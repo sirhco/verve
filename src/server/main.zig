@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
-    std.debug.print("[verve] listening on http://127.0.0.1:{d}\n", .{port});
+    printStartupBanner(port);
 
     while (true) {
         const stream = server.accept(io) catch |err| {
@@ -159,6 +159,22 @@ fn renderPage(
 fn pathOf(target: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, target, '?')) |q| return target[0..q];
     return target;
+}
+
+fn printStartupBanner(port: u16) void {
+    std.debug.print("[verve] listening on http://127.0.0.1:{d}\n", .{port});
+    std.debug.print("[verve] pages:\n", .{});
+    for (app.routes) |r| {
+        std.debug.print("  GET  {s}\n", .{r.path});
+    }
+    std.debug.print("[verve] actions:\n", .{});
+    inline for (comptime std.meta.declarations(app.Actions)) |decl| {
+        std.debug.print("  POST /api/{s}\n", .{decl.name});
+    }
+    std.debug.print("[verve] assets:\n  GET  /client.wasm ({d} B)\n  GET  /verve.js ({d} B)\n", .{
+        assets.wasm.len,
+        assets.js.len,
+    });
 }
 
 const DEFAULT_PORT: u16 = 8080;
