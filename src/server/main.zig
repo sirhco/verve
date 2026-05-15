@@ -20,7 +20,7 @@ const DEFAULT_BODY_LIMIT: usize = 1 * 1024 * 1024;
 const PUBLIC_PREFIX = "/public/";
 const STATIC_MAX_SIZE: usize = 4 * 1024 * 1024;
 
-var request_count: u64 = 0;
+var request_count: std.atomic.Value(u64) = .init(0);
 var start_timestamp: ?std.Io.Timestamp = null;
 var body_limit: usize = DEFAULT_BODY_LIMIT;
 var public_dir: ?std.Io.Dir = null;
@@ -84,7 +84,7 @@ fn handleConnection(
         const start = std.Io.Clock.now(.awake, io);
         const method_name = @tagName(request.head.method);
         const target_copy = request.head.target;
-        request_count += 1;
+        _ = request_count.fetchAdd(1, .monotonic);
         handleRequest(gpa, io, &request) catch |err| {
             log.err("{s} {s} → error: {s}", .{ method_name, target_copy, @errorName(err) });
             return;
@@ -347,7 +347,7 @@ fn respondHealth(
     defer aw.deinit();
     try aw.writer.print(
         "{{\"status\":\"ok\",\"uptime_sec\":{d},\"requests\":{d}}}",
-        .{ uptime_sec, request_count },
+        .{ uptime_sec, request_count.load(.monotonic) },
     );
 
     try request.respond(aw.written(), .{
@@ -375,7 +375,7 @@ fn onShutdownSignal(sig: std.posix.SIG) callconv(.c) void {
         .TERM => "SIGTERM",
         else => "signal",
     };
-    std.debug.print("\n[verve] received {s}, shutting down (served {d} requests)\n", .{ name, request_count });
+    std.debug.print("\n[verve] received {s}, shutting down (served {d} requests)\n", .{ name, request_count.load(.monotonic) });
     std.process.exit(0);
 }
 
