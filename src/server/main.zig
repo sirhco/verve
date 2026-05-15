@@ -17,11 +17,13 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(8080) };
+    const port = try parsePort(init);
+
+    var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
-    std.debug.print("[verve] listening on http://127.0.0.1:8080\n", .{});
+    std.debug.print("[verve] listening on http://127.0.0.1:{d}\n", .{port});
 
     while (true) {
         const stream = server.accept(io) catch |err| {
@@ -140,4 +142,32 @@ fn handleRequest(gpa: std.mem.Allocator, request: *std.http.Server.Request) !voi
 fn pathOf(target: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, target, '?')) |q| return target[0..q];
     return target;
+}
+
+const DEFAULT_PORT: u16 = 8080;
+
+fn parsePort(init: std.process.Init) !u16 {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.startsWith(u8, a, "--port=")) {
+            return std.fmt.parseInt(u16, a["--port=".len..], 10) catch {
+                std.debug.print("[verve] invalid --port value: {s}\n", .{a});
+                return error.InvalidPort;
+            };
+        }
+        if (std.mem.eql(u8, a, "--port")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("[verve] --port requires a value\n", .{});
+                return error.InvalidPort;
+            }
+            return std.fmt.parseInt(u16, args[i], 10) catch {
+                std.debug.print("[verve] invalid --port value: {s}\n", .{args[i]});
+                return error.InvalidPort;
+            };
+        }
+    }
+    return DEFAULT_PORT;
 }
