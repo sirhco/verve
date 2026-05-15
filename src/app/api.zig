@@ -13,4 +13,8 @@ pub const Actions = struct {
     pub fn updateDatabase(args: struct { new_count: i32 }) !void {
         std.debug.print("[verve] updateDatabase: new_count={d}\n", .{args.new_count});
     }
+
+    pub fn logMessage(args: struct { text: []const u8 }) !void {
+        std.debug.print("[verve] logMessage: {s}\n", .{args.text});
+    }
 };
