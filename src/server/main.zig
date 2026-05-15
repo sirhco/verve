@@ -18,7 +18,10 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    const cli = try parseCli(init);
+    const cli = parseCli(init) catch |err| switch (err) {
+        error.HelpRequested => return,
+        else => return err,
+    };
 
     var addr = cli.address;
     var server = try addr.listen(io, .{ .reuse_address = true });
@@ -186,8 +189,11 @@ const CliOptions = struct {
     port: u16,
 };
 
+pub const CliExit = error{HelpRequested};
+
 fn parseCli(init: std.process.Init) !CliOptions {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const program = if (args.len > 0) args[0] else "verve-server";
 
     var port: u16 = DEFAULT_PORT;
     var host_text: []const u8 = DEFAULT_HOST;
@@ -195,6 +201,10 @@ fn parseCli(init: std.process.Init) !CliOptions {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            printUsage(program);
+            return error.HelpRequested;
+        }
         if (try optionValue(args, &i, a, "--port")) |v| {
             port = std.fmt.parseInt(u16, v, 10) catch {
                 std.debug.print("[verve] invalid --port value: {s}\n", .{v});
@@ -206,7 +216,7 @@ fn parseCli(init: std.process.Init) !CliOptions {
             host_text = v;
             continue;
         }
-        std.debug.print("[verve] unknown argument: {s}\n", .{a});
+        std.debug.print("[verve] unknown argument: {s}\n  (run with --help for usage)\n", .{a});
         return error.UnknownArgument;
     }
 
@@ -221,6 +231,24 @@ fn parseCli(init: std.process.Init) !CliOptions {
         .host_text = host_text,
         .port = port,
     };
+}
+
+fn printUsage(program: []const u8) void {
+    std.debug.print(
+        \\Usage: {s} [--host HOST] [--port PORT] [--help]
+        \\
+        \\Verve full-stack web server. Serves SSR pages, embedded WASM client,
+        \\and auto-generated /api/<fn> endpoints from app.Actions.
+        \\
+        \\Options:
+        \\  --host HOST     Bind interface. IP literal (default: {s}).
+        \\                  Use 0.0.0.0 to accept connections on any interface.
+        \\  --port PORT     TCP port (default: {d}).
+        \\  -h, --help      Show this message and exit.
+        \\
+        \\Pages and actions are listed at startup; visit / once the server is up.
+        \\
+    , .{ program, DEFAULT_HOST, DEFAULT_PORT });
 }
 
 fn optionValue(
