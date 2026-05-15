@@ -14,6 +14,9 @@ const READ_BUF_SIZE = 64 * 1024;
 const WRITE_BUF_SIZE = 64 * 1024;
 const BODY_LIMIT: usize = 1 * 1024 * 1024;
 
+var request_count: u64 = 0;
+var start_timestamp: ?std.Io.Timestamp = null;
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -27,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
+    start_timestamp = std.Io.Clock.now(.awake, io);
     printStartupBanner(cli);
 
     while (true) {
@@ -63,7 +67,8 @@ fn handleConnection(
         const start = std.Io.Clock.now(.awake, io);
         const method_name = @tagName(request.head.method);
         const target_copy = request.head.target;
-        handleRequest(gpa, &request) catch |err| {
+        request_count += 1;
+        handleRequest(gpa, io, &request) catch |err| {
             std.debug.print("[verve] {s} {s} → error: {s}\n", .{ method_name, target_copy, @errorName(err) });
             return;
         };
@@ -85,9 +90,14 @@ fn logRequest(method: []const u8, target: []const u8, ns: i96) void {
     std.debug.print("[verve] {s} {s} {d}.{d}ms\n", .{ method, target, ms_whole, ms_frac });
 }
 
-fn handleRequest(gpa: std.mem.Allocator, request: *std.http.Server.Request) !void {
+fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.Request) !void {
     const target = request.head.target;
     const path = pathOf(target);
+
+    if (std.mem.eql(u8, path, "/health")) {
+        try respondHealth(gpa, io, request);
+        return;
+    }
 
     if (std.mem.eql(u8, path, "/client.wasm")) {
         try request.respond(assets.wasm, .{
@@ -176,6 +186,33 @@ fn renderPage(
     });
 }
 
+fn respondHealth(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    request: *std.http.Server.Request,
+) !void {
+    const uptime_sec: i64 = if (start_timestamp) |s| blk: {
+        const now = std.Io.Clock.now(.awake, io);
+        const ns_i96 = s.durationTo(now).nanoseconds;
+        break :blk @intCast(@divTrunc(ns_i96, std.time.ns_per_s));
+    } else 0;
+
+    var aw: Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try aw.writer.print(
+        "{{\"status\":\"ok\",\"uptime_sec\":{d},\"requests\":{d}}}",
+        .{ uptime_sec, request_count },
+    );
+
+    try request.respond(aw.written(), .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "cache-control", .value = "no-store" },
+        },
+    });
+}
+
 fn pathOf(target: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, target, '?')) |q| return target[0..q];
     return target;
@@ -195,6 +232,7 @@ fn printStartupBanner(cli: CliOptions) void {
         assets.wasm.len,
         assets.js.len,
     });
+    std.debug.print("[verve] ops:\n  GET  /health\n", .{});
 }
 
 const DEFAULT_PORT: u16 = 8080;
