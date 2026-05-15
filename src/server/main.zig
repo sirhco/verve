@@ -8,6 +8,7 @@ const assets = @import("assets");
 const app = @import("app");
 const router = @import("router.zig");
 const api_handler = @import("api_handler.zig");
+const components = app.components;
 
 const READ_BUF_SIZE = 64 * 1024;
 const WRITE_BUF_SIZE = 64 * 1024;
@@ -112,31 +113,47 @@ fn handleRequest(gpa: std.mem.Allocator, request: *std.http.Server.Request) !voi
     }
 
     if (router.match(path)) |route| {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        defer arena.deinit();
-        const ctx = verve.Context.init(&arena);
-
-        const node = route.render(&ctx) catch |err| {
-            std.debug.print("[verve] render error: {s}\n", .{@errorName(err)});
-            try request.respond("render failed", .{ .status = .internal_server_error });
-            return;
-        };
-
-        var aw: Writer.Allocating = .init(gpa);
-        defer aw.deinit();
-        try aw.writer.writeAll("<!DOCTYPE html>");
-        try verve.Renderer.render(&aw.writer, node);
-
-        try request.respond(aw.written(), .{
-            .status = .ok,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/html; charset=utf-8" },
-            },
-        });
+        try renderPage(gpa, request, .ok, route.render, null);
         return;
     }
 
-    try request.respond("not found", .{ .status = .not_found });
+    try renderPage(gpa, request, .not_found, null, path);
+}
+
+fn renderPage(
+    gpa: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    status: std.http.Status,
+    route_render: ?*const fn (ctx: *const verve.Context) anyerror!verve.Node,
+    not_found_path: ?[]const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx = verve.Context.init(&arena);
+
+    const node = blk: {
+        if (route_render) |render_fn| {
+            break :blk render_fn(&ctx) catch |err| {
+                std.debug.print("[verve] render error: {s}\n", .{@errorName(err)});
+                try request.respond("render failed", .{ .status = .internal_server_error });
+                return;
+            };
+        }
+        const body = try components.notFound(&ctx, not_found_path orelse "");
+        break :blk try components.page(&ctx, body);
+    };
+
+    var aw: Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try aw.writer.writeAll("<!DOCTYPE html>");
+    try verve.Renderer.render(&aw.writer, node);
+
+    try request.respond(aw.written(), .{
+        .status = status,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+        },
+    });
 }
 
 fn pathOf(target: []const u8) []const u8 {

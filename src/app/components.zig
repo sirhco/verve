@@ -56,6 +56,29 @@ pub fn home(ctx: *const verve.Context) !verve.Node {
     };
 }
 
+pub fn notFound(ctx: *const verve.Context, path: []const u8) !verve.Node {
+    const alloc = ctx.alloc();
+    const kids = try alloc.alloc(verve.Node, 3);
+    kids[0] = .{ .tag = "h1", .text = "404 — Not Found" };
+
+    const path_kids = try alloc.alloc(verve.Node, 2);
+    path_kids[0] = .{ .tag = "span", .text = "No route for " };
+    path_kids[1] = .{ .tag = "code", .text = path };
+    kids[1] = .{ .tag = "p", .children = path_kids };
+
+    const link_kids = try alloc.alloc(verve.Node, 1);
+    link_kids[0] = .{ .tag = "a", .text = "← Home", .attrs = &.{
+        .{ .key = "href", .value = "/" },
+    } };
+    kids[2] = .{ .tag = "p", .children = link_kids };
+
+    return .{
+        .tag = "main",
+        .attrs = &.{.{ .key = "class", .value = "home" }},
+        .children = kids,
+    };
+}
+
 pub fn page(ctx: *const verve.Context, body: verve.Node) !verve.Node {
     const alloc = ctx.alloc();
     const head_kids = try alloc.alloc(verve.Node, 3);
