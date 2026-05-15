@@ -67,16 +67,46 @@ fn request(
     method: []const u8,
     path: []const u8,
 ) !Response {
+    return requestWithBody(io, gpa, port, method, path, null, null);
+}
+
+fn postForm(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    port: u16,
+    path: []const u8,
+    body: []const u8,
+) !Response {
+    return requestWithBody(io, gpa, port, "POST", path, "application/x-www-form-urlencoded", body);
+}
+
+fn requestWithBody(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    port: u16,
+    method: []const u8,
+    path: []const u8,
+    content_type: ?[]const u8,
+    body: ?[]const u8,
+) !Response {
     const addr = loopback(port);
     var stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
-    var write_buf: [512]u8 = undefined;
+    var write_buf: [1024]u8 = undefined;
     var sw = stream.writer(io, &write_buf);
     try sw.interface.print(
-        "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n",
         .{ method, path },
     );
+    if (content_type) |ct| {
+        try sw.interface.print("Content-Type: {s}\r\n", .{ct});
+    }
+    if (body) |b| {
+        try sw.interface.print("Content-Length: {d}\r\n", .{b.len});
+    }
+    try sw.interface.writeAll("\r\n");
+    if (body) |b| try sw.interface.writeAll(b);
     try sw.interface.flush();
 
     var read_buf: [4096]u8 = undefined;
@@ -174,5 +204,66 @@ test "server boots, serves pages, returns expected status codes" {
         defer resp.deinit(gpa);
         try std.testing.expectEqual(@as(u16, 200), resp.status);
         try std.testing.expect(resp.body.len > 0);
+    }
+}
+
+test "form-encoded /api/addTodo + /api/removeTodo updates /todos" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 1);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    // Initial: page renders, no list items
+    {
+        var resp = try request(io, gpa, port, "GET", "/todos");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "<h1>Todos</h1>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "<li>") == null);
+    }
+
+    // Add two items via form-encoded POST
+    {
+        var resp = try postForm(io, gpa, port, "/api/addTodo", "text=buy+milk");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 303), resp.status);
+    }
+    {
+        var resp = try postForm(io, gpa, port, "/api/addTodo", "text=write%20tests");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 303), resp.status);
+    }
+
+    // Page now shows both items
+    {
+        var resp = try request(io, gpa, port, "GET", "/todos");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "buy milk") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "write tests") != null);
+    }
+
+    // Empty text rejected (Action returns error.EmptyTodo → 500)
+    {
+        var resp = try postForm(io, gpa, port, "/api/addTodo", "text=");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 500), resp.status);
+    }
+
+    // Remove first item, second remains
+    {
+        var resp = try postForm(io, gpa, port, "/api/removeTodo", "index=0");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 303), resp.status);
+    }
+    {
+        var resp = try request(io, gpa, port, "GET", "/todos");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "buy milk") == null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "write tests") != null);
     }
 }
