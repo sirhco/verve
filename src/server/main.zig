@@ -146,6 +146,10 @@ fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.R
     }
 
     if (router.match(path)) |route| {
+        if (request.head.method != .GET and request.head.method != .HEAD) {
+            try renderError(gpa, request, .method_not_allowed, "This page only accepts GET requests.");
+            return;
+        }
         try renderPage(gpa, request, .ok, route.render, null);
         return;
     }
@@ -168,7 +172,7 @@ fn renderPage(
         if (route_render) |render_fn| {
             break :blk render_fn(&ctx) catch |err| {
                 std.debug.print("[verve] render error: {s}\n", .{@errorName(err)});
-                try request.respond("render failed", .{ .status = .internal_server_error });
+                try renderError(gpa, request, .internal_server_error, "The page failed to render.");
                 return;
             };
         }
@@ -187,6 +191,57 @@ fn renderPage(
             .{ .name = "content-type", .value = "text/html; charset=utf-8" },
         },
     });
+}
+
+fn renderError(
+    gpa: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    status: std.http.Status,
+    message: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ctx = verve.Context.init(&arena);
+
+    const status_code: u16 = @intFromEnum(status);
+    const status_text = status.phrase() orelse "Error";
+
+    // Error responses close the connection rather than drain the request body.
+    // std.http.Server's respond() asserts the body is consumable if keep_alive
+    // is true; on a 4xx/5xx for an unread POST that assertion panics.
+    const fallback_opts: std.http.Server.Request.RespondOptions = .{
+        .status = status,
+        .keep_alive = false,
+    };
+    const html_opts: std.http.Server.Request.RespondOptions = .{
+        .status = status,
+        .keep_alive = false,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+        },
+    };
+
+    const body = components.errorPage(&ctx, status_code, status_text, message) catch {
+        try request.respond(message, fallback_opts);
+        return;
+    };
+    const node = components.page(&ctx, body) catch {
+        try request.respond(message, fallback_opts);
+        return;
+    };
+
+    var aw: Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    aw.writer.writeAll("<!DOCTYPE html>") catch {
+        try request.respond(message, fallback_opts);
+        return;
+    };
+    verve.Renderer.render(&aw.writer, node) catch {
+        try request.respond(message, fallback_opts);
+        return;
+    };
+
+    try request.respond(aw.written(), html_opts);
 }
 
 fn respondHealth(

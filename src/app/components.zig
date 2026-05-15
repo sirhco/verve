@@ -87,6 +87,36 @@ pub fn notFound(ctx: *const verve.Context, path: []const u8) !verve.Node {
     };
 }
 
+pub fn errorPage(
+    ctx: *const verve.Context,
+    status_code: u16,
+    status_text: []const u8,
+    message: []const u8,
+) !verve.Node {
+    const alloc = ctx.alloc();
+
+    var heading_buf: [64]u8 = undefined;
+    var hw: @import("std").Io.Writer = .fixed(&heading_buf);
+    try hw.print("{d} — {s}", .{ status_code, status_text });
+    const heading_owned = try alloc.dupe(u8, hw.buffered());
+
+    const kids = try alloc.alloc(verve.Node, 3);
+    kids[0] = .{ .tag = "h1", .text = heading_owned };
+    kids[1] = .{ .tag = "p", .text = message };
+
+    const link_kids = try alloc.alloc(verve.Node, 1);
+    link_kids[0] = .{ .tag = "a", .text = "← Home", .attrs = &.{
+        .{ .key = "href", .value = "/" },
+    } };
+    kids[2] = .{ .tag = "p", .children = link_kids };
+
+    return .{
+        .tag = "main",
+        .attrs = &.{.{ .key = "class", .value = "home" }},
+        .children = kids,
+    };
+}
+
 pub fn page(ctx: *const verve.Context, body: verve.Node) !verve.Node {
     const alloc = ctx.alloc();
     const head_kids = try alloc.alloc(verve.Node, 3);
