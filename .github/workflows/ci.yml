@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: zig version
+        run: zig version
+
+      - name: zig build (default)
+        run: zig build
+
+      - name: zig build test
+        run: zig build test --summary all
+
+      - name: smoke test server
+        shell: bash
+        run: |
+          ./zig-out/bin/verve-server --port 18080 &
+          server_pid=$!
+          sleep 1
+          set -e
+          curl -fsS -o /dev/null -w 'GET /          %{http_code}\n' http://127.0.0.1:18080/
+          curl -fsS -o /dev/null -w 'GET /counter   %{http_code}\n' http://127.0.0.1:18080/counter
+          curl -fsS -o /dev/null -w 'GET /client.wasm %{http_code}\n' http://127.0.0.1:18080/client.wasm
+          curl -fsS -o /dev/null -w 'GET /verve.js  %{http_code}\n' http://127.0.0.1:18080/verve.js
+          curl -fsS -o /dev/null -w 'GET /health    %{http_code}\n' http://127.0.0.1:18080/health
+          curl -fsS -o /dev/null -w 'POST /api/getCount %{http_code}\n' \
+            -X POST -H 'content-type: application/json' -d '{}' http://127.0.0.1:18080/api/getCount
+          kill -TERM $server_pid
+          wait $server_pid || true
