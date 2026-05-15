@@ -55,10 +55,35 @@ pub fn main(init: std.process.Init) !void {
             log.err("accept error: {s}", .{@errorName(err)});
             continue;
         };
-        handleConnection(gpa, io, stream) catch |err| {
-            log.err("connection error: {s}", .{@errorName(err)});
+
+        const ctx = gpa.create(ConnCtx) catch |err| {
+            log.err("alloc conn ctx: {s}", .{@errorName(err)});
+            stream.close(io);
+            continue;
         };
+        ctx.* = .{ .gpa = gpa, .io = io, .stream = stream };
+
+        const thread = std.Thread.spawn(.{}, runConnection, .{ctx}) catch |err| {
+            log.err("thread spawn: {s}", .{@errorName(err)});
+            gpa.destroy(ctx);
+            stream.close(io);
+            continue;
+        };
+        thread.detach();
     }
+}
+
+const ConnCtx = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    stream: std.Io.net.Stream,
+};
+
+fn runConnection(ctx: *ConnCtx) void {
+    defer ctx.gpa.destroy(ctx);
+    handleConnection(ctx.gpa, ctx.io, ctx.stream) catch |err| {
+        log.err("connection error: {s}", .{@errorName(err)});
+    };
 }
 
 fn handleConnection(

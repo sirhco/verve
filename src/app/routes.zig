@@ -23,11 +23,12 @@ fn renderHome(ctx: *const verve.Context) !verve.Node {
 }
 
 fn renderCounter(ctx: *const verve.Context) !verve.Node {
-    const body = try components.counter(ctx, api.last_count);
+    const body = try components.counter(ctx, api.currentCount());
     return components.page(ctx, body);
 }
 
 fn renderTodos(ctx: *const verve.Context) !verve.Node {
-    const body = try components.todoList(ctx, api.todos());
+    const items = try api.copyTodosInto(ctx.alloc());
+    const body = try components.todoList(ctx, items);
     return components.page(ctx, body);
 }
