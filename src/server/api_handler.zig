@@ -1,11 +1,12 @@
 //! Comptime-generated /api/<fn> dispatcher for app.Actions.
 //!
-//! Convention: each Action is a `fn(args: struct { ... }) !void` where the
-//! struct's fields are JSON-deserialized from the POST body. This lets us use
-//! field names (which @typeInfo exposes) rather than parameter names (which it
-//! does not).
+//! Convention: each Action is `fn(args: struct { ... }) Ret` where Ret is
+//! one of: `void`, `!void`, a serializable value, or an error union of one.
+//! The arg struct's fields are JSON-deserialized from the POST body; void
+//! returns produce `{"ok":true}`, value returns produce `{"value":<v>}`.
 
 const std = @import("std");
+const Writer = std.Io.Writer;
 const app = @import("app");
 const http = std.http;
 
@@ -55,27 +56,67 @@ fn invoke(
         @compileError("Action argument must be a struct");
     }
 
-    const parsed = std.json.parseFromSlice(ArgsStruct, gpa, body, .{
-        .ignore_unknown_fields = true,
-    }) catch {
-        try request.respond("bad json", .{ .status = .bad_request });
-        return;
-    };
-    defer parsed.deinit();
-
     const Ret = fn_info.return_type.?;
     const ret_info = @typeInfo(Ret);
+    const returns_error = ret_info == .error_union;
+    const Payload = if (returns_error) ret_info.error_union.payload else Ret;
+    const returns_value = Payload != void;
 
-    if (ret_info == .error_union) {
-        func(parsed.value) catch {
+    var args: ArgsStruct = undefined;
+    if (@typeInfo(ArgsStruct).@"struct".fields.len == 0) {
+        args = .{};
+    } else {
+        const parsed = std.json.parseFromSlice(ArgsStruct, gpa, body, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            try request.respond("bad json", .{ .status = .bad_request });
+            return;
+        };
+        defer parsed.deinit();
+        args = parsed.value;
+    }
+
+    if (returns_error and returns_value) {
+        const value = func(args) catch {
             try request.respond("internal error", .{ .status = .internal_server_error });
             return;
         };
+        try respondValue(gpa, request, value);
+    } else if (returns_error and !returns_value) {
+        func(args) catch {
+            try request.respond("internal error", .{ .status = .internal_server_error });
+            return;
+        };
+        try respondOk(request);
+    } else if (!returns_error and returns_value) {
+        const value = func(args);
+        try respondValue(gpa, request, value);
     } else {
-        func(parsed.value);
+        func(args);
+        try respondOk(request);
     }
+}
 
+fn respondOk(request: *http.Server.Request) !void {
     try request.respond("{\"ok\":true}", .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+        },
+    });
+}
+
+fn respondValue(
+    gpa: std.mem.Allocator,
+    request: *http.Server.Request,
+    value: anytype,
+) !void {
+    var aw: Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"value\":");
+    try std.json.Stringify.value(value, .{}, &aw.writer);
+    try aw.writer.writeAll("}");
+    try request.respond(aw.written(), .{
         .status = .ok,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
@@ -122,4 +163,11 @@ test "JSON parse rejects malformed body" {
     const Args = struct { new_count: i32 };
     const result = std.json.parseFromSlice(Args, std.testing.allocator, "not json", .{});
     try std.testing.expectError(error.SyntaxError, result);
+}
+
+test "Stringify produces JSON for primitives" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try std.json.Stringify.value(@as(i32, 42), .{}, &aw.writer);
+    try std.testing.expectEqualStrings("42", aw.written());
 }

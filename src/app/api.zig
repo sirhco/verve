@@ -9,12 +9,21 @@ pub const routes_mod = @import("routes.zig");
 pub const Route = routes_mod.Route;
 pub const routes = routes_mod.routes;
 
+/// Shared server-side counter state. Single-threaded std.http.Server, so
+/// no atomics or locking needed at MVP scope.
+pub var last_count: i32 = 0;
+
 pub const Actions = struct {
     pub fn updateDatabase(args: struct { new_count: i32 }) !void {
+        last_count = args.new_count;
         std.debug.print("[verve] updateDatabase: new_count={d}\n", .{args.new_count});
     }
 
     pub fn logMessage(args: struct { text: []const u8 }) !void {
         std.debug.print("[verve] logMessage: {s}\n", .{args.text});
+    }
+
+    pub fn getCount(_: struct {}) !i32 {
+        return last_count;
     }
 };
