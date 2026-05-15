@@ -1,0 +1,84 @@
+//! Comptime-generated /api/<fn> dispatcher for app.Actions.
+//!
+//! Convention: each Action is a `fn(args: struct { ... }) !void` where the
+//! struct's fields are JSON-deserialized from the POST body. This lets us use
+//! field names (which @typeInfo exposes) rather than parameter names (which it
+//! does not).
+
+const std = @import("std");
+const app = @import("app");
+const http = std.http;
+
+const API_PREFIX = "/api/";
+
+pub fn isApiPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, API_PREFIX);
+}
+
+pub fn dispatch(
+    gpa: std.mem.Allocator,
+    request: *http.Server.Request,
+    path: []const u8,
+    body: []const u8,
+) !void {
+    if (!isApiPath(path)) {
+        try request.respond("not found", .{ .status = .not_found });
+        return;
+    }
+    const fn_name = path[API_PREFIX.len..];
+
+    const Actions = app.Actions;
+    const decls = comptime std.meta.declarations(Actions);
+
+    inline for (decls) |decl| {
+        if (std.mem.eql(u8, decl.name, fn_name)) {
+            try invoke(gpa, request, @field(Actions, decl.name), body);
+            return;
+        }
+    }
+
+    try request.respond("unknown action", .{ .status = .not_found });
+}
+
+fn invoke(
+    gpa: std.mem.Allocator,
+    request: *http.Server.Request,
+    comptime func: anytype,
+    body: []const u8,
+) !void {
+    const fn_info = @typeInfo(@TypeOf(func)).@"fn";
+    if (fn_info.params.len != 1) {
+        @compileError("Action functions must take exactly one struct argument");
+    }
+    const ArgsStruct = fn_info.params[0].type.?;
+    if (@typeInfo(ArgsStruct) != .@"struct") {
+        @compileError("Action argument must be a struct");
+    }
+
+    const parsed = std.json.parseFromSlice(ArgsStruct, gpa, body, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        try request.respond("bad json", .{ .status = .bad_request });
+        return;
+    };
+    defer parsed.deinit();
+
+    const Ret = fn_info.return_type.?;
+    const ret_info = @typeInfo(Ret);
+
+    if (ret_info == .error_union) {
+        func(parsed.value) catch {
+            try request.respond("internal error", .{ .status = .internal_server_error });
+            return;
+        };
+    } else {
+        func(parsed.value);
+    }
+
+    try request.respond("{\"ok\":true}", .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+        },
+    });
+}
