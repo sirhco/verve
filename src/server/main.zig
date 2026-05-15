@@ -18,13 +18,13 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    const port = try parsePort(init);
+    const cli = try parseCli(init);
 
-    var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var addr = cli.address;
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
-    printStartupBanner(port);
+    printStartupBanner(cli);
 
     while (true) {
         const stream = server.accept(io) catch |err| {
@@ -161,8 +161,8 @@ fn pathOf(target: []const u8) []const u8 {
     return target;
 }
 
-fn printStartupBanner(port: u16) void {
-    std.debug.print("[verve] listening on http://127.0.0.1:{d}\n", .{port});
+fn printStartupBanner(cli: CliOptions) void {
+    std.debug.print("[verve] listening on http://{s}:{d}\n", .{ cli.host_text, cli.port });
     std.debug.print("[verve] pages:\n", .{});
     for (app.routes) |r| {
         std.debug.print("  GET  {s}\n", .{r.path});
@@ -178,29 +178,66 @@ fn printStartupBanner(port: u16) void {
 }
 
 const DEFAULT_PORT: u16 = 8080;
+const DEFAULT_HOST: []const u8 = "127.0.0.1";
 
-fn parsePort(init: std.process.Init) !u16 {
+const CliOptions = struct {
+    address: std.Io.net.IpAddress,
+    host_text: []const u8,
+    port: u16,
+};
+
+fn parseCli(init: std.process.Init) !CliOptions {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+
+    var port: u16 = DEFAULT_PORT;
+    var host_text: []const u8 = DEFAULT_HOST;
+
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.startsWith(u8, a, "--port=")) {
-            return std.fmt.parseInt(u16, a["--port=".len..], 10) catch {
-                std.debug.print("[verve] invalid --port value: {s}\n", .{a});
+        if (try optionValue(args, &i, a, "--port")) |v| {
+            port = std.fmt.parseInt(u16, v, 10) catch {
+                std.debug.print("[verve] invalid --port value: {s}\n", .{v});
                 return error.InvalidPort;
             };
+            continue;
         }
-        if (std.mem.eql(u8, a, "--port")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("[verve] --port requires a value\n", .{});
-                return error.InvalidPort;
-            }
-            return std.fmt.parseInt(u16, args[i], 10) catch {
-                std.debug.print("[verve] invalid --port value: {s}\n", .{args[i]});
-                return error.InvalidPort;
-            };
+        if (try optionValue(args, &i, a, "--host")) |v| {
+            host_text = v;
+            continue;
         }
+        std.debug.print("[verve] unknown argument: {s}\n", .{a});
+        return error.UnknownArgument;
     }
-    return DEFAULT_PORT;
+
+    var address = std.Io.net.IpAddress.parseLiteral(host_text) catch {
+        std.debug.print("[verve] invalid --host value: {s}\n", .{host_text});
+        return error.InvalidHost;
+    };
+    address.setPort(port);
+
+    return .{
+        .address = address,
+        .host_text = host_text,
+        .port = port,
+    };
+}
+
+fn optionValue(
+    args: []const []const u8,
+    i: *usize,
+    arg: []const u8,
+    comptime name: []const u8,
+) !?[]const u8 {
+    const eq_prefix = name ++ "=";
+    if (std.mem.startsWith(u8, arg, eq_prefix)) return arg[eq_prefix.len..];
+    if (std.mem.eql(u8, arg, name)) {
+        i.* += 1;
+        if (i.* >= args.len) {
+            std.debug.print("[verve] {s} requires a value\n", .{name});
+            return error.MissingValue;
+        }
+        return args[i.*];
+    }
+    return null;
 }
