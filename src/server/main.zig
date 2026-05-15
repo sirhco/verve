@@ -60,12 +60,29 @@ fn handleConnection(
             error.HttpRequestTruncated => return,
             else => return err,
         };
+        const start = std.Io.Clock.now(.awake, io);
+        const method_name = @tagName(request.head.method);
+        const target_copy = request.head.target;
         handleRequest(gpa, &request) catch |err| {
-            std.debug.print("[verve] request error: {s}\n", .{@errorName(err)});
+            std.debug.print("[verve] {s} {s} → error: {s}\n", .{ method_name, target_copy, @errorName(err) });
             return;
         };
+        const end = std.Io.Clock.now(.awake, io);
+        const ns = start.durationTo(end).nanoseconds;
+        logRequest(method_name, target_copy, ns);
         if (!request.head.keep_alive) return;
     }
+}
+
+fn logRequest(method: []const u8, target: []const u8, ns: i96) void {
+    const us: i64 = @intCast(@divTrunc(ns, std.time.ns_per_us));
+    if (us < 1000) {
+        std.debug.print("[verve] {s} {s} {d}µs\n", .{ method, target, us });
+        return;
+    }
+    const ms_whole: i64 = @divTrunc(us, 1000);
+    const ms_frac: i64 = @divTrunc(@rem(us, 1000), 100);
+    std.debug.print("[verve] {s} {s} {d}.{d}ms\n", .{ method, target, ms_whole, ms_frac });
 }
 
 fn handleRequest(gpa: std.mem.Allocator, request: *std.http.Server.Request) !void {
