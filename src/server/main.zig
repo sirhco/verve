@@ -349,6 +349,10 @@ fn parseCli(init: std.process.Init) !CliOptions {
                 log.err("invalid --port value: {s}", .{v});
                 return error.InvalidPort;
             };
+            if (port == 0) {
+                log.err("--port 0 is not supported (ephemeral binding); pick an explicit port 1-65535", .{});
+                return error.InvalidPort;
+            }
             continue;
         }
         if (try optionValue(args, &i, a, "--host")) |v| {
