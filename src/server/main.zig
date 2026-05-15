@@ -133,6 +133,11 @@ fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.R
             return;
         }
 
+        // Inspect request headers BEFORE reading the body. After the body
+        // reader is initialized std.http.Server transitions out of the
+        // received_head state and iterateHeaders asserts.
+        const meta = api_handler.RequestMeta.fromRequest(request);
+
         var body_buf: [16 * 1024]u8 = undefined;
         const body_reader = request.readerExpectContinue(&body_buf) catch {
             try request.respond("bad request", .{ .status = .bad_request });
@@ -145,7 +150,7 @@ fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.R
         };
         defer gpa.free(body);
 
-        try api_handler.dispatch(gpa, request, path, body);
+        try api_handler.dispatch(gpa, request, path, body, meta);
         return;
     }
 

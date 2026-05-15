@@ -14,6 +14,7 @@ pub const Route = struct {
 pub const routes: []const Route = &.{
     .{ .path = "/", .render = renderHome },
     .{ .path = "/counter", .render = renderCounter },
+    .{ .path = "/todos", .render = renderTodos },
 };
 
 fn renderHome(ctx: *const verve.Context) !verve.Node {
@@ -23,5 +24,10 @@ fn renderHome(ctx: *const verve.Context) !verve.Node {
 
 fn renderCounter(ctx: *const verve.Context) !verve.Node {
     const body = try components.counter(ctx, api.last_count);
+    return components.page(ctx, body);
+}
+
+fn renderTodos(ctx: *const verve.Context) !verve.Node {
+    const body = try components.todoList(ctx, api.todos());
     return components.page(ctx, body);
 }

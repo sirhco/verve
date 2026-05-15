@@ -45,17 +45,111 @@ pub fn counter(ctx: *const verve.Context, initial: i32) !verve.Node {
 
 pub fn home(ctx: *const verve.Context) !verve.Node {
     const alloc = ctx.alloc();
-    const kids = try alloc.alloc(verve.Node, 3);
+    const kids = try alloc.alloc(verve.Node, 4);
     kids[0] = .{ .tag = "h1", .text = "Verve" };
     kids[1] = .{
         .tag = "p",
         .text = "Full-stack Zig web framework — fine-grained reactivity, no macros.",
     };
-    const link_kids = try alloc.alloc(verve.Node, 1);
-    link_kids[0] = .{ .tag = "a", .text = "Counter demo →", .attrs = &.{
+
+    const counter_link = try alloc.alloc(verve.Node, 1);
+    counter_link[0] = .{ .tag = "a", .text = "Counter demo →", .attrs = &.{
         .{ .key = "href", .value = "/counter" },
     } };
-    kids[2] = .{ .tag = "p", .children = link_kids };
+    kids[2] = .{ .tag = "p", .children = counter_link };
+
+    const todos_link = try alloc.alloc(verve.Node, 1);
+    todos_link[0] = .{ .tag = "a", .text = "Todo list (form fallback) →", .attrs = &.{
+        .{ .key = "href", .value = "/todos" },
+    } };
+    kids[3] = .{ .tag = "p", .children = todos_link };
+
+    return .{
+        .tag = "main",
+        .attrs = &.{.{ .key = "class", .value = "home" }},
+        .children = kids,
+    };
+}
+
+pub fn todoList(ctx: *const verve.Context, items: []const []const u8) !verve.Node {
+    const alloc = ctx.alloc();
+
+    const kids = try alloc.alloc(verve.Node, 4);
+    kids[0] = .{ .tag = "h1", .text = "Todos" };
+    kids[1] = .{
+        .tag = "p",
+        .text = "Pure server-rendered list. Submissions degrade gracefully without wasm.",
+    };
+
+    // Add-form
+    const add_inputs = try alloc.alloc(verve.Node, 2);
+    add_inputs[0] = .{
+        .tag = "input",
+        .attrs = &.{
+            .{ .key = "name", .value = "text" },
+            .{ .key = "type", .value = "text" },
+            .{ .key = "placeholder", .value = "Write something to do" },
+            .{ .key = "required", .value = "true" },
+            .{ .key = "autofocus", .value = "true" },
+        },
+    };
+    add_inputs[1] = .{
+        .tag = "button",
+        .text = "Add",
+        .attrs = &.{.{ .key = "type", .value = "submit" }},
+    };
+    kids[2] = .{
+        .tag = "form",
+        .attrs = &.{
+            .{ .key = "method", .value = "post" },
+            .{ .key = "action", .value = "/api/addTodo" },
+            .{ .key = "class", .value = "todo-form" },
+        },
+        .children = add_inputs,
+    };
+
+    // List of items + per-item remove form
+    const item_nodes = try alloc.alloc(verve.Node, items.len);
+    for (items, 0..) |text, i| {
+        var idx_buf: [12]u8 = undefined;
+        var iw: @import("std").Io.Writer = .fixed(&idx_buf);
+        try iw.print("{d}", .{i});
+        const idx_owned = try alloc.dupe(u8, iw.buffered());
+
+        const remove_kids = try alloc.alloc(verve.Node, 2);
+        const hidden_attrs = try alloc.alloc(verve.Attr, 3);
+        hidden_attrs[0] = .{ .key = "type", .value = "hidden" };
+        hidden_attrs[1] = .{ .key = "name", .value = "index" };
+        hidden_attrs[2] = .{ .key = "value", .value = idx_owned };
+        remove_kids[0] = .{
+            .tag = "input",
+            .attrs = hidden_attrs,
+        };
+        remove_kids[1] = .{
+            .tag = "button",
+            .text = "×",
+            .attrs = &.{.{ .key = "type", .value = "submit" }},
+        };
+        const remove_form = verve.Node{
+            .tag = "form",
+            .attrs = &.{
+                .{ .key = "method", .value = "post" },
+                .{ .key = "action", .value = "/api/removeTodo" },
+                .{ .key = "class", .value = "todo-remove" },
+            },
+            .children = remove_kids,
+        };
+
+        const li_kids = try alloc.alloc(verve.Node, 2);
+        li_kids[0] = .{ .tag = "span", .text = text };
+        li_kids[1] = remove_form;
+        item_nodes[i] = .{ .tag = "li", .children = li_kids };
+    }
+    kids[3] = .{
+        .tag = "ul",
+        .attrs = &.{.{ .key = "class", .value = "todo-list" }},
+        .children = item_nodes,
+    };
 
     return .{
         .tag = "main",
@@ -133,6 +227,13 @@ pub fn page(ctx: *const verve.Context, body: verve.Node) !verve.Node {
         \\a{color:#58a6ff;text-decoration:none}
         \\a:hover{text-decoration:underline}
         \\.home{max-width:36rem}
+        \\.todo-form{display:flex;gap:.5rem;margin:1rem 0}
+        \\.todo-form input[type=text]{flex:1;padding:.5rem;background:#1c1c1f;color:inherit;border:1px solid #333;border-radius:4px;font:inherit}
+        \\.todo-list{list-style:none;padding:0;margin:1rem 0}
+        \\.todo-list li{display:flex;align-items:center;gap:.5rem;padding:.5rem;border-bottom:1px solid #222}
+        \\.todo-list li span{flex:1}
+        \\.todo-remove button{background:#3d1d1d;padding:.25rem .5rem}
+        \\.todo-remove button:hover{background:#5b2727}
         ,
     };
 
