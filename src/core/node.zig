@@ -19,7 +19,7 @@ pub const Node = struct {
 pub fn isVoidTag(tag: []const u8) bool {
     const std = @import("std");
     const void_tags = [_][]const u8{
-        "area", "base", "br",  "col",   "embed", "hr",    "img", "input",
+        "area", "base", "br",     "col",   "embed", "hr", "img", "input",
         "link", "meta", "source", "track", "wbr",
     };
     for (void_tags) |v| {

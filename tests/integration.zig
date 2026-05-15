@@ -297,10 +297,10 @@ test "concurrent addTodo requests are serialized without races" {
 
     const N: usize = 16;
     const bodies = [_][]const u8{
-        "text=p0", "text=p1", "text=p2", "text=p3",
-        "text=p4", "text=p5", "text=p6", "text=p7",
-        "text=p8", "text=p9", "text=p10","text=p11",
-        "text=p12","text=p13","text=p14","text=p15",
+        "text=p0",  "text=p1",  "text=p2",  "text=p3",
+        "text=p4",  "text=p5",  "text=p6",  "text=p7",
+        "text=p8",  "text=p9",  "text=p10", "text=p11",
+        "text=p12", "text=p13", "text=p14", "text=p15",
     };
 
     var contexts: [N]WorkerCtx = undefined;
