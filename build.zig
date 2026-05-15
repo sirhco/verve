@@ -91,7 +91,22 @@ pub fn build(b: *std.Build) void {
     const server_tests = b.addTest(.{ .root_module = server_test_mod });
     const run_server_tests = b.addRunArtifact(server_tests);
 
+    const integration_opts = b.addOptions();
+    integration_opts.addOptionPath("server_exe", server.getEmittedBin());
+
+    const integration_mod = b.createModule(.{
+        .root_source_file = b.path("tests/integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_mod.addOptions("build_options", integration_opts);
+
+    const integration_tests = b.addTest(.{ .root_module = integration_mod });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    run_integration_tests.step.dependOn(&server.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_server_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
 }
