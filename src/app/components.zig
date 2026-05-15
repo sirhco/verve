@@ -35,6 +35,27 @@ pub fn counter(ctx: *const verve.Context, initial: i32) !verve.Node {
     };
 }
 
+pub fn home(ctx: *const verve.Context) !verve.Node {
+    const alloc = ctx.alloc();
+    const kids = try alloc.alloc(verve.Node, 3);
+    kids[0] = .{ .tag = "h1", .text = "Verve" };
+    kids[1] = .{
+        .tag = "p",
+        .text = "Full-stack Zig web framework — fine-grained reactivity, no macros.",
+    };
+    const link_kids = try alloc.alloc(verve.Node, 1);
+    link_kids[0] = .{ .tag = "a", .text = "Counter demo →", .attrs = &.{
+        .{ .key = "href", .value = "/counter" },
+    } };
+    kids[2] = .{ .tag = "p", .children = link_kids };
+
+    return .{
+        .tag = "main",
+        .attrs = &.{.{ .key = "class", .value = "home" }},
+        .children = kids,
+    };
+}
+
 pub fn page(ctx: *const verve.Context, body: verve.Node) !verve.Node {
     const alloc = ctx.alloc();
     const head_kids = try alloc.alloc(verve.Node, 3);
@@ -48,6 +69,9 @@ pub fn page(ctx: *const verve.Context, body: verve.Node) !verve.Node {
         \\.count{font-size:3rem;display:block;margin:1rem 0;font-variant-numeric:tabular-nums}
         \\button{font:inherit;padding:.5rem 1rem;margin-right:.5rem;background:#1f6feb;color:#fff;border:0;border-radius:4px;cursor:pointer}
         \\button:hover{background:#388bfd}
+        \\a{color:#58a6ff;text-decoration:none}
+        \\a:hover{text-decoration:underline}
+        \\.home{max-width:36rem}
         ,
     };
 

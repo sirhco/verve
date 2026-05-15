@@ -12,10 +12,15 @@ pub const Route = struct {
 
 pub const routes: []const Route = &.{
     .{ .path = "/", .render = renderHome },
-    .{ .path = "/counter", .render = renderHome },
+    .{ .path = "/counter", .render = renderCounter },
 };
 
 fn renderHome(ctx: *const verve.Context) !verve.Node {
+    const body = try components.home(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderCounter(ctx: *const verve.Context) !verve.Node {
     const body = try components.counter(ctx, 0);
     return components.page(ctx, body);
 }
