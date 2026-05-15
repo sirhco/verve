@@ -78,6 +78,20 @@ pub fn build(b: *std.Build) void {
     });
     const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
+
+    const server_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/api_handler.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "verve", .module = verve_mod },
+            .{ .name = "app", .module = app_mod },
+        },
+    });
+    const server_tests = b.addTest(.{ .root_module = server_test_mod });
+    const run_server_tests = b.addRunArtifact(server_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_server_tests.step);
 }

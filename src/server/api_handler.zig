@@ -82,3 +82,44 @@ fn invoke(
         },
     });
 }
+
+test "isApiPath matches /api/ prefix only" {
+    const testing = std.testing;
+    try testing.expect(isApiPath("/api/foo"));
+    try testing.expect(isApiPath("/api/"));
+    try testing.expect(!isApiPath("/foo/api/bar"));
+    try testing.expect(!isApiPath("/foo"));
+    try testing.expect(!isApiPath(""));
+}
+
+test "Actions struct has expected decl signature" {
+    const Actions = app.Actions;
+    const decls = comptime std.meta.declarations(Actions);
+    var found = false;
+    inline for (decls) |decl| {
+        if (std.mem.eql(u8, decl.name, "updateDatabase")) {
+            found = true;
+            const fn_info = @typeInfo(@TypeOf(@field(Actions, decl.name))).@"fn";
+            try std.testing.expectEqual(@as(usize, 1), fn_info.params.len);
+            const ArgsStruct = fn_info.params[0].type.?;
+            try std.testing.expect(@typeInfo(ArgsStruct) == .@"struct");
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "JSON body parses into single-struct argument" {
+    const Args = struct { new_count: i32 };
+    const body = "{\"new_count\":7}";
+    const parsed = try std.json.parseFromSlice(Args, std.testing.allocator, body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i32, 7), parsed.value.new_count);
+}
+
+test "JSON parse rejects malformed body" {
+    const Args = struct { new_count: i32 };
+    const result = std.json.parseFromSlice(Args, std.testing.allocator, "not json", .{});
+    try std.testing.expectError(error.SyntaxError, result);
+}
