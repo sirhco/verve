@@ -26,6 +26,9 @@ jobs:
       - name: zig version
         run: zig version
 
+      - name: zig fmt --check
+        run: zig fmt --check build.zig src tests
+
       - name: zig build (default)
         run: zig build
 
@@ -35,16 +38,23 @@ jobs:
       - name: smoke test server
         shell: bash
         run: |
-          ./zig-out/bin/verve-server --port 18080 &
+          mkdir -p /tmp/verve-pub
+          echo "ci-static-asset" > /tmp/verve-pub/hello.txt
+          ./zig-out/bin/verve-server --port 18080 --public-dir /tmp/verve-pub &
           server_pid=$!
           sleep 1
           set -e
-          curl -fsS -o /dev/null -w 'GET /          %{http_code}\n' http://127.0.0.1:18080/
-          curl -fsS -o /dev/null -w 'GET /counter   %{http_code}\n' http://127.0.0.1:18080/counter
-          curl -fsS -o /dev/null -w 'GET /client.wasm %{http_code}\n' http://127.0.0.1:18080/client.wasm
-          curl -fsS -o /dev/null -w 'GET /verve.js  %{http_code}\n' http://127.0.0.1:18080/verve.js
-          curl -fsS -o /dev/null -w 'GET /health    %{http_code}\n' http://127.0.0.1:18080/health
+          curl -fsS -o /dev/null -w 'GET /              %{http_code}\n' http://127.0.0.1:18080/
+          curl -fsS -o /dev/null -w 'GET /counter       %{http_code}\n' http://127.0.0.1:18080/counter
+          curl -fsS -o /dev/null -w 'GET /todos         %{http_code}\n' http://127.0.0.1:18080/todos
+          curl -fsS -o /dev/null -w 'GET /client.wasm   %{http_code}\n' http://127.0.0.1:18080/client.wasm
+          curl -fsS -o /dev/null -w 'GET /verve.js      %{http_code}\n' http://127.0.0.1:18080/verve.js
+          curl -fsS -o /dev/null -w 'GET /health        %{http_code}\n' http://127.0.0.1:18080/health
+          curl -fsS -o /dev/null -w 'GET /public/hello  %{http_code}\n' http://127.0.0.1:18080/public/hello.txt
           curl -fsS -o /dev/null -w 'POST /api/getCount %{http_code}\n' \
             -X POST -H 'content-type: application/json' -d '{}' http://127.0.0.1:18080/api/getCount
+          curl -fsS -o /dev/null -w 'POST /api/addTodo  %{http_code}\n' \
+            -X POST -H 'content-type: application/x-www-form-urlencoded' -d 'text=ci+task' http://127.0.0.1:18080/api/addTodo
+          curl -fsS -o /dev/null -w 'GET /missing       %{http_code}\n' http://127.0.0.1:18080/missing || true
           kill -TERM $server_pid
           wait $server_pid || true
