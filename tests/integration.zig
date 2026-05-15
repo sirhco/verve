@@ -267,3 +267,62 @@ test "form-encoded /api/addTodo + /api/removeTodo updates /todos" {
         try std.testing.expect(std.mem.indexOf(u8, resp.body, "write tests") != null);
     }
 }
+
+const WorkerCtx = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    port: u16,
+    body: []const u8,
+    status: u16 = 0,
+    err: ?anyerror = null,
+};
+
+fn concurrentWorker(ctx: *WorkerCtx) void {
+    var resp = postForm(ctx.io, ctx.gpa, ctx.port, "/api/addTodo", ctx.body) catch |err| {
+        ctx.err = err;
+        return;
+    };
+    defer resp.deinit(ctx.gpa);
+    ctx.status = resp.status;
+}
+
+test "concurrent addTodo requests are serialized without races" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 2);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    const N: usize = 16;
+    const bodies = [_][]const u8{
+        "text=p0", "text=p1", "text=p2", "text=p3",
+        "text=p4", "text=p5", "text=p6", "text=p7",
+        "text=p8", "text=p9", "text=p10","text=p11",
+        "text=p12","text=p13","text=p14","text=p15",
+    };
+
+    var contexts: [N]WorkerCtx = undefined;
+    var threads: [N]std.Thread = undefined;
+    for (0..N) |i| {
+        contexts[i] = .{ .io = io, .gpa = gpa, .port = port, .body = bodies[i] };
+        threads[i] = try std.Thread.spawn(.{}, concurrentWorker, .{&contexts[i]});
+    }
+    for (threads) |t| t.join();
+
+    for (contexts) |c| {
+        if (c.err) |e| return e;
+        try std.testing.expectEqual(@as(u16, 303), c.status);
+    }
+
+    // All N items should appear exactly once in the rendered page.
+    var resp = try request(io, gpa, port, "GET", "/todos");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    for (bodies) |b| {
+        // Strip the "text=" prefix from each form body to get the rendered text
+        const text = b[5..];
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, text) != null);
+    }
+}
