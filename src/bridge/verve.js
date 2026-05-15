@@ -38,6 +38,16 @@
   memory = wasm.instance.exports.memory;
   const exp = wasm.instance.exports;
 
+  // Seed wasm state from server-rendered DOM so client picks up where SSR
+  // left off (otherwise wasm's internal counter would start at 0).
+  if (typeof exp.verve_init_count === "function") {
+    const el = document.querySelector('[z-bind="count_display"]');
+    if (el) {
+      const n = parseInt(el.textContent, 10);
+      if (!Number.isNaN(n)) exp.verve_init_count(n | 0);
+    }
+  }
+
   if (typeof exp.verve_hydrate === "function") exp.verve_hydrate();
 
   document.addEventListener("click", (e) => {

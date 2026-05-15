@@ -15,6 +15,10 @@ export fn verve_hydrate() void {
     dom.set_text_by_bind_i32(COUNT_BIND.ptr, COUNT_BIND.len, count);
 }
 
+export fn verve_init_count(value: i32) void {
+    count = value;
+}
+
 export fn increment_counter() void {
     count += 1;
     dom.set_text_by_bind_i32(COUNT_BIND.ptr, COUNT_BIND.len, count);
