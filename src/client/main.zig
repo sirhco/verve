@@ -6,21 +6,28 @@
 const dom = @import("dom.zig");
 const signal = @import("signal.zig");
 
-var count = signal.ClientSignal(i32).init("count_display", 0);
+var count = signal.ClientSignal(i32).init("count", 0);
+var clicks = signal.ClientSignal(i32).init("clicks", 0);
 
 const API_PATH: []const u8 = "/api/updateDatabase";
 const API_FIELD: []const u8 = "new_count";
 
 export fn verve_hydrate() void {
     count.set(count.get());
+    clicks.set(clicks.get());
 }
 
 export fn verve_init_count(value: i32) void {
     count.value = value;
 }
 
+export fn verve_init_clicks(value: i32) void {
+    clicks.value = value;
+}
+
 export fn increment_counter() void {
     count.increment();
+    clicks.increment();
     dom.post_json_i32(
         API_PATH.ptr,
         API_PATH.len,
@@ -32,6 +39,7 @@ export fn increment_counter() void {
 
 export fn decrement_counter() void {
     count.decrement();
+    clicks.increment();
 }
 
 export fn current_count() i32 {

@@ -9,11 +9,11 @@ pub fn counter(ctx: *const verve.Context, initial: i32) !verve.Node {
     const count_str = try printInt(&count_str_buf, initial);
     const count_owned = try alloc.dupe(u8, count_str);
 
-    const children = try alloc.alloc(verve.Node, 4);
+    const children = try alloc.alloc(verve.Node, 5);
     children[0] = .{ .tag = "h1", .text = "Verve Counter" };
     children[1] = .{
         .tag = "span",
-        .z_bind = "count_display",
+        .z_bind = "count",
         .text = count_owned,
         .attrs = &.{.{ .key = "class", .value = "count" }},
     };
@@ -26,6 +26,14 @@ pub fn counter(ctx: *const verve.Context, initial: i32) !verve.Node {
         .tag = "button",
         .z_on_click = "decrement_counter",
         .text = "-",
+    };
+    const clicks_kids = try alloc.alloc(verve.Node, 2);
+    clicks_kids[0] = .{ .tag = "span", .text = "Total clicks: " };
+    clicks_kids[1] = .{ .tag = "span", .z_bind = "clicks", .text = "0" };
+    children[4] = .{
+        .tag = "p",
+        .attrs = &.{.{ .key = "class", .value = "clicks" }},
+        .children = clicks_kids,
     };
 
     return .{
