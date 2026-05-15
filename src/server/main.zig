@@ -12,10 +12,11 @@ const components = app.components;
 
 const READ_BUF_SIZE = 64 * 1024;
 const WRITE_BUF_SIZE = 64 * 1024;
-const BODY_LIMIT: usize = 1 * 1024 * 1024;
+const DEFAULT_BODY_LIMIT: usize = 1 * 1024 * 1024;
 
 var request_count: u64 = 0;
 var start_timestamp: ?std.Io.Timestamp = null;
+var body_limit: usize = DEFAULT_BODY_LIMIT;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -32,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
 
     installShutdownHandlers();
     start_timestamp = std.Io.Clock.now(.awake, io);
+    body_limit = cli.body_limit;
     printStartupBanner(cli);
 
     while (true) {
@@ -132,7 +134,7 @@ fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.R
             try request.respond("bad request", .{ .status = .bad_request });
             return;
         };
-        const body = body_reader.allocRemaining(gpa, .limited(BODY_LIMIT)) catch |err| {
+        const body = body_reader.allocRemaining(gpa, .limited(body_limit)) catch |err| {
             std.debug.print("[verve] body read error: {s}\n", .{@errorName(err)});
             try request.respond("body read failed", .{ .status = .bad_request });
             return;
@@ -263,6 +265,7 @@ const CliOptions = struct {
     address: std.Io.net.IpAddress,
     host_text: []const u8,
     port: u16,
+    body_limit: usize,
 };
 
 pub const CliExit = error{HelpRequested};
@@ -273,6 +276,7 @@ fn parseCli(init: std.process.Init) !CliOptions {
 
     var port: u16 = DEFAULT_PORT;
     var host_text: []const u8 = DEFAULT_HOST;
+    var bl: usize = DEFAULT_BODY_LIMIT;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -292,6 +296,13 @@ fn parseCli(init: std.process.Init) !CliOptions {
             host_text = v;
             continue;
         }
+        if (try optionValue(args, &i, a, "--body-limit")) |v| {
+            bl = parseByteSize(v) catch {
+                std.debug.print("[verve] invalid --body-limit value: {s}\n", .{v});
+                return error.InvalidBodyLimit;
+            };
+            continue;
+        }
         std.debug.print("[verve] unknown argument: {s}\n  (run with --help for usage)\n", .{a});
         return error.UnknownArgument;
     }
@@ -306,25 +317,44 @@ fn parseCli(init: std.process.Init) !CliOptions {
         .address = address,
         .host_text = host_text,
         .port = port,
+        .body_limit = bl,
     };
+}
+
+/// Parse a byte size — plain digits, optionally followed by k / m / g (KB/MB/GB
+/// powers of 1024). Examples: "4096", "64k", "2m", "1g".
+fn parseByteSize(text: []const u8) !usize {
+    if (text.len == 0) return error.Empty;
+    const last = text[text.len - 1];
+    const multiplier: usize = switch (last) {
+        'k', 'K' => 1024,
+        'm', 'M' => 1024 * 1024,
+        'g', 'G' => 1024 * 1024 * 1024,
+        else => 1,
+    };
+    const num_text = if (multiplier == 1) text else text[0 .. text.len - 1];
+    const n = try std.fmt.parseInt(usize, num_text, 10);
+    return std.math.mul(usize, n, multiplier) catch error.Overflow;
 }
 
 fn printUsage(program: []const u8) void {
     std.debug.print(
-        \\Usage: {s} [--host HOST] [--port PORT] [--help]
+        \\Usage: {s} [--host HOST] [--port PORT] [--body-limit SIZE] [--help]
         \\
         \\Verve full-stack web server. Serves SSR pages, embedded WASM client,
         \\and auto-generated /api/<fn> endpoints from app.Actions.
         \\
         \\Options:
-        \\  --host HOST     Bind interface. IP literal (default: {s}).
-        \\                  Use 0.0.0.0 to accept connections on any interface.
-        \\  --port PORT     TCP port (default: {d}).
-        \\  -h, --help      Show this message and exit.
+        \\  --host HOST          Bind interface. IP literal (default: {s}).
+        \\                       Use 0.0.0.0 to accept on any interface.
+        \\  --port PORT          TCP port (default: {d}).
+        \\  --body-limit SIZE    Max POST body bytes (default: {d}).
+        \\                       Accepts k/m/g suffixes (e.g. 64k, 2m, 1g).
+        \\  -h, --help           Show this message and exit.
         \\
         \\Pages and actions are listed at startup; visit / once the server is up.
         \\
-    , .{ program, DEFAULT_HOST, DEFAULT_PORT });
+    , .{ program, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_BODY_LIMIT });
 }
 
 fn optionValue(
