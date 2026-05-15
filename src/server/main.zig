@@ -10,6 +10,10 @@ const router = @import("router.zig");
 const api_handler = @import("api_handler.zig");
 const components = app.components;
 
+const log = std.log.scoped(.verve);
+
+pub const std_options: std.Options = .{ .log_level = .info };
+
 const READ_BUF_SIZE = 64 * 1024;
 const WRITE_BUF_SIZE = 64 * 1024;
 const DEFAULT_BODY_LIMIT: usize = 1 * 1024 * 1024;
@@ -38,11 +42,11 @@ pub fn main(init: std.process.Init) !void {
 
     while (true) {
         const stream = server.accept(io) catch |err| {
-            std.debug.print("[verve] accept error: {s}\n", .{@errorName(err)});
+            log.err("accept error: {s}", .{@errorName(err)});
             continue;
         };
         handleConnection(gpa, io, stream) catch |err| {
-            std.debug.print("[verve] connection error: {s}\n", .{@errorName(err)});
+            log.err("connection error: {s}", .{@errorName(err)});
         };
     }
 }
@@ -72,7 +76,7 @@ fn handleConnection(
         const target_copy = request.head.target;
         request_count += 1;
         handleRequest(gpa, io, &request) catch |err| {
-            std.debug.print("[verve] {s} {s} → error: {s}\n", .{ method_name, target_copy, @errorName(err) });
+            log.err("{s} {s} → error: {s}", .{ method_name, target_copy, @errorName(err) });
             return;
         };
         const end = std.Io.Clock.now(.awake, io);
@@ -85,12 +89,12 @@ fn handleConnection(
 fn logRequest(method: []const u8, target: []const u8, ns: i96) void {
     const us: i64 = @intCast(@divTrunc(ns, std.time.ns_per_us));
     if (us < 1000) {
-        std.debug.print("[verve] {s} {s} {d}µs\n", .{ method, target, us });
+        log.info("{s} {s} {d}µs", .{ method, target, us });
         return;
     }
     const ms_whole: i64 = @divTrunc(us, 1000);
     const ms_frac: i64 = @divTrunc(@rem(us, 1000), 100);
-    std.debug.print("[verve] {s} {s} {d}.{d}ms\n", .{ method, target, ms_whole, ms_frac });
+    log.info("{s} {s} {d}.{d}ms", .{ method, target, ms_whole, ms_frac });
 }
 
 fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.Request) !void {
@@ -135,7 +139,7 @@ fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.R
             return;
         };
         const body = body_reader.allocRemaining(gpa, .limited(body_limit)) catch |err| {
-            std.debug.print("[verve] body read error: {s}\n", .{@errorName(err)});
+            log.err("body read error: {s}", .{@errorName(err)});
             try request.respond("body read failed", .{ .status = .bad_request });
             return;
         };
@@ -171,7 +175,7 @@ fn renderPage(
     const node = blk: {
         if (route_render) |render_fn| {
             break :blk render_fn(&ctx) catch |err| {
-                std.debug.print("[verve] render error: {s}\n", .{@errorName(err)});
+                log.err("render error: {s}", .{@errorName(err)});
                 try renderError(gpa, request, .internal_server_error, "The page failed to render.");
                 return;
             };
@@ -297,20 +301,20 @@ fn pathOf(target: []const u8) []const u8 {
 }
 
 fn printStartupBanner(cli: CliOptions) void {
-    std.debug.print("[verve] listening on http://{s}:{d}\n", .{ cli.host_text, cli.port });
-    std.debug.print("[verve] pages:\n", .{});
+    log.info("listening on http://{s}:{d}", .{ cli.host_text, cli.port });
+    log.info("pages:", .{});
     for (app.routes) |r| {
-        std.debug.print("  GET  {s}\n", .{r.path});
+        log.info("  GET  {s}", .{r.path});
     }
-    std.debug.print("[verve] actions:\n", .{});
+    log.info("actions:", .{});
     inline for (comptime std.meta.declarations(app.Actions)) |decl| {
-        std.debug.print("  POST /api/{s}\n", .{decl.name});
+        log.info("  POST /api/{s}", .{decl.name});
     }
-    std.debug.print("[verve] assets:\n  GET  /client.wasm ({d} B)\n  GET  /verve.js ({d} B)\n", .{
-        assets.wasm.len,
-        assets.js.len,
-    });
-    std.debug.print("[verve] ops:\n  GET  /health\n", .{});
+    log.info("assets:", .{});
+    log.info("  GET  /client.wasm ({d} B)", .{assets.wasm.len});
+    log.info("  GET  /verve.js ({d} B)", .{assets.js.len});
+    log.info("ops:", .{});
+    log.info("  GET  /health", .{});
 }
 
 const DEFAULT_PORT: u16 = 8080;
@@ -342,7 +346,7 @@ fn parseCli(init: std.process.Init) !CliOptions {
         }
         if (try optionValue(args, &i, a, "--port")) |v| {
             port = std.fmt.parseInt(u16, v, 10) catch {
-                std.debug.print("[verve] invalid --port value: {s}\n", .{v});
+                log.err("invalid --port value: {s}", .{v});
                 return error.InvalidPort;
             };
             continue;
@@ -353,17 +357,17 @@ fn parseCli(init: std.process.Init) !CliOptions {
         }
         if (try optionValue(args, &i, a, "--body-limit")) |v| {
             bl = parseByteSize(v) catch {
-                std.debug.print("[verve] invalid --body-limit value: {s}\n", .{v});
+                log.err("invalid --body-limit value: {s}", .{v});
                 return error.InvalidBodyLimit;
             };
             continue;
         }
-        std.debug.print("[verve] unknown argument: {s}\n  (run with --help for usage)\n", .{a});
+        log.err("unknown argument: {s} (run with --help for usage)", .{a});
         return error.UnknownArgument;
     }
 
     var address = std.Io.net.IpAddress.parseLiteral(host_text) catch {
-        std.debug.print("[verve] invalid --host value: {s}\n", .{host_text});
+        log.err("invalid --host value: {s}", .{host_text});
         return error.InvalidHost;
     };
     address.setPort(port);
@@ -423,7 +427,7 @@ fn optionValue(
     if (std.mem.eql(u8, arg, name)) {
         i.* += 1;
         if (i.* >= args.len) {
-            std.debug.print("[verve] {s} requires a value\n", .{name});
+            log.err("{s} requires a value", .{name});
             return error.MissingValue;
         }
         return args[i.*];
