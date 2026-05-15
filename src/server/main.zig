@@ -184,17 +184,18 @@ fn renderPage(
         break :blk try components.page(&ctx, body);
     };
 
-    var aw: Writer.Allocating = .init(gpa);
-    defer aw.deinit();
-    try aw.writer.writeAll("<!DOCTYPE html>");
-    try verve.Renderer.render(&aw.writer, node);
-
-    try request.respond(aw.written(), .{
-        .status = status,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+    var stream_buf: [16 * 1024]u8 = undefined;
+    var body_writer = try request.respondStreaming(&stream_buf, .{
+        .respond_options = .{
+            .status = status,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+            },
         },
     });
+    try body_writer.writer.writeAll("<!DOCTYPE html>");
+    try verve.Renderer.render(&body_writer.writer, node);
+    try body_writer.end();
 }
 
 fn renderError(
@@ -217,13 +218,6 @@ fn renderError(
         .status = status,
         .keep_alive = false,
     };
-    const html_opts: std.http.Server.Request.RespondOptions = .{
-        .status = status,
-        .keep_alive = false,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
-        },
-    };
 
     const body = components.errorPage(&ctx, status_code, status_text, message) catch {
         try request.respond(message, fallback_opts);
@@ -234,18 +228,19 @@ fn renderError(
         return;
     };
 
-    var aw: Writer.Allocating = .init(gpa);
-    defer aw.deinit();
-    aw.writer.writeAll("<!DOCTYPE html>") catch {
-        try request.respond(message, fallback_opts);
-        return;
-    };
-    verve.Renderer.render(&aw.writer, node) catch {
-        try request.respond(message, fallback_opts);
-        return;
-    };
-
-    try request.respond(aw.written(), html_opts);
+    var stream_buf: [4 * 1024]u8 = undefined;
+    var body_writer = try request.respondStreaming(&stream_buf, .{
+        .respond_options = .{
+            .status = status,
+            .keep_alive = false,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+            },
+        },
+    });
+    try body_writer.writer.writeAll("<!DOCTYPE html>");
+    try verve.Renderer.render(&body_writer.writer, node);
+    try body_writer.end();
 }
 
 fn respondHealth(
