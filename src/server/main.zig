@@ -30,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
+    installShutdownHandlers();
     start_timestamp = std.Io.Clock.now(.awake, io);
     printStartupBanner(cli);
 
@@ -211,6 +212,26 @@ fn respondHealth(
             .{ .name = "cache-control", .value = "no-store" },
         },
     });
+}
+
+fn installShutdownHandlers() void {
+    const sa: std.posix.Sigaction = .{
+        .handler = .{ .handler = &onShutdownSignal },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &sa, null);
+    std.posix.sigaction(.TERM, &sa, null);
+}
+
+fn onShutdownSignal(sig: std.posix.SIG) callconv(.c) void {
+    const name: []const u8 = switch (sig) {
+        .INT => "SIGINT",
+        .TERM => "SIGTERM",
+        else => "signal",
+    };
+    std.debug.print("\n[verve] received {s}, shutting down (served {d} requests)\n", .{ name, request_count });
+    std.process.exit(0);
 }
 
 fn pathOf(target: []const u8) []const u8 {
