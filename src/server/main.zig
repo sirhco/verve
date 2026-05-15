@@ -17,10 +17,13 @@ pub const std_options: std.Options = .{ .log_level = .info };
 const READ_BUF_SIZE = 64 * 1024;
 const WRITE_BUF_SIZE = 64 * 1024;
 const DEFAULT_BODY_LIMIT: usize = 1 * 1024 * 1024;
+const PUBLIC_PREFIX = "/public/";
+const STATIC_MAX_SIZE: usize = 4 * 1024 * 1024;
 
 var request_count: u64 = 0;
 var start_timestamp: ?std.Io.Timestamp = null;
 var body_limit: usize = DEFAULT_BODY_LIMIT;
+var public_dir: ?std.Io.Dir = null;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -38,6 +41,13 @@ pub fn main(init: std.process.Init) !void {
     installShutdownHandlers();
     start_timestamp = std.Io.Clock.now(.awake, io);
     body_limit = cli.body_limit;
+    if (cli.public_dir) |path| {
+        public_dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = false }) catch |err| {
+            log.err("failed to open --public-dir {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+    }
+    defer if (public_dir) |*d| d.close(io);
     printStartupBanner(cli);
 
     while (true) {
@@ -124,6 +134,11 @@ fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.R
                 .{ .name = "cache-control", .value = "public, max-age=300" },
             },
         });
+        return;
+    }
+
+    if (std.mem.startsWith(u8, path, PUBLIC_PREFIX)) {
+        try serveStatic(gpa, io, request, path[PUBLIC_PREFIX.len..]);
         return;
     }
 
@@ -248,6 +263,75 @@ fn renderError(
     try body_writer.end();
 }
 
+fn serveStatic(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    request: *std.http.Server.Request,
+    rel_path: []const u8,
+) !void {
+    const dir = public_dir orelse {
+        try renderError(gpa, request, .not_found, "No --public-dir is configured.");
+        return;
+    };
+
+    if (rel_path.len == 0 or rel_path[0] == '/' or std.mem.indexOf(u8, rel_path, "..") != null) {
+        try renderError(gpa, request, .forbidden, "Invalid static asset path.");
+        return;
+    }
+
+    var file = dir.openFile(io, rel_path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.IsDir => {
+            try renderError(gpa, request, .not_found, "Static asset not found.");
+            return;
+        },
+        else => {
+            log.err("static open {s}: {s}", .{ rel_path, @errorName(err) });
+            try renderError(gpa, request, .internal_server_error, "Static asset open failed.");
+            return;
+        },
+    };
+    defer file.close(io);
+
+    const stat = try file.stat(io);
+    if (stat.size > STATIC_MAX_SIZE) {
+        try renderError(gpa, request, .payload_too_large, "Static asset exceeds the per-file size limit.");
+        return;
+    }
+
+    const data = try gpa.alloc(u8, @intCast(stat.size));
+    defer gpa.free(data);
+    _ = try file.readPositionalAll(io, data, 0);
+
+    try request.respond(data, .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = contentTypeFor(rel_path) },
+            .{ .name = "cache-control", .value = "public, max-age=300" },
+        },
+    });
+}
+
+fn contentTypeFor(path: []const u8) []const u8 {
+    const ext_pos = std.mem.lastIndexOfScalar(u8, path, '.') orelse return "application/octet-stream";
+    const ext = path[ext_pos + 1 ..];
+    const table = .{
+        .{ "css", "text/css; charset=utf-8" },
+        .{ "html", "text/html; charset=utf-8" },
+        .{ "ico", "image/x-icon" },
+        .{ "js", "application/javascript" },
+        .{ "json", "application/json" },
+        .{ "png", "image/png" },
+        .{ "svg", "image/svg+xml" },
+        .{ "txt", "text/plain; charset=utf-8" },
+        .{ "wasm", "application/wasm" },
+        .{ "webp", "image/webp" },
+    };
+    inline for (table) |row| {
+        if (std.ascii.eqlIgnoreCase(ext, row[0])) return row[1];
+    }
+    return "application/octet-stream";
+}
+
 fn respondHealth(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -313,6 +397,7 @@ fn printStartupBanner(cli: CliOptions) void {
     log.info("assets:", .{});
     log.info("  GET  /client.wasm ({d} B)", .{assets.wasm.len});
     log.info("  GET  /verve.js ({d} B)", .{assets.js.len});
+    if (cli.public_dir) |p| log.info("  GET  /public/* (from {s})", .{p});
     log.info("ops:", .{});
     log.info("  GET  /health", .{});
 }
@@ -325,6 +410,7 @@ const CliOptions = struct {
     host_text: []const u8,
     port: u16,
     body_limit: usize,
+    public_dir: ?[]const u8,
 };
 
 pub const CliExit = error{HelpRequested};
@@ -336,6 +422,7 @@ fn parseCli(init: std.process.Init) !CliOptions {
     var port: u16 = DEFAULT_PORT;
     var host_text: []const u8 = DEFAULT_HOST;
     var bl: usize = DEFAULT_BODY_LIMIT;
+    var public: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -366,6 +453,10 @@ fn parseCli(init: std.process.Init) !CliOptions {
             };
             continue;
         }
+        if (try optionValue(args, &i, a, "--public-dir")) |v| {
+            public = v;
+            continue;
+        }
         log.err("unknown argument: {s} (run with --help for usage)", .{a});
         return error.UnknownArgument;
     }
@@ -381,6 +472,7 @@ fn parseCli(init: std.process.Init) !CliOptions {
         .host_text = host_text,
         .port = port,
         .body_limit = bl,
+        .public_dir = public,
     };
 }
 
@@ -402,7 +494,7 @@ fn parseByteSize(text: []const u8) !usize {
 
 fn printUsage(program: []const u8) void {
     std.debug.print(
-        \\Usage: {s} [--host HOST] [--port PORT] [--body-limit SIZE] [--help]
+        \\Usage: {s} [--host HOST] [--port PORT] [--body-limit SIZE] [--public-dir DIR] [--help]
         \\
         \\Verve full-stack web server. Serves SSR pages, embedded WASM client,
         \\and auto-generated /api/<fn> endpoints from app.Actions.
@@ -413,6 +505,9 @@ fn printUsage(program: []const u8) void {
         \\  --port PORT          TCP port (default: {d}).
         \\  --body-limit SIZE    Max POST body bytes (default: {d}).
         \\                       Accepts k/m/g suffixes (e.g. 64k, 2m, 1g).
+        \\  --public-dir DIR     Directory served at /public/*. Files up to 4 MB are
+        \\                       returned with a guessed content-type and cached
+        \\                       for 5 minutes. Paths containing `..` are rejected.
         \\  -h, --help           Show this message and exit.
         \\
         \\Pages and actions are listed at startup; visit / once the server is up.
