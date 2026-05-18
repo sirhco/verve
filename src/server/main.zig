@@ -196,6 +196,11 @@ fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.R
         return;
     }
 
+    if (std.mem.eql(u8, path, "/events")) {
+        try streamEvents(io, request);
+        return;
+    }
+
     if (api_handler.isApiPath(path)) {
         if (request.head.method != .POST) {
             try request.respond("method not allowed", .{ .status = .method_not_allowed });
@@ -315,6 +320,46 @@ fn renderError(
     try body_writer.writer.writeAll("<!DOCTYPE html>");
     try verve.Renderer.render(&body_writer.writer, node);
     try body_writer.end();
+}
+
+const SSE_TICK = std.Io.Duration.fromMilliseconds(1000);
+
+/// Long-lived Server-Sent Events stream. Pushes the current `last_count`
+/// once per second as `event: count` until the client disconnects (any
+/// write returns an error) or the thread is cancelled.
+fn streamEvents(io: std.Io, request: *std.http.Server.Request) !void {
+    var stream_buf: [1024]u8 = undefined;
+    var body_writer = try request.respondStreaming(&stream_buf, .{
+        .respond_options = .{
+            .status = .ok,
+            .keep_alive = false,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/event-stream" },
+                .{ .name = "cache-control", .value = "no-cache" },
+                .{ .name = "x-accel-buffering", .value = "no" },
+            },
+        },
+    });
+
+    try body_writer.writer.writeAll("retry: 2000\n\n");
+    try flushBodyWriter(&body_writer);
+
+    while (true) {
+        const count = app.last_count.load(.monotonic);
+        body_writer.writer.print("event: count\ndata: {d}\n\n", .{count}) catch break;
+        flushBodyWriter(&body_writer) catch break;
+        std.Io.sleep(io, SSE_TICK, .awake) catch break;
+    }
+    body_writer.end() catch {};
+}
+
+/// Push everything buffered in the BodyWriter's chunk encoder *and* the
+/// underlying TCP stream writer out to the kernel. `BodyWriter.flush`
+/// alone only flushes the outer writer; the in-flight chunk stays cached
+/// in the inner writer's buffer until it fills.
+fn flushBodyWriter(w: *std.http.BodyWriter) !void {
+    try w.writer.flush();
+    try w.flush();
 }
 
 fn serveStatic(
@@ -458,6 +503,7 @@ fn printStartupBanner(cli: CliOptions) void {
     if (cli.public_dir) |p| log.info("  GET  /public/* (from {s})", .{p});
     log.info("ops:", .{});
     log.info("  GET  /health", .{});
+    log.info("  GET  /events (SSE, 1s tick)", .{});
 }
 
 const DEFAULT_PORT: u16 = 8080;

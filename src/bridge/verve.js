@@ -51,6 +51,25 @@
 
   if (typeof exp.verve_hydrate === "function") exp.verve_hydrate();
 
+  // Subscribe to the server's SSE stream. Named events whose data parses
+  // as an integer get written into any [z-bind="<event>"] element.
+  try {
+    const es = new EventSource("/events");
+    const bindFromEvent = (name, raw) => {
+      const v = parseInt(raw, 10);
+      if (Number.isNaN(v)) return;
+      document
+        .querySelectorAll(`[z-bind="${CSS.escape(name)}"]`)
+        .forEach((el) => {
+          el.textContent = String(v);
+        });
+    };
+    es.addEventListener("count", (e) => bindFromEvent("count", e.data));
+    es.onerror = () => {};
+  } catch (err) {
+    console.warn("verve: SSE not available:", err);
+  }
+
   document.addEventListener("click", (e) => {
     const target = e.target.closest("[z-on-click]");
     if (!target) return;
