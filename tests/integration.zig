@@ -140,6 +140,15 @@ const Harness = struct {
 };
 
 fn spawnServer(gpa: std.mem.Allocator, threaded: *std.Io.Threaded, port: u16) !Harness {
+    return spawnServerExtra(gpa, threaded, port, &.{});
+}
+
+fn spawnServerExtra(
+    gpa: std.mem.Allocator,
+    threaded: *std.Io.Threaded,
+    port: u16,
+    extra_args: []const []const u8,
+) !Harness {
     threaded.* = .init(gpa, .{});
     errdefer threaded.deinit();
     const io = threaded.io();
@@ -147,9 +156,15 @@ fn spawnServer(gpa: std.mem.Allocator, threaded: *std.Io.Threaded, port: u16) !H
     var port_buf: [8]u8 = undefined;
     const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
 
-    const argv = [_][]const u8{ build_options.server_exe, "--port", port_str };
+    const base_argv = [_][]const u8{ build_options.server_exe, "--port", port_str };
+
+    var argv_list: std.ArrayList([]const u8) = .empty;
+    defer argv_list.deinit(gpa);
+    try argv_list.appendSlice(gpa, &base_argv);
+    try argv_list.appendSlice(gpa, extra_args);
+
     var child = try std.process.spawn(io, .{
-        .argv = &argv,
+        .argv = argv_list.items,
         .stdout = .ignore,
         .stderr = .ignore,
     });
@@ -325,4 +340,91 @@ test "concurrent addTodo requests are serialized without races" {
         const text = b[5..];
         try std.testing.expect(std.mem.indexOf(u8, resp.body, text) != null);
     }
+}
+
+test "--public-dir serves files at /public/* with traversal protection" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServerExtra(gpa, &threaded, TEST_PORT + 3, &.{
+        "--public-dir", build_options.public_dir,
+    });
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    {
+        var resp = try request(io, gpa, port, "GET", "/public/hello.txt");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "static asset fixture") != null);
+    }
+    {
+        var resp = try request(io, gpa, port, "GET", "/public/style.css");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "background:#000") != null);
+    }
+    {
+        var resp = try request(io, gpa, port, "GET", "/public/missing.png");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 404), resp.status);
+    }
+    {
+        var resp = try request(io, gpa, port, "GET", "/public/../etc/passwd");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 403), resp.status);
+    }
+}
+
+test "/events emits initial count and live updates via SSE" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 4);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    // Seed a known count first.
+    {
+        var resp = try requestWithBody(io, gpa, port, "POST", "/api/updateDatabase", "application/json", "{\"new_count\":7}");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+
+    // Open a single SSE connection by hand and read enough bytes to see the
+    // initial tick. The server emits one event per second, so 1500ms is
+    // enough headroom.
+    const addr = loopback(port);
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var write_buf: [256]u8 = undefined;
+    var sw = stream.writer(io, &write_buf);
+    try sw.interface.writeAll(
+        "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    try sw.interface.flush();
+
+    var read_buf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(gpa);
+
+    const deadline = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(1800));
+    while (true) {
+        if (std.Io.Timestamp.now(io, .awake).durationTo(deadline).nanoseconds <= 0) break;
+        const slice = sr.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        try acc.appendSlice(gpa, slice);
+        sr.interface.toss(slice.len);
+        if (std.mem.indexOf(u8, acc.items, "data: 7") != null) break;
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, acc.items, "text/event-stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, acc.items, "event: count") != null);
+    try std.testing.expect(std.mem.indexOf(u8, acc.items, "data: 7") != null);
 }

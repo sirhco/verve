@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) void {
 
     const integration_opts = b.addOptions();
     integration_opts.addOptionPath("server_exe", server.getEmittedBin());
+    integration_opts.addOptionPath("public_dir", b.path("tests/public_fixture"));
 
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration.zig"),
