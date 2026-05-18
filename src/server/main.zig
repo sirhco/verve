@@ -34,8 +34,7 @@ pub fn main(init: std.process.Init) !void {
         else => return err,
     };
 
-    var addr = cli.address;
-    var server = try addr.listen(io, .{ .reuse_address = true });
+    var server = try openListenSocket(init, io, cli);
     defer server.deinit(io);
 
     installShutdownHandlers();
@@ -84,6 +83,36 @@ fn runConnection(ctx: *ConnCtx) void {
     handleConnection(ctx.gpa, ctx.io, ctx.stream) catch |err| {
         log.err("connection error: {s}", .{@errorName(err)});
     };
+}
+
+/// Returns a listening Server, either by binding to `cli.address` or by
+/// adopting a pre-opened socket via the systemd-style LISTEN_FDS protocol.
+/// LISTEN_FDS=N means file descriptors 3..3+N-1 are already bound listening
+/// sockets; we take fd 3 only.
+fn openListenSocket(
+    init: std.process.Init,
+    io: std.Io,
+    cli: CliOptions,
+) !std.Io.net.Server {
+    if (init.environ_map.get("LISTEN_FDS")) |raw| {
+        const count = std.fmt.parseInt(u32, raw, 10) catch {
+            log.err("LISTEN_FDS value not an integer: {s}", .{raw});
+            return error.InvalidListenFds;
+        };
+        if (count >= 1) {
+            log.info("adopting fd 3 as listening socket (LISTEN_FDS={d})", .{count});
+            return .{
+                .socket = .{
+                    .handle = 3,
+                    .address = .{ .ip4 = std.Io.net.Ip4Address.unspecified(0) },
+                },
+                .options = {},
+            };
+        }
+    }
+
+    var addr = cli.address;
+    return addr.listen(io, .{ .reuse_address = true });
 }
 
 fn handleConnection(
@@ -410,7 +439,11 @@ fn pathOf(target: []const u8) []const u8 {
 }
 
 fn printStartupBanner(cli: CliOptions) void {
-    log.info("listening on http://{s}:{d}", .{ cli.host_text, cli.port });
+    if (cli.listen_fd_inherited) {
+        log.info("listening on inherited fd 3 (LISTEN_FDS)", .{});
+    } else {
+        log.info("listening on http://{s}:{d}", .{ cli.host_text, cli.port });
+    }
     log.info("pages:", .{});
     for (app.routes) |r| {
         log.info("  GET  {s}", .{r.path});
@@ -436,6 +469,7 @@ const CliOptions = struct {
     port: u16,
     body_limit: usize,
     public_dir: ?[]const u8,
+    listen_fd_inherited: bool,
 };
 
 pub const CliExit = error{HelpRequested};
@@ -492,12 +526,19 @@ fn parseCli(init: std.process.Init) !CliOptions {
     };
     address.setPort(port);
 
+    const listen_fd_inherited = blk: {
+        const raw = init.environ_map.get("LISTEN_FDS") orelse break :blk false;
+        const n = std.fmt.parseInt(u32, raw, 10) catch break :blk false;
+        break :blk n >= 1;
+    };
+
     return .{
         .address = address,
         .host_text = host_text,
         .port = port,
         .body_limit = bl,
         .public_dir = public,
+        .listen_fd_inherited = listen_fd_inherited,
     };
 }
 
@@ -534,6 +575,12 @@ fn printUsage(program: []const u8) void {
         \\                       returned with a guessed content-type and cached
         \\                       for 5 minutes. Paths containing `..` are rejected.
         \\  -h, --help           Show this message and exit.
+        \\
+        \\Environment:
+        \\  LISTEN_FDS=N         If set to a positive integer (systemd socket
+        \\                       activation), the server adopts file descriptor
+        \\                       3 as its listening socket and ignores --host
+        \\                       and --port.
         \\
         \\Pages and actions are listed at startup; visit / once the server is up.
         \\
