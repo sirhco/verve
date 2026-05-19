@@ -315,7 +315,10 @@ test "concurrent addTodo requests are serialized without races" {
     const gpa = std.testing.allocator;
 
     var threaded: std.Io.Threaded = undefined;
-    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 2);
+    // Override --workers so every concurrent connection fits in the
+    // admission pool even on low-core CI runners (default is cpu*2,
+    // which is only 4 on a 2-core ubuntu-latest).
+    var harness = try spawnServerExtra(gpa, &threaded, TEST_PORT + 2, &.{ "--workers", "32" });
     defer harness.deinit();
     const io = harness.io();
     const port = harness.port;
