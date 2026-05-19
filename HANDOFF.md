@@ -10,7 +10,7 @@ A working snapshot of where the framework stands and what's left to do, so the n
 
 - Builds and runs on Zig **0.16.0** (no third-party deps).
 - `zig build` → `zig-out/bin/verve-server` (~3.1 MB native binary) + `zig-out/bin/verve-cli` (~2.2 MB scaffolder).
-- `zig build test --summary all` → **32/32 green** (9 core + 12 server + 11 integration).
+- `zig build test --summary all` → **37/37 green** (9 core + 12 server + 5 client + 11 integration).
 - Single-binary distribution: wasm client + JS bridge are `@embedFile`d; `-Dpublic-dir=DIR` bakes additional static files in.
 - README.md ships project documentation.
 
@@ -43,10 +43,12 @@ A working snapshot of where the framework stands and what's left to do, so the n
 
 **WASM client (`src/client/`)**
 - Compiles to wasm32-freestanding, ReleaseSmall
-- Current binary size: **565 B** (budget was 30 KB)
+- Current binary size: **~650 B** (budget was 30 KB)
 - `ClientSignal(T)` generic for multi-bind support
 - Two signals shipped: `count` + `clicks` — proves multi-bind end-to-end
-- Exports: `verve_hydrate`, `verve_init_count`, `verve_init_clicks`, `increment_counter`, `decrement_counter`, `current_count`
+- **`FixedBufferAllocator`** (`allocator.zig`) over a 16 KB static heap, exposed as `client_alloc.allocator()`. Diagnostic exports: `verve_alloc_used`, `verve_alloc_capacity`, `verve_alloc_reset`. Monotonic by design; consumer calls `reset()` between render passes.
+- **`render.escapeHtmlAlloc`** (`render.zig`) — XSS-safe primitive backed by the wasm client's FBA. Wraps `verve.escapeHtml` so consumer code assembling `innerHTML` strings has an allocator-backed helper. `escapeHtmlAllocWith` takes a caller-supplied allocator for ownership independence.
+- Exports: `verve_hydrate`, `verve_init_count`, `verve_init_clicks`, `increment_counter`, `decrement_counter`, `current_count`, `verve_alloc_used`, `verve_alloc_capacity`, `verve_alloc_reset`
 - SSR-to-client state sync: JS bridge auto-matches every `verve_init_<bind>` export to `[z-bind="<bind>"]` text
 
 **JS bridge (`src/bridge/verve.js`)**
@@ -80,12 +82,10 @@ A working snapshot of where the framework stands and what's left to do, so the n
 
 ## Remaining work
 
-Only the two items the prior pass flagged as wait-for-consumer remain.
-
-### Premature (wait for a consumer)
-
-1. **WASM allocator.** Client currently has none. Once a component needs client-side state beyond fixed-size primitives (strings, lists), wire `FixedBufferAllocator` over a static `var heap: [N]u8` or implement a wasm-page-grow allocator.
-2. **`Renderer.escapeHtml` in WASM path.** Server already escapes; client uses `set_text_by_bind` which the JS bridge writes via `textContent` (safe). If the client ever generates HTML strings directly, escape there too.
+Nothing in the original ten-item backlog remains. Future directions if a
+consumer arrives: per-action timing histograms, cookie/session helpers,
+HTTPS, CSRF tokens, file-upload streaming, a wasm-page-grow allocator
+to lift the 16 KB FBA ceiling.
 
 ---
 
@@ -161,7 +161,7 @@ zig fmt --check build.zig src tests
 | `src/server/metrics.zig` | Per-route count / avg_ns / max_ns + JSON serializer |
 | `src/server/gzip.zig` | `std.compress.flate` wrapper with content-type eligibility test |
 | `src/server/tests.zig` | Aggregator that imports every server test root |
-| `src/client/{main,signal,dom}.zig` | WASM runtime |
+| `src/client/{main,signal,dom,allocator,render,tests}.zig` | WASM runtime — signals, DOM externs, FixedBufferAllocator over a static heap, escapeHtml helper |
 | `src/bridge/verve.js` | DOM externs, delegated click handler, EventSource + WebSocket subscriptions |
 | `src/app/{components,api,routes}.zig` | Example application (Counter w/ form fallback, TodoList, Home) |
 | `src/cli/main.zig` | `verve-cli new` scaffolder — writes skeleton + auto-fingerprints |
@@ -171,6 +171,4 @@ zig fmt --check build.zig src tests
 
 ### Where to start next
 
-If a real consumer arrives, items #1 (WASM allocator) and #2 (client-side HTML escape) are the open work — both are easy to land in a session each when the requirement is concrete.
-
-Otherwise: continued polishing (per-action timing buckets, cookie-based session helpers, HTTPS, CSRF tokens, file-upload streaming) is open territory.
+Nothing in the closed backlog is open. The framework is at feature parity for the original spec. Future directions are listed under "Remaining work" above.

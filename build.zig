@@ -139,6 +139,21 @@ pub fn build(b: *std.Build) void {
     const server_tests = b.addTest(.{ .root_module = server_test_mod });
     const run_server_tests = b.addRunArtifact(server_tests);
 
+    // Client modules are wasm-shaped but the data structures (FBA,
+    // escape helpers) are target-agnostic. Run their tests on native
+    // so they participate in `zig build test` without requiring a
+    // wasm runtime.
+    const client_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/client/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "verve", .module = verve_mod },
+        },
+    });
+    const client_tests = b.addTest(.{ .root_module = client_test_mod });
+    const run_client_tests = b.addRunArtifact(client_tests);
+
     const integration_opts = b.addOptions();
     integration_opts.addOptionPath("server_exe", server.getEmittedBin());
     integration_opts.addOptionPath("embed_server_exe", embed_server.getEmittedBin());
@@ -159,6 +174,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_server_tests.step);
+    test_step.dependOn(&run_client_tests.step);
     test_step.dependOn(&run_integration_tests.step);
 }
 
