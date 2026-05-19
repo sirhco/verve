@@ -1,0 +1,12 @@
+.{
+    .name = .verve_stopwatch_example,
+    .version = "0.0.0",
+    .fingerprint = 0x7816bc01300a2c27,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

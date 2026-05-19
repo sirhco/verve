@@ -12,11 +12,26 @@ generate a scaffolded variant.
 
 ## At a glance
 
+### Server-driven examples
+
 | Example | Pattern showcased | Live? | No-JS fallback? |
 |---|---|---|---|
 | [`chat/`](chat/README.md)           | Form actions + SSE-driven reload     | Yes via SSE      | Yes |
 | [`poll/`](poll/README.md)           | Atomic counter array + SSE reload    | Yes via SSE      | Yes |
 | [`bookmarks/`](bookmarks/README.md) | Multi-route + validation + app stats | No (static pages)| Yes |
+
+### Wasm-driven examples
+
+| Example | Pattern showcased | Wasm size |
+|---|---|---|
+| [`stopwatch/`](stopwatch/README.md)   | JS-driven tick into wasm, FBA-formatted display, z-on-click → exports | ~3 KB |
+| [`calculator/`](calculator/README.md) | Many small exports, f64 math, keyboard ↔ click parity                | ~7 KB |
+| [`keystrokes/`](keystrokes/README.md) | JS → wasm string passing via shared memory                            | ~440 B |
+
+The three wasm examples each ship their own `src/client/main.zig` and
+`src/bridge/verve.js`, overriding the framework defaults. The framework's
+server, core types, and `/health` + `/metrics` + `/events` + `/ws`
+endpoints come along for free.
 
 For a WebSocket demo, see the counter at the root of the repository:
 `./zig-out/bin/verve-server` from the repo root, then visit
