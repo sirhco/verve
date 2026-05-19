@@ -51,29 +51,65 @@
 
   if (typeof exp.verve_hydrate === "function") exp.verve_hydrate();
 
-  // Subscribe to the server's SSE stream. Named events whose data parses
-  // as an integer get written into any [z-bind="<event>"] element.
+  // Live counter sync. Prefer bidirectional WebSocket (lets +/- buttons
+  // bypass the fetch-then-redirect path); fall back to Server-Sent
+  // Events when WS open fails. The fallback is one-way — clicks still
+  // go through wasm/post_json_i32 or the native <form> submit.
+  let ws = null;
+  const setCount = (raw) => {
+    const v = parseInt(raw, 10);
+    if (Number.isNaN(v)) return;
+    setTextByBind("count", String(v));
+  };
+
+  try {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+    ws.onmessage = (e) => setCount(e.data);
+    ws.onerror = () => {};
+    ws.onclose = () => {
+      ws = null;
+    };
+  } catch (err) {
+    console.warn("verve: WebSocket not available:", err);
+    ws = null;
+  }
+
   try {
     const es = new EventSource("/events");
-    const bindFromEvent = (name, raw) => {
-      const v = parseInt(raw, 10);
-      if (Number.isNaN(v)) return;
-      document
-        .querySelectorAll(`[z-bind="${CSS.escape(name)}"]`)
-        .forEach((el) => {
-          el.textContent = String(v);
-        });
-    };
-    es.addEventListener("count", (e) => bindFromEvent("count", e.data));
+    es.addEventListener("count", (e) => {
+      // Only let SSE drive the count when WS isn't connected, so we
+      // don't double-update on every tick.
+      if (!ws || ws.readyState !== WebSocket.OPEN) setCount(e.data);
+    });
     es.onerror = () => {};
   } catch (err) {
     console.warn("verve: SSE not available:", err);
   }
 
+  const wsCounterAction = (action) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (action === "increment_counter") {
+      ws.send("+");
+      return true;
+    }
+    if (action === "decrement_counter") {
+      ws.send("-");
+      return true;
+    }
+    return false;
+  };
+
   document.addEventListener("click", (e) => {
     const target = e.target.closest("[z-on-click]");
     if (!target) return;
     const action = target.getAttribute("z-on-click");
+
+    if (wsCounterAction(action)) {
+      e.preventDefault();
+      return;
+    }
+
     const fn = exp[action];
     if (typeof fn === "function") {
       e.preventDefault();

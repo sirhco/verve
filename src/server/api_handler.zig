@@ -24,15 +24,18 @@ const FORM_CT = "application/x-www-form-urlencoded";
 pub const RequestMeta = struct {
     is_form: bool,
     referer: ?[]const u8,
+    accept_gzip: bool,
 
     pub fn fromRequest(request: *http.Server.Request) RequestMeta {
-        var result: RequestMeta = .{ .is_form = false, .referer = null };
+        var result: RequestMeta = .{ .is_form = false, .referer = null, .accept_gzip = false };
         var iter = request.iterateHeaders();
         while (iter.next()) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
                 result.is_form = std.mem.startsWith(u8, h.value, FORM_CT);
             } else if (std.ascii.eqlIgnoreCase(h.name, "referer")) {
                 result.referer = h.value;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) {
+                result.accept_gzip = std.mem.indexOf(u8, h.value, "gzip") != null;
             }
         }
         return result;

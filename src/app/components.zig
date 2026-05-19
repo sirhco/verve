@@ -17,16 +17,45 @@ pub fn counter(ctx: *const verve.Context, initial: i32) !verve.Node {
         .text = count_owned,
         .attrs = &.{.{ .key = "class", .value = "count" }},
     };
-    children[2] = .{
+
+    // +/- buttons are wrapped in forms so they work without JS (native
+    // submit → 303 to Referer). When wasm/WS is available, the bridge's
+    // delegated click handler calls preventDefault and routes through
+    // the wasm export instead.
+    const inc_button = try alloc.alloc(verve.Node, 1);
+    inc_button[0] = .{
         .tag = "button",
         .z_on_click = "increment_counter",
         .text = "+",
+        .attrs = &.{.{ .key = "type", .value = "submit" }},
     };
-    children[3] = .{
+    children[2] = .{
+        .tag = "form",
+        .attrs = &.{
+            .{ .key = "method", .value = "post" },
+            .{ .key = "action", .value = "/api/incrementCount" },
+            .{ .key = "class", .value = "counter-form" },
+        },
+        .children = inc_button,
+    };
+
+    const dec_button = try alloc.alloc(verve.Node, 1);
+    dec_button[0] = .{
         .tag = "button",
         .z_on_click = "decrement_counter",
         .text = "-",
+        .attrs = &.{.{ .key = "type", .value = "submit" }},
     };
+    children[3] = .{
+        .tag = "form",
+        .attrs = &.{
+            .{ .key = "method", .value = "post" },
+            .{ .key = "action", .value = "/api/decrementCount" },
+            .{ .key = "class", .value = "counter-form" },
+        },
+        .children = dec_button,
+    };
+
     const clicks_kids = try alloc.alloc(verve.Node, 2);
     clicks_kids[0] = .{ .tag = "span", .text = "Total clicks: " };
     clicks_kids[1] = .{ .tag = "span", .z_bind = "clicks", .text = "0" };
@@ -224,6 +253,7 @@ pub fn page(ctx: *const verve.Context, body: verve.Node) !verve.Node {
         \\.count{font-size:3rem;display:block;margin:1rem 0;font-variant-numeric:tabular-nums}
         \\button{font:inherit;padding:.5rem 1rem;margin-right:.5rem;background:#1f6feb;color:#fff;border:0;border-radius:4px;cursor:pointer}
         \\button:hover{background:#388bfd}
+        \\.counter-form{display:inline}
         \\a{color:#58a6ff;text-decoration:none}
         \\a:hover{text-decoration:underline}
         \\.home{max-width:36rem}

@@ -149,6 +149,16 @@ fn spawnServerExtra(
     port: u16,
     extra_args: []const []const u8,
 ) !Harness {
+    return spawnServerBin(gpa, threaded, port, build_options.server_exe, extra_args);
+}
+
+fn spawnServerBin(
+    gpa: std.mem.Allocator,
+    threaded: *std.Io.Threaded,
+    port: u16,
+    exe: []const u8,
+    extra_args: []const []const u8,
+) !Harness {
     threaded.* = .init(gpa, .{});
     errdefer threaded.deinit();
     const io = threaded.io();
@@ -156,7 +166,7 @@ fn spawnServerExtra(
     var port_buf: [8]u8 = undefined;
     const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
 
-    const base_argv = [_][]const u8{ build_options.server_exe, "--port", port_str };
+    const base_argv = [_][]const u8{ exe, "--port", port_str };
 
     var argv_list: std.ArrayList([]const u8) = .empty;
     defer argv_list.deinit(gpa);
@@ -375,6 +385,348 @@ test "--public-dir serves files at /public/* with traversal protection" {
         defer resp.deinit(gpa);
         try std.testing.expectEqual(@as(u16, 403), resp.status);
     }
+}
+
+test "counter form fallback: /api/incrementCount + /api/decrementCount via form POST" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 5);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    // Counter page shows the +/- forms.
+    {
+        var resp = try request(io, gpa, port, "GET", "/counter");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "action=\"/api/incrementCount\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "action=\"/api/decrementCount\"") != null);
+    }
+
+    // Empty form body → 303 redirect; count moves 0 → 1.
+    {
+        var resp = try postForm(io, gpa, port, "/api/incrementCount", "");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 303), resp.status);
+    }
+
+    // Two more increments and one decrement → final count = 2.
+    inline for (&.{ "/api/incrementCount", "/api/incrementCount", "/api/decrementCount" }) |path| {
+        var resp = try postForm(io, gpa, port, path, "");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 303), resp.status);
+    }
+
+    // Page re-render reflects new count.
+    {
+        var resp = try request(io, gpa, port, "GET", "/counter");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, ">2<") != null);
+    }
+}
+
+const FloodCtx = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    port: u16,
+    status: u16 = 0,
+    err: ?anyerror = null,
+};
+
+fn floodWorker(ctx: *FloodCtx) void {
+    var resp = request(ctx.io, ctx.gpa, ctx.port, "GET", "/health") catch |err| switch (err) {
+        // Under heavy concurrent load with --workers 1, the kernel may
+        // RST a freshly-accepted socket if the server closes before the
+        // client finishes its half of the handshake. Treat as "rejected".
+        error.ConnectionResetByPeer, error.ConnectionRefused, error.ReadFailed => {
+            ctx.status = 503;
+            return;
+        },
+        else => {
+            ctx.err = err;
+            return;
+        },
+    };
+    defer resp.deinit(ctx.gpa);
+    ctx.status = resp.status;
+}
+
+test "--workers caps concurrent connections (excess returns 503)" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServerExtra(gpa, &threaded, TEST_PORT + 6, &.{ "--workers", "1" });
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    const N: usize = 32;
+    var contexts: [N]FloodCtx = undefined;
+    var threads: [N]std.Thread = undefined;
+    for (0..N) |i| {
+        contexts[i] = .{ .io = io, .gpa = gpa, .port = port };
+        threads[i] = try std.Thread.spawn(.{}, floodWorker, .{&contexts[i]});
+    }
+    for (threads) |t| t.join();
+
+    var ok_count: usize = 0;
+    var busy_count: usize = 0;
+    for (contexts) |c| {
+        if (c.err) |e| return e;
+        switch (c.status) {
+            200 => ok_count += 1,
+            503 => busy_count += 1,
+            else => return error.UnexpectedStatus,
+        }
+    }
+    // With --workers 1 and 32 parallel connections, the admission counter
+    // must reject at least one request and admit at least one. The exact
+    // split is timing-dependent — only the invariants matter.
+    try std.testing.expect(ok_count >= 1);
+    try std.testing.expect(busy_count >= 1);
+    try std.testing.expectEqual(N, ok_count + busy_count);
+}
+
+test "-Dpublic-dir bakes files into the binary and serves them without --public-dir" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServerBin(gpa, &threaded, TEST_PORT + 9, build_options.embed_server_exe, &.{});
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    // Embedded entry served without --public-dir.
+    {
+        var resp = try request(io, gpa, port, "GET", "/public/hello.txt");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "static asset fixture") != null);
+    }
+    {
+        var resp = try request(io, gpa, port, "GET", "/public/style.css");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "background:#000") != null);
+    }
+    {
+        var resp = try request(io, gpa, port, "GET", "/public/missing.png");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 404), resp.status);
+    }
+    {
+        var resp = try request(io, gpa, port, "GET", "/public/../etc/passwd");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 403), resp.status);
+    }
+}
+
+test "/ws upgrades, accepts +/- frames, broadcasts count" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 10);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    // Seed count to a known starting value so the test is deterministic
+    // regardless of any cross-test counter leakage in the same process.
+    {
+        var resp = try requestWithBody(io, gpa, port, "POST", "/api/updateDatabase", "application/json", "{\"new_count\":100}");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+
+    const addr = loopback(port);
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var write_buf: [512]u8 = undefined;
+    var sw = stream.writer(io, &write_buf);
+    try sw.interface.writeAll(
+        "GET /ws HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n\r\n",
+    );
+    try sw.interface.flush();
+
+    var read_buf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    const reader = &sr.interface;
+
+    // Drain the 101 Switching Protocols response line + headers
+    // byte-by-byte so the first WS frame bytes stay in the reader buffer
+    // for readTextFrame to consume.
+    const header_block = blk: {
+        var acc: std.ArrayList(u8) = .empty;
+        defer acc.deinit(gpa);
+        while (true) {
+            const b = try reader.takeByte();
+            try acc.append(gpa, b);
+            if (acc.items.len >= 4 and std.mem.eql(u8, acc.items[acc.items.len - 4 ..], "\r\n\r\n")) {
+                break :blk try gpa.dupe(u8, acc.items);
+            }
+        }
+    };
+    defer gpa.free(header_block);
+    try std.testing.expect(std.mem.indexOf(u8, header_block, "101") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header_block, "upgrade: websocket") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header_block, "sec-websocket-accept:") != null);
+
+    // Read the initial server-pushed frame (FIN+text, no mask, len <= 125).
+    const initial = try readTextFrame(gpa, reader);
+    defer gpa.free(initial);
+    try std.testing.expectEqualStrings("100", initial);
+
+    // Send a client text frame "+" with a 4-byte mask.
+    const mask = [_]u8{ 0x12, 0x34, 0x56, 0x78 };
+    var frame = [_]u8{
+        0x81, // FIN + text opcode
+        0x81, // MASK + payload length 1
+        mask[0],
+        mask[1],
+        mask[2],
+        mask[3],
+        '+' ^ mask[0],
+    };
+    try sw.interface.writeAll(&frame);
+    try sw.interface.flush();
+
+    // Server should push the new count back (101).
+    const after_plus = try readTextFrame(gpa, reader);
+    defer gpa.free(after_plus);
+    try std.testing.expectEqualStrings("101", after_plus);
+}
+
+fn readTextFrame(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    const h0 = try reader.takeByte();
+    const opcode = h0 & 0x0F;
+    try std.testing.expectEqual(@as(u8, 0x01), opcode);
+    const h1 = try reader.takeByte();
+    try std.testing.expectEqual(@as(u8, 0), h1 & 0x80); // server-to-client must not mask
+    const len: usize = blk: {
+        const small = h1 & 0x7F;
+        if (small == 126) break :blk @intCast(try reader.takeInt(u16, .big));
+        if (small == 127) break :blk @intCast(try reader.takeInt(u64, .big));
+        break :blk small;
+    };
+    const payload = try gpa.alloc(u8, len);
+    errdefer gpa.free(payload);
+    var remaining: usize = len;
+    while (remaining > 0) {
+        const slice = try reader.peekGreedy(1);
+        const n = @min(slice.len, remaining);
+        @memcpy(payload[len - remaining .. len - remaining + n], slice[0..n]);
+        reader.toss(n);
+        remaining -= n;
+    }
+    return payload;
+}
+
+test "Accept-Encoding: gzip yields gzip-compressed HTML" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 8);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    // Issue a manual request with Accept-Encoding: gzip on /counter.
+    const addr = loopback(port);
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var write_buf: [256]u8 = undefined;
+    var sw = stream.writer(io, &write_buf);
+    try sw.interface.writeAll(
+        "GET /counter HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    try sw.interface.flush();
+
+    var read_buf: [16 * 1024]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(gpa);
+    while (true) {
+        const slice = sr.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        try acc.appendSlice(gpa, slice);
+        sr.interface.toss(slice.len);
+    }
+
+    const raw = acc.items;
+    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.MalformedResponse;
+    const headers = raw[0..header_end];
+    const body = raw[header_end + 4 ..];
+
+    try std.testing.expect(std.mem.indexOf(u8, headers, "200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, headers, "content-encoding: gzip") != null);
+
+    // First two bytes of every gzip stream are 0x1f 0x8b.
+    try std.testing.expect(body.len >= 2);
+    try std.testing.expectEqual(@as(u8, 0x1f), body[0]);
+    try std.testing.expectEqual(@as(u8, 0x8b), body[1]);
+
+    // Decompress and confirm it's the counter HTML.
+    const flate = std.compress.flate;
+    var in_reader: std.Io.Reader = .fixed(body);
+    var dc_buf: [flate.max_window_len]u8 = undefined;
+    var dc: flate.Decompress = .init(&in_reader, .gzip, &dc_buf);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    _ = try dc.reader.streamRemaining(&out.writer);
+    const inflated = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, inflated, "Verve Counter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inflated, "z-bind=\"count\"") != null);
+}
+
+test "/metrics returns JSON with per-route counters" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 7);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    // Hit a couple of routes so the counters are non-zero.
+    {
+        var resp = try request(io, gpa, port, "GET", "/");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+    {
+        var resp = try request(io, gpa, port, "GET", "/counter");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+    {
+        var resp = try request(io, gpa, port, "GET", "/counter");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+
+    var resp = try request(io, gpa, port, "GET", "/metrics");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"uptime_sec\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"total_requests\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"rejected\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"routes\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"/\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"/counter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"avg_ns\"") != null);
 }
 
 test "/events emits initial count and live updates via SSE" {

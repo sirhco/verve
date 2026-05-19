@@ -61,6 +61,14 @@ pub const Actions = struct {
         return last_count.load(.monotonic);
     }
 
+    pub fn incrementCount(_: struct {}) i32 {
+        return last_count.fetchAdd(1, .monotonic) + 1;
+    }
+
+    pub fn decrementCount(_: struct {}) i32 {
+        return last_count.fetchSub(1, .monotonic) - 1;
+    }
+
     pub fn addTodo(args: struct { text: []const u8 }) !void {
         const trimmed = std.mem.trim(u8, args.text, &std.ascii.whitespace);
         if (trimmed.len == 0) return error.EmptyTodo;

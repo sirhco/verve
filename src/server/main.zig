@@ -5,9 +5,13 @@ const std = @import("std");
 const Writer = std.Io.Writer;
 const verve = @import("verve");
 const assets = @import("assets");
+const public_assets = @import("public_assets");
 const app = @import("app");
 const router = @import("router.zig");
 const api_handler = @import("api_handler.zig");
+const pool_mod = @import("pool.zig");
+const metrics = @import("metrics.zig");
+const gzip = @import("gzip.zig");
 const components = app.components;
 
 const log = std.log.scoped(.verve);
@@ -21,9 +25,11 @@ const PUBLIC_PREFIX = "/public/";
 const STATIC_MAX_SIZE: usize = 4 * 1024 * 1024;
 
 var request_count: std.atomic.Value(u64) = .init(0);
+var rejected_count: std.atomic.Value(u64) = .init(0);
 var start_timestamp: ?std.Io.Timestamp = null;
 var body_limit: usize = DEFAULT_BODY_LIMIT;
 var public_dir: ?std.Io.Dir = null;
+var admit: pool_mod.Admit = .init(0);
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -40,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
     installShutdownHandlers();
     start_timestamp = std.Io.Clock.now(.awake, io);
     body_limit = cli.body_limit;
+    admit = .init(cli.workers);
     if (cli.public_dir) |path| {
         public_dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = false }) catch |err| {
             log.err("failed to open --public-dir {s}: {s}", .{ path, @errorName(err) });
@@ -55,8 +62,15 @@ pub fn main(init: std.process.Init) !void {
             continue;
         };
 
+        if (!admit.tryAdmit()) {
+            _ = rejected_count.fetchAdd(1, .monotonic);
+            rejectBusy(io, stream);
+            continue;
+        }
+
         const ctx = gpa.create(ConnCtx) catch |err| {
             log.err("alloc conn ctx: {s}", .{@errorName(err)});
+            admit.release();
             stream.close(io);
             continue;
         };
@@ -65,11 +79,32 @@ pub fn main(init: std.process.Init) !void {
         const thread = std.Thread.spawn(.{}, runConnection, .{ctx}) catch |err| {
             log.err("thread spawn: {s}", .{@errorName(err)});
             gpa.destroy(ctx);
+            admit.release();
             stream.close(io);
             continue;
         };
         thread.detach();
     }
+}
+
+/// Send a minimal HTTP/1.1 503 to a connection that arrived while the
+/// admission counter was saturated. Best-effort — we ignore write errors
+/// because the client may already be gone.
+fn rejectBusy(io: std.Io, stream: std.Io.net.Stream) void {
+    const body = "Server busy. Please retry.\n";
+    var buf: [256]u8 = undefined;
+    var sw = stream.writer(io, &buf);
+    const w = &sw.interface;
+    w.print(
+        "HTTP/1.1 503 Service Unavailable\r\n" ++
+            "Content-Type: text/plain; charset=utf-8\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n" ++
+            "Retry-After: 1\r\n\r\n{s}",
+        .{ body.len, body },
+    ) catch {};
+    w.flush() catch {};
+    stream.close(io);
 }
 
 const ConnCtx = struct {
@@ -80,6 +115,7 @@ const ConnCtx = struct {
 
 fn runConnection(ctx: *ConnCtx) void {
     defer ctx.gpa.destroy(ctx);
+    defer admit.release();
     handleConnection(ctx.gpa, ctx.io, ctx.stream) catch |err| {
         log.err("connection error: {s}", .{@errorName(err)});
     };
@@ -138,13 +174,20 @@ fn handleConnection(
         const start = std.Io.Clock.now(.awake, io);
         const method_name = @tagName(request.head.method);
         const target_copy = request.head.target;
+        const path = pathOf(target_copy);
+        const route_label = metrics.routeLabel(path);
+        // Capture request headers ONCE before any response or body read.
+        // std.http.Server invalidates iterateHeaders after the body reader
+        // transitions out of received_head.
+        const req_meta = api_handler.RequestMeta.fromRequest(&request);
         _ = request_count.fetchAdd(1, .monotonic);
-        handleRequest(gpa, io, &request) catch |err| {
+        handleRequest(gpa, io, &request, path, req_meta) catch |err| {
             log.err("{s} {s} → error: {s}", .{ method_name, target_copy, @errorName(err) });
             return;
         };
         const end = std.Io.Clock.now(.awake, io);
         const ns = start.durationTo(end).nanoseconds;
+        metrics.record(route_label, @intCast(@max(ns, 0)));
         logRequest(method_name, target_copy, ns);
         if (!request.head.keep_alive) return;
     }
@@ -161,38 +204,34 @@ fn logRequest(method: []const u8, target: []const u8, ns: i96) void {
     log.info("{s} {s} {d}.{d}ms", .{ method, target, ms_whole, ms_frac });
 }
 
-fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.Request) !void {
-    const target = request.head.target;
-    const path = pathOf(target);
-
+fn handleRequest(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    request: *std.http.Server.Request,
+    path: []const u8,
+    meta: api_handler.RequestMeta,
+) !void {
     if (std.mem.eql(u8, path, "/health")) {
-        try respondHealth(gpa, io, request);
+        try respondHealth(gpa, io, request, meta);
+        return;
+    }
+
+    if (std.mem.eql(u8, path, "/metrics")) {
+        try respondMetrics(gpa, io, request, meta);
         return;
     }
 
     if (std.mem.eql(u8, path, "/client.wasm")) {
-        try request.respond(assets.wasm, .{
-            .status = .ok,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/wasm" },
-                .{ .name = "cache-control", .value = "public, max-age=300" },
-            },
-        });
+        try respondBuffered(gpa, request, .ok, "application/wasm", "public, max-age=300", meta.accept_gzip, assets.wasm);
         return;
     }
     if (std.mem.eql(u8, path, "/verve.js")) {
-        try request.respond(assets.js, .{
-            .status = .ok,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/javascript" },
-                .{ .name = "cache-control", .value = "public, max-age=300" },
-            },
-        });
+        try respondBuffered(gpa, request, .ok, "application/javascript", "public, max-age=300", meta.accept_gzip, assets.js);
         return;
     }
 
     if (std.mem.startsWith(u8, path, PUBLIC_PREFIX)) {
-        try serveStatic(gpa, io, request, path[PUBLIC_PREFIX.len..]);
+        try serveStatic(gpa, io, request, path[PUBLIC_PREFIX.len..], meta.accept_gzip);
         return;
     }
 
@@ -201,16 +240,21 @@ fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.R
         return;
     }
 
+    if (std.mem.eql(u8, path, "/ws")) {
+        const upgrade = request.upgradeRequested();
+        if (upgrade != .websocket or upgrade.websocket == null) {
+            try renderError(gpa, request, .bad_request, "WebSocket upgrade required.");
+            return;
+        }
+        try streamWebSocket(io, request, upgrade.websocket.?);
+        return;
+    }
+
     if (api_handler.isApiPath(path)) {
         if (request.head.method != .POST) {
             try request.respond("method not allowed", .{ .status = .method_not_allowed });
             return;
         }
-
-        // Inspect request headers BEFORE reading the body. After the body
-        // reader is initialized std.http.Server transitions out of the
-        // received_head state and iterateHeaders asserts.
-        const meta = api_handler.RequestMeta.fromRequest(request);
 
         var body_buf: [16 * 1024]u8 = undefined;
         const body_reader = request.readerExpectContinue(&body_buf) catch {
@@ -233,11 +277,11 @@ fn handleRequest(gpa: std.mem.Allocator, io: std.Io, request: *std.http.Server.R
             try renderError(gpa, request, .method_not_allowed, "This page only accepts GET requests.");
             return;
         }
-        try renderPage(gpa, request, .ok, route.render, null);
+        try renderPage(gpa, request, .ok, route.render, null, meta.accept_gzip);
         return;
     }
 
-    try renderPage(gpa, request, .not_found, null, path);
+    try renderPage(gpa, request, .not_found, null, path, meta.accept_gzip);
 }
 
 fn renderPage(
@@ -246,6 +290,7 @@ fn renderPage(
     status: std.http.Status,
     route_render: ?*const fn (ctx: *const verve.Context) anyerror!verve.Node,
     not_found_path: ?[]const u8,
+    accept_gzip: bool,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -263,18 +308,12 @@ fn renderPage(
         break :blk try components.page(&ctx, body);
     };
 
-    var stream_buf: [16 * 1024]u8 = undefined;
-    var body_writer = try request.respondStreaming(&stream_buf, .{
-        .respond_options = .{
-            .status = status,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/html; charset=utf-8" },
-            },
-        },
-    });
-    try body_writer.writer.writeAll("<!DOCTYPE html>");
-    try verve.Renderer.render(&body_writer.writer, node);
-    try body_writer.end();
+    var aw: Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try aw.writer.writeAll("<!DOCTYPE html>");
+    try verve.Renderer.render(&aw.writer, node);
+
+    try respondBuffered(gpa, request, status, "text/html; charset=utf-8", null, accept_gzip, aw.written());
 }
 
 fn renderError(
@@ -353,6 +392,84 @@ fn streamEvents(io: std.Io, request: *std.http.Server.Request) !void {
     body_writer.end() catch {};
 }
 
+const WS_TICK = std.Io.Duration.fromMilliseconds(250);
+
+const WsBroadcastCtx = struct {
+    io: std.Io,
+    ws: *std.http.Server.WebSocket,
+    write_mu: *std.atomic.Mutex,
+    shutdown: *std.atomic.Value(bool),
+    last_seen: i32,
+};
+
+/// Bidirectional WebSocket counter mirror. The reader half consumes "+"
+/// / "-" frames and applies them to `last_count`; the writer half (a
+/// helper thread) polls last_count every WS_TICK and pushes the current
+/// value to the client whenever it changes. The mutex serializes writes
+/// from both halves; the shutdown flag lets the broadcaster exit
+/// promptly when the reader loop terminates.
+fn streamWebSocket(
+    io: std.Io,
+    request: *std.http.Server.Request,
+    key: []const u8,
+) !void {
+    var ws = try request.respondWebSocket(.{ .key = key });
+    try ws.flush();
+
+    var write_mu: std.atomic.Mutex = .unlocked;
+    var shutdown: std.atomic.Value(bool) = .init(false);
+
+    // Initial state push.
+    writeCount(&ws, &write_mu);
+
+    var ctx = WsBroadcastCtx{
+        .io = io,
+        .ws = &ws,
+        .write_mu = &write_mu,
+        .shutdown = &shutdown,
+        .last_seen = app.last_count.load(.monotonic),
+    };
+    const broadcaster = try std.Thread.spawn(.{}, wsBroadcastLoop, .{&ctx});
+    defer {
+        shutdown.store(true, .release);
+        broadcaster.join();
+    }
+
+    while (true) {
+        const msg = ws.readSmallMessage() catch break;
+        if (msg.opcode != .text and msg.opcode != .binary) continue;
+
+        if (std.mem.eql(u8, msg.data, "+")) {
+            _ = app.last_count.fetchAdd(1, .monotonic);
+        } else if (std.mem.eql(u8, msg.data, "-")) {
+            _ = app.last_count.fetchSub(1, .monotonic);
+        } else {
+            // Unknown frame — echo current count anyway.
+        }
+        writeCount(&ws, &write_mu);
+    }
+}
+
+fn wsBroadcastLoop(ctx: *WsBroadcastCtx) void {
+    while (!ctx.shutdown.load(.acquire)) {
+        const cur = app.last_count.load(.monotonic);
+        if (cur != ctx.last_seen) {
+            writeCount(ctx.ws, ctx.write_mu);
+            ctx.last_seen = cur;
+        }
+        std.Io.sleep(ctx.io, WS_TICK, .awake) catch break;
+    }
+}
+
+fn writeCount(ws: *std.http.Server.WebSocket, mu: *std.atomic.Mutex) void {
+    while (!mu.tryLock()) std.atomic.spinLoopHint();
+    defer mu.unlock();
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("{d}", .{app.last_count.load(.monotonic)}) catch return;
+    ws.writeMessage(w.buffered(), .text) catch {};
+}
+
 /// Push everything buffered in the BodyWriter's chunk encoder *and* the
 /// underlying TCP stream writer out to the kernel. `BodyWriter.flush`
 /// alone only flushes the outer writer; the in-flight chunk stays cached
@@ -367,26 +484,55 @@ fn serveStatic(
     io: std.Io,
     request: *std.http.Server.Request,
     rel_path: []const u8,
+    accept_gzip: bool,
 ) !void {
-    const dir = public_dir orelse {
-        try renderError(gpa, request, .not_found, "No --public-dir is configured.");
-        return;
-    };
-
     if (rel_path.len == 0 or rel_path[0] == '/' or std.mem.indexOf(u8, rel_path, "..") != null) {
         try renderError(gpa, request, .forbidden, "Invalid static asset path.");
         return;
     }
 
-    var file = dir.openFile(io, rel_path, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir, error.IsDir => {
-            try renderError(gpa, request, .not_found, "Static asset not found.");
+    // --public-dir is checked first so it acts as a dev-time overlay over
+    // the comptime-embedded set; embedded entries are the fallback when no
+    // runtime dir is configured or the file isn't on disk.
+    if (public_dir) |dir| {
+        if (try tryServeFromDisk(gpa, io, request, dir, rel_path, accept_gzip)) return;
+    }
+
+    for (public_assets.entries) |entry| {
+        if (std.mem.eql(u8, entry.path, rel_path)) {
+            try respondBuffered(
+                gpa,
+                request,
+                .ok,
+                entry.content_type,
+                "public, max-age=300",
+                accept_gzip,
+                entry.bytes,
+            );
             return;
-        },
+        }
+    }
+
+    try renderError(gpa, request, .not_found, "Static asset not found.");
+}
+
+/// Returns true when the request was answered (either with the file or
+/// with an error response for an unexpected open/read failure). Returns
+/// false for FileNotFound etc. so the caller can try the embedded fallback.
+fn tryServeFromDisk(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    request: *std.http.Server.Request,
+    dir: std.Io.Dir,
+    rel_path: []const u8,
+    accept_gzip: bool,
+) !bool {
+    var file = dir.openFile(io, rel_path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.IsDir => return false,
         else => {
             log.err("static open {s}: {s}", .{ rel_path, @errorName(err) });
             try renderError(gpa, request, .internal_server_error, "Static asset open failed.");
-            return;
+            return true;
         },
     };
     defer file.close(io);
@@ -394,19 +540,66 @@ fn serveStatic(
     const stat = try file.stat(io);
     if (stat.size > STATIC_MAX_SIZE) {
         try renderError(gpa, request, .payload_too_large, "Static asset exceeds the per-file size limit.");
-        return;
+        return true;
     }
 
     const data = try gpa.alloc(u8, @intCast(stat.size));
     defer gpa.free(data);
     _ = try file.readPositionalAll(io, data, 0);
 
-    try request.respond(data, .{
-        .status = .ok,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = contentTypeFor(rel_path) },
-            .{ .name = "cache-control", .value = "public, max-age=300" },
-        },
+    try respondBuffered(gpa, request, .ok, contentTypeFor(rel_path), "public, max-age=300", accept_gzip, data);
+    return true;
+}
+
+/// Single-shot response with optional gzip. Falls back to the raw body if
+/// gzip fails (allocation, compressor error) so the request always returns
+/// something — clients tolerant of `content-encoding: identity` will still
+/// see the page.
+fn respondBuffered(
+    gpa: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    status: std.http.Status,
+    content_type: []const u8,
+    cache_control: ?[]const u8,
+    accept_gzip: bool,
+    body: []const u8,
+) !void {
+    const GZIP_MIN: usize = 256;
+
+    if (accept_gzip and body.len >= GZIP_MIN and gzip.shouldCompress(content_type)) {
+        const compressed = gzip.compress(gpa, body) catch null;
+        if (compressed) |c| {
+            defer gpa.free(c);
+            try respondRaw(request, status, content_type, cache_control, "gzip", c);
+            return;
+        }
+    }
+    try respondRaw(request, status, content_type, cache_control, null, body);
+}
+
+fn respondRaw(
+    request: *std.http.Server.Request,
+    status: std.http.Status,
+    content_type: []const u8,
+    cache_control: ?[]const u8,
+    encoding: ?[]const u8,
+    body: []const u8,
+) !void {
+    var headers: [4]std.http.Header = undefined;
+    var n: usize = 0;
+    headers[n] = .{ .name = "content-type", .value = content_type };
+    n += 1;
+    if (cache_control) |cc| {
+        headers[n] = .{ .name = "cache-control", .value = cc };
+        n += 1;
+    }
+    if (encoding) |enc| {
+        headers[n] = .{ .name = "content-encoding", .value = enc };
+        n += 1;
+    }
+    try request.respond(body, .{
+        .status = status,
+        .extra_headers = headers[0..n],
     });
 }
 
@@ -435,6 +628,7 @@ fn respondHealth(
     gpa: std.mem.Allocator,
     io: std.Io,
     request: *std.http.Server.Request,
+    meta: api_handler.RequestMeta,
 ) !void {
     const uptime_sec: i64 = if (start_timestamp) |s| blk: {
         const now = std.Io.Clock.now(.awake, io);
@@ -449,13 +643,31 @@ fn respondHealth(
         .{ uptime_sec, request_count.load(.monotonic) },
     );
 
-    try request.respond(aw.written(), .{
-        .status = .ok,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/json" },
-            .{ .name = "cache-control", .value = "no-store" },
-        },
-    });
+    try respondBuffered(gpa, request, .ok, "application/json", "no-store", meta.accept_gzip, aw.written());
+}
+
+fn respondMetrics(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    request: *std.http.Server.Request,
+    meta: api_handler.RequestMeta,
+) !void {
+    const uptime_sec: i64 = if (start_timestamp) |s| blk: {
+        const now = std.Io.Clock.now(.awake, io);
+        const ns_i96 = s.durationTo(now).nanoseconds;
+        break :blk @intCast(@divTrunc(ns_i96, std.time.ns_per_s));
+    } else 0;
+
+    var aw: Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try metrics.writeJson(
+        &aw.writer,
+        uptime_sec,
+        request_count.load(.monotonic),
+        rejected_count.load(.monotonic),
+    );
+
+    try respondBuffered(gpa, request, .ok, "application/json", "no-store", meta.accept_gzip, aw.written());
 }
 
 fn installShutdownHandlers() void {
@@ -489,6 +701,7 @@ fn printStartupBanner(cli: CliOptions) void {
     } else {
         log.info("listening on http://{s}:{d}", .{ cli.host_text, cli.port });
     }
+    log.info("max concurrent connections: {d}", .{cli.workers});
     log.info("pages:", .{});
     for (app.routes) |r| {
         log.info("  GET  {s}", .{r.path});
@@ -503,7 +716,9 @@ fn printStartupBanner(cli: CliOptions) void {
     if (cli.public_dir) |p| log.info("  GET  /public/* (from {s})", .{p});
     log.info("ops:", .{});
     log.info("  GET  /health", .{});
+    log.info("  GET  /metrics", .{});
     log.info("  GET  /events (SSE, 1s tick)", .{});
+    log.info("  GET  /ws (WebSocket, bidirectional)", .{});
 }
 
 const DEFAULT_PORT: u16 = 8080;
@@ -516,6 +731,7 @@ const CliOptions = struct {
     body_limit: usize,
     public_dir: ?[]const u8,
     listen_fd_inherited: bool,
+    workers: u32,
 };
 
 pub const CliExit = error{HelpRequested};
@@ -528,6 +744,7 @@ fn parseCli(init: std.process.Init) !CliOptions {
     var host_text: []const u8 = DEFAULT_HOST;
     var bl: usize = DEFAULT_BODY_LIMIT;
     var public: ?[]const u8 = null;
+    var workers: u32 = defaultWorkers();
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -562,6 +779,17 @@ fn parseCli(init: std.process.Init) !CliOptions {
             public = v;
             continue;
         }
+        if (try optionValue(args, &i, a, "--workers")) |v| {
+            workers = std.fmt.parseInt(u32, v, 10) catch {
+                log.err("invalid --workers value: {s}", .{v});
+                return error.InvalidWorkers;
+            };
+            if (workers == 0) {
+                log.err("--workers must be >= 1", .{});
+                return error.InvalidWorkers;
+            }
+            continue;
+        }
         log.err("unknown argument: {s} (run with --help for usage)", .{a});
         return error.UnknownArgument;
     }
@@ -585,7 +813,14 @@ fn parseCli(init: std.process.Init) !CliOptions {
         .body_limit = bl,
         .public_dir = public,
         .listen_fd_inherited = listen_fd_inherited,
+        .workers = workers,
     };
+}
+
+fn defaultWorkers() u32 {
+    const cpu = std.Thread.getCpuCount() catch 4;
+    const doubled = std.math.mul(usize, cpu, 2) catch return 8;
+    return @intCast(std.math.clamp(doubled, 4, 1024));
 }
 
 /// Parse a byte size — plain digits, optionally followed by k / m / g (KB/MB/GB
@@ -606,7 +841,8 @@ fn parseByteSize(text: []const u8) !usize {
 
 fn printUsage(program: []const u8) void {
     std.debug.print(
-        \\Usage: {s} [--host HOST] [--port PORT] [--body-limit SIZE] [--public-dir DIR] [--help]
+        \\Usage: {s} [--host HOST] [--port PORT] [--body-limit SIZE]
+        \\                    [--public-dir DIR] [--workers N] [--help]
         \\
         \\Verve full-stack web server. Serves SSR pages, embedded WASM client,
         \\and auto-generated /api/<fn> endpoints from app.Actions.
@@ -620,6 +856,9 @@ fn printUsage(program: []const u8) void {
         \\  --public-dir DIR     Directory served at /public/*. Files up to 4 MB are
         \\                       returned with a guessed content-type and cached
         \\                       for 5 minutes. Paths containing `..` are rejected.
+        \\  --workers N          Max concurrent in-flight connections. Excess
+        \\                       requests get an immediate 503 with Retry-After: 1.
+        \\                       Default: clamp(cpu*2, 4, 1024).
         \\  -h, --help           Show this message and exit.
         \\
         \\Environment:

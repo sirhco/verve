@@ -40,21 +40,54 @@ jobs:
         run: |
           mkdir -p /tmp/verve-pub
           echo "ci-static-asset" > /tmp/verve-pub/hello.txt
-          ./zig-out/bin/verve-server --port 18080 --public-dir /tmp/verve-pub &
+          ./zig-out/bin/verve-server --port 18080 --public-dir /tmp/verve-pub --workers 4 &
           server_pid=$!
           sleep 1
           set -e
-          curl -fsS -o /dev/null -w 'GET /              %{http_code}\n' http://127.0.0.1:18080/
-          curl -fsS -o /dev/null -w 'GET /counter       %{http_code}\n' http://127.0.0.1:18080/counter
-          curl -fsS -o /dev/null -w 'GET /todos         %{http_code}\n' http://127.0.0.1:18080/todos
-          curl -fsS -o /dev/null -w 'GET /client.wasm   %{http_code}\n' http://127.0.0.1:18080/client.wasm
-          curl -fsS -o /dev/null -w 'GET /verve.js      %{http_code}\n' http://127.0.0.1:18080/verve.js
-          curl -fsS -o /dev/null -w 'GET /health        %{http_code}\n' http://127.0.0.1:18080/health
-          curl -fsS -o /dev/null -w 'GET /public/hello  %{http_code}\n' http://127.0.0.1:18080/public/hello.txt
-          curl -fsS -o /dev/null -w 'POST /api/getCount %{http_code}\n' \
+          curl -fsS -o /dev/null -w 'GET /                       %{http_code}\n' http://127.0.0.1:18080/
+          curl -fsS -o /dev/null -w 'GET /counter                %{http_code}\n' http://127.0.0.1:18080/counter
+          curl -fsS -o /dev/null -w 'GET /todos                  %{http_code}\n' http://127.0.0.1:18080/todos
+          curl -fsS -o /dev/null -w 'GET /client.wasm            %{http_code}\n' http://127.0.0.1:18080/client.wasm
+          curl -fsS -o /dev/null -w 'GET /verve.js               %{http_code}\n' http://127.0.0.1:18080/verve.js
+          curl -fsS -o /dev/null -w 'GET /health                 %{http_code}\n' http://127.0.0.1:18080/health
+          curl -fsS -o /dev/null -w 'GET /metrics                %{http_code}\n' http://127.0.0.1:18080/metrics
+          curl -fsS -o /dev/null -w 'GET /public/hello           %{http_code}\n' http://127.0.0.1:18080/public/hello.txt
+          curl -fsS --compressed -o /dev/null -w 'GET /counter (gzip)         %{http_code} encoding=%{content_type}\n' \
+            -H 'Accept-Encoding: gzip' http://127.0.0.1:18080/counter
+          curl -fsS -o /dev/null -w 'POST /api/getCount          %{http_code}\n' \
             -X POST -H 'content-type: application/json' -d '{}' http://127.0.0.1:18080/api/getCount
-          curl -fsS -o /dev/null -w 'POST /api/addTodo  %{http_code}\n' \
+          curl -fsS -o /dev/null -w 'POST /api/incrementCount    %{http_code}\n' \
+            -X POST -H 'content-type: application/x-www-form-urlencoded' -d '' http://127.0.0.1:18080/api/incrementCount
+          curl -fsS -o /dev/null -w 'POST /api/addTodo           %{http_code}\n' \
             -X POST -H 'content-type: application/x-www-form-urlencoded' -d 'text=ci+task' http://127.0.0.1:18080/api/addTodo
-          curl -fsS -o /dev/null -w 'GET /missing       %{http_code}\n' http://127.0.0.1:18080/missing || true
+          curl -fsS -o /dev/null -w 'GET /missing                %{http_code}\n' http://127.0.0.1:18080/missing || true
+          kill -TERM $server_pid
+          wait $server_pid || true
+
+      - name: scaffold + build a starter project
+        shell: bash
+        run: |
+          set -e
+          ./zig-out/bin/verve-cli new /tmp/verve-starter --name=ci_starter
+          cd /tmp/verve-starter
+          zig build
+          ./zig-out/bin/verve-server --port 18081 &
+          server_pid=$!
+          sleep 1
+          curl -fsS -o /dev/null -w 'scaffold GET /              %{http_code}\n' http://127.0.0.1:18081/
+          curl -fsS -o /dev/null -w 'scaffold GET /counter       %{http_code}\n' http://127.0.0.1:18081/counter
+          kill -TERM $server_pid
+          wait $server_pid || true
+
+      - name: smoke test comptime /public embed
+        shell: bash
+        run: |
+          set -e
+          zig build -Dpublic-dir=tests/public_fixture
+          ./zig-out/bin/verve-server --port 18082 &
+          server_pid=$!
+          sleep 1
+          curl -fsS -o /dev/null -w 'embed GET /public/hello.txt %{http_code}\n' http://127.0.0.1:18082/public/hello.txt
+          curl -fsS -o /dev/null -w 'embed GET /public/style.css %{http_code}\n' http://127.0.0.1:18082/public/style.css
           kill -TERM $server_pid
           wait $server_pid || true
