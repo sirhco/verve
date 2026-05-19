@@ -4,6 +4,9 @@ Full-stack Zig web framework. Server-side rendering with fine-grained reactivity
 
 Targets **Zig 0.16.0**.
 
+📚 **[Documentation](docs/README.md)** — 12 topic guides covering every feature.
+🧪 **[Examples](examples/README.md)** — three runnable sample apps (chat, poll, bookmarks).
+
 ```sh
 zig build                           # native server + wasm client
 zig build test --summary all        # 19 tests across core + server + integration
