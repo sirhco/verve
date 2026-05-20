@@ -455,6 +455,12 @@ fn renderPage(req: RenderRequest) !void {
         .csp_nonce = csp_nonce,
     };
 
+    // Tell the renderer the current request's CSP nonce so it can
+    // auto-stamp `nonce="…"` on script/style tags. Reset on the way
+    // out so a later request without a nonce doesn't reuse this one.
+    verve.setRendererNonce(csp_nonce);
+    defer verve.setRendererNonce("");
+
     const node: *verve.Node = blk: {
         if (req.route_chain.len > 0) {
             // Run guards root-first; first redirect wins.
@@ -517,13 +523,16 @@ fn renderPage(req: RenderRequest) !void {
 
     // Dev mode: splice the auto-reload client snippet into the body
     // right before `</body>`. Skips fragment / non-HTML responses since
-    // they shouldn't carry a `<body>` close tag.
+    // they shouldn't carry a `<body>` close tag. The injected <script>
+    // carries the current CSP nonce so it loads under the same
+    // 'strict-dynamic' policy as the rest of the page.
     var final_body: []const u8 = aw.written();
     var injected_buf: ?[]u8 = null;
     defer if (injected_buf) |b| req.gpa.free(b);
     if (dev_mode and !is_fragment) {
         if (std.mem.lastIndexOf(u8, final_body, "</body>")) |pos| {
-            const snippet = DEV_RELOAD_SNIPPET;
+            const snippet = try std.fmt.allocPrint(req.gpa, DEV_RELOAD_SNIPPET_FMT, .{csp_nonce});
+            defer req.gpa.free(snippet);
             const out = try req.gpa.alloc(u8, final_body.len + snippet.len);
             @memcpy(out[0..pos], final_body[0..pos]);
             @memcpy(out[pos .. pos + snippet.len], snippet);
@@ -541,11 +550,14 @@ fn renderPage(req: RenderRequest) !void {
 ///   - first open → store that we've been alive
 ///   - close → mark dead and start reconnect attempts
 ///   - reconnect succeeds → location.reload()
-const DEV_RELOAD_SNIPPET =
-    "<script>(()=>{let connected=false;function tick(){const ws=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/__verve/dev_ws`);" ++
-    "ws.onopen=()=>{if(connected){location.reload();return;}connected=true;};" ++
-    "ws.onclose=()=>{connected=false;setTimeout(tick,500);};" ++
-    "ws.onerror=()=>{ws.close();};}tick();})();</script>";
+///
+/// `{s}` is the current request's CSP nonce — required so the inline
+/// script loads under the page's 'strict-dynamic' policy.
+const DEV_RELOAD_SNIPPET_FMT =
+    "<script nonce=\"{s}\">(()=>{{let connected=false;function tick(){{const ws=new WebSocket(`${{location.protocol==='https:'?'wss:':'ws:'}}//${{location.host}}/__verve/dev_ws`);" ++
+    "ws.onopen=()=>{{if(connected){{location.reload();return;}}connected=true;}};" ++
+    "ws.onclose=()=>{{connected=false;setTimeout(tick,500);}};" ++
+    "ws.onerror=()=>{{ws.close();}};}}tick();}})();</script>";
 
 fn renderError(
     gpa: std.mem.Allocator,

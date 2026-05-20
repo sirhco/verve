@@ -6,6 +6,14 @@ const node_mod = @import("node.zig");
 const Context = @import("context.zig").Context;
 const Node = node_mod.Node;
 
+/// Per-render CSP nonce. The server sets this before serialization
+/// so the renderer can stamp `nonce="…"` on every emitted `<script>`
+/// / `<style>` tag that doesn't already carry one — required when
+/// the response's CSP uses `'strict-dynamic'` (the framework default).
+///
+/// Empty string disables auto-stamping.
+pub threadlocal var current_nonce: []const u8 = "";
+
 pub const Renderer = struct {
     pub fn render(w: *Writer, node: *const Node) Writer.Error!void {
         // Outlet placeholder for nested routing — expand into the
@@ -33,9 +41,21 @@ pub const Renderer = struct {
 
         try w.print("<{s}", .{node.tag});
 
+        var has_nonce: bool = false;
         for (node.attrs.items) |a| {
+            if (std.mem.eql(u8, a.key, "nonce")) has_nonce = true;
             try w.print(" {s}=\"", .{a.key});
             try escapeAttr(w, a.value);
+            try w.writeAll("\"");
+        }
+        // Auto-stamp the per-request CSP nonce onto script/style tags
+        // when the renderer's threadlocal is set and the node doesn't
+        // already carry one. Required for CSP `'strict-dynamic'`.
+        if (!has_nonce and current_nonce.len > 0 and
+            (std.mem.eql(u8, node.tag, "script") or std.mem.eql(u8, node.tag, "style")))
+        {
+            try w.writeAll(" nonce=\"");
+            try escapeAttr(w, current_nonce);
             try w.writeAll("\"");
         }
         if (node.z_bind_name) |bind| {

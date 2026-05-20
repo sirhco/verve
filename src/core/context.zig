@@ -489,7 +489,18 @@ pub const Context = struct {
     }
 
     pub fn script(ctx: *const Context, src: []const u8) *Node {
-        return ctx.el("script").src(src);
+        const n = ctx.el("script").src(src);
+        if (ctx.csp_nonce.len > 0) _ = n.attr("nonce", ctx.csp_nonce);
+        return n;
+    }
+
+    /// Inline `<script>body</script>` with the current CSP nonce
+    /// automatically applied. Body is emitted verbatim (NOT escaped) so
+    /// caller is responsible for safety.
+    pub fn scriptInline(ctx: *const Context, body: []const u8) *Node {
+        const n = ctx.el("script").raw(body);
+        if (ctx.csp_nonce.len > 0) _ = n.attr("nonce", ctx.csp_nonce);
+        return n;
     }
 };
 

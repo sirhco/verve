@@ -80,6 +80,12 @@ pub const Context = context_mod.Context;
 pub const AssetResolver = context_mod.AssetResolver;
 pub const Renderer = renderer_mod.Renderer;
 pub const escapeHtml = renderer_mod.escapeHtml;
+
+/// Set the per-request CSP nonce the renderer will stamp onto every
+/// `<script>` / `<style>` tag missing one. Empty string disables.
+pub fn setRendererNonce(nonce: []const u8) void {
+    renderer_mod.current_nonce = nonce;
+}
 pub const RequestMeta = request_meta_mod.RequestMeta;
 pub const Cookie = request_meta_mod.Cookie;
 pub const Method = request_meta_mod.Method;
