@@ -21,15 +21,34 @@ pub const Segment = union(enum) {
 
 pub const RenderFn = *const fn (ctx: *Context) anyerror!*Node;
 
+/// Per-render guard — when set, the server invokes it BEFORE the
+/// matched route's render fn. Returning a Redirect short-circuits to
+/// a 302 response; returning null lets the render proceed.
+pub const Guard = *const fn (ctx: *Context) ?Redirect;
+
+/// Server-recognized 302 sentinel. A render or guard returning this
+/// value triggers an HTTP redirect to `to`.
+pub const Redirect = struct {
+    to: []const u8,
+    /// Defaults to 303 (See Other) so POST-redirect-GET works without
+    /// caching the redirect itself.
+    status: u16 = 303,
+};
+
 pub const Route = struct {
     pattern: []const u8,
     segments: []const Segment,
     render: RenderFn,
+    /// Optional pre-render guard. See `Guard`.
+    guard: ?Guard = null,
+    /// Nested children. Match consumes parent segments first, then
+    /// continues into the first child whose remaining path matches.
+    /// Parent's `render` is invoked LAST and should embed
+    /// `ctx.outlet()` somewhere in its tree.
+    children: []const Route = &.{},
 
-    /// Compile a route at comptime. The pattern is parsed once into the
-    /// segment slice that the runtime matcher walks. Invalid patterns
-    /// (`:` without a name, `*rest` followed by another segment) produce
-    /// a comptime error.
+    /// Compile a leaf route at comptime. The pattern is parsed once
+    /// into the segment slice the runtime matcher walks.
     pub fn init(comptime pattern: []const u8, comptime render: RenderFn) Route {
         comptime {
             const segments = parsePattern(pattern);
@@ -39,6 +58,34 @@ pub const Route = struct {
                 .render = render,
             };
         }
+    }
+
+    /// Compile a layout route — a route that owns nested children. The
+    /// layout's render must call `ctx.outlet()` somewhere; the matched
+    /// child's tree is spliced in at that point.
+    pub fn layout(comptime pattern: []const u8, comptime render: RenderFn, comptime children: []const Route) Route {
+        comptime {
+            const segments = parsePattern(pattern);
+            return .{
+                .pattern = pattern,
+                .segments = segments,
+                .render = render,
+                .children = children,
+            };
+        }
+    }
+
+    /// Mark a route as protected. The guard runs before render; if it
+    /// returns a Redirect, the server emits a 302/303 and skips the
+    /// render entirely. Used for auth / role checks at the route layer.
+    pub fn protect(self: Route, comptime g: Guard) Route {
+        return .{
+            .pattern = self.pattern,
+            .segments = self.segments,
+            .render = self.render,
+            .guard = g,
+            .children = self.children,
+        };
     }
 };
 

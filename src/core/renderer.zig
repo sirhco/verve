@@ -8,6 +8,18 @@ const Node = node_mod.Node;
 
 pub const Renderer = struct {
     pub fn render(w: *Writer, node: *const Node) Writer.Error!void {
+        // Outlet placeholder for nested routing — expand into the
+        // child route's rendered tree (or emit nothing when no child
+        // matched).
+        if (std.mem.eql(u8, node.tag, "__outlet__")) {
+            if (node.outlet_content) |c| try render(w, c);
+            return;
+        }
+        // Redirect sentinel — never renders to HTML; the server is
+        // expected to intercept it before reaching the renderer. Safe
+        // fallback: skip silently.
+        if (std.mem.eql(u8, node.tag, "__redirect__")) return;
+
         // Empty tag → fragment. Emit only raw_inner (if set) or children;
         // attrs/bindings/text on a fragment are silently ignored.
         if (node.tag.len == 0) {

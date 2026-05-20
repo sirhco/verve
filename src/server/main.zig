@@ -341,7 +341,7 @@ fn handleRequest(
     var params: std.StringHashMapUnmanaged([]const u8) = .empty;
     const matched = router.match(path, app.routes, &params, arena.allocator()) catch null;
 
-    if (matched) |route| {
+    if (matched) |m| {
         if (request.head.method != .GET and request.head.method != .HEAD) {
             try renderError(gpa, io, request, .method_not_allowed, "This page only accepts GET requests.");
             return;
@@ -355,7 +355,7 @@ fn handleRequest(
             .target = target,
             .params = &params,
             .meta = &meta,
-            .route_render = route.render,
+            .route_chain = m.chain[0..m.chain_len],
             .not_found_path = null,
             .accept_gzip = meta.accept_gzip,
         });
@@ -371,7 +371,7 @@ fn handleRequest(
         .target = target,
         .params = &params,
         .meta = &meta,
-        .route_render = null,
+        .route_chain = &.{},
         .not_found_path = path,
         .accept_gzip = meta.accept_gzip,
     });
@@ -386,7 +386,10 @@ const RenderRequest = struct {
     target: []const u8,
     params: *const std.StringHashMapUnmanaged([]const u8),
     meta: *const api_handler.RequestMeta,
-    route_render: ?*const fn (ctx: *verve.Context) anyerror!*verve.Node,
+    /// Empty when no route matched (renders 404). Otherwise root →
+    /// leaf: server invokes guards root-first, then renders leaf-first
+    /// while threading `outlet_node` through each layer.
+    route_chain: []const verve.Route,
     not_found_path: ?[]const u8,
     accept_gzip: bool,
 };
@@ -453,16 +456,45 @@ fn renderPage(req: RenderRequest) !void {
     };
 
     const node: *verve.Node = blk: {
-        if (req.route_render) |render_fn| {
-            break :blk render_fn(&ctx) catch |err| {
-                log.err("render error: {s}", .{@errorName(err)});
-                try renderError(req.gpa, req.io, req.request, .internal_server_error, "The page failed to render.");
-                return;
-            };
+        if (req.route_chain.len > 0) {
+            // Run guards root-first; first redirect wins.
+            for (req.route_chain) |r| {
+                if (r.guard) |g| if (g(&ctx)) |redir| {
+                    try respondRedirectRaw(req.request, redir);
+                    return;
+                };
+            }
+            // Render leaf-first, accumulating each layer's tree into
+            // the parent's outlet slot.
+            var inner: ?*verve.Node = null;
+            var i: usize = req.route_chain.len;
+            while (i > 0) {
+                i -= 1;
+                ctx.outlet_node = inner;
+                const rendered = req.route_chain[i].render(&ctx) catch |err| {
+                    log.err("render error in route {s}: {s}", .{ req.route_chain[i].pattern, @errorName(err) });
+                    try renderError(req.gpa, req.io, req.request, .internal_server_error, "The page failed to render.");
+                    return;
+                };
+                // Redirect short-circuit from a render: same handling
+                // as a guard.
+                if (rendered.redirect) |redir| {
+                    try respondRedirectRaw(req.request, redir);
+                    return;
+                }
+                inner = rendered;
+            }
+            break :blk inner.?;
         }
         const body = try components.notFound(&ctx, req.not_found_path orelse "");
         break :blk try components.page(&ctx, body);
     };
+
+    // Top-level redirect (a 1-route chain that returned ctx.redirect).
+    if (node.redirect) |redir| {
+        try respondRedirectRaw(req.request, redir);
+        return;
+    }
 
     var aw: Writer.Allocating = .init(req.gpa);
     defer aw.deinit();
@@ -1014,6 +1046,17 @@ fn respondBuffered(
         }
     }
     try respondRaw(request, status, content_type, cache_control, null, body);
+}
+
+fn respondRedirectRaw(request: *std.http.Server.Request, redir: verve.Redirect) !void {
+    const status: std.http.Status = @enumFromInt(redir.status);
+    try request.respond("", .{
+        .status = status,
+        .keep_alive = false,
+        .extra_headers = &.{
+            .{ .name = "location", .value = redir.to },
+        },
+    });
 }
 
 fn respondRaw(

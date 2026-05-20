@@ -85,6 +85,42 @@ pub fn todoList(ctx: *const verve.Context, items: []const []const u8) !*verve.No
     }).build();
 }
 
+pub fn appShell(ctx: *const verve.Context, outlet: *verve.Node) !*verve.Node {
+    return ctx.main_().class("home").children(.{
+        ctx.h1("App"),
+        ctx.nav().children(.{
+            verve.link(ctx, "/app/dashboard", "Dashboard", .{}),
+            ctx.span().text(" · "),
+            verve.link(ctx, "/app/settings/general", "Settings", .{}),
+            ctx.span().text(" · "),
+            verve.link(ctx, "/", "← Home", .{}),
+        }),
+        ctx.el("section").children(.{outlet}),
+    }).build();
+}
+
+pub fn appDashboard(ctx: *const verve.Context) !*verve.Node {
+    return ctx.div().children(.{
+        ctx.h2("Dashboard"),
+        ctx.p().text("Nested layout demo. /app is a layout route; this is the leaf rendered into ctx.outlet()."),
+    }).build();
+}
+
+pub fn appSettings(ctx: *const verve.Context, section: []const u8) !*verve.Node {
+    return ctx.div().children(.{
+        ctx.h2("Settings"),
+        ctx.p().children(.{ ctx.span().text("Section: "), ctx.code(section) }),
+    }).build();
+}
+
+pub fn privatePage(ctx: *const verve.Context) !*verve.Node {
+    return ctx.main_().class("home").children(.{
+        ctx.h1("Protected page"),
+        ctx.p().text("This route is gated by a guard fn — visiting without ?token=... redirects to /counter."),
+        ctx.p().children(.{ ctx.a("/", "← Home") }),
+    }).build();
+}
+
 pub fn notFound(ctx: *const verve.Context, path: []const u8) !*verve.Node {
     return ctx.main_().class("home").children(.{
         ctx.h1("404 — Not Found"),

@@ -30,6 +30,15 @@ pub const Node = struct {
     content_type_override: ?[]const u8 = null,
     z_bind_name: ?[]const u8 = null,
     z_on_click_action: ?[]const u8 = null,
+    /// When set, the server short-circuits rendering and sends a
+    /// redirect response (302/303) instead of HTML. Populated via
+    /// `ctx.redirect("/login")`.
+    redirect: ?@import("route.zig").Redirect = null,
+    /// Slot that nested routing fills with the matched child's
+    /// rendered tree. When this node is itself an outlet placeholder
+    /// (tag = `__outlet__`), the renderer emits this subtree in its
+    /// place; null outlet placeholders render to nothing.
+    outlet_content: ?*Node = null,
     attrs: std.ArrayList(Attr) = .empty,
     children_list: std.ArrayList(*Node) = .empty,
     err: ?anyerror = null,

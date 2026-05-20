@@ -11,6 +11,11 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/counter", renderCounter),
     verve.Route.init("/todos", renderTodos),
     verve.Route.init("/work/:slug", renderWorkDetail),
+    verve.Route.layout("/app", renderAppShell, &.{
+        verve.Route.init("/dashboard", renderAppDashboard),
+        verve.Route.init("/settings/:section", renderAppSettings),
+    }),
+    verve.Route.init("/private", renderPrivate).protect(privateGuard),
 };
 
 fn renderHome(ctx: *verve.Context) !*verve.Node {
@@ -33,4 +38,34 @@ fn renderWorkDetail(ctx: *verve.Context) !*verve.Node {
     const slug = ctx.param("slug") orelse "";
     const body = try components.workDetail(ctx, slug);
     return components.page(ctx, body);
+}
+
+fn renderAppShell(ctx: *verve.Context) !*verve.Node {
+    const body = try components.appShell(ctx, ctx.outlet());
+    return components.page(ctx, body);
+}
+
+fn renderAppDashboard(ctx: *verve.Context) !*verve.Node {
+    return components.appDashboard(ctx);
+}
+
+fn renderAppSettings(ctx: *verve.Context) !*verve.Node {
+    const section = ctx.param("section") orelse "general";
+    return components.appSettings(ctx, section);
+}
+
+fn renderPrivate(ctx: *verve.Context) !*verve.Node {
+    const body = try components.privatePage(ctx);
+    return components.page(ctx, body);
+}
+
+/// Sample route guard: redirects to /counter unless `?token=...`
+/// is present in the URL. Real apps would check a session cookie or
+/// auth header; the shape is the same.
+fn privateGuard(ctx: *verve.Context) ?verve.Redirect {
+    const loc = ctx.location orelse return .{ .to = "/counter" };
+    var l = loc.*;
+    const t = l.queryGet(ctx.alloc(), "token") catch return .{ .to = "/counter" };
+    if (t) |val| if (val.len > 0) return null;
+    return .{ .to = "/counter" };
 }

@@ -74,6 +74,11 @@ pub const Context = struct {
     /// Per-request CSP nonce. Stamped onto inline scripts/styles and
     /// echoed in the response's Content-Security-Policy header.
     csp_nonce: []const u8 = "",
+    /// Child route's rendered tree, set by the server when a layout
+    /// route is being rendered. The layout calls `ctx.outlet()` to
+    /// receive a Node placeholder that the renderer expands into
+    /// this tree at serialization time.
+    outlet_node: ?*Node = null,
 
     /// Shared empty StringHashMap exposed as the default `params` pointer
     /// so the field is always dereferenceable.
@@ -256,6 +261,35 @@ pub const Context = struct {
     pub fn actionForm(self: *const Context, opts: FormOpts) *Node {
         const n = self.form(opts);
         return n.children(.{self.csrfField()});
+    }
+
+    /// Placeholder node that nested-route layouts embed to mark where
+    /// the matched child's tree should land. The server fills
+    /// `outlet_node` before invoking the layout's render fn; the
+    /// renderer expands `__outlet__` nodes into that subtree.
+    pub fn outlet(self: *const Context) *Node {
+        const n = node_mod.create(self.allocator, "__outlet__");
+        n.outlet_content = self.outlet_node;
+        return n;
+    }
+
+    /// Return a sentinel node that the server interprets as an HTTP
+    /// redirect. The render aborts before serialization — no body is
+    /// produced. Defaults to 303 See Other so POST-then-GET works
+    /// without caching the redirect itself.
+    pub fn redirect(self: *const Context, to: []const u8) *Node {
+        const route = @import("route.zig");
+        const n = node_mod.create(self.allocator, "__redirect__");
+        n.redirect = route.Redirect{ .to = to };
+        return n;
+    }
+
+    /// Variant with explicit status code (301/302/303/307/308 etc).
+    pub fn redirectWithStatus(self: *const Context, to: []const u8, status: u16) *Node {
+        const route = @import("route.zig");
+        const n = node_mod.create(self.allocator, "__redirect__");
+        n.redirect = route.Redirect{ .to = to, .status = status };
+        return n;
     }
 
     /// Pass-through helper for components that want the arena allocator.

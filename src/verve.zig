@@ -84,6 +84,8 @@ pub const Location = location_mod.Location;
 pub const QueryPair = location_mod.QueryPair;
 pub const Route = route_mod.Route;
 pub const RouteSegment = route_mod.Segment;
+pub const Redirect = route_mod.Redirect;
+pub const RouteGuard = route_mod.Guard;
 
 test {
     _ = node_mod;
