@@ -101,23 +101,65 @@ for details.
 Open `src/app/routes.zig` and add a route:
 
 ```zig
-pub const routes: []const Route = &.{
-    .{ .path = "/", .render = renderHome },
-    .{ .path = "/counter", .render = renderCounter },
-    .{ .path = "/todos", .render = renderTodos },
-    .{ .path = "/hello", .render = renderHello },   // <— new
+pub const routes: []const verve.Route = &.{
+    verve.Route.init("/",         renderHome),
+    verve.Route.init("/counter",  renderCounter),
+    verve.Route.init("/todos",    renderTodos),
+    verve.Route.init("/hello",    renderHello),   // <— new
+    verve.Route.init("/hi/:name", renderHi),      // <— with a path param
 };
 
-fn renderHello(ctx: *const verve.Context) !*verve.Node {
+fn renderHello(ctx: *verve.Context) !*verve.Node {
     return components.page(ctx, ctx.h1("Hello, Verve!"));
+}
+
+fn renderHi(ctx: *verve.Context) !*verve.Node {
+    const name = ctx.param("name") orelse "world";
+    try ctx.setTitle(try std.fmt.allocPrint(ctx.alloc(), "Hi {s}", .{name}));
+    return components.page(ctx, ctx.h1(name));
 }
 ```
 
 Rebuild + reload — your route is live. No restart shortcuts, no
-codegen, no macros. Just a struct field in a comptime table.
+codegen, no macros. Just a slice of comptime-parsed routes.
+
+## Dev auto-reload
+
+`--dev` injects an auto-reload `<script>` into every page. Pair with
+`zig build --watch run -- --dev` and the browser refreshes on every
+rebuild.
+
+```sh
+zig build --watch run -- --dev --public-dir ./public
+```
+
+## What you get out of the box
+
+Beyond the route → render plumbing:
+
+- **Signals + effects** — reactive primitives for shared state
+  (`ctx.useSignal`, `ctx.useEffect`).
+- **Stores** — field-grained reactive structs (`verve.createStore`).
+- **Resources** — async-value wrappers with loading / ready / err
+  states.
+- **Nested routes** — layouts with `Route.layout` + `ctx.outlet()`,
+  guards via `.protect(fn)`, redirects via `ctx.redirect(href)`.
+- **Head accumulator** — `ctx.setTitle / metaTag / linkTag / jsonLd`
+  drained into `<head>` in priority order.
+- **CSRF + CSP** — auto-issued HMAC token + per-request nonce. The
+  `ctx.actionForm` helper handles the form-field side.
+- **SPA navigation** — `verve.link(...)` anchors are intercepted
+  client-side for seamless navigation.
+- **Islands** — opt-in hydration boundaries via `verve.island(...)`.
+- **i18n** — locale resolution (cookie → query → Accept-Language)
+  with `verve.resolveLocale + I18nCatalog`.
+
+Each topic has its own doc — read on.
 
 ## Next
 
 - [02 — Component model](02-components.md) — how the renderer turns
-  `Node` trees into HTML.
+  `Node` trees into HTML, head slots, NodeRef, Slot system.
 - [03 — Actions](03-actions.md) — how `pub fn` becomes `POST /api/<fn>`.
+- [04 — Routing](04-routing.md) — path params, nested routes, guards.
+- [05 — Reactivity](05-reactivity.md) — Owner, Signal, Effect, Store.

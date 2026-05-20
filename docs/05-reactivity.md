@@ -1,139 +1,171 @@
 # 05 — Reactivity
 
-Verve splits state across three layers:
+Verve's reactive runtime mirrors the SolidJS / Leptos model: signals
+are observable values, effects re-run whenever any signal they read
+changes, and an Owner tree groups signals + effects so they're
+disposed deterministically.
 
-1. **Server signals** (`src/core/signal.zig`) — observable values inside
-   a render pass. Available to both server and wasm builds.
-2. **Client signals** (`src/client/signal.zig`) — wasm-side values
-   whose `set()` calls a JS extern to update the DOM.
-3. **Bridge subscriptions** — the JS bridge auto-wires `[z-bind="X"]`
-   elements to `verve_init_X` exports and to SSE / WebSocket events
-   named `X`.
+## The core primitives
 
-## Server signal
+| Type | What it is |
+|---|---|
+| `verve.Owner`     | Scope. Disposes its child owners + cleanups in LIFO. |
+| `verve.Signal(T)` | Reactive value cell. Reads inside an Effect subscribe. |
+| `verve.Effect`    | Closure that re-runs when any tracked Signal changes. |
+| `verve.Store(T)`  | Struct wrapper with per-field signals (field-grained). |
+| `verve.Resource(T)` | Async-value wrapper: `.loading | .ready(T) | .err`. |
+| `verve.ErrorBoundary` | Holds a `Signal(?anyerror)` — components catch + capture. |
 
-```zig
-const verve = @import("verve");
+The render pipeline allocates a fresh `Owner` per request. When the
+response writer is done, the owner disposes — every signal/effect
+created during render is freed, every `on_cleanup` hook fires.
 
-var count: verve.Signal(i32) = .init(0);
-
-count.set(5);                       // mutate
-const v = count.get();              // read
-try count.subscribe(observer);      // notify on set
-```
-
-Today the request path doesn't use server signals — they're useful for
-in-process listeners (tests, background tasks). The "live update over
-SSE" pattern uses `std.atomic.Value(i32)` directly because the broadcast
-loop polls without needing a listener registration.
-
-## Client signal
-
-A `ClientSignal(T)` is small — bind name + value:
+## Signal
 
 ```zig
-const signal = @import("signal.zig");
-
-var count = signal.ClientSignal(i32).init("count", 0);
-
-count.set(7);            // updates DOM via dom.set_text_by_bind_i32
-count.increment();       // count += 1, emit update
-count.decrement();
-const cur = count.get();
+const sig = try ctx.useSignal(i32, 0);
+const cur = sig.get();        // reactive read (subscribes effect)
+const peek = sig.peek();      // non-tracking read
+sig.set(7);                   // notify all subscribers, flush queue
+sig.increment();              // shorthand for numeric T
 ```
 
-`set` calls `dom.set_text_by_bind_i32(bind_ptr, bind_len, value)` which
-the JS bridge maps to `setTextByBind(name, String(value))` — written
-into the `textContent` of every `[z-bind="<name>"]` element on the
-page.
+`Signal(T)` uses thread-local `current_effect` tracking to record
+subscribers automatically. There's no manual `.subscribe(fn)` — the
+effect IS the subscription.
 
-Only `i32` is wired today. Adding `[]const u8` is a few lines in
-`src/client/signal.zig:emit` plus an extra extern in
-`src/client/dom.zig`. Use the wasm FBA from
-[`12-wasm-client.md`](12-wasm-client.md) to own the string buffer.
+Writes batch automatically when nested under `verve.batch`:
 
-## Hydration
+```zig
+verve.batch(ctx, struct {
+    fn run(c: *verve.Context) void {
+        c.useSignal(...) // ...
+    }
+}.run);
+```
 
-When the bridge boots, it scans wasm exports for every name matching
-`verve_init_*` and seeds the client signal from the rendered DOM:
+## Effect
 
-```js
-// src/bridge/verve.js
-for (const name of Object.keys(exp)) {
-  const m = /^verve_init_(.+)$/.exec(name);
-  if (!m || typeof exp[name] !== "function") continue;
-  const el = document.querySelector(`[z-bind="${CSS.escape(m[1])}"]`);
-  if (!el) continue;
-  const n = parseInt(el.textContent, 10);
-  if (!Number.isNaN(n)) exp[name](n | 0);
+```zig
+_ = try ctx.useEffect(&state, struct {
+    fn run(self: *State) void {
+        log.info("count is now {d}", .{self.count.get()});
+    }
+}.run);
+```
+
+The effect runs eagerly once to collect its dependencies, then again
+whenever any signal it read changes. Disposing the owner clears it
+from every signal's subscriber list automatically.
+
+### Escape hatches
+
+`verve.untrack(R, ctx_ptr, fn)` runs the wrapped read without
+subscribing the current effect — useful for "read once, don't react
+to changes":
+
+```zig
+const initial = verve.untrack(i32, &count, struct {
+    fn read(s: *verve.Signal(i32)) i32 {
+        return s.peek();
+    }
+}.read);
+```
+
+`verve.batch(ctx_ptr, fn)` defers the effect flush until the closure
+returns:
+
+```zig
+verve.batch(&store, struct {
+    fn updateAll(s: *verve.Store(User)) void {
+        s.set(.name, "alice");
+        s.set(.age, 31);
+    }
+}.updateAll);
+// → both writes happen, then any effect that reads .name OR .age
+//   runs at most once.
+```
+
+## Store — field-grained reactivity
+
+A bare `Signal(MyStruct)` notifies every reader on any field change.
+`Store(T)` gives each field its own Signal so reads are granular:
+
+```zig
+const Profile = struct { name: []const u8, age: u32 };
+const profile = try verve.createStore(Profile, owner,
+    .{ .name = "alice", .age = 30 });
+
+profile.get(.name);      // subscribes only to the .name signal
+profile.set(.age, 31);   // notifies only .age subscribers
+```
+
+Implementation: a comptime `std.meta.Tuple` of signal pointers, one
+per declared field. The lookup `get(.field)` resolves at comptime to
+a tuple index.
+
+## Resource — async data
+
+```zig
+const todos = try verve.createResource([]Todo, owner, &deps, fetcher);
+
+switch (todos.state.get()) {
+    .loading      => return ctx.span().text("Loading…"),
+    .ready  => |list| return components.todoList(ctx, list),
+    .err    => |e|    return components.errorPage(ctx, e),
 }
-if (typeof exp.verve_hydrate === "function") exp.verve_hydrate();
 ```
 
-So:
+Server-side the fetcher runs synchronously during render — Phase 3
+ships SSR-resolved resources. Reads inside a `verve.suspense(...)`
+boundary that see `.loading` mark the render suspended, and the
+boundary's `fallback` is emitted instead. Phase 8's client runtime
+will resolve resources asynchronously on hydrate.
 
-- Server renders `<span z-bind="count">7</span>`.
-- Bridge sees `verve_init_count` export, parses `7` from the DOM,
-  calls `verve_init_count(7)` which sets the wasm signal.
-- `verve_hydrate()` runs to re-emit current state (in case multiple
-  elements share a bind).
-
-Now the wasm world and the DOM agree, and subsequent
-`count.set(N)` calls flow to the DOM via the extern.
-
-## Click → action
-
-`<button z-on-click="increment_counter">` is intercepted by the
-bridge's delegated click listener:
-
-```js
-document.addEventListener("click", (e) => {
-  const target = e.target.closest("[z-on-click]");
-  if (!target) return;
-  const action = target.getAttribute("z-on-click");
-  if (wsCounterAction(action)) {          // WS fast-path for "+"/"-"
-    e.preventDefault();
-    return;
-  }
-  const fn = exp[action];                 // fallback: wasm export
-  if (typeof fn === "function") {
-    e.preventDefault();
-    fn();
-  }
-});
-```
-
-So the lookup order is:
-
-1. WebSocket fast-path (for `increment_counter` / `decrement_counter`).
-2. Direct wasm export by name.
-
-A button wrapped in a `<form action="/api/...">` falls through to
-native submit when neither path is available — the form-fallback
-pattern (see [`03-actions.md`](03-actions.md)).
-
-## Multi-bind
-
-Multiple elements with the same `z-bind` all update together:
-
-```html
-<span z-bind="count" class="count">0</span>
-<small z-bind="count" class="muted">Current value: 0</small>
-```
-
-`set_text_by_bind` uses `document.querySelectorAll`, so both nodes
-receive every update.
-
-You can also have multiple `ClientSignal`s on the same page with
-different bind names:
+## NodeRef — typed DOM handle
 
 ```zig
-var count = signal.ClientSignal(i32).init("count", 0);
-var clicks = signal.ClientSignal(i32).init("clicks", 0);
+const ref = ctx.nodeRef(.input, "email-field");
+
+return ctx.actionForm(.{ .post = "/api/subscribe" })
+    .children(.{
+        ctx.input().type_("email").ref(ref).required(),
+        ctx.button("Subscribe").type_("submit"),
+    }).build();
 ```
 
-That's why the counter demo tracks "count" (server-shared) and
-"clicks" (per-tab) independently — two binds, one wasm module.
+The renderer emits `data-ref="email-field"`. Client-side
+`verveQueryRef("email-field")` returns the live `Element`. The
+generic phantom `Tag` is enforced at compile time but doesn't make
+it into the DOM.
+
+## Error boundary
+
+```zig
+const eb = try verve.createErrorBoundary(owner);
+
+const widget = renderRiskyWidget(ctx) catch |err| blk: {
+    eb.captureError(err);
+    break :blk ctx.div().class("widget-fallback").text("(unavailable)");
+};
+
+if (eb.captured()) |_| {
+    // sibling subtrees keep rendering; a Try-Again button can call
+    // eb.reset() to clear the captured state.
+}
+```
+
+The boundary holds a `Signal(?anyerror)` so effects observing
+`captured()` re-run when an error lands or is reset.
+
+## Legacy z-bind / ClientSignal
+
+The previous wire (`<span z-bind="count">` + JS bridge
+`set_text_by_bind_i32`) still works for simple counter-style state
+without spinning up the full reactive runtime. The `/counter` example
+demonstrates it. New code should reach for `Signal` + `Effect`
+instead; the JS-bridge path will retire once the WASM client gains
+its own reactive runtime (Phase 8).
 
 ## SSE-driven binds (no wasm required)
 
@@ -150,45 +182,32 @@ So even without invoking any wasm export, the page can have its
 `[z-bind="count"]` elements updated when the server pushes
 `event: count\ndata: <n>\n\n`.
 
-This is how a tab open to `/counter` with JS but no `wasm`
+This is how a tab open to `/counter` with JS but no WASM
 interactions still sees live updates from other browsers.
 
-## WebSocket priority
+## Putting it together — pure SSR with reactivity
 
-The bridge tries WebSocket first; on failure it falls back to SSE:
+The reactive runtime works server-side too: a render can create
+signals and effects, mutate them inline (synchronously), and rely on
+the final state for the HTML it emits. Useful for computed values
+that need to be tracked across helper functions:
 
-```js
-try {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
-  ws.onmessage = (e) => setCount(e.data);
-} catch (err) {
-  ws = null;
-}
+```zig
+const tally = try ctx.useSignal(u32, 0);
+const items = try fetchItems(ctx);
+for (items) |it| tally.increment();
+
+return ctx.main_().children(.{
+    ctx.h1("Items"),
+    ctx.p().textFmt("{d} total", .{tally.peek()}),
+});
 ```
 
-When the WS is open, the SSE listener becomes a no-op for the
-`count` event — preventing double-updates. Same UI, two transports,
-graceful degradation.
-
-## Putting it together
-
-The `/counter` page sends three signals on the wire:
-
-1. Server renders `<span z-bind="count">N</span>` (SSR).
-2. Bridge boots, calls `verve_init_count(N)` (hydrate).
-3. User clicks `[z-on-click="increment_counter"]`. Bridge sees
-   counter action, sends `"+"` over WS.
-4. Server's WS reader bumps `last_count.fetchAdd(1)`, then
-   `writeCount` broadcasts the new value to every connected client.
-5. Each client's bridge receives the WS message → `setCount(data)`
-   → `setTextByBind("count", String(v))` → DOM updates.
-
-The whole chain is observable in the browser's devtools network +
-console.
+Phase 8 will let those same signals participate in client-side
+hydration — same code, more behavior.
 
 ## Next
 
-- [06 — Realtime](06-realtime.md) — protocol details for SSE and WS.
-- [12 — WASM client](12-wasm-client.md) — how the wasm-side allocator,
-  signals, and HTML escape interact.
+- [02 — Components](02-components.md) — head slots, NodeRef, Slot.
+- [06 — Realtime](06-realtime.md) — SSE + WebSocket transports.
+- [12 — WASM client](12-wasm-client.md) — growable heap, hydration.

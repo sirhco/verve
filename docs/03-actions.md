@@ -1,8 +1,9 @@
-# 03 — Actions (Zerver)
+# 03 — Actions / Server Functions
 
-An action is a server-side function the framework exposes as
-`POST /api/<fn_name>`. No router config — Verve walks the `Actions`
-struct at compile time and generates the dispatcher.
+An action (Verve's name for a server function) is a server-side fn
+the framework exposes as `POST /api/<fn_name>`. No router config —
+Verve walks the `Actions` struct at compile time and generates the
+dispatcher.
 
 ## The convention
 
@@ -27,6 +28,19 @@ Every action is `pub fn name(args: struct { ... }) Ret`. The single
 struct argument is required — the dispatcher reads field names off the
 struct's `@typeInfo` at comptime because parameter names aren't
 available there.
+
+## Three call paths
+
+The same action surfaces three ways:
+
+1. **POST /api/&lt;name&gt;** — native HTTP endpoint. Form posts and JSON
+   posts both work; see [Dual-mode dispatch](#dual-mode-dispatch).
+2. **`ctx.serverFn(app.Actions.foo, args)`** — direct invocation from
+   server-side render code. Skips the HTTP/JSON roundtrip; returns
+   the function's real return type.
+3. **`window.verveServerFn("foo", args)`** — JavaScript wrapper that
+   POSTs the same endpoint. WASM islands (Phase 8) will get typed
+   stubs on top of this generic helper.
 
 ## Return types
 
@@ -53,9 +67,39 @@ The dispatcher inspects `Content-Type` to decide how to parse the body:
   user back on a sensible page.
 
 The detection happens once, before the body is read, via
-`api_handler.RequestMeta.fromRequest` — see
+`verve.RequestMeta.fromRequest` — see
 [`06-realtime.md`](06-realtime.md) for why header iteration must
 precede body reads.
+
+## CSRF on form POSTs
+
+Form-encoded POSTs to `/api/<fn>` are CSRF-protected by default. The
+server expects:
+
+- A `__verve_csrf=<token>` cookie (auto-issued on the first GET that
+  renders a page).
+- A `__csrf=<same-token>` field inside the form body.
+
+Render code adds the hidden field with the helper:
+
+```zig
+ctx.actionForm(.{ .post = "/api/addTodo", .class = "todo-form" })
+    .children(.{
+        ctx.input().name("text").type_("text").required(),
+        ctx.button("Add").type_("submit"),
+    })
+```
+
+`actionForm` is `form` + an injected `<input type=hidden
+name=__csrf value=…>`. The standalone `ctx.csrfField()` helper is
+available if you need to embed the field in a hand-built form.
+
+JSON posts skip the form-CSRF check because they're already
+same-origin-only thanks to `SameSite=Strict` on the cookie. The full
+threat model lives in [`13-security.md`](13-security.md).
+
+Disable enforcement during integration tests via
+`verve-server --csrf=disable`.
 
 ## Form body parsing details
 
@@ -86,10 +130,14 @@ curl -X POST http://127.0.0.1:8080/api/updateDatabase \
   -d '{"new_count":42}'
 # → {"ok":true}
 
-# Form
-curl -X POST http://127.0.0.1:8080/api/addTodo \
+# Form — requires CSRF cookie + field
+COOKIE_JAR=$(mktemp)
+TOKEN=$(curl -s -c "$COOKIE_JAR" http://127.0.0.1:8080/counter \
+  | grep -o 'name="__csrf" value="[^"]*"' \
+  | sed 's/.*value="\([^"]*\)".*/\1/')
+curl -X POST -b "$COOKIE_JAR" http://127.0.0.1:8080/api/addTodo \
   -H 'content-type: application/x-www-form-urlencoded' \
-  -d 'text=buy+milk' \
+  -d "__csrf=$TOKEN&text=buy+milk" \
   -H 'Referer: /todos'
 # → 303 See Other, Location: /todos
 
@@ -99,8 +147,30 @@ curl -X POST http://127.0.0.1:8080/api/getCount \
 # → {"value":7}
 ```
 
-The wasm client invokes JSON actions via the `post_json_i32` extern
-declared in `src/client/dom.zig`. See [`05-reactivity.md`](05-reactivity.md).
+The JS bridge invokes JSON actions via `window.verveServerFn(name,
+args)`:
+
+```js
+const todos = await window.verveServerFn("listTodos", { limit: 20 });
+```
+
+The wrapper auto-decodes the `{ value: … }` / `{ ok: true }`
+envelope and returns the bare payload.
+
+## Calling from render code
+
+When you're already on the server, the HTTP roundtrip is pure
+overhead — call the function directly:
+
+```zig
+fn renderTodos(ctx: *verve.Context) !*verve.Node {
+    const items = ctx.serverFn(app.Actions.listTodos, .{ .limit = 20 });
+    return components.todoList(ctx, items);
+}
+```
+
+`ctx.serverFn` returns the function's actual return type, so this
+composes naturally with `try` for error-returning actions.
 
 ## Error handling
 
@@ -129,6 +199,10 @@ pub fn doThing(args: struct { id: usize }) Result {
 }
 ```
 
+The matching `verve.ErrorBoundary` pattern lets the render-side catch
++ display these without bubbling to the framework's 500 page; see
+[`05-reactivity.md`](05-reactivity.md).
+
 ## A no-state action
 
 Actions that take no input parameters use the empty struct:
@@ -139,20 +213,17 @@ pub fn ping(_: struct {}) []const u8 {
 }
 ```
 
-Form mode: `POST /api/ping` with an empty body → 303 to Referer.
-JSON mode: `POST /api/ping` with `{}` → `{"value":"pong"}`.
+Form mode: `POST /api/ping` with an empty body (plus CSRF) → 303 to
+Referer. JSON mode: `POST /api/ping` with `{}` → `{"value":"pong"}`.
 
 ## Reading raw headers in an action
 
-The dispatcher pre-parses `Content-Type`, `Referer`, and
-`Accept-Encoding` into a `RequestMeta` struct, but the action itself
-doesn't get the request handle. If you need other headers (e.g.
-`Authorization`), the cleanest path right now is to extend
-`RequestMeta` in `src/server/api_handler.zig:20-40` and add the field
-you need.
-
-(See [`11-deployment.md`](11-deployment.md) for why this layer is
-strict about header iteration order.)
+The dispatcher pre-parses headers into `verve.RequestMeta` and the
+action itself can read it via the dispatch's `meta` arg. Cookies,
+Accept-Language, User-Agent, Origin, and the raw Cookie header are
+all available. If you need a header that's not currently broken out,
+add the field to `src/core/request_meta.zig` and parse it in
+`fromRequest`.
 
 ## Discovering registered actions
 
@@ -168,11 +239,11 @@ info(verve): actions:
 ```
 
 The walk happens via `inline for (comptime std.meta.declarations(app.Actions))`
-in `src/server/main.zig:706-710`. Adding a `pub fn` to `Actions`
-automatically registers it — no other config required.
+in `src/server/main.zig`. Adding a `pub fn` to `Actions` automatically
+registers it — no other config required.
 
 ## Next
 
-- [04 — Routing](04-routing.md) — page route table + how the action
-  dispatcher hangs off the same `app` module.
-- [05 — Reactivity](05-reactivity.md) — wiring actions to wasm signals.
+- [04 — Routing](04-routing.md) — page route table + path params.
+- [05 — Reactivity](05-reactivity.md) — wiring actions to signals + effects.
+- [13 — Security](13-security.md) — CSRF + CSP + Origin pinning.

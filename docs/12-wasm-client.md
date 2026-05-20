@@ -133,35 +133,32 @@ export fn say_hello() void {
 }
 ```
 
-## Fixed-buffer allocator
+## Growable bump allocator
 
-A 16 KB static heap backs a `std.heap.FixedBufferAllocator`:
-
-```zig
-// src/client/allocator.zig
-pub const HEAP_SIZE: usize = 16 * 1024;
-
-var heap: [HEAP_SIZE]u8 = undefined;
-var fba: std.heap.FixedBufferAllocator = .init(&heap);
-
-pub fn allocator() std.mem.Allocator { return fba.allocator(); }
-pub fn reset() void { fba.reset(); }
-pub fn bytesUsed() usize { return fba.end_index; }
-pub fn capacity() usize { return HEAP_SIZE; }
-```
-
-Monotonic — no free list. Call `client_alloc.reset()` between render
-passes when the previous frame's buffers are unreachable. Typical
-usage:
+`src/client/allocator.zig` is a growable bump arena over linear
+memory:
 
 ```zig
-const alloc = client_alloc.allocator();
-const formatted = try std.fmt.allocPrint(alloc, "Count: {d}", .{n});
-defer client_alloc.reset();   // after all set_text_by_bind calls done
-dom.set_text_by_bind("status".ptr, 6, formatted.ptr, formatted.len);
+// src/client/allocator.zig — abridged
+pub const MAX_HEAP: usize = 16 * 1024 * 1024;
+
+pub fn allocator() std.mem.Allocator { … }
+pub fn reset() void { /* rewinds bump pointer */ }
+pub fn bytesUsed() usize { … }
+pub fn capacity() usize { … }
 ```
 
-Diagnostic exports surface FBA state to JS:
+The allocator anchors at the end of statically-reserved wasm memory
+(via `@wasmMemorySize`) and grows by 64 KB pages on demand
+(`@wasmMemoryGrow`) up to `MAX_HEAP`. No free list; `reset()` rewinds
+the bump pointer in O(1) — call it between render passes when the
+previous frame's buffers are unreachable. Memory is never returned
+to the wasm host (decommit isn't supported by `memory.grow`).
+
+Native builds (running client unit tests on the host) fall back to a
+static `MAX_HEAP`-sized buffer since `@wasmMemoryGrow` is wasm-only.
+
+Diagnostic exports surface allocator state to JS:
 
 ```js
 const used = exp.verve_alloc_used();
@@ -170,10 +167,21 @@ console.log(`wasm heap: ${used}/${cap}`);
 exp.verve_alloc_reset();
 ```
 
-Need more than 16 KB? Bump `HEAP_SIZE` — it ships in every wasm binary
-built against this client, so don't go wild. For genuinely large
-client-side state, swap the FBA for a wasm-page-grow allocator (call
-`@wasmMemoryGrow` and manage a free list manually).
+For very large client-side state (megabytes), pre-grow at startup by
+making one large allocation immediately; subsequent allocations
+inside the reserved region won't trigger further grows.
+
+## NodeRef hydration (Phase 8 roadmap)
+
+`ctx.nodeRef(.input, "email")` emits `data-ref="email"` on the
+server-rendered HTML. The client-side runtime exposes
+`verveQueryRef("email") -> ?Element` so wasm effects can resolve a
+typed handle to the live DOM node. The Phase 8 hydration loader will
+walk `<verve-island>` markers and invoke per-island wasm bundles that
+read these refs to attach handlers + subscribe to reactive state.
+
+Phase 7 ships the marker emission only — the Phase 8 loader and
+per-island bundling are the next round of work on the client side.
 
 ## Escape helper
 

@@ -4,8 +4,8 @@ Full-stack Zig web framework. Server-side rendering with fine-grained reactivity
 
 Targets **Zig 0.16.0**.
 
-📚 **[Documentation](docs/README.md)** — 12 topic guides covering every feature.
-🧪 **[Examples](examples/README.md)** — three runnable sample apps (chat, poll, bookmarks).
+📚 **[Documentation](docs/README.md)** — 16 topic guides covering every feature.
+🧪 **[Examples](examples/README.md)** — 8 runnable sample apps including a full Phase 0-10 [showcase](examples/showcase/).
 
 ```sh
 zig build                           # native server + wasm client
@@ -15,17 +15,58 @@ zig build test --summary all        # 19 tests across core + server + integratio
 
 ## What's in the box
 
-- Streaming SSR via `std.http.Server`, chunked transfer-encoding, no full-body buffering
-- Comptime page router and `/api/<fn>` dispatcher (walks `app.Actions` decls)
-- Dual-mode actions: JSON bodies return `{"ok":true}` or `{"value":...}`; form bodies return `303 See Other` to the Referer
-- Per-connection worker threads with a bounded admission cap (`--workers N`)
-- Server-Sent Events at `/events`, bidirectional WebSocket at `/ws`
-- Static asset routing at `/public/*` — runtime (`--public-dir`) or comptime-embedded (`-Dpublic-dir=...`)
-- Gzip compression for HTML / JS / WASM / JSON / CSS / SVG / text when the client advertises `Accept-Encoding: gzip`
-- `/health` (uptime + request count) and `/metrics` (per-route latency JSON)
-- LISTEN_FDS env-var support for systemd-style socket activation
-- Graceful shutdown on `SIGINT` / `SIGTERM`
-- A 565 B wasm client + 80-line JS bridge, both `@embedFile`'d into the binary
+### Routing + rendering
+- Comptime route parser with **path parameters** (`/work/:slug`), **wildcards** (`/files/*rest`), and **nested layouts** with `ctx.outlet()`.
+- **ProtectedRoute** guards + **Redirect** sentinel (`ctx.redirect("/login")`).
+- **`useLocation`** — `ctx.location` with lazy query parsing + `isActive`.
+- `RequestMeta` exposes cookies, Accept-Language, User-Agent, Origin, Host.
+
+### Reactivity
+- **Signal / Effect / Store / Resource** — full SolidJS/Leptos-style runtime.
+- **Owner tree** with `on_cleanup` (LIFO disposal).
+- **`untrack` / `batch`** escape hatches.
+- **Typed NodeRef** + `data-ref` markers.
+- **Reactive ErrorBoundary** — `Signal(?anyerror)` with `captureError` / `reset`.
+
+### Head + components
+- **Head slot accumulator** — `ctx.setTitle / metaTag / linkTag / jsonLd` with explicit priority + replace-not-append semantics.
+- **`provide` / `use` DI** through the owner chain.
+- **Slot / SlotMap** — named children API.
+- **`show` / `forEach` / `portal`** — control-flow helpers.
+
+### Auth + security
+- **CSRF** — HMAC-SHA256 token, auto-issued cookie + `__csrf` form field. `ctx.actionForm` injects the field automatically.
+- **CSP nonce** — per-request 12-byte hex nonce in `Content-Security-Policy: script-src 'nonce-…' 'strict-dynamic'`.
+- **Origin pinning** on form POSTs.
+- **`SameSite=Strict`** on the CSRF cookie.
+
+### SSR + client
+- Streaming SSR via `std.http.Server`, chunked transfer-encoding, no full-body buffering.
+- **`ctx.fetch`** wrapper around `std.http.Client`.
+- **`ctx.serverFn`** — server-side direct call into `app.Actions`.
+- **SPA navigation** via `verve.link` — delegated click intercept, head merge, body swap, prefetch-on-hover, popstate handler.
+- **Growable WASM heap** (`@wasmMemoryGrow`), `verveQueryRef("id")` for NodeRef lookup.
+
+### i18n
+- `verve.I18nCatalog` + `resolveLocale` — cookie → query → Accept-Language → default with language-prefix fallback.
+
+### Assets
+- Static asset routing at `/public/*` — runtime (`--public-dir`) or comptime-embedded (`-Dpublic-dir=…`).
+- **Hashed URLs**: `/public/style-d5a73163.css` with `Cache-Control: public, max-age=31536000, immutable`. `ctx.assetHref("style.css")` resolves to the hashed form.
+- **mtime-aware LRU** for `--public-dir` reads.
+- **Precompressed `.br` / `.gz`** siblings served when present.
+
+### Dev + ops
+- **`--dev`** auto-reload: injects a WS-disconnect-reconnect script. Pair with `zig build --watch run -- --dev`.
+- **`--csrf=enforce|disable`** flag (default enforce).
+- `/events` SSE + `/ws` bidirectional WebSocket.
+- `/health` (uptime + request count) + `/metrics` (per-route latency JSON).
+- Per-connection worker pool with bounded admission (`--workers N`).
+- LISTEN_FDS env-var support for systemd socket activation.
+- Graceful shutdown on `SIGINT` / `SIGTERM`.
+
+### Islands (scaffold)
+- `verve.island(ctx, opts, inner)` emits `<verve-island data-name=… data-props=…>` markers. Full per-island WASM hydration loader = Phase 8 follow-up.
 
 ## Quickstart
 
@@ -44,6 +85,15 @@ Then open:
 - <http://127.0.0.1:8080/> — landing page
 - <http://127.0.0.1:8080/counter> — live counter (updates via WebSocket when JS is available, native `<form>` submit otherwise)
 - <http://127.0.0.1:8080/todos> — pure server-rendered todo list (no wasm needed)
+- <http://127.0.0.1:8080/work/hello-world> — path-parameter + per-page head slots demo
+- <http://127.0.0.1:8080/app/dashboard> — nested layout route
+
+Or run the **showcase** for a tour of every feature:
+
+```sh
+cd examples/showcase
+zig build run -- --dev
+```
 
 Static-asset demo:
 
@@ -72,19 +122,27 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
     return ctx.main_().children(.{
         ctx.h1("Verve"),
         ctx.p().text("Hello from Zig."),
+        ctx.p().children(.{ verve.link(ctx, "/about", "About →", .{}) }),
     }).build();
 }
 ```
 
-Register it in the route table:
+Register it in the route table — `Route.init` for leaf routes,
+`Route.layout` for nested layouts:
 
 ```zig
 // src/app/routes.zig
-pub const routes: []const Route = &.{
-    .{ .path = "/", .render = renderHome },
+pub const routes: []const verve.Route = &.{
+    verve.Route.init("/",        renderHome),
+    verve.Route.init("/work/:slug", renderWorkDetail),
+    verve.Route.layout("/app",   renderShell, &.{
+        verve.Route.init("/dashboard",        renderDashboard),
+        verve.Route.init("/settings/:section", renderSettings),
+    }),
 };
 
-fn renderHome(ctx: *const verve.Context) !*verve.Node {
+fn renderHome(ctx: *verve.Context) !*verve.Node {
+    try ctx.setTitle("Verve");
     const body = try components.home(ctx);
     return components.page(ctx, body);   // wraps in <html>/<head>/<body>
 }
@@ -123,20 +181,21 @@ Form submissions auto-redirect (303) to the `Referer`, so plain `<form action="/
 
 | Method | Path | Notes |
 |---|---|---|
-| GET  | `/`, `/counter`, `/todos`, …    | Pages from `app.routes` |
-| POST | `/api/<fn>` | Dispatched to `app.Actions.<fn>`; JSON or form-encoded |
-| GET  | `/client.wasm`, `/verve.js`     | Embedded client + bridge |
-| GET  | `/public/<path>`                | Static assets (runtime or comptime) |
-| GET  | `/events`                       | Server-Sent Events (text/event-stream) |
-| GET  | `/ws`                           | WebSocket upgrade |
-| GET  | `/health`                       | JSON: `{status, uptime_sec, requests}` |
-| GET  | `/metrics`                      | JSON: per-route count / avg_ns / max_ns |
+| GET  | `/`, `/counter`, `/todos`, …       | Pages from `app.routes` (supports `:param`, `*wildcard`, nested layouts) |
+| POST | `/api/<fn>`                        | Dispatched to `app.Actions.<fn>`; JSON skips CSRF, form requires `__csrf` field |
+| GET  | `/client.wasm`, `/verve.js`        | Embedded client + bridge |
+| GET  | `/public/<path>`                   | Static assets (hashed URL → immutable cache, plain → max-age=300) |
+| GET  | `/events`                          | Server-Sent Events (text/event-stream) |
+| GET  | `/ws`                              | WebSocket upgrade |
+| GET  | `/__verve/dev_ws`                  | Dev auto-reload (only with `--dev`) |
+| GET  | `/health`                          | JSON: `{status, uptime_sec, requests}` |
+| GET  | `/metrics`                         | JSON: per-route count / avg_ns / max_ns |
 
 ## CLI
 
 ```text
 verve-server [--host HOST] [--port PORT] [--body-limit SIZE]
-             [--public-dir DIR] [--workers N] [--help]
+             [--public-dir DIR] [--workers N] [--csrf=MODE] [--dev] [--help]
 ```
 
 | Flag | Default | Notes |
@@ -144,13 +203,16 @@ verve-server [--host HOST] [--port PORT] [--body-limit SIZE]
 | `--host`        | `127.0.0.1`      | IP literal. Use `0.0.0.0` for any interface. |
 | `--port`        | `8080`           | TCP port; `0` rejected (ephemeral binding unsupported). |
 | `--body-limit`  | `1m`             | Max POST body size. Accepts `k`/`m`/`g` suffix. |
-| `--public-dir`  | (none)           | Serve files from `DIR` at `/public/*`. |
+| `--public-dir`  | (none)           | Serve files from `DIR` at `/public/*`, backed by mtime-aware LRU. |
 | `--workers`     | `CPU * 2`        | Max in-flight connections; excess returns `503`. |
+| `--csrf`        | `enforce`        | `disable` for integration tests; production should leave on. |
+| `--dev`         | off              | Inject auto-reload script + accept `/__verve/dev_ws` upgrades. |
 | `-h, --help`    |                  | Print usage and exit. |
 
 ### Environment
 
 - `LISTEN_FDS=N` — adopt file descriptor 3 as the listening socket (systemd activation). `--host` / `--port` ignored when set.
+- `VERVE_CSRF_KEY` — hex-encoded 32 bytes for stable CSRF tokens across restarts. Random key drawn at startup when absent.
 
 ### Build options
 

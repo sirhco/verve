@@ -72,7 +72,50 @@ for (public_assets.entries) |entry| {
 }
 ```
 
-So the resolution order is **disk → embed → 404**.
+So the resolution order is **hashed URL → disk → embed → 404**.
+
+## Hashed asset URLs
+
+Comptime-embedded assets also generate cache-busted URLs. The build
+step hashes each file's bytes (Wyhash, low 32 bits → 8 hex chars) and
+embeds the hash on each `Entry`. The server accepts BOTH URLs for
+the same file:
+
+| URL form | Cache-Control | Use when |
+|---|---|---|
+| `/public/style.css`           | `public, max-age=300`              | dev / first request |
+| `/public/style-d5a73163.css`  | `public, max-age=31536000, immutable` | every release |
+
+Render code resolves the hashed URL via `ctx.assetHref`:
+
+```zig
+try ctx.linkTag(.{
+    .rel = "stylesheet",
+    .href = try ctx.assetHref("style.css"),
+});
+```
+
+The helper consults the embedded manifest, picks the hash for the
+current bytes, and returns `/public/style-<hash>.css`. Apps don't
+need to manage rebuild-vs-cache-bust by hand.
+
+Unknown asset paths (no entry in the manifest) fall through to the
+raw `/public/<name>` URL — safe behavior for dev without
+`-Dpublic-dir`.
+
+## Public-dir LRU
+
+When `--public-dir` is set the server keeps an in-memory LRU keyed by
+`(mtime, size, inode)`. Repeat hits skip both the `open` and the
+`read` — only a cheap `stat` runs to confirm the file hasn't
+changed. mtime change → eviction + re-read.
+
+Defaults: 32 MB cache, 256 entries, 8 MB per-file cap (files larger
+than the per-file cap are served but never cached).
+
+The cache lives in `src/server/public_dir.zig` and is initialized
+only when `--public-dir` is provided; the embed-only path bypasses it
+since the bytes are already in memory.
 
 ## Why both?
 
@@ -164,9 +207,24 @@ curl -i http://127.0.0.1:8080/public/hello.txt
 # static asset fixture
 ```
 
+## Precompressed brotli / gzip
+
+Drop a `style.css.br` (or `.gz`) next to `style.css` in your
+`--public-dir`. When the client sends `Accept-Encoding: br` (or
+`gzip`), the server serves the precompressed sibling verbatim with
+`content-encoding: br`. No on-the-fly brotli encoding — the
+ecosystem doesn't have a vetted pure-Zig encoder yet, so precompute
+at build time when you want smaller payloads than gzip.
+
+For dynamic HTML responses the server falls back to on-the-fly
+`std.compress.flate` gzip (skipped when the content-type is already
+compressed: PNG, WEBP, WASM, etc.).
+
 ## Next
 
 - [08 — Observability](08-observability.md) — `/health` + `/metrics` +
   request logging.
 - [09 — Performance](09-performance.md) — gzip details, admission cap,
   thread pool.
+- [13 — Security](13-security.md) — CSP nonce header that applies to
+  inline scripts referenced from served HTML.

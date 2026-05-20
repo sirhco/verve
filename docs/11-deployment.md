@@ -208,6 +208,63 @@ The handler runs in the same thread pool as every other request, so
 under admission saturation it'll get a 503 — which is the right
 liveness signal anyway (probe failures should mirror real traffic).
 
+## CLI flags
+
+```
+--host HOST          Bind interface (default 127.0.0.1). Use 0.0.0.0
+                     for public binding.
+--port PORT          TCP port (default 8080).
+--body-limit SIZE    Max POST body bytes (k/m/g suffixes). Default 1m.
+--public-dir DIR     Directory served at /public/*; backed by an LRU.
+--workers N          Max concurrent in-flight connections.
+                     Default clamp(cpu*2, 4, 1024); excess gets 503.
+--csrf MODE          enforce (default) or disable. Disable is for
+                     integration tests; production should leave it on.
+--dev                Enables auto-reload: injects a small <script>
+                     that reconnects to /__verve/dev_ws after the
+                     server restarts. Pair with `zig build --watch run -- --dev`.
+```
+
+## Environment variables
+
+| Var | Purpose |
+|---|---|
+| `LISTEN_FDS`        | systemd socket activation — adopt fd 3 as the listener. |
+| `VERVE_CSRF_KEY`    | Hex-encoded 32 bytes. Stabilizes CSRF tokens across restarts. When absent the server draws a random key at startup. |
+
+## CSRF + CSP defaults
+
+Every HTML response carries:
+
+- `Set-Cookie: __verve_csrf=<hmac-token>; HttpOnly; SameSite=Strict; Path=/`
+  on a fresh request, or no Set-Cookie when the client already has a
+  valid token in its cookie jar.
+- `Content-Security-Policy: script-src 'nonce-<12-byte-hex>'
+  'strict-dynamic'; object-src 'none'; base-uri 'self'`.
+
+`SameSite=Strict` plus the cookie+field round-trip blocks the classic
+CSRF attack vectors. See [`13-security.md`](13-security.md) for the
+threat model and migration notes if you want a custom CSP.
+
+## Dev-mode workflow
+
+`--dev` injects a `<script>` immediately before `</body>` that opens
+a WebSocket to `/__verve/dev_ws`. The script uses the connection's
+lifecycle as the reload signal:
+
+1. First open → "we've been alive."
+2. Close (server restart, crash, deploy) → wait, retry.
+3. Reconnect succeeds → `location.reload()`.
+
+Pair with file watching:
+
+```sh
+zig build --watch run -- --dev --public-dir ./public
+```
+
+`zig build --watch` rebuilds + restarts the server on `.zig` changes;
+the browser refreshes within ~500 ms.
+
 ## Next
 
 - [12 — WASM client](12-wasm-client.md) — the wasm-side details that

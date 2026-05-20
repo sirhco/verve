@@ -6,23 +6,27 @@ you know what you need.
 ## Reading order for a newcomer
 
 1. [Getting started](01-getting-started.md) — install, build, run, write your first page
-2. [Component model](02-components.md) — `Node`, `Attr`, `Context`, the renderer
-3. [Actions (Zerver)](03-actions.md) — the `/api/<fn>` dispatcher, JSON vs form, error returns
-4. [Routing](04-routing.md) — page route table, the comptime API walk
-5. [Reactivity](05-reactivity.md) — server signals + client signals + multi-bind
+2. [Component model](02-components.md) — `Node`, `Context`, head slots, NodeRef, Slot
+3. [Actions / Server Functions](03-actions.md) — `/api/<fn>` dispatcher, `ctx.serverFn`, CSRF on forms
+4. [Routing](04-routing.md) — path params, nested layouts, Outlet, Redirect, ProtectedRoute, Link
+5. [Reactivity](05-reactivity.md) — Owner tree, Signal, Effect, Store, Resource, ErrorBoundary
 6. [Realtime: SSE + WebSocket](06-realtime.md) — push state to the browser
-7. [Static assets](07-static-assets.md) — `--public-dir` runtime, `-Dpublic-dir` comptime
+7. [Static assets](07-static-assets.md) — hashed URLs, public-dir LRU, precompressed brotli
 8. [Observability](08-observability.md) — `/health`, `/metrics`, logging
 9. [Performance & hardening](09-performance.md) — thread pool, admission cap, gzip
 10. [CLI scaffolder](10-scaffolder.md) — `verve-cli new`
-11. [Deployment](11-deployment.md) — systemd `LISTEN_FDS`, signal handling, body limits
-12. [WASM client](12-wasm-client.md) — the wasm32-freestanding runtime, FBA, HTML escape
+11. [Deployment](11-deployment.md) — CLI flags, systemd `LISTEN_FDS`, `--dev`, `VERVE_CSRF_KEY`
+12. [WASM client](12-wasm-client.md) — wasm32-freestanding runtime, growable bump heap
+13. [Security](13-security.md) — CSRF, CSP nonce, Origin pinning, ProtectedRoute
+14. [i18n](14-i18n.md) — Catalog + locale resolution
+15. [Islands](15-islands.md) — opt-in hydration boundary API + Phase 8 roadmap
+16. [SPA router](16-spa-router.md) — `verve.link`, head merge + body swap, prefetch
 
 ## Reference
 
 - [Top-level README](../README.md) — quickstart + feature matrix
 - [HANDOFF.md](../HANDOFF.md) — non-obvious context across sessions
-- [Examples](../examples/README.md) — three working sample apps
+- [Examples](../examples/README.md) — runnable sample apps
 
 ## Conventions used throughout
 
@@ -36,15 +40,27 @@ you know what you need.
 
 ## Glossary
 
-- **Action** — a `pub fn` on `Actions` that the framework exposes as
-  `POST /api/<fn>`. Convention: takes a single struct argument.
-- **Bridge** — `src/bridge/verve.js`, ~100 lines of glue that loads
-  the wasm client and routes DOM events to it.
-- **Context** — per-request `ArenaAllocator` wrapper passed into render
-  functions. Memory is freed when the request completes.
-- **Signal** — server-side reactive value; mutations notify subscribed
-  listeners (used by tests, not the request path today).
-- **ClientSignal** — wasm-side reactive value; mutations call an extern
-  to update the DOM via the bridge.
-- **Zerver action** — Verve's name for an RPC-like server function that
-  appears on the client without any boilerplate.
+- **Action / Server Function** — a `pub fn` on `app.Actions` that the
+  framework exposes as `POST /api/<fn>`. Convention: takes a single
+  struct argument. Callable from render code via `ctx.serverFn(fn, args)`.
+- **Bridge** — `src/bridge/verve.js`, ~250 lines of glue that loads
+  the wasm client, registers the SPA router, runs server-fn POSTs,
+  and registers `<verve-island>` as a custom element.
+- **Context** — per-request handle. Owns the arena, the reactive
+  Owner, the head accumulator, captured route params, the current
+  Location, the request header snapshot, and the asset resolver.
+- **Owner** — reactive scope. Disposes its child owners and `on_cleanup`
+  hooks in LIFO when the request ends.
+- **Signal / Effect** — reactive primitives. Effects re-run when any
+  Signal they read changes. Cleanup via the enclosing Owner.
+- **Store** — comptime struct wrapper with one Signal per field —
+  field-grained reactivity.
+- **Resource** — async-value wrapper exposing
+  `.loading | .ready(T) | .err`.
+- **Island** — opt-in hydration boundary marked with
+  `<verve-island data-name=… data-props=…>`. Phase 8 will fetch the
+  matching WASM chunk and hydrate the subtree.
+- **NodeRef** — typed handle to a DOM node that survives hydration.
+  Server emits `data-ref="<id>"`; client resolves via `verveQueryRef`.
+- **Redirect** — sentinel return value from a render fn or guard
+  that triggers a 302/303 instead of HTML.
