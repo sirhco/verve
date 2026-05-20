@@ -326,7 +326,12 @@ pub const Settings = struct {
     density: Density = .cozy,
     notifications: bool = true,
     digest_weekly: bool = false,
-    accent: [16]u8 = ("#1f6feb" ++ ("\x00" ** 9)).*,
+    accent: [16]u8 = blk: {
+        var buf: [16]u8 = [_]u8{0} ** 16;
+        const default = "#1f6feb";
+        for (default, 0..) |c, i| buf[i] = c;
+        break :blk buf;
+    },
     accent_len: u8 = 7,
     refresh_seconds: u8 = 5,
 
@@ -336,6 +341,13 @@ pub const Settings = struct {
 };
 
 pub var settings: Settings = .{};
+
+/// Init the default accent at startup so the field's `[16]u8` slot
+/// holds "#1f6feb" rather than zeros. (Field default-init with
+/// string-literal coercion doesn't fully populate the buffer here.)
+fn initSettings() void {
+    @memcpy(settings.accent[0..7], "#1f6feb");
+}
 var settings_mu: std.atomic.Mutex = .unlocked;
 
 fn lockSettings() void {

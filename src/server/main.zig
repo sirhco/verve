@@ -518,8 +518,11 @@ fn renderPage(req: RenderRequest) !void {
     else
         null;
 
-    var csp_buf: [128]u8 = undefined;
-    const csp_header = std.fmt.bufPrint(&csp_buf, "script-src 'nonce-{s}' 'strict-dynamic'; object-src 'none'; base-uri 'self'", .{csp_nonce}) catch null;
+    var csp_buf: [192]u8 = undefined;
+    // `wasm-unsafe-eval` is required for WebAssembly.instantiateStreaming;
+    // the framework's client.wasm needs it. Without the directive the
+    // browser blocks the wasm compile with a CSP error.
+    const csp_header = std.fmt.bufPrint(&csp_buf, "script-src 'nonce-{s}' 'strict-dynamic' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'self'", .{csp_nonce}) catch null;
 
     // Dev mode: splice the auto-reload client snippet into the body
     // right before `</body>`. Skips fragment / non-HTML responses since

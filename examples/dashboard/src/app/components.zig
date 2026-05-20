@@ -469,7 +469,11 @@ fn labelStatusCount(
 // ============================================================================
 
 pub fn settingsPage(ctx: *const verve.Context) !*verve.Node {
-    const s = api.settings;
+    // Use a pointer to the global so the slice returned by
+    // `accentSlice()` stays valid through render. A by-value copy here
+    // would put `s` on the stack of this fn and the slice would
+    // dangle after the chain returns.
+    const s = &api.settings;
 
     return ctx.div().class("page page-settings").children(.{
         ctx.div().class("page-head").children(.{
