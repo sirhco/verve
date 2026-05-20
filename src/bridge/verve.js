@@ -119,6 +119,29 @@
     }
   });
 
+  // ---- Server Functions ------------------------------------------------
+  // Generic JS-side caller for app.Actions endpoints. `name` matches
+  // the function declared in `app.Actions`; `args` is a plain object
+  // serialized as JSON. The browser automatically sends the CSRF
+  // cookie alongside same-origin requests; the form-CSRF check on
+  // the server only applies to form posts, so JSON server-fn calls
+  // bypass it (the threat model is XSS-injected forms, which the
+  // SameSite=Strict cookie also defends against).
+  window.verveServerFn = async (name, args) => {
+    const resp = await fetch(`/api/${name}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(args || {}),
+    });
+    if (!resp.ok) {
+      throw new Error(`verveServerFn ${name} ${resp.status}`);
+    }
+    const json = await resp.json();
+    if (Object.prototype.hasOwnProperty.call(json, "value")) return json.value;
+    if (Object.prototype.hasOwnProperty.call(json, "ok")) return json.ok;
+    return json;
+  };
+
   // ---- SPA router ------------------------------------------------------
   // Delegated click handler intercepts <a data-vlink="1"> anchors. The
   // target HTML is fetched, parsed, and grafted into the current

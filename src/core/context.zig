@@ -242,6 +242,19 @@ pub const Context = struct {
         return fetch_mod.fetch(self.allocator, url, opts);
     }
 
+    /// Direct-call a Server Function from a render. The function must
+    /// take a single struct argument (`app.Actions` convention). Since
+    /// we're already on the server, the call skips the JSON-encode →
+    /// HTTP → JSON-decode roundtrip that the client-side stub uses.
+    /// Returns the function's real return type.
+    pub fn serverFn(self: *const Context, comptime f: anytype, args: anytype) blk: {
+        const ret = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+        break :blk ret;
+    } {
+        _ = self;
+        return f(args);
+    }
+
     /// Build a hidden `<input>` carrying the current CSRF token. Add
     /// this to every `<form>` that posts to an Action; the server-side
     /// `api_handler` rejects POST requests whose form field doesn't
