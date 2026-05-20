@@ -1,0 +1,79 @@
+//! Islands — opt-in hydration boundary. Server renders the full HTML
+//! inline (so search engines and noscript clients see content), and
+//! wraps the subtree in a `<verve-island>` marker carrying the
+//! component name + JSON-serialized props. The Phase 8 client runtime
+//! (deferred) walks these markers, dynamically loads the per-island
+//! WASM chunk, and hydrates the subtree in place.
+//!
+//! Phase 7's scaffold ships the server-side marker emission + a
+//! placeholder client-side custom element that absorbs the marker
+//! without changing behavior. Full per-island WASM bundling, hash
+//! dedup, and the hydration loader come with Phase 8.
+
+const std = @import("std");
+const Context = @import("context.zig").Context;
+const Node = @import("node.zig").Node;
+
+pub const IslandOpts = struct {
+    /// Component identifier (typically `@typeName(Component)`). Phase
+    /// 8 uses this to look up the WASM chunk that owns this island.
+    name: []const u8,
+    /// Pre-serialized props blob (JSON or binary). Passed back to the
+    /// island's render fn during hydration. Caller is responsible for
+    /// encoding it.
+    props: []const u8 = "",
+    /// Optional initial state ID — useful when the island reads from
+    /// a Resource that was pre-resolved server-side.
+    state_id: ?[]const u8 = null,
+    /// When false, the inline HTML is emitted but no marker is set
+    /// (effectively turns the island into a plain SSR subtree). Used
+    /// for build-time A/B between island vs static.
+    hydrate: bool = true,
+};
+
+/// Wrap `inner` in an island marker. Server emits both the marker AND
+/// the inner HTML inline; Phase 8 hydration upgrades the marker to a
+/// reactive component.
+pub fn island(ctx: *const Context, opts: IslandOpts, inner: *Node) *Node {
+    if (!opts.hydrate) return inner;
+
+    var node = ctx.el("verve-island")
+        .attr("data-name", opts.name)
+        .attr("data-props", opts.props);
+    if (opts.state_id) |s| node = node.attr("data-state", s);
+    return node.children(.{inner});
+}
+
+// ---- tests ------------------------------------------------------------
+
+const testing = std.testing;
+
+test "island wraps subtree with data-name and data-props" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const inner = ctx.div().class("counter").text("0");
+    const wrapped = island(&ctx, .{ .name = "Counter", .props = "{}" }, inner);
+
+    try testing.expectEqualStrings("verve-island", wrapped.tag);
+    var has_name = false;
+    var has_props = false;
+    for (wrapped.attrs.items) |a| {
+        if (std.mem.eql(u8, a.key, "data-name") and std.mem.eql(u8, a.value, "Counter")) has_name = true;
+        if (std.mem.eql(u8, a.key, "data-props") and std.mem.eql(u8, a.value, "{}")) has_props = true;
+    }
+    try testing.expect(has_name);
+    try testing.expect(has_props);
+    try testing.expectEqual(@as(usize, 1), wrapped.children_list.items.len);
+}
+
+test "island hydrate=false returns inner unchanged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const inner = ctx.div().class("static");
+    const wrapped = island(&ctx, .{ .name = "x", .hydrate = false }, inner);
+    try testing.expect(wrapped == inner);
+}

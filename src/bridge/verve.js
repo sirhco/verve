@@ -119,6 +119,24 @@
     }
   });
 
+  // ---- Islands placeholder --------------------------------------------
+  // Phase 7 ships the server-side marker; the runtime here just
+  // registers `<verve-island>` as a custom element so the browser
+  // doesn't print a warning. Phase 8 will replace this stub with a
+  // dynamic per-island WASM loader that hydrates each marker.
+  if (typeof customElements !== "undefined" && !customElements.get("verve-island")) {
+    customElements.define(
+      "verve-island",
+      class extends HTMLElement {
+        connectedCallback() {
+          // No-op: SSR HTML is already inside this element. Phase 8
+          // hydration will read data-name + data-props here and swap
+          // in a reactive subtree.
+        }
+      },
+    );
+  }
+
   // ---- Server Functions ------------------------------------------------
   // Generic JS-side caller for app.Actions endpoints. `name` matches
   // the function declared in `app.Actions`; `args` is a plain object
