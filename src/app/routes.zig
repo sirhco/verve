@@ -8,7 +8,7 @@ const api = @import("api.zig");
 
 pub const Route = struct {
     path: []const u8,
-    render: *const fn (ctx: *const verve.Context) anyerror!verve.Node,
+    render: *const fn (ctx: *const verve.Context) anyerror!*verve.Node,
 };
 
 pub const routes: []const Route = &.{
@@ -17,17 +17,17 @@ pub const routes: []const Route = &.{
     .{ .path = "/todos", .render = renderTodos },
 };
 
-fn renderHome(ctx: *const verve.Context) !verve.Node {
+fn renderHome(ctx: *const verve.Context) !*verve.Node {
     const body = try components.home(ctx);
     return components.page(ctx, body);
 }
 
-fn renderCounter(ctx: *const verve.Context) !verve.Node {
+fn renderCounter(ctx: *const verve.Context) !*verve.Node {
     const body = try components.counter(ctx, api.currentCount());
     return components.page(ctx, body);
 }
 
-fn renderTodos(ctx: *const verve.Context) !verve.Node {
+fn renderTodos(ctx: *const verve.Context) !*verve.Node {
     const items = try api.copyTodosInto(ctx.alloc());
     const body = try components.todoList(ctx, items);
     return components.page(ctx, body);

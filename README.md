@@ -62,16 +62,17 @@ curl http://127.0.0.1:8080/public/hello.txt
 
 ## Writing a page
 
-A page is a function that builds a `Node` tree. The renderer streams the tree to the socket.
+A page is a function that builds a `*Node` tree via the fluent chain. Each
+method on `Node` mutates the arena-backed node and returns `*Node` so calls
+compose left-to-right. The renderer streams the tree to the socket.
 
 ```zig
 // src/app/components.zig
-pub fn home(ctx: *const verve.Context) !verve.Node {
-    const alloc = ctx.alloc();
-    const kids = try alloc.alloc(verve.Node, 2);
-    kids[0] = .{ .tag = "h1", .text = "Verve" };
-    kids[1] = .{ .tag = "p", .text = "Hello from Zig." };
-    return .{ .tag = "main", .children = kids };
+pub fn home(ctx: *const verve.Context) !*verve.Node {
+    return ctx.main_().children(.{
+        ctx.h1("Verve"),
+        ctx.p().text("Hello from Zig."),
+    }).build();
 }
 ```
 
@@ -83,13 +84,20 @@ pub const routes: []const Route = &.{
     .{ .path = "/", .render = renderHome },
 };
 
-fn renderHome(ctx: *const verve.Context) !verve.Node {
+fn renderHome(ctx: *const verve.Context) !*verve.Node {
     const body = try components.home(ctx);
     return components.page(ctx, body);   // wraps in <html>/<head>/<body>
 }
 ```
 
-`Node` and `Attr` are plain structs; `ctx.alloc()` returns a per-request `ArenaAllocator`. Anonymous array literals (`&.{...}`) hold runtime values that dangle after function return — use `try alloc.alloc(verve.Attr, N)` explicitly for any attr whose value isn't comptime-known.
+`ctx.alloc()` returns the per-request `ArenaAllocator` if you need it
+directly. Element factories on `Context` cover the common HTML tags
+(`div`, `span`, `h1`–`h4`, `a`, `button`, `form`, `input`, `ul`, `li`,
+`nav`, `main_`, `section`, ...); the generic `ctx.el(tag)` is the
+escape hatch. Chain methods include `.class()`, `.id()`, `.href()`,
+`.attr(k,v)`, `.attrFmt(k,fmt,args)`, `.text(t)`, `.textFmt(fmt,args)`,
+`.textInt(n)`, `.bind(name)`, `.onClick(action)`, `.children(.{ a, b, ... })`.
+Errors encountered mid-chain are deferred to the terminating `.build()`.
 
 ## Writing an Action (Zerver)
 

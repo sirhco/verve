@@ -108,8 +108,8 @@ pub const routes: []const Route = &.{
     .{ .path = "/hello", .render = renderHello },   // <— new
 };
 
-fn renderHello(ctx: *const verve.Context) !verve.Node {
-    return components.page(ctx, .{ .tag = "h1", .text = "Hello, Verve!" });
+fn renderHello(ctx: *const verve.Context) !*verve.Node {
+    return components.page(ctx, ctx.h1("Hello, Verve!"));
 }
 ```
 

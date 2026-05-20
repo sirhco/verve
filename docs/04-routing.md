@@ -16,7 +16,7 @@ free: `/health`, `/metrics`, `/events`, `/ws`, `/client.wasm`,
 // src/app/routes.zig
 pub const Route = struct {
     path: []const u8,
-    render: *const fn (ctx: *const verve.Context) anyerror!verve.Node,
+    render: *const fn (ctx: *const verve.Context) anyerror!*verve.Node,
 };
 
 pub const routes: []const Route = &.{
@@ -129,8 +129,8 @@ pub const routes: []const Route = &.{
     .{ .path = "/about", .render = renderAbout },
 };
 
-fn renderAbout(ctx: *const verve.Context) !verve.Node {
-    return components.page(ctx, .{ .tag = "h1", .text = "About" });
+fn renderAbout(ctx: *const verve.Context) !*verve.Node {
+    return components.page(ctx, ctx.h1("About"));
 }
 ```
 

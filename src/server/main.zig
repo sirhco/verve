@@ -117,6 +117,10 @@ fn runConnection(ctx: *ConnCtx) void {
     defer ctx.gpa.destroy(ctx);
     defer admit.release();
     handleConnection(ctx.gpa, ctx.io, ctx.stream) catch |err| {
+        // Client closed the socket mid-stream (e.g. SSE tab navigated away,
+        // browser refresh dropped the long-lived /events connection).
+        // Not a server fault — keep the log clean.
+        if (err == error.ReadFailed) return;
         log.err("connection error: {s}", .{@errorName(err)});
     };
 }
@@ -243,7 +247,7 @@ fn handleRequest(
     if (std.mem.eql(u8, path, "/ws")) {
         const upgrade = request.upgradeRequested();
         if (upgrade != .websocket or upgrade.websocket == null) {
-            try renderError(gpa, request, .bad_request, "WebSocket upgrade required.");
+            try renderError(gpa, io, request, .bad_request, "WebSocket upgrade required.");
             return;
         }
         try streamWebSocket(io, request, upgrade.websocket.?);
@@ -274,33 +278,34 @@ fn handleRequest(
 
     if (router.match(path)) |route| {
         if (request.head.method != .GET and request.head.method != .HEAD) {
-            try renderError(gpa, request, .method_not_allowed, "This page only accepts GET requests.");
+            try renderError(gpa, io, request, .method_not_allowed, "This page only accepts GET requests.");
             return;
         }
-        try renderPage(gpa, request, .ok, route.render, null, meta.accept_gzip);
+        try renderPage(gpa, io, request, .ok, route.render, null, meta.accept_gzip);
         return;
     }
 
-    try renderPage(gpa, request, .not_found, null, path, meta.accept_gzip);
+    try renderPage(gpa, io, request, .not_found, null, path, meta.accept_gzip);
 }
 
 fn renderPage(
     gpa: std.mem.Allocator,
+    io: std.Io,
     request: *std.http.Server.Request,
     status: std.http.Status,
-    route_render: ?*const fn (ctx: *const verve.Context) anyerror!verve.Node,
+    route_render: ?*const fn (ctx: *const verve.Context) anyerror!*verve.Node,
     not_found_path: ?[]const u8,
     accept_gzip: bool,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const ctx = verve.Context.init(&arena);
+    const ctx = verve.Context.initWithIo(&arena, io);
 
-    const node = blk: {
+    const node: *verve.Node = blk: {
         if (route_render) |render_fn| {
             break :blk render_fn(&ctx) catch |err| {
                 log.err("render error: {s}", .{@errorName(err)});
-                try renderError(gpa, request, .internal_server_error, "The page failed to render.");
+                try renderError(gpa, io, request, .internal_server_error, "The page failed to render.");
                 return;
             };
         }
@@ -318,13 +323,14 @@ fn renderPage(
 
 fn renderError(
     gpa: std.mem.Allocator,
+    io: std.Io,
     request: *std.http.Server.Request,
     status: std.http.Status,
     message: []const u8,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const ctx = verve.Context.init(&arena);
+    const ctx = verve.Context.initWithIo(&arena, io);
 
     const status_code: u16 = @intFromEnum(status);
     const status_text = status.phrase() orelse "Error";
@@ -402,6 +408,66 @@ const WsBroadcastCtx = struct {
     last_seen: i32,
 };
 
+// ---- WS chat broadcast registry ------------------------------------------
+//
+// Any text frame that is not "+"/"-" gets relayed to all other open WS
+// peers. Apps can wire a chat-like UI on top of `/ws` without touching the
+// framework. The registry uses a fixed-size slot array protected by a
+// spinlock-style mutex; allocations on the connection hot-path are avoided.
+
+const CHAT_PEER_MAX = 64;
+const CHAT_FRAME_MAX = 1024;
+
+const ChatPeer = struct {
+    ws: *std.http.Server.WebSocket,
+    write_mu: *std.atomic.Mutex,
+};
+
+var chat_peer_slots: [CHAT_PEER_MAX]?*ChatPeer = .{null} ** CHAT_PEER_MAX;
+var chat_peer_mu: std.atomic.Mutex = .unlocked;
+
+fn lockPeers() void {
+    while (!chat_peer_mu.tryLock()) std.atomic.spinLoopHint();
+}
+
+/// Insert the peer in the first free slot. Returns the slot index or null
+/// when the registry is full.
+fn registerPeer(peer: *ChatPeer) ?usize {
+    lockPeers();
+    defer chat_peer_mu.unlock();
+    for (&chat_peer_slots, 0..) |*s, i| {
+        if (s.* == null) {
+            s.* = peer;
+            return i;
+        }
+    }
+    return null;
+}
+
+fn unregisterPeer(slot: usize) void {
+    lockPeers();
+    defer chat_peer_mu.unlock();
+    chat_peer_slots[slot] = null;
+}
+
+fn broadcastChat(except_slot: usize, payload: []const u8) void {
+    // Snapshot peers under lock; write outside lock so a slow peer doesn't
+    // stall the broadcaster's other writes.
+    var snapshot: [CHAT_PEER_MAX]?*ChatPeer = undefined;
+    {
+        lockPeers();
+        defer chat_peer_mu.unlock();
+        snapshot = chat_peer_slots;
+    }
+    for (snapshot, 0..) |maybe, i| {
+        if (i == except_slot) continue;
+        const peer = maybe orelse continue;
+        while (!peer.write_mu.tryLock()) std.atomic.spinLoopHint();
+        defer peer.write_mu.unlock();
+        peer.ws.writeMessage(payload, .text) catch {};
+    }
+}
+
 /// Bidirectional WebSocket counter mirror. The reader half consumes "+"
 /// / "-" frames and applies them to `last_count`; the writer half (a
 /// helper thread) polls last_count every WS_TICK and pushes the current
@@ -418,6 +484,10 @@ fn streamWebSocket(
 
     var write_mu: std.atomic.Mutex = .unlocked;
     var shutdown: std.atomic.Value(bool) = .init(false);
+
+    var peer = ChatPeer{ .ws = &ws, .write_mu = &write_mu };
+    const peer_slot = registerPeer(&peer);
+    defer if (peer_slot) |s| unregisterPeer(s);
 
     // Initial state push.
     writeCount(&ws, &write_mu);
@@ -441,12 +511,22 @@ fn streamWebSocket(
 
         if (std.mem.eql(u8, msg.data, "+")) {
             _ = app.last_count.fetchAdd(1, .monotonic);
+            writeCount(&ws, &write_mu);
         } else if (std.mem.eql(u8, msg.data, "-")) {
             _ = app.last_count.fetchSub(1, .monotonic);
+            writeCount(&ws, &write_mu);
         } else {
-            // Unknown frame — echo current count anyway.
+            // Treat as chat: fan out to every other connected peer, plus
+            // echo back to the sender so their UI confirms receipt.
+            const len = @min(msg.data.len, CHAT_FRAME_MAX);
+            const payload = msg.data[0..len];
+            if (peer_slot) |s| broadcastChat(s, payload);
+            {
+                while (!write_mu.tryLock()) std.atomic.spinLoopHint();
+                defer write_mu.unlock();
+                ws.writeMessage(payload, .text) catch {};
+            }
         }
-        writeCount(&ws, &write_mu);
     }
 }
 
@@ -487,7 +567,7 @@ fn serveStatic(
     accept_gzip: bool,
 ) !void {
     if (rel_path.len == 0 or rel_path[0] == '/' or std.mem.indexOf(u8, rel_path, "..") != null) {
-        try renderError(gpa, request, .forbidden, "Invalid static asset path.");
+        try renderError(gpa, io, request, .forbidden, "Invalid static asset path.");
         return;
     }
 
@@ -513,7 +593,7 @@ fn serveStatic(
         }
     }
 
-    try renderError(gpa, request, .not_found, "Static asset not found.");
+    try renderError(gpa, io, request, .not_found, "Static asset not found.");
 }
 
 /// Returns true when the request was answered (either with the file or
@@ -531,7 +611,7 @@ fn tryServeFromDisk(
         error.FileNotFound, error.NotDir, error.IsDir => return false,
         else => {
             log.err("static open {s}: {s}", .{ rel_path, @errorName(err) });
-            try renderError(gpa, request, .internal_server_error, "Static asset open failed.");
+            try renderError(gpa, io, request, .internal_server_error, "Static asset open failed.");
             return true;
         },
     };
@@ -539,7 +619,7 @@ fn tryServeFromDisk(
 
     const stat = try file.stat(io);
     if (stat.size > STATIC_MAX_SIZE) {
-        try renderError(gpa, request, .payload_too_large, "Static asset exceeds the per-file size limit.");
+        try renderError(gpa, io, request, .payload_too_large, "Static asset exceeds the per-file size limit.");
         return true;
     }
 
