@@ -3,22 +3,17 @@ const verve = @import("verve");
 const components = @import("components.zig");
 const api = @import("api.zig");
 
-pub const Route = struct {
-    path: []const u8,
-    render: *const fn (ctx: *const verve.Context) anyerror!*verve.Node,
+pub const routes: []const verve.Route = &.{
+    verve.Route.init("/", renderOverview),
+    verve.Route.init("/tasks", renderTasks),
+    verve.Route.init("/team", renderTeam),
+    verve.Route.init("/external", renderExternal),
+    verve.Route.init("/analytics", renderAnalytics),
+    verve.Route.init("/live", renderLive),
+    verve.Route.init("/settings", renderSettings),
 };
 
-pub const routes: []const Route = &.{
-    .{ .path = "/", .render = renderOverview },
-    .{ .path = "/tasks", .render = renderTasks },
-    .{ .path = "/team", .render = renderTeam },
-    .{ .path = "/external", .render = renderExternal },
-    .{ .path = "/analytics", .render = renderAnalytics },
-    .{ .path = "/live", .render = renderLive },
-    .{ .path = "/settings", .render = renderSettings },
-};
-
-fn renderOverview(ctx: *const verve.Context) !*verve.Node {
+fn renderOverview(ctx: *verve.Context) !*verve.Node {
     const tasks = try api.copyTasksInto(ctx.alloc());
     const members = try api.copyMembersInto(ctx.alloc());
     const activity = try api.copyActivityInto(ctx.alloc());
@@ -26,25 +21,25 @@ fn renderOverview(ctx: *const verve.Context) !*verve.Node {
     return components.shell(ctx, "Overview", "/", body);
 }
 
-fn renderTasks(ctx: *const verve.Context) !*verve.Node {
+fn renderTasks(ctx: *verve.Context) !*verve.Node {
     const tasks = try api.copyTasksInto(ctx.alloc());
     const members = try api.copyMembersInto(ctx.alloc());
     const body = try components.tasksPage(ctx, tasks, members);
     return components.shell(ctx, "Tasks", "/tasks", body);
 }
 
-fn renderTeam(ctx: *const verve.Context) !*verve.Node {
+fn renderTeam(ctx: *verve.Context) !*verve.Node {
     const members = try api.copyMembersInto(ctx.alloc());
     const body = try components.teamPage(ctx, members);
     return components.shell(ctx, "Team", "/team", body);
 }
 
-fn renderSettings(ctx: *const verve.Context) !*verve.Node {
+fn renderSettings(ctx: *verve.Context) !*verve.Node {
     const body = try components.settingsPage(ctx);
     return components.shell(ctx, "Settings", "/settings", body);
 }
 
-fn renderAnalytics(ctx: *const verve.Context) !*verve.Node {
+fn renderAnalytics(ctx: *verve.Context) !*verve.Node {
     if (ctx.io) |io| {
         api.wireExternalRefresh();
         api.external.ensureFetcher(io);
@@ -53,12 +48,12 @@ fn renderAnalytics(ctx: *const verve.Context) !*verve.Node {
     return components.shell(ctx, "Analytics", "/analytics", body);
 }
 
-fn renderLive(ctx: *const verve.Context) !*verve.Node {
+fn renderLive(ctx: *verve.Context) !*verve.Node {
     const body = try components.livePage(ctx);
     return components.shell(ctx, "Live chat", "/live", body);
 }
 
-fn renderExternal(ctx: *const verve.Context) !*verve.Node {
+fn renderExternal(ctx: *verve.Context) !*verve.Node {
     // Lazy-start the background fetcher on first visit. Idempotent.
     if (ctx.io) |io| {
         api.wireExternalRefresh();

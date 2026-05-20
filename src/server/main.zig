@@ -12,6 +12,7 @@ const api_handler = @import("api_handler.zig");
 const pool_mod = @import("pool.zig");
 const metrics = @import("metrics.zig");
 const gzip = @import("gzip.zig");
+const public_dir_mod = @import("public_dir.zig");
 const components = app.components;
 
 const log = std.log.scoped(.verve);
@@ -29,7 +30,42 @@ var rejected_count: std.atomic.Value(u64) = .init(0);
 var start_timestamp: ?std.Io.Timestamp = null;
 var body_limit: usize = DEFAULT_BODY_LIMIT;
 var public_dir: ?std.Io.Dir = null;
+var public_dir_cache: ?public_dir_mod.Cache = null;
 var admit: pool_mod.Admit = .init(0);
+/// Dev mode: when true, the server injects an auto-reload client snippet
+/// into every HTML response and accepts `/__verve/dev_ws` upgrades. The
+/// browser uses the WS connection's lifecycle as a reload signal —
+/// disconnect-then-reconnect (which happens whenever the server
+/// restarts) triggers `location.reload`.
+var dev_mode: bool = false;
+
+/// Maximum length of a hashed-asset URL emitted by Context.assetHref. The
+/// formatter writes `<basename>-<hash><ext>`; 256 bytes covers any sane
+/// public-asset filename.
+const ASSET_HREF_MAX: usize = 256;
+
+/// AssetResolver impl backed by the comptime `public_assets.entries`
+/// manifest. Wired onto Context per request so `ctx.assetHref("style.css")`
+/// emits `/public/style-<hash>.css` for cache busting.
+fn resolveAssetHref(
+    state: *const anyopaque,
+    path: []const u8,
+    arena: std.mem.Allocator,
+) std.mem.Allocator.Error!?[]const u8 {
+    _ = state;
+    if (comptime !@hasDecl(public_assets, "lookupByOriginalPath")) return null;
+    const entry = public_assets.lookupByOriginalPath(path) orelse return null;
+    var buf: [ASSET_HREF_MAX]u8 = undefined;
+    const hashed_rel = public_assets.formatHashedPath(&buf, entry) orelse return null;
+    const out = try std.fmt.allocPrint(arena, "/public/{s}", .{hashed_rel});
+    return out;
+}
+
+var asset_resolver_state: u8 = 0;
+const asset_resolver: verve.AssetResolver = .{
+    .state = &asset_resolver_state,
+    .lookup = resolveAssetHref,
+};
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -52,8 +88,16 @@ pub fn main(init: std.process.Init) !void {
             log.err("failed to open --public-dir {s}: {s}", .{ path, @errorName(err) });
             return err;
         };
+        public_dir_cache = public_dir_mod.Cache.init(gpa, .{});
     }
     defer if (public_dir) |*d| d.close(io);
+    defer if (public_dir_cache) |*c| c.deinit();
+
+    // Initialize the CSRF HMAC key. Reads VERVE_CSRF_KEY from env (hex
+    // 64 chars = 32 bytes) for stable tokens across restarts; falls
+    // back to fresh randomness otherwise.
+    const csrf_env = init.environ_map.get("VERVE_CSRF_KEY");
+    verve.csrf.initFromEnvOrRandom(csrf_env, io);
     printStartupBanner(cli);
 
     while (true) {
@@ -185,7 +229,7 @@ fn handleConnection(
         // transitions out of received_head.
         const req_meta = api_handler.RequestMeta.fromRequest(&request);
         _ = request_count.fetchAdd(1, .monotonic);
-        handleRequest(gpa, io, &request, path, req_meta) catch |err| {
+        handleRequest(gpa, io, &request, target_copy, path, req_meta) catch |err| {
             log.err("{s} {s} → error: {s}", .{ method_name, target_copy, @errorName(err) });
             return;
         };
@@ -212,6 +256,7 @@ fn handleRequest(
     gpa: std.mem.Allocator,
     io: std.Io,
     request: *std.http.Server.Request,
+    target: []const u8,
     path: []const u8,
     meta: api_handler.RequestMeta,
 ) !void {
@@ -235,7 +280,7 @@ fn handleRequest(
     }
 
     if (std.mem.startsWith(u8, path, PUBLIC_PREFIX)) {
-        try serveStatic(gpa, io, request, path[PUBLIC_PREFIX.len..], meta.accept_gzip);
+        try serveStatic(gpa, io, request, path[PUBLIC_PREFIX.len..], meta.accept_gzip, meta.accept_brotli);
         return;
     }
 
@@ -251,6 +296,20 @@ fn handleRequest(
             return;
         }
         try streamWebSocket(io, request, upgrade.websocket.?);
+        return;
+    }
+
+    if (std.mem.eql(u8, path, "/__verve/dev_ws")) {
+        if (!dev_mode) {
+            try renderError(gpa, io, request, .not_found, "Dev WebSocket disabled (start with --dev).");
+            return;
+        }
+        const upgrade = request.upgradeRequested();
+        if (upgrade != .websocket or upgrade.websocket == null) {
+            try renderError(gpa, io, request, .bad_request, "WebSocket upgrade required.");
+            return;
+        }
+        try streamDevWebSocket(io, request, upgrade.websocket.?);
         return;
     }
 
@@ -276,50 +335,185 @@ fn handleRequest(
         return;
     }
 
-    if (router.match(path)) |route| {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var params: std.StringHashMapUnmanaged([]const u8) = .empty;
+    const matched = router.match(path, app.routes, &params, arena.allocator()) catch null;
+
+    if (matched) |route| {
         if (request.head.method != .GET and request.head.method != .HEAD) {
             try renderError(gpa, io, request, .method_not_allowed, "This page only accepts GET requests.");
             return;
         }
-        try renderPage(gpa, io, request, .ok, route.render, null, meta.accept_gzip);
+        try renderPage(.{
+            .gpa = gpa,
+            .io = io,
+            .request = request,
+            .arena = &arena,
+            .status = .ok,
+            .target = target,
+            .params = &params,
+            .meta = &meta,
+            .route_render = route.render,
+            .not_found_path = null,
+            .accept_gzip = meta.accept_gzip,
+        });
         return;
     }
 
-    try renderPage(gpa, io, request, .not_found, null, path, meta.accept_gzip);
+    try renderPage(.{
+        .gpa = gpa,
+        .io = io,
+        .request = request,
+        .arena = &arena,
+        .status = .not_found,
+        .target = target,
+        .params = &params,
+        .meta = &meta,
+        .route_render = null,
+        .not_found_path = path,
+        .accept_gzip = meta.accept_gzip,
+    });
 }
 
-fn renderPage(
+const RenderRequest = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     request: *std.http.Server.Request,
+    arena: *std.heap.ArenaAllocator,
     status: std.http.Status,
-    route_render: ?*const fn (ctx: *const verve.Context) anyerror!*verve.Node,
+    target: []const u8,
+    params: *const std.StringHashMapUnmanaged([]const u8),
+    meta: *const api_handler.RequestMeta,
+    route_render: ?*const fn (ctx: *verve.Context) anyerror!*verve.Node,
     not_found_path: ?[]const u8,
     accept_gzip: bool,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const ctx = verve.Context.initWithIo(&arena, io);
+};
+
+fn renderPage(req: RenderRequest) !void {
+    var loc = verve.Location.parse(req.target);
+    // Per-request reactive owner. Signals/effects created during this
+    // render attach here; we dispose it explicitly so any `on_cleanup`
+    // hooks (e.g. background fetcher unregistration) run before the
+    // response writer is dropped.
+    var owner = verve.Owner.init(req.gpa);
+    defer owner.dispose();
+    // Effect scheduling state is thread-local but the queue's backing
+    // allocator must point at the current request's arena so freed
+    // memory doesn't leak across requests.
+    verve.setReactivePendingAllocator(owner.allocator());
+    // Same story for the DI side-table that ties provided values to
+    // their owning scope.
+    verve.setDiTablesAllocator(owner.allocator());
+
+    var head = verve.Head.init(owner.allocator());
+
+    // CSRF token: reuse the cookie value if it validates, otherwise
+    // mint a fresh one and surface to respondBuffered for Set-Cookie.
+    var csrf_buf: [verve.csrf.TOKEN_TEXT_LEN]u8 = undefined;
+    const now_ts = std.Io.Clock.now(.awake, req.io);
+    const now_secs: i64 = @intCast(@divTrunc(now_ts.nanoseconds, std.time.ns_per_s));
+    const incoming_cookie = req.meta.cookie(verve.csrf.COOKIE_NAME);
+    var issued_new_csrf = false;
+    const csrf_token: []const u8 = blk: {
+        if (incoming_cookie) |c| {
+            if (c.len == verve.csrf.TOKEN_TEXT_LEN and verve.csrf.validate(c, c, now_secs)) {
+                @memcpy(csrf_buf[0..c.len], c);
+                break :blk csrf_buf[0..c.len];
+            }
+        }
+        issued_new_csrf = true;
+        break :blk verve.csrf.generate(&csrf_buf, now_secs) catch "";
+    };
+
+    // CSP nonce — 16 random bytes hex-encoded.
+    var nonce_bin: [12]u8 = undefined;
+    req.io.random(&nonce_bin);
+    var nonce_buf: [24]u8 = undefined;
+    const hex = "0123456789abcdef";
+    for (nonce_bin, 0..) |b, i| {
+        nonce_buf[i * 2] = hex[b >> 4];
+        nonce_buf[i * 2 + 1] = hex[b & 0xf];
+    }
+    const csp_nonce: []const u8 = &nonce_buf;
+
+    var ctx: verve.Context = .{
+        .arena = req.arena,
+        .allocator = req.arena.allocator(),
+        .io = req.io,
+        .params = req.params,
+        .location = &loc,
+        .request_meta = req.meta,
+        .asset_resolver = &asset_resolver,
+        .owner = &owner,
+        .head = &head,
+        .csrf_token = csrf_token,
+        .csp_nonce = csp_nonce,
+    };
 
     const node: *verve.Node = blk: {
-        if (route_render) |render_fn| {
+        if (req.route_render) |render_fn| {
             break :blk render_fn(&ctx) catch |err| {
                 log.err("render error: {s}", .{@errorName(err)});
-                try renderError(gpa, io, request, .internal_server_error, "The page failed to render.");
+                try renderError(req.gpa, req.io, req.request, .internal_server_error, "The page failed to render.");
                 return;
             };
         }
-        const body = try components.notFound(&ctx, not_found_path orelse "");
+        const body = try components.notFound(&ctx, req.not_found_path orelse "");
         break :blk try components.page(&ctx, body);
     };
 
-    var aw: Writer.Allocating = .init(gpa);
+    var aw: Writer.Allocating = .init(req.gpa);
     defer aw.deinit();
-    try aw.writer.writeAll("<!DOCTYPE html>");
+    // Fragment roots (tag="") emit raw bytes — no DOCTYPE prefix. Used for
+    // sitemap.xml, feed.xml, OG SVG, and other non-HTML responses.
+    const is_fragment = node.tag.len == 0;
+    if (!is_fragment) try aw.writer.writeAll("<!DOCTYPE html>");
     try verve.Renderer.render(&aw.writer, node);
 
-    try respondBuffered(gpa, request, status, "text/html; charset=utf-8", null, accept_gzip, aw.written());
+    const content_type = node.content_type_override orelse "text/html; charset=utf-8";
+
+    var csrf_cookie_buf: [128]u8 = undefined;
+    const csrf_cookie: ?[]const u8 = if (issued_new_csrf and csrf_token.len > 0)
+        (verve.csrf.cookieHeaderValue(&csrf_cookie_buf, csrf_token) catch null)
+    else
+        null;
+
+    var csp_buf: [128]u8 = undefined;
+    const csp_header = std.fmt.bufPrint(&csp_buf, "script-src 'nonce-{s}' 'strict-dynamic'; object-src 'none'; base-uri 'self'", .{csp_nonce}) catch null;
+
+    // Dev mode: splice the auto-reload client snippet into the body
+    // right before `</body>`. Skips fragment / non-HTML responses since
+    // they shouldn't carry a `<body>` close tag.
+    var final_body: []const u8 = aw.written();
+    var injected_buf: ?[]u8 = null;
+    defer if (injected_buf) |b| req.gpa.free(b);
+    if (dev_mode and !is_fragment) {
+        if (std.mem.lastIndexOf(u8, final_body, "</body>")) |pos| {
+            const snippet = DEV_RELOAD_SNIPPET;
+            const out = try req.gpa.alloc(u8, final_body.len + snippet.len);
+            @memcpy(out[0..pos], final_body[0..pos]);
+            @memcpy(out[pos .. pos + snippet.len], snippet);
+            @memcpy(out[pos + snippet.len ..], final_body[pos..]);
+            injected_buf = out;
+            final_body = out;
+        }
+    }
+
+    try respondBufferedExtra(req.gpa, req.request, req.status, content_type, null, req.accept_gzip, final_body, csrf_cookie, csp_header);
 }
+
+/// Dev-mode auto-reload client. Connects to /__verve/dev_ws and uses
+/// connection lifecycle as the reload signal:
+///   - first open → store that we've been alive
+///   - close → mark dead and start reconnect attempts
+///   - reconnect succeeds → location.reload()
+const DEV_RELOAD_SNIPPET =
+    "<script>(()=>{let connected=false;function tick(){const ws=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/__verve/dev_ws`);" ++
+    "ws.onopen=()=>{if(connected){location.reload();return;}connected=true;};" ++
+    "ws.onclose=()=>{connected=false;setTimeout(tick,500);};" ++
+    "ws.onerror=()=>{ws.close();};}tick();})();</script>";
 
 fn renderError(
     gpa: std.mem.Allocator,
@@ -330,7 +524,20 @@ fn renderError(
 ) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const ctx = verve.Context.initWithIo(&arena, io);
+
+    var owner = verve.Owner.init(gpa);
+    defer owner.dispose();
+    verve.setReactivePendingAllocator(owner.allocator());
+    verve.setDiTablesAllocator(owner.allocator());
+    var head = verve.Head.init(owner.allocator());
+
+    const ctx: verve.Context = .{
+        .arena = &arena,
+        .allocator = arena.allocator(),
+        .io = io,
+        .owner = &owner,
+        .head = &head,
+    };
 
     const status_code: u16 = @intFromEnum(status);
     const status_text = status.phrase() orelse "Error";
@@ -530,6 +737,24 @@ fn streamWebSocket(
     }
 }
 
+/// Dev-mode WebSocket: kept open as long as the server is alive. The
+/// browser reads the connection's drop (server restart, crash, or
+/// explicit shutdown) as a "go reload" signal. Server never sends
+/// anything — the client side just monitors lifecycle.
+fn streamDevWebSocket(
+    io: std.Io,
+    request: *std.http.Server.Request,
+    key: []const u8,
+) !void {
+    _ = io;
+    var ws = try request.respondWebSocket(.{ .key = key });
+    try ws.flush();
+    while (true) {
+        const msg = ws.readSmallMessage() catch break;
+        _ = msg;
+    }
+}
+
 fn wsBroadcastLoop(ctx: *WsBroadcastCtx) void {
     while (!ctx.shutdown.load(.acquire)) {
         const cur = app.last_count.load(.monotonic);
@@ -565,21 +790,41 @@ fn serveStatic(
     request: *std.http.Server.Request,
     rel_path: []const u8,
     accept_gzip: bool,
+    accept_brotli: bool,
 ) !void {
     if (rel_path.len == 0 or rel_path[0] == '/' or std.mem.indexOf(u8, rel_path, "..") != null) {
         try renderError(gpa, io, request, .forbidden, "Invalid static asset path.");
         return;
     }
 
-    // --public-dir is checked first so it acts as a dev-time overlay over
+    // Hashed-URL fast path: when the client requests `<stem>-<hash><ext>`,
+    // we know the content is immutable (the hash changes if the bytes
+    // change), so the response gets the long-lived cache header. Older
+    // example manifests may not expose the helper; fall through if so.
+    if (comptime @hasDecl(public_assets, "lookupByHashedPath")) {
+        if (public_assets.lookupByHashedPath(rel_path)) |entry| {
+            try respondBuffered(
+                gpa,
+                request,
+                .ok,
+                entry.content_type,
+                "public, max-age=31536000, immutable",
+                accept_gzip,
+                entry.bytes,
+            );
+            return;
+        }
+    }
+
+    // --public-dir is checked next so it acts as a dev-time overlay over
     // the comptime-embedded set; embedded entries are the fallback when no
     // runtime dir is configured or the file isn't on disk.
     if (public_dir) |dir| {
-        if (try tryServeFromDisk(gpa, io, request, dir, rel_path, accept_gzip)) return;
+        if (try tryServeFromDisk(gpa, io, request, dir, rel_path, accept_gzip, accept_brotli)) return;
     }
 
-    for (public_assets.entries) |entry| {
-        if (std.mem.eql(u8, entry.path, rel_path)) {
+    if (comptime @hasDecl(public_assets, "lookupByOriginalPath")) {
+        if (public_assets.lookupByOriginalPath(rel_path)) |entry| {
             try respondBuffered(
                 gpa,
                 request,
@@ -590,6 +835,21 @@ fn serveStatic(
                 entry.bytes,
             );
             return;
+        }
+    } else {
+        for (public_assets.entries) |entry| {
+            if (std.mem.eql(u8, entry.path, rel_path)) {
+                try respondBuffered(
+                    gpa,
+                    request,
+                    .ok,
+                    entry.content_type,
+                    "public, max-age=300",
+                    accept_gzip,
+                    entry.bytes,
+                );
+                return;
+            }
         }
     }
 
@@ -606,7 +866,25 @@ fn tryServeFromDisk(
     dir: std.Io.Dir,
     rel_path: []const u8,
     accept_gzip: bool,
+    accept_brotli: bool,
 ) !bool {
+    // Precompressed-variant lookup: if the client accepts brotli/gzip and a
+    // `<rel_path>.br` or `<rel_path>.gz` exists adjacent to the resource,
+    // serve it verbatim with the corresponding Content-Encoding header.
+    // No on-the-fly brotli encoding — std lacks an encoder — so we rely on
+    // build-time precompression. Browsers cope with `identity` when the
+    // precompressed variant is missing.
+    if (accept_brotli) {
+        const br_path = try std.fmt.allocPrint(gpa, "{s}.br", .{rel_path});
+        defer gpa.free(br_path);
+        if (try tryServePrecompressed(gpa, io, request, dir, br_path, rel_path, "br")) return true;
+    }
+    if (accept_gzip) {
+        const gz_path = try std.fmt.allocPrint(gpa, "{s}.gz", .{rel_path});
+        defer gpa.free(gz_path);
+        if (try tryServePrecompressed(gpa, io, request, dir, gz_path, rel_path, "gzip")) return true;
+    }
+
     var file = dir.openFile(io, rel_path, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.IsDir => return false,
         else => {
@@ -623,11 +901,92 @@ fn tryServeFromDisk(
         return true;
     }
 
+    const content_type = contentTypeFor(rel_path);
+
+    // mtime-aware LRU: if the cached entry matches the on-disk stat,
+    // respond from memory and skip the read entirely.
+    const cache_stat: public_dir_mod.Stat = .{
+        .mtime_ns = @as(i128, stat.mtime.nanoseconds),
+        .size = stat.size,
+        .inode = @intCast(stat.inode),
+    };
+    if (public_dir_cache) |*cache| {
+        switch (cache.get(rel_path, cache_stat)) {
+            .hit => |hit| {
+                try respondBuffered(gpa, request, .ok, hit.content_type, "public, max-age=300", accept_gzip, hit.bytes);
+                return true;
+            },
+            .miss => {},
+        }
+    }
+
+    const data = try gpa.alloc(u8, @intCast(stat.size));
+    _ = try file.readPositionalAll(io, data, 0);
+
+    if (public_dir_cache) |*cache| {
+        // Cache takes ownership on success; on failure we still own `data`.
+        cache.put(rel_path, data, content_type, cache_stat) catch {
+            defer gpa.free(data);
+            try respondBuffered(gpa, request, .ok, content_type, "public, max-age=300", accept_gzip, data);
+            return true;
+        };
+        // Re-read the cached slice so we can serve it inside the same call.
+        switch (cache.get(rel_path, cache_stat)) {
+            .hit => |hit| {
+                try respondBuffered(gpa, request, .ok, hit.content_type, "public, max-age=300", accept_gzip, hit.bytes);
+                return true;
+            },
+            .miss => {
+                // Cache rejected the insert (e.g. per-file cap) and freed `data`.
+                // Re-read from disk for this response only.
+                const reread = try gpa.alloc(u8, @intCast(stat.size));
+                defer gpa.free(reread);
+                _ = try file.readPositionalAll(io, reread, 0);
+                try respondBuffered(gpa, request, .ok, content_type, "public, max-age=300", accept_gzip, reread);
+                return true;
+            },
+        }
+    }
+
+    defer gpa.free(data);
+    try respondBuffered(gpa, request, .ok, content_type, "public, max-age=300", accept_gzip, data);
+    return true;
+}
+
+/// Serve a precompressed `.br` / `.gz` sibling with the original file's
+/// inferred Content-Type and the matching Content-Encoding. Returns false
+/// when the precompressed variant isn't present (caller falls through to
+/// the original file).
+fn tryServePrecompressed(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    request: *std.http.Server.Request,
+    dir: std.Io.Dir,
+    enc_path: []const u8,
+    base_path: []const u8,
+    encoding: []const u8,
+) !bool {
+    var file = dir.openFile(io, enc_path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.IsDir => return false,
+        else => return false,
+    };
+    defer file.close(io);
+
+    const stat = try file.stat(io);
+    if (stat.size > STATIC_MAX_SIZE) return false;
+
     const data = try gpa.alloc(u8, @intCast(stat.size));
     defer gpa.free(data);
     _ = try file.readPositionalAll(io, data, 0);
 
-    try respondBuffered(gpa, request, .ok, contentTypeFor(rel_path), "public, max-age=300", accept_gzip, data);
+    try respondRaw(
+        request,
+        .ok,
+        contentTypeFor(base_path),
+        "public, max-age=300",
+        encoding,
+        data,
+    );
     return true;
 }
 
@@ -665,7 +1024,20 @@ fn respondRaw(
     encoding: ?[]const u8,
     body: []const u8,
 ) !void {
-    var headers: [4]std.http.Header = undefined;
+    try respondRawExtra(request, status, content_type, cache_control, encoding, body, null, null);
+}
+
+fn respondRawExtra(
+    request: *std.http.Server.Request,
+    status: std.http.Status,
+    content_type: []const u8,
+    cache_control: ?[]const u8,
+    encoding: ?[]const u8,
+    body: []const u8,
+    set_cookie: ?[]const u8,
+    csp: ?[]const u8,
+) !void {
+    var headers: [6]std.http.Header = undefined;
     var n: usize = 0;
     headers[n] = .{ .name = "content-type", .value = content_type };
     n += 1;
@@ -677,10 +1049,42 @@ fn respondRaw(
         headers[n] = .{ .name = "content-encoding", .value = enc };
         n += 1;
     }
+    if (set_cookie) |sc| {
+        headers[n] = .{ .name = "set-cookie", .value = sc };
+        n += 1;
+    }
+    if (csp) |c| {
+        headers[n] = .{ .name = "content-security-policy", .value = c };
+        n += 1;
+    }
     try request.respond(body, .{
         .status = status,
         .extra_headers = headers[0..n],
     });
+}
+
+fn respondBufferedExtra(
+    gpa: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    status: std.http.Status,
+    content_type: []const u8,
+    cache_control: ?[]const u8,
+    accept_gzip: bool,
+    body: []const u8,
+    set_cookie: ?[]const u8,
+    csp: ?[]const u8,
+) !void {
+    const GZIP_MIN: usize = 256;
+
+    if (accept_gzip and body.len >= GZIP_MIN and gzip.shouldCompress(content_type)) {
+        const compressed = gzip.compress(gpa, body) catch null;
+        if (compressed) |c| {
+            defer gpa.free(c);
+            try respondRawExtra(request, status, content_type, cache_control, "gzip", c, set_cookie, csp);
+            return;
+        }
+    }
+    try respondRawExtra(request, status, content_type, cache_control, null, body, set_cookie, csp);
 }
 
 fn contentTypeFor(path: []const u8) []const u8 {
@@ -784,7 +1188,7 @@ fn printStartupBanner(cli: CliOptions) void {
     log.info("max concurrent connections: {d}", .{cli.workers});
     log.info("pages:", .{});
     for (app.routes) |r| {
-        log.info("  GET  {s}", .{r.path});
+        log.info("  GET  {s}", .{r.pattern});
     }
     log.info("actions:", .{});
     inline for (comptime std.meta.declarations(app.Actions)) |decl| {
@@ -867,6 +1271,21 @@ fn parseCli(init: std.process.Init) !CliOptions {
             if (workers == 0) {
                 log.err("--workers must be >= 1", .{});
                 return error.InvalidWorkers;
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--dev")) {
+            dev_mode = true;
+            continue;
+        }
+        if (try optionValue(args, &i, a, "--csrf")) |v| {
+            if (std.mem.eql(u8, v, "disable")) {
+                api_handler.enforce_csrf = false;
+            } else if (std.mem.eql(u8, v, "enforce")) {
+                api_handler.enforce_csrf = true;
+            } else {
+                log.err("invalid --csrf value: {s} (expected enforce|disable)", .{v});
+                return error.InvalidCsrfMode;
             }
             continue;
         }

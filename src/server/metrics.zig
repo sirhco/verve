@@ -34,7 +34,7 @@ fn collectLabels() []const []const u8 {
     @setEvalBranchQuota(10_000);
     var list: []const []const u8 = &.{};
     for (app.routes) |r| {
-        list = list ++ &[_][]const u8{r.path};
+        list = list ++ &[_][]const u8{r.pattern};
     }
     for (std.meta.declarations(app.Actions)) |d| {
         list = list ++ &[_][]const u8{"/api/" ++ d.name};
@@ -65,7 +65,7 @@ pub fn routeLabel(path: []const u8) []const u8 {
         return "__not_found__";
     }
     inline for (app.routes) |r| {
-        if (std.mem.eql(u8, path, r.path)) return r.path;
+        if (std.mem.eql(u8, path, r.pattern)) return r.pattern;
     }
     const fixed = .{
         "/health", "/metrics", "/events", "/ws", "/client.wasm", "/verve.js",

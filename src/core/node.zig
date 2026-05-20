@@ -18,6 +18,16 @@ pub const Node = struct {
     arena: ?std.mem.Allocator = null,
     tag: []const u8,
     text_content: ?[]const u8 = null,
+    /// Raw inner HTML — when set, emitted verbatim without escaping in
+    /// place of `text_content` and `children_list`. The enclosing tag is
+    /// still produced. Use `ctx.raw(bytes)` (tag="") to emit a body with
+    /// no wrapping tag (sitemap, feed, OG SVG responses).
+    raw_inner: ?[]const u8 = null,
+    /// Optional response Content-Type override. Only honored when this
+    /// node is the root of the page tree (read by the server before
+    /// writing the response headers). Routes that render non-HTML
+    /// (XML, Atom, SVG) set this via `.contentType()`.
+    content_type_override: ?[]const u8 = null,
     z_bind_name: ?[]const u8 = null,
     z_on_click_action: ?[]const u8 = null,
     attrs: std.ArrayList(Attr) = .empty,
@@ -140,6 +150,22 @@ pub const Node = struct {
         return self;
     }
 
+    /// Stamp `data-ref="<id>"` onto this node. The client-side runtime
+    /// resolves the id back to a live DOM Element via `verveQueryRef`,
+    /// letting WASM effects observe or mutate a specific element
+    /// without scanning the whole tree.
+    ///
+    /// `noderef` is a `NodeRef(Tag)` — see core/noderef.zig. The Tag is
+    /// not enforced at render time but downstream `use:` directives
+    /// can require a specific element kind.
+    pub fn ref(self: *Node, noderef: anytype) *Node {
+        if (self.err != null) return self;
+        // Accept any NodeRef(...) — duck-type on the .id field rather
+        // than importing the noderef module here (which would create a
+        // circular import via the renderer chain).
+        return self.attr("data-ref", noderef.id);
+    }
+
     // ---- text ------------------------------------------------------------
 
     pub fn text(self: *Node, t: []const u8) *Node {
@@ -160,6 +186,26 @@ pub const Node = struct {
 
     pub fn textInt(self: *Node, n: anytype) *Node {
         return self.textFmt("{d}", .{n});
+    }
+
+    /// Set raw inner HTML — bytes emitted verbatim, NOT escaped.
+    /// Replaces `text` and `children` if both are present. Used for
+    /// inline `<script>` bodies, server-rendered SVG, and the fragment
+    /// (`tag = ""`) form returned from non-HTML SEO routes.
+    pub fn raw(self: *Node, bytes: []const u8) *Node {
+        if (self.err != null) return self;
+        self.raw_inner = bytes;
+        return self;
+    }
+
+    /// Override the HTTP Content-Type emitted for this response. Only
+    /// effective on the root node returned from a page route. Combine
+    /// with `ctx.raw(bytes).contentType("application/xml")` to serve
+    /// sitemaps, Atom feeds, or SVG OG images from the same router.
+    pub fn contentType(self: *Node, t: []const u8) *Node {
+        if (self.err != null) return self;
+        self.content_type_override = t;
+        return self;
     }
 
     // ---- children --------------------------------------------------------

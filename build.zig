@@ -181,24 +181,32 @@ pub fn build(b: *std.Build) void {
 /// Walk `dir_opt` (relative to build root) at configure time, copy each
 /// regular file into a generated WriteFiles directory, and emit a
 /// `public_assets.zig` manifest containing `@embedFile` references plus
-/// a content-type guess. When `dir_opt` is null an empty manifest is
-/// emitted so the server module's import always resolves.
+/// a content-type guess and a content hash for cache-busting. When
+/// `dir_opt` is null an empty manifest is emitted so the server module's
+/// import always resolves.
 fn buildPublicAssets(b: *std.Build, dir_opt: ?[]const u8) *std.Build.Module {
     const wf = b.addWriteFiles();
+    const manifest_header =
+        \\const std = @import("std");
+        \\
+        \\pub const Entry = struct {
+        \\    path: []const u8,
+        \\    bytes: []const u8,
+        \\    content_type: []const u8,
+        \\    /// Lower 32 bits of Wyhash(bytes). Rendered as 8 hex chars in
+        \\    /// the hashed-asset URL — collision-resistant enough for cache
+        \\    /// busting without inflating the path length.
+        \\    hash: u32,
+        \\};
+        \\
+        \\pub const entries: []const Entry = &.{
+        \\
+    ;
 
     if (dir_opt) |dir| {
         var manifest: std.ArrayList(u8) = .empty;
 
-        manifest.appendSlice(b.allocator,
-            \\pub const Entry = struct {
-            \\    path: []const u8,
-            \\    bytes: []const u8,
-            \\    content_type: []const u8,
-            \\};
-            \\
-            \\pub const entries: []const Entry = &.{
-            \\
-        ) catch @panic("OOM");
+        manifest.appendSlice(b.allocator, manifest_header) catch @panic("OOM");
 
         const io = b.graph.io;
         var root = b.build_root.handle.openDir(io, dir, .{ .iterate = true }) catch |err| {
@@ -223,33 +231,74 @@ fn buildPublicAssets(b: *std.Build, dir_opt: ?[]const u8) *std.Build.Module {
             const lazy = b.path(b.pathJoin(&.{ dir, entry.path }));
             _ = wf.addCopyFile(lazy, path_forward);
 
+            // Hash the bytes once at configure time so we can embed the
+            // hash in the manifest. The runtime never re-hashes.
+            const native_path = b.pathJoin(&.{ dir, entry.path });
+            var f = b.build_root.handle.openFile(io, native_path, .{}) catch @panic("asset open failed");
+            defer f.close(io);
+            const stat = f.stat(io) catch @panic("asset stat failed");
+            const bytes = b.allocator.alloc(u8, @intCast(stat.size)) catch @panic("OOM");
+            defer b.allocator.free(bytes);
+            _ = f.readPositionalAll(io, bytes, 0) catch @panic("asset read failed");
+            const hash64 = std.hash.Wyhash.hash(0, bytes);
+            const hash32: u32 = @truncate(hash64);
+
             const ct = guessContentType(entry.path);
             const line = std.fmt.allocPrint(b.allocator,
-                \\    .{{ .path = "{s}", .bytes = @embedFile("{s}"), .content_type = "{s}" }},
+                \\    .{{ .path = "{s}", .bytes = @embedFile("{s}"), .content_type = "{s}", .hash = 0x{x:0>8} }},
                 \\
-            , .{ path_forward, path_forward, ct }) catch @panic("OOM");
+            , .{ path_forward, path_forward, ct, hash32 }) catch @panic("OOM");
             manifest.appendSlice(b.allocator, line) catch @panic("OOM");
         }
 
-        manifest.appendSlice(b.allocator, "};\n") catch @panic("OOM");
+        manifest.appendSlice(b.allocator, "};\n\n" ++ manifest_helpers) catch @panic("OOM");
         _ = wf.add("public_assets.zig", manifest.items);
     } else {
-        _ = wf.add("public_assets.zig",
-            \\pub const Entry = struct {
-            \\    path: []const u8,
-            \\    bytes: []const u8,
-            \\    content_type: []const u8,
-            \\};
-            \\
-            \\pub const entries: []const Entry = &.{};
-            \\
-        );
+        _ = wf.add("public_assets.zig", manifest_header ++ "};\n\n" ++ manifest_helpers);
     }
 
     return b.createModule(.{
         .root_source_file = wf.getDirectory().path(b, "public_assets.zig"),
     });
 }
+
+/// Helper functions appended after the `entries` slice. Both lookups
+/// run linearly over the entries; the public-asset count is small (and
+/// hot files like style.css land near the front of the walk) so a hash
+/// index isn't worth the build-time complexity.
+const manifest_helpers =
+    \\/// Look up an entry by its unhashed path (`style.css`). Used by
+    \\/// `Context.assetHref` to resolve the hashed URL and by the server
+    \\/// when a request arrives with the unhashed name.
+    \\pub fn lookupByOriginalPath(path: []const u8) ?Entry {
+    \\    for (entries) |e| {
+    \\        if (std.mem.eql(u8, e.path, path)) return e;
+    \\    }
+    \\    return null;
+    \\}
+    \\
+    \\/// Look up an entry by its hashed URL form (`style-7f4c1d20.css`).
+    \\/// Returns null when no entry's `<basename>-<hash><ext>` matches the
+    \\/// request path.
+    \\pub fn lookupByHashedPath(hashed: []const u8) ?Entry {
+    \\    for (entries) |e| {
+    \\        var buf: [256]u8 = undefined;
+    \\        const formatted = formatHashedPath(&buf, e) orelse continue;
+    \\        if (std.mem.eql(u8, formatted, hashed)) return e;
+    \\    }
+    \\    return null;
+    \\}
+    \\
+    \\/// Render an entry as `<basename>-<hash><ext>` into `buf`. Returns
+    \\/// null when the resulting string would overflow.
+    \\pub fn formatHashedPath(buf: []u8, e: Entry) ?[]const u8 {
+    \\    const dot = std.mem.lastIndexOfScalar(u8, e.path, '.');
+    \\    const stem = if (dot) |i| e.path[0..i] else e.path;
+    \\    const ext = if (dot) |i| e.path[i..] else "";
+    \\    return std.fmt.bufPrint(buf, "{s}-{x:0>8}{s}", .{ stem, e.hash, ext }) catch null;
+    \\}
+    \\
+;
 
 /// Walk the directories the scaffolded starter project needs and emit
 /// `skeleton.zig`, a flat list of (relative-path, @embedFile-bytes)

@@ -8,39 +8,21 @@
 const std = @import("std");
 const Writer = std.Io.Writer;
 const app = @import("app");
+const verve = @import("verve");
 const http = std.http;
 
+pub const RequestMeta = verve.RequestMeta;
+
 const API_PREFIX = "/api/";
+
+/// When false, the form-CSRF check is skipped. Defaults to enforce.
+/// Set via `verve-server --csrf=disable` for local dev / integration
+/// tests that don't yet thread tokens through their form posts.
+pub var enforce_csrf: bool = true;
 
 pub fn isApiPath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, API_PREFIX);
 }
-
-const FORM_CT = "application/x-www-form-urlencoded";
-
-/// Snapshot of headers a dispatch needs taken BEFORE the body is read.
-/// std.http.Server requires header iteration while the reader is in
-/// the `received_head` state, which the body reader consumes.
-pub const RequestMeta = struct {
-    is_form: bool,
-    referer: ?[]const u8,
-    accept_gzip: bool,
-
-    pub fn fromRequest(request: *http.Server.Request) RequestMeta {
-        var result: RequestMeta = .{ .is_form = false, .referer = null, .accept_gzip = false };
-        var iter = request.iterateHeaders();
-        while (iter.next()) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
-                result.is_form = std.mem.startsWith(u8, h.value, FORM_CT);
-            } else if (std.ascii.eqlIgnoreCase(h.name, "referer")) {
-                result.referer = h.value;
-            } else if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) {
-                result.accept_gzip = std.mem.indexOf(u8, h.value, "gzip") != null;
-            }
-        }
-        return result;
-    }
-};
 
 pub fn dispatch(
     gpa: std.mem.Allocator,
@@ -54,6 +36,29 @@ pub fn dispatch(
         return;
     }
     const fn_name = path[API_PREFIX.len..];
+
+    // CSRF check for form posts. We require the request to carry a
+    // `__csrf` field whose value matches the `__verve_csrf` cookie.
+    // JSON posts (which originate from the same-origin WASM bridge that
+    // can read the cookie) are skipped here; a future phase will fold
+    // them in via a custom header check.
+    if (enforce_csrf and meta.is_form) {
+        const form_token = findFormField(body, "__csrf");
+        const cookie_token = meta.cookie(verve.csrf.COOKIE_NAME) orelse "";
+        if (form_token.len == 0 or cookie_token.len == 0 or !std.mem.eql(u8, form_token, cookie_token)) {
+            try request.respond("CSRF token missing or invalid", .{ .status = .forbidden });
+            return;
+        }
+        // Origin pinning (when present): the Origin header must match the
+        // request Host. Skips the check when Origin is absent (older
+        // browsers or same-origin form posts).
+        if (meta.origin) |origin| if (meta.host) |host| {
+            if (!originMatchesHost(origin, host)) {
+                try request.respond("Origin mismatch", .{ .status = .forbidden });
+                return;
+            }
+        };
+    }
 
     const redirect_target = if (meta.is_form) meta.referer orelse "/" else "";
 
@@ -142,6 +147,26 @@ fn invoke(
         func(args);
         if (is_form) try respondRedirect(request, redirect_target) else try respondOk(request);
     }
+}
+
+/// Look up a single form-encoded field by name. Returns the raw
+/// (still percent-encoded) value, or an empty slice when missing.
+fn findFormField(body: []const u8, name: []const u8) []const u8 {
+    var it = std.mem.tokenizeScalar(u8, body, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return &.{};
+}
+
+/// Loose Origin/Host comparison. `Origin` is `<scheme>://<host>[:port]`
+/// while `Host` is `<host>[:port]`. We strip the scheme prefix and
+/// compare the rest verbatim.
+fn originMatchesHost(origin: []const u8, host: []const u8) bool {
+    var rest = origin;
+    if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
+    return std.mem.eql(u8, rest, host);
 }
 
 fn parseFormBody(

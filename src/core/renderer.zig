@@ -8,6 +8,17 @@ const Node = node_mod.Node;
 
 pub const Renderer = struct {
     pub fn render(w: *Writer, node: *const Node) Writer.Error!void {
+        // Empty tag → fragment. Emit only raw_inner (if set) or children;
+        // attrs/bindings/text on a fragment are silently ignored.
+        if (node.tag.len == 0) {
+            if (node.raw_inner) |inner| {
+                try w.writeAll(inner);
+                return;
+            }
+            for (node.children_list.items) |c| try render(w, c);
+            return;
+        }
+
         try w.print("<{s}", .{node.tag});
 
         for (node.attrs.items) |a| {
@@ -33,11 +44,15 @@ pub const Renderer = struct {
 
         try w.writeAll(">");
 
-        if (node.text_content) |t| {
-            try escapeHtml(w, t);
-        }
-        for (node.children_list.items) |c| {
-            try render(w, c);
+        if (node.raw_inner) |inner| {
+            try w.writeAll(inner);
+        } else {
+            if (node.text_content) |t| {
+                try escapeHtml(w, t);
+            }
+            for (node.children_list.items) |c| {
+                try render(w, c);
+            }
         }
 
         try w.print("</{s}>", .{node.tag});
@@ -154,4 +169,52 @@ test "void elements omit closing tag" {
     const node = try ctx.br().build();
     try Renderer.render(&w, node);
     try std.testing.expectEqualStrings("<br>", w.buffered());
+}
+
+test "raw inner HTML bypasses escaping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    var buf: [256]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    const node = try ctx.el("script").raw("if (a < b && c > 0) {}").build();
+    try Renderer.render(&w, node);
+    try std.testing.expectEqualStrings(
+        "<script>if (a < b && c > 0) {}</script>",
+        w.buffered(),
+    );
+}
+
+test "ctx.raw fragment emits bytes verbatim with no wrapper tag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    var buf: [512]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    const xml =
+        \\<?xml version="1.0" encoding="utf-8"?>
+        \\<urlset><url><loc>https://example.com/</loc></url></urlset>
+    ;
+    const node = try ctx.raw(xml).contentType("application/xml").build();
+    try Renderer.render(&w, node);
+    try std.testing.expectEqualStrings(xml, w.buffered());
+    try std.testing.expectEqualStrings("application/xml", node.content_type_override.?);
+}
+
+test "raw_inner takes precedence over text and children" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    var buf: [256]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    const node = try ctx.div()
+        .text("should not appear")
+        .children(.{ ctx.span().text("nope") })
+        .raw("<i>raw</i>")
+        .build();
+    try Renderer.render(&w, node);
+    try std.testing.expectEqualStrings("<div><i>raw</i></div>", w.buffered());
 }

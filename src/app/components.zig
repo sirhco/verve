@@ -1,5 +1,6 @@
 //! Example components for the demo app.
 
+const std = @import("std");
 const verve = @import("verve");
 
 pub fn counter(ctx: *const verve.Context, initial: i32) !*verve.Node {
@@ -10,10 +11,10 @@ pub fn counter(ctx: *const verve.Context, initial: i32) !*verve.Node {
         // submit → 303 to Referer). When wasm/WS is available, the bridge's
         // delegated click handler calls preventDefault and routes through
         // the wasm export instead.
-        ctx.form(.{ .post = "/api/incrementCount", .class = "counter-form" }).children(.{
+        ctx.actionForm(.{ .post = "/api/incrementCount", .class = "counter-form" }).children(.{
             ctx.button("+").type_("submit").onClick("increment_counter"),
         }),
-        ctx.form(.{ .post = "/api/decrementCount", .class = "counter-form" }).children(.{
+        ctx.actionForm(.{ .post = "/api/decrementCount", .class = "counter-form" }).children(.{
             ctx.button("-").type_("submit").onClick("decrement_counter"),
         }),
         ctx.p().class("clicks").children(.{
@@ -27,8 +28,35 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
     return ctx.main_().class("home").children(.{
         ctx.h1("Verve"),
         ctx.p().text("Full-stack Zig web framework — fine-grained reactivity, no macros."),
-        ctx.p().children(.{ ctx.a("/counter", "Counter demo →") }),
-        ctx.p().children(.{ ctx.a("/todos", "Todo list (form fallback) →") }),
+        ctx.p().children(.{ verve.link(ctx, "/counter", "Counter demo →", .{ .prefetch_on_hover = true }) }),
+        ctx.p().children(.{ verve.link(ctx, "/todos", "Todo list (form fallback) →", .{}) }),
+        ctx.p().children(.{ verve.link(ctx, "/work/hello-world", "Path-param demo (/work/:slug) →", .{}) }),
+    }).build();
+}
+
+pub fn workDetail(ctx: *const verve.Context, slug: []const u8) !*verve.Node {
+    // Per-page <head> contributions. The shell drains ctx.head in
+    // priority order before emitting the body, so canonical / OG /
+    // JSON-LD end up correctly ordered regardless of where they were
+    // contributed from.
+    try ctx.setTitle(try std.fmt.allocPrint(ctx.alloc(), "Work — {s}", .{slug}));
+    try ctx.metaTag(.{ .name = "description", .content = "Work-detail demo for path params + per-page head." });
+    try ctx.linkTag(.{ .rel = "canonical", .href = try std.fmt.allocPrint(ctx.alloc(), "https://example.com/work/{s}", .{slug}) });
+    try ctx.metaTag(.{ .name = "og:title", .content = slug, .is_property = true, .priority = 40 });
+    try ctx.jsonLd(try std.fmt.allocPrint(
+        ctx.alloc(),
+        "{{\"@context\":\"https://schema.org\",\"@type\":\"CreativeWork\",\"name\":\"{s}\"}}",
+        .{slug},
+    ));
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("Work Detail"),
+        ctx.p().children(.{
+            ctx.span().text("Slug: "),
+            ctx.code(slug),
+        }),
+        ctx.p().text("This route uses /work/:slug. The matched parameter is bound to ctx.params[\"slug\"] by the router."),
+        ctx.p().children(.{ ctx.a("/", "← Home") }),
     }).build();
 }
 
@@ -38,7 +66,7 @@ pub fn todoList(ctx: *const verve.Context, items: []const []const u8) !*verve.No
         _ = list.children(.{
             ctx.li().children(.{
                 ctx.span().text(item_text),
-                ctx.form(.{ .post = "/api/removeTodo", .class = "todo-remove" }).children(.{
+                ctx.actionForm(.{ .post = "/api/removeTodo", .class = "todo-remove" }).children(.{
                     ctx.input().type_("hidden").name("index").attrFmt("value", "{d}", .{i}),
                     ctx.button("×").type_("submit"),
                 }),
@@ -49,7 +77,7 @@ pub fn todoList(ctx: *const verve.Context, items: []const []const u8) !*verve.No
     return ctx.main_().class("home").children(.{
         ctx.h1("Todos"),
         ctx.p().text("Pure server-rendered list. Submissions degrade gracefully without wasm."),
-        ctx.form(.{ .post = "/api/addTodo", .class = "todo-form" }).children(.{
+        ctx.actionForm(.{ .post = "/api/addTodo", .class = "todo-form" }).children(.{
             ctx.input().name("text").type_("text").placeholder("Write something to do").required().autofocus(),
             ctx.button("Add").type_("submit"),
         }),
@@ -82,10 +110,19 @@ pub fn errorPage(
 }
 
 pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
+    // Provide a default title only if the page didn't set one of its own.
+    try ctx.setTitleIfUnset("Verve");
+
+    // Drain ctx.head into a static byte buffer that we emit verbatim
+    // inside <head>. The accumulator already produces <meta charset>,
+    // <title>, plus any meta/link/json-ld the page contributed.
+    var aw: std.Io.Writer.Allocating = .init(ctx.alloc());
+    try ctx.head.?.render(&aw.writer);
+    const head_html = aw.written();
+
     return ctx.el("html").children(.{
         ctx.el("head").children(.{
-            ctx.meta("charset", "utf-8"),
-            ctx.title("Verve"),
+            ctx.raw(head_html),
             ctx.style(
                 \\body{font:16px system-ui;margin:2rem;background:#0e0e10;color:#f5f5f5}
                 \\.counter-card{padding:1.5rem;border:1px solid #333;border-radius:8px;max-width:24rem}
