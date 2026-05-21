@@ -251,6 +251,51 @@
   // hydrate fn during `verve_hydrate`, so this pass picks them up.
   dispatchIslands();
 
+  // ---- Phase 13C: per-island WASM chunk loader -------------------------
+  // For every `<verve-island>` marker on the page, fetch the matching
+  // chunk (cached per name across the session), instantiate it, copy
+  // the data-props string into the chunk's own scratch buffer, then
+  // call its `hydrate` export. The main client.wasm's data-vh walker
+  // has already wired reactive state inside the marker by this point —
+  // the chunk hook is the place island-specific code lives.
+  const islandChunks = new Map();
+  const loadIslandChunk = async (el) => {
+    const name = el.getAttribute("data-name") || "";
+    if (!name) return;
+    const url = `/islands/${name}.wasm`;
+    if (!islandChunks.has(name)) {
+      islandChunks.set(
+        name,
+        WebAssembly.instantiateStreaming(fetch(url), {}).catch((err) => {
+          islandChunks.delete(name);
+          console.warn("verve: island chunk fetch failed", name, err);
+          return null;
+        }),
+      );
+    }
+    const chunk = await islandChunks.get(name);
+    if (!chunk) return;
+    const cexp = chunk.instance.exports;
+    if (typeof cexp.hydrate !== "function") return;
+    const props = el.getAttribute("data-props") || "";
+    if (typeof cexp.props_buf_ptr === "function" && cexp.memory) {
+      const ptr = cexp.props_buf_ptr();
+      const cap = cexp.props_buf_capacity ? cexp.props_buf_capacity() : 0;
+      const propsBytes = new TextEncoder().encode(props);
+      if (propsBytes.length > cap) {
+        console.warn("verve: island props exceed chunk scratch", name);
+        return;
+      }
+      new Uint8Array(cexp.memory.buffer, ptr, cap).set(propsBytes, 0);
+      cexp.hydrate(propsBytes.length, 0);
+    } else {
+      cexp.hydrate(0, 0);
+    }
+  };
+  document.querySelectorAll("verve-island").forEach((el) => {
+    loadIslandChunk(el).catch(() => {});
+  });
+
   // ---- Phase 14: out-of-order Suspense swap ---------------------------
   // Each parked Suspense boundary renders as
   //   <div data-vs="N">{fallback}</div>

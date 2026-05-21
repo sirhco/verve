@@ -37,12 +37,29 @@ pub fn build(b: *std.Build) void {
     wasm.entry = .disabled;
     wasm.rdynamic = true;
 
+    // Phase 13C: per-island WASM chunks. Today only Counter ships —
+    // Phase 13D's meta-codegen will fan this out across every
+    // `app.islands` decl + extract a shared runtime chunk.
+    const counter_island_mod = b.createModule(.{
+        .root_source_file = b.path("src/client/islands/counter.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    const counter_island_wasm = b.addExecutable(.{
+        .name = "island_counter",
+        .root_module = counter_island_mod,
+    });
+    counter_island_wasm.entry = .disabled;
+    counter_island_wasm.rdynamic = true;
+
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(wasm.getEmittedBin(), "client.wasm");
     _ = wf.addCopyFile(b.path("src/bridge/verve.js"), "verve.js");
+    _ = wf.addCopyFile(counter_island_wasm.getEmittedBin(), "island_counter.wasm");
     _ = wf.add("assets.zig",
         \\pub const wasm: []const u8 = @embedFile("client.wasm");
         \\pub const js: []const u8 = @embedFile("verve.js");
+        \\pub const island_counter: []const u8 = @embedFile("island_counter.wasm");
         \\
     );
     const assets_mod = b.createModule(.{

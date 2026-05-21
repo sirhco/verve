@@ -9,6 +9,7 @@ test "manifest carries the Counter island declared in app.islands" {
     const entry = manifest.lookup("Counter") orelse return error.MissingCounter;
     try testing.expectEqualStrings("Counter", entry.name);
     try testing.expectEqualStrings("{\"initial\":\"i32\"}", entry.props_schema);
+    try testing.expectEqualStrings("/islands/Counter.wasm", entry.chunk_url);
 }
 
 test "manifest lookup returns null for unknown names" {

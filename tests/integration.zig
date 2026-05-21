@@ -233,6 +233,19 @@ test "server boots, serves pages, returns expected status codes" {
         try std.testing.expectEqual(@as(u16, 200), resp.status);
         try std.testing.expect(resp.body.len > 0);
     }
+    {
+        // Phase 13C: per-island chunk served at /islands/<name>.wasm.
+        // Body starts with the WASM magic `\0asm` so we can confirm
+        // the bytes actually parse as a module.
+        var resp = try request(io, gpa, TEST_PORT, "GET", "/islands/Counter.wasm");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(resp.body.len >= 8);
+        try std.testing.expectEqual(@as(u8, 0x00), resp.body[0]);
+        try std.testing.expectEqual(@as(u8, 'a'), resp.body[1]);
+        try std.testing.expectEqual(@as(u8, 's'), resp.body[2]);
+        try std.testing.expectEqual(@as(u8, 'm'), resp.body[3]);
+    }
 }
 
 test "form-encoded /api/addTodo + /api/removeTodo updates /todos" {

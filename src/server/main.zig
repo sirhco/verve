@@ -278,6 +278,10 @@ fn handleRequest(
         try respondBuffered(gpa, request, .ok, "application/javascript", "public, max-age=300", meta.accept_gzip, assets.js);
         return;
     }
+    if (std.mem.eql(u8, path, "/islands/Counter.wasm")) {
+        try respondBuffered(gpa, request, .ok, "application/wasm", "public, max-age=300", meta.accept_gzip, assets.island_counter);
+        return;
+    }
 
     if (std.mem.startsWith(u8, path, PUBLIC_PREFIX)) {
         try serveStatic(gpa, io, request, path[PUBLIC_PREFIX.len..], meta.accept_gzip, meta.accept_brotli);
