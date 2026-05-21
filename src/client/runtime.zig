@@ -164,6 +164,47 @@ test "registerI32 distinct names share the owner allocator" {
     try testing.expect(a != b);
 }
 
+test "ForEachHandle.update advances the cached key list" {
+    resetForTesting();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const initial = [_][]const u8{ "a", "b", "c" };
+    const handle = try registerForEach("items", &initial);
+
+    try testing.expectEqual(@as(usize, 3), handle.current_keys.len);
+    try testing.expectEqualStrings("a", handle.current_keys[0]);
+
+    const next = [_][]const u8{ "c", "a", "d" };
+    const next_html = [_][]const u8{ "<li data-vkey=\"c\">C</li>", "<li data-vkey=\"a\">A</li>", "<li data-vkey=\"d\">D</li>" };
+    try handle.update(arena.allocator(), &next, &next_html);
+
+    try testing.expectEqual(@as(usize, 3), handle.current_keys.len);
+    try testing.expectEqualStrings("c", handle.current_keys[0]);
+    try testing.expectEqualStrings("a", handle.current_keys[1]);
+    try testing.expectEqualStrings("d", handle.current_keys[2]);
+}
+
+test "ForEachHandle survives multiple updates including empty list" {
+    resetForTesting();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const initial = [_][]const u8{"only"};
+    const handle = try registerForEach("items", &initial);
+
+    // Remove everything.
+    try handle.update(arena.allocator(), &.{}, &.{});
+    try testing.expectEqual(@as(usize, 0), handle.current_keys.len);
+
+    // Add two fresh items.
+    const after = [_][]const u8{ "x", "y" };
+    const after_html = [_][]const u8{ "<li>x</li>", "<li>y</li>" };
+    try handle.update(arena.allocator(), &after, &after_html);
+    try testing.expectEqual(@as(usize, 2), handle.current_keys.len);
+    try testing.expectEqualStrings("x", handle.current_keys[0]);
+}
+
 test "applyReconcile runs against native dom stubs without crashing" {
     resetForTesting();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -255,6 +296,67 @@ fn htmlForKey(
         if (std.mem.eql(u8, k, target)) return h;
     }
     return "";
+}
+
+/// Persistent handle over a keyed parent. Holds the last-known key
+/// order in the runtime's owner-allocated storage so subsequent
+/// `update` calls can diff against the live DOM without the caller
+/// having to track the previous order themselves. Constructed via
+/// `registerForEach` — the initial keys must match what the server
+/// rendered into the parent, so the very first `update` only emits
+/// ops for the actual delta.
+pub const ForEachHandle = struct {
+    parent_bind: []const u8,
+    current_keys: [][]const u8,
+    allocator: std.mem.Allocator,
+
+    /// Reconcile against a new key/html pairing. `new_html[i]` is the
+    /// child markup for `new_keys[i]`. Inserted children are anchored
+    /// against the next surviving key; removed children are detached;
+    /// surviving children keep their DOM nodes intact across moves.
+    ///
+    /// `arena` is scratch for the planner — it can be the caller's
+    /// per-frame allocator. The handle's own slot stays on the runtime
+    /// owner.
+    pub fn update(
+        self: *ForEachHandle,
+        arena: std.mem.Allocator,
+        new_keys: []const []const u8,
+        new_html: []const []const u8,
+    ) !void {
+        try applyReconcile(arena, self.parent_bind, self.current_keys, new_keys, new_html);
+        // Replace the cached key list with owner-allocated copies so
+        // the caller can reuse `new_keys`' backing memory.
+        const owned = try self.allocator.alloc([]const u8, new_keys.len);
+        for (new_keys, 0..) |k, i| {
+            owned[i] = try self.allocator.dupe(u8, k);
+        }
+        // Free the previous cache slot. Bump allocator is a no-op
+        // free; native fallback skip is harmless.
+        self.allocator.free(self.current_keys);
+        self.current_keys = owned;
+    }
+};
+
+/// Build a `ForEachHandle` keyed against `parent_bind`. `initial_keys`
+/// is the key order the server rendered — supplying it correctly is
+/// the contract that makes the first `update` emit ops for only the
+/// real delta (rather than treating every existing child as new).
+pub fn registerForEach(parent_bind: []const u8, initial_keys: []const []const u8) !*ForEachHandle {
+    const owner = ensureOwner();
+    const gpa = owner.allocator();
+
+    const handle = try gpa.create(ForEachHandle);
+    const owned = try gpa.alloc([]const u8, initial_keys.len);
+    for (initial_keys, 0..) |k, i| {
+        owned[i] = try gpa.dupe(u8, k);
+    }
+    handle.* = .{
+        .parent_bind = parent_bind,
+        .current_keys = owned,
+        .allocator = gpa,
+    };
+    return handle;
 }
 
 /// Wipe runtime state. ONLY for use from unit tests on the native build.
