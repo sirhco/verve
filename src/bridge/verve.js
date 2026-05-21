@@ -205,6 +205,31 @@
   // hydrate fn during `verve_hydrate`, so this pass picks them up.
   dispatchIslands();
 
+  // ---- Phase 14: out-of-order Suspense swap ---------------------------
+  // Each parked Suspense boundary renders as
+  //   <div data-vs="N">{fallback}</div>
+  // in the shell, and the server eventually emits
+  //   <template id="verve-vs-N">{real content}</template>
+  //   <script nonce=…>verveSwap(N)</script>
+  // when the resource resolves. The helper here unwraps the template
+  // and grafts its content in place of the fallback div. Reactive
+  // state on surrounding nodes stays put — the swap only touches the
+  // single placeholder element.
+  window.verveSwap = (id) => {
+    const placeholder = document.querySelector(`[data-vs="${id}"]`);
+    if (!placeholder) return;
+    const tpl = document.getElementById(`verve-vs-${id}`);
+    if (!tpl || tpl.tagName !== "TEMPLATE") return;
+    const frag = tpl.content.cloneNode(true);
+    placeholder.replaceWith(frag);
+    tpl.remove();
+    // Pick up any new `data-vh` markers introduced by the swap so the
+    // reactive runtime sees them on the next signal tick.
+    if (typeof exp !== "undefined" && typeof exp.verve_hydrate === "function") {
+      try { exp.verve_hydrate(); } catch (_) {}
+    }
+  };
+
   // ---- Server Functions ------------------------------------------------
   // Generic JS-side caller for app.Actions endpoints. `name` matches
   // the function declared in `app.Actions`; `args` is a plain object

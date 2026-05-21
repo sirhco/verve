@@ -53,6 +53,8 @@ pub const createAction = action_mod.create;
 pub const suspense = suspense_mod.suspense;
 pub const transition = suspense_mod.transition;
 pub const markSuspended = suspense_mod.markSuspended;
+pub const StreamRegistry = @import("core/stream_context.zig").Registry;
+pub const StreamSlot = @import("core/stream_context.zig").Slot;
 pub const encode = serialize_mod.encode;
 pub const csrf = csrf_mod;
 pub const show = control_flow_mod.show;
@@ -115,6 +117,7 @@ test {
     _ = @import("core/resource.zig");
     _ = @import("core/action.zig");
     _ = @import("core/suspense.zig");
+    _ = @import("core/stream_context.zig");
     _ = @import("core/serialize.zig");
     _ = @import("core/csrf.zig");
     _ = @import("core/control_flow.zig");
