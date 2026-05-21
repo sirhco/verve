@@ -14,6 +14,15 @@ pub const tracker = struct {
     pub const issue = @import("components/tracker/issue.zig");
     pub const issues = @import("components/tracker/issues.zig");
     pub const team = @import("components/tracker/team.zig");
+    pub const realtime = @import("components/tracker/realtime.zig");
+};
+pub const admin = struct {
+    pub const index = @import("components/admin/index.zig");
+    pub const analytics = @import("components/admin/analytics.zig");
+    pub const settings = @import("components/admin/settings.zig");
+    pub const jobs = @import("components/admin/jobs.zig");
+    pub const audit = @import("components/admin/audit.zig");
+    pub const users = @import("components/admin/users.zig");
 };
 pub const not_found = @import("components/notFound.zig");
 

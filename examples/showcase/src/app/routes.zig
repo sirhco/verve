@@ -36,8 +36,45 @@ pub const routes: []const verve.Route = &.{
             verve.Route.init("/i/:num",  renderIssueDetail),
             verve.Route.init("/team",    renderTeam).protect(api.teamGuard),
         }),
+        verve.Route.init("/realtime", renderRealtime),
     }),
+
+    // Phase C — admin (all gated by adminGuard) + island demo + draft endpoint
+    verve.Route.init("/admin",            renderAdminHome).protect(api.adminGuard),
+    verve.Route.init("/admin/analytics",  renderAdminAnalytics).protect(api.adminGuard),
+    verve.Route.init("/admin/settings",   renderAdminSettings).protect(api.adminGuard),
+    verve.Route.init("/admin/jobs",       renderAdminJobs).protect(api.adminGuard),
+    verve.Route.init("/admin/audit",      renderAdminAudit).protect(api.adminGuard),
+    verve.Route.init("/admin/users/:id",  renderAdminUser).protect(api.adminGuard),
 };
+
+fn renderRealtime(ctx: *verve.Context) !*verve.Node {
+    return components.tracker.realtime.realtimePage(ctx);
+}
+
+fn renderAdminHome(ctx: *verve.Context) !*verve.Node {
+    return components.admin.index.adminHome(ctx);
+}
+
+fn renderAdminAnalytics(ctx: *verve.Context) !*verve.Node {
+    return components.admin.analytics.analyticsPage(ctx);
+}
+
+fn renderAdminSettings(ctx: *verve.Context) !*verve.Node {
+    return components.admin.settings.settingsPage(ctx);
+}
+
+fn renderAdminJobs(ctx: *verve.Context) !*verve.Node {
+    return components.admin.jobs.jobsPage(ctx);
+}
+
+fn renderAdminAudit(ctx: *verve.Context) !*verve.Node {
+    return components.admin.audit.auditPage(ctx);
+}
+
+fn renderAdminUser(ctx: *verve.Context) !*verve.Node {
+    return components.admin.users.userPage(ctx);
+}
 
 fn renderAppRedirect(ctx: *verve.Context) !*verve.Node {
     return ctx.redirect("/app/o/acme/projects");
