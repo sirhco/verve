@@ -81,6 +81,38 @@ const WasmBridge = struct {
         bind_ptr: [*]const u8,
         bind_len: usize,
     ) void;
+
+    // ---- Phase 12C: keyed-list reconciler primitives ------------------------
+    // Parent element is identified by its `z-bind` (or `data-vh`) name.
+    // Children carry `data-vkey="<key>"`. `anchor_len == 0` means "append
+    // to the end of the parent" (no insertBefore reference node).
+
+    pub extern "verve" fn create_keyed_child(
+        parent_ptr: [*]const u8,
+        parent_len: usize,
+        key_ptr: [*]const u8,
+        key_len: usize,
+        html_ptr: [*]const u8,
+        html_len: usize,
+        anchor_ptr: [*]const u8,
+        anchor_len: usize,
+    ) void;
+
+    pub extern "verve" fn move_keyed_child(
+        parent_ptr: [*]const u8,
+        parent_len: usize,
+        key_ptr: [*]const u8,
+        key_len: usize,
+        anchor_ptr: [*]const u8,
+        anchor_len: usize,
+    ) void;
+
+    pub extern "verve" fn remove_keyed_child(
+        parent_ptr: [*]const u8,
+        parent_len: usize,
+        key_ptr: [*]const u8,
+        key_len: usize,
+    ) void;
 };
 
 const NativeStub = struct {
@@ -93,6 +125,9 @@ const NativeStub = struct {
     pub fn set_text_by_bind_str(_: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
     pub fn set_value_by_bind(_: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
     pub fn remove_by_bind(_: [*]const u8, _: usize) void {}
+    pub fn create_keyed_child(_: [*]const u8, _: usize, _: [*]const u8, _: usize, _: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
+    pub fn move_keyed_child(_: [*]const u8, _: usize, _: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
+    pub fn remove_keyed_child(_: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
 };
 
 pub const set_text_by_bind = Bridge.set_text_by_bind;
@@ -104,3 +139,6 @@ pub const set_class_by_bind = Bridge.set_class_by_bind;
 pub const set_text_by_bind_str = Bridge.set_text_by_bind_str;
 pub const set_value_by_bind = Bridge.set_value_by_bind;
 pub const remove_by_bind = Bridge.remove_by_bind;
+pub const create_keyed_child = Bridge.create_keyed_child;
+pub const move_keyed_child = Bridge.move_keyed_child;
+pub const remove_keyed_child = Bridge.remove_keyed_child;

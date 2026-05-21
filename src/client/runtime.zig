@@ -16,6 +16,7 @@
 const std = @import("std");
 const verve = @import("verve");
 const dom = @import("dom.zig");
+const reconciler = @import("reconciler.zig");
 const client_alloc = @import("allocator.zig");
 
 const MAX_SLOTS = 64;
@@ -163,6 +164,20 @@ test "registerI32 distinct names share the owner allocator" {
     try testing.expect(a != b);
 }
 
+test "applyReconcile runs against native dom stubs without crashing" {
+    resetForTesting();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const old_keys = [_][]const u8{ "a", "b", "c" };
+    const new_keys = [_][]const u8{ "c", "a", "d" };
+    const new_html = [_][]const u8{ "<li data-vkey=\"c\">C</li>", "<li data-vkey=\"a\">A</li>", "<li data-vkey=\"d\">D</li>" };
+
+    // Native dom stubs are no-ops; this exercises the planner +
+    // dispatch glue end-to-end without a real DOM.
+    try applyReconcile(arena.allocator(), "items", &old_keys, &new_keys, &new_html);
+}
+
 test "registerStr allocates a string Signal" {
     resetForTesting();
 
@@ -176,6 +191,70 @@ test "registerStr allocates a string Signal" {
     try testing.expectEqual(counter, signalI32("count").?);
     try testing.expect(signalStr("count") == null);
     try testing.expect(signalI32("title") == null);
+}
+
+/// Reconcile a keyed parent against a new key/html pairing. Calls
+/// `reconciler.plan` to compute the minimum (insert | move | remove)
+/// op sequence then dispatches each op through the matching DOM
+/// primitive. `new_html` is parallel to `new_keys` — entry `i` is the
+/// child markup for `new_keys[i]`. Existing children keep their DOM
+/// nodes intact across moves so reactive state on their descendants
+/// survives.
+pub fn applyReconcile(
+    arena: std.mem.Allocator,
+    parent_bind: []const u8,
+    old_keys: []const []const u8,
+    new_keys: []const []const u8,
+    new_html: []const []const u8,
+) !void {
+    std.debug.assert(new_keys.len == new_html.len);
+    const ops = try reconciler.plan(arena, old_keys, new_keys);
+    for (ops) |op| switch (op.kind) {
+        .insert => {
+            const html = htmlForKey(new_keys, new_html, op.key);
+            const anchor = op.anchor orelse "";
+            dom.create_keyed_child(
+                parent_bind.ptr,
+                parent_bind.len,
+                op.key.ptr,
+                op.key.len,
+                html.ptr,
+                html.len,
+                anchor.ptr,
+                anchor.len,
+            );
+        },
+        .move => {
+            const anchor = op.anchor orelse "";
+            dom.move_keyed_child(
+                parent_bind.ptr,
+                parent_bind.len,
+                op.key.ptr,
+                op.key.len,
+                anchor.ptr,
+                anchor.len,
+            );
+        },
+        .remove => {
+            dom.remove_keyed_child(
+                parent_bind.ptr,
+                parent_bind.len,
+                op.key.ptr,
+                op.key.len,
+            );
+        },
+    };
+}
+
+fn htmlForKey(
+    keys: []const []const u8,
+    htmls: []const []const u8,
+    target: []const u8,
+) []const u8 {
+    for (keys, htmls) |k, h| {
+        if (std.mem.eql(u8, k, target)) return h;
+    }
+    return "";
 }
 
 /// Wipe runtime state. ONLY for use from unit tests on the native build.
