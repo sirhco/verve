@@ -46,7 +46,30 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/admin/jobs",       renderAdminJobs).protect(api.adminGuard),
     verve.Route.init("/admin/audit",      renderAdminAudit).protect(api.adminGuard),
     verve.Route.init("/admin/users/:id",  renderAdminUser).protect(api.adminGuard),
+
+    // Phase D
+    verve.Route.init("/island-demo", renderIslandDemo),
 };
+
+fn renderIslandDemo(ctx: *verve.Context) !*verve.Node {
+    const inline_widget = ctx.div().class("kpi").children(.{
+        ctx.span().class("kpi-label").text("hydration target"),
+        ctx.span().class("kpi-value").bind("count").textInt(api.last_count.load(.monotonic)),
+    });
+    const wrapped = verve.island(ctx, .{
+        .name = "Counter",
+        .props = "{\"initial\":0}",
+    }, inline_widget);
+
+    const body = ctx.div().children(.{
+        ctx.div().class("hero").children(.{
+            ctx.h1("Islands"),
+            ctx.p().class("lead").text("Server emits a `<verve-island data-name=… data-props=…>` marker around the SSR subtree. The Phase 8 client runtime will fetch a per-island WASM chunk and hydrate this subtree in place. View source to see the wrapper."),
+        }),
+        ctx.section().class("card").children(.{ wrapped }),
+    });
+    return components.shell.page(ctx, body);
+}
 
 fn renderRealtime(ctx: *verve.Context) !*verve.Node {
     return components.tracker.realtime.realtimePage(ctx);
