@@ -1,34 +1,77 @@
 # 12 — WASM client
 
-The browser-side runtime. ~650 bytes of wasm + ~100 lines of JS bridge.
+The browser-side runtime. ~4 KB of wasm + the JS bridge.
 Compiles from `src/client/` against `wasm32-freestanding`, optimized
-for size.
+for size. Hosts the same `Signal` / `Effect` / `Owner` graph the
+server uses — DOM updates are a *consequence* of `Signal.set`, not
+a parallel write path.
 
 ## Surface
 
 | Module | Purpose |
 |---|---|
-| `src/client/main.zig`      | Exported wasm symbols + signal wiring |
-| `src/client/signal.zig`    | `ClientSignal(T)` generic |
-| `src/client/dom.zig`       | Externs supplied by the JS bridge |
-| `src/client/allocator.zig` | Fixed-buffer allocator over a static heap |
-| `src/client/render.zig`    | `escapeHtml` wrapped against the FBA |
-| `src/bridge/verve.js`      | Boot, hydrate, DOM ↔ wasm glue |
+| `src/client/main.zig`      | Exported wasm symbols + per-bind Signal wiring |
+| `src/client/runtime.zig`   | `registerI32` / `registerStr` / `registerBool` / `registerF32` + `ForEachHandle` + `bindForEach` |
+| `src/client/reconciler.zig`| LIS-based keyed-list planner. See [17 — Reconciler](17-reconciler.md). |
+| `src/client/island.zig`    | Per-binary island dispatch + registry |
+| `src/client/signal.zig`    | Legacy `ClientSignal(T)` — kept for pre-Phase-12 callers |
+| `src/client/dom.zig`       | Externs supplied by the JS bridge + native no-op stubs |
+| `src/client/allocator.zig` | Growable bump allocator — long-lived state (Signals, Owner, key caches) |
+| `src/client/scratch.zig`   | Fixed 256 KB scratch bump — reset between effect re-runs |
+| `src/client/islands/`      | Per-island chunk sources (`<Name>.zig` or fallback `_default.zig`) |
+| `src/client/render.zig`    | `escapeHtml` wrapped against the long-lived allocator |
+| `src/bridge/verve.js`      | Boot, hydrate, DOM ↔ wasm glue, island chunk loader, `verveSwap` |
+
+## Reactive runtime
+
+The WASM client allocates a root `Owner` lazily over the bump
+allocator and registers one `verve.Signal(T)` per `[data-vh="<name>"]`
+binding the server rendered. Each Signal's `on_set` hook fires into
+a DOM primitive — `set_text_by_bind_i32`, `set_class_present_by_bind`,
+`set_text_by_bind_f32`, `set_text_by_bind_str`, … — so any
+`signal.set(value)` mutation lands in the DOM through the existing
+reactive graph rather than a parallel write path.
+
+```zig
+// src/client/main.zig
+const count_sig = runtime.registerI32("count", count_initial);
+
+export fn increment_counter() void {
+    count_sig.?.set(count_sig.?.peek() + 1);   // → on_set → DOM
+}
+```
+
+Available registrars:
+
+| Function | Signal type | DOM effect |
+|---|---|---|
+| `runtime.registerI32(name, initial)` | `Signal(i32)` | Replaces text content via `set_text_by_bind_i32` |
+| `runtime.registerStr(name, initial)` | `Signal([]const u8)` | Replaces text content via `set_text_by_bind_str` |
+| `runtime.registerBool(name, class, initial)` | `Signal(bool)` | Toggles `class` via `set_class_present_by_bind` |
+| `runtime.registerF32(name, initial)` | `Signal(f32)` | Replaces text content via `set_text_by_bind_f32` |
+| `runtime.registerForEach(parent, initial_keys)` | `*ForEachHandle` | Reconciler-driven keyed children — see [17 — Reconciler](17-reconciler.md) |
+| `runtime.bindForEach(handle, ctx, render_fn)` | `*verve.Effect` | Re-runs `render_fn` and calls `handle.update` on any tracked Signal change |
 
 ## Exports
 
 What the wasm module exposes to JS:
 
 ```
-verve_hydrate()                  re-emit current signal values
-verve_init_count(value: i32)     seed `count` signal from SSR'd DOM
-verve_init_clicks(value: i32)    seed `clicks` signal
-increment_counter()              count.increment(); clicks.increment(); POST /api/updateDatabase
-decrement_counter()              count.decrement(); clicks.increment();
-current_count() i32              count.get()
-verve_alloc_used() u32           FBA bytes consumed
-verve_alloc_capacity() u32       FBA total bytes
-verve_alloc_reset()              FBA reclaim
+verve_hydrate()                       allocate Signal slots, hook on_set callbacks
+verve_init_<bind>(value: i32)         seed the named bind from SSR'd DOM text
+verve_set_count(value: i32)           drive `count` through the reactive graph (WS push)
+increment_counter / decrement_counter app actions
+current_count() i32                   peek the count Signal
+verve_alloc_used / verve_alloc_capacity / verve_alloc_reset
+                                      growable bump heap introspection
+verve_scratch_used / verve_scratch_capacity
+                                      256 KB scratch region introspection
+verve_island_count() u32              number of entries in the build-time manifest
+verve_island_scratch_ptr() u32        shared scratch base address for per-island chunks
+verve_island_scratch_capacity() u32   shared scratch size
+verve_island_dispatch(name_len, props_len) i32
+                                      in-process island dispatch — returns 1 when a
+                                      hydrator was registered for the named island, 0 otherwise
 ```
 
 The bridge enumerates these on boot:

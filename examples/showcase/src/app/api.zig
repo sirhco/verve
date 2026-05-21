@@ -14,6 +14,7 @@ const std = @import("std");
 const verve = @import("verve");
 
 pub const components = @import("components.zig");
+pub const islands = @import("islands.zig");
 pub const routes_mod = @import("routes.zig");
 pub const routes = routes_mod.routes;
 

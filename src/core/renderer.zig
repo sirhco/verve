@@ -341,7 +341,7 @@ test "raw_inner takes precedence over text and children" {
     var w: Writer = .fixed(&buf);
     const node = try ctx.div()
         .text("should not appear")
-        .children(.{ ctx.span().text("nope") })
+        .children(.{ctx.span().text("nope")})
         .raw("<i>raw</i>")
         .build();
     try Renderer.render(&w, node);

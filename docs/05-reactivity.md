@@ -5,6 +5,11 @@ are observable values, effects re-run whenever any signal they read
 changes, and an Owner tree groups signals + effects so they're
 disposed deterministically.
 
+The same primitives ship in the WASM client — see
+[12 — WASM client](12-wasm-client.md) for the runtime that hosts
+the graph in the browser and [17 — Reconciler](17-reconciler.md)
+for the keyed-list machinery `forEach` ties into.
+
 ## The core primitives
 
 | Type | What it is |

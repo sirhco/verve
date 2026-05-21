@@ -143,7 +143,7 @@ fn spawnServer(gpa: std.mem.Allocator, threaded: *std.Io.Threaded, port: u16) !H
     // Integration tests don't (yet) round-trip CSRF tokens through their
     // form-posting helpers, so disable the check at the boundary. End-
     // to-end CSRF coverage lives in the dedicated csrf_smoke test.
-    return spawnServerExtra(gpa, threaded, port, &.{ "--csrf=disable" });
+    return spawnServerExtra(gpa, threaded, port, &.{"--csrf=disable"});
 }
 
 fn spawnServerExtra(

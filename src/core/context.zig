@@ -521,7 +521,7 @@ test "Context.div builds tag with class and child" {
 
     const ctx = Context.init(&arena);
     const node = try ctx.div().class("page")
-        .children(.{ ctx.h1("hi") })
+        .children(.{ctx.h1("hi")})
         .build();
 
     try std.testing.expectEqualStrings("div", node.tag);

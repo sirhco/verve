@@ -28,9 +28,9 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
     return ctx.main_().class("home").children(.{
         ctx.h1("Verve"),
         ctx.p().text("Full-stack Zig web framework — fine-grained reactivity, no macros."),
-        ctx.p().children(.{ verve.link(ctx, "/counter", "Counter demo →", .{ .prefetch_on_hover = true }) }),
-        ctx.p().children(.{ verve.link(ctx, "/todos", "Todo list (form fallback) →", .{}) }),
-        ctx.p().children(.{ verve.link(ctx, "/work/hello-world", "Path-param demo (/work/:slug) →", .{}) }),
+        ctx.p().children(.{verve.link(ctx, "/counter", "Counter demo →", .{ .prefetch_on_hover = true })}),
+        ctx.p().children(.{verve.link(ctx, "/todos", "Todo list (form fallback) →", .{})}),
+        ctx.p().children(.{verve.link(ctx, "/work/hello-world", "Path-param demo (/work/:slug) →", .{})}),
     }).build();
 }
 
@@ -56,7 +56,7 @@ pub fn workDetail(ctx: *const verve.Context, slug: []const u8) !*verve.Node {
             ctx.code(slug),
         }),
         ctx.p().text("This route uses /work/:slug. The matched parameter is bound to ctx.params[\"slug\"] by the router."),
-        ctx.p().children(.{ ctx.a("/", "← Home") }),
+        ctx.p().children(.{ctx.a("/", "← Home")}),
     }).build();
 }
 
@@ -117,7 +117,7 @@ pub fn privatePage(ctx: *const verve.Context) !*verve.Node {
     return ctx.main_().class("home").children(.{
         ctx.h1("Protected page"),
         ctx.p().text("This route is gated by a guard fn — visiting without ?token=... redirects to /counter."),
-        ctx.p().children(.{ ctx.a("/", "← Home") }),
+        ctx.p().children(.{ctx.a("/", "← Home")}),
     }).build();
 }
 
@@ -128,7 +128,7 @@ pub fn notFound(ctx: *const verve.Context, path: []const u8) !*verve.Node {
             ctx.span().text("No route for "),
             ctx.code(path),
         }),
-        ctx.p().children(.{ ctx.a("/", "← Home") }),
+        ctx.p().children(.{ctx.a("/", "← Home")}),
     }).build();
 }
 
@@ -141,7 +141,7 @@ pub fn errorPage(
     return ctx.main_().class("home").children(.{
         ctx.el("h1").textFmt("{d} — {s}", .{ status_code, status_text }),
         ctx.p().text(message),
-        ctx.p().children(.{ ctx.a("/", "← Home") }),
+        ctx.p().children(.{ctx.a("/", "← Home")}),
     }).build();
 }
 

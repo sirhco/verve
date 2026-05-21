@@ -29,18 +29,45 @@ struct argument is required — the dispatcher reads field names off the
 struct's `@typeInfo` at comptime because parameter names aren't
 available there.
 
-## Three call paths
+## Four call paths
 
-The same action surfaces three ways:
+The same action surfaces four ways:
 
 1. **POST /api/&lt;name&gt;** — native HTTP endpoint. Form posts and JSON
    posts both work; see [Dual-mode dispatch](#dual-mode-dispatch).
 2. **`ctx.serverFn(app.Actions.foo, args)`** — direct invocation from
    server-side render code. Skips the HTTP/JSON roundtrip; returns
    the function's real return type.
-3. **`window.verveServerFn("foo", args)`** — JavaScript wrapper that
-   POSTs the same endpoint. WASM islands (Phase 8) will get typed
-   stubs on top of this generic helper.
+3. **`app_client.<name>(arena, args)`** — generated typed stub. Same
+   shape as `ctx.serverFn` but reachable without a Context — useful
+   for utilities and tests. See [Generated client stubs](#generated-client-stubs).
+4. **`app_client.<name>_post(scratch, args)`** — generated WASM-side
+   fire-and-forget. Serializes `args` to JSON and posts to
+   `/api/<name>` via the JS bridge; response is discarded. Native
+   build invokes the action directly + drops the result, so the
+   same symbol compiles in both targets. Untyped escape hatch
+   remains `window.verveServerFn("foo", args)` for hand-written JS.
+
+## Generated client stubs
+
+`build.zig` runs `tools/server_fn_codegen.zig` at build time. The
+codegen tool walks `app.Actions` at comptime and emits a generated
+`app_client.zig` module that gets imported into the server binary
+(and the WASM client, where `_post` variants reach the JS bridge):
+
+```zig
+// generated — used from server-side render code
+const after = try app_client.incrementCount(ctx.alloc(), .{});
+try testing.expectEqual(@as(i32, 1), after);
+
+// generated — used from WASM client; serializes args + posts.
+// On native it just runs the action and drops the result.
+app_client.addTodo_post(scratch, .{ .text = "milk" });
+```
+
+Native value-returning calls are typed end-to-end. WASM-side
+typed *value returns* still wait on the streaming async runtime
+(Phase 14C) — use the `_post` variant for now.
 
 ## Return types
 
