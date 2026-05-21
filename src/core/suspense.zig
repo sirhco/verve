@@ -23,6 +23,7 @@ const std = @import("std");
 const Context = @import("context.zig").Context;
 const Node = @import("node.zig").Node;
 const create_node = @import("node.zig").create;
+const stream_context = @import("stream_context.zig");
 
 /// Thread-local flag set by Resource (and other suspendable primitives)
 /// during render to signal the nearest enclosing `<Suspense>` boundary
@@ -56,7 +57,6 @@ pub fn suspense(
     ctx_ptr: anytype,
     comptime render_child: fn (@TypeOf(ctx_ptr)) anyerror!*Node,
 ) !*Node {
-    _ = ctx;
     const prev = suspended;
     suspended = false;
     defer suspended = prev;
@@ -69,9 +69,15 @@ pub fn suspense(
     };
 
     if (suspended) {
-        // Phase 4-future: emit `<div data-vs="{id}">{fallback}</div>` and
-        // register a continuation. For now we just return the fallback
-        // directly since no Resource is genuinely async.
+        // Phase 14B: when a stream registry is active, register the
+        // child render fn as a continuation + emit a placeholder
+        // `<div data-vs="{id}">{fallback}</div>` the client swaps
+        // once the real content arrives. Non-streaming renders fall
+        // through to the legacy inline-fallback shape.
+        if (stream_context.current) |reg| {
+            const id = reg.registerSuspended(ctx_ptr, render_child) catch return opts.fallback;
+            return ctx.el("div").attrFmt("data-vs", "{d}", .{id}).children(.{opts.fallback});
+        }
         return opts.fallback;
     }
 

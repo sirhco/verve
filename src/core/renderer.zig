@@ -5,6 +5,7 @@ const Writer = std.Io.Writer;
 const node_mod = @import("node.zig");
 const Context = @import("context.zig").Context;
 const Node = node_mod.Node;
+const stream_context = @import("stream_context.zig");
 
 /// Per-render CSP nonce. The server sets this before serialization
 /// so the renderer can stamp `nonce="…"` on every emitted `<script>`
@@ -15,6 +16,53 @@ const Node = node_mod.Node;
 pub threadlocal var current_nonce: []const u8 = "";
 
 pub const Renderer = struct {
+    /// Phase 14B — chunked render that flushes the shell first, then
+    /// drains every Suspense boundary that registered a continuation.
+    /// `reg` is wired through `stream_context.current` for the duration
+    /// of the call so deeply-nested `suspense()` invocations can pick
+    /// up the slot allocator without threading the registry through
+    /// every closure.
+    ///
+    /// Output shape per draining continuation:
+    ///   <template id="verve-vs-{id}">{real content}</template>
+    ///   <script>verveSwap({id})</script>
+    ///
+    /// The script tag carries no nonce by default — server callers
+    /// that run under a strict CSP should stamp `current_nonce` before
+    /// invoking; the inline script then picks the nonce up the same
+    /// way every other emitted script does.
+    pub fn streamRender(
+        w: *Writer,
+        node: *const Node,
+        reg: *@import("stream_context.zig").Registry,
+    ) Writer.Error!void {
+        const prev = stream_context.current;
+        stream_context.current = reg;
+        defer stream_context.current = prev;
+
+        try render(w, node);
+
+        // Drain continuations in registration order. Each parked
+        // boundary's `render_real` runs again now that the underlying
+        // upstream is meant to have resolved — today that just means
+        // a second sync call into the same child, since Resource is
+        // still synchronous. Once the async runtime lands, the slot
+        // can hold off until its future fires.
+        for (reg.pending()) |slot| {
+            const real = slot.render_real(slot.ctx) catch continue;
+            try w.print("<template id=\"verve-vs-{d}\">", .{slot.id});
+            try render(w, real);
+            try w.writeAll("</template>");
+            if (current_nonce.len > 0) {
+                try w.writeAll("<script nonce=\"");
+                try escapeAttr(w, current_nonce);
+                try w.print("\">verveSwap({d})</script>", .{slot.id});
+            } else {
+                try w.print("<script>verveSwap({d})</script>", .{slot.id});
+            }
+        }
+    }
+
     pub fn render(w: *Writer, node: *const Node) Writer.Error!void {
         // Outlet placeholder for nested routing — expand into the
         // child route's rendered tree (or emit nothing when no child
@@ -166,6 +214,48 @@ test "renders nested element with attrs and z-bind" {
     try std.testing.expectEqualStrings(
         \\<div class="card"><span z-bind="count" data-vh="count">0</span><button z-on-click="increment">+</button></div>
     , w.buffered());
+}
+
+test "streamRender emits placeholder + template + verveSwap for a suspended boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    var reg = @import("stream_context.zig").Registry.init(arena.allocator());
+    defer reg.deinit();
+
+    const Inner = struct {
+        var hits: u32 = 0;
+        fn render(c: *const Context) anyerror!*Node {
+            hits += 1;
+            // Suspend on the first render so the boundary parks a
+            // continuation + emits a placeholder; subsequent runs
+            // (driven by the drain pump) deliver the real content.
+            if (hits == 1) @import("suspense.zig").markSuspended();
+            return c.div().class("real-content").text("ok").build();
+        }
+    };
+    Inner.hits = 0;
+
+    // Activate the registry before building the tree — suspense()
+    // is eager (it runs the child during tree construction), so the
+    // threadlocal must be live during that call, not just during
+    // the writer walk.
+    stream_context.current = &reg;
+    const fallback = ctx.div().class("loading");
+    const root = try @import("suspense.zig").suspense(&ctx, .{ .fallback = fallback }, &ctx, Inner.render);
+    stream_context.current = null;
+
+    var buf: [1024]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    try Renderer.streamRender(&w, root, &reg);
+
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "data-vs=\"0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "loading") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<template id=\"verve-vs-0\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "real-content") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "verveSwap(0)") != null);
 }
 
 test "escapes HTML entities in text" {

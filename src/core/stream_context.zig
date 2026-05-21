@@ -17,6 +17,11 @@
 const std = @import("std");
 const Node = @import("node.zig").Node;
 
+/// Thread-local pointer to the active stream registry, or null when
+/// the render is going through the legacy single-shot path. Set by
+/// `Renderer.streamRender` for the lifetime of a chunked response.
+pub threadlocal var current: ?*Registry = null;
+
 /// One parked boundary. `id` matches the `data-vs` attribute on the
 /// fallback placeholder; `render_real` is invoked by the drain pump
 /// after the boundary's upstream finishes.

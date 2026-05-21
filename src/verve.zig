@@ -56,6 +56,23 @@ pub const transition = suspense_mod.transition;
 pub const markSuspended = suspense_mod.markSuspended;
 pub const StreamRegistry = @import("core/stream_context.zig").Registry;
 pub const StreamSlot = @import("core/stream_context.zig").Slot;
+
+/// Activate `reg` as the thread-local stream registry for the lifetime
+/// of the call. Suspense boundaries triggered inside `f(ctx_ptr)`
+/// register their continuations on `reg` rather than emitting fallback
+/// inline. Use alongside `Renderer.streamRender` for the chunked
+/// response path.
+pub fn withStreamRegistry(
+    reg: *StreamRegistry,
+    ctx_ptr: anytype,
+    comptime f: fn (@TypeOf(ctx_ptr)) anyerror!*Node,
+) anyerror!*Node {
+    const stream_ctx = @import("core/stream_context.zig");
+    const prev = stream_ctx.current;
+    stream_ctx.current = reg;
+    defer stream_ctx.current = prev;
+    return f(ctx_ptr);
+}
 pub const encode = serialize_mod.encode;
 pub const csrf = csrf_mod;
 pub const show = control_flow_mod.show;
