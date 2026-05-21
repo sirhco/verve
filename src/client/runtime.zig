@@ -26,9 +26,13 @@ const Slot = struct {
     type_tag: TypeTag,
 };
 
-const TypeTag = enum { i32 };
+const TypeTag = enum { i32, str };
 
 const BindBoxI32 = struct {
+    name: []const u8,
+};
+
+const BindBoxStr = struct {
     name: []const u8,
 };
 
@@ -89,6 +93,44 @@ fn onSetI32(ctx: *anyopaque, value: i32) void {
     dom.set_text_by_bind_i32(box.name.ptr, box.name.len, value);
 }
 
+/// Register a reactive string keyed by its bind-name. Allocates a
+/// `verve.Signal([]const u8)` under the root Owner and wires on_set
+/// to push the new text into every `[data-vh="<name>"]` element via
+/// the bridge's `set_text_by_bind_str` primitive.
+pub fn registerStr(name: []const u8, initial: []const u8) *verve.Signal([]const u8) {
+    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
+    const owner = ensureOwner();
+    const gpa = owner.allocator();
+
+    const sig = gpa.create(verve.Signal([]const u8)) catch @panic("verve client: OOM allocating Signal");
+    sig.* = verve.Signal([]const u8).init(initial, gpa);
+
+    const box = gpa.create(BindBoxStr) catch @panic("verve client: OOM allocating bind box");
+    box.* = .{ .name = name };
+    sig.on_set = onSetStr;
+    sig.on_set_ctx = box;
+
+    slots[slot_count] = .{ .name = name, .sig_ptr = sig, .type_tag = .str };
+    slot_count += 1;
+
+    return sig;
+}
+
+pub fn signalStr(name: []const u8) ?*verve.Signal([]const u8) {
+    for (slots[0..slot_count]) |s| {
+        if (s.type_tag != .str) continue;
+        if (std.mem.eql(u8, s.name, name)) {
+            return @ptrCast(@alignCast(s.sig_ptr));
+        }
+    }
+    return null;
+}
+
+fn onSetStr(ctx: *anyopaque, value: []const u8) void {
+    const box: *BindBoxStr = @ptrCast(@alignCast(ctx));
+    dom.set_text_by_bind_str(box.name.ptr, box.name.len, value.ptr, value.len);
+}
+
 // ---- testing ---------------------------------------------------------------
 
 const testing = std.testing;
@@ -119,6 +161,21 @@ test "registerI32 distinct names share the owner allocator" {
     try testing.expectEqual(@as(i32, 1), a.peek());
     try testing.expectEqual(@as(i32, 2), b.peek());
     try testing.expect(a != b);
+}
+
+test "registerStr allocates a string Signal" {
+    resetForTesting();
+
+    const sig = registerStr("title", "hello");
+    try testing.expectEqualStrings("hello", sig.peek());
+    try testing.expectEqual(sig, signalStr("title").?);
+    try testing.expect(sig.on_set != null);
+
+    // i32 and str slots coexist by tag.
+    const counter = registerI32("count", 0);
+    try testing.expectEqual(counter, signalI32("count").?);
+    try testing.expect(signalStr("count") == null);
+    try testing.expect(signalI32("title") == null);
 }
 
 /// Wipe runtime state. ONLY for use from unit tests on the native build.

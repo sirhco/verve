@@ -8,4 +8,5 @@ test {
     _ = @import("render.zig");
     _ = @import("runtime.zig");
     _ = @import("island.zig");
+    _ = @import("reconciler.zig");
 }
