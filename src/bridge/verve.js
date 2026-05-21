@@ -281,6 +281,12 @@
   // call its `hydrate` export. The main client.wasm's data-vh walker
   // has already wired reactive state inside the marker by this point —
   // the chunk hook is the place island-specific code lives.
+  // Phase 13E: chunks import the main client's linear memory at
+  // instantiation time so each island ships as a pure-function
+  // bundle (no duplicated runtime bytes). Props strings live in
+  // the main runtime's island scratch buffer — JS writes them
+  // there before calling the chunk's `hydrate(ptr, len, root_id)`,
+  // which then reads the bytes directly from shared memory.
   const islandChunks = new Map();
   const loadIslandChunk = async (el) => {
     const name = el.getAttribute("data-name") || "";
@@ -289,7 +295,9 @@
     if (!islandChunks.has(name)) {
       islandChunks.set(
         name,
-        WebAssembly.instantiateStreaming(fetch(url), {}).catch((err) => {
+        WebAssembly.instantiateStreaming(fetch(url), {
+          env: { memory },
+        }).catch((err) => {
           islandChunks.delete(name);
           console.warn("verve: island chunk fetch failed", name, err);
           return null;
@@ -301,18 +309,21 @@
     const cexp = chunk.instance.exports;
     if (typeof cexp.hydrate !== "function") return;
     const props = el.getAttribute("data-props") || "";
-    if (typeof cexp.props_buf_ptr === "function" && cexp.memory) {
-      const ptr = cexp.props_buf_ptr();
-      const cap = cexp.props_buf_capacity ? cexp.props_buf_capacity() : 0;
+    if (
+      typeof exp.verve_island_scratch_ptr === "function" &&
+      typeof exp.verve_island_scratch_capacity === "function"
+    ) {
+      const ptr = exp.verve_island_scratch_ptr();
+      const cap = exp.verve_island_scratch_capacity();
       const propsBytes = new TextEncoder().encode(props);
       if (propsBytes.length > cap) {
-        console.warn("verve: island props exceed chunk scratch", name);
+        console.warn("verve: island props exceed shared scratch", name);
         return;
       }
-      new Uint8Array(cexp.memory.buffer, ptr, cap).set(propsBytes, 0);
-      cexp.hydrate(propsBytes.length, 0);
+      new Uint8Array(memory.buffer, ptr, cap).set(propsBytes, 0);
+      cexp.hydrate(ptr, propsBytes.length, 0);
     } else {
-      cexp.hydrate(0, 0);
+      cexp.hydrate(0, 0, 0);
     }
   };
   document.querySelectorAll("verve-island").forEach((el) => {

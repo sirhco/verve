@@ -86,6 +86,17 @@ pub fn build(b: *std.Build) void {
         });
         exe.entry = .disabled;
         exe.rdynamic = true;
+        // Phase 13E: per-island chunks share the main client's
+        // linear memory at instantiation time. Combined with
+        // chunk sources that declare zero static state, this lets
+        // the chunks ship as pure-function bundles with no
+        // duplicated runtime bytes.
+        exe.import_memory = true;
+        // Small stack — chunks only hold transient locals during
+        // `hydrate`; the linker reserves the bottom of imported
+        // memory for it, which the main runtime is responsible
+        // for avoiding (`__heap_base` ≥ stack ceiling).
+        exe.stack_size = 4 * 1024;
 
         const out_name = b.fmt("island_{s}.wasm", .{name});
         _ = wf.addCopyFile(exe.getEmittedBin(), out_name);

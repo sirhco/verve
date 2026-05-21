@@ -1,33 +1,25 @@
-//! Phase 13D — default per-island chunk source.
+//! Phase 13E — shared-runtime default per-island chunk.
 //!
-//! Build.zig picks this up for every island declared under
-//! `app.islands` that doesn't ship a dedicated
-//! `src/client/islands/<Name>.zig` source file. The default chunk
-//! exports the same hydrate + scratch surface as a hand-written
-//! island so the JS bridge can treat them uniformly — the actual
-//! reactive wiring still flows through the main client.wasm's
-//! `data-vh` walker. Components that need custom per-island logic
-//! drop in a same-named file alongside this one.
+//! The chunk imports its memory from the main `client.wasm`'s
+//! linear memory at instantiation time. As long as the chunk
+//! declares zero static state of its own — no globals, no
+//! `var` decls outside fn bodies, no stack-resident locals
+//! beyond what a no-op hydrate needs — the import is safe:
+//! both modules see the same `memory[0..]` and the chunk's code
+//! never touches addresses the main runtime has reserved.
+//!
+//! Per-island chunks that do want their own scratch should
+//! reach into the main runtime's `scratch` allocator via the
+//! exports the shared instantiation passes in as imports (the
+//! Phase 13F follow-up adds this surface).
 
-const std = @import("std");
-
-var props_scratch: [4096]u8 align(@alignOf(usize)) = undefined;
-var hydrate_hits: u32 = 0;
-
-export fn props_buf_ptr() u32 {
-    return @intFromPtr(&props_scratch);
-}
-
-export fn props_buf_capacity() u32 {
-    return props_scratch.len;
-}
-
-export fn hydrate_count() u32 {
-    return hydrate_hits;
-}
-
-export fn hydrate(props_len: u32, root_id: u32) void {
+/// Island hydration entry. JS arranges for `props_ptr` /
+/// `props_len` to point into the main runtime's memory (so the
+/// chunk can read the data-props string without a per-chunk
+/// scratch buffer). `root_id` is reserved for the multi-instance
+/// case Phase 13F formalizes.
+export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
+    _ = props_ptr;
     _ = props_len;
     _ = root_id;
-    hydrate_hits += 1;
 }
