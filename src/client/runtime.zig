@@ -18,6 +18,7 @@ const verve = @import("verve");
 const dom = @import("dom.zig");
 const reconciler = @import("reconciler.zig");
 const client_alloc = @import("allocator.zig");
+const scratch = @import("scratch.zig");
 
 const MAX_SLOTS = 64;
 
@@ -183,6 +184,46 @@ test "ForEachHandle.update advances the cached key list" {
     try testing.expectEqualStrings("c", handle.current_keys[0]);
     try testing.expectEqualStrings("a", handle.current_keys[1]);
     try testing.expectEqualStrings("d", handle.current_keys[2]);
+}
+
+test "bindForEach scratch stays bounded across many re-runs" {
+    resetForTesting();
+
+    const initial = [_][]const u8{};
+    const handle = try registerForEach("items", &initial);
+    const sig = registerI32("n", 0);
+
+    const State = struct {
+        s: *verve.Signal(i32),
+        fn render(self: *@This(), alloc: std.mem.Allocator) anyerror!ForEachData {
+            const n: usize = @intCast(self.s.get());
+            const ks = try alloc.alloc([]const u8, n);
+            const hs = try alloc.alloc([]const u8, n);
+            for (0..n) |i| {
+                ks[i] = try std.fmt.allocPrint(alloc, "row{d}", .{i});
+                hs[i] = try std.fmt.allocPrint(alloc, "<li>{d}</li>", .{i});
+            }
+            return .{ .keys = ks, .html = hs };
+        }
+    };
+    var state: State = .{ .s = sig };
+    _ = try bindForEach(handle, &state, State.render);
+
+    scratch.reset();
+    // Same workload size across many re-runs — scratch usage after
+    // each tick stays under a small constant (function of the list
+    // size, not the iteration count).
+    var i: i32 = 0;
+    var peak: usize = 0;
+    while (i < 64) : (i += 1) {
+        sig.set(8);
+        sig.set(0);
+        peak = @max(peak, scratch.bytesUsed());
+    }
+    // A few hundred bytes per list-of-8 frame is the rough order. Cap
+    // generously to absorb compiler/layout variance — the load-bearing
+    // assertion is that the value doesn't scale with iteration count.
+    try testing.expect(peak < 8 * 1024);
 }
 
 test "bindForEach re-runs handle.update when a tracked signal changes" {
@@ -421,12 +462,13 @@ pub const ForEachData = struct {
 /// new keys. The first invocation runs eagerly under the runtime's
 /// Owner so the initial dependency set is recorded.
 ///
-/// `render_fn` allocates the returned slices from the supplied
-/// scratch allocator — caller doesn't have to manage scratch
-/// lifetime. The runtime allocates that scratch lazily; today it
-/// reuses the owner allocator, so memory grows across re-runs and
-/// is reclaimed only when the page tears down. Per-frame reset
-/// arrives with Phase 12F.
+/// `render_fn` allocates its returned slices from the per-frame
+/// scratch bump allocator (`src/client/scratch.zig`). The runtime
+/// resets scratch at the top of each re-run so memory usage stays
+/// bounded by the largest single-frame render, not the page's
+/// lifetime. Long-lived state (the handle's key cache, Signals, the
+/// reactive graph itself) lives on the separate `client/allocator.zig`
+/// heap and is untouched by the reset.
 pub fn bindForEach(
     handle: *ForEachHandle,
     ctx_ptr: anytype,
@@ -441,16 +483,17 @@ pub fn bindForEach(
     const Wrapper = struct {
         h: *ForEachHandle,
         outer: CtxT,
-        scratch: std.mem.Allocator,
 
         fn run(self: *@This()) void {
-            const data = render_fn(self.outer, self.scratch) catch return;
-            self.h.update(self.scratch, data.keys, data.html) catch return;
+            scratch.reset();
+            const a = scratch.allocator();
+            const data = render_fn(self.outer, a) catch return;
+            self.h.update(a, data.keys, data.html) catch return;
         }
     };
 
     const wrap = try gpa.create(Wrapper);
-    wrap.* = .{ .h = handle, .outer = ctx_ptr, .scratch = gpa };
+    wrap.* = .{ .h = handle, .outer = ctx_ptr };
 
     return try verve.createEffect(owner, wrap, Wrapper.run);
 }

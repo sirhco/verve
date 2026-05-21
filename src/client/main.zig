@@ -13,6 +13,7 @@ const runtime = @import("runtime.zig");
 const island = @import("island.zig");
 const dom = @import("dom.zig");
 const client_alloc = @import("allocator.zig");
+const scratch = @import("scratch.zig");
 
 pub const render = @import("render.zig");
 
@@ -110,4 +111,14 @@ export fn verve_alloc_capacity() u32 {
 
 export fn verve_alloc_reset() void {
     client_alloc.reset();
+}
+
+// ---- Phase 12F: scratch allocator introspection --------------------------
+
+export fn verve_scratch_used() u32 {
+    return @intCast(scratch.bytesUsed());
+}
+
+export fn verve_scratch_capacity() u32 {
+    return @intCast(scratch.capacityBytes());
 }
