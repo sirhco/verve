@@ -14,6 +14,20 @@
       });
   };
 
+  const eachBind = (bind, fn) => {
+    document
+      .querySelectorAll(`[z-bind="${CSS.escape(bind)}"]`)
+      .forEach(fn);
+    // Phase 12 dual-stamps `data-vh` next to `z-bind` so the new
+    // hydration walker can find the same nodes without colliding
+    // with the legacy class-name selector.
+    document
+      .querySelectorAll(`[data-vh="${CSS.escape(bind)}"]`)
+      .forEach((el) => {
+        if (!el.hasAttribute("z-bind")) fn(el);
+      });
+  };
+
   const env = {
     verve: {
       set_text_by_bind: (bp, bl, tp, tl) =>
@@ -30,6 +44,29 @@
         }).catch((err) => console.error("verve fetch failed:", err));
       },
       console_log_i32: (v) => console.log("verve:", v | 0),
+
+      // ---- Phase 12 primitives ----------------------------------------
+      set_attr_by_bind: (bp, bl, ap, al, vp, vl) => {
+        const attr = readStr(ap, al);
+        const val = readStr(vp, vl);
+        eachBind(readStr(bp, bl), (el) => el.setAttribute(attr, val));
+      },
+      set_class_by_bind: (bp, bl, cp, cl, on) => {
+        const cls = readStr(cp, cl);
+        eachBind(readStr(bp, bl), (el) =>
+          on ? el.classList.add(cls) : el.classList.remove(cls),
+        );
+      },
+      set_text_by_bind_str: (bp, bl, tp, tl) =>
+        eachBind(readStr(bp, bl), (el) => {
+          el.textContent = readStr(tp, tl);
+        }),
+      set_value_by_bind: (bp, bl, vp, vl) =>
+        eachBind(readStr(bp, bl), (el) => {
+          el.value = readStr(vp, vl);
+        }),
+      remove_by_bind: (bp, bl) =>
+        eachBind(readStr(bp, bl), (el) => el.remove()),
     },
   };
 
@@ -59,7 +96,14 @@
   const setCount = (raw) => {
     const v = parseInt(raw, 10);
     if (Number.isNaN(v)) return;
-    setTextByBind("count", String(v));
+    // Phase 12: route counter updates through WASM so the reactive
+    // graph stays authoritative. Fall back to the legacy direct DOM
+    // write when the export is absent (older builds).
+    if (typeof exp.verve_set_count === "function") {
+      exp.verve_set_count(v);
+    } else {
+      setTextByBind("count", String(v));
+    }
   };
 
   try {

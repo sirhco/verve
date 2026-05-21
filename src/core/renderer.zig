@@ -62,6 +62,13 @@ pub const Renderer = struct {
             try w.writeAll(" z-bind=\"");
             try escapeAttr(w, bind);
             try w.writeAll("\"");
+            // Phase 12 hydration marker. Stamped alongside the legacy
+            // `z-bind` so the client runtime can walk a stable
+            // attribute name (the existing selector remains the
+            // pre-Phase-12 path).
+            try w.writeAll(" data-vh=\"");
+            try escapeAttr(w, bind);
+            try w.writeAll("\"");
         }
         if (node.z_on_click_action) |action| {
             try w.writeAll(" z-on-click=\"");
@@ -157,7 +164,7 @@ test "renders nested element with attrs and z-bind" {
         .build();
     try Renderer.render(&w, tree);
     try std.testing.expectEqualStrings(
-        \\<div class="card"><span z-bind="count">0</span><button z-on-click="increment">+</button></div>
+        \\<div class="card"><span z-bind="count" data-vh="count">0</span><button z-on-click="increment">+</button></div>
     , w.buffered());
 }
 
