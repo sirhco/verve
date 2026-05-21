@@ -317,6 +317,27 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_server_tests.step);
     test_step.dependOn(&run_client_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+
+    // ---- Autodoc generation -------------------------------------------------
+    // `zig build docs` emits the Zig autodoc HTML/JS bundle for the
+    // public `verve` module into `zig-out/docs/api/`. Open
+    // `zig-out/docs/api/index.html` in a browser (or serve the
+    // directory) to browse the generated reference.
+    const docs_lib = b.addLibrary(.{
+        .name = "verve",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/verve.zig"),
+            .target = target,
+            .optimize = .Debug,
+        }),
+    });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs_lib.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs/api",
+    });
+    const docs_step = b.step("docs", "Generate Zig autodoc for the verve module");
+    docs_step.dependOn(&install_docs.step);
 }
 
 /// Walk `dir_opt` (relative to build root) at configure time, copy each

@@ -10,6 +10,7 @@ Targets **Zig 0.16.0**.
 ```sh
 zig build                           # native server + wasm client + per-island chunks
 zig build test --summary all        # 155+ tests across core + server + client + integration
+zig build docs                      # zig-out/docs/api/index.html — Zig autodoc for the public verve module
 ./zig-out/bin/verve-server          # open http://127.0.0.1:8080
 ```
 
@@ -334,12 +335,33 @@ zig build && ./zig-out/bin/verve-server
 
 The scaffolder embeds the entire Verve source tree at build time and writes it into the target directory. The generated app is self-contained — no Zig package-manager dependency, no git clone.
 
+## API reference
+
+`zig build docs` runs Zig's built-in autodoc generator over
+`src/verve.zig` and writes a static bundle to `zig-out/docs/api/`:
+
+```sh
+zig build docs
+open zig-out/docs/api/index.html        # macOS — or any browser
+# or serve over HTTP for the live search:
+python3 -m http.server -d zig-out/docs/api 8000
+```
+
+The bundle is a single `index.html` plus `main.js` + `main.wasm`
+(the search runtime) + `sources.tar` (the indexed source set).
+Every `pub` symbol with a `///` doc-comment shows up under its
+declaring module in the navigation.
+
+Browsable HTML guides live under [`docs/`](docs/) — the handwritten
+companion to the auto-generated reference.
+
 ## Contributing
 
 ```sh
 zig fmt --check build.zig src tests
 zig build
 zig build test --summary all
+zig build docs                          # regenerate API reference
 ```
 
 CI runs the same on ubuntu-latest and macos-latest and adds a curl smoke test against the live binary. See `.github/workflows/ci.yml`.
