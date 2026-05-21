@@ -37,31 +37,80 @@ pub fn build(b: *std.Build) void {
     wasm.entry = .disabled;
     wasm.rdynamic = true;
 
-    // Phase 13C: per-island WASM chunks. Today only Counter ships —
-    // Phase 13D's meta-codegen will fan this out across every
-    // `app.islands` decl + extract a shared runtime chunk.
-    const counter_island_mod = b.createModule(.{
-        .root_source_file = b.path("src/client/islands/counter.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSmall,
-    });
-    const counter_island_wasm = b.addExecutable(.{
-        .name = "island_counter",
-        .root_module = counter_island_mod,
-    });
-    counter_island_wasm.entry = .disabled;
-    counter_island_wasm.rdynamic = true;
-
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(wasm.getEmittedBin(), "client.wasm");
     _ = wf.addCopyFile(b.path("src/bridge/verve.js"), "verve.js");
-    _ = wf.addCopyFile(counter_island_wasm.getEmittedBin(), "island_counter.wasm");
-    _ = wf.add("assets.zig",
+
+    // Phase 13D: meta-codegen builds one WASM chunk per island
+    // declared under `app.islands`. Names are discovered by parsing
+    // `src/app/islands.zig` at configure time — the codegen tool used
+    // for the manifest can't feed back into the build graph since
+    // build.zig already has to know which targets to add. Each
+    // island uses its dedicated source file (`src/client/islands/
+    // <Name>.zig`) when present, falling back to the shared
+    // `_default.zig` stub otherwise.
+    const island_names = discoverIslandNames(b);
+
+    var assets_buf: std.ArrayList(u8) = .empty;
+    assets_buf.appendSlice(b.allocator,
         \\pub const wasm: []const u8 = @embedFile("client.wasm");
         \\pub const js: []const u8 = @embedFile("verve.js");
-        \\pub const island_counter: []const u8 = @embedFile("island_counter.wasm");
         \\
-    );
+        \\pub const IslandChunk = struct { name: []const u8, bytes: []const u8 };
+        \\
+        \\pub const island_chunks: []const IslandChunk = &.{
+        \\
+    ) catch @panic("OOM");
+
+    for (island_names) |name| {
+        const source_rel = b.fmt("src/client/islands/{s}.zig", .{name});
+        const fallback_rel = "src/client/islands/_default.zig";
+        // Custom source wins when the file exists on disk; otherwise
+        // every island shares the default stub.
+        const io_h = b.graph.io;
+        const exists = blk: {
+            var probe = b.build_root.handle.openFile(io_h, source_rel, .{}) catch break :blk false;
+            probe.close(io_h);
+            break :blk true;
+        };
+        const rel = if (exists) source_rel else fallback_rel;
+
+        const island_mod = b.createModule(.{
+            .root_source_file = b.path(rel),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+        });
+        const exe = b.addExecutable(.{
+            .name = b.fmt("island_{s}", .{name}),
+            .root_module = island_mod,
+        });
+        exe.entry = .disabled;
+        exe.rdynamic = true;
+
+        const out_name = b.fmt("island_{s}.wasm", .{name});
+        _ = wf.addCopyFile(exe.getEmittedBin(), out_name);
+
+        const line = b.fmt(
+            "    .{{ .name = \"{s}\", .bytes = @embedFile(\"{s}\") }},\n",
+            .{ name, out_name },
+        );
+        assets_buf.appendSlice(b.allocator, line) catch @panic("OOM");
+    }
+
+    assets_buf.appendSlice(b.allocator,
+        \\};
+        \\
+        \\pub fn lookupIslandChunk(name: []const u8) ?IslandChunk {
+        \\    const std_mod = @import("std");
+        \\    for (island_chunks) |c| {
+        \\        if (std_mod.mem.eql(u8, c.name, name)) return c;
+        \\    }
+        \\    return null;
+        \\}
+        \\
+    ) catch @panic("OOM");
+
+    _ = wf.add("assets.zig", assets_buf.items);
     const assets_mod = b.createModule(.{
         .root_source_file = wf.getDirectory().path(b, "assets.zig"),
     });
@@ -461,6 +510,65 @@ fn embedTree(
         , .{ joined, joined }) catch @panic("OOM");
         manifest.appendSlice(b.allocator, line) catch @panic("OOM");
     }
+}
+
+/// Parse `src/app/islands.zig` at configure time and extract every
+/// island name declared via `pub const <Name> = struct` at the
+/// top level. Build.zig needs the list before the codegen tool
+/// runs so it can wire one WASM exe per name into the build graph.
+/// Returns an empty slice when the file is missing — apps without
+/// islands stay legal.
+fn discoverIslandNames(b: *std.Build) [][]const u8 {
+    const io = b.graph.io;
+    const path = "src/app/islands.zig";
+    var f = b.build_root.handle.openFile(io, path, .{}) catch return &.{};
+    defer f.close(io);
+
+    const stat = f.stat(io) catch return &.{};
+    const bytes = b.allocator.alloc(u8, @intCast(stat.size)) catch @panic("OOM");
+    defer b.allocator.free(bytes);
+    _ = f.readPositionalAll(io, bytes, 0) catch return &.{};
+
+    var names: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        // Top-level Zig decls start at column 0 by convention — that
+        // sidesteps having to track brace depth around nested struct
+        // bodies and line comments. Doc-comments (`///`) start with
+        // a slash so they get filtered by the prefix check.
+        const prefix = "pub const ";
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const rest = line[prefix.len..];
+
+        // Harvest identifier until whitespace, '=' or ':' — Zig
+        // identifiers can't contain those.
+        var end: usize = 0;
+        while (end < rest.len) : (end += 1) {
+            const ch = rest[end];
+            if (ch == ' ' or ch == '\t' or ch == ':' or ch == '=' or ch == '\n' or ch == '\r') break;
+        }
+        if (end == 0) continue;
+        const ident = rest[0..end];
+
+        // Validate identifier shape — alphanumeric + underscore only.
+        var ok = true;
+        for (ident) |ch| {
+            const alpha = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z');
+            const digit = ch >= '0' and ch <= '9';
+            if (!alpha and !digit and ch != '_') {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+
+        // Confirm `struct` appears on the same line (after the `=`).
+        if (std.mem.indexOf(u8, rest[end..], "struct") == null) continue;
+
+        const owned = b.allocator.dupe(u8, ident) catch @panic("OOM");
+        names.append(b.allocator, owned) catch @panic("OOM");
+    }
+    return names.toOwnedSlice(b.allocator) catch @panic("OOM");
 }
 
 fn guessContentType(path: []const u8) []const u8 {

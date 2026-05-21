@@ -246,6 +246,27 @@ test "server boots, serves pages, returns expected status codes" {
         try std.testing.expectEqual(@as(u8, 's'), resp.body[2]);
         try std.testing.expectEqual(@as(u8, 'm'), resp.body[3]);
     }
+    {
+        // Phase 13D: meta-codegen fans chunks across every
+        // `app.islands` decl. Greeting was added to the namespace
+        // without a dedicated source file — it picks up the shared
+        // `_default.zig` stub but still ships its own chunk.
+        var resp = try request(io, gpa, TEST_PORT, "GET", "/islands/Greeting.wasm");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(resp.body.len >= 8);
+        try std.testing.expectEqual(@as(u8, 0x00), resp.body[0]);
+        try std.testing.expectEqual(@as(u8, 'a'), resp.body[1]);
+    }
+    {
+        // Unknown island falls through to 404, not 200 with stale
+        // bytes — confirms the generic lookup actually checks the
+        // table rather than blindly serving anything under
+        // `/islands/`.
+        var resp = try request(io, gpa, TEST_PORT, "GET", "/islands/NotAThing.wasm");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 404), resp.status);
+    }
 }
 
 test "form-encoded /api/addTodo + /api/removeTodo updates /todos" {

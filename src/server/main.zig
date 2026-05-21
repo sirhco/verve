@@ -278,9 +278,14 @@ fn handleRequest(
         try respondBuffered(gpa, request, .ok, "application/javascript", "public, max-age=300", meta.accept_gzip, assets.js);
         return;
     }
-    if (std.mem.eql(u8, path, "/islands/Counter.wasm")) {
-        try respondBuffered(gpa, request, .ok, "application/wasm", "public, max-age=300", meta.accept_gzip, assets.island_counter);
-        return;
+    const ISLAND_PREFIX = "/islands/";
+    const ISLAND_SUFFIX = ".wasm";
+    if (std.mem.startsWith(u8, path, ISLAND_PREFIX) and std.mem.endsWith(u8, path, ISLAND_SUFFIX)) {
+        const name = path[ISLAND_PREFIX.len .. path.len - ISLAND_SUFFIX.len];
+        if (assets.lookupIslandChunk(name)) |chunk| {
+            try respondBuffered(gpa, request, .ok, "application/wasm", "public, max-age=300", meta.accept_gzip, chunk.bytes);
+            return;
+        }
     }
 
     if (std.mem.startsWith(u8, path, PUBLIC_PREFIX)) {

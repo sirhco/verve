@@ -11,7 +11,11 @@
 
 pub const Counter = struct {
     /// Pre-serialized JSON shape the SSR marker stamps into
-    /// `data-props`. Today the runtime doesn't decode it — Phase 13C
+    /// `data-props`. Today the runtime doesn't decode it — Phase 13E
     /// will pipe the schema through the binary codec.
     pub const props_schema: []const u8 = "{\"initial\":\"i32\"}";
+};
+
+pub const Greeting = struct {
+    pub const props_schema: []const u8 = "{\"name\":\"string\"}";
 };
