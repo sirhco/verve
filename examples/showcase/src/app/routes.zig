@@ -10,6 +10,12 @@ const shell = components.shell;
 const blog_list = components.blog.list;
 const blog_post = components.blog.post;
 const blog_feed = components.blog.feed;
+const tracker_org = components.tracker.org;
+const tracker_project = components.tracker.project;
+const tracker_board = components.tracker.board;
+const tracker_issue = components.tracker.issue;
+const tracker_issues = components.tracker.issues;
+const tracker_team = components.tracker.team;
 
 pub const routes: []const verve.Route = &.{
     // Phase A
@@ -19,7 +25,51 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/blog/:lang/p/:slug", renderBlogPost),
     verve.Route.init("/blog/rss.xml",      renderRss),
     verve.Route.init("/blog/sitemap.xml",  renderSitemap),
+
+    // Phase B — project tracker (3-level nesting)
+    verve.Route.init("/app", renderAppRedirect),
+    verve.Route.layout("/app/o/:org", renderOrgShell, &.{
+        verve.Route.init("/projects", renderProjectList),
+        verve.Route.layout("/p/:project", renderProjectShell, &.{
+            verve.Route.init("/board",   renderBoard),
+            verve.Route.init("/issues",  renderIssues),
+            verve.Route.init("/i/:num",  renderIssueDetail),
+            verve.Route.init("/team",    renderTeam).protect(api.teamGuard),
+        }),
+    }),
 };
+
+fn renderAppRedirect(ctx: *verve.Context) !*verve.Node {
+    return ctx.redirect("/app/o/acme/projects");
+}
+
+fn renderOrgShell(ctx: *verve.Context) !*verve.Node {
+    return tracker_org.orgShell(ctx, ctx.outlet());
+}
+
+fn renderProjectList(ctx: *verve.Context) !*verve.Node {
+    return tracker_org.projectList(ctx);
+}
+
+fn renderProjectShell(ctx: *verve.Context) !*verve.Node {
+    return tracker_project.projectShell(ctx, ctx.outlet());
+}
+
+fn renderBoard(ctx: *verve.Context) !*verve.Node {
+    return tracker_board.boardPage(ctx);
+}
+
+fn renderIssues(ctx: *verve.Context) !*verve.Node {
+    return tracker_issues.issuesList(ctx);
+}
+
+fn renderIssueDetail(ctx: *verve.Context) !*verve.Node {
+    return tracker_issue.issueDetail(ctx);
+}
+
+fn renderTeam(ctx: *verve.Context) !*verve.Node {
+    return tracker_team.teamPage(ctx);
+}
 
 fn renderHome(ctx: *verve.Context) !*verve.Node {
     return components.shell.page(ctx, try homeBody(ctx));

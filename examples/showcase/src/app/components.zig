@@ -7,6 +7,14 @@ pub const blog = struct {
     pub const list = @import("components/blog/list.zig");
     pub const feed = @import("components/blog/feed.zig");
 };
+pub const tracker = struct {
+    pub const org = @import("components/tracker/org.zig");
+    pub const project = @import("components/tracker/project.zig");
+    pub const board = @import("components/tracker/board.zig");
+    pub const issue = @import("components/tracker/issue.zig");
+    pub const issues = @import("components/tracker/issues.zig");
+    pub const team = @import("components/tracker/team.zig");
+};
 pub const not_found = @import("components/notFound.zig");
 
 // Hooks the framework's main.zig expects on the `app.components`
