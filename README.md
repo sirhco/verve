@@ -96,6 +96,30 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - LISTEN_FDS env-var support for systemd socket activation.
 - Graceful shutdown on `SIGINT` / `SIGTERM`.
 
+## Install
+
+Prebuilt binaries ship on every tagged release. Releases include
+`verve-server` + `verve-cli` for four targets:
+
+- `x86_64-linux`
+- `aarch64-linux`
+- `x86_64-macos`
+- `aarch64-macos`
+
+```sh
+VERSION=0.1.0
+SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos
+curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
+curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256
+shasum -a 256 -c verve.tgz.sha256
+tar -xzf verve.tgz
+./verve-${VERSION}-${SUFFIX}/bin/verve-server --help
+```
+
+Or build from source — see [Quickstart](#quickstart) below.
+
+The release history lives in [CHANGELOG.md](CHANGELOG.md).
+
 ## Quickstart
 
 ```sh

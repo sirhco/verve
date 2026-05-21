@@ -137,16 +137,35 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Codegen tools always target the host: they run during the
+    // build to emit Zig source the cross-target server binary then
+    // imports. Cross-compiling them would produce binaries the host
+    // can't execute. The duplicate `app`/`verve` host modules are
+    // build-time only — they don't ship in the produced artifacts.
+    const host_target = b.graph.host;
+    const host_verve_mod = b.createModule(.{
+        .root_source_file = b.path("src/verve.zig"),
+        .target = host_target,
+    });
+    const host_app_mod = b.createModule(.{
+        .root_source_file = b.path("src/app/api.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "verve", .module = host_verve_mod },
+        },
+    });
+
     // Phase 11: typed client stubs for `app.Actions`. A small native
     // codegen binary imports `app` and prints a per-action wrapper to
     // stdout; the run step's captured output is grafted into the build
     // WriteFiles as `app_client.zig`, then wrapped as `app_client_mod`.
     const codegen_mod = b.createModule(.{
         .root_source_file = b.path("tools/server_fn_codegen.zig"),
-        .target = target,
+        .target = host_target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "app", .module = app_mod },
+            .{ .name = "app", .module = host_app_mod },
         },
     });
     const codegen_exe = b.addExecutable(.{
@@ -169,10 +188,10 @@ pub fn build(b: *std.Build) void {
     // walks `app.islands` at comptime and emits `client_manifest.zig`.
     const manifest_mod = b.createModule(.{
         .root_source_file = b.path("tools/island_manifest_gen.zig"),
-        .target = target,
+        .target = host_target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "app", .module = app_mod },
+            .{ .name = "app", .module = host_app_mod },
         },
     });
     const manifest_exe = b.addExecutable(.{
