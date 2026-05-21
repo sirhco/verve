@@ -63,6 +63,7 @@ pub const SlotMap = slot_mod.SlotMap;
 pub const link = link_mod.link;
 pub const LinkOpts = link_mod.LinkOpts;
 pub const serverFn = @import("core/server_fn.zig").call;
+pub const serverFnGen = @import("core/server_fn_gen.zig");
 pub const island = @import("core/island.zig").island;
 pub const IslandOpts = @import("core/island.zig").IslandOpts;
 pub const Store = store_mod.Store;
@@ -123,5 +124,6 @@ test {
     _ = @import("core/i18n.zig");
     _ = @import("core/error_boundary.zig");
     _ = @import("core/server_fn.zig");
+    _ = @import("core/server_fn_gen.zig");
     _ = @import("core/island.zig");
 }

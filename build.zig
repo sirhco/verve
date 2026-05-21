@@ -57,6 +57,34 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Phase 11: typed client stubs for `app.Actions`. A small native
+    // codegen binary imports `app` and prints a per-action wrapper to
+    // stdout; the run step's captured output is grafted into the build
+    // WriteFiles as `app_client.zig`, then wrapped as `app_client_mod`.
+    const codegen_mod = b.createModule(.{
+        .root_source_file = b.path("tools/server_fn_codegen.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "app", .module = app_mod },
+        },
+    });
+    const codegen_exe = b.addExecutable(.{
+        .name = "verve-codegen-server-fn",
+        .root_module = codegen_mod,
+    });
+    const codegen_run = b.addRunArtifact(codegen_exe);
+    const generated_app_client = codegen_run.captureStdOut(.{ .basename = "app_client.zig" });
+    _ = wf.addCopyFile(generated_app_client, "app_client.zig");
+
+    const app_client_mod = b.createModule(.{
+        .root_source_file = wf.getDirectory().path(b, "app_client.zig"),
+        .imports = &.{
+            .{ .name = "verve", .module = verve_mod },
+            .{ .name = "app", .module = app_mod },
+        },
+    });
+
     const server_mod = b.createModule(.{
         .root_source_file = b.path("src/server/main.zig"),
         .target = target,
@@ -65,6 +93,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "verve", .module = verve_mod },
             .{ .name = "assets", .module = assets_mod },
             .{ .name = "app", .module = app_mod },
+            .{ .name = "app_client", .module = app_client_mod },
             .{ .name = "public_assets", .module = public_assets_mod },
         },
     });
@@ -93,6 +122,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "verve", .module = verve_mod },
             .{ .name = "assets", .module = assets_mod },
             .{ .name = "app", .module = app_mod },
+            .{ .name = "app_client", .module = app_client_mod },
             .{ .name = "public_assets", .module = embed_assets_mod },
         },
     });
@@ -134,6 +164,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "verve", .module = verve_mod },
             .{ .name = "app", .module = app_mod },
+            .{ .name = "app_client", .module = app_client_mod },
         },
     });
     const server_tests = b.addTest(.{ .root_module = server_test_mod });
