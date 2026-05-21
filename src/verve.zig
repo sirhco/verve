@@ -34,6 +34,7 @@ pub const Node = node_mod.Node;
 pub const Attr = node_mod.Attr;
 pub const Signal = signal_mod.Signal;
 pub const Effect = effect_mod.Effect;
+pub const createEffect = effect_mod.createEffect;
 pub const Owner = owner_mod.Owner;
 pub const NodeRef = noderef_mod.NodeRef;
 pub const NodeRefTag = noderef_mod.Tag;

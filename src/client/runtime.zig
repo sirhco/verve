@@ -185,6 +185,55 @@ test "ForEachHandle.update advances the cached key list" {
     try testing.expectEqualStrings("d", handle.current_keys[2]);
 }
 
+test "bindForEach re-runs handle.update when a tracked signal changes" {
+    resetForTesting();
+
+    const initial = [_][]const u8{ "a", "b" };
+    const handle = try registerForEach("items", &initial);
+
+    // Tracked signal: number of items to render. Render fn produces
+    // keys "k0".."k(n-1)" each tick.
+    const sig = registerI32("len", 2);
+
+    const State = struct {
+        s: *verve.Signal(i32),
+        var render_hits: u32 = 0;
+        fn render(self: *@This(), alloc: std.mem.Allocator) anyerror!ForEachData {
+            const n: usize = @intCast(self.s.get());
+            const ks = try alloc.alloc([]const u8, n);
+            const hs = try alloc.alloc([]const u8, n);
+            for (0..n) |i| {
+                ks[i] = try std.fmt.allocPrint(alloc, "k{d}", .{i});
+                hs[i] = try std.fmt.allocPrint(alloc, "<li>i{d}</li>", .{i});
+            }
+            render_hits += 1;
+            return .{ .keys = ks, .html = hs };
+        }
+    };
+    State.render_hits = 0;
+    var state: State = .{ .s = sig };
+
+    _ = try bindForEach(handle, &state, State.render);
+
+    // First eager run set the cache to ["k0","k1"].
+    try testing.expectEqual(@as(u32, 1), State.render_hits);
+    try testing.expectEqual(@as(usize, 2), handle.current_keys.len);
+    try testing.expectEqualStrings("k0", handle.current_keys[0]);
+    try testing.expectEqualStrings("k1", handle.current_keys[1]);
+
+    // Bump the signal → effect re-runs → cache extends to k0..k3.
+    sig.set(4);
+    try testing.expectEqual(@as(u32, 2), State.render_hits);
+    try testing.expectEqual(@as(usize, 4), handle.current_keys.len);
+    try testing.expectEqualStrings("k3", handle.current_keys[3]);
+
+    // Shrink back → cache shrinks.
+    sig.set(1);
+    try testing.expectEqual(@as(u32, 3), State.render_hits);
+    try testing.expectEqual(@as(usize, 1), handle.current_keys.len);
+    try testing.expectEqualStrings("k0", handle.current_keys[0]);
+}
+
 test "ForEachHandle survives multiple updates including empty list" {
     resetForTesting();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -357,6 +406,53 @@ pub fn registerForEach(parent_bind: []const u8, initial_keys: []const []const u8
         .allocator = gpa,
     };
     return handle;
+}
+
+/// Snapshot returned by a `bindForEach` render fn — parallel slices of
+/// keys + per-key HTML markup. `keys.len` must equal `html.len`.
+pub const ForEachData = struct {
+    keys: []const []const u8,
+    html: []const []const u8,
+};
+
+/// Wire a list-valued computation into the reactive graph: every
+/// signal `render_fn` reads becomes a dependency, and any subsequent
+/// `set` re-runs the closure → calls `handle.update(...)` against the
+/// new keys. The first invocation runs eagerly under the runtime's
+/// Owner so the initial dependency set is recorded.
+///
+/// `render_fn` allocates the returned slices from the supplied
+/// scratch allocator — caller doesn't have to manage scratch
+/// lifetime. The runtime allocates that scratch lazily; today it
+/// reuses the owner allocator, so memory grows across re-runs and
+/// is reclaimed only when the page tears down. Per-frame reset
+/// arrives with Phase 12F.
+pub fn bindForEach(
+    handle: *ForEachHandle,
+    ctx_ptr: anytype,
+    comptime render_fn: fn (@TypeOf(ctx_ptr), std.mem.Allocator) anyerror!ForEachData,
+) !*verve.Effect {
+    const CtxT = @TypeOf(ctx_ptr);
+    comptime std.debug.assert(@typeInfo(CtxT) == .pointer);
+
+    const owner = ensureOwner();
+    const gpa = owner.allocator();
+
+    const Wrapper = struct {
+        h: *ForEachHandle,
+        outer: CtxT,
+        scratch: std.mem.Allocator,
+
+        fn run(self: *@This()) void {
+            const data = render_fn(self.outer, self.scratch) catch return;
+            self.h.update(self.scratch, data.keys, data.html) catch return;
+        }
+    };
+
+    const wrap = try gpa.create(Wrapper);
+    wrap.* = .{ .h = handle, .outer = ctx_ptr, .scratch = gpa };
+
+    return try verve.createEffect(owner, wrap, Wrapper.run);
 }
 
 /// Wipe runtime state. ONLY for use from unit tests on the native build.
