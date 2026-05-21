@@ -10,10 +10,38 @@
 const std = @import("std");
 const verve = @import("verve");
 const runtime = @import("runtime.zig");
+const island = @import("island.zig");
 const dom = @import("dom.zig");
 const client_alloc = @import("allocator.zig");
 
 pub const render = @import("render.zig");
+
+// ---- Phase 13: island dispatch scratch buffer ----------------------------
+// JS writes name+props as concatenated UTF-8 bytes into this buffer
+// then invokes `verve_island_dispatch(name_len, props_len)`. Sized for
+// modest payloads — large prop blobs should be staged through the
+// general-purpose allocator instead (deferred).
+var island_scratch: [8192]u8 align(@alignOf(u8)) = undefined;
+
+export fn verve_island_scratch_ptr() u32 {
+    return @intFromPtr(&island_scratch);
+}
+
+export fn verve_island_scratch_capacity() u32 {
+    return island_scratch.len;
+}
+
+export fn verve_island_dispatch(name_len: u32, props_len: u32) i32 {
+    const total = @as(usize, name_len) + @as(usize, props_len);
+    if (total > island_scratch.len) return 0;
+    const name = island_scratch[0..name_len];
+    const props = island_scratch[name_len .. name_len + props_len];
+    if (island.lookup(name)) |hydrate_fn| {
+        hydrate_fn(props);
+        return 1;
+    }
+    return 0;
+}
 
 const API_PATH: []const u8 = "/api/updateDatabase";
 const API_FIELD: []const u8 = "new_count";

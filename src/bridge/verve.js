@@ -163,23 +163,47 @@
     }
   });
 
-  // ---- Islands placeholder --------------------------------------------
-  // Phase 7 ships the server-side marker; the runtime here just
-  // registers `<verve-island>` as a custom element so the browser
-  // doesn't print a warning. Phase 8 will replace this stub with a
-  // dynamic per-island WASM loader that hydrates each marker.
+  // ---- Phase 13: island hydration dispatch ----------------------------
+  // Register `<verve-island>` so the browser stops complaining about
+  // the unknown tag. The actual hydration runs in a single post-WASM
+  // pass below — connectedCallback may fire before WASM is up.
   if (typeof customElements !== "undefined" && !customElements.get("verve-island")) {
     customElements.define(
       "verve-island",
       class extends HTMLElement {
         connectedCallback() {
-          // No-op: SSR HTML is already inside this element. Phase 8
-          // hydration will read data-name + data-props here and swap
-          // in a reactive subtree.
+          // SSR HTML is already inside this element; the post-hydrate
+          // pass below routes any custom registration via the WASM
+          // dispatch entry.
         }
       },
     );
   }
+
+  const dispatchIslands = () => {
+    if (typeof exp.verve_island_dispatch !== "function") return;
+    const scratchPtr = exp.verve_island_scratch_ptr();
+    const scratchCap = exp.verve_island_scratch_capacity();
+    if (!scratchPtr || !scratchCap) return;
+    const enc = new TextEncoder();
+    document.querySelectorAll("verve-island").forEach((el) => {
+      const name = el.getAttribute("data-name") || "";
+      const props = el.getAttribute("data-props") || "";
+      const nameBytes = enc.encode(name);
+      const propsBytes = enc.encode(props);
+      if (nameBytes.length + propsBytes.length > scratchCap) {
+        console.warn("verve: island payload exceeds scratch buffer", name);
+        return;
+      }
+      const view = new Uint8Array(memory.buffer, scratchPtr, scratchCap);
+      view.set(nameBytes, 0);
+      view.set(propsBytes, nameBytes.length);
+      exp.verve_island_dispatch(nameBytes.length, propsBytes.length);
+    });
+  };
+  // Run once after the initial hydrate. Components register their
+  // hydrate fn during `verve_hydrate`, so this pass picks them up.
+  dispatchIslands();
 
   // ---- Server Functions ------------------------------------------------
   // Generic JS-side caller for app.Actions endpoints. `name` matches

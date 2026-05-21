@@ -7,4 +7,5 @@ test {
     _ = @import("allocator.zig");
     _ = @import("render.zig");
     _ = @import("runtime.zig");
+    _ = @import("island.zig");
 }
