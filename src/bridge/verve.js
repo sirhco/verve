@@ -113,6 +113,18 @@
           if (node) node.remove();
         });
       },
+
+      // ---- Phase 12G: bool + f32 primitives -----------------------------
+      set_class_present_by_bind: (bp, bl, cp, cl, on) => {
+        const cls = readStr(cp, cl);
+        eachBind(readStr(bp, bl), (el) =>
+          on ? el.classList.add(cls) : el.classList.remove(cls),
+        );
+      },
+      set_text_by_bind_f32: (bp, bl, v) =>
+        eachBind(readStr(bp, bl), (el) => {
+          el.textContent = String(v);
+        }),
     },
   };
 

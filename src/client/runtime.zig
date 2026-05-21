@@ -28,13 +28,22 @@ const Slot = struct {
     type_tag: TypeTag,
 };
 
-const TypeTag = enum { i32, str };
+const TypeTag = enum { i32, str, bool, f32 };
 
 const BindBoxI32 = struct {
     name: []const u8,
 };
 
 const BindBoxStr = struct {
+    name: []const u8,
+};
+
+const BindBoxBool = struct {
+    name: []const u8,
+    class_name: []const u8,
+};
+
+const BindBoxF32 = struct {
     name: []const u8,
 };
 
@@ -131,6 +140,88 @@ pub fn signalStr(name: []const u8) ?*verve.Signal([]const u8) {
 fn onSetStr(ctx: *anyopaque, value: []const u8) void {
     const box: *BindBoxStr = @ptrCast(@alignCast(ctx));
     dom.set_text_by_bind_str(box.name.ptr, box.name.len, value.ptr, value.len);
+}
+
+/// Register a reactive bool that drives a single CSS class on every
+/// `[data-vh="<name>"]` element. The class is added when the Signal
+/// holds `true`, removed when false — the common idiom for `.active`
+/// / `.is-open` toggles without re-render.
+pub fn registerBool(name: []const u8, class_name: []const u8, initial: bool) *verve.Signal(bool) {
+    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
+    const owner = ensureOwner();
+    const gpa = owner.allocator();
+
+    const sig = gpa.create(verve.Signal(bool)) catch @panic("verve client: OOM allocating Signal");
+    sig.* = verve.Signal(bool).init(initial, gpa);
+
+    const box = gpa.create(BindBoxBool) catch @panic("verve client: OOM allocating bind box");
+    box.* = .{ .name = name, .class_name = class_name };
+    sig.on_set = onSetBool;
+    sig.on_set_ctx = box;
+
+    slots[slot_count] = .{ .name = name, .sig_ptr = sig, .type_tag = .bool };
+    slot_count += 1;
+
+    return sig;
+}
+
+pub fn signalBool(name: []const u8) ?*verve.Signal(bool) {
+    for (slots[0..slot_count]) |s| {
+        if (s.type_tag != .bool) continue;
+        if (std.mem.eql(u8, s.name, name)) {
+            return @ptrCast(@alignCast(s.sig_ptr));
+        }
+    }
+    return null;
+}
+
+fn onSetBool(ctx: *anyopaque, value: bool) void {
+    const box: *BindBoxBool = @ptrCast(@alignCast(ctx));
+    dom.set_class_present_by_bind(
+        box.name.ptr,
+        box.name.len,
+        box.class_name.ptr,
+        box.class_name.len,
+        if (value) 1 else 0,
+    );
+}
+
+/// Register a reactive f32 keyed by its bind-name. on_set pushes the
+/// new float into every `[data-vh="<name>"]` element via the bridge's
+/// `set_text_by_bind_f32` primitive (JS formats with its default
+/// stringification).
+pub fn registerF32(name: []const u8, initial: f32) *verve.Signal(f32) {
+    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
+    const owner = ensureOwner();
+    const gpa = owner.allocator();
+
+    const sig = gpa.create(verve.Signal(f32)) catch @panic("verve client: OOM allocating Signal");
+    sig.* = verve.Signal(f32).init(initial, gpa);
+
+    const box = gpa.create(BindBoxF32) catch @panic("verve client: OOM allocating bind box");
+    box.* = .{ .name = name };
+    sig.on_set = onSetF32;
+    sig.on_set_ctx = box;
+
+    slots[slot_count] = .{ .name = name, .sig_ptr = sig, .type_tag = .f32 };
+    slot_count += 1;
+
+    return sig;
+}
+
+pub fn signalF32(name: []const u8) ?*verve.Signal(f32) {
+    for (slots[0..slot_count]) |s| {
+        if (s.type_tag != .f32) continue;
+        if (std.mem.eql(u8, s.name, name)) {
+            return @ptrCast(@alignCast(s.sig_ptr));
+        }
+    }
+    return null;
+}
+
+fn onSetF32(ctx: *anyopaque, value: f32) void {
+    const box: *BindBoxF32 = @ptrCast(@alignCast(ctx));
+    dom.set_text_by_bind_f32(box.name.ptr, box.name.len, value);
 }
 
 // ---- testing ---------------------------------------------------------------
@@ -307,6 +398,35 @@ test "applyReconcile runs against native dom stubs without crashing" {
     // Native dom stubs are no-ops; this exercises the planner +
     // dispatch glue end-to-end without a real DOM.
     try applyReconcile(arena.allocator(), "items", &old_keys, &new_keys, &new_html);
+}
+
+test "registerBool toggles its CSS class via the on_set hook" {
+    resetForTesting();
+
+    const sig = registerBool("panel", "open", false);
+    try testing.expect(!sig.peek());
+    try testing.expectEqual(sig, signalBool("panel").?);
+    try testing.expect(sig.on_set != null);
+
+    // signalI32 / signalStr / signalF32 don't see the bool slot.
+    try testing.expect(signalI32("panel") == null);
+    try testing.expect(signalStr("panel") == null);
+    try testing.expect(signalF32("panel") == null);
+
+    // set fires on_set (no-op on native, just exercise the path).
+    sig.set(true);
+    try testing.expect(sig.peek());
+}
+
+test "registerF32 stores and updates a float Signal" {
+    resetForTesting();
+
+    const sig = registerF32("ratio", 0.25);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), sig.peek(), 1e-6);
+    try testing.expectEqual(sig, signalF32("ratio").?);
+
+    sig.set(0.875);
+    try testing.expectApproxEqAbs(@as(f32, 0.875), sig.peek(), 1e-6);
 }
 
 test "registerStr allocates a string Signal" {

@@ -113,6 +113,25 @@ const WasmBridge = struct {
         key_ptr: [*]const u8,
         key_len: usize,
     ) void;
+
+    // ---- Phase 12G: bool + f32 primitives ----------------------------------
+    // bool drives a single CSS class toggle keyed by bind-name; f32 lands
+    // as formatted text content. Both follow the same `(ptr, len, value)`
+    // shape as their i32 counterparts.
+
+    pub extern "verve" fn set_class_present_by_bind(
+        bind_ptr: [*]const u8,
+        bind_len: usize,
+        class_ptr: [*]const u8,
+        class_len: usize,
+        on: u32,
+    ) void;
+
+    pub extern "verve" fn set_text_by_bind_f32(
+        bind_ptr: [*]const u8,
+        bind_len: usize,
+        value: f32,
+    ) void;
 };
 
 const NativeStub = struct {
@@ -128,6 +147,8 @@ const NativeStub = struct {
     pub fn create_keyed_child(_: [*]const u8, _: usize, _: [*]const u8, _: usize, _: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
     pub fn move_keyed_child(_: [*]const u8, _: usize, _: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
     pub fn remove_keyed_child(_: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
+    pub fn set_class_present_by_bind(_: [*]const u8, _: usize, _: [*]const u8, _: usize, _: u32) void {}
+    pub fn set_text_by_bind_f32(_: [*]const u8, _: usize, _: f32) void {}
 };
 
 pub const set_text_by_bind = Bridge.set_text_by_bind;
@@ -142,3 +163,5 @@ pub const remove_by_bind = Bridge.remove_by_bind;
 pub const create_keyed_child = Bridge.create_keyed_child;
 pub const move_keyed_child = Bridge.move_keyed_child;
 pub const remove_keyed_child = Bridge.remove_keyed_child;
+pub const set_class_present_by_bind = Bridge.set_class_present_by_bind;
+pub const set_text_by_bind_f32 = Bridge.set_text_by_bind_f32;
