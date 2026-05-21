@@ -34,3 +34,21 @@ test "generated stub: incrementCount preserves return type" {
     try testing.expectEqual(@as(i32, 1), after);
     try testing.expectEqual(@as(i32, 1), app.last_count.load(.monotonic));
 }
+
+test "generated stub: _post variant runs the action and drops the return" {
+    app.last_count.store(5, .monotonic);
+    defer app.last_count.store(0, .monotonic);
+
+    // `incrementCount` returns i32 — on native, `_post` invokes it
+    // and silently discards the value. State still advances.
+    app_client.incrementCount_post(testing.allocator, .{});
+    try testing.expectEqual(@as(i32, 6), app.last_count.load(.monotonic));
+}
+
+test "generated stub: _post variant absorbs errors on void-returning actions" {
+    // `updateDatabase` returns `!void`. On native, `_post` invokes it
+    // and discards both the success and error paths.
+    defer app.last_count.store(0, .monotonic);
+    app_client.updateDatabase_post(testing.allocator, .{ .new_count = 99 });
+    try testing.expectEqual(@as(i32, 99), app.last_count.load(.monotonic));
+}

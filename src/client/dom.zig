@@ -132,6 +132,19 @@ const WasmBridge = struct {
         bind_len: usize,
         value: f32,
     ) void;
+
+    // ---- Phase 11B: typed server-fn JSON POST -------------------------------
+    // Fire-and-forget. `name` is the Action's bare identifier; the JS
+    // bridge prepends `/api/`. Value returns are intentionally not
+    // plumbed back yet — async response delivery lands with the
+    // streaming runtime in a later phase.
+
+    pub extern "verve" fn server_fn_post(
+        name_ptr: [*]const u8,
+        name_len: usize,
+        body_ptr: [*]const u8,
+        body_len: usize,
+    ) void;
 };
 
 const NativeStub = struct {
@@ -149,6 +162,7 @@ const NativeStub = struct {
     pub fn remove_keyed_child(_: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
     pub fn set_class_present_by_bind(_: [*]const u8, _: usize, _: [*]const u8, _: usize, _: u32) void {}
     pub fn set_text_by_bind_f32(_: [*]const u8, _: usize, _: f32) void {}
+    pub fn server_fn_post(_: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
 };
 
 pub const set_text_by_bind = Bridge.set_text_by_bind;
@@ -165,3 +179,4 @@ pub const move_keyed_child = Bridge.move_keyed_child;
 pub const remove_keyed_child = Bridge.remove_keyed_child;
 pub const set_class_present_by_bind = Bridge.set_class_present_by_bind;
 pub const set_text_by_bind_f32 = Bridge.set_text_by_bind_f32;
+pub const server_fn_post = Bridge.server_fn_post;

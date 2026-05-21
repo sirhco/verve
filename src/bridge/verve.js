@@ -125,6 +125,17 @@
         eachBind(readStr(bp, bl), (el) => {
           el.textContent = String(v);
         }),
+
+      // ---- Phase 11B: fire-and-forget typed server-fn POST -------------
+      server_fn_post: (np, nl, bp, bl) => {
+        const name = readStr(np, nl);
+        const body = readStr(bp, bl);
+        fetch(`/api/${name}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body,
+        }).catch((err) => console.error("verve server_fn_post failed:", err));
+      },
     },
   };
 
