@@ -43,19 +43,37 @@ pub fn realtimePage(ctx: *verve.Context) !*verve.Node {
             \\const input = document.getElementById('ws-input');
             \\const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
             \\const ws = new WebSocket(`${proto}//${location.host}/ws`);
+            \\const queue = [];
             \\const append = (txt) => {
             \\  const row = document.createElement('div');
             \\  row.textContent = txt;
             \\  presence.appendChild(row);
             \\  if (presence.childElementCount > 12) presence.removeChild(presence.firstChild);
             \\};
-            \\ws.onmessage = (e) => append(`◀ ${e.data}`);
-            \\ws.onopen = () => append('· connected ·');
-            \\input.addEventListener('keydown', (e) => {
-            \\  if (e.key !== 'Enter') return;
-            \\  const v = input.value.trim();
+            \\const flush = () => {
+            \\  while (queue.length && ws.readyState === WebSocket.OPEN) ws.send(queue.shift());
+            \\};
+            \\ws.addEventListener('open', () => { append('· connected ·'); flush(); });
+            \\ws.addEventListener('close', () => append('· disconnected ·'));
+            \\ws.addEventListener('error', () => append('· error ·'));
+            \\ws.addEventListener('message', (e) => append(`◀ ${e.data}`));
+            \\const send = (v) => {
+            \\  if (ws.readyState === WebSocket.OPEN) ws.send(v);
+            \\  else queue.push(v);
+            \\};
+            \\const submit = () => {
+            \\  const v = (input.value || '').trim();
             \\  if (!v) return;
-            \\  ws.send(v); append(`▶ ${v}`); input.value = '';
+            \\  send(v); append(`▶ ${v}`); input.value = '';
+            \\};
+            \\input.addEventListener('keydown', (e) => {
+            \\  if (e.key === 'Enter' || e.keyCode === 13) {
+            \\    e.preventDefault();
+            \\    submit();
+            \\  }
+            \\});
+            \\input.addEventListener('beforeinput', (e) => {
+            \\  if (e.inputType === 'insertLineBreak') { e.preventDefault(); submit(); }
             \\});
             \\const es = new EventSource('/events');
             \\es.addEventListener('count', (e) => {
