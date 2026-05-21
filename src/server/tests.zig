@@ -7,4 +7,5 @@ test {
     _ = @import("metrics.zig");
     _ = @import("gzip.zig");
     _ = @import("server_fn_codegen_test.zig");
+    _ = @import("island_manifest_test.zig");
 }

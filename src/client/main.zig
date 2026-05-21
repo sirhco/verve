@@ -14,6 +14,7 @@ const island = @import("island.zig");
 const dom = @import("dom.zig");
 const client_alloc = @import("allocator.zig");
 const scratch = @import("scratch.zig");
+const client_manifest = @import("client_manifest");
 
 pub const render = @import("render.zig");
 
@@ -121,4 +122,13 @@ export fn verve_scratch_used() u32 {
 
 export fn verve_scratch_capacity() u32 {
     return @intCast(scratch.capacityBytes());
+}
+
+// ---- Phase 13B: island manifest introspection ----------------------------
+
+/// Number of islands the build-time codegen recorded in
+/// `client_manifest.zig`. JS uses this to validate `data-name`
+/// attributes against the known set before invoking dispatch.
+export fn verve_island_count() u32 {
+    return @intCast(client_manifest.entries.len);
 }

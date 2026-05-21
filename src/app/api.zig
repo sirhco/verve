@@ -5,6 +5,7 @@
 const std = @import("std");
 
 pub const components = @import("components.zig");
+pub const islands = @import("islands.zig");
 pub const routes_mod = @import("routes.zig");
 pub const Route = routes_mod.Route;
 pub const routes = routes_mod.routes;

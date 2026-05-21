@@ -27,6 +27,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "verve", .module = verve_mod },
         },
     });
+    // `client_manifest_mod` is wired into the client below — its
+    // module is created after `app_mod` because the codegen run needs
+    // `app.islands` to resolve at the tool's comptime.
     const wasm = b.addExecutable(.{
         .name = "client",
         .root_module = client_mod,
@@ -85,6 +88,33 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Phase 13B: client island manifest. Companion codegen binary
+    // walks `app.islands` at comptime and emits `client_manifest.zig`.
+    const manifest_mod = b.createModule(.{
+        .root_source_file = b.path("tools/island_manifest_gen.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "app", .module = app_mod },
+        },
+    });
+    const manifest_exe = b.addExecutable(.{
+        .name = "verve-codegen-islands",
+        .root_module = manifest_mod,
+    });
+    const manifest_run = b.addRunArtifact(manifest_exe);
+    const generated_manifest = manifest_run.captureStdOut(.{ .basename = "client_manifest.zig" });
+    // Use a dedicated WriteFiles for the manifest so the WASM client
+    // can import it without creating a dependency cycle through the
+    // main `wf` step (which also holds `client.wasm`).
+    const wf_manifest = b.addWriteFiles();
+    _ = wf_manifest.addCopyFile(generated_manifest, "client_manifest.zig");
+
+    const client_manifest_mod = b.createModule(.{
+        .root_source_file = wf_manifest.getDirectory().path(b, "client_manifest.zig"),
+    });
+    client_mod.addImport("client_manifest", client_manifest_mod);
+
     const server_mod = b.createModule(.{
         .root_source_file = b.path("src/server/main.zig"),
         .target = target,
@@ -94,6 +124,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "assets", .module = assets_mod },
             .{ .name = "app", .module = app_mod },
             .{ .name = "app_client", .module = app_client_mod },
+            .{ .name = "client_manifest", .module = client_manifest_mod },
             .{ .name = "public_assets", .module = public_assets_mod },
         },
     });
@@ -123,6 +154,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "assets", .module = assets_mod },
             .{ .name = "app", .module = app_mod },
             .{ .name = "app_client", .module = app_client_mod },
+            .{ .name = "client_manifest", .module = client_manifest_mod },
             .{ .name = "public_assets", .module = embed_assets_mod },
         },
     });
@@ -165,6 +197,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "verve", .module = verve_mod },
             .{ .name = "app", .module = app_mod },
             .{ .name = "app_client", .module = app_client_mod },
+            .{ .name = "client_manifest", .module = client_manifest_mod },
         },
     });
     const server_tests = b.addTest(.{ .root_module = server_test_mod });
