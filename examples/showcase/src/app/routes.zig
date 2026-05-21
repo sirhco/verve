@@ -39,8 +39,10 @@ pub const routes: []const verve.Route = &.{
         verve.Route.init("/realtime", renderRealtime),
     }),
 
-    // Phase C — admin (all gated by adminGuard) + island demo + draft endpoint
-    verve.Route.init("/admin",            renderAdminHome).protect(api.adminGuard),
+    // Phase C — admin sub-routes guarded; /admin itself renders an
+    // auth-hint page when the role cookie is missing so the URL keeps
+    // working in the browser (devtools Sources view, deep links).
+    verve.Route.init("/admin",            renderAdminHome),
     verve.Route.init("/admin/analytics",  renderAdminAnalytics).protect(api.adminGuard),
     verve.Route.init("/admin/settings",   renderAdminSettings).protect(api.adminGuard),
     verve.Route.init("/admin/jobs",       renderAdminJobs).protect(api.adminGuard),
