@@ -1031,6 +1031,18 @@ fn tryServePrecompressed(
     const stat = try file.stat(io);
     if (stat.size > STATIC_MAX_SIZE) return false;
 
+    // Skip the precompressed sibling when its mtime is older than the
+    // source file's. Prevents a stale `.br`/`.gz` left behind by a prior
+    // release build from shadowing a freshly rewritten source. Decline so
+    // the caller falls through to the raw-file path.
+    if (dir.openFile(io, base_path, .{})) |src_file| {
+        var src_mut = src_file;
+        defer src_mut.close(io);
+        if (src_mut.stat(io)) |src_stat| {
+            if (stat.mtime.nanoseconds < src_stat.mtime.nanoseconds) return false;
+        } else |_| {}
+    } else |_| {}
+
     const data = try gpa.alloc(u8, @intCast(stat.size));
     defer gpa.free(data);
     _ = try file.readPositionalAll(io, data, 0);
@@ -1168,6 +1180,15 @@ fn contentTypeFor(path: []const u8) []const u8 {
         .{ "txt", "text/plain; charset=utf-8" },
         .{ "wasm", "application/wasm" },
         .{ "webp", "image/webp" },
+        .{ "woff2", "font/woff2" },
+        .{ "woff", "font/woff" },
+        .{ "ttf", "font/ttf" },
+        .{ "otf", "font/otf" },
+        .{ "xml", "application/xml; charset=utf-8" },
+        .{ "jpg", "image/jpeg" },
+        .{ "jpeg", "image/jpeg" },
+        .{ "gif", "image/gif" },
+        .{ "md", "text/markdown; charset=utf-8" },
     };
     inline for (table) |row| {
         if (std.ascii.eqlIgnoreCase(ext, row[0])) return row[1];
