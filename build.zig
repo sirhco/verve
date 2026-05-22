@@ -240,6 +240,19 @@ pub fn build(b: *std.Build) void {
     // tests/public_fixture baked in regardless of the user's -Dpublic-dir
     // flag. Lets CI verify the embed path without polluting the main
     // production binary.
+    //
+    // When verve is consumed as a Zig package dependency, `tests/` is not
+    // included (see build.zig.zon `.paths` — only src + LICENSE ship). Skip
+    // every test-related artifact in that case so consumers don't trip the
+    // panic in `buildPublicAssets`.
+    const tests_present = blk: {
+        const io_h = b.graph.io;
+        var probe = b.build_root.handle.openDir(io_h, "tests/public_fixture", .{}) catch break :blk false;
+        probe.close(io_h);
+        break :blk true;
+    };
+
+    if (tests_present) {
     const embed_assets_mod = buildPublicAssets(b, "tests/public_fixture");
     const embed_server_mod = b.createModule(.{
         .root_source_file = b.path("src/server/main.zig"),
@@ -336,6 +349,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_server_tests.step);
     test_step.dependOn(&run_client_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    } // end if (tests_present)
 
     // ---- Autodoc generation -------------------------------------------------
     // `zig build docs` emits the Zig autodoc HTML/JS bundle for the
