@@ -276,14 +276,33 @@ pub fn build(b: *std.Build) void {
     // wiring + tests fixture) into the binary; `verve-cli new <dir>` then
     // writes it out as a self-contained starter app.
     const skeleton_mod = buildCliSkeleton(b);
+    const skeleton_desktop_mod = buildCliSkeletonDesktop(b);
+
+    // Default verve dependency path baked into `verve-cli`. Desktop
+    // scaffolds reference verve through a `.path` dep — without a
+    // baked default the generated `build.zig.zon` would have to guess
+    // `../verve`, which only works for sibling-layout projects. Users
+    // can override per-scaffold via `verve-cli new --verve-path ...`,
+    // and once verve ships GitHub releases this default flips to a
+    // `.url + .hash` flow.
+    const default_verve_path = b.option(
+        []const u8,
+        "verve-path",
+        "Absolute path to the Verve checkout that scaffolded apps depend on (default: this build root)",
+    ) orelse b.build_root.path orelse ".";
+    const cli_options = b.addOptions();
+    cli_options.addOption([]const u8, "default_verve_path", default_verve_path);
+
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("src/cli/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "skeleton", .module = skeleton_mod },
+            .{ .name = "skeleton_desktop", .module = skeleton_desktop_mod },
         },
     });
+    cli_mod.addOptions("build_options", cli_options);
     const cli = b.addExecutable(.{
         .name = "verve-cli",
         .root_module = cli_mod,
@@ -344,11 +363,24 @@ pub fn build(b: *std.Build) void {
     run_integration_tests.step.dependOn(&server.step);
     run_integration_tests.step.dependOn(&embed_server.step);
 
+    // Desktop platform layer's pure-Zig pieces (asset router, MIME
+    // guess) get a headless test artifact so they run on every host
+    // without requiring a windowing system. The native backends
+    // (macos/windows/linux) are not exercised here.
+    const desktop_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/desktop/asset_router_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const desktop_tests = b.addTest(.{ .root_module = desktop_test_mod });
+    const run_desktop_tests = b.addRunArtifact(desktop_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_server_tests.step);
     test_step.dependOn(&run_client_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_desktop_tests.step);
     } // end if (tests_present)
 
     // ---- Autodoc generation -------------------------------------------------
@@ -517,6 +549,10 @@ fn buildCliSkeleton(b: *std.Build) *std.Build.Module {
     embedSingleFile(b, wf, &manifest, "LICENSE");
     embedTree(b, wf, &manifest, "src");
     embedTree(b, wf, &manifest, "tests");
+    // `tools/` holds the build-time codegen binaries (server-fn stubs,
+    // island manifest). The generated project's build.zig invokes them,
+    // so they must travel with the scaffold.
+    embedTree(b, wf, &manifest, "tools");
 
     manifest.appendSlice(b.allocator, "};\n") catch @panic("OOM");
     _ = wf.add("skeleton.zig", manifest.items);
@@ -542,6 +578,111 @@ fn embedSingleFile(
         \\
     , .{ dest, dest }) catch @panic("OOM");
     manifest.appendSlice(b.allocator, line) catch @panic("OOM");
+}
+
+/// Sibling of `buildCliSkeleton` that produces the desktop template
+/// manifest. The output tree layout is:
+///
+///   build.zig, build.zig.zon, LICENSE, README.md, .gitignore   ← from templates/desktop/
+///   src/main.zig, src/handlers.zig, frontend/*, public/*       ← from templates/desktop/
+///   src/desktop/*.zig                                          ← vendored from framework src/desktop/
+///
+/// The vendor step lets the produced project be self-contained: it
+/// imports the platform window layer through a relative path inside
+/// its own `src/desktop/` tree, with no compile-time dependency back
+/// on the Verve checkout.
+fn buildCliSkeletonDesktop(b: *std.Build) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    var manifest: std.ArrayList(u8) = .empty;
+
+    manifest.appendSlice(b.allocator,
+        \\pub const Entry = struct {
+        \\    path: []const u8,
+        \\    bytes: []const u8,
+        \\};
+        \\
+        \\pub const entries: []const Entry = &.{
+        \\
+    ) catch @panic("OOM");
+
+    // The desktop template tree only exists in the framework checkout.
+    // When the verve sources are vendored into a scaffolded app the
+    // `templates/` directory is not shipped (web apps don't need it),
+    // so emit an empty entry list rather than aborting the build. The
+    // generated CLI in that case can still scaffold web projects.
+    const io = b.graph.io;
+    const have_templates = blk: {
+        var probe = b.build_root.handle.openDir(io, "templates/desktop", .{}) catch break :blk false;
+        probe.close(io);
+        break :blk true;
+    };
+
+    if (have_templates) {
+        // Root LICENSE is shared between web and desktop generated apps.
+        embedSingleFile(b, wf, &manifest, "LICENSE");
+        // Everything else comes from the desktop template tree (rooted at
+        // `templates/desktop`) plus a vendored copy of the platform layer.
+        embedTreeAs(b, wf, &manifest, "templates/desktop", "");
+        embedTreeAs(b, wf, &manifest, "src/desktop", "src/desktop");
+    }
+
+    manifest.appendSlice(b.allocator, "};\n") catch @panic("OOM");
+    _ = wf.add("skeleton_desktop.zig", manifest.items);
+
+    return b.createModule(.{
+        .root_source_file = wf.getDirectory().path(b, "skeleton_desktop.zig"),
+    });
+}
+
+/// Like `embedTree`, but rewrites the in-binary path so files end up
+/// at `out_prefix/<rel>` regardless of where they live on disk. Used
+/// by `buildCliSkeletonDesktop` to lift `templates/desktop/...` to the
+/// project root and to vendor `src/desktop/` under the generated app.
+fn embedTreeAs(
+    b: *std.Build,
+    wf: *std.Build.Step.WriteFile,
+    manifest: *std.ArrayList(u8),
+    disk_root: []const u8,
+    out_prefix: []const u8,
+) void {
+    const io = b.graph.io;
+    var root = b.build_root.handle.openDir(io, disk_root, .{ .iterate = true }) catch |err| {
+        std.debug.print("verve: cannot embed {s}: {s}\n", .{ disk_root, @errorName(err) });
+        @panic("desktop skeleton root missing");
+    };
+    defer root.close(io);
+
+    var walker = root.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+
+    while (walker.next(io) catch @panic("walk failed")) |entry| {
+        if (entry.kind != .file) continue;
+
+        // Forward-slashed relative path from the disk root.
+        const rel_fwd = b.allocator.dupe(u8, entry.path) catch @panic("OOM");
+        for (rel_fwd) |*c| if (c.* == '\\') {
+            c.* = '/';
+        };
+
+        const out_path = if (out_prefix.len == 0)
+            rel_fwd
+        else
+            std.fmt.allocPrint(b.allocator, "{s}/{s}", .{ out_prefix, rel_fwd }) catch @panic("OOM");
+
+        // The on-disk source path for @embedFile/addCopyFile is the
+        // join of disk_root and the relative entry path.
+        const disk_path = std.fs.path.join(b.allocator, &.{ disk_root, entry.path }) catch @panic("OOM");
+        for (disk_path) |*c| if (c.* == '\\') {
+            c.* = '/';
+        };
+
+        _ = wf.addCopyFile(b.path(disk_path), out_path);
+        const line = std.fmt.allocPrint(b.allocator,
+            \\    .{{ .path = "{s}", .bytes = @embedFile("{s}") }},
+            \\
+        , .{ out_path, out_path }) catch @panic("OOM");
+        manifest.appendSlice(b.allocator, line) catch @panic("OOM");
+    }
 }
 
 fn embedTree(
