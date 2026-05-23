@@ -15,6 +15,7 @@ const std = @import("std");
 const opts_mod = @import("options.zig");
 const ipc = @import("ipc.zig");
 const router = @import("asset_router.zig");
+const cookies_mod = @import("cookies.zig");
 
 // ---- Opaque GTK/GLib/WebKit pointer types -----------------------------------
 
@@ -295,6 +296,12 @@ pub const Window = struct {
         return Window.init(self.ctx.allocator, opts);
     }
 
+    /// Per-window cookie store. WebKitCookieManager wiring is a
+    /// follow-up — see module-level stubs.
+    pub fn cookies(self: *Window) cookies_mod.CookieStore {
+        return .{ .window = @ptrCast(self) };
+    }
+
     pub fn run(self: *Window) void {
         _ = self;
         gtk_main();
@@ -384,4 +391,27 @@ fn onScriptMessage(_: *WebKitUserContentManager, message: *WebKitJavascriptResul
     defer g_free(raw);
     const slice = std.mem.span(raw);
     if (cx.on_message) |h| h(cx.on_message_ctx, slice);
+}
+
+// ---- Cookie store -----------------------------------------------------------
+// WebKitCookieManager is per-WebContext (we already create one per
+// window), so the API maps cleanly. Real wiring is a follow-up — the
+// WebKitGTK cookie APIs are async via GAsyncResult; need GMainLoop or
+// g_main_context_iteration spin to sync-wrap. See
+// docs/11-desktop-roadmap.md item #22.
+
+pub fn cookieGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
+    return opts_mod.CookieError.Unsupported;
+}
+
+pub fn cookieSet(_: *anyopaque, _: opts_mod.Cookie) opts_mod.CookieError!void {
+    return opts_mod.CookieError.Unsupported;
+}
+
+pub fn cookieDelete(_: *anyopaque, _: []const u8) opts_mod.CookieError!void {
+    return opts_mod.CookieError.Unsupported;
+}
+
+pub fn cookieClear(_: *anyopaque) opts_mod.CookieError!void {
+    return opts_mod.CookieError.Unsupported;
 }

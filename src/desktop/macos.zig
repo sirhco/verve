@@ -21,6 +21,7 @@ const m = @import("msg.zig");
 const opts_mod = @import("options.zig");
 const ipc = @import("ipc.zig");
 const router = @import("asset_router.zig");
+const cookies_mod = @import("cookies.zig");
 
 const id = m.id;
 const SEL = m.SEL;
@@ -277,6 +278,12 @@ pub const Window = struct {
     /// WindowCtx in the registry. Uses the parent's allocator.
     pub fn openChildWindow(self: *Window, opts: opts_mod.WindowOptions) !Window {
         return Window.init(self.allocator, opts);
+    }
+
+    /// Per-window cookie store. WKHTTPCookieStore wiring is a
+    /// follow-up — see module-level cookieGet/Set/Delete/Clear stubs.
+    pub fn cookies(self: *Window) cookies_mod.CookieStore {
+        return .{ .window = @ptrCast(self) };
     }
 
     pub fn run(self: *Window) void {
@@ -660,4 +667,26 @@ fn makeHeaderDict(content_type: []const u8, length: usize) id {
 
     const dictWithObjects = m.cast(*const fn (id, SEL, [*]const id, [*]const id, usize) callconv(.c) id);
     return dictWithObjects(@as(id, @ptrCast(NSDictionary)), m.sel("dictionaryWithObjects:forKeys:count:"), &vals, &keys, 4);
+}
+
+// ----- Cookie store ----------------------------------------------------------
+// WKHTTPCookieStore lives on `webview.configuration.websiteDataStore`.
+// Real wiring is a follow-up — all four entry points need an NSBlock
+// impostor + `dispatch_semaphore_wait` to sync-wrap the async
+// completion handlers. See docs/11-desktop-roadmap.md item #22.
+
+pub fn cookieGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
+    return opts_mod.CookieError.Unsupported;
+}
+
+pub fn cookieSet(_: *anyopaque, _: opts_mod.Cookie) opts_mod.CookieError!void {
+    return opts_mod.CookieError.Unsupported;
+}
+
+pub fn cookieDelete(_: *anyopaque, _: []const u8) opts_mod.CookieError!void {
+    return opts_mod.CookieError.Unsupported;
+}
+
+pub fn cookieClear(_: *anyopaque) opts_mod.CookieError!void {
+    return opts_mod.CookieError.Unsupported;
 }

@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 pub const options = @import("options.zig");
 pub const ipc = @import("ipc.zig");
 pub const asset_router = @import("asset_router.zig");
+pub const cookies = @import("cookies.zig");
 
 pub const WindowOptions = options.WindowOptions;
 pub const AssetEntry = options.AssetEntry;
@@ -21,6 +22,10 @@ pub const FileDialogOptions = options.FileDialogOptions;
 pub const AlertOptions = options.AlertOptions;
 pub const AlertStyle = options.AlertStyle;
 pub const DialogError = options.DialogError;
+pub const Cookie = options.Cookie;
+pub const CookieError = options.CookieError;
+pub const SameSite = options.SameSite;
+pub const CookieStore = cookies.CookieStore;
 
 const backend = switch (builtin.os.tag) {
     .macos => @import("macos.zig"),

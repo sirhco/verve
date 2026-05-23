@@ -62,6 +62,35 @@ pub const DialogError = error{
     PathTooLong,
 };
 
+/// Subset of `SameSite` cookie attribute values. Maps onto the
+/// platform-native enums at the backend boundary.
+pub const SameSite = enum { default, none, lax, strict };
+
+/// Single cookie record. Values are caller-owned strings; backends
+/// dupe into platform-native storage and never retain the slice.
+/// Mirrors WKHTTPCookieStore / ICoreWebView2CookieManager /
+/// SoupCookie field surfaces closely enough to round-trip without
+/// information loss on the common path.
+pub const Cookie = struct {
+    name: []const u8,
+    value: []const u8,
+    /// Defaults to the request origin when empty.
+    domain: []const u8 = "",
+    path: []const u8 = "/",
+    /// Unix epoch seconds. 0 = session cookie (no Expires attribute).
+    expires_unix: i64 = 0,
+    secure: bool = false,
+    http_only: bool = false,
+    same_site: SameSite = .default,
+};
+
+pub const CookieError = error{
+    Unsupported,
+    NotReady,
+    OutOfMemory,
+    Backend,
+};
+
 /// Construction parameters for `Window.init`. The platform layer
 /// captures these by value during init; later changes need explicit
 /// setter calls (`setTitle`, `loadUrl`, …).

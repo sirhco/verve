@@ -29,6 +29,7 @@ const builtin = @import("builtin");
 const opts_mod = @import("options.zig");
 const ipc = @import("ipc.zig");
 const router = @import("asset_router.zig");
+const cookies_mod = @import("cookies.zig");
 
 const WV2_INSTALL_URL = "https://developer.microsoft.com/microsoft-edge/webview2/";
 
@@ -398,6 +399,12 @@ pub const Window = struct {
         return Window.init(self.ctx.allocator, opts);
     }
 
+    /// Per-window cookie store. ICoreWebView2CookieManager wiring is
+    /// a follow-up — see module-level stubs.
+    pub fn cookies(self: *Window) cookies_mod.CookieStore {
+        return .{ .window = @ptrCast(self) };
+    }
+
     pub fn run(self: *Window) void {
         _ = self;
         var msg: MSG = undefined;
@@ -674,6 +681,29 @@ fn onResourceRequested(this: ?*const IResourceRequestedHandler, _: ?*Wv2, args: 
     const putResp = vtSlot(*const fn (*RequestedArgs, ?*ResponseT) callconv(.winapi) HRESULT, args.?.lpVtbl, SLOT_RequestedArgs_put_Response);
     _ = putResp(args.?, response);
     return 0;
+}
+
+// ---- Cookie store -----------------------------------------------------------
+// ICoreWebView2CookieManager hangs off ICoreWebView2_2 via QueryInterface
+// from the base webview pointer. Real wiring is a follow-up — all four
+// entry points need an async-to-sync wrapper around the COM completion
+// handler pattern (similar to env/controller bring-up). See
+// docs/11-desktop-roadmap.md item #22.
+
+pub fn cookieGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
+    return opts_mod.CookieError.Unsupported;
+}
+
+pub fn cookieSet(_: *anyopaque, _: opts_mod.Cookie) opts_mod.CookieError!void {
+    return opts_mod.CookieError.Unsupported;
+}
+
+pub fn cookieDelete(_: *anyopaque, _: []const u8) opts_mod.CookieError!void {
+    return opts_mod.CookieError.Unsupported;
+}
+
+pub fn cookieClear(_: *anyopaque) opts_mod.CookieError!void {
+    return opts_mod.CookieError.Unsupported;
 }
 
 comptime {
