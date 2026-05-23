@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -67,8 +68,25 @@ pub fn build(b: *std.Build) void {
             desktop_mod.linkSystemLibrary("Shell32", .{});
             desktop_mod.linkSystemLibrary("Shlwapi", .{});
             // WebView2 loader. Ship the SDK under `third_party/webview2/`
-            // or override with `-Dwebview2-sdk=...`.
+            // or override with `-Dwebview2-sdk=...`. When the SDK is
+            // not present, `tools/fetch_webview2.{sh,ps1}` downloads
+            // the pinned NuGet release. The script is idempotent so
+            // running it from every Windows build is cheap (an
+            // existing .lib short-circuits before any network I/O).
             const sdk = b.option([]const u8, "webview2-sdk", "Path to the WebView2 SDK") orelse "third_party/webview2";
+            const skip_fetch = b.option(bool, "webview2-no-fetch", "Skip auto-vendor of WebView2 SDK from NuGet") orelse false;
+            if (!skip_fetch) {
+                const fetch_cmd = if (builtin.os.tag == .windows) blk: {
+                    const c = b.addSystemCommand(&.{ "pwsh", "-File", "tools/fetch_webview2.ps1", "-Dest" });
+                    c.addArg(sdk);
+                    break :blk c;
+                } else blk: {
+                    const c = b.addSystemCommand(&.{ "sh", "tools/fetch_webview2.sh" });
+                    c.addArg(b.fmt("--dest={s}", .{sdk}));
+                    break :blk c;
+                };
+                exe.step.dependOn(&fetch_cmd.step);
+            }
             desktop_mod.addLibraryPath(b.path(sdk));
             desktop_mod.linkSystemLibrary("WebView2Loader.dll", .{});
         },

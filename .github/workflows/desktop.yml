@@ -68,19 +68,9 @@ jobs:
             libgtk-3-dev libwebkit2gtk-4.1-dev \
             xvfb imagemagick
 
-      # ---- Windows WebView2 SDK -------------------------------------------
-      - name: vendor WebView2 SDK
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $sdk = "app\third_party\webview2"
-          New-Item -ItemType Directory -Force -Path $sdk | Out-Null
-          $nupkg = "$env:RUNNER_TEMP\webview2.zip"
-          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2" -OutFile $nupkg
-          Expand-Archive -Path $nupkg -DestinationPath "$env:RUNNER_TEMP\webview2"
-          Copy-Item "$env:RUNNER_TEMP\webview2\build\native\x64\WebView2Loader.dll.lib" $sdk
-          Copy-Item "$env:RUNNER_TEMP\webview2\build\native\x64\WebView2Loader.dll" $sdk
-          Copy-Item "$env:RUNNER_TEMP\webview2\build\native\include\WebView2.h" $sdk
+      # WebView2 SDK on Windows is vendored automatically by the
+      # scaffolded `build.zig` (calls `tools/fetch_webview2.ps1`).
+      # No explicit CI step needed — `zig build` below triggers it.
 
       - name: build app
         working-directory: app

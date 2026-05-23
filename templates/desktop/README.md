@@ -16,11 +16,15 @@ The build wires platform-native libraries automatically per target.
 ## Platform prerequisites
 
 - **macOS**: WebKit/Cocoa ship with the OS. Nothing to install.
-- **Windows**: requires the Microsoft Edge WebView2 Evergreen runtime.
-  Win11 ships with it; Win10 may not. Install from
-  <https://developer.microsoft.com/microsoft-edge/webview2/> and copy
-  the `WebView2Loader.dll.lib` into `third_party/webview2/` (or pass
-  `-Dwebview2-sdk=PATH`).
+- **Windows**: requires the Microsoft Edge WebView2 Evergreen runtime
+  at run time. Win11 ships with it; Win10 may not — install from
+  <https://developer.microsoft.com/microsoft-edge/webview2/>. The
+  build-time SDK (`WebView2Loader.dll.lib`) is fetched automatically
+  by `tools/fetch_webview2.ps1` when `third_party/webview2/` is empty;
+  the script honours the version pinned in
+  `tools/webview2.pinned.txt`. To skip the fetch (CI cache hits, air-
+  gapped builds) pass `-Dwebview2-no-fetch=true` and supply the SDK
+  via `-Dwebview2-sdk=PATH`.
 - **Linux (Debian/Ubuntu)**: `sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev`.
 - **Linux (Fedora)**: `sudo dnf install gtk3-devel webkit2gtk4.1-devel`.
 

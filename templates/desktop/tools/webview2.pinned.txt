@@ -1,0 +1,12 @@
+# Pinned WebView2 SDK release. `fetch_webview2.{sh,ps1}` downloads
+# this exact NuGet version into `third_party/webview2/` so all builds
+# link against the same loader binary. Bump the version line below
+# and (ideally) drop a known SHA next to it before pushing — the
+# scripts will refuse to overwrite a populated SDK directory unless
+# `--force` is passed.
+version=1.0.2849.39
+# sha512 of microsoft.web.webview2.<version>.nupkg from
+# https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/<version>/microsoft.web.webview2.<version>.nupkg.sha512
+# Leave blank to skip verification; set to the base64 NuGet hash to
+# enforce it. TODO: pin once the first CI run verifies the value.
+sha512=
