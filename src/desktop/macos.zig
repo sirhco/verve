@@ -670,23 +670,286 @@ fn makeHeaderDict(content_type: []const u8, length: usize) id {
 }
 
 // ----- Cookie store ----------------------------------------------------------
+//
 // WKHTTPCookieStore lives on `webview.configuration.websiteDataStore`.
-// Real wiring is a follow-up — all four entry points need an NSBlock
-// impostor + `dispatch_semaphore_wait` to sync-wrap the async
-// completion handlers. See docs/11-desktop-roadmap.md item #22.
+// Its APIs (getAllCookies:, setCookie:completionHandler:,
+// deleteCookie:completionHandler:) are all async — completion handlers
+// are Objective-C blocks delivered on the main thread. To present a
+// blocking Zig API we use two pieces of plumbing:
+//
+//   1. NSBlock impostor — a Zig extern struct laid out identically to
+//      the Objective-C block ABI so we can construct blocks without
+//      `__block` syntax. Captured fields follow the standard
+//      isa/flags/reserved/invoke/descriptor header.
+//   2. Nested run-loop pump — we spin `[NSRunLoop currentRunLoop]
+//      runMode:beforeDate:` until the completion block toggles a
+//      `done` bool. This is the documented pattern for sync-wrapping
+//      main-thread-async APIs. Trade-off: the nested loop processes
+//      other input sources, so the calling context must be re-entrant
+//      safe. Cookie calls from IPC handlers are fine; from inside
+//      another modal run loop, less so.
 
-pub fn cookieGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
-    return opts_mod.CookieError.Unsupported;
+extern const _NSConcreteStackBlock: anyopaque;
+
+const BlockDescriptor = extern struct {
+    reserved: c_ulong = 0,
+    size: c_ulong,
+};
+
+const get_all_block_desc: BlockDescriptor = .{ .size = @sizeOf(GetAllBlock) };
+const void_block_desc: BlockDescriptor = .{ .size = @sizeOf(VoidBlock) };
+
+const GetAllBlock = extern struct {
+    isa: *const anyopaque,
+    flags: c_int,
+    reserved: c_int,
+    invoke: *const fn (*GetAllBlock, id) callconv(.c) void,
+    descriptor: *const BlockDescriptor,
+    // captured:
+    out_array: *?id,
+    done: *bool,
+};
+
+const VoidBlock = extern struct {
+    isa: *const anyopaque,
+    flags: c_int,
+    reserved: c_int,
+    invoke: *const fn (*VoidBlock) callconv(.c) void,
+    descriptor: *const BlockDescriptor,
+    // captured:
+    done: *bool,
+};
+
+fn getAllBlockInvoke(block: *GetAllBlock, cookies_arr: id) callconv(.c) void {
+    // Retain the array so it outlives the block's stack frame.
+    const retain = m.cast(*const fn (id, SEL) callconv(.c) id);
+    block.out_array.* = retain(cookies_arr, m.sel("retain"));
+    block.done.* = true;
 }
 
-pub fn cookieSet(_: *anyopaque, _: opts_mod.Cookie) opts_mod.CookieError!void {
-    return opts_mod.CookieError.Unsupported;
+fn voidBlockInvoke(block: *VoidBlock) callconv(.c) void {
+    block.done.* = true;
 }
 
-pub fn cookieDelete(_: *anyopaque, _: []const u8) opts_mod.CookieError!void {
-    return opts_mod.CookieError.Unsupported;
+fn pumpUntilDone(done: *const bool) void {
+    const NSRunLoop = m.getClass("NSRunLoop");
+    const NSDate = m.getClass("NSDate");
+    const currentRunLoop = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const distantFuture = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const runMode = m.cast(*const fn (id, SEL, id, id) callconv(.c) bool);
+
+    const mode_str = nsString("kCFRunLoopDefaultMode");
+    while (!done.*) {
+        const rl = currentRunLoop(@as(id, @ptrCast(NSRunLoop)), m.sel("currentRunLoop"));
+        const date = distantFuture(@as(id, @ptrCast(NSDate)), m.sel("distantFuture"));
+        _ = runMode(rl, m.sel("runMode:beforeDate:"), mode_str, date);
+    }
 }
 
-pub fn cookieClear(_: *anyopaque) opts_mod.CookieError!void {
-    return opts_mod.CookieError.Unsupported;
+fn cookieStoreFromWindow(window: *anyopaque) id {
+    const win: *Window = @ptrCast(@alignCast(window));
+    const dataStore = m.cast(*const fn (id, SEL) callconv(.c) id)(win.config, m.sel("websiteDataStore"));
+    return m.cast(*const fn (id, SEL) callconv(.c) id)(dataStore, m.sel("httpCookieStore"));
+}
+
+/// Block-on-completion wrapper around `[cookieStore getAllCookies:^...]`.
+/// Returns a retained NSArray<NSHTTPCookie*>; caller must `release`.
+fn fetchAllCookies(cookieStore: id) ?id {
+    var result: ?id = null;
+    var done = false;
+    var block: GetAllBlock = .{
+        .isa = &_NSConcreteStackBlock,
+        .flags = 0,
+        .reserved = 0,
+        .invoke = &getAllBlockInvoke,
+        .descriptor = &get_all_block_desc,
+        .out_array = &result,
+        .done = &done,
+    };
+    const getAll = m.cast(*const fn (id, SEL, *GetAllBlock) callconv(.c) void);
+    getAll(cookieStore, m.sel("getAllCookies:"), &block);
+    pumpUntilDone(&done);
+    return result;
+}
+
+/// Run `[cookieStore <selector>:cookie completionHandler:^()]` to
+/// completion. `selector` is "setCookie:completionHandler:" or
+/// "deleteCookie:completionHandler:".
+fn cookieMutate(cookieStore: id, selector: [*:0]const u8, cookie: id) void {
+    var done = false;
+    var block: VoidBlock = .{
+        .isa = &_NSConcreteStackBlock,
+        .flags = 0,
+        .reserved = 0,
+        .invoke = &voidBlockInvoke,
+        .descriptor = &void_block_desc,
+        .done = &done,
+    };
+    const call = m.cast(*const fn (id, SEL, id, *VoidBlock) callconv(.c) void);
+    call(cookieStore, m.sel(selector), cookie, &block);
+    pumpUntilDone(&done);
+}
+
+fn nsStringToOwned(allocator: std.mem.Allocator, ns_str: id) opts_mod.CookieError![]u8 {
+    const utf8 = m.cast(*const fn (id, SEL) callconv(.c) [*:0]const u8);
+    const cstr = utf8(ns_str, m.sel("UTF8String"));
+    const len = std.mem.len(cstr);
+    return allocator.dupe(u8, cstr[0..len]) catch return opts_mod.CookieError.OutOfMemory;
+}
+
+fn marshalCookie(allocator: std.mem.Allocator, ns_cookie: id) opts_mod.CookieError!opts_mod.Cookie {
+    const getStr = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const getBool = m.cast(*const fn (id, SEL) callconv(.c) bool);
+    const getDate = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+
+    const ns_name = getStr(ns_cookie, m.sel("name"));
+    const ns_value = getStr(ns_cookie, m.sel("value"));
+    const ns_domain = getStr(ns_cookie, m.sel("domain"));
+    const ns_path = getStr(ns_cookie, m.sel("path"));
+
+    var out: opts_mod.Cookie = .{
+        .name = try nsStringToOwned(allocator, ns_name),
+        .value = try nsStringToOwned(allocator, ns_value),
+        .domain = try nsStringToOwned(allocator, ns_domain),
+        .path = try nsStringToOwned(allocator, ns_path),
+        .secure = getBool(ns_cookie, m.sel("isSecure")),
+        .http_only = getBool(ns_cookie, m.sel("isHTTPOnly")),
+    };
+
+    if (getDate(ns_cookie, m.sel("expiresDate"))) |date| {
+        const tiSince1970 = m.cast(*const fn (id, SEL) callconv(.c) f64);
+        out.expires_unix = @intFromFloat(tiSince1970(date, m.sel("timeIntervalSince1970")));
+    }
+
+    // sameSitePolicy is macOS 10.15+. Returns NSString or nil.
+    const same_site_ns = getStr(ns_cookie, m.sel("sameSitePolicy"));
+    if (@intFromPtr(same_site_ns) != 0) {
+        const ns_to_cstr = m.cast(*const fn (id, SEL) callconv(.c) [*:0]const u8);
+        const policy_cstr = ns_to_cstr(same_site_ns, m.sel("UTF8String"));
+        const policy = std.mem.span(policy_cstr);
+        // Apple normalises to lowercase ("lax"/"strict"/"none").
+        if (std.ascii.eqlIgnoreCase(policy, "lax")) out.same_site = .lax;
+        if (std.ascii.eqlIgnoreCase(policy, "strict")) out.same_site = .strict;
+        if (std.ascii.eqlIgnoreCase(policy, "none")) out.same_site = .none;
+    }
+
+    return out;
+}
+
+/// Build a transient NSHTTPCookie from a Cookie record via
+/// `+cookieWithProperties:`. Returned cookie is autoreleased.
+fn buildNsCookie(cookie: opts_mod.Cookie) ?id {
+    const NSMutableDictionary = m.getClass("NSMutableDictionary");
+    const dictAlloc = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const dictInit = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const dict = dictInit(dictAlloc(@as(id, @ptrCast(NSMutableDictionary)), m.sel("alloc")), m.sel("init"));
+
+    const setObj = m.cast(*const fn (id, SEL, id, id) callconv(.c) void);
+    setObj(dict, m.sel("setObject:forKey:"), nsString(cookie.name), nsString("Name"));
+    setObj(dict, m.sel("setObject:forKey:"), nsString(cookie.value), nsString("Value"));
+    const domain = if (cookie.domain.len > 0) cookie.domain else "";
+    setObj(dict, m.sel("setObject:forKey:"), nsString(domain), nsString("Domain"));
+    const path = if (cookie.path.len > 0) cookie.path else "/";
+    setObj(dict, m.sel("setObject:forKey:"), nsString(path), nsString("Path"));
+
+    if (cookie.secure) {
+        setObj(dict, m.sel("setObject:forKey:"), nsString("TRUE"), nsString("Secure"));
+    }
+    if (cookie.http_only) {
+        setObj(dict, m.sel("setObject:forKey:"), nsString("TRUE"), nsString("HTTPOnly"));
+    }
+    if (cookie.expires_unix > 0) {
+        const NSDate = m.getClass("NSDate");
+        const dateAt = m.cast(*const fn (id, SEL, f64) callconv(.c) id);
+        const date = dateAt(@as(id, @ptrCast(NSDate)), m.sel("dateWithTimeIntervalSince1970:"), @floatFromInt(cookie.expires_unix));
+        setObj(dict, m.sel("setObject:forKey:"), date, nsString("Expires"));
+    }
+    switch (cookie.same_site) {
+        .default => {},
+        .lax => setObj(dict, m.sel("setObject:forKey:"), nsString("lax"), nsString("SameSitePolicy")),
+        .strict => setObj(dict, m.sel("setObject:forKey:"), nsString("strict"), nsString("SameSitePolicy")),
+        .none => setObj(dict, m.sel("setObject:forKey:"), nsString("none"), nsString("SameSitePolicy")),
+    }
+
+    const NSHTTPCookie = m.getClass("NSHTTPCookie");
+    const cookieWith = m.cast(*const fn (id, SEL, id) callconv(.c) ?id);
+    return cookieWith(@as(id, @ptrCast(NSHTTPCookie)), m.sel("cookieWithProperties:"), dict);
+}
+
+fn nsStringEquals(ns: id, want: []const u8) bool {
+    const utf8 = m.cast(*const fn (id, SEL) callconv(.c) [*:0]const u8);
+    const cstr = utf8(ns, m.sel("UTF8String"));
+    const len = std.mem.len(cstr);
+    return std.mem.eql(u8, cstr[0..len], want);
+}
+
+pub fn cookieGet(window: *anyopaque, allocator: std.mem.Allocator, name: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
+    const cookieStore = cookieStoreFromWindow(window);
+    const arr = fetchAllCookies(cookieStore) orelse return null;
+    defer {
+        const release = m.cast(*const fn (id, SEL) callconv(.c) void);
+        release(arr, m.sel("release"));
+    }
+
+    const countSel = m.cast(*const fn (id, SEL) callconv(.c) usize);
+    const objAt = m.cast(*const fn (id, SEL, usize) callconv(.c) id);
+    const getName = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const count = countSel(arr, m.sel("count"));
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const c = objAt(arr, m.sel("objectAtIndex:"), i);
+        if (nsStringEquals(getName(c, m.sel("name")), name)) {
+            return try marshalCookie(allocator, c);
+        }
+    }
+    return null;
+}
+
+pub fn cookieSet(window: *anyopaque, cookie: opts_mod.Cookie) opts_mod.CookieError!void {
+    const cookieStore = cookieStoreFromWindow(window);
+    const ns_cookie = buildNsCookie(cookie) orelse return opts_mod.CookieError.Backend;
+    cookieMutate(cookieStore, "setCookie:completionHandler:", ns_cookie);
+}
+
+pub fn cookieDelete(window: *anyopaque, name: []const u8) opts_mod.CookieError!void {
+    const cookieStore = cookieStoreFromWindow(window);
+    const arr = fetchAllCookies(cookieStore) orelse return;
+    defer {
+        const release = m.cast(*const fn (id, SEL) callconv(.c) void);
+        release(arr, m.sel("release"));
+    }
+
+    const countSel = m.cast(*const fn (id, SEL) callconv(.c) usize);
+    const objAt = m.cast(*const fn (id, SEL, usize) callconv(.c) id);
+    const getName = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const count = countSel(arr, m.sel("count"));
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const c = objAt(arr, m.sel("objectAtIndex:"), i);
+        if (nsStringEquals(getName(c, m.sel("name")), name)) {
+            cookieMutate(cookieStore, "deleteCookie:completionHandler:", c);
+            return;
+        }
+    }
+}
+
+pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
+    const cookieStore = cookieStoreFromWindow(window);
+    const arr = fetchAllCookies(cookieStore) orelse return;
+    defer {
+        const release = m.cast(*const fn (id, SEL) callconv(.c) void);
+        release(arr, m.sel("release"));
+    }
+
+    const countSel = m.cast(*const fn (id, SEL) callconv(.c) usize);
+    const objAt = m.cast(*const fn (id, SEL, usize) callconv(.c) id);
+    const count = countSel(arr, m.sel("count"));
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const c = objAt(arr, m.sel("objectAtIndex:"), i);
+        cookieMutate(cookieStore, "deleteCookie:completionHandler:", c);
+    }
 }
