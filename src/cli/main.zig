@@ -327,8 +327,12 @@ fn renderZonWithFingerprint(pkg_name: []const u8, fingerprint: u64, gpa: std.mem
             \\        // Path dep baked from `verve-cli`'s build-time
             \\        // default. Override per-scaffold with
             \\        //     verve-cli new ... --verve-path /abs/path
-            \\        // Once Verve ships releases, swap to a
-            \\        // `zig fetch --save URL` declaration.
+            \\        //
+            \\        // To swap to a tagged release once Verve ships
+            \\        // one, comment out the line below and run:
+            \\        //     zig fetch --save https://github.com/chrisolson22/verve/archive/refs/tags/vX.Y.Z.tar.gz
+            \\        // which will rewrite this dep as
+            \\        //     .verve = .{{ .url = "...", .hash = "..." }},
             \\        .verve = .{{ .path = "{s}" }},
             \\    }},
             \\    .paths = .{{
@@ -337,6 +341,7 @@ fn renderZonWithFingerprint(pkg_name: []const u8, fingerprint: u64, gpa: std.mem
             \\        "src",
             \\        "frontend",
             \\        "public",
+            \\        "tools",
             \\        "LICENSE",
             \\    }},
             \\}}

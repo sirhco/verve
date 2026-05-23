@@ -30,6 +30,10 @@ jobs:
             asset_suffix: x86_64-macos
           - target: aarch64-macos
             asset_suffix: aarch64-macos
+          # x86_64-windows-gnu is intentionally absent — verve-server
+          # uses posix APIs and verve-cli's realpath path needs libc
+          # linkage on Windows. Both are tracked follow-ups (roadmap
+          # #20 — release tarball Windows coverage).
 
     steps:
       - uses: actions/checkout@v4
