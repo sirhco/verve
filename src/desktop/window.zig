@@ -1,0 +1,32 @@
+//! Cross-platform window facade. Comptime-dispatches to the backend
+//! that matches the host OS. The selected backend implements a `Window`
+//! struct with the same public surface; this file re-exports it so app
+//! code writes `const w = try desktop.Window.init(alloc, opts);`
+//! regardless of platform.
+//!
+//! Unsupported hosts fail at compile time rather than at runtime — a
+//! missing backend is a build-graph mistake, not a recoverable error.
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+pub const options = @import("options.zig");
+pub const ipc = @import("ipc.zig");
+pub const asset_router = @import("asset_router.zig");
+
+pub const WindowOptions = options.WindowOptions;
+pub const AssetEntry = options.AssetEntry;
+pub const MessageHandler = options.MessageHandler;
+pub const FileDialogOptions = options.FileDialogOptions;
+pub const AlertOptions = options.AlertOptions;
+pub const AlertStyle = options.AlertStyle;
+pub const DialogError = options.DialogError;
+
+const backend = switch (builtin.os.tag) {
+    .macos => @import("macos.zig"),
+    .windows => @import("windows.zig"),
+    .linux => @import("linux.zig"),
+    else => @compileError("verve.desktop: unsupported OS — only macOS, Windows, and Linux are wired today"),
+};
+
+pub const Window = backend.Window;

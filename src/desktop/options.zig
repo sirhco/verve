@@ -1,0 +1,114 @@
+//! Window construction options shared by every platform backend.
+//!
+//! The platform modules (`macos.zig`, `windows.zig`, `linux.zig`) all
+//! consume the same `WindowOptions` value so a desktop app written
+//! against `desktop.window` compiles unchanged across hosts. Only the
+//! field set is platform-neutral; each backend is free to apply or
+//! ignore individual fields (e.g. `devtools` is a no-op on Windows when
+//! the WebView2 runtime has the developer-tools UI gated by group
+//! policy).
+
+const std = @import("std");
+
+/// Embedded asset entry. Identical shape to `public_assets.Entry`
+/// emitted by `build.zig:buildPublicAssets`, so a desktop app can pipe
+/// its compile-time asset table straight into the router without an
+/// intermediate adapter type.
+pub const AssetEntry = struct {
+    path: []const u8,
+    bytes: []const u8,
+    content_type: []const u8,
+};
+
+/// Callback invoked when the frontend posts a message via
+/// `window.verve.send(...)`. `ctx` is the opaque pointer registered
+/// alongside the callback. `payload` is the raw JSON string the JS
+/// runtime delivered — the framework does not parse it.
+pub const MessageHandler = *const fn (ctx: ?*anyopaque, payload: []const u8) void;
+
+/// Parameters for `Window.openFileDialog` / `Window.saveFileDialog`.
+pub const FileDialogOptions = struct {
+    title: []const u8 = "",
+    message: []const u8 = "",
+    /// Initial directory. Empty string defers to the platform default.
+    default_path: []const u8 = "",
+    /// File-name suggestion shown in save dialogs. Ignored on open.
+    default_name: []const u8 = "",
+    /// Extensions like "txt", "json". Empty slice = allow any.
+    allowed_extensions: []const []const u8 = &.{},
+    /// Open dialogs only. Always false for save.
+    allow_multiple: bool = false,
+    /// Open dialogs only. When true, the dialog selects directories
+    /// instead of files.
+    pick_directory: bool = false,
+};
+
+/// Parameters for `Window.showAlert`.
+pub const AlertOptions = struct {
+    title: []const u8 = "",
+    message: []const u8 = "",
+    /// Button labels rendered right-to-left. The first label is the
+    /// default action. Empty slice falls back to `["OK"]`.
+    buttons: []const []const u8 = &.{},
+    style: AlertStyle = .informational,
+};
+
+pub const AlertStyle = enum { informational, warning, critical };
+
+pub const DialogError = error{
+    Cancelled,
+    Unsupported,
+    OutOfMemory,
+    PathTooLong,
+};
+
+/// Construction parameters for `Window.init`. The platform layer
+/// captures these by value during init; later changes need explicit
+/// setter calls (`setTitle`, `loadUrl`, …).
+pub const WindowOptions = struct {
+    /// UTF-8 window title shown in the OS title bar. Length is bounded
+    /// by the platform — the macOS backend silently truncates beyond
+    /// roughly 256 chars; Windows allows up to ~32K via `SetWindowTextW`.
+    title: []const u8 = "Verve",
+
+    /// Initial outer dimensions in OS-logical pixels. The backend may
+    /// clamp these to the primary display's working area.
+    width: u32 = 1024,
+    height: u32 = 768,
+
+    /// Whether the embedded webview should expose its native developer
+    /// tools UI. Honored on macOS (WKWebView `developerExtrasEnabled`)
+    /// and Windows (WebView2 `AreDevToolsEnabled`). On WebKitGTK the
+    /// `WEBKIT_DEBUG=...` environment variable still applies.
+    devtools: bool = false,
+
+    /// URL scheme name used for the custom-scheme asset bridge. Defaults
+    /// to `verve`, producing URLs of the form `verve://app/<path>`. The
+    /// authority (`app`) is fixed by `asset_router.resolve`.
+    scheme: []const u8 = "verve",
+
+    /// Path that the backend should navigate to after the window is
+    /// shown. Resolved through the custom scheme so the asset router
+    /// answers it from the embedded table. Pass an empty string to skip
+    /// the initial navigation entirely.
+    initial_path: []const u8 = "index.html",
+
+    /// Embedded asset table the custom-scheme handler resolves against.
+    /// May be empty — in that case all in-flight resource requests fail
+    /// with a clear error, which is useful while iterating on a project
+    /// that has not produced its production bundle yet.
+    assets: []const AssetEntry = &.{},
+
+    /// Optional message-handler callback + context registered before
+    /// any page load. The same pointer pair can be set later via
+    /// `Window.setMessageHandler`; supplying it here just saves the
+    /// follow-up call.
+    on_message: ?MessageHandler = null,
+    on_message_ctx: ?*anyopaque = null,
+
+    /// Install a default OS menu bar on macOS (App + Edit + Window).
+    /// Disable when the app builds its own menu from scratch. On
+    /// Windows/Linux the field is currently ignored — menu bars on
+    /// those platforms are a follow-up.
+    install_default_menu: bool = true,
+};
