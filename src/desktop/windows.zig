@@ -391,6 +391,13 @@ pub const Window = struct {
         self.ctx.on_message_ctx = handler_ctx;
     }
 
+    /// Open a second window in the same app session. Each call mints
+    /// a fresh HWND + WebView2 environment/controller; the registry
+    /// keeps both windows resolvable from wndProc.
+    pub fn openChildWindow(self: *Window, opts: opts_mod.WindowOptions) !Window {
+        return Window.init(self.ctx.allocator, opts);
+    }
+
     pub fn run(self: *Window) void {
         _ = self;
         var msg: MSG = undefined;
@@ -458,9 +465,12 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_DESTROY => {
-            // TODO multi-window: only PostQuitMessage when last
-            // registered ctx unregisters, not on every window close.
-            PostQuitMessage(0);
+            // Multi-window quit: unregister this HWND, only post
+            // WM_QUIT when the last live window destroys. Win32 has
+            // no equivalent of NSApp's automatic last-window tracking
+            // so the registry size IS the live-window count.
+            unregisterCtx(hwnd);
+            if (registry.count() == 0) PostQuitMessage(0);
             return 0;
         },
         else => return DefWindowProcW(hwnd, msg, wparam, lparam),

@@ -46,6 +46,12 @@ const WindowCtx = struct {
 // page allocator — entries are tiny and live for the window's lifetime.
 var registry: std.AutoHashMapUnmanaged(*anyopaque, *WindowCtx) = .{};
 
+// App-level setup (NSApplication delegate, menu bar) must happen
+// exactly once per process. Window.init is idempotent through this
+// flag so openChildWindow can call it for additional windows without
+// re-installing the delegate or clobbering the menu bar.
+var app_initialized: bool = false;
+
 fn registerCtx(webview: id, ctx_ptr: *WindowCtx) !void {
     try registry.put(std.heap.page_allocator, @ptrCast(webview), ctx_ptr);
 }
@@ -75,8 +81,10 @@ pub const Window = struct {
         const NSApplication = m.getClass("NSApplication");
         const sharedApp = m.cast(*const fn (id, SEL) callconv(.c) id);
         const app = sharedApp(@as(id, @ptrCast(NSApplication)), m.sel("sharedApplication"));
-        const setActivationPolicy = m.cast(*const fn (id, SEL, isize) callconv(.c) void);
-        setActivationPolicy(app, m.sel("setActivationPolicy:"), 0); // NSApplicationActivationPolicyRegular
+        if (!app_initialized) {
+            const setActivationPolicy = m.cast(*const fn (id, SEL, isize) callconv(.c) void);
+            setActivationPolicy(app, m.sel("setActivationPolicy:"), 0); // NSApplicationActivationPolicyRegular
+        }
 
         // Build a content rect and create the window. Style mask =
         // titled | closable | miniaturizable | resizable.
@@ -109,27 +117,32 @@ pub const Window = struct {
         m.addProtocol(message_class, "WKScriptMessageHandler");
         m.registerClass(message_class);
 
-        // NSApplicationDelegate. Without one, closing the last window
-        // leaves the app running with no UI and no menu — the run
-        // loop keeps spinning forever. The standard Cocoa convention
-        // for single-window apps is to terminate when the last window
-        // closes; the delegate's `applicationShouldTerminateAfterLastWindowClosed:`
-        // returns YES to opt in.
-        const app_delegate_class = m.allocateClass(NSObject, "VerveAppDelegate");
-        m.addMethod(app_delegate_class, m.sel("applicationShouldTerminateAfterLastWindowClosed:"), @ptrCast(&appShouldTerminateOnLastWindowClosed), "B@:@");
-        m.addProtocol(app_delegate_class, "NSApplicationDelegate");
-        m.registerClass(app_delegate_class);
+        if (!app_initialized) {
+            // NSApplicationDelegate. Without one, closing the last window
+            // leaves the app running with no UI and no menu — the run
+            // loop keeps spinning forever. The standard Cocoa convention
+            // for single-window apps is to terminate when the last window
+            // closes; the delegate's `applicationShouldTerminateAfterLastWindowClosed:`
+            // returns YES to opt in. For multi-window apps NSApp tracks
+            // all open windows automatically, so the same delegate
+            // handles single AND multi-window quit semantics.
+            const app_delegate_class = m.allocateClass(NSObject, "VerveAppDelegate");
+            m.addMethod(app_delegate_class, m.sel("applicationShouldTerminateAfterLastWindowClosed:"), @ptrCast(&appShouldTerminateOnLastWindowClosed), "B@:@");
+            m.addProtocol(app_delegate_class, "NSApplicationDelegate");
+            m.registerClass(app_delegate_class);
 
-        const delegate_alloc = m.cast(*const fn (id, SEL) callconv(.c) id);
-        const delegate_init = m.cast(*const fn (id, SEL) callconv(.c) id);
-        const app_delegate = delegate_init(
-            delegate_alloc(@as(id, @ptrCast(app_delegate_class)), m.sel("alloc")),
-            m.sel("init"),
-        );
-        const setDelegate = m.cast(*const fn (id, SEL, id) callconv(.c) void);
-        setDelegate(app, m.sel("setDelegate:"), app_delegate);
+            const delegate_alloc = m.cast(*const fn (id, SEL) callconv(.c) id);
+            const delegate_init = m.cast(*const fn (id, SEL) callconv(.c) id);
+            const app_delegate = delegate_init(
+                delegate_alloc(@as(id, @ptrCast(app_delegate_class)), m.sel("alloc")),
+                m.sel("init"),
+            );
+            const setDelegate = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+            setDelegate(app, m.sel("setDelegate:"), app_delegate);
 
-        if (opts.install_default_menu) installDefaultMenuBar(app);
+            if (opts.install_default_menu) installDefaultMenuBar(app);
+            app_initialized = true;
+        }
 
         // Configure the WKWebView with a user-content controller that
         // owns the message handler and the document-start shim.
@@ -256,6 +269,14 @@ pub const Window = struct {
     pub fn setMessageHandler(self: *Window, handler: opts_mod.MessageHandler, handler_ctx: ?*anyopaque) void {
         self.ctx.on_message = handler;
         self.ctx.on_message_ctx = handler_ctx;
+    }
+
+    /// Open a second window in the same app session. Returned Window
+    /// shares NSApplication state (delegate, menu bar) with the
+    /// caller; it gets its own WKWebView, scheme handler, and
+    /// WindowCtx in the registry. Uses the parent's allocator.
+    pub fn openChildWindow(self: *Window, opts: opts_mod.WindowOptions) !Window {
+        return Window.init(self.allocator, opts);
     }
 
     pub fn run(self: *Window) void {

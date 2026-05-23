@@ -160,6 +160,12 @@ const WindowCtx = struct {
     web_context: ?*WebKitWebContext = null,
 };
 
+// GTK's main loop has no automatic last-window tracking, so we count
+// live windows ourselves. Incremented after gtk_window_new succeeds;
+// decremented in onDestroy. gtk_main_quit only fires when the counter
+// hits zero — matches Cocoa applicationShouldTerminateAfterLastWindowClosed.
+var live_windows: u32 = 0;
+
 pub const Window = struct {
     ctx: *WindowCtx,
 
@@ -178,6 +184,7 @@ pub const Window = struct {
 
         const window_widget = gtk_window_new(GTK_WINDOW_TOPLEVEL);
         heap.window = window_widget;
+        live_windows += 1;
 
         const title_z = try allocator.dupeZ(u8, opts.title);
         defer allocator.free(title_z);
@@ -281,6 +288,13 @@ pub const Window = struct {
         self.ctx.on_message_ctx = handler_ctx;
     }
 
+    /// Open a second window in the same GTK main loop. Returned
+    /// Window owns its own GtkWindow + WebKitWebContext + WebView;
+    /// gtk_main_quit only fires when the last live window destroys.
+    pub fn openChildWindow(self: *Window, opts: opts_mod.WindowOptions) !Window {
+        return Window.init(self.ctx.allocator, opts);
+    }
+
     pub fn run(self: *Window) void {
         _ = self;
         gtk_main();
@@ -329,9 +343,8 @@ pub const Window = struct {
 // ---- GTK signal trampolines -------------------------------------------------
 
 fn onDestroy(_: ?*GtkWidget, _: ?*anyopaque) callconv(.c) void {
-    // TODO multi-window: only gtk_main_quit when the last window
-    // destroys. For now this preserves single-window behaviour.
-    gtk_main_quit();
+    if (live_windows > 0) live_windows -= 1;
+    if (live_windows == 0) gtk_main_quit();
 }
 
 fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callconv(.c) void {
