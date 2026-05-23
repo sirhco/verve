@@ -29,11 +29,18 @@ const WebKitUserScript = opaque {};
 const WebKitURISchemeRequest = opaque {};
 const WebKitJavascriptResult = opaque {};
 const WebKitSettings = opaque {};
+const WebKitCookieManager = opaque {};
 const GInputStream = opaque {};
 const GError = opaque {};
+const GAsyncResult = opaque {};
+const GList = opaque {};
 const JSCValue = opaque {};
 const GObject = opaque {};
+const SoupCookie = opaque {};
+const SoupDate = opaque {};
 const GClosureNotify = ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void;
+const GAsyncReadyCallback = ?*const fn (?*anyopaque, ?*GAsyncResult, ?*anyopaque) callconv(.c) void;
+const GDestroyNotify = ?*const fn (?*anyopaque) callconv(.c) void;
 
 const gboolean = c_int;
 const GQuark = u32;
@@ -78,6 +85,11 @@ extern fn g_memory_input_stream_new_from_data(
     len: c_long,
     destroy: ?*const fn (?*anyopaque) callconv(.c) void,
 ) *GInputStream;
+
+extern fn g_main_context_iteration(ctx: ?*anyopaque, may_block: gboolean) gboolean;
+extern fn g_list_length(list: ?*GList) c_uint;
+extern fn g_list_nth_data(list: ?*GList, n: c_uint) ?*anyopaque;
+extern fn g_list_free_full(list: ?*GList, destroy: GDestroyNotify) void;
 
 // ---- WebKitGTK externs ------------------------------------------------------
 
@@ -140,6 +152,63 @@ extern fn webkit_uri_scheme_request_finish_error(req: *WebKitURISchemeRequest, e
 extern fn webkit_javascript_result_get_js_value(result: *WebKitJavascriptResult) *JSCValue;
 extern fn jsc_value_is_string(v: *JSCValue) gboolean;
 extern fn jsc_value_to_string(v: *JSCValue) [*:0]u8;
+
+// ---- WebKit cookie manager + SoupCookie externs -----------------------------
+
+extern fn webkit_web_context_get_cookie_manager(ctx: *WebKitWebContext) *WebKitCookieManager;
+extern fn webkit_cookie_manager_get_all_cookies(
+    mgr: *WebKitCookieManager,
+    cancellable: ?*anyopaque,
+    callback: GAsyncReadyCallback,
+    user_data: ?*anyopaque,
+) void;
+extern fn webkit_cookie_manager_get_all_cookies_finish(
+    mgr: *WebKitCookieManager,
+    result: *GAsyncResult,
+    err: ?*?*GError,
+) ?*GList;
+extern fn webkit_cookie_manager_add_cookie(
+    mgr: *WebKitCookieManager,
+    cookie: *SoupCookie,
+    cancellable: ?*anyopaque,
+    callback: GAsyncReadyCallback,
+    user_data: ?*anyopaque,
+) void;
+extern fn webkit_cookie_manager_delete_cookie(
+    mgr: *WebKitCookieManager,
+    cookie: *SoupCookie,
+    cancellable: ?*anyopaque,
+    callback: GAsyncReadyCallback,
+    user_data: ?*anyopaque,
+) void;
+
+extern fn soup_cookie_new(
+    name: [*:0]const u8,
+    value: [*:0]const u8,
+    domain: [*:0]const u8,
+    path: [*:0]const u8,
+    max_age: c_int,
+) ?*SoupCookie;
+extern fn soup_cookie_free(c: *SoupCookie) void;
+extern fn soup_cookie_get_name(c: *SoupCookie) [*:0]const u8;
+extern fn soup_cookie_get_value(c: *SoupCookie) [*:0]const u8;
+extern fn soup_cookie_get_domain(c: *SoupCookie) [*:0]const u8;
+extern fn soup_cookie_get_path(c: *SoupCookie) [*:0]const u8;
+extern fn soup_cookie_get_secure(c: *SoupCookie) gboolean;
+extern fn soup_cookie_get_http_only(c: *SoupCookie) gboolean;
+extern fn soup_cookie_get_expires(c: *SoupCookie) ?*SoupDate;
+extern fn soup_cookie_get_same_site_policy(c: *SoupCookie) c_int;
+extern fn soup_cookie_set_secure(c: *SoupCookie, v: gboolean) void;
+extern fn soup_cookie_set_http_only(c: *SoupCookie, v: gboolean) void;
+extern fn soup_cookie_set_same_site_policy(c: *SoupCookie, p: c_int) void;
+extern fn soup_cookie_set_expires(c: *SoupCookie, date: ?*SoupDate) void;
+extern fn soup_date_new_from_time_t(t: c_long) *SoupDate;
+extern fn soup_date_to_time_t(d: *SoupDate) c_long;
+extern fn soup_date_free(d: *SoupDate) void;
+
+const SOUP_SAME_SITE_NONE: c_int = 0;
+const SOUP_SAME_SITE_LAX: c_int = 1;
+const SOUP_SAME_SITE_STRICT: c_int = 2;
 
 // ---- Implementation ---------------------------------------------------------
 
@@ -394,24 +463,186 @@ fn onScriptMessage(_: *WebKitUserContentManager, message: *WebKitJavascriptResul
 }
 
 // ---- Cookie store -----------------------------------------------------------
+//
 // WebKitCookieManager is per-WebContext (we already create one per
-// window), so the API maps cleanly. Real wiring is a follow-up — the
-// WebKitGTK cookie APIs are async via GAsyncResult; need GMainLoop or
-// g_main_context_iteration spin to sync-wrap. See
-// docs/11-desktop-roadmap.md item #22.
+// window). All cookie APIs are async via GAsyncResult — we sync-wrap by
+// spinning `g_main_context_iteration` until the GAsyncReadyCallback
+// flips a `done` bool. Standard GLib pattern; processes other GTK
+// events during the wait. Requires WebKitGTK ≥ 2.40 for
+// get_all_cookies (introduced 2023-03). add_cookie / delete_cookie are
+// available since 2.20.
 
-pub fn cookieGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
-    return opts_mod.CookieError.Unsupported;
+/// Continuation cell passed as `user_data` to async cookie ops. The
+/// callback writes its result into the cell and signals via `done`.
+const GetAllCookiesCell = extern struct {
+    result: ?*GAsyncResult = null,
+    done: bool = false,
+};
+
+const SimpleAsyncCell = extern struct {
+    done: bool = false,
+};
+
+fn onGetAllCookiesDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *GetAllCookiesCell = @ptrCast(@alignCast(user_data orelse return));
+    cell.result = res;
+    cell.done = true;
 }
 
-pub fn cookieSet(_: *anyopaque, _: opts_mod.Cookie) opts_mod.CookieError!void {
-    return opts_mod.CookieError.Unsupported;
+fn onSimpleAsyncDone(_: ?*anyopaque, _: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *SimpleAsyncCell = @ptrCast(@alignCast(user_data orelse return));
+    cell.done = true;
 }
 
-pub fn cookieDelete(_: *anyopaque, _: []const u8) opts_mod.CookieError!void {
-    return opts_mod.CookieError.Unsupported;
+fn pumpMainContextUntilDone(done: *const bool) void {
+    while (!done.*) {
+        _ = g_main_context_iteration(null, 1); // 1 = may_block
+    }
 }
 
-pub fn cookieClear(_: *anyopaque) opts_mod.CookieError!void {
-    return opts_mod.CookieError.Unsupported;
+fn cookieManagerFor(window: *anyopaque) opts_mod.CookieError!*WebKitCookieManager {
+    const win: *Window = @ptrCast(@alignCast(window));
+    const wc = win.ctx.web_context orelse return opts_mod.CookieError.NotReady;
+    return webkit_web_context_get_cookie_manager(wc);
+}
+
+fn fetchAllCookies(mgr: *WebKitCookieManager) ?*GList {
+    var cell: GetAllCookiesCell = .{};
+    webkit_cookie_manager_get_all_cookies(mgr, null, &onGetAllCookiesDone, @ptrCast(&cell));
+    pumpMainContextUntilDone(&cell.done);
+    const res = cell.result orelse return null;
+    var err: ?*GError = null;
+    const list = webkit_cookie_manager_get_all_cookies_finish(mgr, res, &err);
+    if (err) |e| {
+        std.log.warn("verve.desktop[linux]: get_all_cookies_finish failed", .{});
+        g_error_free(e);
+        return null;
+    }
+    return list;
+}
+
+fn marshalCookie(allocator: std.mem.Allocator, c: *SoupCookie) opts_mod.CookieError!opts_mod.Cookie {
+    const name = std.mem.span(soup_cookie_get_name(c));
+    const value = std.mem.span(soup_cookie_get_value(c));
+    const domain = std.mem.span(soup_cookie_get_domain(c));
+    const path = std.mem.span(soup_cookie_get_path(c));
+
+    var out: opts_mod.Cookie = .{
+        .name = allocator.dupe(u8, name) catch return opts_mod.CookieError.OutOfMemory,
+        .value = allocator.dupe(u8, value) catch return opts_mod.CookieError.OutOfMemory,
+        .domain = allocator.dupe(u8, domain) catch return opts_mod.CookieError.OutOfMemory,
+        .path = allocator.dupe(u8, path) catch return opts_mod.CookieError.OutOfMemory,
+        .secure = soup_cookie_get_secure(c) != 0,
+        .http_only = soup_cookie_get_http_only(c) != 0,
+    };
+
+    if (soup_cookie_get_expires(c)) |date| {
+        out.expires_unix = @intCast(soup_date_to_time_t(date));
+    }
+
+    out.same_site = switch (soup_cookie_get_same_site_policy(c)) {
+        SOUP_SAME_SITE_NONE => .none,
+        SOUP_SAME_SITE_LAX => .lax,
+        SOUP_SAME_SITE_STRICT => .strict,
+        else => .default,
+    };
+
+    return out;
+}
+
+fn buildSoupCookie(allocator: std.mem.Allocator, cookie: opts_mod.Cookie) opts_mod.CookieError!*SoupCookie {
+    const name_z = allocator.dupeZ(u8, cookie.name) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(name_z);
+    const value_z = allocator.dupeZ(u8, cookie.value) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(value_z);
+    const domain_src = if (cookie.domain.len > 0) cookie.domain else "";
+    const domain_z = allocator.dupeZ(u8, domain_src) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(domain_z);
+    const path_src = if (cookie.path.len > 0) cookie.path else "/";
+    const path_z = allocator.dupeZ(u8, path_src) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(path_z);
+
+    // max_age == -1 → session cookie. soup_cookie_new ignores expires;
+    // we override below via soup_cookie_set_expires if requested.
+    const c = soup_cookie_new(name_z.ptr, value_z.ptr, domain_z.ptr, path_z.ptr, -1) orelse return opts_mod.CookieError.Backend;
+
+    if (cookie.secure) soup_cookie_set_secure(c, 1);
+    if (cookie.http_only) soup_cookie_set_http_only(c, 1);
+    if (cookie.expires_unix > 0) {
+        const date = soup_date_new_from_time_t(@intCast(cookie.expires_unix));
+        soup_cookie_set_expires(c, date);
+        soup_date_free(date);
+    }
+    soup_cookie_set_same_site_policy(c, switch (cookie.same_site) {
+        .default, .lax => SOUP_SAME_SITE_LAX,
+        .none => SOUP_SAME_SITE_NONE,
+        .strict => SOUP_SAME_SITE_STRICT,
+    });
+
+    return c;
+}
+
+pub fn cookieGet(window: *anyopaque, allocator: std.mem.Allocator, name: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
+    const mgr = try cookieManagerFor(window);
+    const list = fetchAllCookies(mgr) orelse return null;
+    defer g_list_free_full(list, @ptrCast(&soup_cookie_free));
+
+    const count = g_list_length(list);
+    var i: c_uint = 0;
+    while (i < count) : (i += 1) {
+        const raw = g_list_nth_data(list, i) orelse continue;
+        const c: *SoupCookie = @ptrCast(@alignCast(raw));
+        const c_name = std.mem.span(soup_cookie_get_name(c));
+        if (std.mem.eql(u8, c_name, name)) {
+            return try marshalCookie(allocator, c);
+        }
+    }
+    return null;
+}
+
+pub fn cookieSet(window: *anyopaque, cookie: opts_mod.Cookie) opts_mod.CookieError!void {
+    const mgr = try cookieManagerFor(window);
+    const win: *Window = @ptrCast(@alignCast(window));
+    const c = try buildSoupCookie(win.ctx.allocator, cookie);
+    defer soup_cookie_free(c);
+
+    var cell: SimpleAsyncCell = .{};
+    webkit_cookie_manager_add_cookie(mgr, c, null, &onSimpleAsyncDone, @ptrCast(&cell));
+    pumpMainContextUntilDone(&cell.done);
+}
+
+pub fn cookieDelete(window: *anyopaque, name: []const u8) opts_mod.CookieError!void {
+    const mgr = try cookieManagerFor(window);
+    const list = fetchAllCookies(mgr) orelse return;
+    defer g_list_free_full(list, @ptrCast(&soup_cookie_free));
+
+    const count = g_list_length(list);
+    var i: c_uint = 0;
+    while (i < count) : (i += 1) {
+        const raw = g_list_nth_data(list, i) orelse continue;
+        const c: *SoupCookie = @ptrCast(@alignCast(raw));
+        const c_name = std.mem.span(soup_cookie_get_name(c));
+        if (std.mem.eql(u8, c_name, name)) {
+            var cell: SimpleAsyncCell = .{};
+            webkit_cookie_manager_delete_cookie(mgr, c, null, &onSimpleAsyncDone, @ptrCast(&cell));
+            pumpMainContextUntilDone(&cell.done);
+            return;
+        }
+    }
+}
+
+pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
+    const mgr = try cookieManagerFor(window);
+    const list = fetchAllCookies(mgr) orelse return;
+    defer g_list_free_full(list, @ptrCast(&soup_cookie_free));
+
+    const count = g_list_length(list);
+    var i: c_uint = 0;
+    while (i < count) : (i += 1) {
+        const raw = g_list_nth_data(list, i) orelse continue;
+        const c: *SoupCookie = @ptrCast(@alignCast(raw));
+        var cell: SimpleAsyncCell = .{};
+        webkit_cookie_manager_delete_cookie(mgr, c, null, &onSimpleAsyncDone, @ptrCast(&cell));
+        pumpMainContextUntilDone(&cell.done);
+    }
 }

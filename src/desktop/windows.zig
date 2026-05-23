@@ -148,6 +148,10 @@ const IUnknown = extern struct {
 const Env = extern struct { lpVtbl: *const anyopaque };
 const Ctrl = extern struct { lpVtbl: *const anyopaque };
 const Wv2 = extern struct { lpVtbl: *const anyopaque };
+const Wv2_2 = extern struct { lpVtbl: *const anyopaque };
+const CookieMgr = extern struct { lpVtbl: *const anyopaque };
+const CookieT = extern struct { lpVtbl: *const anyopaque };
+const CookieList = extern struct { lpVtbl: *const anyopaque };
 const ResponseT = extern struct { lpVtbl: *const anyopaque };
 const RequestT = extern struct { lpVtbl: *const anyopaque };
 const RequestedArgs = extern struct { lpVtbl: *const anyopaque };
@@ -176,6 +180,49 @@ const SLOT_RequestedArgs_put_Response: usize = 5;
 const SLOT_Request_get_Uri: usize = 3;
 
 const SLOT_MessageArgs_TryGetWebMessageAsString: usize = 5;
+
+// ICoreWebView2_2 inherits all 58 ICoreWebView2 methods (slots 3-60),
+// then adds 7 more (slots 61-67). Only get_CookieManager is consumed
+// here.
+const SLOT_WV2_2_get_CookieManager: usize = 66;
+
+// ICoreWebView2CookieManager.
+const SLOT_CM_CreateCookie: usize = 3;
+const SLOT_CM_GetCookies: usize = 5;
+const SLOT_CM_AddOrUpdateCookie: usize = 6;
+const SLOT_CM_DeleteCookie: usize = 7;
+const SLOT_CM_DeleteAllCookies: usize = 10;
+
+// ICoreWebView2Cookie property accessors.
+const SLOT_CK_get_Name: usize = 3;
+const SLOT_CK_get_Value: usize = 4;
+const SLOT_CK_get_Domain: usize = 6;
+const SLOT_CK_get_Path: usize = 7;
+const SLOT_CK_get_Expires: usize = 8;
+const SLOT_CK_put_Expires: usize = 9;
+const SLOT_CK_get_IsHttpOnly: usize = 10;
+const SLOT_CK_put_IsHttpOnly: usize = 11;
+const SLOT_CK_get_SameSite: usize = 12;
+const SLOT_CK_put_SameSite: usize = 13;
+const SLOT_CK_get_IsSecure: usize = 14;
+const SLOT_CK_put_IsSecure: usize = 15;
+
+// ICoreWebView2CookieList.
+const SLOT_CL_get_Count: usize = 3;
+const SLOT_CL_GetValueAtIndex: usize = 4;
+
+// COREWEBVIEW2_COOKIE_SAME_SITE_KIND.
+const COOKIE_SAME_SITE_NONE: c_int = 0;
+const COOKIE_SAME_SITE_LAX: c_int = 1;
+const COOKIE_SAME_SITE_STRICT: c_int = 2;
+
+// IIDs (from WebView2 SDK).
+const IID_ICoreWebView2_2: IID = .{
+    .Data1 = 0x9E8F0CF8,
+    .Data2 = 0xE670,
+    .Data3 = 0x4B5E,
+    .Data4 = .{ 0xB2, 0xBC, 0x73, 0xE0, 0x61, 0xE3, 0x18, 0x4C },
+};
 
 fn vtSlot(comptime Fn: type, lpVtbl: *const anyopaque, slot: usize) Fn {
     const arr: [*]const *const anyopaque = @ptrCast(@alignCast(lpVtbl));
@@ -684,26 +731,295 @@ fn onResourceRequested(this: ?*const IResourceRequestedHandler, _: ?*Wv2, args: 
 }
 
 // ---- Cookie store -----------------------------------------------------------
-// ICoreWebView2CookieManager hangs off ICoreWebView2_2 via QueryInterface
-// from the base webview pointer. Real wiring is a follow-up — all four
-// entry points need an async-to-sync wrapper around the COM completion
-// handler pattern (similar to env/controller bring-up). See
-// docs/11-desktop-roadmap.md item #22.
+//
+// ICoreWebView2CookieManager hangs off ICoreWebView2_2; obtained via
+// QueryInterface from the base webview pointer. GetCookies is the only
+// async call — its completion handler delivers a CookieList on the UI
+// thread. We sync-wrap by spinning a nested Win32 message pump until
+// the handler's `done` flag flips.
+//
+// Lifetime: GetCookies returns a +1 refcount on the CookieList in the
+// completion handler, and each Cookie returned by GetValueAtIndex
+// carries its own +1 — we Release each Cookie after marshaling and
+// the list after iteration. CookieManager + Wv2_2 returned by
+// QueryInterface / get_CookieManager are also +1 refs; release at end.
 
-pub fn cookieGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
-    return opts_mod.CookieError.Unsupported;
+const IGetCookiesHandlerVtbl = extern struct {
+    QueryInterface: *const fn (?*const IGetCookiesHandler, *const IID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (?*const IGetCookiesHandler) callconv(.winapi) ULONG,
+    Release: *const fn (?*const IGetCookiesHandler) callconv(.winapi) ULONG,
+    Invoke: *const fn (?*const IGetCookiesHandler, HRESULT, ?*CookieList) callconv(.winapi) HRESULT,
+};
+
+const IGetCookiesHandler = extern struct {
+    lpVtbl: *const IGetCookiesHandlerVtbl,
+    out_list: *?*CookieList,
+    done: *bool,
+};
+
+fn onGetCookies(this: ?*const IGetCookiesHandler, hr: HRESULT, list: ?*CookieList) callconv(.winapi) HRESULT {
+    const self = this orelse return 0;
+    if (hr >= 0 and list != null) {
+        // AddRef so the list outlives the callback frame.
+        const AddRef = vtSlot(*const fn (*CookieList) callconv(.winapi) ULONG, list.?.lpVtbl, 1);
+        _ = AddRef(list.?);
+        self.out_list.* = list;
+    }
+    self.done.* = true;
+    return 0;
 }
 
-pub fn cookieSet(_: *anyopaque, _: opts_mod.Cookie) opts_mod.CookieError!void {
-    return opts_mod.CookieError.Unsupported;
+const get_cookies_handler_vtbl: IGetCookiesHandlerVtbl = .{
+    .QueryInterface = @ptrCast(&comQI),
+    .AddRef = @ptrCast(&comAddRef),
+    .Release = @ptrCast(&comRelease),
+    .Invoke = &onGetCookies,
+};
+
+fn pumpMsgUntilDone(done: *const bool) void {
+    var msg: MSG = undefined;
+    while (!done.*) {
+        const got = GetMessageW(&msg, null, 0, 0);
+        if (got <= 0) break;
+        _ = TranslateMessage(&msg);
+        _ = DispatchMessageW(&msg);
+    }
 }
 
-pub fn cookieDelete(_: *anyopaque, _: []const u8) opts_mod.CookieError!void {
-    return opts_mod.CookieError.Unsupported;
+fn releaseRef(any: *anyopaque) void {
+    const ptr: *Wv2 = @ptrCast(@alignCast(any));
+    const Release = vtSlot(*const fn (*Wv2) callconv(.winapi) ULONG, ptr.lpVtbl, 2);
+    _ = Release(ptr);
 }
 
-pub fn cookieClear(_: *anyopaque) opts_mod.CookieError!void {
-    return opts_mod.CookieError.Unsupported;
+fn cookieMgrFromWindow(window: *anyopaque) opts_mod.CookieError!struct { mgr: *CookieMgr, wv2_2: *Wv2_2 } {
+    const win: *Window = @ptrCast(@alignCast(window));
+    const wv = win.ctx.webview orelse return opts_mod.CookieError.NotReady;
+    var wv2_raw: ?*anyopaque = null;
+    const QI = vtSlot(*const fn (*Wv2, *const IID, *?*anyopaque) callconv(.winapi) HRESULT, wv.lpVtbl, 0);
+    const hr = QI(wv, &IID_ICoreWebView2_2, &wv2_raw);
+    if (hr < 0 or wv2_raw == null) return opts_mod.CookieError.Backend;
+    const wv2_2: *Wv2_2 = @ptrCast(@alignCast(wv2_raw.?));
+    const getCM = vtSlot(*const fn (*Wv2_2, *?*CookieMgr) callconv(.winapi) HRESULT, wv2_2.lpVtbl, SLOT_WV2_2_get_CookieManager);
+    var cm: ?*CookieMgr = null;
+    const hr2 = getCM(wv2_2, &cm);
+    if (hr2 < 0 or cm == null) {
+        releaseRef(@ptrCast(wv2_2));
+        return opts_mod.CookieError.Backend;
+    }
+    return .{ .mgr = cm.?, .wv2_2 = wv2_2 };
+}
+
+fn fetchAllCookies(mgr: *CookieMgr) ?*CookieList {
+    var out: ?*CookieList = null;
+    var done = false;
+    var handler: IGetCookiesHandler = .{
+        .lpVtbl = &get_cookies_handler_vtbl,
+        .out_list = &out,
+        .done = &done,
+    };
+    const GetCookies = vtSlot(*const fn (*CookieMgr, LPCWSTR, *const IGetCookiesHandler) callconv(.winapi) HRESULT, mgr.lpVtbl, SLOT_CM_GetCookies);
+    _ = GetCookies(mgr, null, &handler);
+    pumpMsgUntilDone(&done);
+    return out;
+}
+
+fn lpwstrToOwned(allocator: std.mem.Allocator, w: LPWSTR) opts_mod.CookieError![]u8 {
+    if (w == null) return allocator.dupe(u8, "") catch return opts_mod.CookieError.OutOfMemory;
+    const slice = std.mem.span(@as([*:0]const u16, @ptrCast(w.?)));
+    return std.unicode.utf16LeToUtf8Alloc(allocator, slice) catch return opts_mod.CookieError.OutOfMemory;
+}
+
+fn cookieNameMatches(ck: *CookieT, want: []const u8) bool {
+    const getName = vtSlot(*const fn (*CookieT, *LPWSTR) callconv(.winapi) HRESULT, ck.lpVtbl, SLOT_CK_get_Name);
+    var raw: LPWSTR = null;
+    _ = getName(ck, &raw);
+    if (raw == null) return false;
+    defer CoTaskMemFree(raw);
+    const slice = std.mem.span(@as([*:0]const u16, @ptrCast(raw.?)));
+    var buf: [512]u8 = undefined;
+    const len = std.unicode.utf16LeToUtf8(&buf, slice) catch return false;
+    return std.mem.eql(u8, buf[0..len], want);
+}
+
+fn marshalCookie(allocator: std.mem.Allocator, ck: *CookieT) opts_mod.CookieError!opts_mod.Cookie {
+    const getStr = struct {
+        fn call(c: *CookieT, slot: usize) LPWSTR {
+            const f = vtSlot(*const fn (*CookieT, *LPWSTR) callconv(.winapi) HRESULT, c.lpVtbl, slot);
+            var raw: LPWSTR = null;
+            _ = f(c, &raw);
+            return raw;
+        }
+    }.call;
+
+    const name_raw = getStr(ck, SLOT_CK_get_Name);
+    defer if (name_raw != null) CoTaskMemFree(name_raw);
+    const value_raw = getStr(ck, SLOT_CK_get_Value);
+    defer if (value_raw != null) CoTaskMemFree(value_raw);
+    const domain_raw = getStr(ck, SLOT_CK_get_Domain);
+    defer if (domain_raw != null) CoTaskMemFree(domain_raw);
+    const path_raw = getStr(ck, SLOT_CK_get_Path);
+    defer if (path_raw != null) CoTaskMemFree(path_raw);
+
+    var out: opts_mod.Cookie = .{
+        .name = try lpwstrToOwned(allocator, name_raw),
+        .value = try lpwstrToOwned(allocator, value_raw),
+        .domain = try lpwstrToOwned(allocator, domain_raw),
+        .path = try lpwstrToOwned(allocator, path_raw),
+    };
+
+    const getBool = struct {
+        fn call(c: *CookieT, slot: usize) bool {
+            const f = vtSlot(*const fn (*CookieT, *BOOL) callconv(.winapi) HRESULT, c.lpVtbl, slot);
+            var v: BOOL = 0;
+            _ = f(c, &v);
+            return v != 0;
+        }
+    }.call;
+    out.secure = getBool(ck, SLOT_CK_get_IsSecure);
+    out.http_only = getBool(ck, SLOT_CK_get_IsHttpOnly);
+
+    const getExpires = vtSlot(*const fn (*CookieT, *f64) callconv(.winapi) HRESULT, ck.lpVtbl, SLOT_CK_get_Expires);
+    var expires: f64 = -1;
+    _ = getExpires(ck, &expires);
+    out.expires_unix = if (expires > 0) @intFromFloat(expires) else 0;
+
+    const getSS = vtSlot(*const fn (*CookieT, *c_int) callconv(.winapi) HRESULT, ck.lpVtbl, SLOT_CK_get_SameSite);
+    var ss: c_int = 0;
+    _ = getSS(ck, &ss);
+    out.same_site = switch (ss) {
+        COOKIE_SAME_SITE_NONE => .none,
+        COOKIE_SAME_SITE_LAX => .lax,
+        COOKIE_SAME_SITE_STRICT => .strict,
+        else => .default,
+    };
+
+    return out;
+}
+
+fn buildNsCookie(mgr: *CookieMgr, cookie: opts_mod.Cookie, allocator: std.mem.Allocator) opts_mod.CookieError!*CookieT {
+    const name_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, cookie.name) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(name_w);
+    const value_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, cookie.value) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(value_w);
+    const domain_src = if (cookie.domain.len > 0) cookie.domain else "";
+    const domain_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, domain_src) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(domain_w);
+    const path_src = if (cookie.path.len > 0) cookie.path else "/";
+    const path_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, path_src) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(path_w);
+
+    const CreateCookie = vtSlot(*const fn (*CookieMgr, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, *?*CookieT) callconv(.winapi) HRESULT, mgr.lpVtbl, SLOT_CM_CreateCookie);
+    var out: ?*CookieT = null;
+    const hr = CreateCookie(mgr, name_w.ptr, value_w.ptr, domain_w.ptr, path_w.ptr, &out);
+    if (hr < 0 or out == null) return opts_mod.CookieError.Backend;
+    const ck = out.?;
+
+    if (cookie.secure) {
+        const putSecure = vtSlot(*const fn (*CookieT, BOOL) callconv(.winapi) HRESULT, ck.lpVtbl, SLOT_CK_put_IsSecure);
+        _ = putSecure(ck, 1);
+    }
+    if (cookie.http_only) {
+        const putHttpOnly = vtSlot(*const fn (*CookieT, BOOL) callconv(.winapi) HRESULT, ck.lpVtbl, SLOT_CK_put_IsHttpOnly);
+        _ = putHttpOnly(ck, 1);
+    }
+    if (cookie.expires_unix > 0) {
+        const putExpires = vtSlot(*const fn (*CookieT, f64) callconv(.winapi) HRESULT, ck.lpVtbl, SLOT_CK_put_Expires);
+        _ = putExpires(ck, @floatFromInt(cookie.expires_unix));
+    }
+    switch (cookie.same_site) {
+        .default, .lax => {
+            const putSS = vtSlot(*const fn (*CookieT, c_int) callconv(.winapi) HRESULT, ck.lpVtbl, SLOT_CK_put_SameSite);
+            _ = putSS(ck, COOKIE_SAME_SITE_LAX);
+        },
+        .none => {
+            const putSS = vtSlot(*const fn (*CookieT, c_int) callconv(.winapi) HRESULT, ck.lpVtbl, SLOT_CK_put_SameSite);
+            _ = putSS(ck, COOKIE_SAME_SITE_NONE);
+        },
+        .strict => {
+            const putSS = vtSlot(*const fn (*CookieT, c_int) callconv(.winapi) HRESULT, ck.lpVtbl, SLOT_CK_put_SameSite);
+            _ = putSS(ck, COOKIE_SAME_SITE_STRICT);
+        },
+    }
+
+    return ck;
+}
+
+pub fn cookieGet(window: *anyopaque, allocator: std.mem.Allocator, name: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
+    const handles = try cookieMgrFromWindow(window);
+    defer releaseRef(@ptrCast(handles.mgr));
+    defer releaseRef(@ptrCast(handles.wv2_2));
+
+    const list = fetchAllCookies(handles.mgr) orelse return null;
+    defer releaseRef(@ptrCast(list));
+
+    const getCount = vtSlot(*const fn (*CookieList, *u32) callconv(.winapi) HRESULT, list.lpVtbl, SLOT_CL_get_Count);
+    var count: u32 = 0;
+    _ = getCount(list, &count);
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const getAt = vtSlot(*const fn (*CookieList, u32, *?*CookieT) callconv(.winapi) HRESULT, list.lpVtbl, SLOT_CL_GetValueAtIndex);
+        var ck: ?*CookieT = null;
+        _ = getAt(list, i, &ck);
+        if (ck == null) continue;
+        defer releaseRef(@ptrCast(ck.?));
+        if (cookieNameMatches(ck.?, name)) {
+            return try marshalCookie(allocator, ck.?);
+        }
+    }
+    return null;
+}
+
+pub fn cookieSet(window: *anyopaque, cookie: opts_mod.Cookie) opts_mod.CookieError!void {
+    const handles = try cookieMgrFromWindow(window);
+    defer releaseRef(@ptrCast(handles.mgr));
+    defer releaseRef(@ptrCast(handles.wv2_2));
+
+    const win: *Window = @ptrCast(@alignCast(window));
+    const ck = try buildNsCookie(handles.mgr, cookie, win.ctx.allocator);
+    defer releaseRef(@ptrCast(ck));
+
+    const AddOrUpdate = vtSlot(*const fn (*CookieMgr, *CookieT) callconv(.winapi) HRESULT, handles.mgr.lpVtbl, SLOT_CM_AddOrUpdateCookie);
+    const hr = AddOrUpdate(handles.mgr, ck);
+    if (hr < 0) return opts_mod.CookieError.Backend;
+}
+
+pub fn cookieDelete(window: *anyopaque, name: []const u8) opts_mod.CookieError!void {
+    const handles = try cookieMgrFromWindow(window);
+    defer releaseRef(@ptrCast(handles.mgr));
+    defer releaseRef(@ptrCast(handles.wv2_2));
+
+    const list = fetchAllCookies(handles.mgr) orelse return;
+    defer releaseRef(@ptrCast(list));
+
+    const getCount = vtSlot(*const fn (*CookieList, *u32) callconv(.winapi) HRESULT, list.lpVtbl, SLOT_CL_get_Count);
+    var count: u32 = 0;
+    _ = getCount(list, &count);
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const getAt = vtSlot(*const fn (*CookieList, u32, *?*CookieT) callconv(.winapi) HRESULT, list.lpVtbl, SLOT_CL_GetValueAtIndex);
+        var ck: ?*CookieT = null;
+        _ = getAt(list, i, &ck);
+        if (ck == null) continue;
+        defer releaseRef(@ptrCast(ck.?));
+        if (cookieNameMatches(ck.?, name)) {
+            const Delete = vtSlot(*const fn (*CookieMgr, *CookieT) callconv(.winapi) HRESULT, handles.mgr.lpVtbl, SLOT_CM_DeleteCookie);
+            _ = Delete(handles.mgr, ck.?);
+            return;
+        }
+    }
+}
+
+pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
+    const handles = try cookieMgrFromWindow(window);
+    defer releaseRef(@ptrCast(handles.mgr));
+    defer releaseRef(@ptrCast(handles.wv2_2));
+
+    const DeleteAll = vtSlot(*const fn (*CookieMgr) callconv(.winapi) HRESULT, handles.mgr.lpVtbl, SLOT_CM_DeleteAllCookies);
+    const hr = DeleteAll(handles.mgr);
+    if (hr < 0) return opts_mod.CookieError.Backend;
 }
 
 comptime {
