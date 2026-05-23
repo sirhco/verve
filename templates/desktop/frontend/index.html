@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Verve Desktop</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Verve Desktop</h1>
+      <p class="subtitle">Native window, native webview, zero Electron.</p>
+    </header>
+    <main>
+      <section class="card">
+        <h2>IPC round-trip</h2>
+        <button id="ping">Send ping</button>
+        <pre id="log">listening for verve:ready…</pre>
+      </section>
+    </main>
+    <script>
+      const logEl = document.getElementById('log');
+      function log(msg) {
+        logEl.textContent = msg + '\n' + logEl.textContent;
+      }
+
+      document.addEventListener('verve:ready', () => {
+        log('bridge ready');
+        window.verve.onMessage((data) => log('← ' + JSON.stringify(data)));
+      });
+
+      document.getElementById('ping').addEventListener('click', () => {
+        const payload = { type: 'ping', sent_at: Date.now() };
+        log('→ ' + JSON.stringify(payload));
+        window.verve.send(payload);
+      });
+    </script>
+  </body>
+</html>
