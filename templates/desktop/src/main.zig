@@ -30,6 +30,6 @@ pub fn main() !void {
     });
     defer window.deinit();
 
-    handlers.attach(&window);
+    handlers.attach(&window, asset_entries);
     window.run();
 }

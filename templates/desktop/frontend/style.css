@@ -47,11 +47,18 @@ main {
   border-radius: 12px;
   padding: 24px;
   max-width: 640px;
+  margin-bottom: 16px;
 }
 h2 {
   margin: 0 0 16px;
   font-size: 16px;
   font-weight: 600;
+}
+.row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
 }
 button {
   background: var(--accent);
@@ -64,6 +71,19 @@ button {
 }
 button:hover {
   filter: brightness(1.08);
+}
+input[type="text"] {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font: inherit;
+  width: 160px;
+}
+input[type="text"]:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 pre {
   margin: 16px 0 0;

@@ -57,7 +57,7 @@ Override via env vars:
 Frontend → Zig:
 
 ```js
-window.verve.send(JSON.stringify({ type: "ping", payload: 42 }));
+window.verve.send({ type: "ping", payload: 42 });
 ```
 
 Zig → Frontend:
@@ -66,4 +66,50 @@ Zig → Frontend:
 window.evalJs("window.verve._dispatch({ type: \"pong\", value: 43 })");
 ```
 
+`window.verve` is injected at document-start, so it is available to
+inline scripts immediately — no `verve:ready` event listener needed.
+
 See `src/handlers.zig` for routing.
+
+## Cookies
+
+Per-window cookie store. Sync wrappers around the platform-native
+async cookie manager:
+
+```zig
+const store = window.cookies();
+try store.set(.{ .name = "session", .value = "abc123", .domain = "localhost" });
+const got = try store.get(allocator, "session");
+if (got) |c| { /* c.name, c.value, c.domain, c.path are allocator-owned */ }
+try store.delete("session");
+try store.clear();
+```
+
+`Cookie` fields default to `path="/"`, no expiry (session cookie),
+`secure=false`, `http_only=false`, `same_site=.default`. Returned
+strings are allocator-owned — free `name`/`value`/`domain`/`path`
+after use.
+
+The scaffolded frontend includes Set / Get / Clear demo buttons
+wired through the `cookie_set` / `cookie_get` / `cookie_clear` IPC
+routes in `src/handlers.zig`.
+
+## Multi-window
+
+`Window.openChildWindow(opts)` mints a second window in the same app
+session, sharing the parent allocator. The app terminates when the
+last live window closes (Cocoa tracks this natively on macOS; Win32
+and GTK do it through internal counters).
+
+```zig
+const child = try window.openChildWindow(.{
+    .title = "Inspector",
+    .width = 640,
+    .height = 400,
+    .assets = asset_entries,
+    .initial_path = "inspector.html",
+});
+```
+
+The demo `Open child window` button uses the same `index.html` for
+the child.
