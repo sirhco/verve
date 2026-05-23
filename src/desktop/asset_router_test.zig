@@ -1,10 +1,20 @@
 //! Headless tests for `asset_router.resolve` and `guessContentType`.
 //! These compile on every host so the desktop subsystem participates
 //! in `zig build test` even where no windowing system exists.
+//!
+//! Acts as the aggregator entry for `zig build test` — other
+//! desktop-side headless test files (`cookies_test.zig`,
+//! `surface_test.zig`) are pulled in below so their `test {}` blocks
+//! run in the same artifact.
 
 const std = @import("std");
 const router = @import("asset_router.zig");
 const options = @import("options.zig");
+
+comptime {
+    _ = @import("cookies_test.zig");
+    _ = @import("surface_test.zig");
+}
 
 const entries = [_]options.AssetEntry{
     .{ .path = "index.html", .bytes = "<!doctype html>", .content_type = "" },

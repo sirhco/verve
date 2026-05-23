@@ -35,3 +35,32 @@ const backend = switch (builtin.os.tag) {
 };
 
 pub const Window = backend.Window;
+
+// Backend-conformance check. Every host backend MUST expose this
+// surface or downstream call sites blow up at instantiation time
+// with confusing decl-missing errors. Fail fast at framework-build
+// instead. Adding a new public method? Append it here too.
+comptime {
+    const required = [_][]const u8{
+        "init",
+        "setTitle",
+        "loadUrl",
+        "loadHtml",
+        "evalJs",
+        "setMessageHandler",
+        "run",
+        "deinit",
+        "terminate",
+        "close",
+        "openFileDialog",
+        "saveFileDialog",
+        "showAlert",
+        "openChildWindow",
+        "cookies",
+    };
+    for (required) |name| {
+        if (!@hasDecl(Window, name)) {
+            @compileError("desktop backend (" ++ @tagName(builtin.os.tag) ++ ") missing required method: " ++ name);
+        }
+    }
+}
