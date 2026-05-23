@@ -41,6 +41,7 @@ const GtkWindowType = c_uint;
 const WebKitUserContentInjectedFrames = c_uint;
 const WebKitUserScriptInjectionTime = c_uint;
 const GCallback = *const fn () callconv(.c) void;
+const GType = usize;
 
 const GTK_WINDOW_TOPLEVEL: GtkWindowType = 0;
 const WEBKIT_USER_CONTENT_INJECT_TOP_FRAME: WebKitUserContentInjectedFrames = 0;
@@ -83,6 +84,7 @@ const WebKitURISchemeRequestCallback = *const fn (req: *WebKitURISchemeRequest, 
 const ScriptMessageCallback = *const fn (ucm: *WebKitUserContentManager, msg: *WebKitJavascriptResult, user_data: ?*anyopaque) callconv(.c) void;
 
 extern fn webkit_web_context_get_default() *WebKitWebContext;
+extern fn webkit_web_context_new() *WebKitWebContext;
 extern fn webkit_web_context_register_uri_scheme(
     ctx: *WebKitWebContext,
     scheme: [*:0]const u8,
@@ -108,6 +110,11 @@ extern fn webkit_user_script_new(
 extern fn webkit_user_script_unref(s: *WebKitUserScript) void;
 
 extern fn webkit_web_view_new_with_user_content_manager(ucm: *WebKitUserContentManager) *GtkWidget;
+extern fn webkit_web_view_get_type() GType;
+// GObject's universal constructor — variadic property list, NULL-terminated.
+// Needed because no WebKitGTK 4.1 helper takes BOTH a custom WebContext and a
+// custom UserContentManager; we set them both via properties at construction.
+extern fn g_object_new(g_type: GType, first_prop: ?[*:0]const u8, ...) ?*anyopaque;
 extern fn webkit_web_view_load_uri(wv: *WebKitWebView, uri: [*:0]const u8) void;
 extern fn webkit_web_view_load_html(wv: *WebKitWebView, html: [*:0]const u8, base_uri: ?[*:0]const u8) void;
 extern fn webkit_web_view_run_javascript(
@@ -135,32 +142,39 @@ extern fn jsc_value_to_string(v: *JSCValue) [*:0]u8;
 
 // ---- Implementation ---------------------------------------------------------
 
-const Ctx = struct {
+/// Per-window state. Each window owns its own WebKitWebContext so that
+/// the URI scheme handler can be registered per-context (a WebKitGTK
+/// constraint — scheme registration sticks to the WebContext, not the
+/// view). The global `webkit_web_context_get_default()` of the prior
+/// implementation made multi-window impossible. user_data threading
+/// via g_signal_connect_data + webkit_web_context_register_uri_scheme
+/// carries the WindowCtx pointer directly into trampolines, so this
+/// backend needs no module-level registry.
+const WindowCtx = struct {
     allocator: std.mem.Allocator,
     opts: opts_mod.WindowOptions,
     on_message: ?opts_mod.MessageHandler,
     on_message_ctx: ?*anyopaque,
     window: ?*GtkWidget = null,
     webview: ?*WebKitWebView = null,
+    web_context: ?*WebKitWebContext = null,
 };
 
-var ctx_storage: ?*Ctx = null;
-
 pub const Window = struct {
-    ctx: *Ctx,
+    ctx: *WindowCtx,
 
     pub fn init(allocator: std.mem.Allocator, opts: opts_mod.WindowOptions) !Window {
         std.log.debug("verve.desktop[linux]: gtk_init_check", .{});
         if (gtk_init_check(null, null) == 0) return error.GtkInitFailed;
 
-        const heap = try allocator.create(Ctx);
+        const heap = try allocator.create(WindowCtx);
+        errdefer allocator.destroy(heap);
         heap.* = .{
             .allocator = allocator,
             .opts = opts,
             .on_message = opts.on_message,
             .on_message_ctx = opts.on_message_ctx,
         };
-        ctx_storage = heap;
 
         const window_widget = gtk_window_new(GTK_WINDOW_TOPLEVEL);
         heap.window = window_widget;
@@ -170,16 +184,17 @@ pub const Window = struct {
         gtk_window_set_title(@ptrCast(window_widget), title_z.ptr);
         gtk_window_set_default_size(@ptrCast(window_widget), @intCast(opts.width), @intCast(opts.height));
 
-        _ = g_signal_connect_data(window_widget, "destroy", @as(GCallback, @ptrCast(&onDestroy)), null, null, 0);
+        _ = g_signal_connect_data(window_widget, "destroy", @as(GCallback, @ptrCast(&onDestroy)), @ptrCast(heap), null, 0);
 
-        // Register the custom scheme on the default context BEFORE any
-        // WebView is created — WebKitGTK refuses scheme registration
-        // once a WebView is live.
-        const default_ctx = webkit_web_context_get_default();
+        // Per-window WebContext. Scheme handlers must be registered
+        // BEFORE the WebView is constructed; the WebView resolves its
+        // context-bound handlers at first navigation.
+        const web_ctx = webkit_web_context_new();
+        heap.web_context = web_ctx;
         const scheme_z = try allocator.dupeZ(u8, opts.scheme);
         defer allocator.free(scheme_z);
-        std.log.debug("verve.desktop[linux]: register scheme '{s}://'", .{opts.scheme});
-        webkit_web_context_register_uri_scheme(default_ctx, scheme_z.ptr, &onSchemeRequest, null, null);
+        std.log.debug("verve.desktop[linux]: register scheme '{s}://' (per-window context)", .{opts.scheme});
+        webkit_web_context_register_uri_scheme(web_ctx, scheme_z.ptr, &onSchemeRequest, @ptrCast(heap), null);
 
         const ucm = webkit_user_content_manager_new();
         const shim_z = try allocator.dupeZ(u8, ipc.shim_js);
@@ -195,9 +210,20 @@ pub const Window = struct {
         webkit_user_script_unref(script);
 
         _ = webkit_user_content_manager_register_script_message_handler(ucm, "verve");
-        _ = g_signal_connect_data(ucm, "script-message-received::verve", @as(GCallback, @ptrCast(&onScriptMessage)), null, null, 0);
+        _ = g_signal_connect_data(ucm, "script-message-received::verve", @as(GCallback, @ptrCast(&onScriptMessage)), @ptrCast(heap), null, 0);
 
-        const wv_widget = webkit_web_view_new_with_user_content_manager(ucm);
+        // Construct WebView with BOTH our custom WebContext and our
+        // UserContentManager. No WebKitGTK 4.1 single-call helper takes
+        // both, so go through g_object_new with explicit properties.
+        const wv_obj = g_object_new(
+            webkit_web_view_get_type(),
+            "web-context",
+            web_ctx,
+            @as(?[*:0]const u8, "user-content-manager"),
+            ucm,
+            @as(?[*:0]const u8, null),
+        ) orelse return error.WebViewCreateFailed;
+        const wv_widget: *GtkWidget = @ptrCast(wv_obj);
         const wv: *WebKitWebView = @ptrCast(wv_widget);
         heap.webview = wv;
 
@@ -270,6 +296,7 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
+        if (self.ctx.web_context) |wc| g_object_unref(wc);
         self.ctx.allocator.destroy(self.ctx);
     }
 
@@ -302,11 +329,13 @@ pub const Window = struct {
 // ---- GTK signal trampolines -------------------------------------------------
 
 fn onDestroy(_: ?*GtkWidget, _: ?*anyopaque) callconv(.c) void {
+    // TODO multi-window: only gtk_main_quit when the last window
+    // destroys. For now this preserves single-window behaviour.
     gtk_main_quit();
 }
 
-fn onSchemeRequest(req: *WebKitURISchemeRequest, _: ?*anyopaque) callconv(.c) void {
-    const cx = ctx_storage orelse return;
+fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callconv(.c) void {
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return));
 
     const uri = webkit_uri_scheme_request_get_uri(req);
     const uri_slice = std.mem.span(uri);
@@ -334,8 +363,8 @@ fn onSchemeRequest(req: *WebKitURISchemeRequest, _: ?*anyopaque) callconv(.c) vo
     g_object_unref(stream);
 }
 
-fn onScriptMessage(_: *WebKitUserContentManager, message: *WebKitJavascriptResult, _: ?*anyopaque) callconv(.c) void {
-    const cx = ctx_storage orelse return;
+fn onScriptMessage(_: *WebKitUserContentManager, message: *WebKitJavascriptResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return));
     const value = webkit_javascript_result_get_js_value(message);
     if (jsc_value_is_string(value) == 0) return;
     const raw = jsc_value_to_string(value);

@@ -189,7 +189,10 @@ const IEnvCreatedHandlerVtbl = extern struct {
     Release: *const fn (?*const IEnvCreatedHandler) callconv(.winapi) ULONG,
     Invoke: *const fn (?*const IEnvCreatedHandler, HRESULT, ?*Env) callconv(.winapi) HRESULT,
 };
-const IEnvCreatedHandler = extern struct { lpVtbl: *const IEnvCreatedHandlerVtbl };
+const IEnvCreatedHandler = extern struct {
+    lpVtbl: *const IEnvCreatedHandlerVtbl,
+    ctx: *WindowCtx,
+};
 
 const ICtrlCreatedHandlerVtbl = extern struct {
     QueryInterface: *const fn (?*const ICtrlCreatedHandler, *const IID, *?*anyopaque) callconv(.winapi) HRESULT,
@@ -197,7 +200,10 @@ const ICtrlCreatedHandlerVtbl = extern struct {
     Release: *const fn (?*const ICtrlCreatedHandler) callconv(.winapi) ULONG,
     Invoke: *const fn (?*const ICtrlCreatedHandler, HRESULT, ?*Ctrl) callconv(.winapi) HRESULT,
 };
-const ICtrlCreatedHandler = extern struct { lpVtbl: *const ICtrlCreatedHandlerVtbl };
+const ICtrlCreatedHandler = extern struct {
+    lpVtbl: *const ICtrlCreatedHandlerVtbl,
+    ctx: *WindowCtx,
+};
 
 const IMessageReceivedHandlerVtbl = extern struct {
     QueryInterface: *const fn (?*const IMessageReceivedHandler, *const IID, *?*anyopaque) callconv(.winapi) HRESULT,
@@ -205,7 +211,10 @@ const IMessageReceivedHandlerVtbl = extern struct {
     Release: *const fn (?*const IMessageReceivedHandler) callconv(.winapi) ULONG,
     Invoke: *const fn (?*const IMessageReceivedHandler, ?*Wv2, ?*MessageArgs) callconv(.winapi) HRESULT,
 };
-const IMessageReceivedHandler = extern struct { lpVtbl: *const IMessageReceivedHandlerVtbl };
+const IMessageReceivedHandler = extern struct {
+    lpVtbl: *const IMessageReceivedHandlerVtbl,
+    ctx: *WindowCtx,
+};
 
 const IResourceRequestedHandlerVtbl = extern struct {
     QueryInterface: *const fn (?*const IResourceRequestedHandler, *const IID, *?*anyopaque) callconv(.winapi) HRESULT,
@@ -213,7 +222,10 @@ const IResourceRequestedHandlerVtbl = extern struct {
     Release: *const fn (?*const IResourceRequestedHandler) callconv(.winapi) ULONG,
     Invoke: *const fn (?*const IResourceRequestedHandler, ?*Wv2, ?*RequestedArgs) callconv(.winapi) HRESULT,
 };
-const IResourceRequestedHandler = extern struct { lpVtbl: *const IResourceRequestedHandlerVtbl };
+const IResourceRequestedHandler = extern struct {
+    lpVtbl: *const IResourceRequestedHandlerVtbl,
+    ctx: *WindowCtx,
+};
 
 fn comQI(_: ?*const IUnknown, _: *const IID, ppv: *?*anyopaque) callconv(.winapi) HRESULT {
     ppv.* = null;
@@ -230,9 +242,14 @@ fn comRelease(_: ?*const IUnknown) callconv(.winapi) ULONG {
 
 const COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL: c_int = 0;
 
-// ---- Process-global context -------------------------------------------------
+// ---- Per-window context + registry ------------------------------------------
 
-const Ctx = struct {
+/// Per-window state. Heap-allocated by `Window.init`. Each WebView2
+/// COM event handler embeds a back-pointer to the WindowCtx that owns
+/// it (see the four `*Handler` types below) so callbacks resolve which
+/// window fired them without consulting a process-global. wndProc
+/// finds the WindowCtx via the HWND registry below.
+const WindowCtx = struct {
     allocator: std.mem.Allocator,
     opts: opts_mod.WindowOptions,
     on_message: ?opts_mod.MessageHandler,
@@ -241,24 +258,48 @@ const Ctx = struct {
     controller: ?*Ctrl = null,
     webview: ?*Wv2 = null,
     environment: ?*Env = null,
+    env_handler: IEnvCreatedHandler,
+    ctrl_handler: ICtrlCreatedHandler,
+    msg_handler: IMessageReceivedHandler,
+    res_handler: IResourceRequestedHandler,
 };
 
-var ctx_storage: ?*Ctx = null;
+/// Win32 messages dispatch through wndProc which receives the HWND
+/// directly, so we key the registry by HWND. WebView2 COM callbacks
+/// resolve their own ctx through the embedded back-pointer in each
+/// handler struct, no registry lookup needed.
+var registry: std.AutoHashMapUnmanaged(HWND, *WindowCtx) = .{};
+
+fn registerCtx(hwnd: HWND, ctx_ptr: *WindowCtx) !void {
+    try registry.put(std.heap.page_allocator, hwnd, ctx_ptr);
+}
+
+fn lookupCtx(hwnd: HWND) ?*WindowCtx {
+    return registry.get(hwnd);
+}
+
+fn unregisterCtx(hwnd: HWND) void {
+    _ = registry.remove(hwnd);
+}
 
 // ---- Window facade ----------------------------------------------------------
 
 pub const Window = struct {
-    ctx: *Ctx,
+    ctx: *WindowCtx,
 
     pub fn init(allocator: std.mem.Allocator, opts: opts_mod.WindowOptions) !Window {
-        const heap = try allocator.create(Ctx);
+        const heap = try allocator.create(WindowCtx);
+        errdefer allocator.destroy(heap);
         heap.* = .{
             .allocator = allocator,
             .opts = opts,
             .on_message = opts.on_message,
             .on_message_ctx = opts.on_message_ctx,
+            .env_handler = .{ .lpVtbl = &env_created_handler_vtbl, .ctx = heap },
+            .ctrl_handler = .{ .lpVtbl = &ctrl_created_handler_vtbl, .ctx = heap },
+            .msg_handler = .{ .lpVtbl = &message_handler_vtbl, .ctx = heap },
+            .res_handler = .{ .lpVtbl = &resource_handler_vtbl, .ctx = heap },
         };
-        ctx_storage = heap;
 
         const class_name = std.unicode.utf8ToUtf16LeStringLiteral("VerveWindow");
         const hinstance = GetModuleHandleW(null);
@@ -288,6 +329,8 @@ pub const Window = struct {
             null,
         ) orelse return error.WindowCreateFailed;
         heap.hwnd = hwnd;
+        try registerCtx(hwnd, heap);
+        errdefer unregisterCtx(hwnd);
 
         _ = ShowWindow(hwnd, SW_SHOW);
         _ = UpdateWindow(hwnd);
@@ -297,7 +340,7 @@ pub const Window = struct {
         // Async — actual webview creation runs in the env/controller
         // completion handlers below.
         std.log.debug("verve.desktop[windows]: CreateCoreWebView2EnvironmentWithOptions", .{});
-        const hr = CreateCoreWebView2EnvironmentWithOptions(null, null, null, &env_created_handler);
+        const hr = CreateCoreWebView2EnvironmentWithOptions(null, null, null, &heap.env_handler);
         if (hr < 0) {
             std.log.err(
                 "WebView2 runtime missing or failed (hr=0x{x:0>8}). Install Evergreen runtime: {s}",
@@ -372,6 +415,7 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
+        unregisterCtx(self.ctx.hwnd);
         self.ctx.allocator.destroy(self.ctx);
     }
 
@@ -405,7 +449,7 @@ pub const Window = struct {
 fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
         WM_SIZE => {
-            if (ctx_storage) |cx| if (cx.controller) |ctrl| {
+            if (lookupCtx(hwnd)) |cx| if (cx.controller) |ctrl| {
                 var rect: RECT = undefined;
                 _ = GetClientRect(hwnd, &rect);
                 const putBounds = vtSlot(*const fn (*Ctrl, RECT) callconv(.winapi) HRESULT, ctrl.lpVtbl, SLOT_CTRL_putBounds);
@@ -414,6 +458,8 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_DESTROY => {
+            // TODO multi-window: only PostQuitMessage when last
+            // registered ctx unregisters, not on every window close.
             PostQuitMessage(0);
             return 0;
         },
@@ -423,13 +469,17 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
 
 // ---- Completion handler vtables ---------------------------------------------
 
+// Handler vtables stay module-level (the function pointer table is
+// identical across all windows). Each WindowCtx embeds an instance of
+// the matching handler struct so the COM "this" pointer carries a
+// back-ref to the owning ctx.
+
 const env_created_handler_vtbl: IEnvCreatedHandlerVtbl = .{
     .QueryInterface = @ptrCast(&comQI),
     .AddRef = @ptrCast(&comAddRef),
     .Release = @ptrCast(&comRelease),
     .Invoke = &onEnvironmentReady,
 };
-const env_created_handler: IEnvCreatedHandler = .{ .lpVtbl = &env_created_handler_vtbl };
 
 const ctrl_created_handler_vtbl: ICtrlCreatedHandlerVtbl = .{
     .QueryInterface = @ptrCast(&comQI),
@@ -437,7 +487,6 @@ const ctrl_created_handler_vtbl: ICtrlCreatedHandlerVtbl = .{
     .Release = @ptrCast(&comRelease),
     .Invoke = &onControllerReady,
 };
-const ctrl_created_handler: ICtrlCreatedHandler = .{ .lpVtbl = &ctrl_created_handler_vtbl };
 
 const message_handler_vtbl: IMessageReceivedHandlerVtbl = .{
     .QueryInterface = @ptrCast(&comQI),
@@ -445,7 +494,6 @@ const message_handler_vtbl: IMessageReceivedHandlerVtbl = .{
     .Release = @ptrCast(&comRelease),
     .Invoke = &onMessageReceived,
 };
-const message_handler: IMessageReceivedHandler = .{ .lpVtbl = &message_handler_vtbl };
 
 const resource_handler_vtbl: IResourceRequestedHandlerVtbl = .{
     .QueryInterface = @ptrCast(&comQI),
@@ -453,27 +501,28 @@ const resource_handler_vtbl: IResourceRequestedHandlerVtbl = .{
     .Release = @ptrCast(&comRelease),
     .Invoke = &onResourceRequested,
 };
-const resource_handler: IResourceRequestedHandler = .{ .lpVtbl = &resource_handler_vtbl };
 
 // ---- Async creation flow ----------------------------------------------------
 
-fn onEnvironmentReady(_: ?*const IEnvCreatedHandler, hr: HRESULT, env: ?*Env) callconv(.winapi) HRESULT {
+fn onEnvironmentReady(this: ?*const IEnvCreatedHandler, hr: HRESULT, env: ?*Env) callconv(.winapi) HRESULT {
     if (hr < 0 or env == null) return hr;
-    const cx = ctx_storage orelse return 0;
+    const self = this orelse return 0;
+    const cx = self.ctx;
     cx.environment = env;
     const CreateController = vtSlot(
         *const fn (*Env, HWND, *const ICtrlCreatedHandler) callconv(.winapi) HRESULT,
         env.?.lpVtbl,
         SLOT_ENV_CreateController,
     );
-    _ = CreateController(env.?, cx.hwnd, &ctrl_created_handler);
+    _ = CreateController(env.?, cx.hwnd, &cx.ctrl_handler);
     return 0;
 }
 
-fn onControllerReady(_: ?*const ICtrlCreatedHandler, hr: HRESULT, ctrl: ?*Ctrl) callconv(.winapi) HRESULT {
+fn onControllerReady(this: ?*const ICtrlCreatedHandler, hr: HRESULT, ctrl: ?*Ctrl) callconv(.winapi) HRESULT {
     std.log.debug("verve.desktop[windows]: controller ready (hr=0x{x:0>8})", .{@as(u32, @bitCast(hr))});
     if (hr < 0 or ctrl == null) return hr;
-    const cx = ctx_storage orelse return 0;
+    const self = this orelse return 0;
+    const cx = self.ctx;
     cx.controller = ctrl;
 
     var rect: RECT = undefined;
@@ -497,7 +546,7 @@ fn onControllerReady(_: ?*const ICtrlCreatedHandler, hr: HRESULT, ctrl: ?*Ctrl) 
     // Hook message channel.
     const addMessage = vtSlot(*const fn (*Wv2, *const IMessageReceivedHandler, *anyopaque) callconv(.winapi) HRESULT, wv.?.lpVtbl, SLOT_WV2_add_WebMessageReceived);
     var token: i64 = 0;
-    _ = addMessage(wv.?, &message_handler, @ptrCast(&token));
+    _ = addMessage(wv.?, &cx.msg_handler, @ptrCast(&token));
 
     // Filter `<scheme>://app/*` requests.
     var filter_utf8_buf: [256]u8 = undefined;
@@ -510,7 +559,7 @@ fn onControllerReady(_: ?*const ICtrlCreatedHandler, hr: HRESULT, ctrl: ?*Ctrl) 
 
     const addResource = vtSlot(*const fn (*Wv2, *const IResourceRequestedHandler, *anyopaque) callconv(.winapi) HRESULT, wv.?.lpVtbl, SLOT_WV2_add_WebResourceRequested);
     var token2: i64 = 0;
-    _ = addResource(wv.?, &resource_handler, @ptrCast(&token2));
+    _ = addResource(wv.?, &cx.res_handler, @ptrCast(&token2));
 
     // Initial navigation.
     if (cx.opts.initial_path.len > 0) {
@@ -525,8 +574,9 @@ fn onControllerReady(_: ?*const ICtrlCreatedHandler, hr: HRESULT, ctrl: ?*Ctrl) 
     return 0;
 }
 
-fn onMessageReceived(_: ?*const IMessageReceivedHandler, _: ?*Wv2, args: ?*MessageArgs) callconv(.winapi) HRESULT {
-    const cx = ctx_storage orelse return 0;
+fn onMessageReceived(this: ?*const IMessageReceivedHandler, _: ?*Wv2, args: ?*MessageArgs) callconv(.winapi) HRESULT {
+    const self = this orelse return 0;
+    const cx = self.ctx;
     if (args == null) return 0;
 
     const tryGet = vtSlot(*const fn (*MessageArgs, *LPWSTR) callconv(.winapi) HRESULT, args.?.lpVtbl, SLOT_MessageArgs_TryGetWebMessageAsString);
@@ -542,8 +592,9 @@ fn onMessageReceived(_: ?*const IMessageReceivedHandler, _: ?*Wv2, args: ?*Messa
     return 0;
 }
 
-fn onResourceRequested(_: ?*const IResourceRequestedHandler, _: ?*Wv2, args: ?*RequestedArgs) callconv(.winapi) HRESULT {
-    const cx = ctx_storage orelse return 0;
+fn onResourceRequested(this: ?*const IResourceRequestedHandler, _: ?*Wv2, args: ?*RequestedArgs) callconv(.winapi) HRESULT {
+    const self = this orelse return 0;
+    const cx = self.ctx;
     if (args == null) return 0;
 
     const getReq = vtSlot(*const fn (*RequestedArgs, *?*RequestT) callconv(.winapi) HRESULT, args.?.lpVtbl, SLOT_RequestedArgs_get_Request);
