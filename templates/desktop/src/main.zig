@@ -18,18 +18,22 @@ pub fn main() !void {
     // intentionally compatible.
     const asset_entries: []const desktop.AssetEntry = @ptrCast(public_assets.entries);
 
-    var window = try desktop.Window.init(allocator, .{
+    var window: desktop.Window = undefined;
+    // The router needs a stable pointer to its Ctx, and the Window
+    // needs that pointer in `on_message_ctx`. Order: build the Window
+    // first (so `attach` has a real pointer to capture), then plug
+    // the returned Ctx pointer in via `setMessageHandler`.
+    window = try desktop.Window.init(allocator, .{
         .title = "Verve Desktop",
         .width = 1100,
         .height = 760,
         .devtools = true,
         .assets = asset_entries,
         .initial_path = "index.html",
-        .on_message = handlers.onMessage,
-        .on_message_ctx = null,
     });
     defer window.deinit();
 
-    handlers.attach(&window, asset_entries);
+    const ctx_ptr = handlers.attach(&window, asset_entries);
+    window.setMessageHandler(handlers.onMessage, ctx_ptr);
     window.run();
 }

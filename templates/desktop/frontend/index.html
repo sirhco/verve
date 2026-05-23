@@ -44,46 +44,43 @@
     </main>
     <script>
       // window.verve is injected at document-start by the framework,
-      // so it's already defined before this inline script runs. No
-      // need to wait on verve:ready (the event fires before any inline
-      // <script> tag in the body has been parsed).
+      // so it's already defined before this inline script runs.
       const logEl = document.getElementById('log');
       function log(msg) {
         logEl.textContent = msg + '\n' + logEl.textContent;
       }
 
-      window.verve.onMessage((data) => log('← ' + JSON.stringify(data)));
-
-      function send(payload) {
-        log('→ ' + JSON.stringify(payload));
-        window.verve.send(payload);
+      async function call(type, args) {
+        log('→ ' + type + ' ' + JSON.stringify(args || {}));
+        try {
+          const reply = await window.verve.request(Object.assign({ type }, args || {}));
+          log('← ' + JSON.stringify(reply));
+        } catch (err) {
+          log('✕ ' + err.message);
+        }
       }
 
       document.getElementById('ping').addEventListener('click', () => {
-        send({ type: 'ping', sent_at: Date.now() });
+        call('ping', { sent_at: Date.now() });
       });
 
       document.getElementById('cookie-set').addEventListener('click', () => {
-        send({
-          type: 'cookie_set',
+        call('cookie_set', {
           name: document.getElementById('cookie-name').value,
           value: document.getElementById('cookie-value').value,
         });
       });
 
       document.getElementById('cookie-get').addEventListener('click', () => {
-        send({
-          type: 'cookie_get',
-          name: document.getElementById('cookie-name').value,
-        });
+        call('cookie_get', { name: document.getElementById('cookie-name').value });
       });
 
       document.getElementById('cookie-clear').addEventListener('click', () => {
-        send({ type: 'cookie_clear' });
+        call('cookie_clear');
       });
 
       document.getElementById('open-child').addEventListener('click', () => {
-        send({ type: 'open_child' });
+        call('open_child');
       });
     </script>
   </body>

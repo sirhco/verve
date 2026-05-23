@@ -12,8 +12,11 @@ const builtin = @import("builtin");
 
 pub const options = @import("options.zig");
 pub const ipc = @import("ipc.zig");
+pub const ipc_router = @import("ipc_router.zig");
 pub const asset_router = @import("asset_router.zig");
 pub const cookies = @import("cookies.zig");
+
+pub const Router = ipc_router.Router;
 
 pub const WindowOptions = options.WindowOptions;
 pub const AssetEntry = options.AssetEntry;

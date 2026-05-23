@@ -1,131 +1,117 @@
-//! Example IPC routes. The window invokes `onMessage` for every JSON
-//! payload `window.verve.send(...)` ships from the frontend. The match
-//! on `type` is plain string equality — replace with a `std.StaticStringMap`
-//! once the route table grows past a handful of entries.
+//! Example IPC routes via the comptime typed router.
+//!
+//! Each route in `Routes` declares an `Args` type, a `Reply` type, and
+//! a `handle(ctx, alloc, args)` fn. The router parses incoming JSON
+//! against `Args`, calls the handler, JSON-encodes `Reply`, and ships
+//! it back through `window.evalJs` so the JS `await
+//! window.verve.request(...)` Promise resolves with the typed value.
+//!
+//! Fire-and-forget messages from `window.verve.send(payload)` without
+//! a `__verve_id` field still flow through here — handlers that
+//! return a Reply simply log unobserved.
 
 const std = @import("std");
 const desktop = @import("desktop");
 
-var window_ref: ?*desktop.Window = null;
-var asset_ref: []const desktop.AssetEntry = &.{};
-var child_window: ?desktop.Window = null;
+const RouterCtx = struct {
+    window: *desktop.Window,
+    assets: []const desktop.AssetEntry,
+    child_window: ?desktop.Window = null,
+};
 
-pub fn attach(window: *desktop.Window, assets: []const desktop.AssetEntry) void {
-    window_ref = window;
-    asset_ref = assets;
+var ctx: RouterCtx = undefined;
+
+const Router = desktop.Router(RouterCtx, Routes);
+
+pub const onMessage = Router.dispatch;
+
+pub fn attach(window: *desktop.Window, assets: []const desktop.AssetEntry) *RouterCtx {
+    ctx = .{ .window = window, .assets = assets };
+    return &ctx;
 }
 
-pub fn onMessage(_: ?*anyopaque, payload: []const u8) void {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload, .{}) catch {
-        std.log.warn("ipc: malformed json: {s}", .{payload});
-        return;
+/// Comptime route table. Each public decl is a route; the router
+/// matches incoming `type` against the decl name.
+const Routes = struct {
+    pub const ping = struct {
+        pub const Args = struct { sent_at: i64 = 0 };
+        pub const Reply = struct { echo: bool, sent_at: i64 };
+        pub fn handle(_: *RouterCtx, _: std.mem.Allocator, args: Args) !Reply {
+            return .{ .echo = true, .sent_at = args.sent_at };
+        }
     };
-    defer parsed.deinit();
 
-    const root = parsed.value;
-    const msg_type = root.object.get("type") orelse return;
-    if (msg_type != .string) return;
+    pub const log = struct {
+        pub const Args = struct { message: []const u8 };
+        pub const Reply = struct { ok: bool };
+        pub fn handle(_: *RouterCtx, _: std.mem.Allocator, args: Args) !Reply {
+            std.log.info("[ui] {s}", .{args.message});
+            return .{ .ok = true };
+        }
+    };
 
-    if (std.mem.eql(u8, msg_type.string, "ping")) {
-        reply("{\"type\":\"pong\",\"echo\":true}");
-        return;
-    }
+    pub const cookie_set = struct {
+        pub const Args = struct { name: []const u8, value: []const u8 };
+        pub const Reply = struct { ok: bool };
+        pub fn handle(c: *RouterCtx, _: std.mem.Allocator, args: Args) !Reply {
+            try c.window.cookies().set(.{
+                .name = args.name,
+                .value = args.value,
+                .domain = "localhost",
+                .path = "/",
+            });
+            return .{ .ok = true };
+        }
+    };
 
-    if (std.mem.eql(u8, msg_type.string, "log")) {
-        const m = root.object.get("message") orelse return;
-        if (m == .string) std.log.info("[ui] {s}", .{m.string});
-        return;
-    }
-
-    if (std.mem.eql(u8, msg_type.string, "cookie_set")) {
-        handleCookieSet(root) catch |err| std.log.warn("cookie_set: {s}", .{@errorName(err)});
-        return;
-    }
-
-    if (std.mem.eql(u8, msg_type.string, "cookie_get")) {
-        handleCookieGet(root) catch |err| std.log.warn("cookie_get: {s}", .{@errorName(err)});
-        return;
-    }
-
-    if (std.mem.eql(u8, msg_type.string, "cookie_clear")) {
-        const w = window_ref orelse return;
-        w.cookies().clear() catch |err| {
-            std.log.warn("cookie_clear: {s}", .{@errorName(err)});
-            return;
+    pub const cookie_get = struct {
+        pub const Args = struct { name: []const u8 };
+        pub const Reply = struct {
+            found: bool = false,
+            name: []const u8 = "",
+            value: []const u8 = "",
+            domain: []const u8 = "",
+            path: []const u8 = "",
         };
-        reply("{\"type\":\"cookie_cleared\"}");
-        return;
-    }
+        pub fn handle(c: *RouterCtx, alloc: std.mem.Allocator, args: Args) !Reply {
+            // Cookie strings come back allocator-owned; the arena
+            // passed in here is the per-dispatch one, so the slices
+            // remain valid through the reply JSON-encoding step.
+            const got = try c.window.cookies().get(alloc, args.name);
+            if (got) |k| return .{
+                .found = true,
+                .name = k.name,
+                .value = k.value,
+                .domain = k.domain,
+                .path = k.path,
+            };
+            return .{};
+        }
+    };
 
-    if (std.mem.eql(u8, msg_type.string, "open_child")) {
-        openChild() catch |err| std.log.warn("open_child: {s}", .{@errorName(err)});
-        return;
-    }
+    pub const cookie_clear = struct {
+        pub const Args = struct {};
+        pub const Reply = struct { ok: bool };
+        pub fn handle(c: *RouterCtx, _: std.mem.Allocator, _: Args) !Reply {
+            try c.window.cookies().clear();
+            return .{ .ok = true };
+        }
+    };
 
-    std.log.info("ipc: unhandled message type='{s}'", .{msg_type.string});
-}
-
-fn handleCookieSet(root: std.json.Value) !void {
-    const w = window_ref orelse return;
-    const name_v = root.object.get("name") orelse return;
-    const value_v = root.object.get("value") orelse return;
-    if (name_v != .string or value_v != .string) return;
-
-    try w.cookies().set(.{
-        .name = name_v.string,
-        .value = value_v.string,
-        .domain = "localhost",
-        .path = "/",
-    });
-    reply("{\"type\":\"cookie_set_ok\"}");
-}
-
-fn handleCookieGet(root: std.json.Value) !void {
-    const w = window_ref orelse return;
-    const name_v = root.object.get("name") orelse return;
-    if (name_v != .string) return;
-
-    const alloc = std.heap.page_allocator;
-    const got = try w.cookies().get(alloc, name_v.string);
-    if (got) |c| {
-        defer alloc.free(c.name);
-        defer alloc.free(c.value);
-        defer alloc.free(c.domain);
-        defer alloc.free(c.path);
-
-        const json = try std.json.Stringify.valueAlloc(alloc, .{
-            .type = "cookie_value",
-            .name = c.name,
-            .value = c.value,
-            .domain = c.domain,
-            .path = c.path,
-        }, .{});
-        defer alloc.free(json);
-        reply(json);
-    } else {
-        reply("{\"type\":\"cookie_value\",\"value\":null}");
-    }
-}
-
-fn openChild() !void {
-    const w = window_ref orelse return;
-    if (child_window != null) {
-        std.log.info("open_child: already open — ignoring", .{});
-        return;
-    }
-    child_window = try w.openChildWindow(.{
-        .title = "Verve Desktop — child",
-        .width = 640,
-        .height = 400,
-        .assets = asset_ref,
-        .initial_path = "index.html",
-        .scheme = "verve",
-    });
-}
-
-fn reply(json: []const u8) void {
-    const w = window_ref orelse return;
-    var buf: [4096]u8 = undefined;
-    const script = std.fmt.bufPrint(&buf, "window.verve._dispatch({s})", .{json}) catch return;
-    w.evalJs(script);
-}
+    pub const open_child = struct {
+        pub const Args = struct {};
+        pub const Reply = struct { ok: bool };
+        pub fn handle(c: *RouterCtx, _: std.mem.Allocator, _: Args) !Reply {
+            if (c.child_window != null) return .{ .ok = true };
+            c.child_window = try c.window.openChildWindow(.{
+                .title = "Verve Desktop — child",
+                .width = 640,
+                .height = 400,
+                .assets = c.assets,
+                .initial_path = "index.html",
+                .scheme = "verve",
+            });
+            return .{ .ok = true };
+        }
+    };
+};

@@ -23,6 +23,8 @@ pub const shim_js: []const u8 =
     \\(function () {
     \\  if (window.verve) return;
     \\  var listeners = [];
+    \\  var pending = {};
+    \\  var nextId = 1;
     \\  function send(payload) {
     \\    var msg = typeof payload === 'string' ? payload : JSON.stringify(payload);
     \\    try {
@@ -39,6 +41,14 @@ pub const shim_js: []const u8 =
     \\    }
     \\    console.warn('[verve] no native bridge — dropping', msg);
     \\  }
+    \\  function request(payload) {
+    \\    return new Promise(function (resolve, reject) {
+    \\      var id = '_v' + (nextId += 1);
+    \\      pending[id] = { resolve: resolve, reject: reject };
+    \\      var msg = Object.assign({}, payload || {}, { __verve_id: id });
+    \\      send(msg);
+    \\    });
+    \\  }
     \\  function onMessage(fn) {
     \\    if (typeof fn === 'function') listeners.push(fn);
     \\  }
@@ -46,12 +56,19 @@ pub const shim_js: []const u8 =
     \\    var data;
     \\    try { data = typeof raw === 'string' ? JSON.parse(raw) : raw; }
     \\    catch (err) { data = raw; }
+    \\    if (data && data.__verve_id && pending[data.__verve_id]) {
+    \\      var slot = pending[data.__verve_id];
+    \\      delete pending[data.__verve_id];
+    \\      if (data.__verve_error) slot.reject(new Error(data.__verve_error));
+    \\      else slot.resolve(data.result);
+    \\      return;
+    \\    }
     \\    for (var i = 0; i < listeners.length; i += 1) {
     \\      try { listeners[i](data); }
     \\      catch (err) { console.error('[verve] listener failed', err); }
     \\    }
     \\  }
-    \\  window.verve = { send: send, onMessage: onMessage, _dispatch: _dispatch };
+    \\  window.verve = { send: send, request: request, onMessage: onMessage, _dispatch: _dispatch };
     \\  document.dispatchEvent(new Event('verve:ready'));
     \\})();
 ;
