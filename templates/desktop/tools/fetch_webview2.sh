@@ -29,8 +29,8 @@ if [[ ! -f "$PIN_FILE" ]]; then
   exit 1
 fi
 
-VERSION="$(grep '^version=' "$PIN_FILE" | head -1 | cut -d= -f2)"
-SHA512="$(grep '^sha512=' "$PIN_FILE" | head -1 | cut -d= -f2 || true)"
+VERSION="$(grep '^version=' "$PIN_FILE" | head -1 | cut -d= -f2-)"
+SHA512="$(grep '^sha512=' "$PIN_FILE" | head -1 | cut -d= -f2- || true)"
 
 if [[ -z "$VERSION" ]]; then
   echo "fetch_webview2.sh: webview2.pinned.txt has no version= line" >&2
