@@ -33,10 +33,31 @@ The build wires platform-native libraries automatically per target.
 ```
 src/main.zig         Entry point — opens Window, runs event loop.
 src/handlers.zig     Example IPC routes.
+src/components.zig   Verve component tree — rendered to HTML at build time.
 src/desktop/         Platform abstraction (vendored, do not edit casually).
-frontend/            HTML/JS/CSS served via `verve://app/*`.
+tools/render_index.zig  Build-time SSR binary — walks components.page().
+frontend/            Static assets (CSS, fonts, images) served via `verve://app/*`.
 public/              Optional extra assets.
 ```
+
+## SSR pipeline
+
+The window's main HTML is produced at build time by walking a Verve
+`Node` tree, not handwritten:
+
+1. `src/components.zig` defines `home(ctx)` and `page(ctx, body)` using
+   the framework's fluent factory API (`ctx.div().class(...).children(...)`).
+2. `tools/render_index.zig` runs during `zig build` as a host-target
+   program. It imports `verve` + `components`, constructs the tree, and
+   prints HTML to stdout via `verve.Renderer.render`.
+3. `build.zig` captures that stdout into `index.html` via
+   `addRunArtifact(...).captureStdOut(...)` and overlays it onto the
+   `public_assets` table — so the on-disk `frontend/` directory holds
+   static assets only (CSS, fonts, images), while `index.html` is
+   regenerated on every build.
+
+To change the markup, edit `src/components.zig`. To add stylesheets or
+images, drop them in `frontend/` and reference them by path.
 
 ## Smoke test (macOS)
 

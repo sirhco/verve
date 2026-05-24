@@ -14,6 +14,7 @@
         "src",
         "frontend",
         "public",
+        "tools",
         "LICENSE",
     },
 }

@@ -11,13 +11,51 @@ pub fn build(b: *std.Build) void {
         "Directory whose contents are baked into the binary and served at verve://app/<path>",
     ) orelse "frontend";
 
-    const public_assets_mod = buildPublicAssets(b, public_dir_opt);
-
     const verve_dep = b.dependency("verve", .{
         .target = target,
         .optimize = optimize,
     });
     const verve_mod = verve_dep.module("verve");
+
+    // Build-time SSR. A tiny host-target program imports `verve` +
+    // `components` and prints the rendered HTML to stdout; the captured
+    // output is grafted into `public_assets` as `index.html`, replacing
+    // any on-disk copy in the frontend directory.
+    const host_target = b.graph.host;
+    const verve_host_dep = b.dependency("verve", .{
+        .target = host_target,
+        .optimize = optimize,
+    });
+    const verve_host_mod = verve_host_dep.module("verve");
+
+    const components_host_mod = b.createModule(.{
+        .root_source_file = b.path("src/components.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "verve", .module = verve_host_mod } },
+    });
+
+    const render_index_mod = b.createModule(.{
+        .root_source_file = b.path("tools/render_index.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "verve", .module = verve_host_mod },
+            .{ .name = "components", .module = components_host_mod },
+        },
+    });
+    const render_index_exe = b.addExecutable(.{
+        .name = "render_index",
+        .root_module = render_index_mod,
+    });
+    const render_index_run = b.addRunArtifact(render_index_exe);
+    const generated_index = render_index_run.captureStdOut(.{
+        .basename = "index.html",
+    });
+
+    const public_assets_mod = buildPublicAssets(b, public_dir_opt, &.{
+        .{ .name = "index.html", .lazy = generated_index, .content_type = "text/html; charset=utf-8" },
+    });
 
     // The desktop platform layer is shipped inside this project tree
     // (vendored at scaffold time). It depends only on Zig stdlib and
@@ -217,7 +255,18 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-fn buildPublicAssets(b: *std.Build, dir: []const u8) *std.Build.Module {
+pub const Overlay = struct {
+    /// Forward-slashed path inside the public-assets tree (e.g.
+    /// "index.html", "client.wasm"). Replaces any on-disk file with the
+    /// same name; otherwise appended as a fresh entry after the walk.
+    name: []const u8,
+    lazy: std.Build.LazyPath,
+    /// Optional explicit content type. When empty, derived from the
+    /// name's extension via `guessContentType`.
+    content_type: []const u8 = "",
+};
+
+fn buildPublicAssets(b: *std.Build, dir: []const u8, overlays: []const Overlay) *std.Build.Module {
     const wf = b.addWriteFiles();
     var manifest: std.ArrayList(u8) = .empty;
     manifest.appendSlice(b.allocator,
@@ -233,38 +282,69 @@ fn buildPublicAssets(b: *std.Build, dir: []const u8) *std.Build.Module {
         \\
     ) catch @panic("OOM");
 
+    // Track which overlays were consumed during the walk so we can
+    // append fresh entries for any that didn't shadow an on-disk file.
+    const consumed = b.allocator.alloc(bool, overlays.len) catch @panic("OOM");
+    @memset(consumed, false);
+
+    const emitEntry = struct {
+        fn call(
+            b_: *std.Build,
+            wf_: *std.Build.Step.WriteFile,
+            mf: *std.ArrayList(u8),
+            entry_name: []const u8,
+            lazy: std.Build.LazyPath,
+            ct: []const u8,
+        ) void {
+            _ = wf_.addCopyFile(lazy, entry_name);
+            const line = std.fmt.allocPrint(b_.allocator,
+                \\    .{{ .path = "{s}", .bytes = @embedFile("{s}"), .content_type = "{s}" }},
+                \\
+            , .{ entry_name, entry_name, ct }) catch @panic("OOM");
+            mf.appendSlice(b_.allocator, line) catch @panic("OOM");
+        }
+    }.call;
+
     const io = b.graph.io;
-    var root = b.build_root.handle.openDir(io, dir, .{ .iterate = true }) catch {
-        // No frontend directory yet — emit an empty manifest so the
-        // build still succeeds.
-        manifest.appendSlice(b.allocator, "};\n") catch @panic("OOM");
-        _ = wf.add("public_assets.zig", manifest.items);
-        return b.createModule(.{
-            .root_source_file = wf.getDirectory().path(b, "public_assets.zig"),
-        });
-    };
-    defer root.close(io);
+    if (b.build_root.handle.openDir(io, dir, .{ .iterate = true })) |root_dir| {
+        var root = root_dir;
+        defer root.close(io);
 
-    var walker = root.walk(b.allocator) catch @panic("OOM");
-    defer walker.deinit();
+        var walker = root.walk(b.allocator) catch @panic("OOM");
+        defer walker.deinit();
 
-    while (walker.next(io) catch @panic("walk failed")) |entry| {
-        if (entry.kind != .file) continue;
+        while (walker.next(io) catch @panic("walk failed")) |entry| {
+            if (entry.kind != .file) continue;
 
-        const path_fwd = b.allocator.dupe(u8, entry.path) catch @panic("OOM");
-        for (path_fwd) |*ch| if (ch.* == '\\') {
-            ch.* = '/';
-        };
+            const path_fwd = b.allocator.dupe(u8, entry.path) catch @panic("OOM");
+            for (path_fwd) |*ch| if (ch.* == '\\') {
+                ch.* = '/';
+            };
 
-        const lazy = b.path(b.pathJoin(&.{ dir, entry.path }));
-        _ = wf.addCopyFile(lazy, path_fwd);
+            // Overlay takes precedence over the on-disk file.
+            const overlay_idx = findOverlay(overlays, path_fwd);
+            if (overlay_idx) |i| {
+                consumed[i] = true;
+                const ct = if (overlays[i].content_type.len > 0)
+                    overlays[i].content_type
+                else
+                    guessContentType(overlays[i].name);
+                emitEntry(b, wf, &manifest, path_fwd, overlays[i].lazy, ct);
+                continue;
+            }
 
-        const ct = guessContentType(entry.path);
-        const line = std.fmt.allocPrint(b.allocator,
-            \\    .{{ .path = "{s}", .bytes = @embedFile("{s}"), .content_type = "{s}" }},
-            \\
-        , .{ path_fwd, path_fwd, ct }) catch @panic("OOM");
-        manifest.appendSlice(b.allocator, line) catch @panic("OOM");
+            const lazy = b.path(b.pathJoin(&.{ dir, entry.path }));
+            emitEntry(b, wf, &manifest, path_fwd, lazy, guessContentType(entry.path));
+        }
+    } else |_| {
+        // No frontend directory — fall through to the overlay-only emit.
+    }
+
+    // Emit any overlay that didn't shadow an on-disk file.
+    for (overlays, 0..) |ov, i| {
+        if (consumed[i]) continue;
+        const ct = if (ov.content_type.len > 0) ov.content_type else guessContentType(ov.name);
+        emitEntry(b, wf, &manifest, ov.name, ov.lazy, ct);
     }
 
     manifest.appendSlice(b.allocator, "};\n") catch @panic("OOM");
@@ -273,6 +353,13 @@ fn buildPublicAssets(b: *std.Build, dir: []const u8) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = wf.getDirectory().path(b, "public_assets.zig"),
     });
+}
+
+fn findOverlay(overlays: []const Overlay, name: []const u8) ?usize {
+    for (overlays, 0..) |ov, i| {
+        if (std.mem.eql(u8, ov.name, name)) return i;
+    }
+    return null;
 }
 
 fn guessContentType(path: []const u8) []const u8 {
