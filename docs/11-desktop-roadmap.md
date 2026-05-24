@@ -12,10 +12,11 @@ Fresh session? Do these four in order before writing code:
    step fails, state matches description no longer — stop and surface
    the drift before proceeding.
 3. **Pick one bundle** from the "Suggested next-session bundles"
-   table. Items #16, #17, #21, #22 already done — see "Done in the
-   2026-05-22 → 2026-05-24 session" below. Remaining P1 items:
-   #18 (SSR + WASM hydration), #19 (live reload), #20 finish
-   (Windows release binary), #23 (Level-3 smoke).
+   table. All P1 items (#16–#23) are now closed — see "Done in the
+   2026-05-22 → 2026-05-24 session" below. Remaining work is the
+   #19 HMR follow-up (sub-second reload via runtime disk-read), P2
+   platform ports (Win/Linux `takeSnapshotPng` / dialogs / alerts),
+   and the `webview2.pinned.txt` SHA-512 pin.
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
@@ -79,6 +80,23 @@ drafted in earlier chat history.
   `surface_test.zig` aggregated into existing `asset_router_test`
   entry. `comptime` block in `window.zig` asserts the 15-method
   backend conformance surface. Desktop test artifact: 6 → 13 tests.
+- [x] **#18 SSR + WASM hydration in desktop scaffold** (Phases J1 +
+  J2 + J3). J1: build-time SSR via a host-target binary
+  `templates/desktop/tools/render_index.zig` walks
+  `components.page(ctx, components.home(ctx))` through
+  `verve.Renderer.render`, prints to stdout; the scaffold `build.zig`
+  captures via `addRunArtifact.captureStdOut` and grafts the result
+  into `public_assets` as `index.html`. Static `frontend/index.html`
+  deleted — SSR overlay is canonical. J2: scaffold `build.zig`
+  compiles `src/client/main.zig` to `wasm32-freestanding`
+  (ReleaseSmall) and overlays `client.wasm` into `public_assets`.
+  J3: `frontend/verve_desktop.js` — strict subset of
+  `src/bridge/verve.js` with no `/api`, `/ws`, `/events`, or
+  `/islands/*` endpoint fetches (none exist in desktop context).
+  Validated end-to-end on macOS — the demo counter button drives
+  WASM `increment_counter` export and the DOM updates via the
+  bridge's `set_text_by_bind` extern. Commits 49b053d (J1) +
+  3338d45 (J2 + J3).
 - [x] **Template polish** (Phase H). Scaffolded template demonstrates
   `Window.cookies()` and `Window.openChildWindow()`; frontend
   refactored to `await window.verve.request(...)` for typed routes;
@@ -237,38 +255,22 @@ to handlers, JS `window.verve.request(payload)` returns a Promise
 correlated via `__verve_id` field. Validated end-to-end with auto-
 smoke (ping → cookie_set → cookie_get → cookie_clear → log).
 
-### #18 — Verve SSR + WASM hydration in desktop scaffold (~500 LOC + frontend rework)
+### ~~#18 — Verve SSR + WASM hydration in desktop scaffold~~ — DONE
 
-Today's `frontend/index.html` is plain HTML/JS. Should reuse Verve's
-core pipeline:
+Shipped across phases J1 + J2 + J3 — see the matching entry under
+"Done in the 2026-05-22 → 2026-05-24 session" above. Scaffold now
+ships per-app `Renderer.render` at build time, per-app
+`wasm32-freestanding` client compile, and the
+`verve_desktop.js` subset bridge.
 
-- Template `build.zig` produces `client.wasm` + `verve.js` (same way
-  `src/server/main.zig` does) and bakes them into `public_assets`.
-- Replace static `index.html` with a build-time render via
-  `verve.Renderer.render(node)` against a sample component tree, then
-  embed the resulting HTML.
-- Scheme handler serves `client.wasm` and `verve.js` from the embedded
-  table — they're already in the manifest after build, no special
-  routing needed.
-- Update `index.html` template to load `verve.js` + boot the runtime
-  (mirror `src/server/main.zig` injection).
-- Document the hydration story in `templates/desktop/README.md`.
-
-Risk: WKWebView restricts ES modules + `WebAssembly.instantiateStreaming`
-under custom schemes. Test early; may need `Cross-Origin-Embedder-Policy:
-require-corp` + `Cross-Origin-Opener-Policy: same-origin` headers added
-in `asset_router.zig`.
-
-Note (2026-05-24 session): investigated scope — bigger than initial
-~200 LOC estimate. The framework's `src/bridge/verve.js` depends on
-server endpoints (`/api/...`, `/ws`, `/events`, `/islands/*.wasm`)
-that don't exist in desktop context. `client.wasm` is currently
-built from a SINGLE `src/client/main.zig` in framework — for user
-components in scaffold each app would need its own wasm build
-pipeline. Suggested split: Phase J1 = SSR-only (build-time
-`Renderer.render` into HTML, no WASM, no bridge). Phase J2 = user-
-component WASM compile in scaffold `build.zig`. Phase J3 = subset
-bridge (`verve_desktop.js`) without server-endpoint fetches.
+Risk callout for future regressions: WKWebView restricts ES modules
++ `WebAssembly.instantiateStreaming` under custom schemes. Current
+bridge sidesteps both (no ES modules; arrayBuffer + `instantiate`).
+If hydration regresses, the first thing to check is whether anything
+introduced ES-module syntax or streaming compile against
+`verve://app/*`. If so, add `Cross-Origin-Embedder-Policy:
+require-corp` + `Cross-Origin-Opener-Policy: same-origin` headers in
+`asset_router.zig`.
 
 ### ~~#19 — Dev live-reload~~ — DONE 2026-05-24 (process-restart variant)
 
@@ -378,13 +380,14 @@ now a Level-3 golden-diff harness:
 
 ## Suggested next-session bundles
 
-#16, #17, #21, #22 done. Updated table:
+All P1 items (#16–#23) closed. Remaining work is follow-ups and P2
+platform ports:
 
 | Bundle | Items | Best for |
 |---|---|---|
-| **Verve integration** | #18 (SSR + WASM hydration in scaffold) | Biggest remaining UX win. Bigger than original estimate — see "Note (2026-05-24 session)" above for the J1/J2/J3 split. |
-| **DX polish (HMR upgrade)** | #19 follow-up | Runtime disk-read fallback in asset_router so reload is sub-second instead of process-restart. |
-| **P2 port** | #23 Win/Linux | Port `takeSnapshotPng` to WebView2 + WebKitGTK (current macOS impl is the reference). |
+| **DX polish (HMR upgrade)** | #19 follow-up | Runtime disk-read fallback in `asset_router` so reload is sub-second instead of process-restart. |
+| **P2 port** | #23 Win/Linux | Port `takeSnapshotPng` to WebView2 + WebKitGTK (current macOS impl is the reference). Same shape for the file/save dialog + alert stubs. |
+| **Tech debt** | `webview2.pinned.txt` SHA-512 | Populate the SHA pin after first CI run verifies the published value at the NuGet flatcontainer URL. |
 
 Pick one. Each remaining bundle is ~2–4 hours focused work plus
 testing.
@@ -421,10 +424,6 @@ ls zig-out/app.app/Contents/{Info.plist,MacOS/app}   # both should exist
 
 ## Notes for the next session
 
-- **Two uncommitted items** at handoff: Phase L `verve-cli` realpath
-  portability fix in `src/cli/main.zig`, and this roadmap doc.
-  Stage + commit both before starting new work. Everything else from
-  the 2026-05-22 → 2026-05-24 session is already in `ui-ki` history.
 - Don't touch `src/verve.zig` — keeping its public web surface
   unchanged is a hard constraint.
 - The Linux backend has never run live — diagnostic logs are
