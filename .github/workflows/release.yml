@@ -24,12 +24,19 @@ jobs:
         include:
           - target: x86_64-linux-gnu
             asset_suffix: x86_64-linux
+            exe_suffix: ""
           - target: aarch64-linux-gnu
             asset_suffix: aarch64-linux
+            exe_suffix: ""
           - target: x86_64-macos
             asset_suffix: x86_64-macos
+            exe_suffix: ""
           - target: aarch64-macos
             asset_suffix: aarch64-macos
+            exe_suffix: ""
+          - target: x86_64-windows-gnu
+            asset_suffix: x86_64-windows
+            exe_suffix: ".exe"
 
     steps:
       - uses: actions/checkout@v4
@@ -71,8 +78,9 @@ jobs:
           STAGE="verve-${VERSION}-${SUFFIX}"
           rm -rf "${STAGE}"
           mkdir -p "${STAGE}/bin"
-          cp zig-out/bin/verve-server "${STAGE}/bin/"
-          cp zig-out/bin/verve-cli    "${STAGE}/bin/"
+          EXE="${{ matrix.exe_suffix }}"
+          cp "zig-out/bin/verve-server${EXE}" "${STAGE}/bin/"
+          cp "zig-out/bin/verve-cli${EXE}"    "${STAGE}/bin/"
           cp LICENSE README.md CHANGELOG.md "${STAGE}/"
           tar -czf "${STAGE}.tar.gz" "${STAGE}"
           # Generate a sha256 alongside so users can verify.

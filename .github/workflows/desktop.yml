@@ -1,0 +1,105 @@
+name: desktop
+
+on:
+  push:
+    branches: [main, ui-ki]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  framework:
+    name: framework / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: zig build (framework)
+        run: zig build
+
+      - name: zig build test (framework)
+        run: zig build test
+
+      - name: cross-compile backends (parser sanity)
+        run: |
+          zig build-obj src/desktop/window.zig -target aarch64-macos    -fno-emit-bin
+          zig build-obj src/desktop/window.zig -target x86_64-linux-gnu -fno-emit-bin
+          zig build-obj src/desktop/window.zig -target x86_64-windows-gnu -fno-emit-bin
+
+  scaffold-and-smoke:
+    name: scaffold+smoke / ${{ matrix.os }}
+    needs: framework
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: verve
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: build verve-cli
+        working-directory: verve
+        run: zig build
+
+      - name: scaffold desktop app
+        run: |
+          verve/zig-out/bin/verve-cli new app --desktop --name app --verve-path "$GITHUB_WORKSPACE/verve"
+        shell: bash
+
+      # ---- Linux runtime deps ---------------------------------------------
+      - name: install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libwebkit2gtk-4.1-dev \
+            xvfb imagemagick
+
+      # WebView2 SDK on Windows is vendored automatically by the
+      # scaffolded `build.zig` (calls `tools/fetch_webview2.ps1`).
+      # No explicit CI step needed — `zig build` below triggers it.
+
+      - name: build app
+        working-directory: app
+        run: zig build
+
+      # ---- macOS smoke ----------------------------------------------------
+      - name: smoke (macOS)
+        if: runner.os == 'macOS'
+        working-directory: app
+        run: zig build smoke
+
+      # ---- Linux smoke ----------------------------------------------------
+      - name: smoke (Linux)
+        if: runner.os == 'Linux'
+        working-directory: app
+        env:
+          DISPLAY: ":99"
+        run: zig build smoke
+
+      # ---- Windows smoke --------------------------------------------------
+      - name: smoke (Windows)
+        if: runner.os == 'Windows'
+        working-directory: app
+        run: zig build smoke
+
+      - name: upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.os }}
+          path: app/.smoke/
+          if-no-files-found: ignore

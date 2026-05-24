@@ -1,0 +1,21 @@
+.{
+    .name = .app,
+    .version = "0.0.0",
+    .fingerprint = 0x0000000000000000,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .verve = .{
+            .path = "../verve",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "frontend",
+        "public",
+        "tools",
+        "tests",
+        "LICENSE",
+    },
+}

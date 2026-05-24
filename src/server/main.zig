@@ -2,6 +2,7 @@
 //! Embeds the wasm client and JS bridge via the `assets` module.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Writer = std.Io.Writer;
 const verve = @import("verve");
 const assets = @import("assets");
@@ -178,20 +179,26 @@ fn openListenSocket(
     io: std.Io,
     cli: CliOptions,
 ) !std.Io.net.Server {
-    if (init.environ_map.get("LISTEN_FDS")) |raw| {
-        const count = std.fmt.parseInt(u32, raw, 10) catch {
-            log.err("LISTEN_FDS value not an integer: {s}", .{raw});
-            return error.InvalidListenFds;
-        };
-        if (count >= 1) {
-            log.info("adopting fd 3 as listening socket (LISTEN_FDS={d})", .{count});
-            return .{
-                .socket = .{
-                    .handle = 3,
-                    .address = .{ .ip4 = std.Io.net.Ip4Address.unspecified(0) },
-                },
-                .options = {},
+    // systemd socket activation. The fd-3 handle adoption is POSIX-only
+    // — std.Io.net.Stream.Socket's .handle is an integer fd on Unix but
+    // an opaque pointer on Windows. The comptime gate keeps the block
+    // out of Windows-target compilation entirely.
+    if (comptime builtin.target.os.tag != .windows) {
+        if (init.environ_map.get("LISTEN_FDS")) |raw| {
+            const count = std.fmt.parseInt(u32, raw, 10) catch {
+                log.err("LISTEN_FDS value not an integer: {s}", .{raw});
+                return error.InvalidListenFds;
             };
+            if (count >= 1) {
+                log.info("adopting fd 3 as listening socket (LISTEN_FDS={d})", .{count});
+                return .{
+                    .socket = .{
+                        .handle = 3,
+                        .address = .{ .ip4 = std.Io.net.Ip4Address.unspecified(0) },
+                    },
+                    .options = {},
+                };
+            }
         }
     }
 
@@ -1243,6 +1250,12 @@ fn respondMetrics(
 }
 
 fn installShutdownHandlers() void {
+    // Posix sigaction has no Windows analog; std.posix.Sigaction itself
+    // is `void` there, so the body has to comptime-disappear. Windows
+    // shutdown signaling would route through SetConsoleCtrlHandler —
+    // deferred until a Windows host runs the binary in anger.
+    if (comptime builtin.target.os.tag == .windows) return;
+
     const sa: std.posix.Sigaction = .{
         .handler = .{ .handler = &onShutdownSignal },
         .mask = std.mem.zeroes(std.posix.sigset_t),
