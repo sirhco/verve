@@ -283,28 +283,20 @@ bridge (`verve_desktop.js`) without server-endpoint fetches.
   Loses HMR fidelity but easy.
 - Document expected dev loop in template README.
 
-### #20 — Release tarball + zig fetch flow — PARTIAL (Windows binary remaining)
+### ~~#20 — Release tarball + zig fetch flow~~ — DONE 2026-05-24
 
-Shipped 2026-05-23 (Phases K + L):
-- `.github/workflows/release.yml` exists for Linux + macOS (predates
-  this session); on tag push builds + uploads tarballs + sha256.
+Shipped 2026-05-23 → 2026-05-24:
+- `.github/workflows/release.yml` matrix now includes x86_64-windows-gnu
+  alongside Linux + macOS; `.exe` suffix handled per-matrix-entry.
 - `src/cli/main.zig:renderZon` emits a commented swap-to-URL example.
-- `verve-cli` now cross-compiles cleanly to `x86_64-windows-gnu`
-  (Phase L replaced `std.c.realpath` with `std.Io.Dir.realPathFile
-  AbsoluteAlloc`).
-
-Remaining: add Windows entry to `release.yml` matrix. Blocker —
-`verve-server` uses posix-only fd-3 socket adoption at
-`src/server/main.zig:190` (`.handle = 3` not a `*anyopaque`). Two
-fix shapes:
-  a) Gate the systemd adoption block behind
-     `if (builtin.target.os.tag != .windows)`; cleanest, small diff.
-  b) Skip the server artifact entirely on Windows targets via
-     `build.zig` conditional. Cascades through integration tests
-     that hardcode `embed_server.getEmittedBin()` references.
-
-Recommended: option (a). After, re-enable Windows in `release.yml`
-matrix (entry was tried + reverted 2026-05-23, see git blame).
+- `verve-cli` cross-compiles cleanly to `x86_64-windows-gnu`
+  (Phase L: `std.c.realpath` → `std.Io.Dir.realPathFileAbsoluteAlloc`).
+- `verve-server` cross-compiles cleanly to `x86_64-windows-gnu`
+  after `installShutdownHandlers` + LISTEN_FDS fd-3 adoption were
+  gated behind `if (comptime builtin.target.os.tag != .windows)`.
+  Windows shutdown signaling would route through
+  SetConsoleCtrlHandler — deferred until a Windows host runs the
+  binary in anger.
 
 ### ~~#21 — WebView2 SDK auto-vendor~~ — DONE 2026-05-23
 
@@ -362,7 +354,7 @@ In-process snapshot + IPC checksum for golden-diff CI:
 | Bundle | Items | Best for |
 |---|---|---|
 | **Verve integration** | #18 (SSR + WASM hydration in scaffold) | Biggest remaining UX win. Bigger than original estimate — see "Note (2026-05-24 session)" above for the J1/J2/J3 split. |
-| **DX polish** | #19 + #20-finish | Live reload watcher + Windows release binary (requires `verve-server` posix gating). |
+| **DX polish** | #19 | Live reload watcher (~150 LOC). |
 | **Test infrastructure** | #23 | Golden-diff smoke — unblocks CI confidence on macOS first, then port. |
 
 Pick one. Each remaining bundle is ~2–4 hours focused work plus
