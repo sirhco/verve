@@ -96,6 +96,22 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - LISTEN_FDS env-var support for systemd socket activation.
 - Graceful shutdown on `SIGINT` / `SIGTERM`.
 
+### Desktop apps (no Chromium, no Electron)
+- **Native window + system webview** — WKWebView (macOS), WebView2 (Windows), WebKitGTK (Linux). Cross-platform `Window` surface in `src/desktop/`; per-OS backend behind a comptime dispatcher.
+- **Same SSR pipeline as the server** — `verve.Renderer.render` produces `index.html` at build time; tied into `public_assets` via an overlay arg so on-disk files stay static-only.
+- **WASM hydration** — `src/client/main.zig` compiled to `wasm32-freestanding` (ReleaseSmall, ~470 B for the demo), served at `verve://app/client.wasm`. A stripped bridge (`verve_desktop.js`) instantiates it and dispatches `[z-on-click]` to wasm exports.
+- **Typed IPC** — `desktop.Router(Ctx, Routes)` with comptime `Args` + `Reply` types; JS callers `await window.verve.request({type, ...})` and get a typed Promise back.
+- **Cookies** — per-window `CookieStore` with real implementations on all three backends (sync wrappers over the native async cookie managers via nested run-loop pumps).
+- **Multi-window** — `Window.openChildWindow(opts)`; last-window-quit semantics on all three platforms.
+- **Native dialogs / alerts / menu bar (macOS)** — `openFileDialog`, `saveFileDialog`, `showAlert`, default App+Edit+Window menus (Edit menu is what makes Cmd+C / Cmd+V fire inside WKWebView text inputs).
+- **macOS `.app` bundle** — `zig build bundle` lays out `Info.plist` + `MacOS/<name>`; `-Dbundle-id` / `-Dbundle-version` / `-Dcodesign=<identity>` flags.
+- **Level-3 golden-diff smoke** — `zig build smoke` runs the app under `--smoke`, drives a deterministic interaction sequence, captures a PNG via `Window.takeSnapshotPng`, diffs a DOM checksum vs `tests/golden/`.
+- **Dev-loop watcher** — `zig build dev` polls watched sources and respawns the app on change.
+- **WebView2 auto-vendor** — Windows builds fetch the pinned SDK from NuGet on first build (idempotent).
+
+See **[docs/19-desktop.md](docs/19-desktop.md)** for the full feature
+tour and platform support matrix.
+
 ## Install
 
 Prebuilt binaries ship on every tagged release. Releases include
@@ -161,6 +177,25 @@ zig build -Dpublic-dir=tests/public_fixture
 ./zig-out/bin/verve-server                # no --public-dir; same files served
 curl http://127.0.0.1:8080/public/hello.txt
 ```
+
+### Desktop quickstart
+
+The same `verve-cli` scaffolds a native-desktop project (system
+webview + custom-scheme assets + SSR + wasm hydration). No Chromium
+bundled. No Electron.
+
+```sh
+zig build                                 # builds verve-cli
+./zig-out/bin/verve-cli new my-app --desktop --name=my_app
+cd my-app
+zig build run                             # opens native window
+zig build dev                             # watch sources + auto-restart
+zig build smoke                           # Level-3 golden-diff harness (macOS)
+zig build bundle                          # macOS .app
+```
+
+Full feature tour: [docs/19-desktop.md](docs/19-desktop.md). API +
+options reference: the `README.md` inside the scaffolded project.
 
 ## Writing a page
 
