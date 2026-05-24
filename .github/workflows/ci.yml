@@ -40,7 +40,7 @@ jobs:
         run: |
           mkdir -p /tmp/verve-pub
           echo "ci-static-asset" > /tmp/verve-pub/hello.txt
-          ./zig-out/bin/verve-server --port 18080 --public-dir /tmp/verve-pub --workers 4 &
+          ./zig-out/bin/verve-server --port 18080 --public-dir /tmp/verve-pub --workers 4 --csrf=disable &
           server_pid=$!
           sleep 1
           set -e
