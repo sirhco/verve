@@ -1,0 +1,430 @@
+# Verve Desktop — Roadmap & Handoff
+
+## Hand-off checklist (start here)
+
+Fresh session? Do these four in order before writing code:
+
+1. **Read this doc top-to-bottom.** Sections "Verified working today"
+   (P0 done) and "Outstanding work — P1" frame everything below.
+2. **Run verification commands** in the "Verification commands for
+   fresh sessions" section near the bottom. Confirm framework build,
+   3-backend cross-compile, and macOS scaffold boot all PASS. If any
+   step fails, state matches description no longer — stop and surface
+   the drift before proceeding.
+3. **Pick one bundle** from the "Suggested next-session bundles"
+   table. Items #16, #17, #21, #22 already done — see "Done in the
+   2026-05-22 → 2026-05-24 session" below. Remaining P1 items:
+   #18 (SSR + WASM hydration), #19 (live reload), #20 finish
+   (Windows release binary), #23 (Level-3 smoke).
+4. **Hard constraint: do not modify `src/verve.zig`.** Public web
+   surface stays unchanged. Anything desktop-specific goes in
+   `src/desktop/` or the template tree.
+
+Authoritative state of the desktop scaffold subsystem and the remaining
+work needed to call it "fully functional." Written 2026-05-22, last
+updated 2026-05-24. Fresh sessions should be able to pick up without
+prior context.
+
+## Done in the 2026-05-22 → 2026-05-24 session
+
+Phases A–K committed to `ui-ki`; see `git log --oneline -20` for the
+chain. Two items remain uncommitted at session end:
+
+- `src/cli/main.zig` — Phase L portability fix (replaces
+  `std.c.realpath` with `std.Io.Dir.realPathFileAbsoluteAlloc`).
+- `docs/11-desktop-roadmap.md` — this doc.
+
+Stage + commit both before starting fresh work. Suggested messages
+drafted in earlier chat history.
+
+- [x] **#16 multi-window foundation** (Phases A–D). Per-window
+  `WindowCtx` on each backend, `Window.openChildWindow()` API, last-
+  window-quit semantics on Windows + Linux. Three different ctx-
+  routing strategies per platform: macOS HashMap keyed by WKWebView
+  ptr, Windows embedded back-pointer in COM handler structs + HashMap
+  keyed by HWND, Linux native `user_data` threading through GSignal
+  + per-window `webkit_web_context_new()`.
+- [x] **#22 cookie store API** (Phase E API + F1 macOS / F2 Windows /
+  F3 Linux real impls). `Window.cookies()` returns `CookieStore` with
+  `get`/`set`/`delete`/`clear`. All three backends ship real
+  implementations; macOS validated end-to-end live; Win/Linux compile-
+  clean cross-compile (live validation deferred to CI). NSBlock
+  impostor + nested NSRunLoop pump on macOS; COM `IGetCookiesHandler`
+  vtable + nested Win32 message pump on Windows; `GAsyncReadyCallback`
+  cells + `g_main_context_iteration` pump on Linux.
+- [x] **#17 typed IPC router** (Phase I). `desktop.Router(Ctx, Routes)`
+  comptime route table; per-route `Args` + `Reply` types parsed via
+  `std.json.parseFromValue` against an arena allocator. JS shim gains
+  `window.verve.request(payload)` returning a Promise correlated via
+  `__verve_id` field. Validated end-to-end on macOS.
+- [x] **#21 WebView2 auto-vendor** (Phase J). `tools/fetch_webview2.sh`
+  + `.ps1` download the pinned NuGet package into
+  `third_party/webview2/`. Scaffold `build.zig` invokes the script
+  automatically on Windows targets (idempotent — existing `.lib`
+  short-circuits). CI workflow's inline vendor step removed in favor
+  of the script. SHA pin left blank with TODO until first verified
+  download.
+- [x] **#20 partial — `zig fetch` URL hint** (Phase K). Scaffolded
+  `build.zig.zon` now documents the swap from path-dep to
+  `.url + .hash` once a release tag exists. `tools` added to
+  `.paths`. `release.yml` matrix still Linux + macOS only — Windows
+  binary blocked by `verve-server`'s posix-specific fd-3 socket
+  adoption.
+- [x] **verve-cli Windows compat** (Phase L). `canonicalize()` swapped
+  from `std.c.realpath` (libc-only) to
+  `std.Io.Dir.realPathFileAbsoluteAlloc`. `verve-cli` now cross-
+  compiles cleanly to `x86_64-windows-gnu`. Unlocks Windows binary
+  release once `verve-server` is gated.
+- [x] **Backend headless tests** (Phase G). New `cookies_test.zig` +
+  `surface_test.zig` aggregated into existing `asset_router_test`
+  entry. `comptime` block in `window.zig` asserts the 15-method
+  backend conformance surface. Desktop test artifact: 6 → 13 tests.
+- [x] **Template polish** (Phase H). Scaffolded template demonstrates
+  `Window.cookies()` and `Window.openChildWindow()`; frontend
+  refactored to `await window.verve.request(...)` for typed routes;
+  README documents Cookies + Multi-window sections; broken
+  `document.addEventListener('verve:ready', ...)` pattern removed
+  (event fires at document-start before any inline `<script>` parses).
+
+## Quick orientation
+
+- Entry point: `verve-cli new <dir> --desktop` produces a self-contained
+  app embedding the OS standard webview (WKWebView / WebView2 /
+  WebKitGTK).
+- Framework code: `src/desktop/` (platform abstraction).
+- Embedded template: `templates/desktop/` (scaffolded project tree).
+- Smoke harnesses: `templates/desktop/tools/smoke_{macos.sh,linux.sh,windows.ps1}`.
+- CI: `.github/workflows/desktop.yml` (matrix macOS/Linux/Windows).
+
+## Verified working today (P0 done)
+
+All items below have framework `zig build` + `zig build test` PASS and
+were live-tested on macOS arm64 unless noted.
+
+- [x] **Scaffold both modes.** `verve-cli new <dir>` (web, default) and
+  `verve-cli new <dir> --desktop`. Web tree unchanged except the new
+  `src/desktop/` files.
+- [x] **`--verve-path` baked.** Default = framework abs path, canonicalised
+  through `realpath`, converted to relative for `build.zig.zon`. Override
+  via `verve-cli new --verve-path <abs>`.
+- [x] **All 3 backends cross-compile.** Hand-rolled `extern` decls — no
+  `@cImport` so darwin host can syntax-check Windows + Linux.
+  - `zig build-obj src/desktop/window.zig -target aarch64-macos -fno-emit-bin`
+  - `zig build-obj src/desktop/window.zig -target x86_64-linux-gnu -fno-emit-bin`
+  - `zig build-obj src/desktop/window.zig -target x86_64-windows-gnu -fno-emit-bin`
+- [x] **macOS live boot.** Window opens, WKWebView attaches, scheme
+  handler fires for `index.html` + `style.css`. Bundled `.app` boots
+  identically.
+- [x] **Level-1 smoke harness.** `zig build smoke` per platform. macOS
+  passes in CI-like envs.
+- [x] **Diagnostic logging.** `verve.desktop[macos|linux|windows]:` log
+  lines at each lifecycle stage so live debugging on real Win/Linux
+  hosts is tractable.
+- [x] **CI matrix YAML.** `.github/workflows/desktop.yml` builds the
+  framework + scaffolds + builds the scaffolded app + runs smoke on
+  all three OSes. Untested until the workflow runs on real GH actions.
+- [x] **macOS objc_msgSend audit.** Findings documented in
+  `src/desktop/msg.zig` header. Summary: no `_stret` needed, NSRect is
+  HFA, BOOL = `_Bool` on 64-bit darwin → Zig `bool` works.
+- [x] **`.app` bundle generator.** `zig build bundle` writes
+  `zig-out/<name>.app/Contents/{Info.plist, MacOS/<name>}`. Optional
+  `-Dbundle-id=` / `-Dbundle-version=` / `-Dcodesign=<identity>`.
+- [x] **Native dialogs (macOS).** `Window.openFileDialog` /
+  `saveFileDialog` / `showAlert` against NSOpenPanel/NSSavePanel/NSAlert.
+  Win/Linux stubs return `error.Unsupported` so cross-platform call
+  sites compile.
+- [x] **Window vs app lifecycle split.** `Window.close()` (window-level)
+  separate from `Window.terminate()` (app quit). NSApplicationDelegate
+  with `applicationShouldTerminateAfterLastWindowClosed:` → standard
+  single-window-quits-app behavior on macOS.
+- [x] **Native menu bar (macOS).** App menu (Quit, Cmd+Q), Edit menu
+  (Undo/Redo/Cut/Copy/Paste/Select All — required for WKWebView
+  clipboard shortcuts to fire), Window menu (Minimize, Close).
+
+## File map (current state — reflects 2026-05-24)
+
+```
+src/desktop/
+  window.zig              comptime os.tag dispatcher, public surface,
+                          backend method-surface conformance comptime check
+  options.zig             WindowOptions, AssetEntry, MessageHandler,
+                          FileDialogOptions, AlertOptions, DialogError,
+                          Cookie, SameSite, CookieError
+  asset_router.zig        verve://app/<path> resolver + MIME table
+  asset_router_test.zig   aggregator test entry (imports cookies_test +
+                          surface_test below)
+  cookies.zig             CookieStore comptime dispatch facade
+  cookies_test.zig        Cookie defaults + SameSite stability + CookieStore
+                          method presence
+  surface_test.zig        WindowOptions defaults, ipc.shim_js markers,
+                          AssetEntry ABI shape
+  ipc.zig                 document-start JS shim string (with request()
+                          Promise correlation since 2026-05-23)
+  ipc_router.zig          comptime typed IPC router with Args/Reply
+  msg.zig                 objc_msgSend cast helper + ABI audit notes
+  macos.zig               NSWindow + WKWebView via objc runtime; per-window
+                          WindowCtx + AutoHashMap registry; WKHTTPCookieStore
+                          impl with NSBlock impostor + NSRunLoop pump
+  windows.zig             HWND + WebView2 via offset-based COM; per-window
+                          WindowCtx + AutoHashMap registry; CookieManager
+                          impl with IGetCookiesHandler + msg pump
+  linux.zig               GtkWindow + WebKitGTK 4.1; per-window WindowCtx +
+                          per-window WebKitWebContext (via g_object_new);
+                          CookieManager impl with GAsyncReadyCallback +
+                          GMainContext pump
+  README.md               architecture notes
+
+templates/desktop/        scaffolded into user projects
+  build.zig               per-OS link wiring + bundle + smoke steps;
+                          Windows branch invokes tools/fetch_webview2.*
+  build.zig.zon           verve dep (path baked + canonicalised); comment
+                          documenting zig fetch --save URL swap
+  README.md               user-facing docs (Cookies + Multi-window sections)
+  .gitignore
+  src/
+    main.zig              opens Window, runs event loop, two-step
+                          attach() + setMessageHandler() for typed router
+    handlers.zig          comptime Routes table demonstrating typed IPC
+                          + cookie demo routes + open_child route
+    desktop/              vendored copy of framework src/desktop/
+                          (embedded at scaffold time, not maintained
+                          separately)
+  frontend/
+    index.html            IPC + Cookies + Multi-window demo cards,
+                          all via window.verve.request() Promise API
+    style.css             light/dark themed
+  public/.gitkeep
+  tools/
+    smoke_macos.sh
+    smoke_linux.sh        Xvfb + ImageMagick
+    smoke_windows.ps1     System.Drawing capture
+    fetch_webview2.sh     POSIX NuGet downloader for WebView2 SDK
+    fetch_webview2.ps1    Windows NuGet downloader (idempotent)
+    webview2.pinned.txt   pinned NuGet version (+ optional SHA-512)
+
+.github/workflows/
+  desktop.yml             3x3 matrix: framework + scaffold + smoke
+                          (Windows WebView2 vendor step removed; build.zig
+                          handles it now)
+  release.yml             tag-push release matrix (Linux + macOS targets;
+                          Windows blocked by verve-server posix gate)
+
+build.zig (root)          buildCliSkeleton, buildCliSkeletonDesktop,
+                          embedTreeAs helper, --verve-path option
+src/cli/main.zig          --desktop/--web/--verve-path/--name parsing;
+                          portable realPathFileAbsoluteAlloc canonicalize
+                          (verve-cli now cross-compiles to Windows)
+```
+
+## Outstanding work — P1 (production-ready)
+
+Each bullet is sized + sequenced. Pick bundles per next session.
+
+### ~~#16 — Multi-window support~~ — DONE 2026-05-22
+
+Shipped in Phases A–D. Per-window `WindowCtx` on each backend, three
+different ctx-routing strategies tailored to each platform's callback
+model (see "Done in the 2026-05-22 → 2026-05-24 session" above).
+`Window.openChildWindow(opts)` API present on all three backends.
+Last-window-quit semantics: macOS via NSApp's native tracking,
+Windows via HWND registry size, Linux via `live_windows` counter.
+
+### ~~#17 — Typed IPC + request/response~~ — DONE 2026-05-23
+
+Shipped in Phase I. `desktop.Router(Ctx, Routes)` comptime route
+table with `Args` + `Reply` types per route, arena-allocator passed
+to handlers, JS `window.verve.request(payload)` returns a Promise
+correlated via `__verve_id` field. Validated end-to-end with auto-
+smoke (ping → cookie_set → cookie_get → cookie_clear → log).
+
+### #18 — Verve SSR + WASM hydration in desktop scaffold (~500 LOC + frontend rework)
+
+Today's `frontend/index.html` is plain HTML/JS. Should reuse Verve's
+core pipeline:
+
+- Template `build.zig` produces `client.wasm` + `verve.js` (same way
+  `src/server/main.zig` does) and bakes them into `public_assets`.
+- Replace static `index.html` with a build-time render via
+  `verve.Renderer.render(node)` against a sample component tree, then
+  embed the resulting HTML.
+- Scheme handler serves `client.wasm` and `verve.js` from the embedded
+  table — they're already in the manifest after build, no special
+  routing needed.
+- Update `index.html` template to load `verve.js` + boot the runtime
+  (mirror `src/server/main.zig` injection).
+- Document the hydration story in `templates/desktop/README.md`.
+
+Risk: WKWebView restricts ES modules + `WebAssembly.instantiateStreaming`
+under custom schemes. Test early; may need `Cross-Origin-Embedder-Policy:
+require-corp` + `Cross-Origin-Opener-Policy: same-origin` headers added
+in `asset_router.zig`.
+
+Note (2026-05-24 session): investigated scope — bigger than initial
+~200 LOC estimate. The framework's `src/bridge/verve.js` depends on
+server endpoints (`/api/...`, `/ws`, `/events`, `/islands/*.wasm`)
+that don't exist in desktop context. `client.wasm` is currently
+built from a SINGLE `src/client/main.zig` in framework — for user
+components in scaffold each app would need its own wasm build
+pipeline. Suggested split: Phase J1 = SSR-only (build-time
+`Renderer.render` into HTML, no WASM, no bridge). Phase J2 = user-
+component WASM compile in scaffold `build.zig`. Phase J3 = subset
+bridge (`verve_desktop.js`) without server-endpoint fetches.
+
+### #19 — Dev live-reload (~150 LOC)
+
+- `tools/watch.zig` or `templates/desktop/build.zig` step `zig build watch`
+  that:
+  1. Spawns the desktop app.
+  2. Watches `frontend/` via polling or `kqueue`/`inotify`/`ReadDirectoryChangesW`.
+  3. On change, signals the running app (Unix socket on `/tmp/verve-<pid>.sock`,
+     named pipe on Windows) to call `window.evalJs("location.reload()")`.
+- Alternative simpler path: app listens for SIGUSR1 (Unix) / a window
+  message (Windows) to trigger reload. Watcher sends signal on change.
+  Loses HMR fidelity but easy.
+- Document expected dev loop in template README.
+
+### #20 — Release tarball + zig fetch flow — PARTIAL (Windows binary remaining)
+
+Shipped 2026-05-23 (Phases K + L):
+- `.github/workflows/release.yml` exists for Linux + macOS (predates
+  this session); on tag push builds + uploads tarballs + sha256.
+- `src/cli/main.zig:renderZon` emits a commented swap-to-URL example.
+- `verve-cli` now cross-compiles cleanly to `x86_64-windows-gnu`
+  (Phase L replaced `std.c.realpath` with `std.Io.Dir.realPathFile
+  AbsoluteAlloc`).
+
+Remaining: add Windows entry to `release.yml` matrix. Blocker —
+`verve-server` uses posix-only fd-3 socket adoption at
+`src/server/main.zig:190` (`.handle = 3` not a `*anyopaque`). Two
+fix shapes:
+  a) Gate the systemd adoption block behind
+     `if (builtin.target.os.tag != .windows)`; cleanest, small diff.
+  b) Skip the server artifact entirely on Windows targets via
+     `build.zig` conditional. Cascades through integration tests
+     that hardcode `embed_server.getEmittedBin()` references.
+
+Recommended: option (a). After, re-enable Windows in `release.yml`
+matrix (entry was tried + reverted 2026-05-23, see git blame).
+
+### ~~#21 — WebView2 SDK auto-vendor~~ — DONE 2026-05-23
+
+Shipped in Phase J. `templates/desktop/tools/fetch_webview2.{sh,ps1}`
++ `webview2.pinned.txt`. Scaffold `build.zig` Windows branch invokes
+the script; CI workflow's manual vendor step removed. SHA pin still
+blank — populate after first verified download via CI.
+
+### ~~#22 — Cookie + storage uniform API~~ — DONE 2026-05-23
+
+Shipped across Phases E (API surface), F1 (macOS real impl), F2
+(Windows real impl), F3 (Linux real impl). `Window.cookies()` returns
+`CookieStore { get, set, delete, clear }`. All three backends ship
+real implementations using their native async cookie managers wrapped
+in sync facades (NSRunLoop pump on macOS, Win32 message pump on
+Windows, GMainContext iteration on Linux). macOS validated live;
+Win/Linux compile-clean cross-compile.
+
+### #23 — Level 3 smoke (macOS) (~260 LOC)
+
+In-process snapshot + IPC checksum for golden-diff CI:
+
+- App `--smoke <dir>` flag, parsed in template `main.zig`.
+- Second `WKUserScript` injected only in smoke mode: clicks `#ping`,
+  computes `document.body.innerText.length`, posts
+  `{type:"smoke_done", checksum, …}`.
+- `handlers.zig` smoke routing: receive → `Window.takeSnapshotPng(path)`
+  → write `checksum.txt` → `Window.terminate()`.
+- macos.zig: `takeSnapshotPng` via
+  `WKWebView.takeSnapshotWithConfiguration:completionHandler:`.
+  Completion handler is an Objective-C block — needs an NSBlock
+  impostor struct (`isa`, `flags`, `reserved`, `invoke`, `descriptor`).
+  ~30 LOC of plumbing; standard `_NSConcreteGlobalBlock` pattern.
+- `zig build smoke` step chains: build → run with `--smoke .smoke` →
+  `diff` checksum vs golden + `compare -metric AE` PNG vs golden.
+- Capture initial goldens, commit under `tests/golden/`.
+
+### Out of P1 scope (P2/P3)
+
+- GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
+- Native menu bars on Windows + Linux
+- Tray icons + system notifications
+- Drag-drop, clipboard programmatic access, print API
+- App icons / icns / hicolor theme
+- Single-instance enforcement
+- Deep-link URL handlers
+- Theme follow (light/dark to JS)
+- Accessibility (NSAccessibility / UIA / ATK)
+- Auto-updater (Sparkle / Squirrel)
+
+## Suggested next-session bundles
+
+#16, #17, #21, #22 done. Updated table:
+
+| Bundle | Items | Best for |
+|---|---|---|
+| **Verve integration** | #18 (SSR + WASM hydration in scaffold) | Biggest remaining UX win. Bigger than original estimate — see "Note (2026-05-24 session)" above for the J1/J2/J3 split. |
+| **DX polish** | #19 + #20-finish | Live reload watcher + Windows release binary (requires `verve-server` posix gating). |
+| **Test infrastructure** | #23 | Golden-diff smoke — unblocks CI confidence on macOS first, then port. |
+
+Pick one. Each remaining bundle is ~2–4 hours focused work plus
+testing.
+
+## Verification commands for fresh sessions
+
+```sh
+# 1. Confirm framework still healthy
+cd /Users/chrisolson/development/github/verve
+zig build
+zig build test
+
+# 2. Confirm all 3 backends still cross-compile
+zig build-obj src/desktop/window.zig -target aarch64-macos    -fno-emit-bin
+zig build-obj src/desktop/window.zig -target x86_64-linux-gnu -fno-emit-bin
+zig build-obj src/desktop/window.zig -target x86_64-windows-gnu -fno-emit-bin
+rm -f window.o.o window.o
+
+# 3. Confirm scaffold + boot still works
+ln -sfn $(pwd) /tmp/verve   # if you scaffold to /tmp
+./zig-out/bin/verve-cli new /tmp/vd --desktop --name vd
+cd /tmp/vd
+zig build
+./zig-out/bin/app &
+sleep 1.5
+# expect stdout to show:
+#   info: verve.desktop[macos]: window+webview ready (1100x760), scheme=verve
+#   debug: verve.desktop[macos]: scheme '/index.html'
+#   debug: verve.desktop[macos]: scheme '/style.css'
+kill %1
+zig build bundle
+ls zig-out/app.app/Contents/{Info.plist,MacOS/app}   # both should exist
+```
+
+## Notes for the next session
+
+- **Two uncommitted items** at handoff: Phase L `verve-cli` realpath
+  portability fix in `src/cli/main.zig`, and this roadmap doc.
+  Stage + commit both before starting new work. Everything else from
+  the 2026-05-22 → 2026-05-24 session is already in `ui-ki` history.
+- Don't touch `src/verve.zig` — keeping its public web surface
+  unchanged is a hard constraint.
+- The Linux backend has never run live — diagnostic logs are
+  instrumented but no host has booted it. Live-validate cookies
+  (#22) + multi-window (#16) + scheme handler on Linux when one
+  is available.
+- WebView2 vtable slot indexes in `src/desktop/windows.zig` were
+  hand-extracted from public docs (including the new cookie slots
+  added 2026-05-23 — `SLOT_WV2_2_get_CookieManager = 66` is
+  particularly load-bearing). Verify against actual SDK headers
+  during first Windows live boot.
+- macOS cookie store sync wrapper (`pumpUntilDone` in `macos.zig`)
+  uses a nested `[NSRunLoop runMode:beforeDate:]` — re-entrant in
+  the wrong context. Safe from IPC handlers (the dominant path).
+  Risky from inside other modal run loops; document if a caller
+  trips over it.
+- `webview2.pinned.txt` SHA-512 is blank. Populate after first CI
+  run verifies the published value at
+  `https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.2849.39/microsoft.web.webview2.1.0.2849.39.nupkg.sha512`.
+- Avoid expanding scope mid-session. The recommendation above of
+  one bundle per session is sized for sustainable quality. The
+  2026-05-22 → 2026-05-24 session ran 12 phases — past the limit
+  — and the rubric still held because each phase was bounded and
+  verified independently. That's a ceiling, not a target.
