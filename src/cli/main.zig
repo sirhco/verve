@@ -183,23 +183,19 @@ fn fixFingerprint(io: std.Io, gpa: std.mem.Allocator, dir_path: []const u8, pkg_
     try file.writePositionalAll(io, new_zon, 0);
 }
 
-fn canonicalize(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    // posix realpath resolves symlinks (notably macOS's /tmp →
+fn canonicalize(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    // Stdlib realpath resolves symlinks (notably macOS's /tmp →
     // /private/tmp) so the subsequent `relativePosix` produces a path
     // that Zig's build.zig.zon parser will actually find on disk.
-    var path_z_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len + 1 > path_z_buf.len) return error.PathTooLong;
-    @memcpy(path_z_buf[0..path.len], path);
-    path_z_buf[path.len] = 0;
-    const path_z: [*:0]const u8 = @ptrCast(&path_z_buf);
-
-    var out_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.c.realpath(path_z, &out_buf)) |resolved| {
-        const len = std.mem.len(resolved);
-        return gpa.dupe(u8, resolved[0..len]);
+    // Portable across macOS / Linux / Windows — no direct libc dep.
+    if (std.Io.Dir.realPathFileAbsoluteAlloc(io, path, gpa)) |resolved| {
+        defer gpa.free(resolved);
+        // Strip sentinel; callers free as plain []u8.
+        return gpa.dupe(u8, resolved);
+    } else |_| {
+        // Missing leaves / non-existent paths — fall back to lexical.
+        return gpa.dupe(u8, path);
     }
-    // realpath fails on missing leaves — fall back to lexical resolve.
-    return gpa.dupe(u8, path);
 }
 
 fn resolveRelativeVervePath(io: std.Io, gpa: std.mem.Allocator, dir_path: []const u8, verve_path: []const u8) ![]u8 {
@@ -221,9 +217,9 @@ fn resolveRelativeVervePath(io: std.Io, gpa: std.mem.Allocator, dir_path: []cons
         try std.fs.path.resolve(gpa, &.{ cwd_abs, verve_path });
     defer gpa.free(lex_verve);
 
-    const abs_dir = try canonicalize(gpa, lex_dir);
+    const abs_dir = try canonicalize(io, gpa, lex_dir);
     defer gpa.free(abs_dir);
-    const abs_verve = try canonicalize(gpa, lex_verve);
+    const abs_verve = try canonicalize(io, gpa, lex_verve);
     defer gpa.free(abs_verve);
 
     return std.fs.path.relativePosix(gpa, cwd_abs, abs_dir, abs_verve);
