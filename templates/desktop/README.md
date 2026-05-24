@@ -34,9 +34,11 @@ The build wires platform-native libraries automatically per target.
 src/main.zig         Entry point — opens Window, runs event loop.
 src/handlers.zig     Example IPC routes.
 src/components.zig   Verve component tree — rendered to HTML at build time.
+src/client/main.zig  WASM client — compiled to wasm32-freestanding.
 src/desktop/         Platform abstraction (vendored, do not edit casually).
 tools/render_index.zig  Build-time SSR binary — walks components.page().
-frontend/            Static assets (CSS, fonts, images) served via `verve://app/*`.
+frontend/style.css   Static stylesheet (CSS, fonts, images go here).
+frontend/verve_desktop.js  Desktop bridge — fetches client.wasm + hydrates.
 public/              Optional extra assets.
 ```
 
@@ -53,11 +55,40 @@ The window's main HTML is produced at build time by walking a Verve
 3. `build.zig` captures that stdout into `index.html` via
    `addRunArtifact(...).captureStdOut(...)` and overlays it onto the
    `public_assets` table — so the on-disk `frontend/` directory holds
-   static assets only (CSS, fonts, images), while `index.html` is
+   static assets only (CSS + the bridge JS), while `index.html` is
    regenerated on every build.
 
 To change the markup, edit `src/components.zig`. To add stylesheets or
 images, drop them in `frontend/` and reference them by path.
+
+## WASM hydration
+
+Interactive state lives in `src/client/main.zig`, compiled to
+`wasm32-freestanding` (ReleaseSmall) and served at
+`verve://app/client.wasm`. The `verve_desktop.js` bridge in
+`frontend/` instantiates it and wires it up:
+
+- Every `verve_init_<bind>` export is matched to `[z-bind="<bind>"]`
+  in the SSR'd DOM and seeded with the parsed `i32` text content.
+- After seeding, `verve_hydrate()` runs once for final setup.
+- Click delegate dispatches `[z-on-click="<name>"]` to the matching
+  WASM export.
+
+To add a new reactive piece:
+
+1. Mark the element in `components.zig` with `.bind("name")` and an
+   initial value via `.textInt(0)` or `.text("...")`.
+2. Add a `verve_init_name(value: i32)` export in
+   `src/client/main.zig` to receive the seed.
+3. Update state inside an `export fn handler() void` and call the
+   `set_text_by_bind_*` extern to re-render the bound element.
+4. Wire any UI control with `.onClick("handler")` to dispatch the
+   handler.
+
+The wasm currently uses direct DOM externs (no reactive graph yet).
+Once `verve.Signal` is exposed for `wasm32-freestanding`, the
+`verve_hydrate` body becomes the place to register signals + on_set
+hooks for fine-grained updates.
 
 ## Smoke test (macOS)
 

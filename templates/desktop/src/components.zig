@@ -18,6 +18,7 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
             ctx.el("meta").attr("name", "viewport").attr("content", "width=device-width, initial-scale=1"),
             ctx.title("Verve Desktop"),
             ctx.link("stylesheet", "style.css"),
+            ctx.script("verve_desktop.js").attr("defer", ""),
         }),
         ctx.el("body").children(.{
             body,
@@ -53,6 +54,18 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
                 ctx.h2("Multi-window"),
                 ctx.div().class("row").children(.{
                     ctx.button("Open child window").id("open-child"),
+                }),
+            }),
+            ctx.section().class("card").children(.{
+                ctx.h2("Counter (WASM hydration)"),
+                ctx.div().class("row").children(.{
+                    ctx.span().class("count").bind("count").textInt(@as(i32, 0)),
+                    ctx.button("-").onClick("decrement_counter"),
+                    ctx.button("+").onClick("increment_counter"),
+                }),
+                ctx.p().children(.{
+                    ctx.span().text("Total clicks: "),
+                    ctx.span().bind("clicks").text("0"),
                 }),
             }),
             ctx.section().class("card").children(.{

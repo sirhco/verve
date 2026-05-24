@@ -53,8 +53,29 @@ pub fn build(b: *std.Build) void {
         .basename = "index.html",
     });
 
+    // WASM client. Compiled to wasm32-freestanding ReleaseSmall and
+    // served at verve://app/client.wasm. The verve_desktop.js bridge
+    // instantiates it and seeds `verve_init_*` exports from the
+    // server-rendered DOM.
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const client_mod = b.createModule(.{
+        .root_source_file = b.path("src/client/main.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    const client_wasm = b.addExecutable(.{
+        .name = "client",
+        .root_module = client_mod,
+    });
+    client_wasm.entry = .disabled;
+    client_wasm.rdynamic = true;
+
     const public_assets_mod = buildPublicAssets(b, public_dir_opt, &.{
         .{ .name = "index.html", .lazy = generated_index, .content_type = "text/html; charset=utf-8" },
+        .{ .name = "client.wasm", .lazy = client_wasm.getEmittedBin(), .content_type = "application/wasm" },
     });
 
     // The desktop platform layer is shipped inside this project tree
