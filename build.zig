@@ -253,134 +253,134 @@ pub fn build(b: *std.Build) void {
     };
 
     if (tests_present) {
-    const embed_assets_mod = buildPublicAssets(b, "tests/public_fixture");
-    const embed_server_mod = b.createModule(.{
-        .root_source_file = b.path("src/server/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "verve", .module = verve_mod },
-            .{ .name = "assets", .module = assets_mod },
-            .{ .name = "app", .module = app_mod },
-            .{ .name = "app_client", .module = app_client_mod },
-            .{ .name = "client_manifest", .module = client_manifest_mod },
-            .{ .name = "public_assets", .module = embed_assets_mod },
-        },
-    });
-    const embed_server = b.addExecutable(.{
-        .name = "verve-server-embed",
-        .root_module = embed_server_mod,
-    });
+        const embed_assets_mod = buildPublicAssets(b, "tests/public_fixture");
+        const embed_server_mod = b.createModule(.{
+            .root_source_file = b.path("src/server/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "verve", .module = verve_mod },
+                .{ .name = "assets", .module = assets_mod },
+                .{ .name = "app", .module = app_mod },
+                .{ .name = "app_client", .module = app_client_mod },
+                .{ .name = "client_manifest", .module = client_manifest_mod },
+                .{ .name = "public_assets", .module = embed_assets_mod },
+            },
+        });
+        const embed_server = b.addExecutable(.{
+            .name = "verve-server-embed",
+            .root_module = embed_server_mod,
+        });
 
-    // CLI scaffolder. Embeds the entire project tree (sources + build
-    // wiring + tests fixture) into the binary; `verve-cli new <dir>` then
-    // writes it out as a self-contained starter app.
-    const skeleton_mod = buildCliSkeleton(b);
-    const skeleton_desktop_mod = buildCliSkeletonDesktop(b);
+        // CLI scaffolder. Embeds the entire project tree (sources + build
+        // wiring + tests fixture) into the binary; `verve-cli new <dir>` then
+        // writes it out as a self-contained starter app.
+        const skeleton_mod = buildCliSkeleton(b);
+        const skeleton_desktop_mod = buildCliSkeletonDesktop(b);
 
-    // Default verve dependency path baked into `verve-cli`. Desktop
-    // scaffolds reference verve through a `.path` dep — without a
-    // baked default the generated `build.zig.zon` would have to guess
-    // `../verve`, which only works for sibling-layout projects. Users
-    // can override per-scaffold via `verve-cli new --verve-path ...`,
-    // and once verve ships GitHub releases this default flips to a
-    // `.url + .hash` flow.
-    const default_verve_path = b.option(
-        []const u8,
-        "verve-path",
-        "Absolute path to the Verve checkout that scaffolded apps depend on (default: this build root)",
-    ) orelse b.build_root.path orelse ".";
-    const cli_options = b.addOptions();
-    cli_options.addOption([]const u8, "default_verve_path", default_verve_path);
+        // Default verve dependency path baked into `verve-cli`. Desktop
+        // scaffolds reference verve through a `.path` dep — without a
+        // baked default the generated `build.zig.zon` would have to guess
+        // `../verve`, which only works for sibling-layout projects. Users
+        // can override per-scaffold via `verve-cli new --verve-path ...`,
+        // and once verve ships GitHub releases this default flips to a
+        // `.url + .hash` flow.
+        const default_verve_path = b.option(
+            []const u8,
+            "verve-path",
+            "Absolute path to the Verve checkout that scaffolded apps depend on (default: this build root)",
+        ) orelse b.build_root.path orelse ".";
+        const cli_options = b.addOptions();
+        cli_options.addOption([]const u8, "default_verve_path", default_verve_path);
 
-    const cli_mod = b.createModule(.{
-        .root_source_file = b.path("src/cli/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "skeleton", .module = skeleton_mod },
-            .{ .name = "skeleton_desktop", .module = skeleton_desktop_mod },
-        },
-    });
-    cli_mod.addOptions("build_options", cli_options);
-    const cli = b.addExecutable(.{
-        .name = "verve-cli",
-        .root_module = cli_mod,
-    });
-    b.installArtifact(cli);
+        const cli_mod = b.createModule(.{
+            .root_source_file = b.path("src/cli/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "skeleton", .module = skeleton_mod },
+                .{ .name = "skeleton_desktop", .module = skeleton_desktop_mod },
+            },
+        });
+        cli_mod.addOptions("build_options", cli_options);
+        const cli = b.addExecutable(.{
+            .name = "verve-cli",
+            .root_module = cli_mod,
+        });
+        b.installArtifact(cli);
 
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/verve.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const tests = b.addTest(.{ .root_module = test_mod });
-    const run_tests = b.addRunArtifact(tests);
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path("src/verve.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const tests = b.addTest(.{ .root_module = test_mod });
+        const run_tests = b.addRunArtifact(tests);
 
-    const server_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/server/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "verve", .module = verve_mod },
-            .{ .name = "app", .module = app_mod },
-            .{ .name = "app_client", .module = app_client_mod },
-            .{ .name = "client_manifest", .module = client_manifest_mod },
-        },
-    });
-    const server_tests = b.addTest(.{ .root_module = server_test_mod });
-    const run_server_tests = b.addRunArtifact(server_tests);
+        const server_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/server/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "verve", .module = verve_mod },
+                .{ .name = "app", .module = app_mod },
+                .{ .name = "app_client", .module = app_client_mod },
+                .{ .name = "client_manifest", .module = client_manifest_mod },
+            },
+        });
+        const server_tests = b.addTest(.{ .root_module = server_test_mod });
+        const run_server_tests = b.addRunArtifact(server_tests);
 
-    // Client modules are wasm-shaped but the data structures (FBA,
-    // escape helpers) are target-agnostic. Run their tests on native
-    // so they participate in `zig build test` without requiring a
-    // wasm runtime.
-    const client_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/client/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "verve", .module = verve_mod },
-        },
-    });
-    const client_tests = b.addTest(.{ .root_module = client_test_mod });
-    const run_client_tests = b.addRunArtifact(client_tests);
+        // Client modules are wasm-shaped but the data structures (FBA,
+        // escape helpers) are target-agnostic. Run their tests on native
+        // so they participate in `zig build test` without requiring a
+        // wasm runtime.
+        const client_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/client/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "verve", .module = verve_mod },
+            },
+        });
+        const client_tests = b.addTest(.{ .root_module = client_test_mod });
+        const run_client_tests = b.addRunArtifact(client_tests);
 
-    const integration_opts = b.addOptions();
-    integration_opts.addOptionPath("server_exe", server.getEmittedBin());
-    integration_opts.addOptionPath("embed_server_exe", embed_server.getEmittedBin());
-    integration_opts.addOptionPath("public_dir", b.path("tests/public_fixture"));
+        const integration_opts = b.addOptions();
+        integration_opts.addOptionPath("server_exe", server.getEmittedBin());
+        integration_opts.addOptionPath("embed_server_exe", embed_server.getEmittedBin());
+        integration_opts.addOptionPath("public_dir", b.path("tests/public_fixture"));
 
-    const integration_mod = b.createModule(.{
-        .root_source_file = b.path("tests/integration.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    integration_mod.addOptions("build_options", integration_opts);
+        const integration_mod = b.createModule(.{
+            .root_source_file = b.path("tests/integration.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        integration_mod.addOptions("build_options", integration_opts);
 
-    const integration_tests = b.addTest(.{ .root_module = integration_mod });
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-    run_integration_tests.step.dependOn(&server.step);
-    run_integration_tests.step.dependOn(&embed_server.step);
+        const integration_tests = b.addTest(.{ .root_module = integration_mod });
+        const run_integration_tests = b.addRunArtifact(integration_tests);
+        run_integration_tests.step.dependOn(&server.step);
+        run_integration_tests.step.dependOn(&embed_server.step);
 
-    // Desktop platform layer's pure-Zig pieces (asset router, MIME
-    // guess) get a headless test artifact so they run on every host
-    // without requiring a windowing system. The native backends
-    // (macos/windows/linux) are not exercised here.
-    const desktop_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/desktop/asset_router_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const desktop_tests = b.addTest(.{ .root_module = desktop_test_mod });
-    const run_desktop_tests = b.addRunArtifact(desktop_tests);
+        // Desktop platform layer's pure-Zig pieces (asset router, MIME
+        // guess) get a headless test artifact so they run on every host
+        // without requiring a windowing system. The native backends
+        // (macos/windows/linux) are not exercised here.
+        const desktop_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/desktop/asset_router_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const desktop_tests = b.addTest(.{ .root_module = desktop_test_mod });
+        const run_desktop_tests = b.addRunArtifact(desktop_tests);
 
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_tests.step);
-    test_step.dependOn(&run_server_tests.step);
-    test_step.dependOn(&run_client_tests.step);
-    test_step.dependOn(&run_integration_tests.step);
-    test_step.dependOn(&run_desktop_tests.step);
+        const test_step = b.step("test", "Run tests");
+        test_step.dependOn(&run_tests.step);
+        test_step.dependOn(&run_server_tests.step);
+        test_step.dependOn(&run_client_tests.step);
+        test_step.dependOn(&run_integration_tests.step);
+        test_step.dependOn(&run_desktop_tests.step);
     } // end if (tests_present)
 
     // ---- Autodoc generation -------------------------------------------------
