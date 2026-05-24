@@ -13,6 +13,22 @@ zig build run
 
 The build wires platform-native libraries automatically per target.
 
+## Dev loop
+
+```sh
+zig build dev
+```
+
+Watches `build.zig`, `src/{main,components,handlers,client/main}.zig`,
+and `frontend/{style.css,verve_desktop.js}` for mtime changes. On
+change: kills the running app, runs `zig build`, respawns. Press
+Ctrl-C to exit.
+
+Process-restart grain, not HMR — frontend assets are baked into the
+binary at build time (SSR'd `index.html`, wasm-compiled client,
+embedded CSS / bridge JS), so true in-place reload would need a
+runtime disk-read mode that's out of scope.
+
 ## Platform prerequisites
 
 - **macOS**: WebKit/Cocoa ship with the OS. Nothing to install.
@@ -37,9 +53,11 @@ src/components.zig   Verve component tree — rendered to HTML at build time.
 src/client/main.zig  WASM client — compiled to wasm32-freestanding.
 src/desktop/         Platform abstraction (vendored, do not edit casually).
 tools/render_index.zig  Build-time SSR binary — walks components.page().
+tools/dev.zig        Dev-loop watcher — rebuild + respawn on file change.
 frontend/style.css   Static stylesheet (CSS, fonts, images go here).
 frontend/verve_desktop.js  Desktop bridge — fetches client.wasm + hydrates.
 public/              Optional extra assets.
+tests/golden/        Smoke-harness goldens (checksum + reference shot).
 ```
 
 ## SSR pipeline

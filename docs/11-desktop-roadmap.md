@@ -270,18 +270,35 @@ pipeline. Suggested split: Phase J1 = SSR-only (build-time
 component WASM compile in scaffold `build.zig`. Phase J3 = subset
 bridge (`verve_desktop.js`) without server-endpoint fetches.
 
-### #19 — Dev live-reload (~150 LOC)
+### ~~#19 — Dev live-reload~~ — DONE 2026-05-24 (process-restart variant)
 
-- `tools/watch.zig` or `templates/desktop/build.zig` step `zig build watch`
-  that:
-  1. Spawns the desktop app.
-  2. Watches `frontend/` via polling or `kqueue`/`inotify`/`ReadDirectoryChangesW`.
-  3. On change, signals the running app (Unix socket on `/tmp/verve-<pid>.sock`,
-     named pipe on Windows) to call `window.evalJs("location.reload()")`.
-- Alternative simpler path: app listens for SIGUSR1 (Unix) / a window
-  message (Windows) to trigger reload. Watcher sends signal on change.
-  Loses HMR fidelity but easy.
-- Document expected dev loop in template README.
+Shipped as `zig build dev` in the scaffold template. Implementation
+landed on process-restart granularity rather than in-place HMR
+because the scaffold bakes all frontend assets into the binary at
+build time (SSR'd index.html, wasm-compiled client, embedded CSS +
+bridge JS). True HMR would need a runtime disk-read mode where the
+asset router falls back to reading from `frontend/` on cache miss —
+out of scope for this iteration; documented as a follow-up if/when
+a user actually asks for sub-second reload latency.
+
+What ships today (`templates/desktop/tools/dev.zig`):
+
+- Host-target Zig binary; spawned via `zig build dev`.
+- Polls a fixed list of source files (build.zig, src/main.zig,
+  src/components.zig, src/handlers.zig, src/client/main.zig,
+  frontend/style.css, frontend/verve_desktop.js) at 400ms intervals
+  using `std.Io.Dir.cwd().statFile(...).mtime`.
+- On any mtime change: `Child.kill` the running app, run
+  `zig build`, if successful spawn `./zig-out/bin/app`. If build
+  fails, prints a warning and waits for the next save.
+- Cross-platform via std.process.spawn — works on macOS today; will
+  work on Linux + Windows once those hosts are exercised (no
+  platform-specific hooks in the watcher itself).
+- Ctrl-C kills the watcher; the defer in main reaps the child app.
+
+Trade-off: rebuilds cost ~1-2 seconds + lose live app state on each
+cycle. Acceptable for the demo-app dev loop; a future runtime
+disk-read mode would lift the bake-at-build constraint.
 
 ### ~~#20 — Release tarball + zig fetch flow~~ — DONE 2026-05-24
 
@@ -366,7 +383,7 @@ now a Level-3 golden-diff harness:
 | Bundle | Items | Best for |
 |---|---|---|
 | **Verve integration** | #18 (SSR + WASM hydration in scaffold) | Biggest remaining UX win. Bigger than original estimate — see "Note (2026-05-24 session)" above for the J1/J2/J3 split. |
-| **DX polish** | #19 | Live reload watcher (~150 LOC). |
+| **DX polish (HMR upgrade)** | #19 follow-up | Runtime disk-read fallback in asset_router so reload is sub-second instead of process-restart. |
 | **P2 port** | #23 Win/Linux | Port `takeSnapshotPng` to WebView2 + WebKitGTK (current macOS impl is the reference). |
 
 Pick one. Each remaining bundle is ~2–4 hours focused work plus

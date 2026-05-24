@@ -164,6 +164,24 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the desktop app");
     run_step.dependOn(&run_cmd.step);
 
+    // `zig build dev`: a host-target watcher that re-runs `zig build`
+    // and respawns the app whenever a watched source file changes.
+    // Assets are baked into the binary at build time (SSR'd index.html,
+    // wasm client, embedded CSS / bridge JS) so this is process-restart
+    // grain, not HMR.
+    const dev_mod = b.createModule(.{
+        .root_source_file = b.path("tools/dev.zig"),
+        .target = host_target,
+        .optimize = optimize,
+    });
+    const dev_exe = b.addExecutable(.{
+        .name = "verve-dev-watcher",
+        .root_module = dev_mod,
+    });
+    const dev_run = b.addRunArtifact(dev_exe);
+    const dev_step = b.step("dev", "Watch sources, auto-rebuild + respawn the app");
+    dev_step.dependOn(&dev_run.step);
+
     // macOS .app bundle. `zig build bundle` lays out the Mach-O
     // executable + Info.plist into `zig-out/<name>.app/Contents/`. The
     // bundle is what Finder, Launchpad, and Gatekeeper expect — the
