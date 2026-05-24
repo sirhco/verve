@@ -99,6 +99,11 @@ reference. Headline list:
 - **WebView2 auto-vendor** — Windows builds fetch the pinned SDK
   from NuGet on first build (idempotent)
 - **Dev loop** — `zig build dev` watches sources, rebuilds, respawns
+- **`--dev <dir>` runtime fallback** — scheme handler tries
+  `<dir>/<path>` before the embedded asset table on every request, so
+  hand-written frontend assets (`style.css`, `verve_desktop.js`, …)
+  hot-reload with Cmd+R instead of a rebuild. Rejects `..` and
+  post-strip absolute paths; 16 MB per-file cap.
 - **Level-3 smoke** — golden-diff CI: scripted interaction sequence
   computes a DOM checksum + captures PNG, build step diffs vs
   `tests/golden/`
@@ -135,6 +140,7 @@ Zig calls via nested event-loop pumps.
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
 | Dev-loop watcher | ✓ | ✓ | ✓ |
+| `--dev` runtime fallback | ✓ | ✓ | ✓ |
 
 ✓ = real implementation. `stub` = the API exists and returns
 `error.Unsupported` so cross-platform call sites compile.

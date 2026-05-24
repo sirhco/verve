@@ -29,6 +29,7 @@ pub const Cookie = options.Cookie;
 pub const CookieError = options.CookieError;
 pub const SnapshotError = options.SnapshotError;
 pub const SameSite = options.SameSite;
+pub const DevAssetsConfig = options.DevAssetsConfig;
 pub const CookieStore = cookies.CookieStore;
 
 const backend = switch (builtin.os.tag) {

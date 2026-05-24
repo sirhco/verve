@@ -77,6 +77,7 @@ extern fn g_signal_connect_data(
 ) c_ulong;
 extern fn g_object_unref(o: ?*anyopaque) void;
 extern fn g_free(p: ?*anyopaque) void;
+extern fn g_memdup2(mem: ?*const anyopaque, byte_size: usize) ?*anyopaque;
 extern fn g_quark_from_static_string(s: [*:0]const u8) GQuark;
 extern fn g_error_new_literal(domain: GQuark, code: c_int, message: [*:0]const u8) *GError;
 extern fn g_error_free(err: *GError) void;
@@ -439,22 +440,54 @@ fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callcon
     const path: []const u8 = if (std.mem.indexOf(u8, uri_slice, auth)) |i| uri_slice[i + auth.len ..] else uri_slice;
     std.log.debug("verve.desktop[linux]: scheme '{s}' → '{s}'", .{ uri_slice, path });
 
-    const resolved = router.resolve(cx.opts.assets, path) catch {
-        std.log.warn("verve.desktop[linux]: 404 {s}", .{path});
-        const err = g_error_new_literal(g_quark_from_static_string("verve"), 404, "not found");
-        webkit_uri_scheme_request_finish_error(req, err);
-        g_error_free(err);
-        return;
+    const resolved = blk: {
+        if (cx.opts.dev_assets) |dev| {
+            break :blk router.resolveWithFallback(cx.allocator, dev.io, cx.opts.assets, path, dev.dir) catch {
+                std.log.warn("verve.desktop[linux]: 404 {s}", .{path});
+                const err = g_error_new_literal(g_quark_from_static_string("verve"), 404, "not found");
+                webkit_uri_scheme_request_finish_error(req, err);
+                g_error_free(err);
+                return;
+            };
+        }
+        break :blk router.resolve(cx.opts.assets, path) catch {
+            std.log.warn("verve.desktop[linux]: 404 {s}", .{path});
+            const err = g_error_new_literal(g_quark_from_static_string("verve"), 404, "not found");
+            webkit_uri_scheme_request_finish_error(req, err);
+            g_error_free(err);
+            return;
+        };
     };
+    defer resolved.deinit(cx.allocator);
 
-    const stream = g_memory_input_stream_new_from_data(resolved.bytes.ptr, @intCast(resolved.bytes.len), null);
+    // WebKitGTK's `from_data` does NOT copy the input buffer — the
+    // bytes must outlive the stream. Embedded entries are static, so
+    // passing the slice directly with a null destroy notify is fine.
+    // Dev-mode owned bytes are about to be freed by the defer above,
+    // so we hand a glib-allocated copy to the stream with `g_free` as
+    // the destroy notify.
+    const len_c: c_long = @intCast(resolved.bytes.len);
+    var stream: *GInputStream = undefined;
+    if (resolved.owned) {
+        const copy = g_memdup2(resolved.bytes.ptr, resolved.bytes.len) orelse {
+            std.log.warn("verve.desktop[linux]: g_memdup2 OOM", .{});
+            const err = g_error_new_literal(g_quark_from_static_string("verve"), 500, "out of memory");
+            webkit_uri_scheme_request_finish_error(req, err);
+            g_error_free(err);
+            return;
+        };
+        stream = g_memory_input_stream_new_from_data(@ptrCast(copy), len_c, g_free);
+    } else {
+        stream = g_memory_input_stream_new_from_data(resolved.bytes.ptr, len_c, null);
+    }
+
     var ct_buf: [128]u8 = undefined;
     const ct_z = std.fmt.bufPrintZ(&ct_buf, "{s}", .{resolved.content_type}) catch {
-        webkit_uri_scheme_request_finish(req, stream, @intCast(resolved.bytes.len), "application/octet-stream");
+        webkit_uri_scheme_request_finish(req, stream, len_c, "application/octet-stream");
         g_object_unref(stream);
         return;
     };
-    webkit_uri_scheme_request_finish(req, stream, @intCast(resolved.bytes.len), ct_z.ptr);
+    webkit_uri_scheme_request_finish(req, stream, len_c, ct_z.ptr);
     g_object_unref(stream);
 }
 

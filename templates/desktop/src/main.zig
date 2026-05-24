@@ -14,12 +14,23 @@ pub fn main(init: std.process.Init) !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // CLI: `--smoke <dir>` enables the Level-3 smoke harness. The
-    // bridge JS sees `?smoke=1` in location.search and drives a
-    // scripted ping → counter-click → smoke_done sequence; the
-    // smoke_done IPC handler writes a checksum.txt + shot.png into
-    // <dir>, then terminates the app. Production runs leave this off.
+    // CLI:
+    //   --smoke <dir>      Enables the Level-3 smoke harness. The
+    //                      bridge JS sees `?smoke=1` in location.search
+    //                      and drives a scripted ping → counter-click →
+    //                      smoke_done sequence; the smoke_done IPC
+    //                      handler writes a checksum.txt + shot.png
+    //                      into <dir>, then terminates the app.
+    //                      Production runs leave this off.
+    //   --dev <dir>        Enables runtime disk-read fallback for the
+    //                      asset router. Scheme-handler requests that
+    //                      miss the embedded `public_assets` table fall
+    //                      through to <dir>/<path>. Edit
+    //                      frontend/style.css, reload (Cmd+R), see the
+    //                      change without rebuilding the binary. Path
+    //                      traversal is rejected. Disabled by default.
     var smoke_dir: ?[]const u8 = null;
+    var dev_dir: ?[]const u8 = null;
     var initial_path: []const u8 = "index.html";
     {
         var arg_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
@@ -31,10 +42,15 @@ pub fn main(init: std.process.Init) !void {
                     smoke_dir = try allocator.dupe(u8, val);
                     initial_path = "index.html?smoke=1";
                 }
+            } else if (std.mem.eql(u8, arg, "--dev")) {
+                if (arg_iter.next()) |val| {
+                    dev_dir = try allocator.dupe(u8, val);
+                }
             }
         }
     }
     defer if (smoke_dir) |d| allocator.free(d);
+    defer if (dev_dir) |d| allocator.free(d);
 
     // Caller is responsible for creating <smoke-dir> before launching;
     // the build step does this. App-side does not pull in std.Io just
@@ -51,12 +67,15 @@ pub fn main(init: std.process.Init) !void {
     // needs that pointer in `on_message_ctx`. Order: build the Window
     // first (so `attach` has a real pointer to capture), then plug
     // the returned Ctx pointer in via `setMessageHandler`.
+    const dev_assets: ?desktop.DevAssetsConfig = if (dev_dir) |d| .{ .dir = d, .io = io } else null;
+
     window = try desktop.Window.init(allocator, .{
         .title = "Verve Desktop",
         .width = 1100,
         .height = 760,
         .devtools = true,
         .assets = asset_entries,
+        .dev_assets = dev_assets,
         .initial_path = initial_path,
     });
     defer window.deinit();

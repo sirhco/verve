@@ -101,6 +101,19 @@ pub const SnapshotError = error{
     WriteFailed,
 };
 
+/// Configuration for `WindowOptions.dev_assets`. Pairs the source
+/// directory with the `Io` the backend needs to perform the
+/// fallback file read.
+pub const DevAssetsConfig = struct {
+    /// Directory served as the disk fallback. May be relative to the
+    /// working directory the app was launched from. Caller owns the
+    /// slice; the backend captures by reference and never frees it.
+    dir: []const u8,
+    /// `Io` used for `openFile` / `stat` / `readPositionalAll`. Typically
+    /// `init.io` from the app's `main` entry point.
+    io: std.Io,
+};
+
 /// Construction parameters for `Window.init`. The platform layer
 /// captures these by value during init; later changes need explicit
 /// setter calls (`setTitle`, `loadUrl`, …).
@@ -137,6 +150,14 @@ pub const WindowOptions = struct {
     /// with a clear error, which is useful while iterating on a project
     /// that has not produced its production bundle yet.
     assets: []const AssetEntry = &.{},
+
+    /// Opt-in dev-mode fallback: when set, scheme-handler requests that
+    /// miss `assets` fall through to a sandboxed disk read against
+    /// `dev_assets.dir`. The `io` field is required for the file ops;
+    /// scaffolded apps pass `init.io` straight through. Leave `null`
+    /// for production builds — the asset table is the source of truth.
+    /// Path traversal (`..`) and post-strip absolute paths are rejected.
+    dev_assets: ?DevAssetsConfig = null,
 
     /// Optional message-handler callback + context registered before
     /// any page load. The same pointer pair can be set later via

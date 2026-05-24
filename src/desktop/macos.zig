@@ -36,6 +36,7 @@ const nil: ?id = null;
 const WindowCtx = struct {
     allocator: std.mem.Allocator,
     assets: []const opts_mod.AssetEntry,
+    dev_assets: ?opts_mod.DevAssetsConfig,
     on_message: ?opts_mod.MessageHandler,
     on_message_ctx: ?*anyopaque,
     webview: id,
@@ -202,10 +203,14 @@ pub const Window = struct {
         ctx_ptr.* = .{
             .allocator = allocator,
             .assets = opts.assets,
+            .dev_assets = opts.dev_assets,
             .on_message = opts.on_message,
             .on_message_ctx = opts.on_message_ctx,
             .webview = webview,
         };
+        if (opts.dev_assets) |dev| {
+            std.log.info("verve.desktop[macos]: dev-mode asset fallback enabled, dir='{s}'", .{dev.dir});
+        }
         try registerCtx(webview, ctx_ptr);
         errdefer unregisterCtx(webview);
 
@@ -511,11 +516,22 @@ fn handleSchemeStart(ctx_ptr: *WindowCtx, task: id) !void {
     const path_slice = path_cstr[0..path_len];
     std.log.debug("verve.desktop[macos]: scheme '{s}'", .{path_slice});
 
-    const resolved = router.resolve(ctx_ptr.assets, path_slice) catch |err| {
-        std.log.warn("verve.desktop[macos]: scheme miss '{s}' ({s})", .{ path_slice, @errorName(err) });
-        sendError(task, err);
-        return;
-    };
+    const resolved = if (ctx_ptr.dev_assets) |dev|
+        router.resolveWithFallback(ctx_ptr.allocator, dev.io, ctx_ptr.assets, path_slice, dev.dir) catch |err| {
+            std.log.warn("verve.desktop[macos]: scheme miss '{s}' ({s})", .{ path_slice, @errorName(err) });
+            sendError(task, err);
+            return;
+        }
+    else
+        router.resolve(ctx_ptr.assets, path_slice) catch |err| {
+            std.log.warn("verve.desktop[macos]: scheme miss '{s}' ({s})", .{ path_slice, @errorName(err) });
+            sendError(task, err);
+            return;
+        };
+    defer resolved.deinit(ctx_ptr.allocator);
+    if (resolved.owned) {
+        std.log.debug("verve.desktop[macos]: scheme '{s}' served from dev fallback ({d} B)", .{ path_slice, resolved.bytes.len });
+    }
 
     const NSURLResponse = m.getClass("NSHTTPURLResponse");
     const ns_alloc = m.cast(*const fn (id, SEL) callconv(.c) id);

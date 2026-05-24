@@ -697,19 +697,37 @@ fn onResourceRequested(this: ?*const IResourceRequestedHandler, _: ?*Wv2, args: 
 
     var response: ?*ResponseT = null;
 
-    const resolved = router.resolve(cx.opts.assets, path) catch {
-        _ = createResp(
-            env,
-            null,
-            404,
-            std.unicode.utf8ToUtf16LeStringLiteral("Not Found"),
-            std.unicode.utf8ToUtf16LeStringLiteral(""),
-            &response,
-        );
-        const putResp = vtSlot(*const fn (*RequestedArgs, ?*ResponseT) callconv(.winapi) HRESULT, args.?.lpVtbl, SLOT_RequestedArgs_put_Response);
-        _ = putResp(args.?, response);
-        return 0;
+    const resolved = blk: {
+        if (cx.opts.dev_assets) |dev| {
+            break :blk router.resolveWithFallback(cx.allocator, dev.io, cx.opts.assets, path, dev.dir) catch {
+                _ = createResp(
+                    env,
+                    null,
+                    404,
+                    std.unicode.utf8ToUtf16LeStringLiteral("Not Found"),
+                    std.unicode.utf8ToUtf16LeStringLiteral(""),
+                    &response,
+                );
+                const putResp = vtSlot(*const fn (*RequestedArgs, ?*ResponseT) callconv(.winapi) HRESULT, args.?.lpVtbl, SLOT_RequestedArgs_put_Response);
+                _ = putResp(args.?, response);
+                return 0;
+            };
+        }
+        break :blk router.resolve(cx.opts.assets, path) catch {
+            _ = createResp(
+                env,
+                null,
+                404,
+                std.unicode.utf8ToUtf16LeStringLiteral("Not Found"),
+                std.unicode.utf8ToUtf16LeStringLiteral(""),
+                &response,
+            );
+            const putResp = vtSlot(*const fn (*RequestedArgs, ?*ResponseT) callconv(.winapi) HRESULT, args.?.lpVtbl, SLOT_RequestedArgs_put_Response);
+            _ = putResp(args.?, response);
+            return 0;
+        };
     };
+    defer resolved.deinit(cx.allocator);
 
     var headers_buf: [512]u8 = undefined;
     const headers_utf8 = std.fmt.bufPrint(

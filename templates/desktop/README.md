@@ -381,10 +381,31 @@ and `frontend/{style.css,verve_desktop.js}` for mtime changes (400 ms
 poll). On change: kills the running app, runs `zig build`, respawns.
 Press Ctrl-C to exit.
 
-Process-restart grain, not HMR — frontend assets are baked into the
-binary at build time (SSR'd `index.html`, wasm-compiled client,
-embedded CSS / bridge JS), so true in-place reload would need a
-runtime disk-read mode that's out of scope.
+For changes to the Zig source (`src/components.zig`,
+`src/handlers.zig`, `src/client/main.zig`), the rebuild + restart is
+mandatory — the SSR'd `index.html` and the wasm-compiled client are
+both baked at build time.
+
+### `--dev` runtime fallback (hot CSS / JS)
+
+For changes to **static frontend assets** (`style.css`,
+`verve_desktop.js`, anything you drop into `frontend/`), restart the
+app once with the `--dev <dir>` flag pointing at the same directory:
+
+```sh
+./zig-out/bin/app --dev ./frontend
+```
+
+The scheme handler now checks `<dir>/<path>` on every request first
+and falls through to the embedded copy only when the file is missing.
+Edit the file, press Cmd+R in the window, see the new bytes — no
+rebuild, no respawn. Pair it with `zig build dev` to keep the
+process-restart loop for code changes and use the runtime fallback
+for asset iteration.
+
+Sandboxing: requests with `..` segments or post-strip absolute paths
+are rejected with 404 so a misconfigured `--dev` value can't expose
+arbitrary files. The per-file ceiling is 16 MB.
 
 ## Smoke test (macOS — Level-3)
 
@@ -427,6 +448,7 @@ Overrides:
 | Flag | Effect |
 |------|--------|
 | `--smoke <dir>` | Enable smoke harness; loads page with `?smoke=1`, writes `<dir>/{shot.png,checksum.txt}`, terminates |
+| `--dev <dir>` | Enable runtime disk-read fallback for the asset router; scheme requests check `<dir>/<path>` before falling through to the embedded table. Hot-reload-friendly. Reject `..` segments + absolute paths; 16 MB per-file cap. |
 
 ## Build flags
 
@@ -458,6 +480,7 @@ Overrides:
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
 | Dev-loop watcher | ✓ | ✓ | ✓ |
+| `--dev` runtime fallback | ✓ | ✓ | ✓ |
 
 ✓ = real implementation. `stub` = the API exists and returns
 `error.Unsupported` so cross-platform call sites compile.

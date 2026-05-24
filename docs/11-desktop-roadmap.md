@@ -12,11 +12,12 @@ Fresh session? Do these four in order before writing code:
    step fails, state matches description no longer — stop and surface
    the drift before proceeding.
 3. **Pick one bundle** from the "Suggested next-session bundles"
-   table. All P1 items (#16–#23) are now closed — see "Done in the
-   2026-05-22 → 2026-05-24 session" below. Remaining work is the
-   #19 HMR follow-up (sub-second reload via runtime disk-read), P2
-   platform ports (Win/Linux `takeSnapshotPng` / dialogs / alerts),
-   and the `webview2.pinned.txt` SHA-512 pin.
+   table. All P1 items (#16–#23) are now closed, the `webview2.pinned.txt`
+   SHA-512 is populated, and the #19 HMR follow-up (`--dev <dir>`
+   runtime disk-read fallback) shipped on 2026-05-24. Remaining work
+   is the P2 platform ports (Win/Linux `takeSnapshotPng` /
+   dialogs / alerts) and the broader P3 backlog (GTK4, menu bars,
+   tray, drag-drop, accessibility, auto-updater).
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
@@ -272,16 +273,17 @@ introduced ES-module syntax or streaming compile against
 require-corp` + `Cross-Origin-Opener-Policy: same-origin` headers in
 `asset_router.zig`.
 
-### ~~#19 — Dev live-reload~~ — DONE 2026-05-24 (process-restart variant)
+### ~~#19 — Dev live-reload~~ — DONE 2026-05-24 (process-restart + runtime fallback)
 
-Shipped as `zig build dev` in the scaffold template. Implementation
-landed on process-restart granularity rather than in-place HMR
-because the scaffold bakes all frontend assets into the binary at
-build time (SSR'd index.html, wasm-compiled client, embedded CSS +
-bridge JS). True HMR would need a runtime disk-read mode where the
-asset router falls back to reading from `frontend/` on cache miss —
-out of scope for this iteration; documented as a follow-up if/when
-a user actually asks for sub-second reload latency.
+Shipped in two passes. Phase 1 was `zig build dev`, a process-restart
+watcher in the scaffold template. Phase 2 (closed same day) added the
+`--dev <dir>` runtime flag: scheme-handler requests check
+`<dir>/<path>` before the embedded asset table, falling through only
+on disk miss. Hand-written frontend assets (`style.css`,
+`verve_desktop.js`, anything you drop into `frontend/`) reload with
+Cmd+R, no rebuild required. Zig source changes still need the
+process-restart watcher because the SSR'd `index.html` and the
+wasm-compiled client are both baked at build time.
 
 What ships today (`templates/desktop/tools/dev.zig`):
 
@@ -380,14 +382,15 @@ now a Level-3 golden-diff harness:
 
 ## Suggested next-session bundles
 
-All P1 items (#16–#23) closed. Remaining work is follow-ups and P2
-platform ports:
+All P1 items (#16–#23) closed; the `webview2.pinned.txt` SHA-512 pin
+and the #19 HMR follow-up (`--dev <dir>` runtime fallback) landed on
+2026-05-24. Remaining work is the P2 platform ports and the P3 backlog:
 
 | Bundle | Items | Best for |
 |---|---|---|
-| **DX polish (HMR upgrade)** | #19 follow-up | Runtime disk-read fallback in `asset_router` so reload is sub-second instead of process-restart. |
-| **P2 port** | #23 Win/Linux | Port `takeSnapshotPng` to WebView2 + WebKitGTK (current macOS impl is the reference). Same shape for the file/save dialog + alert stubs. |
-| **Tech debt** | `webview2.pinned.txt` SHA-512 | Populate the SHA pin after first CI run verifies the published value at the NuGet flatcontainer URL. |
+| **P2 port (snapshot)** | Win/Linux | Port `takeSnapshotPng` to WebView2 + WebKitGTK (macOS impl is the reference). |
+| **P2 port (dialogs+alerts)** | Win/Linux | Port `openFileDialog` / `saveFileDialog` / `showAlert` from the macOS NSPanel impl to Win32 common dialogs + GtkDialog. Stubs return `error.Unsupported` today. |
+| **P3** | GTK4, menu bars, tray, drag-drop, accessibility, auto-updater | See the P2/P3 list above for the full set. |
 
 Pick one. Each remaining bundle is ~2–4 hours focused work plus
 testing.
