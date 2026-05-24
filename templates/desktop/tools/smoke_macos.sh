@@ -1,29 +1,39 @@
 #!/bin/zsh
-# Level-1 smoke harness for the scaffolded desktop app.
+# Level-3 smoke harness for the scaffolded desktop app.
 #
-# Boots the app, waits up to 5 s for its main window to appear,
-# captures a screenshot via macOS `screencapture`, validates that the
-# image is non-trivial, and kills the app. Exits non-zero on any
-# failure so the harness is wirable into CI as `zig build smoke`.
+# The app is launched with `--smoke <dir>`, which makes the bridge JS
+# load `index.html?smoke=1` and drive a deterministic interaction
+# sequence after hydration: click the IPC ping button, click the
+# increment_counter button, then post a `smoke_done` IPC message with
+# a checksum (document.body.innerText.length). The Zig smoke_done
+# handler captures a PNG snapshot of the WKWebView via
+# `Window.takeSnapshotPng`, writes the checksum to `<dir>/checksum.txt`,
+# and terminates the app.
+#
+# This script then diffs the produced checksum against
+# `tests/golden/checksum.txt`. PNG comparison is not enforced (renders
+# vary across machines / macOS versions / display scales); the shot
+# is kept for human inspection.
 #
 # Usage:
 #   tools/smoke_macos.sh <app-binary> [output-dir]
 #
-# Notes:
-#   - Window-id lookup via `osascript` requires Accessibility access
-#     for the calling shell. In CI runners that's typically granted.
-#     If unavailable we fall back to a full-display capture so the
-#     harness still produces something to inspect.
-#   - `screencapture -l <wid>` is the cheapest cross-version way to
-#     target a specific window without depending on PyObjC / Quartz.
+# Exit codes:
+#   0  PASS — checksum matches golden
+#   1  FAIL — checksum mismatch
+#   2  FAIL — no snapshot produced
+#   64 usage error
+#   65 first run — golden captured, commit it
 
 set -euo pipefail
 
 APP="${1:-}"
 OUT_DIR="${2:-./.smoke}"
+GOLDEN_DIR="${SMOKE_GOLDEN_DIR:-./tests/golden}"
 SHOT="$OUT_DIR/shot.png"
-MIN_BYTES="${SMOKE_MIN_BYTES:-5000}"
-WAIT_SECS="${SMOKE_WAIT_SECS:-1.5}"
+CKSUM="$OUT_DIR/checksum.txt"
+GOLDEN_CKSUM="$GOLDEN_DIR/checksum.txt"
+APP_TIMEOUT_SECS="${SMOKE_APP_TIMEOUT:-6}"
 
 if [[ -z "$APP" || ! -x "$APP" ]]; then
   echo "smoke: usage: $0 <app-binary> [output-dir]" >&2
@@ -31,43 +41,47 @@ if [[ -z "$APP" || ! -x "$APP" ]]; then
 fi
 
 mkdir -p "$OUT_DIR"
+rm -f "$SHOT" "$CKSUM"
 
-"$APP" &
+# Run the app under --smoke; it self-terminates when smoke_done fires.
+# Cap with a hard timeout in case the bridge driver hangs before it
+# can post smoke_done.
+"$APP" --smoke "$OUT_DIR" &
 APP_PID=$!
 trap 'kill "$APP_PID" 2>/dev/null || true; wait "$APP_PID" 2>/dev/null || true' EXIT
 
-# Poll for the app's first window. 50 × 100 ms = 5 s budget.
-WID=""
-for _ in $(seq 1 50); do
-  WID=$(osascript -e "tell application \"System Events\" to get id of window 1 of (first process whose unix id is $APP_PID)" 2>/dev/null) || true
-  if [[ -n "$WID" && "$WID" != "0" ]]; then
-    break
+# Poll for completion or timeout.
+DEADLINE=$(($(date +%s) + APP_TIMEOUT_SECS))
+while kill -0 "$APP_PID" 2>/dev/null; do
+  if [[ $(date +%s) -ge $DEADLINE ]]; then
+    echo "smoke: FAIL — app didn't exit within ${APP_TIMEOUT_SECS}s" >&2
+    exit 2
   fi
   sleep 0.1
 done
+wait "$APP_PID" 2>/dev/null || true
 
-# Give WebKit a beat to paint the initial page before sampling.
-sleep "$WAIT_SECS"
-
-if [[ -n "$WID" && "$WID" != "0" ]]; then
-  echo "smoke: capturing window id=$WID"
-  screencapture -x -o -l "$WID" "$SHOT"
-else
-  echo "smoke: no window id (Accessibility denied?) — falling back to main display" >&2
-  screencapture -x -o "$SHOT"
-fi
-
-if [[ ! -f "$SHOT" ]]; then
-  echo "smoke: FAIL — screencapture produced no file." >&2
-  echo "       Grant 'Screen Recording' permission to the terminal /" >&2
-  echo "       runner under System Settings → Privacy & Security." >&2
+if [[ ! -f "$SHOT" || ! -f "$CKSUM" ]]; then
+  echo "smoke: FAIL — smoke artifacts missing (shot.png and/or checksum.txt)" >&2
+  echo "       Check console output for snapshot/IPC errors." >&2
   exit 2
 fi
 
-SIZE=$(stat -f%z "$SHOT")
-if (( SIZE < MIN_BYTES )); then
-  echo "smoke: FAIL — capture too small ($SIZE B < $MIN_BYTES)" >&2
+# First run: capture the golden + tell the caller to commit it.
+if [[ ! -f "$GOLDEN_CKSUM" ]]; then
+  mkdir -p "$GOLDEN_DIR"
+  cp "$CKSUM" "$GOLDEN_CKSUM"
+  cp "$SHOT" "$GOLDEN_DIR/shot.png"
+  echo "smoke: captured initial golden at $GOLDEN_DIR; commit it" >&2
+  exit 65
+fi
+
+ACTUAL=$(cat "$CKSUM")
+EXPECTED=$(cat "$GOLDEN_CKSUM")
+if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+  echo "smoke: FAIL — checksum mismatch (actual=$ACTUAL expected=$EXPECTED)" >&2
+  echo "       Compare $SHOT vs $GOLDEN_DIR/shot.png by eye." >&2
   exit 1
 fi
 
-echo "smoke: PASS — $SHOT ($SIZE B)"
+echo "smoke: PASS — checksum=$ACTUAL matches golden ($GOLDEN_CKSUM)"

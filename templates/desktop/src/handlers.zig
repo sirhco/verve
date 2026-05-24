@@ -17,6 +17,13 @@ const RouterCtx = struct {
     window: *desktop.Window,
     assets: []const desktop.AssetEntry,
     child_window: ?desktop.Window = null,
+    /// Output directory for the smoke harness. Null in normal runs;
+    /// the smoke_done route writes shot.png + checksum.txt here when
+    /// set, then terminates the app.
+    smoke_dir: ?[]const u8 = null,
+    /// std.Io handle plumbed from main, used by handlers that touch
+    /// the filesystem (smoke_done writes checksum.txt via it).
+    io: std.Io,
 };
 
 var ctx: RouterCtx = undefined;
@@ -25,8 +32,8 @@ const Router = desktop.Router(RouterCtx, Routes);
 
 pub const onMessage = Router.dispatch;
 
-pub fn attach(window: *desktop.Window, assets: []const desktop.AssetEntry) *RouterCtx {
-    ctx = .{ .window = window, .assets = assets };
+pub fn attach(window: *desktop.Window, assets: []const desktop.AssetEntry, smoke_dir: ?[]const u8, io: std.Io) *RouterCtx {
+    ctx = .{ .window = window, .assets = assets, .smoke_dir = smoke_dir, .io = io };
     return &ctx;
 }
 
@@ -111,6 +118,46 @@ const Routes = struct {
                 .initial_path = "index.html",
                 .scheme = "verve",
             });
+            return .{ .ok = true };
+        }
+    };
+
+    /// Level-3 smoke handler. Fired by the bridge's smoke driver after
+    /// the page is fully hydrated. Captures a PNG snapshot + writes
+    /// a checksum file, then terminates the app so the build step's
+    /// `diff` and `compare` commands can run against the golden.
+    pub const smoke_done = struct {
+        pub const Args = struct { checksum: i64 = 0 };
+        pub const Reply = struct { ok: bool };
+        pub fn handle(c: *RouterCtx, alloc: std.mem.Allocator, args: Args) !Reply {
+            const dir = c.smoke_dir orelse {
+                std.log.warn("smoke_done: no smoke_dir set; ignoring", .{});
+                return .{ .ok = false };
+            };
+
+            const png_path = try std.fs.path.join(alloc, &.{ dir, "shot.png" });
+            defer alloc.free(png_path);
+            const cksum_path = try std.fs.path.join(alloc, &.{ dir, "checksum.txt" });
+            defer alloc.free(cksum_path);
+
+            c.window.takeSnapshotPng(png_path) catch |err| {
+                std.log.err("smoke_done: snapshot failed: {s}", .{@errorName(err)});
+                c.window.terminate();
+                return .{ .ok = false };
+            };
+
+            // Write checksum as a single base-10 line (matches the
+            // golden format the build step diffs against).
+            const cksum_bytes = try std.fmt.allocPrint(alloc, "{d}\n", .{args.checksum});
+            defer alloc.free(cksum_bytes);
+            std.Io.Dir.cwd().writeFile(c.io, .{ .sub_path = cksum_path, .data = cksum_bytes }) catch |err| {
+                std.log.err("smoke_done: checksum write failed: {s}", .{@errorName(err)});
+                c.window.terminate();
+                return .{ .ok = false };
+            };
+
+            std.log.info("smoke_done: shot.png + checksum.txt written to '{s}'", .{dir});
+            c.window.terminate();
             return .{ .ok = true };
         }
     };

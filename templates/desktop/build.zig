@@ -255,7 +255,10 @@ pub fn build(b: *std.Build) void {
             const smoke = b.addSystemCommand(&.{ "sh", "tools/smoke_macos.sh" });
             smoke.addArtifactArg(exe);
             smoke.step.dependOn(b.getInstallStep());
-            const smoke_step = b.step("smoke", "Boot the app, screenshot it, validate capture (macOS)");
+            const smoke_step = b.step(
+                "smoke",
+                "Level-3 smoke (macOS): run app under --smoke, diff checksum vs tests/golden",
+            );
             smoke_step.dependOn(&smoke.step);
         },
         .linux => {

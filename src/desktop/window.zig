@@ -27,6 +27,7 @@ pub const AlertStyle = options.AlertStyle;
 pub const DialogError = options.DialogError;
 pub const Cookie = options.Cookie;
 pub const CookieError = options.CookieError;
+pub const SnapshotError = options.SnapshotError;
 pub const SameSite = options.SameSite;
 pub const CookieStore = cookies.CookieStore;
 
@@ -60,6 +61,7 @@ comptime {
         "showAlert",
         "openChildWindow",
         "cookies",
+        "takeSnapshotPng",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

@@ -286,6 +286,59 @@ pub const Window = struct {
         return .{ .window = @ptrCast(self) };
     }
 
+    /// Render a PNG snapshot of the current WKWebView contents to
+    /// `path` on disk. Sync-blocks on a nested NSRunLoop pump until the
+    /// completion handler fires, then encodes the NSImage via
+    /// NSBitmapImageRep and writes via `[NSData writeToFile:atomically:]`.
+    /// Used by the Level-3 smoke harness for golden-diff CI.
+    pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
+        var image: ?id = null;
+        var done = false;
+        var block: SnapshotBlock = .{
+            .isa = &_NSConcreteStackBlock,
+            .flags = 0,
+            .reserved = 0,
+            .invoke = &snapshotBlockInvoke,
+            .descriptor = &snapshot_block_desc,
+            .out_image = &image,
+            .done = &done,
+        };
+        // Pass nil config — defaults to the whole web view bounds at
+        // the device's native pixel scale.
+        const takeSnapshot = m.cast(*const fn (id, SEL, ?id, *SnapshotBlock) callconv(.c) void);
+        takeSnapshot(self.webview, m.sel("takeSnapshotWithConfiguration:completionHandler:"), null, &block);
+        pumpUntilDone(&done);
+
+        const ns_image = image orelse return opts_mod.SnapshotError.CaptureFailed;
+        const release = m.cast(*const fn (id, SEL) callconv(.c) void);
+        defer release(ns_image, m.sel("release"));
+
+        // NSImage → TIFF → NSBitmapImageRep → PNG NSData.
+        const tiffSel = m.cast(*const fn (id, SEL) callconv(.c) id);
+        const tiff = tiffSel(ns_image, m.sel("TIFFRepresentation"));
+        if (@intFromPtr(tiff) == 0) return opts_mod.SnapshotError.EncodeFailed;
+
+        const NSBitmapImageRep = m.getClass("NSBitmapImageRep");
+        const imageRepWithData = m.cast(*const fn (id, SEL, id) callconv(.c) id);
+        const rep = imageRepWithData(@as(id, @ptrCast(NSBitmapImageRep)), m.sel("imageRepWithData:"), tiff);
+        if (@intFromPtr(rep) == 0) return opts_mod.SnapshotError.EncodeFailed;
+
+        // Empty NSDictionary singleton for properties.
+        const NSDictionary = m.getClass("NSDictionary");
+        const dictionarySel = m.cast(*const fn (id, SEL) callconv(.c) id);
+        const empty_dict = dictionarySel(@as(id, @ptrCast(NSDictionary)), m.sel("dictionary"));
+
+        // NSBitmapImageFileTypePNG = 4 (NSPNGFileType enum value).
+        const NS_BITMAP_FILE_TYPE_PNG: u64 = 4;
+        const representationUsingType = m.cast(*const fn (id, SEL, u64, id) callconv(.c) id);
+        const png_data = representationUsingType(rep, m.sel("representationUsingType:properties:"), NS_BITMAP_FILE_TYPE_PNG, empty_dict);
+        if (@intFromPtr(png_data) == 0) return opts_mod.SnapshotError.EncodeFailed;
+
+        const writeToFile = m.cast(*const fn (id, SEL, id, bool) callconv(.c) bool);
+        const ok = writeToFile(png_data, m.sel("writeToFile:atomically:"), nsString(path), true);
+        if (!ok) return opts_mod.SnapshotError.WriteFailed;
+    }
+
     pub fn run(self: *Window) void {
         const activate = m.cast(*const fn (id, SEL, bool) callconv(.c) void);
         activate(self.app, m.sel("activateIgnoringOtherApps:"), true);
@@ -698,6 +751,7 @@ const BlockDescriptor = extern struct {
 
 const get_all_block_desc: BlockDescriptor = .{ .size = @sizeOf(GetAllBlock) };
 const void_block_desc: BlockDescriptor = .{ .size = @sizeOf(VoidBlock) };
+const snapshot_block_desc: BlockDescriptor = .{ .size = @sizeOf(SnapshotBlock) };
 
 const GetAllBlock = extern struct {
     isa: *const anyopaque,
@@ -728,6 +782,29 @@ fn getAllBlockInvoke(block: *GetAllBlock, cookies_arr: id) callconv(.c) void {
 }
 
 fn voidBlockInvoke(block: *VoidBlock) callconv(.c) void {
+    block.done.* = true;
+}
+
+/// Completion block for `WKWebView.takeSnapshotWithConfiguration:completionHandler:`.
+/// Two-arg signature: (NSImage*, NSError*). We retain the NSImage so
+/// it outlives the block frame; error is ignored — the caller infers
+/// failure from `out_image == null`.
+const SnapshotBlock = extern struct {
+    isa: *const anyopaque,
+    flags: c_int,
+    reserved: c_int,
+    invoke: *const fn (*SnapshotBlock, id, ?id) callconv(.c) void,
+    descriptor: *const BlockDescriptor,
+    out_image: *?id,
+    done: *bool,
+};
+
+fn snapshotBlockInvoke(block: *SnapshotBlock, image: id, err: ?id) callconv(.c) void {
+    _ = err;
+    const retain = m.cast(*const fn (id, SEL) callconv(.c) id);
+    if (@intFromPtr(image) != 0) {
+        block.out_image.* = retain(image, m.sel("retain"));
+    }
     block.done.* = true;
 }
 

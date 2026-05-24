@@ -15,6 +15,7 @@
         "frontend",
         "public",
         "tools",
+        "tests",
         "LICENSE",
     },
 }

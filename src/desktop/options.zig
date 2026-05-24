@@ -91,6 +91,16 @@ pub const CookieError = error{
     Backend,
 };
 
+pub const SnapshotError = error{
+    Unsupported,
+    /// Snapshot capture returned without an image (timeout / view not ready / GPU issue).
+    CaptureFailed,
+    /// PNG encoding via platform image API failed.
+    EncodeFailed,
+    /// Write to disk failed (permissions / disk full / invalid path).
+    WriteFailed,
+};
+
 /// Construction parameters for `Window.init`. The platform layer
 /// captures these by value during init; later changes need explicit
 /// setter calls (`setTitle`, `loadUrl`, …).

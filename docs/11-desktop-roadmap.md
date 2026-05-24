@@ -315,24 +315,36 @@ in sync facades (NSRunLoop pump on macOS, Win32 message pump on
 Windows, GMainContext iteration on Linux). macOS validated live;
 Win/Linux compile-clean cross-compile.
 
-### #23 — Level 3 smoke (macOS) (~260 LOC)
+### ~~#23 — Level 3 smoke (macOS)~~ — DONE 2026-05-24
 
-In-process snapshot + IPC checksum for golden-diff CI:
+Shipped end-to-end. The desktop scaffold's `zig build smoke` step is
+now a Level-3 golden-diff harness:
 
-- App `--smoke <dir>` flag, parsed in template `main.zig`.
-- Second `WKUserScript` injected only in smoke mode: clicks `#ping`,
-  computes `document.body.innerText.length`, posts
-  `{type:"smoke_done", checksum, …}`.
-- `handlers.zig` smoke routing: receive → `Window.takeSnapshotPng(path)`
-  → write `checksum.txt` → `Window.terminate()`.
-- macos.zig: `takeSnapshotPng` via
-  `WKWebView.takeSnapshotWithConfiguration:completionHandler:`.
-  Completion handler is an Objective-C block — needs an NSBlock
-  impostor struct (`isa`, `flags`, `reserved`, `invoke`, `descriptor`).
-  ~30 LOC of plumbing; standard `_NSConcreteGlobalBlock` pattern.
-- `zig build smoke` step chains: build → run with `--smoke .smoke` →
-  `diff` checksum vs golden + `compare -metric AE` PNG vs golden.
-- Capture initial goldens, commit under `tests/golden/`.
+- `Window.takeSnapshotPng(path)` lives on the cross-platform surface
+  (Win/Linux stubs return `error.Unsupported`). macOS impl uses
+  `WKWebView.takeSnapshotWithConfiguration:completionHandler:` with
+  an `_NSConcreteStackBlock` impostor (`SnapshotBlock`) + the existing
+  `pumpUntilDone` nested NSRunLoop pump, then NSImage →
+  NSBitmapImageRep → PNG → `writeToFile:atomically:`.
+- Template `main.zig` parses `--smoke <dir>`; when set, overrides
+  `initial_path` to `index.html?smoke=1` so the bridge driver wakes up.
+- `frontend/verve_desktop.js` smoke driver runs after hydration:
+  clicks `#ping`, clicks the `increment_counter` button, then posts
+  `{ type: "smoke_done", checksum: document.body.innerText.length }`
+  via the existing IPC channel.
+- `handlers.zig` `smoke_done` route: `takeSnapshotPng` →
+  `writeFile(checksum.txt)` → `Window.terminate()`.
+- `tools/smoke_macos.sh` runs the app with `--smoke .smoke`, polls
+  for self-exit, diffs `.smoke/checksum.txt` against
+  `tests/golden/checksum.txt`. PNG comparison intentionally NOT
+  enforced (renders are display/font/scale-dependent); shot kept for
+  human inspection.
+- `tests/golden/checksum.txt` baked into scaffold template
+  (default = "284"). First-run fallback in script captures + exits
+  65 with "commit it" message.
+- Cross-platform: macOS only. Win/Linux smoke scripts still live but
+  call into stubs — port follows the same shape once those backends
+  get `takeSnapshotPng` real impls.
 
 ### Out of P1 scope (P2/P3)
 
@@ -355,7 +367,7 @@ In-process snapshot + IPC checksum for golden-diff CI:
 |---|---|---|
 | **Verve integration** | #18 (SSR + WASM hydration in scaffold) | Biggest remaining UX win. Bigger than original estimate — see "Note (2026-05-24 session)" above for the J1/J2/J3 split. |
 | **DX polish** | #19 | Live reload watcher (~150 LOC). |
-| **Test infrastructure** | #23 | Golden-diff smoke — unblocks CI confidence on macOS first, then port. |
+| **P2 port** | #23 Win/Linux | Port `takeSnapshotPng` to WebView2 + WebKitGTK (current macOS impl is the reference). |
 
 Pick one. Each remaining bundle is ~2–4 hours focused work plus
 testing.

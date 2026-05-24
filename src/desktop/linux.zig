@@ -414,6 +414,12 @@ pub const Window = struct {
         _ = opts;
         return 0;
     }
+
+    pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
+        _ = self;
+        _ = path;
+        return opts_mod.SnapshotError.Unsupported;
+    }
 };
 
 // ---- GTK signal trampolines -------------------------------------------------

@@ -90,22 +90,39 @@ Once `verve.Signal` is exposed for `wasm32-freestanding`, the
 `verve_hydrate` body becomes the place to register signals + on_set
 hooks for fine-grained updates.
 
-## Smoke test (macOS)
+## Smoke test (macOS — Level-3)
 
 ```sh
 zig build smoke
 ```
 
-Launches the app, waits for its window to appear, captures a
-screenshot to `./.smoke/shot.png`, and validates the image is
-non-trivial. The `osascript` window-id lookup needs Accessibility
-access; the screenshot itself needs Screen Recording permission. Grant
-both to the terminal (or CI runner) under
-**System Settings → Privacy & Security**.
+End-to-end golden-diff harness. The app is launched with
+`--smoke ./.smoke`, which makes the bridge JS load
+`index.html?smoke=1` and run a deterministic interaction sequence
+after hydration (click `#ping`, click `+`, compute
+`document.body.innerText.length`). The `smoke_done` IPC handler:
 
-Override via env vars:
-- `SMOKE_MIN_BYTES` — minimum acceptable PNG size (default 5000)
-- `SMOKE_WAIT_SECS` — paint settling delay (default 1.5)
+1. Captures a PNG snapshot of the WKWebView via
+   `Window.takeSnapshotPng` (uses
+   `WKWebView.takeSnapshotWithConfiguration:completionHandler:`).
+2. Writes the checksum to `./.smoke/checksum.txt`.
+3. Terminates the app.
+
+The script then diffs the checksum against `tests/golden/checksum.txt`.
+PNG comparison is not enforced — renders vary by display scale /
+macOS version / installed fonts — but the snapshot is kept under
+`./.smoke/shot.png` for eyeballing on failure.
+
+First-run capture: if `tests/golden/checksum.txt` is missing, the
+script copies the freshly-captured checksum + PNG into
+`tests/golden/`, exits 65, and prints "commit it." The scaffolded
+template already ships a default golden (checksum=284 for the demo
+markup); update it when you change `src/components.zig` enough to
+shift the DOM text length.
+
+Overrides:
+- `SMOKE_GOLDEN_DIR` — alternate golden directory (default `./tests/golden`)
+- `SMOKE_APP_TIMEOUT` — seconds to wait for app exit (default 6)
 - second arg — output directory (default `./.smoke`)
 
 ## IPC

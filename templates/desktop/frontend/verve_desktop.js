@@ -121,4 +121,29 @@
       console.warn("verve: no wasm export for action", action);
     }
   });
+
+  // ---- Level-3 smoke driver ---------------------------------------------
+  // The Zig main.zig --smoke flag loads the page as `index.html?smoke=1`
+  // so we don't need an extra global / build-time flag. After hydration
+  // we drive a deterministic interaction sequence, compute a checksum
+  // of the resulting DOM text, and call the smoke_done IPC route. The
+  // Zig handler then captures a PNG snapshot, writes the checksum, and
+  // terminates the app so the build step can diff against goldens.
+  if (location.search.includes("smoke=1")) {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    (async () => {
+      try {
+        await sleep(300);
+        document.getElementById("ping")?.click();
+        document
+          .querySelector('[z-on-click="increment_counter"]')
+          ?.click();
+        await sleep(300);
+        const checksum = document.body.innerText.length;
+        await window.verve.request({ type: "smoke_done", checksum: checksum });
+      } catch (err) {
+        console.error("smoke driver failed:", err);
+      }
+    })();
+  }
 })();
