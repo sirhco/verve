@@ -476,7 +476,7 @@ Overrides:
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | — | — |
-| Window snapshot (PNG) | ✓ | stub | stub |
+| Window snapshot (PNG) | ✓ | ✓ | ✓ |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
 | Dev-loop watcher | ✓ | ✓ | ✓ |

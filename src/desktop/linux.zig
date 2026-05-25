@@ -28,6 +28,8 @@ const GtkFileChooserNative = opaque {};
 const GtkNativeDialog = opaque {};
 const GtkMessageDialog = opaque {};
 const GtkFileFilter = opaque {};
+const CairoSurface = opaque {};
+const GCancellable = opaque {};
 const WebKitWebView = opaque {};
 const WebKitWebContext = opaque {};
 const WebKitUserContentManager = opaque {};
@@ -136,6 +138,39 @@ extern fn gtk_message_dialog_new(
 extern fn gtk_message_dialog_set_markup(dialog: *GtkMessageDialog, str: [*:0]const u8) void;
 extern fn gtk_dialog_add_button(dialog: *GtkDialog, text: [*:0]const u8, response_id: c_int) *GtkWidget;
 extern fn gtk_dialog_run(dialog: *GtkDialog) c_int;
+
+// ---- Snapshot externs (used by takeSnapshotPng) ----------------------------
+//
+// `webkit_web_view_get_snapshot` is async — the standard
+// `g_main_context_iteration` pump wraps it sync (same shape as the
+// cookie-store getters). `cairo_surface_write_to_png` handles the
+// PNG encoding inline so no third-party encoder dependency lands in
+// the linker line.
+
+const WebKitSnapshotRegion = c_uint;
+const WebKitSnapshotOptions = c_uint;
+const CairoStatus = c_int;
+
+const WEBKIT_SNAPSHOT_REGION_VISIBLE: WebKitSnapshotRegion = 0;
+const WEBKIT_SNAPSHOT_OPTIONS_NONE: WebKitSnapshotOptions = 0;
+const CAIRO_STATUS_SUCCESS: CairoStatus = 0;
+
+extern fn webkit_web_view_get_snapshot(
+    web_view: *WebKitWebView,
+    region: WebKitSnapshotRegion,
+    options: WebKitSnapshotOptions,
+    cancellable: ?*GCancellable,
+    callback: GAsyncReadyCallback,
+    user_data: ?*anyopaque,
+) void;
+extern fn webkit_web_view_get_snapshot_finish(
+    web_view: *WebKitWebView,
+    result: *GAsyncResult,
+    err: ?*?*GError,
+) ?*CairoSurface;
+
+extern fn cairo_surface_write_to_png(surface: *CairoSurface, filename: [*:0]const u8) CairoStatus;
+extern fn cairo_surface_destroy(surface: *CairoSurface) void;
 
 extern fn g_signal_connect_data(
     instance: ?*anyopaque,
@@ -520,10 +555,36 @@ pub const Window = struct {
         return @intCast(response);
     }
 
+    /// Capture the visible WebView region as PNG via
+    /// `webkit_web_view_get_snapshot` (async, sync-wrapped through a
+    /// GMainContext pump) + `cairo_surface_write_to_png`. Same shape
+    /// as the macOS NSImage path; output is byte-for-byte deterministic
+    /// for a given DOM render at a given device pixel ratio, so it
+    /// plugs into the existing Level-3 golden-diff harness once the
+    /// Linux smoke runner exists.
     pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
-        _ = self;
-        _ = path;
-        return opts_mod.SnapshotError.Unsupported;
+        const wv = self.ctx.webview orelse return opts_mod.SnapshotError.Unsupported;
+
+        var cell: SnapshotCell = .{};
+        webkit_web_view_get_snapshot(
+            wv,
+            WEBKIT_SNAPSHOT_REGION_VISIBLE,
+            WEBKIT_SNAPSHOT_OPTIONS_NONE,
+            null,
+            onSnapshotDone,
+            @ptrCast(&cell),
+        );
+        pumpMainContextUntilDone(&cell.done);
+
+        const result = cell.result orelse return opts_mod.SnapshotError.CaptureFailed;
+        const surface = webkit_web_view_get_snapshot_finish(wv, result, null) orelse return opts_mod.SnapshotError.CaptureFailed;
+        defer cairo_surface_destroy(surface);
+
+        const path_z = self.ctx.allocator.dupeZ(u8, path) catch return opts_mod.SnapshotError.WriteFailed;
+        defer self.ctx.allocator.free(path_z);
+        if (cairo_surface_write_to_png(surface, path_z.ptr) != CAIRO_STATUS_SUCCESS) {
+            return opts_mod.SnapshotError.WriteFailed;
+        }
     }
 };
 
@@ -712,6 +773,17 @@ fn onGetAllCookiesDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaq
 
 fn onSimpleAsyncDone(_: ?*anyopaque, _: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     const cell: *SimpleAsyncCell = @ptrCast(@alignCast(user_data orelse return));
+    cell.done = true;
+}
+
+const SnapshotCell = extern struct {
+    result: ?*GAsyncResult = null,
+    done: bool = false,
+};
+
+fn onSnapshotDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *SnapshotCell = @ptrCast(@alignCast(user_data orelse return));
+    cell.result = res;
     cell.done = true;
 }
 

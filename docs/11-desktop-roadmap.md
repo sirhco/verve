@@ -14,10 +14,11 @@ Fresh session? Do these four in order before writing code:
 3. **Pick one bundle** from the "Suggested next-session bundles"
    table. All P1 items (#16–#23) are now closed, the `webview2.pinned.txt`
    SHA-512 is populated, the #19 HMR follow-up (`--dev <dir>` runtime
-   disk-read fallback) shipped on 2026-05-24, and Win/Linux
-   `openFileDialog` / `saveFileDialog` / `showAlert` ports landed the
-   same day. Remaining work is the Win/Linux `takeSnapshotPng` port
-   and the broader P3 backlog (GTK4, menu bars, tray, drag-drop,
+   disk-read fallback) shipped on 2026-05-24, all P2 platform ports
+   (Win/Linux dialogs + alerts + snapshot) landed the same day, and
+   the cross-platform support matrix is full ✓ for every surface
+   except the explicitly-P3-only items. Remaining work is the P3
+   backlog (GTK4, native menu bars on Win/Linux, tray, drag-drop,
    accessibility, auto-updater).
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
@@ -383,15 +384,16 @@ now a Level-3 golden-diff harness:
 
 ## Suggested next-session bundles
 
-All P1 items (#16–#23) closed; the `webview2.pinned.txt` SHA-512 pin
-and the #19 HMR follow-up (`--dev <dir>` runtime fallback) landed on
-2026-05-24, and the P2 dialogs+alerts port followed the same day.
-Remaining work is the snapshot port and the broader P3 backlog:
+All P1 items (#16–#23) closed; the `webview2.pinned.txt` SHA-512 pin,
+the #19 HMR follow-up (`--dev <dir>` runtime fallback), the P2
+dialogs+alerts port, and the P2 snapshot port all landed on
+2026-05-24. Remaining work is the broader P3 backlog:
 
 | Bundle | Items | Best for |
 |---|---|---|
-| **P2 port (snapshot)** | Win/Linux | Port `takeSnapshotPng` to WebView2 + WebKitGTK (macOS impl is the reference). |
-| **P3** | GTK4, menu bars, tray, drag-drop, accessibility, auto-updater | See the P2/P3 list above for the full set. |
+| **P3 GTK4** | GTK4 + WebKitGTK 6.0 behind `-Dgtk4` | Future-proofing once Ubuntu LTS / Fedora ship GTK4 webkit by default. |
+| **P3 menu bars** | Win/Linux native menus | Tray-adjacent feature; current `install_default_menu` is macOS-only. |
+| **P3 misc** | Tray icons, drag-drop, clipboard, deep-link URLs, single-instance, app icons, accessibility, auto-updater | Each is a self-contained bundle; see the P2/P3 list above. |
 
 Pick one. Each remaining bundle is ~2–4 hours focused work plus
 testing.

@@ -184,8 +184,101 @@ const WM_CLOSE: UINT = 0x0010;
 extern "ole32" fn CoTaskMemFree(p: LPVOID) callconv(.winapi) void;
 extern "shlwapi" fn SHCreateMemStream(bytes: ?[*]const u8, size: UINT) callconv(.winapi) ?*IStream;
 
-// IStream is opaque to us — we only hand the pointer to WebView2.
-const IStream = opaque {};
+// `CapturePreview` writes through a writable IStream. `shlwapi`'s
+// `SHCreateStreamOnHGlobal(NULL, TRUE, &stream)` allocates a growable
+// HGLOBAL-backed stream that releases its memory when the stream's
+// refcount hits zero. Caller reads back via IStream::Stat + Seek +
+// Read.
+extern "shlwapi" fn SHCreateStreamOnHGlobal(
+    hGlobal: ?*anyopaque,
+    fDeleteOnRelease: BOOL,
+    ppstm: *?*IStreamW,
+) callconv(.winapi) HRESULT;
+
+// IStream we DO consume directly (Stat / Seek / Read) — needs a real
+// vtable layout. `IStream` (consumer-named `IStreamW` to avoid colliding
+// with the opaque WebView2-only alias above) extends ISequentialStream
+// which extends IUnknown.
+const IStreamW = extern struct { lpVtbl: *const anyopaque };
+
+const SLOT_IStream_Read: usize = 3;
+const SLOT_IStream_Seek: usize = 5;
+const SLOT_IStream_Stat: usize = 11;
+
+const STREAM_SEEK_SET: DWORD = 0;
+const STATFLAG_NONAME: DWORD = 1;
+
+const STATSTG = extern struct {
+    pwcsName: LPWSTR = null,
+    type: DWORD = 0,
+    cbSize: u64 = 0,
+    mtime: extern struct { lo: DWORD = 0, hi: DWORD = 0 } = .{},
+    ctime: extern struct { lo: DWORD = 0, hi: DWORD = 0 } = .{},
+    atime: extern struct { lo: DWORD = 0, hi: DWORD = 0 } = .{},
+    grfMode: DWORD = 0,
+    grfLocksSupported: DWORD = 0,
+    clsid: GUID = .{ .Data1 = 0, .Data2 = 0, .Data3 = 0, .Data4 = .{ 0, 0, 0, 0, 0, 0, 0, 0 } },
+    grfStateBits: DWORD = 0,
+    reserved: DWORD = 0,
+};
+
+// IStream is opaque to us when handed to WebView2's CapturePreview —
+// we only need the pointer round-tripped. The IStreamW alias above is
+// for the cases where we DO call into the vtable.
+const IStream = IStreamW;
+
+const HANDLE = ?*opaque {};
+const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+
+const GENERIC_WRITE: DWORD = 0x40000000;
+const CREATE_ALWAYS: DWORD = 2;
+const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
+const FILE_SHARE_READ: DWORD = 0x01;
+
+extern "kernel32" fn CreateFileW(
+    name: LPCWSTR,
+    access: DWORD,
+    share: DWORD,
+    sec: ?*anyopaque,
+    creation: DWORD,
+    flags: DWORD,
+    template: HANDLE,
+) callconv(.winapi) HANDLE;
+extern "kernel32" fn WriteFile(
+    handle: HANDLE,
+    buffer: ?[*]const u8,
+    bytes_to_write: DWORD,
+    bytes_written: *DWORD,
+    overlapped: ?*anyopaque,
+) callconv(.winapi) BOOL;
+extern "kernel32" fn CloseHandle(handle: HANDLE) callconv(.winapi) BOOL;
+
+// ---- WebView2 CapturePreview completion handler -----------------------------
+//
+// IID for `ICoreWebView2CapturePreviewCompletedHandler` from the SDK
+// idl. Required for `QueryInterface`. We hardcode it the same way the
+// cookie/env handlers do.
+const IID_CapturePreviewCompleted: GUID = .{
+    .Data1 = 0x697E05E9,
+    .Data2 = 0x3D8F,
+    .Data3 = 0x45FA,
+    .Data4 = .{ 0x96, 0x04, 0x28, 0x21, 0x47, 0xE4, 0xCE, 0x05 },
+};
+
+const ICapturePreviewCompletedHandlerVtbl = extern struct {
+    QueryInterface: *const fn (?*const ICapturePreviewCompletedHandler, *const IID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (?*const ICapturePreviewCompletedHandler) callconv(.winapi) ULONG,
+    Release: *const fn (?*const ICapturePreviewCompletedHandler) callconv(.winapi) ULONG,
+    Invoke: *const fn (?*const ICapturePreviewCompletedHandler, HRESULT) callconv(.winapi) HRESULT,
+};
+
+const ICapturePreviewCompletedHandler = extern struct {
+    lpVtbl: *const ICapturePreviewCompletedHandlerVtbl,
+    done: *bool,
+    error_code: *HRESULT,
+};
+
+const COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG: c_int = 0;
 
 // ---- WebView2 loader entry --------------------------------------------------
 
@@ -227,6 +320,10 @@ const SLOT_WV2_Navigate: usize = 5;
 const SLOT_WV2_NavigateToString: usize = 6;
 const SLOT_WV2_AddScriptToExecuteOnDocumentCreated: usize = 27;
 const SLOT_WV2_ExecuteScript: usize = 29;
+/// `CapturePreview(format, IStream*, completionHandler)` —
+/// ICoreWebView2 slot 30 per WebView2.h. PNG encoder is built into
+/// the runtime; output goes into the supplied stream.
+const SLOT_WV2_CapturePreview: usize = 30;
 const SLOT_WV2_add_WebMessageReceived: usize = 34;
 const SLOT_WV2_add_WebResourceRequested: usize = 52;
 const SLOT_WV2_AddWebResourceRequestedFilter: usize = 54;
@@ -608,10 +705,85 @@ pub const Window = struct {
         };
     }
 
+    /// Capture the WebView2 contents as PNG. The runtime exposes the
+    /// PNG encoder via `ICoreWebView2::CapturePreview`, which writes
+    /// into a caller-supplied IStream and signals completion through
+    /// a COM handler. Sync-wrap with a nested Win32 message pump —
+    /// same pattern as the cookie store and the original macOS
+    /// snapshot path. Reads the resulting stream into a buffer and
+    /// writes it to disk with `CreateFileW` + `WriteFile`.
     pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
-        _ = self;
-        _ = path;
-        return opts_mod.SnapshotError.Unsupported;
+        const wv = self.ctx.webview orelse return opts_mod.SnapshotError.Unsupported;
+
+        var stream: ?*IStreamW = null;
+        // SHCreateStreamOnHGlobal(NULL, TRUE, ...) gives us a growable
+        // HGLOBAL-backed stream that frees its memory on Release.
+        if (SHCreateStreamOnHGlobal(null, 1, &stream) < 0) return opts_mod.SnapshotError.CaptureFailed;
+        const stm = stream orelse return opts_mod.SnapshotError.CaptureFailed;
+        defer releaseRef(@ptrCast(stm));
+
+        var done = false;
+        var err: HRESULT = 0;
+        var handler: ICapturePreviewCompletedHandler = .{
+            .lpVtbl = &capture_preview_handler_vtbl,
+            .done = &done,
+            .error_code = &err,
+        };
+
+        const capture = vtSlot(
+            *const fn (*Wv2, c_int, ?*IStreamW, *const ICapturePreviewCompletedHandler) callconv(.winapi) HRESULT,
+            wv.lpVtbl,
+            SLOT_WV2_CapturePreview,
+        );
+        const hr = capture(wv, COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, stm, &handler);
+        if (hr < 0) return opts_mod.SnapshotError.CaptureFailed;
+
+        pumpMsgUntilDone(&done);
+        if (err < 0) return opts_mod.SnapshotError.CaptureFailed;
+
+        // Read stream into a heap buffer. Stat → Seek(0) → Read.
+        var stat: STATSTG = .{};
+        const istat = vtSlot(*const fn (*IStreamW, *STATSTG, DWORD) callconv(.winapi) HRESULT, stm.lpVtbl, SLOT_IStream_Stat);
+        if (istat(stm, &stat, STATFLAG_NONAME) < 0) return opts_mod.SnapshotError.EncodeFailed;
+        if (stat.cbSize == 0) return opts_mod.SnapshotError.EncodeFailed;
+        if (stat.cbSize > std.math.maxInt(usize)) return opts_mod.SnapshotError.EncodeFailed;
+
+        const iseek = vtSlot(*const fn (*IStreamW, i64, DWORD, ?*u64) callconv(.winapi) HRESULT, stm.lpVtbl, SLOT_IStream_Seek);
+        if (iseek(stm, 0, STREAM_SEEK_SET, null) < 0) return opts_mod.SnapshotError.EncodeFailed;
+
+        const size: usize = @intCast(stat.cbSize);
+        const buf = self.ctx.allocator.alloc(u8, size) catch return opts_mod.SnapshotError.EncodeFailed;
+        defer self.ctx.allocator.free(buf);
+
+        const iread = vtSlot(*const fn (*IStreamW, ?[*]u8, DWORD, ?*DWORD) callconv(.winapi) HRESULT, stm.lpVtbl, SLOT_IStream_Read);
+        var read_total: usize = 0;
+        while (read_total < size) {
+            const chunk: DWORD = @intCast(@min(@as(usize, std.math.maxInt(DWORD)), size - read_total));
+            var got: DWORD = 0;
+            if (iread(stm, buf.ptr + read_total, chunk, &got) < 0) return opts_mod.SnapshotError.EncodeFailed;
+            if (got == 0) break;
+            read_total += got;
+        }
+        if (read_total != size) return opts_mod.SnapshotError.EncodeFailed;
+
+        // Write to disk via Win32. UTF-8 → UTF-16, CreateFileW, WriteFile.
+        var path_w: [1024]u16 = undefined;
+        const w_len = std.unicode.utf8ToUtf16Le(&path_w, path) catch return opts_mod.SnapshotError.WriteFailed;
+        if (w_len >= path_w.len) return opts_mod.SnapshotError.WriteFailed;
+        path_w[w_len] = 0;
+
+        const handle = CreateFileW(@ptrCast(&path_w), GENERIC_WRITE, FILE_SHARE_READ, null, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
+        if (handle == INVALID_HANDLE_VALUE) return opts_mod.SnapshotError.WriteFailed;
+        defer _ = CloseHandle(handle);
+
+        var written: DWORD = 0;
+        var off: usize = 0;
+        while (off < size) {
+            const chunk: DWORD = @intCast(@min(@as(usize, std.math.maxInt(DWORD)), size - off));
+            if (WriteFile(handle, buf.ptr + off, chunk, &written, null) == 0) return opts_mod.SnapshotError.WriteFailed;
+            if (written == 0) return opts_mod.SnapshotError.WriteFailed;
+            off += written;
+        }
     }
 };
 
@@ -1011,6 +1183,20 @@ const get_cookies_handler_vtbl: IGetCookiesHandlerVtbl = .{
     .AddRef = @ptrCast(&comAddRef),
     .Release = @ptrCast(&comRelease),
     .Invoke = &onGetCookies,
+};
+
+fn onCapturePreviewDone(self: ?*const ICapturePreviewCompletedHandler, error_code: HRESULT) callconv(.winapi) HRESULT {
+    const handler = self orelse return 0;
+    handler.error_code.* = error_code;
+    handler.done.* = true;
+    return 0;
+}
+
+const capture_preview_handler_vtbl: ICapturePreviewCompletedHandlerVtbl = .{
+    .QueryInterface = @ptrCast(&comQI),
+    .AddRef = @ptrCast(&comAddRef),
+    .Release = @ptrCast(&comRelease),
+    .Invoke = &onCapturePreviewDone,
 };
 
 fn pumpMsgUntilDone(done: *const bool) void {

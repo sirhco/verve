@@ -97,9 +97,15 @@ reference. Headline list:
 - **Native menu bar (macOS)** — App + Edit + Window menus stamped by
   default (`install_default_menu = true`); Edit menu is what makes
   Cmd+C / Cmd+V actually fire inside WKWebView text inputs
-- **Window snapshot (macOS)** — `Window.takeSnapshotPng(path)` via
-  WKWebView's `takeSnapshotWithConfiguration:completionHandler:`,
-  encoded as PNG via NSBitmapImageRep
+- **Window snapshot** — `Window.takeSnapshotPng(path)` ships on all
+  three backends. macOS uses
+  `WKWebView.takeSnapshotWithConfiguration:completionHandler:` →
+  NSBitmapImageRep → PNG. Linux uses
+  `webkit_web_view_get_snapshot` (async, GMainContext-pumped) →
+  cairo surface → `cairo_surface_write_to_png`. Windows uses
+  `ICoreWebView2::CapturePreview` (PNG format, message-pumped) into
+  an `SHCreateStreamOnHGlobal` IStream, then writes via `CreateFileW` /
+  `WriteFile`.
 - **macOS `.app` bundle** — `zig build bundle` + `-Dbundle-id` /
   `-Dbundle-version` / `-Dcodesign`
 - **WebView2 auto-vendor** — Windows builds fetch the pinned SDK
@@ -142,7 +148,7 @@ Zig calls via nested event-loop pumps.
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | — | — |
-| Window snapshot (PNG) | ✓ | stub | stub |
+| Window snapshot (PNG) | ✓ | ✓ | ✓ |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
 | Dev-loop watcher | ✓ | ✓ | ✓ |
