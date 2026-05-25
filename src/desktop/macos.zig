@@ -430,6 +430,17 @@ pub const Window = struct {
     /// `VerveDragWindow` subclass extract file URLs from the
     /// pasteboard on drop and fire the callback. Passing `null`
     /// unregisters the destination.
+    /// Trigger the platform print dialog for the WebView's current
+    /// document. v1 dispatches via the page's `window.print()` —
+    /// each native engine (WKWebView / WebView2 / WebKitGTK) renders
+    /// its own print UI off that call. Native print APIs
+    /// (`NSPrintOperation` / `ICoreWebView2_16::ShowPrintUI` /
+    /// `webkit_print_operation_run_dialog`) are deferred polish for
+    /// silent print + page-range / printer-selection controls.
+    pub fn print(self: *Window) void {
+        self.evalJs("window.print();");
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;

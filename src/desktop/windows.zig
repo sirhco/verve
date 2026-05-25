@@ -835,6 +835,15 @@ pub const Window = struct {
     /// a drop target via `RegisterDragDrop` on first non-null call;
     /// later calls just swap the callback fields. Setting `null`
     /// revokes the registration.
+    /// Trigger the platform print dialog. v1 dispatches via the
+    /// page's `window.print()` — WebView2 renders its built-in print
+    /// preview off that call. Native `ICoreWebView2_16::ShowPrintUI`
+    /// is deferred polish for silent print + browser-vs-system
+    /// dialog selection.
+    pub fn print(self: *Window) void {
+        self.evalJs("window.print();");
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;

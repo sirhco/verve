@@ -670,6 +670,14 @@ pub const Window = struct {
     /// `gtk_drag_dest_set` + URI-list targets + a `drag-data-received`
     /// signal on the window widget. Passing `null` disconnects the
     /// signal and clears the destination.
+    /// Trigger the platform print dialog. v1 dispatches via the
+    /// page's `window.print()` — WebKitGTK shows its built-in print
+    /// dialog off that call. Native `webkit_print_operation_run_dialog`
+    /// is deferred polish for richer programmatic print control.
+    pub fn print(self: *Window) void {
+        self.evalJs("window.print();");
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;

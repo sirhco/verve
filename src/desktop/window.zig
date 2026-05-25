@@ -79,6 +79,7 @@ comptime {
         "deliverUrl",
         "takeSnapshotPng",
         "setDragDropHandler",
+        "print",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

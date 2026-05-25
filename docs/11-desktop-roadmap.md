@@ -61,6 +61,11 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   subclass + `registerForDraggedTypes:`; Windows via `IDropTarget`
   COM + `RegisterDragDrop` + `DragQueryFileW`; Linux via
   `gtk_drag_dest_set` + `drag-data-received` signal.
+- Print API — `Window.print()` dispatches via `window.print()` on
+  all 3 engines (WKWebView / WebView2 / WebKitGTK). Native APIs
+  (`NSPrintOperation` / `ICoreWebView2_16::ShowPrintUI` /
+  `webkit_print_operation_run_dialog`) deferred as polish for
+  silent print + advanced controls.
 
 ### Tray click handlers + submenus
 
@@ -735,9 +740,11 @@ now a Level-3 golden-diff harness:
 ### Out of P1 scope (P3 — open)
 
 - GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
-- Print API (`NSPrintOperation` / `PrintDlgExW` /
-  `gtk_print_operation_run`) — drag-drop's native-path counterpart
-  shipped 2026-05-26.
+- Native print APIs (`NSPrintOperation` /
+  `ICoreWebView2_16::ShowPrintUI` /
+  `webkit_print_operation_run_dialog`) — `window.print()` path
+  shipped 2026-05-26; native APIs remain future polish for silent
+  print + page-range / printer-selection controls.
 - Win Toast (WinRT) notifications — balloon path shipped 2026-05-26;
   Toast remains future polish for richer styling + Action Center
   grouping.
