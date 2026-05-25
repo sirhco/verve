@@ -85,6 +85,16 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Page title auto-sync — the IPC shim_js polls `document.title`
+  every 500ms and posts a `__verve_title:<title>` marker via the
+  native bridge whenever it changes. Each backend's script-message
+  trampoline (`handleScriptMessage` on macOS, `onScriptMessage`
+  on Linux, `onMessageReceived` on Windows) peeks for the prefix
+  before forwarding to the user's `MessageHandler` — when matched,
+  it calls the native title setter (`setTitle:` / `gtk_window_set_title`
+  / `SetWindowTextW`) and returns without propagating. Pages that
+  change `<title>` (or call `document.title = ...`) now propagate
+  to the OS title bar / taskbar / window-list with no app code.
 - Navigation queries — `Window.canGoBack()` / `canGoForward()` /
   `currentUrl(allocator) ![]u8` / `currentTitle(allocator) ![]u8`
   on all 3 backends. Pairs with `goBack` / `goForward` for back

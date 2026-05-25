@@ -1377,7 +1377,20 @@ fn handleScriptMessage(ctx_ptr: *WindowCtx, message: id) void {
         const utf8 = m.cast(*const fn (id, SEL) callconv(.c) [*:0]const u8);
         const cstr = utf8(body, m.sel("UTF8String"));
         const len = std.mem.len(cstr);
-        if (ctx_ptr.on_message) |handler| handler(ctx_ptr.on_message_ctx, cstr[0..len]);
+        const payload = cstr[0..len];
+        // Intercept the title-sync marker before forwarding to the
+        // user's MessageHandler. The shim's polling loop posts this
+        // prefix whenever `document.title` changes.
+        const title_prefix = "__verve_title:";
+        if (std.mem.startsWith(u8, payload, title_prefix)) {
+            const title = payload[title_prefix.len..];
+            // `setTitle:` runs on the AppKit main thread; we're
+            // already there (script-message callback fires on main).
+            const setTitleSel = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+            setTitleSel(ctx_ptr.window_obj orelse return, m.sel("setTitle:"), nsString(title));
+            return;
+        }
+        if (ctx_ptr.on_message) |handler| handler(ctx_ptr.on_message_ctx, payload);
     }
 }
 

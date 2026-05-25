@@ -1936,7 +1936,18 @@ fn onMessageReceived(this: ?*const IMessageReceivedHandler, _: ?*Wv2, args: ?*Me
     var buf: [16 * 1024]u8 = undefined;
     const w_slice = std.mem.span(@as([*:0]const u16, @ptrCast(raw.?)));
     const utf8_len = std.unicode.utf16LeToUtf8(&buf, w_slice) catch return 0;
-    if (cx.on_message) |handler| handler(cx.on_message_ctx, buf[0..utf8_len]);
+    const payload = buf[0..utf8_len];
+    // Intercept the title-sync marker before forwarding.
+    const title_prefix = "__verve_title:";
+    if (std.mem.startsWith(u8, payload, title_prefix)) {
+        const title = payload[title_prefix.len..];
+        var title_buf: [512]u16 = undefined;
+        const tlen = std.unicode.utf8ToUtf16Le(&title_buf, title) catch return 0;
+        title_buf[@min(title_buf.len - 1, tlen)] = 0;
+        _ = SetWindowTextW(cx.hwnd, @ptrCast(&title_buf));
+        return 0;
+    }
+    if (cx.on_message) |handler| handler(cx.on_message_ctx, payload);
     return 0;
 }
 

@@ -69,6 +69,20 @@ pub const shim_js: []const u8 =
     \\    }
     \\  }
     \\  window.verve = { send: send, request: request, onMessage: onMessage, _dispatch: _dispatch };
+    \\  // Title auto-sync: poll document.title every 500ms, post a
+    \\  // marker string to the native bridge whenever it changes. The
+    \\  // backend's script-message trampolines peek for the prefix +
+    \\  // route to the native setTitle without forwarding to user
+    \\  // handlers. ES5-only; safe in every WebView engine.
+    \\  var __vt_last = document.title || '';
+    \\  function __vt_post(t) { send('__verve_title:' + t); }
+    \\  __vt_post(__vt_last);
+    \\  setInterval(function () {
+    \\    if (document.title !== __vt_last) {
+    \\      __vt_last = document.title;
+    \\      __vt_post(__vt_last);
+    \\    }
+    \\  }, 500);
     \\  document.dispatchEvent(new Event('verve:ready'));
     \\})();
 ;

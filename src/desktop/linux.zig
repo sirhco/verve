@@ -1476,6 +1476,15 @@ fn onScriptMessage(_: *WebKitUserContentManager, message: *WebKitJavascriptResul
     const raw = jsc_value_to_string(value);
     defer g_free(raw);
     const slice = std.mem.span(raw);
+    // Intercept the title-sync marker before forwarding.
+    const title_prefix = "__verve_title:";
+    if (std.mem.startsWith(u8, slice, title_prefix)) {
+        const title = slice[title_prefix.len..];
+        const z = cx.allocator.dupeZ(u8, title) catch return;
+        defer cx.allocator.free(z);
+        if (cx.window) |w| gtk_window_set_title(@ptrCast(w), z.ptr);
+        return;
+    }
     if (cx.on_message) |h| h(cx.on_message_ctx, slice);
 }
 
