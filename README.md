@@ -1,31 +1,42 @@
 # Verve
 
-Full-stack Zig web framework. Server-side rendering with fine-grained reactivity, a wasm32-freestanding client runtime that hosts the real Signal/Effect graph, per-island WASM code-splitting, and a single-binary distribution. No VDOM. No macros. No third-party dependencies.
+Full-stack Zig framework for **both web apps and native desktop apps**.
+Server-side rendering with fine-grained reactivity, a wasm32-freestanding
+client runtime that hosts the real Signal/Effect graph, per-island WASM
+code-splitting, and a single-binary distribution. The same component
+tree, reactive runtime, and asset pipeline drive an HTTP server *or* a
+native window backed by the OS webview (WKWebView / WebView2 /
+WebKitGTK) — pick the target at `zig build` time. No VDOM. No macros.
+No Chromium. No Electron. No third-party dependencies.
 
 Targets **Zig 0.16.0**.
 
-📚 **[Documentation](docs/README.md)** — 18 topic guides covering every feature.
+📚 **[Documentation](docs/README.md)** — 19 topic guides covering every feature.
 🧪 **[Examples](examples/README.md)** — runnable sample apps including a full [showcase](examples/showcase/).
 
 ```sh
+# Web app — HTTP server + wasm hydration
 zig build                           # native server + wasm client + per-island chunks
-zig build test --summary all        # 155+ tests across core + server + client + integration
+zig build test --summary all        # 176+ tests across core + server + client + desktop + integration
 zig build docs                      # zig-out/docs/api/index.html — Zig autodoc for the public verve module
 ./zig-out/bin/verve-server          # open http://127.0.0.1:8080
+
+# Desktop app — native window + system webview, no HTTP server, no Chromium
+./zig-out/bin/verve-cli new ~/my-app --desktop && cd ~/my-app && zig build run
 ```
 
 ## Why Verve
 
-Most web frameworks force a trade between **time-to-first-byte** (SSR), **interactive feel** (client-side reactivity), and **operational shape** (one binary vs. a Node/Bun/Deno toolchain alongside a backend service). Pick two; live with the third.
+Most web frameworks force a trade between **time-to-first-byte** (SSR), **interactive feel** (client-side reactivity), and **operational shape** (one binary vs. a Node/Bun/Deno toolchain alongside a backend service). Pick two; live with the third. Most *desktop* frameworks force a different trade — Electron's 150 MB Chromium bundle, Tauri's split Rust + JS toolchain, native Swift/Kotlin/C# locked to one OS, or a webview wrapper without a real component model.
 
-Verve is the bet that you can have all three in **pure Zig**:
+Verve is the bet that you can have all three web targets *and* desktop, in **pure Zig**:
 
 - **SSR-first.** Pages render server-side as `*Node` trees streamed straight to the socket. Search engines and noscript clients see real content. No hydration handshake required to read the page.
 - **Real reactivity on the client.** The same `Signal` / `Effect` / `Owner` / `Resource` graph the server uses ships into a wasm32-freestanding client runtime. DOM updates are a *consequence* of `Signal.set` — not a parallel write path tacked on for "JS interactivity."
-- **One binary.** No Node runtime. No build server. No bundler config. `zig build` produces a single executable with the WASM client, per-island chunks, JS bridge, public assets, and manifest baked in. Deploy by `scp`.
-- **Pure Zig.** Zero third-party dependencies. The framework, scaffolder, server-fn codegen, island chunker, and reactive runtime are all in this repo, in one language, behind the same `zig fmt` rules.
+- **One binary, two surfaces.** `zig build` produces either an HTTP server with the WASM client, per-island chunks, JS bridge, public assets, and manifest baked in — *or* a native desktop binary opening a system webview, with the build-time-SSR'd page + the same wasm hydration served from the embedded asset table via a `verve://` URL scheme. No Chromium, no Node runtime, no bundler config. Deploy by `scp` either way.
+- **Pure Zig.** Zero third-party dependencies. The framework, scaffolder, server-fn codegen, island chunker, reactive runtime, *and* the three desktop backends (objc runtime for WKWebView, hand-rolled COM offsets for WebView2, GTK 3 + WebKit 4.1 for Linux) are all in this repo, in one language, behind the same `zig fmt` rules.
 
-If the goal is to ship a server-rendered, reactive web app with the operational profile of a Go binary and the type ergonomics of a hand-written `view!` macro — without taking on Rust's compile times, npm's lockfile churn, or React's hydration cost — that's what Verve exists for.
+If the goal is to ship a server-rendered, reactive web app with the operational profile of a Go binary and the type ergonomics of a hand-written `view!` macro — *or* a native desktop app that doesn't bundle a whole browser — without taking on Rust's compile times, npm's lockfile churn, or React's hydration cost, that's what Verve exists for.
 
 ## Why "Verve"
 
@@ -102,11 +113,16 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - **WASM hydration** — `src/client/main.zig` compiled to `wasm32-freestanding` (ReleaseSmall, ~470 B for the demo), served at `verve://app/client.wasm`. A stripped bridge (`verve_desktop.js`) instantiates it and dispatches `[z-on-click]` to wasm exports.
 - **Typed IPC** — `desktop.Router(Ctx, Routes)` with comptime `Args` + `Reply` types; JS callers `await window.verve.request({type, ...})` and get a typed Promise back.
 - **Cookies** — per-window `CookieStore` with real implementations on all three backends (sync wrappers over the native async cookie managers via nested run-loop pumps).
+- **Clipboard** — `Window.clipboard().writeText(s)` / `.readText(alloc)` against `NSPasteboard` (macOS), `CF_UNICODETEXT` + HGLOBAL (Windows), and `GtkClipboard` on the CLIPBOARD selection (Linux).
 - **Multi-window** — `Window.openChildWindow(opts)`; last-window-quit semantics on all three platforms.
+- **Single-instance enforcement** — `desktop.single_instance.acquire(alloc, "my-app")` returns a `Lock` held for process lifetime. POSIX `flock` on macOS + Linux, `CreateMutexW` under `Local\` on Windows.
+- **Color-scheme follow** — `Window.colorScheme()` returns `.light` / `.dark` / `.unknown` from the OS preference; `Window.setColorSchemeHandler(cb, ctx)` fires live on toggle (NSDistributedNotificationCenter / WM_SETTINGCHANGE / GtkSettings notify).
 - **Native dialogs / alerts** — `openFileDialog`, `saveFileDialog`, `showAlert` wired against the system picker on all three backends (NSOpenPanel/NSSavePanel/NSAlert on macOS, `GtkFileChooserNative` + `GtkMessageDialog` on Linux, `GetOpenFileNameW` / `GetSaveFileNameW` + `MessageBoxW` on Windows). **Native menu bar (macOS)** — default App+Edit+Window menus (Edit menu is what makes Cmd+C / Cmd+V fire inside WKWebView text inputs).
-- **macOS `.app` bundle** — `zig build bundle` lays out `Info.plist` + `MacOS/<name>`; `-Dbundle-id` / `-Dbundle-version` / `-Dcodesign=<identity>` flags.
+- **Window snapshot** — `Window.takeSnapshotPng(path)` on all three backends (WKWebView snapshot → NSBitmapImageRep on macOS; `webkit_web_view_get_snapshot` → cairo PNG on Linux; `ICoreWebView2::CapturePreview` → IStream → `WriteFile` on Windows).
+- **macOS `.app` bundle** — `zig build bundle` lays out `Info.plist` + `MacOS/<name>`; `-Dbundle-id` / `-Dbundle-version` / `-Dicon=<path-to-icns>` / `-Dcodesign=<identity>` flags.
 - **Level-3 golden-diff smoke** — `zig build smoke` runs the app under `--smoke`, drives a deterministic interaction sequence, captures a PNG via `Window.takeSnapshotPng`, diffs a DOM checksum vs `tests/golden/`.
 - **Dev-loop watcher** — `zig build dev` polls watched sources and respawns the app on change.
+- **`--dev <dir>` hot-reload** — runtime asset fallback in the scheme handler. Edit `frontend/style.css` or `frontend/verve_desktop.js`, reload with Cmd+R, see the change without a rebuild. Path traversal rejected; 16 MB per-file cap.
 - **WebView2 auto-vendor** — Windows builds fetch the pinned SDK from NuGet on first build (idempotent).
 
 See **[docs/19-desktop.md](docs/19-desktop.md)** for the full feature
