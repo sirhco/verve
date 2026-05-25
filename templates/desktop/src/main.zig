@@ -132,6 +132,18 @@ pub fn main(init: std.process.Init) !void {
     window.setMessageHandler(handlers.onMessage, ctx_ptr);
     window.setUrlOpenHandler(handlers.onUrlOpen, ctx_ptr);
 
+    // Optional tray icon. Best-effort: a runtime error (libayatana
+    // missing on Linux, status-bar unavailable in headless macOS, …)
+    // just logs + drops the tray; the rest of the app keeps running.
+    var tray_handle: ?desktop.tray.Tray = desktop.tray.init(allocator, &window, .{
+        .label = "V",
+        .tooltip = "Verve Desktop",
+    }) catch |err| blk: {
+        std.log.warn("verve.desktop: tray init failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (tray_handle) |*t| t.deinit();
+
     // Start the warm-launch URL listener. macOS makes this a no-op
     // (NSAppleEventManager already covers warm-launch). Windows leans
     // on the wndProc WM_COPYDATA case, so this is also a no-op there.

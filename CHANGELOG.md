@@ -6,6 +6,35 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Tray icons + native notifications (2026-05-25)
+
+- **New `desktop.tray` module.** `tray.init(allocator, &window,
+  .{ .label, .tooltip })` creates a system-tray / status-bar icon;
+  `setTooltip(text)` updates the hover text; `deinit` removes it.
+  macOS: `NSStatusItem` from `[NSStatusBar systemStatusBar]`.
+  Windows: `Shell_NotifyIconW(NIM_ADD)` with stock
+  `IDI_APPLICATION` icon (`NIF_ICON | NIF_TIP`). Linux:
+  `app_indicator_new` (libayatana-appindicator3) with an empty
+  `GtkMenu` attached because some Ayatana versions silently refuse
+  to render the icon without one. Click handlers + submenus are
+  deferred to a future bundle.
+- **New `desktop.notifications` module.** `notifications.show(allocator,
+  .{ .title, .body })`. macOS: `NSUserNotification` +
+  `NSUserNotificationCenter.deliverNotification:`. Linux: `notify_init`
+  + `notify_notification_new` + `notify_notification_show` (libnotify).
+  Windows returns `error.Unsupported` — Toast notifications need
+  COM + AUMID + Start-menu registration, deferred to a future
+  bundle. Apps that need Win notifications today combine
+  `desktop.tray` with a manual `Shell_NotifyIconW(NIF_INFO)` call
+  against the tray icon.
+- **Backend exposure.** `src/desktop/windows.zig` gains `hwndOf(window)`
+  so sibling modules can reach the underlying HWND without going
+  through the cross-platform `Window` facade.
+- **Template demo wiring.** Scaffold `main.zig` opens a tray icon
+  on startup; `handlers.zig` ships a `notify` IPC route that fires
+  a native notification; `components.zig` adds a "Notify" button
+  card.
+
 ### Added — Win/Linux warm-launch URL forwarding (2026-05-25)
 
 - **New `desktop.deep_link` module** with two halves:

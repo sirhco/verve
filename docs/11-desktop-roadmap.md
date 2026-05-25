@@ -15,10 +15,12 @@ Fresh session? Do these four in order before writing code:
    table. All P1 items (#16–#23) are closed; every P2 platform port
    (Win/Linux dialogs, alerts, snapshot) is in. The P3 items that
    shipped 2026-05-24/25 are listed under "Out of P1 scope — shipped"
-   below. Remaining P3 backlog: GTK4 backend, tray icons +
-   notifications, drag-drop with native paths, print API, hicolor /
-   Linux icon-theme install, accessibility (NSAccessibility / UIA /
-   ATK), auto-updater (Sparkle / Squirrel).
+   below. Remaining P3 backlog: GTK4 backend, drag-drop with native
+   paths, print API, hicolor / Linux icon-theme install,
+   accessibility (NSAccessibility / UIA / ATK), auto-updater
+   (Sparkle / Squirrel), Win tray-balloon / Toast notifications
+   (macOS + Linux notifications already landed), tray click
+   handlers + submenus on all 3 platforms.
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
@@ -391,6 +393,18 @@ now a Level-3 golden-diff harness:
 
 ### Out of P1 scope — shipped 2026-05-25
 
+- Tray icons + notifications — new `desktop.tray` +
+  `desktop.notifications` modules. Tray: macOS `NSStatusItem`,
+  Windows `Shell_NotifyIconW` + stock `IDI_APPLICATION`, Linux
+  `libayatana-appindicator3` with an empty `GtkMenu` attached
+  (some Ayatana versions silently refuse to render without one).
+  Notifications: macOS `NSUserNotification`, Linux `libnotify`
+  (`notify_init` + `notify_notification_new` + `_show`); Windows
+  returns `error.Unsupported` — Toast notifications need COM +
+  AUMID + Start-menu registration, deferred. Scope deliberately
+  narrow: no click handlers, no submenus, no actions. Apps that
+  need Win notifications today drop down to
+  `Shell_NotifyIconW(NIF_INFO)` against the tray icon.
 - Win/Linux warm-launch URL forwarding — `desktop.deep_link` module
   with `forwardToRunningInstance(allocator, name, url)` +
   `startListener(window, name)`. Windows side: `FindWindowW` to
@@ -443,7 +457,6 @@ clipboard, color scheme + change events, app icons) all landed on
 | Bundle | Items | Best for |
 |---|---|---|
 | **P3 GTK4** | GTK4 + WebKitGTK 6.0 behind `-Dgtk4` | Future-proofing once Ubuntu LTS / Fedora ship GTK4 webkit by default. New backend module; existing GTK3 path stays. |
-| **P3 tray + notifications** | NSStatusItem / `Shell_NotifyIconW` / Ayatana AppIndicator | Linux side requires an extra dep (libappindicator / Ayatana) since GtkStatusIcon is deprecated. |
 | **P3 drag-drop / print** | `NSDraggingDestination` / `IDropTarget` / GTK drag signals; `NSPrintOperation` / `PrintDlgExW` / `gtk_print_operation_run` | Drag-drop with native file paths (browser DataTransfer doesn't expose them). |
 | **P3 a11y** | NSAccessibility / UIA / ATK | Window-chrome + menu accessibility — web content already inherits from WebView. |
 | **P3 auto-updater** | Sparkle on macOS / Squirrel or MSIX on Windows / AppImage update on Linux | Multi-platform signing + delta channels. |

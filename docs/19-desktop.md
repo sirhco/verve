@@ -122,6 +122,23 @@ reference. Headline list:
   → MB_OK / MB_YESNO / MB_YESNOCANCEL) but not arbitrary labels;
   directory-picking via `pick_directory` is macOS + Linux only on this
   surface (Win32 splits dir-picking into `IFileOpenDialog` — port TBD).
+- **Tray icon** — `desktop.tray.init(allocator, &window, .{ .label,
+  .tooltip })` creates a system-tray / status-bar icon, `setTooltip`
+  updates the hover text, `deinit` removes it. macOS:
+  `NSStatusItem` from `[NSStatusBar systemStatusBar]`. Windows:
+  `Shell_NotifyIconW(NIM_ADD)` with stock `IDI_APPLICATION` icon.
+  Linux: `app_indicator_new` (libayatana-appindicator3) with an
+  empty menu attached (some Ayatana versions refuse to draw the
+  icon without one). Click handlers + submenus are a future bundle.
+- **Notifications** — `desktop.notifications.show(allocator, .{ .title,
+  .body })`. macOS uses `NSUserNotification` +
+  `[NSUserNotificationCenter deliverNotification:]`; Linux uses
+  `notify_init` + `notify_notification_new` +
+  `notify_notification_show` (libnotify). Windows returns
+  `error.Unsupported` — Toast notifications need COM + AUMID + a
+  Start-menu registration, deferred to a future bundle. Apps that
+  need Win notifications today layer on `tray.zig` plus a manual
+  `Shell_NotifyIconW(NIF_INFO)` call.
 - **Deep-link URL handlers** — register a custom scheme at install
   time (`-Durl-scheme=verve` injects `CFBundleURLTypes` into the
   macOS `Info.plist`; Win/Linux registration is app-controlled),
@@ -209,6 +226,8 @@ Zig calls via nested event-loop pumps.
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | ✓ | ✓ |
+| Tray icon | ✓ | ✓ | ✓ |
+| Notifications | ✓ | stub | ✓ |
 | Window snapshot (PNG) | ✓ | ✓ | ✓ |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
@@ -225,10 +244,11 @@ All P1 and all P2 desktop items per `docs/11-desktop-roadmap.md`
 are closed; clipboard, single-instance enforcement, color-scheme
 follow (getter + live change events), runtime asset-disk fallback,
 and macOS app-icon bundling shipped 2026-05-24. Native menu bars
-on Windows + Linux, deep-link URL handlers, and Win/Linux warm-launch
-URL forwarding (`WM_COPYDATA` + abstract `AF_UNIX` socket) all
-landed 2026-05-25. Remaining P3 follow-ups: GTK4 + WebKitGTK 6.0
-backend, tray icons + system notifications, drag-drop with native
+on Windows + Linux, deep-link URL handlers, Win/Linux warm-launch
+URL forwarding (`WM_COPYDATA` + abstract `AF_UNIX` socket), and
+tray icons + notifications (macOS + Linux real, Win tray real and
+notifications stubbed) all landed 2026-05-25. Remaining P3
+follow-ups: GTK4 + WebKitGTK 6.0 backend, drag-drop with native
 paths, print API, hicolor / Linux app-icon theme install,
 accessibility (NSAccessibility / UIA / ATK), auto-updater
 (Sparkle / Squirrel).

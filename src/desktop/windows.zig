@@ -584,6 +584,14 @@ fn unregisterCtx(hwnd: HWND) void {
     _ = registry.remove(hwnd);
 }
 
+/// Expose the underlying HWND of a `Window`. Used by sibling modules
+/// (`tray.zig`) that need the raw HWND to plug into Win32 APIs which
+/// route through `Shell_NotifyIconW` / `SendMessageW` etc. Lives on
+/// the backend so the cross-platform `Window` struct stays opaque.
+pub fn hwndOf(window: *Window) ?*anyopaque {
+    return @ptrCast(window.ctx.hwnd);
+}
+
 // ---- Window facade ----------------------------------------------------------
 
 pub const Window = struct {

@@ -335,6 +335,50 @@ platform:
 Set `.install_default_menu = false` to suppress the bar entirely
 (apps building their own).
 
+## Tray icon
+
+```zig
+var tray = try desktop.tray.init(allocator, &window, .{
+    .label   = "V",                // macOS status-bar text; ignored on Win/Linux
+    .tooltip = "Verve Desktop",    // hover tooltip
+});
+defer tray.deinit();
+
+// Optional later update:
+tray.setTooltip("Now with 30% more cowbell");
+```
+
+Platform delivery:
+
+- **macOS** — `NSStatusItem` from `[NSStatusBar systemStatusBar]`.
+  `label` renders next to the icon in the menubar.
+- **Windows** — `Shell_NotifyIconW(NIM_ADD)` with stock
+  `IDI_APPLICATION` icon. Tooltip shows on hover.
+- **Linux** — `libayatana-appindicator3` (`app_indicator_new`).
+  Requires `libayatana-appindicator3-1` at runtime; nearly every
+  GNOME/KDE distro ships it.
+
+Click handlers + submenus are deferred to a future bundle. The
+tray icon is purely presence + tooltip in this release.
+
+## Notifications
+
+```zig
+try desktop.notifications.show(allocator, .{
+    .title = "Hello",
+    .body  = "From the native side.",
+});
+```
+
+- **macOS** — `NSUserNotification` + `NSUserNotificationCenter`.
+  Deprecated by Apple but still works without a permission grant.
+- **Linux** — `libnotify` (`notify_init` + `notify_notification_new`
+  + `notify_notification_show`). Requires `libnotify` at runtime.
+- **Windows** — returns `error.Unsupported`. Toast notifications
+  need COM + AUMID + Start-menu registration; deferred. Apps that
+  need Win notifications today combine `desktop.tray` with a manual
+  `Shell_NotifyIconW(NIF_INFO)` call against the tray icon.
+
 ## Deep-link URLs
 
 ```zig
@@ -551,6 +595,8 @@ Overrides:
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | ✓ | ✓ |
+| Tray icon | ✓ | ✓ | ✓ |
+| Notifications | ✓ | stub | ✓ |
 | Window snapshot (PNG) | ✓ | ✓ | ✓ |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |

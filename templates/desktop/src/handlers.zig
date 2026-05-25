@@ -71,6 +71,27 @@ const Routes = struct {
         }
     };
 
+    pub const notify = struct {
+        pub const Args = struct {
+            title: []const u8 = "Verve Desktop",
+            body: []const u8 = "Hello from the native side.",
+        };
+        pub const Reply = struct { ok: bool };
+        pub fn handle(_: *RouterCtx, alloc: std.mem.Allocator, args: Args) !Reply {
+            // Notifications are best-effort. macOS + Linux fire the
+            // native API; Win returns Unsupported (deferred to a
+            // future tray-balloon / Toast bundle).
+            desktop.notifications.show(alloc, .{
+                .title = args.title,
+                .body = args.body,
+            }) catch |err| switch (err) {
+                error.Unsupported => return .{ .ok = false },
+                else => return err,
+            };
+            return .{ .ok = true };
+        }
+    };
+
     pub const log = struct {
         pub const Args = struct { message: []const u8 };
         pub const Reply = struct { ok: bool };
