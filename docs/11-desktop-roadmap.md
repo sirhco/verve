@@ -18,8 +18,7 @@ Fresh session? Do these four in order before writing code:
    below. Remaining P3 backlog: GTK4 backend, tray icons +
    notifications, drag-drop with native paths, print API, hicolor /
    Linux icon-theme install, accessibility (NSAccessibility / UIA /
-   ATK), auto-updater (Sparkle / Squirrel), warm-launch URL
-   forwarding on Win/Linux (cold-launch is done).
+   ATK), auto-updater (Sparkle / Squirrel).
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
@@ -375,8 +374,6 @@ now a Level-3 golden-diff harness:
 - Tray icons + system notifications
 - Drag-drop with native paths, print API
 - Hicolor / Linux app icon theme installation
-- Warm-launch URL forwarding on Win/Linux (cold-launch landed
-  2026-05-25; WM_COPYDATA / AF_UNIX socket forwarding deferred)
 - Accessibility (NSAccessibility / UIA / ATK)
 - Auto-updater (Sparkle / Squirrel)
 
@@ -394,6 +391,21 @@ now a Level-3 golden-diff harness:
 
 ### Out of P1 scope — shipped 2026-05-25
 
+- Win/Linux warm-launch URL forwarding — `desktop.deep_link` module
+  with `forwardToRunningInstance(allocator, name, url)` +
+  `startListener(window, name)`. Windows side: `FindWindowW` to
+  locate the running app's HWND, then `SendMessageW(WM_COPYDATA)`
+  with a `URL` sentinel `dwData` so unrelated WM_COPYDATA traffic
+  doesn't trip the receiver; receiver lives in `wndProc`. Linux
+  side: abstract `AF_UNIX SOCK_DGRAM` socket bound to
+  `\0verve-deeplink-<name>`; sender `connect`+`send`s; receiver
+  wraps the bound fd in a `GIOChannel` watch (`G_IO_IN`) so the
+  GTK main loop dispatches inbound URLs. macOS is a no-op on both
+  calls — `NSAppleEventManager` already routes warm-launch URLs
+  through the AEH installed at `setUrlOpenHandler` time. Template
+  `main.zig` calls `forwardToRunningInstance` from the second
+  instance's `AlreadyRunning` branch when `--url` was supplied,
+  and `startListener` after the window opens.
 - Deep-link URL handlers — `Window.setUrlOpenHandler(cb, ctx)` +
   `Window.deliverUrl(url)` on the public surface. macOS installs
   a process-wide `NSAppleEventManager` URL handler
@@ -432,7 +444,6 @@ clipboard, color scheme + change events, app icons) all landed on
 |---|---|---|
 | **P3 GTK4** | GTK4 + WebKitGTK 6.0 behind `-Dgtk4` | Future-proofing once Ubuntu LTS / Fedora ship GTK4 webkit by default. New backend module; existing GTK3 path stays. |
 | **P3 tray + notifications** | NSStatusItem / `Shell_NotifyIconW` / Ayatana AppIndicator | Linux side requires an extra dep (libappindicator / Ayatana) since GtkStatusIcon is deprecated. |
-| **P3 warm-launch URL fwd** | `WM_COPYDATA` on Win + abstract `AF_UNIX` socket on Linux | Cold-launch landed 2026-05-25; second-instance forwarding is the remaining piece for parity with macOS AEH semantics. |
 | **P3 drag-drop / print** | `NSDraggingDestination` / `IDropTarget` / GTK drag signals; `NSPrintOperation` / `PrintDlgExW` / `gtk_print_operation_run` | Drag-drop with native file paths (browser DataTransfer doesn't expose them). |
 | **P3 a11y** | NSAccessibility / UIA / ATK | Window-chrome + menu accessibility — web content already inherits from WebView. |
 | **P3 auto-updater** | Sparkle on macOS / Squirrel or MSIX on Windows / AppImage update on Linux | Multi-platform signing + delta channels. |

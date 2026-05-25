@@ -6,6 +6,34 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Win/Linux warm-launch URL forwarding (2026-05-25)
+
+- **New `desktop.deep_link` module** with two halves:
+  `forwardToRunningInstance(allocator, name, url)` (second-instance
+  side) and `startListener(window, name)` (running-instance side).
+  macOS makes both calls no-ops because `NSAppleEventManager`
+  already routes URLs to the running process; Win + Linux now
+  implement real cross-process delivery.
+- **Windows** — `FindWindowW("VerveWindow", null)` locates the
+  running app's HWND; `SendMessageW(WM_COPYDATA)` ships the URL
+  with a `0x55524C00` ("URL\0") `dwData` sentinel so unrelated
+  WM_COPYDATA traffic doesn't trip the receiver. The wndProc
+  WM_COPYDATA case validates the sentinel, bounds-checks the
+  payload (≤4 KB), and fires `on_url_open` on the matched
+  `WindowCtx`.
+- **Linux** — abstract `AF_UNIX SOCK_DGRAM` socket bound to
+  `\0verve-deeplink-<single_instance_name>`. Sender `connect`s +
+  `send`s a single datagram with the URL bytes. Receiver wraps the
+  bound fd in a `GIOChannel` with a `G_IO_IN` watch so the GTK
+  main loop dispatches inbound URLs; `close_on_unref(true)` cleans
+  the fd up when the window is destroyed.
+- **Template `main.zig`** — second-instance `AlreadyRunning`
+  branch now calls `forwardToRunningInstance(allocator, name, u)`
+  when `--url <u>` was provided, then exits. After the primary
+  instance opens its window it calls
+  `deep_link.startListener(&window, instance_name)` to bind the
+  receive side.
+
 ### Added — Desktop deep-link URL handlers (2026-05-25)
 
 - **`Window.setUrlOpenHandler(cb, ctx)` + `Window.deliverUrl(url)`**

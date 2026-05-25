@@ -258,6 +258,22 @@ const IDNO: c_int = 7;
 
 const WM_CLOSE: UINT = 0x0010;
 const WM_SETTINGCHANGE: UINT = 0x001A;
+const WM_COPYDATA: UINT = 0x004A;
+
+/// `COPYDATASTRUCT` from `<winuser.h>`. WM_COPYDATA carries a pointer
+/// to one of these in `lParam`. The receiver must not retain `lpData`
+/// past message return — the sender's buffer goes out of scope as
+/// soon as `SendMessageW` returns.
+const COPYDATASTRUCT = extern struct {
+    dwData: usize,
+    cbData: DWORD,
+    lpData: ?*const anyopaque,
+};
+
+/// Sentinel `dwData` value the deep-link forwarder uses. Mirrors the
+/// constant in `deep_link.zig` so the receiver can ignore unrelated
+/// WM_COPYDATA traffic (other apps using the same wndProc, etc).
+const URL_COPYDATA_SENTINEL: usize = 0x55524C00; // "URL\0"
 
 extern "ole32" fn CoTaskMemFree(p: LPVOID) callconv(.winapi) void;
 extern "shlwapi" fn SHCreateMemStream(bytes: ?[*]const u8, size: UINT) callconv(.winapi) ?*IStream;
@@ -1074,6 +1090,24 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 };
             }
             return 0;
+        },
+        WM_COPYDATA => {
+            // Deep-link URL handoff from a second instance. The
+            // `dwData` sentinel guards against random WM_COPYDATA
+            // traffic from other processes. Payload is UTF-8 URL bytes
+            // with no terminator.
+            if (lparam == 0) return 0;
+            const cds: *const COPYDATASTRUCT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            if (cds.dwData != URL_COPYDATA_SENTINEL) return 0;
+            if (cds.cbData == 0) return 0;
+            if (cds.cbData > 4096) return 0;
+            const data_ptr = cds.lpData orelse return 0;
+            const url_ptr: [*]const u8 = @ptrCast(data_ptr);
+            const url = url_ptr[0..cds.cbData];
+            if (lookupCtx(hwnd)) |cx| if (cx.on_url_open) |cb| {
+                cb(cx.on_url_open_ctx, url);
+            };
+            return 1;
         },
         WM_COMMAND => {
             // Default menu commands. Only File→Quit fires real work;

@@ -69,14 +69,31 @@ pub fn main(init: std.process.Init) !void {
     // mutex, so a second launch immediately picks up the slot. Skip in
     // smoke runs so back-to-back CI invocations don't race on the
     // tmp-file fd / mutex name.
+    const instance_name = "verve-desktop";
     var lock: ?desktop.single_instance.Lock = null;
     defer if (lock) |*l| l.release();
     if (smoke_dir == null) {
-        if (desktop.single_instance.acquire(allocator, "verve-desktop")) |l| {
+        if (desktop.single_instance.acquire(allocator, instance_name)) |l| {
             lock = l;
         } else |err| switch (err) {
             error.AlreadyRunning => {
-                std.log.err("verve.desktop: another instance is already running", .{});
+                // Second instance with a cold-launch URL: hand the
+                // URL off to the running copy via the deep-link
+                // forwarder (WM_COPYDATA on Win, abstract AF_UNIX
+                // socket on Linux), then exit. macOS never reaches
+                // this branch — the OS routes URLs to the running
+                // process via NSAppleEventManager directly.
+                if (cold_url) |u| {
+                    desktop.deep_link.forwardToRunningInstance(allocator, instance_name, u) catch |fe| switch (fe) {
+                        // macOS routes URLs via NSAppleEventManager, so
+                        // the manual forward isn't supposed to run on
+                        // that backend. Suppress the noise.
+                        error.Unsupported => {},
+                        else => std.log.err("verve.desktop: forward to running instance failed: {s}", .{@errorName(fe)}),
+                    };
+                } else {
+                    std.log.err("verve.desktop: another instance is already running", .{});
+                }
                 return;
             },
             else => |e| return e,
@@ -114,6 +131,15 @@ pub fn main(init: std.process.Init) !void {
     const ctx_ptr = handlers.attach(&window, asset_entries, smoke_dir, io);
     window.setMessageHandler(handlers.onMessage, ctx_ptr);
     window.setUrlOpenHandler(handlers.onUrlOpen, ctx_ptr);
+
+    // Start the warm-launch URL listener. macOS makes this a no-op
+    // (NSAppleEventManager already covers warm-launch). Windows leans
+    // on the wndProc WM_COPYDATA case, so this is also a no-op there.
+    // Linux binds an abstract AF_UNIX socket keyed on `instance_name`
+    // and wires a GIOChannel watch into the GTK main loop.
+    desktop.deep_link.startListener(&window, instance_name) catch |err| {
+        std.log.warn("verve.desktop: deep-link listener failed: {s}", .{@errorName(err)});
+    };
 
     // Cold-launch URL: synthesize a delivery through the same
     // callback so apps don't need a separate code path for argv vs.

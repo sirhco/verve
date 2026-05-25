@@ -354,11 +354,19 @@ Platform delivery:
   `kInternetEventClass`/`kAEGetURL`. Both warm-launch and
   cold-launch URLs route through the same path; Cocoa queues
   pre-launch URLs until the AEH installs, then drains them.
-- **Windows + Linux** — cold-launch only. The OS spawns the binary
-  with the URL in argv; the scaffold template's `main.zig` parses
-  `--url <u>` or any positional starting with `verve://` and calls
-  `Window.deliverUrl(url)` after the window opens. Warm-launch
-  forwarding (`WM_COPYDATA` / `AF_UNIX` socket) is a follow-up.
+- **Windows + Linux** — both cold-launch and warm-launch.
+  Cold-launch: the OS spawns the binary with the URL in argv; the
+  scaffold template's `main.zig` parses `--url <u>` or any
+  positional starting with `verve://` and calls
+  `Window.deliverUrl(url)` after the window opens. Warm-launch: the
+  same template detects `single_instance.acquire` returning
+  `AlreadyRunning`, calls
+  `desktop.deep_link.forwardToRunningInstance(allocator, name, url)`,
+  and exits — the forwarder uses `FindWindowW` + `WM_COPYDATA` on
+  Win and an abstract `AF_UNIX SOCK_DGRAM` socket on Linux. The
+  receive side is auto-installed: Win sits in the wndProc, Linux
+  binds via `desktop.deep_link.startListener(&window, name)` after
+  the window opens.
 
 Registering the scheme with the OS is install-time:
 

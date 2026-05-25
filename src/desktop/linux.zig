@@ -259,6 +259,26 @@ extern fn g_memory_input_stream_new_from_data(
 ) *GInputStream;
 
 extern fn g_main_context_iteration(ctx: ?*anyopaque, may_block: gboolean) gboolean;
+
+// ---- GIOChannel externs (used by deep_link.attachUrlSocket) ----------------
+//
+// `g_io_channel_unix_new` wraps a raw POSIX fd in a GIOChannel so it
+// plugs into the GTK main loop's source dispatch. `g_io_add_watch`
+// installs a callback fired when the socket has bytes to read; we
+// pass `G_IO_IN` (= 1) plus the per-window WindowCtx pointer as
+// user_data so the trampoline can route inbound URLs through the
+// stored handler.
+const GIOChannel = opaque {};
+const GIOCondition = c_uint;
+const G_IO_IN: GIOCondition = 1;
+const GIOFunc = *const fn (source: *GIOChannel, cond: GIOCondition, data: ?*anyopaque) callconv(.c) gboolean;
+
+extern fn g_io_channel_unix_new(fd: c_int) *GIOChannel;
+extern fn g_io_channel_set_close_on_unref(channel: *GIOChannel, do_close: gboolean) void;
+extern fn g_io_add_watch(channel: *GIOChannel, cond: GIOCondition, func: GIOFunc, data: ?*anyopaque) c_uint;
+extern fn g_io_channel_unref(channel: *GIOChannel) void;
+
+extern "c" fn recv(fd: c_int, buf: *anyopaque, len: usize, flags: c_int) isize;
 extern fn g_list_length(list: ?*GList) c_uint;
 extern fn g_list_nth_data(list: ?*GList, n: c_uint) ?*anyopaque;
 extern fn g_list_free_full(list: ?*GList, destroy: GDestroyNotify) void;
@@ -401,6 +421,8 @@ const WindowCtx = struct {
     on_color_scheme_ctx: ?*anyopaque = null,
     on_url_open: ?opts_mod.UrlOpenHandler = null,
     on_url_open_ctx: ?*anyopaque = null,
+    url_socket_fd: c_int = -1,
+    url_socket_watch: c_uint = 0,
     color_scheme_signal: c_ulong = 0,
     window: ?*GtkWidget = null,
     webview: ?*WebKitWebView = null,
@@ -797,6 +819,34 @@ fn installDefaultMenuBar(ctx: *WindowCtx, window_widget: *GtkWidget, wv_widget: 
 
     gtk_box_pack_start(@ptrCast(box), menu_bar, 0, 0, 0);
     gtk_box_pack_start(@ptrCast(box), wv_widget, 1, 1, 0);
+}
+
+/// Wrap an already-bound `AF_UNIX` SOCK_DGRAM fd in a GIOChannel
+/// watch keyed on `G_IO_IN`. Called by `deep_link.startListener` on
+/// the Linux backend; the fd ownership transfers — we set
+/// `close_on_unref(true)` so the channel cleans the fd up at
+/// window destruction.
+pub fn attachUrlSocket(window: *Window, fd: c_int) !void {
+    const ch = g_io_channel_unix_new(fd);
+    g_io_channel_set_close_on_unref(ch, 1);
+    const watch = g_io_add_watch(ch, G_IO_IN, &onUrlSocketReadable, @ptrCast(window.ctx));
+    window.ctx.url_socket_fd = fd;
+    window.ctx.url_socket_watch = watch;
+}
+
+/// `G_IO_IN` callback. One datagram per `recv`; URL bytes are UTF-8
+/// with no terminator. Returns `1` (TRUE) to keep the watch active —
+/// returning `0` would unregister the source after the first URL.
+fn onUrlSocketReadable(source: *GIOChannel, _cond: GIOCondition, data: ?*anyopaque) callconv(.c) gboolean {
+    _ = source;
+    _ = _cond;
+    const cx: *WindowCtx = @ptrCast(@alignCast(data orelse return 1));
+    var buf: [4096]u8 = undefined;
+    const n = recv(cx.url_socket_fd, &buf, buf.len, 0);
+    if (n <= 0) return 1;
+    const url = buf[0..@intCast(n)];
+    if (cx.on_url_open) |cb| cb(cx.on_url_open_ctx, url);
+    return 1;
 }
 
 /// `activate` handler for File → Quit. Routes through the per-window

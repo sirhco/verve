@@ -132,9 +132,15 @@ reference. Headline list:
   callback. Windows + Linux deliver cold-launch URLs via the
   process argv — the scaffold template parses `--url <u>` and any
   positional starting with `verve://` and calls
-  `Window.deliverUrl(url)` after the window opens. Second-instance
-  URL forwarding (`WM_COPYDATA` / `AF_UNIX` socket) on Win/Linux is
-  a follow-up.
+  `Window.deliverUrl(url)` after the window opens. Warm-launch
+  forwarding on Win/Linux uses `desktop.deep_link`: the second
+  instance calls `forwardToRunningInstance(allocator, name, url)`
+  which `FindWindowW` + `SendMessageW(WM_COPYDATA)` on Win, or
+  opens an abstract `AF_UNIX SOCK_DGRAM` socket
+  (`\0verve-deeplink-<name>`) and `send`s on Linux. The running
+  instance receives via the wndProc `WM_COPYDATA` case (Win) or a
+  GIOChannel watch on the bound socket (Linux), routed back through
+  the same `setUrlOpenHandler` callback.
 - **Native menu bar** — `install_default_menu = true` (the default)
   stamps a default menu bar on all three platforms. macOS gets App +
   Edit + Window menus; the Edit menu is what makes Cmd+C / Cmd+V
@@ -219,14 +225,13 @@ All P1 and all P2 desktop items per `docs/11-desktop-roadmap.md`
 are closed; clipboard, single-instance enforcement, color-scheme
 follow (getter + live change events), runtime asset-disk fallback,
 and macOS app-icon bundling shipped 2026-05-24. Native menu bars
-on Windows + Linux + deep-link URL handlers landed 2026-05-25
-(macOS AppleEventManager + Win/Linux cold-launch argv path).
-Remaining P3 follow-ups: GTK4 + WebKitGTK 6.0 backend, tray icons
-+ system notifications, drag-drop with native paths, print API,
-hicolor / Linux app-icon theme install, accessibility
-(NSAccessibility / UIA / ATK), auto-updater (Sparkle / Squirrel),
-warm-launch URL forwarding on Win/Linux (`WM_COPYDATA` / AF_UNIX
-socket).
+on Windows + Linux, deep-link URL handlers, and Win/Linux warm-launch
+URL forwarding (`WM_COPYDATA` + abstract `AF_UNIX` socket) all
+landed 2026-05-25. Remaining P3 follow-ups: GTK4 + WebKitGTK 6.0
+backend, tray icons + system notifications, drag-drop with native
+paths, print API, hicolor / Linux app-icon theme install,
+accessibility (NSAccessibility / UIA / ATK), auto-updater
+(Sparkle / Squirrel).
 
 ## Constraints
 
