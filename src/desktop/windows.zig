@@ -844,6 +844,16 @@ pub const Window = struct {
         self.evalJs("window.print();");
     }
 
+    /// On Windows the window's accessible name (what screen readers
+    /// read on focus) comes straight from `SetWindowTextW`. Without a
+    /// dedicated UIA / IAccessible2 provider there is no separate
+    /// accessibility-label channel, so this method delegates to
+    /// `setTitle` — apps that want title + label distinct should
+    /// ship a UIA provider; that scope is deferred.
+    pub fn setAccessibilityLabel(self: *Window, label: []const u8) void {
+        self.setTitle(label);
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;

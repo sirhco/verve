@@ -66,6 +66,11 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   (`NSPrintOperation` / `ICoreWebView2_16::ShowPrintUI` /
   `webkit_print_operation_run_dialog`) deferred as polish for
   silent print + advanced controls.
+- Window accessibility label — `Window.setAccessibilityLabel(text)`
+  on all 3 backends. macOS: NSAccessibilityLabel. Linux:
+  `atk_object_set_name` on the window's AtkObject. Windows: routes
+  through `setTitle` since Win32 has no separate a11y-label
+  channel without a custom UIA provider.
 
 ### Tray click handlers + submenus
 
@@ -748,7 +753,11 @@ now a Level-3 golden-diff harness:
 - Win Toast (WinRT) notifications — balloon path shipped 2026-05-26;
   Toast remains future polish for richer styling + Action Center
   grouping.
-- Accessibility (NSAccessibility / UIA / ATK)
+- Accessibility — `setAccessibilityLabel` shipped 2026-05-26;
+  richer NSAccessibility / UIA provider / full ATK roles + states
+  remain future polish. Web content + default menu items already
+  publish their own labels through the WebView engines + native
+  menu APIs.
 - Auto-updater (Sparkle / Squirrel)
 
 ### Out of P1 scope — shipped 2026-05-24

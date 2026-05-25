@@ -80,6 +80,7 @@ comptime {
         "takeSnapshotPng",
         "setDragDropHandler",
         "print",
+        "setAccessibilityLabel",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

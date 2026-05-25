@@ -441,6 +441,17 @@ pub const Window = struct {
         self.evalJs("window.print();");
     }
 
+    /// Set the window's `NSAccessibilityLabel` — the string
+    /// VoiceOver reads when the window receives focus. Distinct from
+    /// `setTitle:`; the latter sets the visible title-bar text while
+    /// this targets the accessibility tree only. Web content +
+    /// default menu items already publish their own accessibility
+    /// labels via WKWebView + NSMenuItem, no extra wiring needed.
+    pub fn setAccessibilityLabel(self: *Window, label: []const u8) void {
+        const setLabel = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+        setLabel(self.window, m.sel("setAccessibilityLabel:"), nsString(label));
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;

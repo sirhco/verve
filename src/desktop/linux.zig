@@ -147,6 +147,11 @@ extern fn gtk_selection_data_get_uris(data: *GtkSelectionData) ?[*]const ?[*:0]c
 extern fn g_strfreev(strv: ?[*]const ?[*:0]const u8) void;
 extern fn g_signal_handler_disconnect(instance: *anyopaque, handler_id: c_ulong) void;
 
+// ---- ATK accessibility -----------------------------------------------------
+const AtkObject = opaque {};
+extern fn gtk_widget_get_accessible(w: *GtkWidget) *AtkObject;
+extern fn atk_object_set_name(obj: *AtkObject, name: [*:0]const u8) void;
+
 // ---- GTK dialog externs (used by openFileDialog / saveFileDialog / showAlert)
 //
 // File chooser uses the native variant: portal-aware on modern hosts,
@@ -676,6 +681,21 @@ pub const Window = struct {
     /// is deferred polish for richer programmatic print control.
     pub fn print(self: *Window) void {
         self.evalJs("window.print();");
+    }
+
+    /// Set the window's ATK accessible name. `gtk_widget_get_accessible`
+    /// returns the AtkObject lazily attached to every GtkWidget;
+    /// `atk_object_set_name` then sets the string Orca + other AT
+    /// tools announce on focus. Distinct from `gtk_window_set_title`
+    /// (the visible title-bar text). Web content + GTK menu items
+    /// already publish their own ATK names through WebKitGTK and the
+    /// default menu bar.
+    pub fn setAccessibilityLabel(self: *Window, label: []const u8) void {
+        const w = self.ctx.window orelse return;
+        const z = self.ctx.allocator.dupeZ(u8, label) catch return;
+        defer self.ctx.allocator.free(z);
+        const atk_obj = gtk_widget_get_accessible(w);
+        atk_object_set_name(atk_obj, z.ptr);
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
