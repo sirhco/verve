@@ -475,6 +475,7 @@ Overrides:
 | WASM hydration | ✓ | ✓ | ✓ |
 | Single-instance lock | ✓ | ✓ | ✓ |
 | Clipboard read / write | ✓ | ✓ | ✓ |
+| Color scheme (light/dark) | ✓ | ✓ | ✓ |
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | — | — |

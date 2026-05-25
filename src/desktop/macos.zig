@@ -318,6 +318,23 @@ pub const Window = struct {
         return .{ .window = @ptrCast(self) };
     }
 
+    /// Current macOS appearance: dark vs light, derived from
+    /// `[NSApp.effectiveAppearance].name`. The string is one of
+    /// `NSAppearanceNameAqua`, `NSAppearanceNameDarkAqua`,
+    /// `NSAppearanceNameAccessibilityHighContrastAqua`, etc — any
+    /// name containing the substring "Dark" maps to .dark.
+    pub fn colorScheme(self: *Window) opts_mod.ColorScheme {
+        const appearanceSel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+        const appearance = appearanceSel(self.app, m.sel("effectiveAppearance")) orelse return .unknown;
+        const nameSel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+        const name_str = nameSel(appearance, m.sel("name")) orelse return .unknown;
+        const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+        const cstr = utf8(name_str, m.sel("UTF8String")) orelse return .unknown;
+        const slice = std.mem.span(cstr);
+        if (std.mem.indexOf(u8, slice, "Dark") != null) return .dark;
+        return .light;
+    }
+
     /// Render a PNG snapshot of the current WKWebView contents to
     /// `path` on disk. Sync-blocks on a nested NSRunLoop pump until the
     /// completion handler fires, then encodes the NSImage via

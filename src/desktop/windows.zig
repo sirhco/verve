@@ -137,6 +137,27 @@ extern "kernel32" fn GlobalUnlock(mem: ?*anyopaque) callconv(.winapi) BOOL;
 extern "kernel32" fn GlobalFree(mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GlobalSize(mem: ?*anyopaque) callconv(.winapi) usize;
 
+// ---- Registry (color-scheme query) -----------------------------------------
+//
+// `RegGetValueW` reads a single value with one call and handles the
+// open + close internally. We only care about
+// `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`
+// which is 0 for dark and 1 for light on Windows 10/11. Missing key
+// (older Windows) collapses to .unknown.
+const HKEY = ?*opaque {};
+const HKEY_CURRENT_USER: HKEY = @ptrFromInt(0x80000001);
+const ERROR_SUCCESS: c_long = 0;
+const RRF_RT_REG_DWORD: DWORD = 0x10;
+extern "advapi32" fn RegGetValueW(
+    hkey: HKEY,
+    sub_key: LPCWSTR,
+    value: LPCWSTR,
+    flags: DWORD,
+    type_out: ?*DWORD,
+    data: ?*anyopaque,
+    data_size: ?*DWORD,
+) callconv(.winapi) c_long;
+
 const CF_UNICODETEXT: UINT = 13;
 const GMEM_MOVEABLE: UINT = 0x0002;
 
@@ -627,6 +648,19 @@ pub const Window = struct {
     /// per-window scoping just gives API parity with `cookies()`.
     pub fn clipboard(self: *Window) clipboard_mod.Clipboard {
         return .{ .window = @ptrCast(self) };
+    }
+
+    /// Read `HKCU\…\Personalize\AppsUseLightTheme`. The key only
+    /// exists on Windows 10 1809+; absence falls back to .unknown.
+    pub fn colorScheme(self: *Window) opts_mod.ColorScheme {
+        _ = self;
+        const subkey = std.unicode.utf8ToUtf16LeStringLiteral("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+        const value = std.unicode.utf8ToUtf16LeStringLiteral("AppsUseLightTheme");
+        var data: DWORD = 0;
+        var size: DWORD = @sizeOf(DWORD);
+        const r = RegGetValueW(HKEY_CURRENT_USER, subkey, value, RRF_RT_REG_DWORD, null, &data, &size);
+        if (r != ERROR_SUCCESS) return .unknown;
+        return if (data == 0) .dark else .light;
     }
 
     pub fn run(self: *Window) void {

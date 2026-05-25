@@ -187,6 +187,18 @@ extern fn gtk_clipboard_wait_for_text(clipboard: *GtkClipboard) ?[*:0]u8;
 // path resolves the well-known string.
 extern fn gdk_atom_intern_static_string(name: [*:0]const u8) GdkAtom;
 
+// ---- GtkSettings (color-scheme query) --------------------------------------
+const GtkSettings = opaque {};
+extern fn gtk_settings_get_default() ?*GtkSettings;
+// g_object_get is varargs in C — declare with the exact arity we need.
+// Final NULL terminator is the sentinel; passing null pointer suffices.
+extern fn g_object_get(
+    object: *GtkSettings,
+    first_property_name: [*:0]const u8,
+    out: *gboolean,
+    sentinel: ?*anyopaque,
+) void;
+
 extern fn g_signal_connect_data(
     instance: ?*anyopaque,
     detailed_signal: [*:0]const u8,
@@ -497,6 +509,19 @@ pub const Window = struct {
     /// scoping just gives API parity with `cookies()`.
     pub fn clipboard(self: *Window) clipboard_mod.Clipboard {
         return .{ .window = @ptrCast(self) };
+    }
+
+    /// Read GTK's `gtk-application-prefer-dark-theme` boolean. This
+    /// reflects the user's theme choice on most GNOME / KDE desktops
+    /// and matches what GTK uses internally to flip widget colors.
+    /// On hosts without a GtkSettings backend (uncommon — `gtk_init`
+    /// already failed earlier in that case), collapses to .unknown.
+    pub fn colorScheme(self: *Window) opts_mod.ColorScheme {
+        _ = self;
+        const settings = gtk_settings_get_default() orelse return .unknown;
+        var prefer_dark: gboolean = 0;
+        g_object_get(settings, "gtk-application-prefer-dark-theme", &prefer_dark, null);
+        return if (prefer_dark != 0) .dark else .light;
     }
 
     pub fn run(self: *Window) void {

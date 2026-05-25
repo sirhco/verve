@@ -97,6 +97,13 @@ pub const ClipboardError = error{
     Backend,
 };
 
+/// Current system color preference. Apps that style their UI to
+/// match the OS appearance should call `Window.colorScheme()` at
+/// startup and re-check on each window restore. Change-notifications
+/// are not yet wired — the value can drift if the user toggles the
+/// OS setting while the app is running.
+pub const ColorScheme = enum { light, dark, unknown };
+
 pub const SnapshotError = error{
     Unsupported,
     /// Snapshot capture returned without an image (timeout / view not ready / GPU issue).

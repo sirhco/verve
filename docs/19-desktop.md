@@ -86,6 +86,15 @@ reference. Headline list:
   platform-native async cookie managers)
 - **Multi-window** — `Window.openChildWindow(opts)`; last-window-quit
   semantics on all three platforms
+- **Color scheme** — `Window.colorScheme()` returns
+  `.light` / `.dark` / `.unknown`. macOS reads
+  `[NSApp.effectiveAppearance].name` and matches "Dark"; Windows
+  reads
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`
+  (0 = dark, 1 = light, absent → unknown); Linux reads
+  `gtk-application-prefer-dark-theme` via `gtk_settings_get_default`.
+  Change-notification events to JS are deferred — apps poll on
+  window restore or wire their own listener for now.
 - **Clipboard** — `Window.clipboard()` returns a handle with
   `writeText(text)` and `readText(alloc) -> ?[]u8`. macOS uses
   `NSPasteboard.generalPasteboard` + `public.utf8-plain-text`;
@@ -162,6 +171,7 @@ Zig calls via nested event-loop pumps.
 | WASM hydration | ✓ | ✓ | ✓ |
 | Single-instance lock | ✓ | ✓ | ✓ |
 | Clipboard read / write | ✓ | ✓ | ✓ |
+| Color scheme (light/dark) | ✓ | ✓ | ✓ |
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | — | — |
