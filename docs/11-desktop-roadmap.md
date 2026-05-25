@@ -27,8 +27,124 @@ Fresh session? Do these four in order before writing code:
 
 Authoritative state of the desktop scaffold subsystem and the remaining
 work needed to call it "fully functional." Written 2026-05-22, last
-updated 2026-05-24. Fresh sessions should be able to pick up without
+updated 2026-05-25. Fresh sessions should be able to pick up without
 prior context.
+
+## Done in the 2026-05-25 session
+
+Four P3 bundles shipped to `ui-ki`. All committed; tree clean at
+session end. Commit chain (newest first):
+
+```
+68af576 desktop: tray icons + native notifications
+c0aeef5 desktop: warm-launch URL forwarding on Win + Linux
+e96d190 desktop: deep-link URL handlers (macOS AEH + Win/Linux cold-launch)
+a31ac6c desktop: native menu bars on Windows + Linux
+```
+
+- [x] **Win/Linux native menu bars** (`a31ac6c`). Default File (Quit,
+  Ctrl+Q) + Edit (Undo/Redo/Cut/Copy/Paste/Select All) honoring the
+  existing `install_default_menu` flag. Win uses
+  `CreateMenu`/`SetMenu` + one-entry `HACCEL` for Ctrl+Q routed
+  through `TranslateAcceleratorW` + `WM_COMMAND`. Linux wraps the
+  webview in a `GtkBox` + `GtkMenuBar` with a single Ctrl+Q binding
+  on the accel group. Edit items render the shortcut hint in the
+  label only — WebView2 / WebKitGTK handle the actual keystrokes
+  natively. Opt-out (`install_default_menu = false`) keeps the
+  pre-existing tree unchanged on every backend.
+- [x] **Deep-link URL handlers** (`e96d190`).
+  `Window.setUrlOpenHandler(cb, ctx)` + `Window.deliverUrl(url)` on
+  the public surface; new `UrlOpenHandler` type and
+  `on_url_open`/`on_url_open_ctx` on `WindowOptions`. macOS installs
+  an `NSAppleEventManager` handler for `kInternetEventClass` /
+  `kAEGetURL` (FourCharCode `'GURL'`, `0x4755524C`) lazily on the
+  first non-null call; Cocoa queues pre-launch URLs and drains them
+  on the next run-loop spin. Win + Linux: cold-launch via argv —
+  template `main.zig` parses `--url <u>` (or any positional
+  starting with `verve://`) and feeds the URL through `deliverUrl`
+  after the window opens. Scaffold `build.zig` gains
+  `-Durl-scheme=<name>` which injects `CFBundleURLTypes` into the
+  generated `Info.plist`. New `window.verve.handleDeepLink` JS
+  bridge hook + "Deep link" card in the demo page.
+- [x] **Win/Linux warm-launch URL forwarding** (`c0aeef5`). New
+  `desktop.deep_link` module:
+  - `forwardToRunningInstance(allocator, name, url)` — second-instance
+    call. Win: `FindWindowW("VerveWindow", null)` + `SendMessageW(WM_COPYDATA)`
+    with a `0x55524C00` (`"URL\0"`) `dwData` sentinel so unrelated
+    WM_COPYDATA traffic doesn't trip the receiver. Linux: abstract
+    `AF_UNIX SOCK_DGRAM` socket bound to
+    `\0verve-deeplink-<single_instance_name>`; `connect` + `send`
+    a single datagram. macOS returns `error.Unsupported` —
+    `NSAppleEventManager` already routes warm-launch URLs through
+    the AEH so no second process is spawned.
+  - `startListener(window, name)` — running-instance call. Win is a
+    no-op (wndProc handles `WM_COPYDATA` directly). Linux wraps the
+    bound fd in a `GIOChannel` with a `G_IO_IN` watch so the GTK
+    main loop dispatches inbound URLs; `close_on_unref(true)` cleans
+    up at window destruction.
+  - Template `main.zig`: second-instance `AlreadyRunning` branch
+    calls `forwardToRunningInstance` when `--url <u>` was provided
+    and exits. Primary instance calls `startListener` after window
+    open. macOS `Unsupported` suppressed silently.
+- [x] **Tray icons + native notifications** (`68af576`). Two new
+  modules:
+  - `desktop.tray` — `init(allocator, &window, .{ .label, .tooltip })`
+    + `setTooltip(text)` + `deinit`. macOS: `NSStatusItem` from
+    `[NSStatusBar systemStatusBar]`. Win: `Shell_NotifyIconW(NIM_ADD)`
+    with stock `IDI_APPLICATION` + `NIF_TIP`. Linux: `app_indicator_new`
+    (libayatana-appindicator3) with an empty `GtkMenu` attached
+    because some Ayatana versions silently refuse to render without
+    one. No click handlers, no submenus — those are a future bundle.
+  - `desktop.notifications` — `show(allocator, .{ .title, .body })`.
+    macOS: `NSUserNotification` + `NSUserNotificationCenter`
+    (deprecated but works without a permission grant). Linux:
+    `notify_init` + `notify_notification_new` + `notify_notification_show`
+    (libnotify). Win: returns `error.Unsupported` — Toast
+    notifications need COM + AUMID + Start-menu registration,
+    deferred. Apps that need Win notifications today layer a
+    manual `Shell_NotifyIconW(NIF_INFO)` on top of the tray icon.
+  - `src/desktop/windows.zig` exposes `hwndOf(window)` so sibling
+    modules can reach the HWND without going through the
+    cross-platform `Window` facade.
+  - Template demo: scaffold opens a tray on startup; new `notify`
+    IPC route fires a native notification; "Notify" button card in
+    the demo page.
+
+### Verification across all four bundles
+
+- Framework `zig build` + `zig build test` PASS each commit.
+- 3-backend cross-compile (`aarch64-macos`, `x86_64-linux-gnu`,
+  `x86_64-windows-gnu`) clean each commit.
+- macOS scaffold boot: window + AEH install + cold-launch URL
+  routing all live (`info: [url-open] verve://app/test-cold-launch`).
+- macOS `-Durl-scheme=verve` bundle step writes
+  `CFBundleURLTypes` into `Info.plist`.
+- Second-instance with `--url`: detects `AlreadyRunning`, attempts
+  forward, gracefully exits.
+
+Live Win/Linux validation deferred — no hosts. Same convention as
+cookies / clipboard / color-scheme / menus on those backends.
+
+### New runtime deps
+
+- **Linux** picks up two new shared libraries:
+  - `libayatana-appindicator3` (tray icon)
+  - `libnotify` (notifications)
+  Both are present by default on Ubuntu / Fedora / Debian / Arch
+  GNOME + KDE installs. Distros without them get a link-time
+  failure when the scaffold app is built. Apps that don't call the
+  new modules still link them today — moving externs behind weak
+  symbols / `dlopen` is a future polish.
+
+### Remaining P3 follow-ups after this session
+
+- GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
+- Drag-drop with native paths, print API
+- Hicolor / Linux app-icon theme installation
+- Deep-link tray click handlers + submenus on all 3 platforms
+- Win Toast notifications (`Windows.UI.Notifications.ToastNotificationManager`)
+- Accessibility (NSAccessibility / UIA / ATK)
+- Auto-updater (Sparkle / Squirrel / AppImage update)
 
 ## Done in the 2026-05-22 → 2026-05-24 session
 
@@ -449,10 +565,12 @@ now a Level-3 golden-diff harness:
 
 ## Suggested next-session bundles
 
-All P1 + every P2 platform port closed; the high-value P3 items
-that user-facing apps reach for immediately (single-instance,
-clipboard, color scheme + change events, app icons) all landed on
-2026-05-24. Remaining work is the lower-frequency P3 surface:
+All P1 + every P2 platform port closed. The high-value P3 items
+landed across 2026-05-24/25: clipboard, single-instance, color
+scheme + change events, app icons, native menu bars (all 3),
+deep-link URL handlers (warm + cold, all 3), tray icons (all 3),
+notifications (macOS + Linux). Remaining work is the lower-
+frequency P3 surface:
 
 | Bundle | Items | Best for |
 |---|---|---|
@@ -520,3 +638,22 @@ ls zig-out/app.app/Contents/{Info.plist,MacOS/app}   # both should exist
   2026-05-22 → 2026-05-24 session ran 12 phases — past the limit
   — and the rubric still held because each phase was bounded and
   verified independently. That's a ceiling, not a target.
+- The 2026-05-25 session shipped four P3 bundles (menus, deep-link
+  cold-launch + warm-launch, tray + notifications). Same rubric
+  applied: each bundle had its own commit + cross-compile + scaffold
+  smoke. Tree clean at session end.
+- New Linux runtime deps as of 2026-05-25:
+  `libayatana-appindicator3` (tray) + `libnotify` (notifications).
+  Both are present by default on most Ubuntu / Fedora / Debian /
+  Arch GNOME + KDE installs. Distros without them will fail at
+  link time for any scaffolded app — including apps that don't use
+  the new modules. Moving the externs behind weak symbols /
+  `dlopen` is a polish item.
+- macOS `NSUserNotification` is deprecated by Apple but still works
+  without a permission grant. Migrating to
+  `UNUserNotificationCenter` requires entitlements + a permission
+  prompt + a bundled app (LSUIElement / NSPrincipalClass).
+  Deferred.
+- Windows tray uses the stock `IDI_APPLICATION` icon. Custom icons
+  need a `setIcon` API on `desktop.tray` — deferred to the same
+  follow-up that adds tray click handlers + submenus.
