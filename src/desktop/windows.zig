@@ -509,6 +509,12 @@ const SLOT_WV2_get_CanGoBack: usize = 38;
 const SLOT_WV2_get_CanGoForward: usize = 39;
 const SLOT_WV2_get_Source: usize = 4;
 const SLOT_WV2_get_DocumentTitle: usize = 48;
+// `ICoreWebView2Controller` (not ICoreWebView2) holds the zoom
+// factor — slot 12 in vtable order: QI/AddRef/Release (3) +
+// get_IsVisible/put_IsVisible/get_Bounds/put_Bounds/get_ZoomFactor/
+// put_ZoomFactor + ... So ZoomFactor lives at slot 11/12.
+const SLOT_CTRL_get_ZoomFactor: usize = 11;
+const SLOT_CTRL_put_ZoomFactor: usize = 12;
 const SLOT_WV2_NavigateToString: usize = 6;
 const SLOT_WV2_AddScriptToExecuteOnDocumentCreated: usize = 27;
 const SLOT_WV2_ExecuteScript: usize = 29;
@@ -1112,6 +1118,20 @@ pub const Window = struct {
     pub fn currentTitle(self: *Window, allocator: std.mem.Allocator) ![]u8 {
         const wv = self.ctx.webview orelse return allocator.dupe(u8, "");
         return wv2StringGetter(wv, SLOT_WV2_get_DocumentTitle, allocator);
+    }
+
+    pub fn setZoom(self: *Window, level: f64) void {
+        const ctrl = self.ctx.controller orelse return;
+        const Put = vtSlot(*const fn (*Ctrl, f64) callconv(.winapi) HRESULT, ctrl.lpVtbl, SLOT_CTRL_put_ZoomFactor);
+        _ = Put(ctrl, level);
+    }
+
+    pub fn getZoom(self: *Window) f64 {
+        const ctrl = self.ctx.controller orelse return 1.0;
+        const Get = vtSlot(*const fn (*Ctrl, *f64) callconv(.winapi) HRESULT, ctrl.lpVtbl, SLOT_CTRL_get_ZoomFactor);
+        var out: f64 = 1.0;
+        _ = Get(ctrl, &out);
+        return out;
     }
 
     pub fn setResizable(self: *Window, on: bool) void {

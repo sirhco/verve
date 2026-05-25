@@ -678,6 +678,18 @@ pub const Window = struct {
         return nsStringToOwnedUtf8(allocator, ns_title);
     }
 
+    /// Page zoom level. `1.0` = 100%. Practical range ~`0.25..5.0`;
+    /// WKWebView clamps values outside its supported range silently.
+    pub fn setZoom(self: *Window, level: f64) void {
+        const sel = m.cast(*const fn (id, SEL, f64) callconv(.c) void);
+        sel(self.webview, m.sel("setPageZoom:"), level);
+    }
+
+    pub fn getZoom(self: *Window) f64 {
+        const sel = m.cast(*const fn (id, SEL) callconv(.c) f64);
+        return sel(self.webview, m.sel("pageZoom"));
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;

@@ -408,6 +408,8 @@ extern fn webkit_web_view_can_go_back(wv: *WebKitWebView) gboolean;
 extern fn webkit_web_view_can_go_forward(wv: *WebKitWebView) gboolean;
 extern fn webkit_web_view_get_uri(wv: *WebKitWebView) ?[*:0]const u8;
 extern fn webkit_web_view_get_title(wv: *WebKitWebView) ?[*:0]const u8;
+extern fn webkit_web_view_set_zoom_level(wv: *WebKitWebView, level: f64) void;
+extern fn webkit_web_view_get_zoom_level(wv: *WebKitWebView) f64;
 extern fn webkit_web_view_run_javascript(
     wv: *WebKitWebView,
     script: [*:0]const u8,
@@ -990,6 +992,16 @@ pub const Window = struct {
         const wv = self.ctx.webview orelse return allocator.dupe(u8, "");
         const title = webkit_web_view_get_title(wv) orelse return allocator.dupe(u8, "");
         return allocator.dupe(u8, std.mem.span(title));
+    }
+
+    pub fn setZoom(self: *Window, level: f64) void {
+        const wv = self.ctx.webview orelse return;
+        webkit_web_view_set_zoom_level(wv, level);
+    }
+
+    pub fn getZoom(self: *Window) f64 {
+        const wv = self.ctx.webview orelse return 1.0;
+        return webkit_web_view_get_zoom_level(wv);
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {

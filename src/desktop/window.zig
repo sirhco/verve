@@ -114,6 +114,8 @@ comptime {
         "canGoForward",
         "currentUrl",
         "currentTitle",
+        "setZoom",
+        "getZoom",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {
