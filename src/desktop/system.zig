@@ -48,6 +48,36 @@ pub fn osVersion(allocator: std.mem.Allocator) Error![]u8 {
     };
 }
 
+/// Trigger the system bell / audible alert. macOS: `NSBeep()`.
+/// Windows: `MessageBeep(MB_OK)`. Linux: writes BEL (0x07) to
+/// stdout — every terminal-aware compositor surfaces it as the
+/// system audible-alert sound. Silent if the user has disabled
+/// the alert in OS settings.
+pub fn beep() void {
+    switch (builtin.os.tag) {
+        .macos => NSBeep(),
+        .windows => _ = MessageBeep(0),
+        .linux => {
+            const bel = "\x07";
+            _ = std.posix.write(std.posix.STDOUT_FILENO, bel) catch {};
+        },
+        else => {},
+    }
+}
+
+/// Current process ID. Useful for log correlation, IPC keying,
+/// crash diagnostics.
+pub fn processId() u32 {
+    return switch (builtin.os.tag) {
+        .windows => @intCast(GetCurrentProcessId()),
+        else => @intCast(std.posix.getpid()),
+    };
+}
+
+extern "AppKit" fn NSBeep() void;
+extern "user32" fn MessageBeep(ty: c_uint) callconv(.winapi) c_int;
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) c_ulong;
+
 // ---- macOS — NSLocale + NSProcessInfo --------------------------------------
 
 fn localeMacos(allocator: std.mem.Allocator) Error![]u8 {

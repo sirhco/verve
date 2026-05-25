@@ -85,6 +85,10 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- System bell + process ID — `desktop.system.beep()` triggers
+  the OS audible alert (NSBeep / MessageBeep / stdout BEL).
+  `desktop.system.processId()` returns the current PID for log
+  correlation / IPC keying. Pure stdlib + per-platform externs.
 - Window zoom — `Window.setZoom(level)` / `getZoom()` on all 3
   backends. `1.0` = 100%; engines clamp to their supported range.
   macOS: `WKWebView setPageZoom:` / `pageZoom`. Windows:
