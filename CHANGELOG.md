@@ -6,6 +6,92 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-26
+
+Six P3 bundles shipped post-`v0.1.0`. Mostly closes the desktop
+backlog — only GTK4, WinRT Toast (polish), full UIA / NSAccessibility
+providers, and the auto-updater remain.
+
+### Added — Custom tray icons (2026-05-26)
+
+- `Tray.setIcon(path)` + `TrayOptions.icon_path` on all 3 backends.
+  Replaces the stock `IDI_APPLICATION` glyph on Windows; macOS uses
+  any `NSImage`-readable format with `setTemplate:true` for menu-bar
+  tinting; Linux routes through `app_indicator_set_icon_full`
+  (accepts absolute PNG path or theme icon name). `owns_icon` on
+  Windows tracks LoadImageW-loaded HICONs vs the shared stock icon
+  so `DestroyIcon` only fires on the owned variant.
+
+### Added — Win balloon notifications (2026-05-26)
+
+- Replaces `error.Unsupported` in `notifications.show` on Windows
+  with `Shell_NotifyIconW(NIM_MODIFY, NIF_INFO)` against the active
+  `desktop.tray` icon. Renders as a Win10/11 balloon tip (older
+  shell) / Action Center entry (modern). Requires `desktop.tray.init`
+  to have run first — without an active tray, the call returns
+  `error.Backend`. WinRT Toast (`ToastNotificationManager`) deferred
+  as polish.
+
+### Added — Hicolor / Linux desktop integration (2026-05-26)
+
+- New `zig build install-icons` step in `templates/desktop/build.zig`
+  stages a freedesktop icon-theme tree + `.desktop` launcher entry
+  under `zig-out/share/` for user (`~/.local/share`) or system
+  (`/usr/share`) install. Build options:
+  - `-Dlinux-icon=<path>` (single PNG → `scalable/apps/<name>.png`)
+  - `-Dlinux-icon-<N>=<path>` for N in
+    `{16,22,24,32,48,64,96,128,256,512}` (per-size variants)
+  - `-Dlinux-categories=<x;y;>`, `-Dlinux-comment=<text>`,
+    `-Dlinux-generic-name=<text>`, `-Dlinux-exec=<text>` for the
+    `.desktop` file fields.
+  Step is gated on `target.result.os.tag == .linux`.
+
+### Added — Drag-drop with native file paths (2026-05-26)
+
+- `Window.setDragDropHandler(cb, ctx)` + `WindowOptions.on_drag_drop`
+  on all 3 backends. Single callback `fn(ctx, paths: []const []const u8)`
+  fires with UTF-8 absolute filesystem paths — the browser
+  `DataTransfer` API hides these by design.
+- macOS: `VerveDragWindow` NSWindow subclass via
+  `objc_allocateClassPair` + `object_setClass`;
+  `registerForDraggedTypes:` with `public.file-url`;
+  `performDragOperation:` reads
+  `[NSPasteboard readObjectsForClasses:@[NSURL.class]]`.
+- Windows: minimal `IDropTarget` COM impl embedded in `WindowCtx`
+  (`drop_target` field, mirrors the env/ctrl/msg/res handler embed
+  pattern). `OleInitialize` + `RegisterDragDrop`; `Drop` reads
+  `IDataObject::GetData(CF_HDROP)` → `DragQueryFileW`. `RevokeDragDrop`
+  on `WM_DESTROY`.
+- Linux: `gtk_drag_dest_set(window, GTK_DEST_DEFAULT_ALL, NULL, 0,
+  GDK_ACTION_COPY)` + `gtk_drag_dest_add_uri_targets` +
+  `drag-data-received` signal. Strips `file://` URI prefix.
+
+In-app drag sources (drags originating inside the WebView) remain
+out of scope — those flow through standard HTML5 drag-drop events.
+
+### Added — Print API (2026-05-26)
+
+- `Window.print()` on all 3 backends. v1 dispatches via the page's
+  `window.print()` — each native engine (WKWebView / WebView2 /
+  WebKitGTK) renders its built-in print UI off that call. Native
+  print APIs (`NSPrintOperation` / `ICoreWebView2_16::ShowPrintUI` /
+  `webkit_print_operation_run_dialog`) deferred as polish for
+  silent print + advanced controls.
+
+### Added — Accessibility label API (2026-05-26)
+
+- `Window.setAccessibilityLabel(text)` on all 3 backends. macOS:
+  `[NSWindow setAccessibilityLabel:]`. Linux:
+  `gtk_widget_get_accessible(window)` + `atk_object_set_name`.
+  Windows: routes through `setTitle` (no separate Win32 a11y-label
+  channel without a custom UIA provider; deferred).
+
+### CLI
+
+- No `verve-cli` changes vs `v0.1.0`. The `--release` / `--release-hash`
+  flags shipped with `v0.1.0` continue to work — point at any
+  released tag (`--release v0.1.1`).
+
 ## [0.1.0] - 2026-05-26
 
 First tagged release. Closes P1 (#16–#23), every P2 platform port,
