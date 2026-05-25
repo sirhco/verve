@@ -14,15 +14,17 @@
 //! - **Linux** — `notify_init` + `notify_notification_new` +
 //!   `notify_notification_show`. Requires `libnotify` to be linked
 //!   into the binary; nearly every desktop installs it by default.
-//! - **Windows** — returns `error.Unsupported`. Modern Win10+ uses
-//!   Toast notifications which require COM + AUMID + Start-menu
-//!   registration; legacy balloon tips are tied to a tray icon and
-//!   the tray module's `Tray.notify` will be the cross-cut once it
-//!   ships. Apps that want Win notifications today fall back to
-//!   `tray.zig` plus a manual `Shell_NotifyIconW(NIF_INFO)` call.
+//! - **Windows** — `Shell_NotifyIconW(NIM_MODIFY, NIF_INFO)` against
+//!   the active `desktop.tray` icon. Renders as a standard Win10/11
+//!   balloon tip (older shell) / Action Center entry (modern
+//!   shell). Requires `desktop.tray.init` to have been called first;
+//!   without an active tray the call returns `error.Backend`. The
+//!   modern WinRT `ToastNotificationManager` path needs COM + AUMID +
+//!   Start-menu shortcut registration and is deferred.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const tray_mod = @import("tray.zig");
 
 pub const Error = error{
     Unsupported,
@@ -39,9 +41,21 @@ pub fn show(allocator: std.mem.Allocator, opts: NotificationOptions) Error!void 
     switch (builtin.os.tag) {
         .macos => return showMacos(allocator, opts),
         .linux => return showLinux(allocator, opts),
-        .windows => return error.Unsupported,
+        .windows => return showWindows(opts),
         else => return error.Unsupported,
     }
+}
+
+fn showWindows(opts: NotificationOptions) Error!void {
+    if (builtin.os.tag != .windows) return error.Unsupported;
+    // Delegate to the tray module's NIF_INFO helper. The error
+    // domain matches ours (Unsupported / Backend), so propagate
+    // directly.
+    return tray_mod.showWindowsBalloon(opts.title, opts.body) catch |err| switch (err) {
+        tray_mod.Error.Unsupported => Error.Unsupported,
+        tray_mod.Error.OutOfMemory => Error.OutOfMemory,
+        tray_mod.Error.Backend => Error.Backend,
+    };
 }
 
 // ---- macOS — NSUserNotification --------------------------------------------

@@ -43,12 +43,16 @@ against the published tag.
 
 ## Done in the 2026-05-26 session
 
-Three P3 bundles shipped to `ui-ki` and tagged as `v0.1.0`:
+Four P3 bundles shipped to `main`. First three tagged as `v0.1.0`:
 - Tray click handlers + submenus (all 3 backends).
 - Release prep — `verve-cli new --release` flag + CHANGELOG bump to
   0.1.0 + working release.yml run.
 - Custom tray icons via `Tray.setIcon(path)` + `TrayOptions.icon_path`
   (all 3 backends).
+
+Fourth shipped post-tag (will roll into a v0.1.1 / v0.2.0):
+- Windows balloon-tip notifications via existing tray. Replaces the
+  `error.Unsupported` Win branch in `notifications.show`.
 
 ### Tray click handlers + submenus
 
@@ -233,6 +237,31 @@ No template demo wiring — would need a real icon file embedded in
 the scaffold, which isn't worth the bytes for a v1 feature. Apps
 add their own icon path in `TrayOptions` or call `setIcon` after
 init.
+
+### Win balloon notifications
+
+Replaces the `error.Unsupported` Win branch in
+`notifications.show`. Strategy: piggy-back on the existing tray
+icon's `NOTIFYICONDATAW` via `Shell_NotifyIconW(NIM_MODIFY,
+NIF_INFO)`. Renders as a Win10/11 balloon tip (older shell) or
+Action Center entry (modern shell).
+
+- New `pub fn tray.showWindowsBalloon(title, body)` reaches the
+  active `g_windows_tray` singleton, fills `szInfoTitle` (UTF-16,
+  cap 64 chars) + `szInfo` (UTF-16, cap 256 chars) + `dwInfoFlags
+  = NIIF_INFO`, and ships via `NIM_MODIFY`.
+- `notifications.show` on Windows delegates to it. Errors map 1:1
+  between the tray + notifications `Error` domains.
+- **Hard requirement**: `desktop.tray.init` must have run before
+  `notifications.show` on Windows — without an active tray, the
+  call returns `error.Backend`. macOS + Linux remain
+  tray-independent.
+
+Modern WinRT Toast (`Windows.UI.Notifications.ToastNotificationManager`)
+is deferred — it needs COM init + AUMID +
+`SetCurrentProcessExplicitAppUserModelID` + Start-menu shortcut
+registration + XML toast templates, ~500 LOC of WinRT plumbing.
+The balloon path covers the basic title/body case for v1.
 
 ### Verification across all four bundles
 
@@ -614,7 +643,9 @@ now a Level-3 golden-diff harness:
 - GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
 - Drag-drop with native paths, print API
 - Hicolor / Linux app icon theme installation
-- Win Toast notifications
+- Win Toast (WinRT) notifications — balloon path shipped 2026-05-26;
+  Toast remains future polish for richer styling + Action Center
+  grouping.
 - Accessibility (NSAccessibility / UIA / ATK)
 - Auto-updater (Sparkle / Squirrel)
 

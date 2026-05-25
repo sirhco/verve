@@ -838,6 +838,36 @@ const WindowsTray = struct {
 var g_windows_tray: ?*WindowsTray = null;
 var windows_hooks_installed: bool = false;
 
+/// Trigger a Windows balloon-tip / Action-Center entry through the
+/// existing tray icon. Used by `notifications.show` on Windows in
+/// lieu of the WinRT `ToastNotificationManager` stack (deferred until
+/// the COM + AUMID + Start-menu plumbing lands). Returns
+/// `error.Backend` if no tray has been initialized in this process —
+/// Win notifications require an attached tray icon.
+pub fn showWindowsBalloon(title: []const u8, body: []const u8) Error!void {
+    if (builtin.os.tag != .windows) return error.Unsupported;
+    const tray = g_windows_tray orelse return error.Backend;
+    if (!tray.added) return error.Backend;
+
+    const NIIF_INFO: WindowsTray.UINT = 0x1;
+    const NIF_INFO: WindowsTray.UINT = 0x10;
+
+    var nid: WindowsTray.NOTIFYICONDATAW = .{};
+    nid.cbSize = @sizeOf(WindowsTray.NOTIFYICONDATAW);
+    nid.hWnd = @ptrCast(@alignCast(tray.hwnd));
+    nid.uID = tray.uid;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+
+    // szInfoTitle is u16[64], szInfo is u16[256] — both NUL-terminated.
+    const t_written = std.unicode.utf8ToUtf16Le(&nid.szInfoTitle, title) catch 0;
+    nid.szInfoTitle[@min(nid.szInfoTitle.len - 1, t_written)] = 0;
+    const b_written = std.unicode.utf8ToUtf16Le(&nid.szInfo, body) catch 0;
+    nid.szInfo[@min(nid.szInfo.len - 1, b_written)] = 0;
+
+    if (WindowsTray.Shell_NotifyIconW(WindowsTray.NIM_MODIFY, &nid) == 0) return error.Backend;
+}
+
 fn installWindowsDispatchHooks() void {
     if (builtin.os.tag != .windows) return;
     if (windows_hooks_installed) return;
