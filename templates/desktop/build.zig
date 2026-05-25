@@ -336,6 +336,120 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // Linux desktop-integration step. `zig build install-icons` lays
+    // out a Hicolor icon-theme tree + a freedesktop `.desktop` file
+    // under `zig-out/share/`. Run after `zig build` to produce:
+    //
+    //   zig-out/share/icons/hicolor/scalable/apps/<name>.png   (always, if -Dlinux-icon set)
+    //   zig-out/share/icons/hicolor/<N>x<N>/apps/<name>.png    (per -Dlinux-icon-<N>)
+    //   zig-out/share/applications/<name>.desktop              (always)
+    //
+    // Install with:
+    //   cp -r zig-out/share ~/.local/share        # user install
+    //   sudo cp -r zig-out/share /usr/share       # system install
+    // and optionally `gtk-update-icon-cache` / `update-desktop-database`.
+    //
+    // No image resizing — Zig stdlib has no image library and pulling
+    // ImageMagick / libpng as a build dep is heavier than the value.
+    // Callers either pre-resize per size or rely on the single
+    // scalable/ entry as the catch-all (Hicolor's icon-lookup spec
+    // explicitly walks scalable when no size match exists).
+    if (target.result.os.tag == .linux) {
+        const linux_icon = b.option(
+            []const u8,
+            "linux-icon",
+            "Path to a PNG icon installed into share/icons/hicolor/scalable/apps/<name>.png.",
+        );
+        const linux_categories = b.option(
+            []const u8,
+            "linux-categories",
+            "Semicolon-separated freedesktop categories list for the .desktop Categories= field (default: Utility;).",
+        ) orelse "Utility;";
+        const linux_comment = b.option(
+            []const u8,
+            "linux-comment",
+            "Short description for the .desktop Comment= field (default: derived from the exe name).",
+        ) orelse b.fmt("Verve desktop application: {s}", .{exe.name});
+        const linux_generic = b.option(
+            []const u8,
+            "linux-generic-name",
+            "GenericName= for the .desktop file (default: 'Application').",
+        ) orelse "Application";
+        const linux_exec = b.option(
+            []const u8,
+            "linux-exec",
+            "Exec= line for the .desktop file. Default: '<name> %U' (relies on $PATH lookup). Override with an absolute path for prefix installs.",
+        ) orelse b.fmt("{s} %U", .{exe.name});
+
+        const desktop_step = b.step(
+            "install-icons",
+            "Stage Hicolor icons + .desktop file under zig-out/share/ for Linux install",
+        );
+
+        // `.desktop` file is always generated — even without an icon
+        // the entry shows up in app launchers with a generic glyph.
+        const desktop_src = b.fmt(
+            \\[Desktop Entry]
+            \\Type=Application
+            \\Version=1.0
+            \\Name={s}
+            \\GenericName={s}
+            \\Comment={s}
+            \\Exec={s}
+            \\Icon={s}
+            \\Terminal=false
+            \\Categories={s}
+            \\StartupNotify=true
+            \\StartupWMClass={s}
+            \\
+        , .{ exe.name, linux_generic, linux_comment, linux_exec, exe.name, linux_categories, exe.name });
+        const desktop_wf = b.addWriteFiles();
+        const desktop_lazy = desktop_wf.add(b.fmt("{s}.desktop", .{exe.name}), desktop_src);
+        const inst_desktop = b.addInstallFileWithDir(
+            desktop_lazy,
+            .{ .custom = "share/applications" },
+            b.fmt("{s}.desktop", .{exe.name}),
+        );
+        desktop_step.dependOn(&inst_desktop.step);
+
+        if (linux_icon) |ip| {
+            const icon_lazy: std.Build.LazyPath = if (std.fs.path.isAbsolute(ip))
+                .{ .cwd_relative = ip }
+            else
+                b.path(ip);
+            const inst_icon = b.addInstallFileWithDir(
+                icon_lazy,
+                .{ .custom = "share/icons/hicolor/scalable/apps" },
+                b.fmt("{s}.png", .{exe.name}),
+            );
+            desktop_step.dependOn(&inst_icon.step);
+        }
+
+        // Per-size variants. Hicolor's standard sizes are
+        // 16/22/24/32/48/64/96/128/256/512 — we expose the most
+        // commonly shipped ones. Each is optional; missing sizes are
+        // resolved by app launchers via Hicolor's scalable fallback.
+        const sizes = [_]u32{ 16, 22, 24, 32, 48, 64, 96, 128, 256, 512 };
+        inline for (sizes) |sz| {
+            const flag = b.fmt("linux-icon-{d}", .{sz});
+            const desc = b.fmt("PNG icon for {d}x{d} Hicolor variant.", .{ sz, sz });
+            const ip = b.option([]const u8, flag, desc);
+            if (ip) |path| {
+                const icon_lazy: std.Build.LazyPath = if (std.fs.path.isAbsolute(path))
+                    .{ .cwd_relative = path }
+                else
+                    b.path(path);
+                const subdir = b.fmt("share/icons/hicolor/{d}x{d}/apps", .{ sz, sz });
+                const inst_sz = b.addInstallFileWithDir(
+                    icon_lazy,
+                    .{ .custom = subdir },
+                    b.fmt("{s}.png", .{exe.name}),
+                );
+                desktop_step.dependOn(&inst_sz.step);
+            }
+        }
+    }
+
     // Level-1 smoke harness. One step per platform — invoked via the
     // platform's shell so the embedded scripts do not need their
     // executable bit preserved through the scaffolder's WriteFile path.

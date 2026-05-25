@@ -43,16 +43,19 @@ against the published tag.
 
 ## Done in the 2026-05-26 session
 
-Four P3 bundles shipped to `main`. First three tagged as `v0.1.0`:
+Five P3 bundles shipped to `main`. First three tagged as `v0.1.0`:
 - Tray click handlers + submenus (all 3 backends).
 - Release prep — `verve-cli new --release` flag + CHANGELOG bump to
   0.1.0 + working release.yml run.
 - Custom tray icons via `Tray.setIcon(path)` + `TrayOptions.icon_path`
   (all 3 backends).
 
-Fourth shipped post-tag (will roll into a v0.1.1 / v0.2.0):
+Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
 - Windows balloon-tip notifications via existing tray. Replaces the
   `error.Unsupported` Win branch in `notifications.show`.
+- Hicolor / Linux desktop integration — `zig build install-icons`
+  stages a freedesktop icon-theme + `.desktop` file tree under
+  `zig-out/share/` for user / system install.
 
 ### Tray click handlers + submenus
 
@@ -237,6 +240,39 @@ No template demo wiring — would need a real icon file embedded in
 the scaffold, which isn't worth the bytes for a v1 feature. Apps
 add their own icon path in `TrayOptions` or call `setIcon` after
 init.
+
+### Hicolor / Linux desktop integration
+
+`templates/desktop/build.zig` gains an `install-icons` step
+(gated on `target.result.os.tag == .linux`) that lays out a
+Hicolor icon-theme tree + freedesktop `.desktop` file under
+`zig-out/share/`:
+
+- `zig-out/share/icons/hicolor/scalable/apps/<name>.png` — written
+  when `-Dlinux-icon=<path>` is set.
+- `zig-out/share/icons/hicolor/<N>x<N>/apps/<name>.png` — written
+  for each `-Dlinux-icon-<N>=<path>` (N ∈ {16,22,24,32,48,64,96,
+  128,256,512}). No resizing — Zig stdlib has no image library
+  and pulling ImageMagick / libpng as a build dep is heavier than
+  the value. Apps either pre-resize per size or rely on the
+  scalable/ catch-all.
+- `zig-out/share/applications/<name>.desktop` — always written.
+  Fields configurable via `-Dlinux-categories`, `-Dlinux-comment`,
+  `-Dlinux-generic-name`, `-Dlinux-exec`. Default `Exec=<name> %U`
+  relies on `$PATH` lookup; users wanting a prefix install override
+  with the absolute path.
+
+Install with:
+```sh
+cp -r zig-out/share ~/.local/share           # user install
+sudo cp -r zig-out/share /usr/share          # system install
+```
+Followed optionally by `gtk-update-icon-cache ~/.local/share/icons/hicolor`
+and `update-desktop-database ~/.local/share/applications`.
+
+Step is invisible on non-Linux targets — the gate uses the
+resolved `target` so a `-Dtarget=x86_64-linux-gnu install-icons`
+cross-stage on macOS / Windows hosts still works.
 
 ### Win balloon notifications
 
@@ -642,7 +678,6 @@ now a Level-3 golden-diff harness:
 
 - GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
 - Drag-drop with native paths, print API
-- Hicolor / Linux app icon theme installation
 - Win Toast (WinRT) notifications — balloon path shipped 2026-05-26;
   Toast remains future polish for richer styling + Action Center
   grouping.
