@@ -166,6 +166,34 @@ extern fn gtk_window_present(w: *GtkWindow) void;
 extern fn gtk_widget_hide(w: *GtkWidget) void;
 extern fn gtk_window_set_resizable(w: *GtkWindow, on: gboolean) void;
 
+// ---- Geometry hints (min/max size) ------------------------------------------
+// `gtk_window_set_geometry_hints` reads bitfields from `GdkGeometry`
+// based on which `GdkWindowHints` flags are set. We only ever set
+// `GDK_HINT_MIN_SIZE = 4` and `GDK_HINT_MAX_SIZE = 8`; the other
+// hint slots stay zero. Layout matches the GTK3 ABI verbatim.
+const GdkGeometry = extern struct {
+    min_width: c_int = 0,
+    min_height: c_int = 0,
+    max_width: c_int = 0,
+    max_height: c_int = 0,
+    base_width: c_int = 0,
+    base_height: c_int = 0,
+    width_inc: c_int = 0,
+    height_inc: c_int = 0,
+    min_aspect: f64 = 0,
+    max_aspect: f64 = 0,
+    win_gravity: c_int = 0,
+};
+const GdkWindowHints = c_uint;
+const GDK_HINT_MIN_SIZE: GdkWindowHints = 4;
+const GDK_HINT_MAX_SIZE: GdkWindowHints = 8;
+extern fn gtk_window_set_geometry_hints(
+    w: *GtkWindow,
+    geometry_widget: ?*GtkWidget,
+    geometry: ?*const GdkGeometry,
+    flags: GdkWindowHints,
+) void;
+
 // ---- GTK dialog externs (used by openFileDialog / saveFileDialog / showAlert)
 //
 // File chooser uses the native variant: portal-aware on modern hosts,
@@ -485,6 +513,10 @@ const WindowCtx = struct {
     focus_in_signal: c_ulong = 0,
     focus_out_signal: c_ulong = 0,
     close_signal: c_ulong = 0,
+    min_width: u32 = 0,
+    min_height: u32 = 0,
+    max_width: u32 = 0,
+    max_height: u32 = 0,
     url_socket_fd: c_int = -1,
     url_socket_watch: c_uint = 0,
     color_scheme_signal: c_ulong = 0,
@@ -900,6 +932,22 @@ pub const Window = struct {
         }
     }
 
+    /// Constraints honored by GTK + the WM. `(0, 0)` clears the
+    /// minimum. Pairs with `setMaxSize` — both must be re-applied
+    /// together because `gtk_window_set_geometry_hints` takes a
+    /// single struct that covers both bounds.
+    pub fn setMinSize(self: *Window, width: u32, height: u32) void {
+        self.ctx.min_width = width;
+        self.ctx.min_height = height;
+        applyGeometryHints(self.ctx);
+    }
+
+    pub fn setMaxSize(self: *Window, width: u32, height: u32) void {
+        self.ctx.max_width = width;
+        self.ctx.max_height = height;
+        applyGeometryHints(self.ctx);
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;
@@ -1189,6 +1237,27 @@ fn onFocusOut(_widget: *GtkWidget, _event: ?*anyopaque, user_data: ?*anyopaque) 
     const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return 0));
     if (cx.on_focus) |cb| cb(cx.on_focus_ctx, false);
     return 0;
+}
+
+/// Compose the current min/max constraints into one GdkGeometry
+/// struct + flag mask, then push through gtk_window_set_geometry_hints.
+/// Called from both `setMinSize` and `setMaxSize` so the two bounds
+/// stay coherent on the WM side.
+fn applyGeometryHints(ctx: *WindowCtx) void {
+    const w = ctx.window orelse return;
+    var hints: GdkGeometry = .{};
+    var flags: GdkWindowHints = 0;
+    if (ctx.min_width != 0 or ctx.min_height != 0) {
+        hints.min_width = @intCast(ctx.min_width);
+        hints.min_height = @intCast(ctx.min_height);
+        flags |= GDK_HINT_MIN_SIZE;
+    }
+    if (ctx.max_width != 0 or ctx.max_height != 0) {
+        hints.max_width = if (ctx.max_width != 0) @intCast(ctx.max_width) else std.math.maxInt(c_int);
+        hints.max_height = if (ctx.max_height != 0) @intCast(ctx.max_height) else std.math.maxInt(c_int);
+        flags |= GDK_HINT_MAX_SIZE;
+    }
+    gtk_window_set_geometry_hints(@ptrCast(w), null, &hints, flags);
 }
 
 /// `delete-event` fires when the WM requests window close. Returning

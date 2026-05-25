@@ -101,6 +101,8 @@ comptime {
         "setResizeHandler",
         "setFocusHandler",
         "setCloseHandler",
+        "setMinSize",
+        "setMaxSize",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

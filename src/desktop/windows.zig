@@ -275,6 +275,18 @@ const WM_CLOSE: UINT = 0x0010;
 const WM_ACTIVATE: UINT = 0x0006;
 const WM_SETTINGCHANGE: UINT = 0x001A;
 const WM_COPYDATA: UINT = 0x004A;
+const WM_GETMINMAXINFO: UINT = 0x0024;
+
+/// `<winuser.h>` — Win32 hands wndProc a pointer to this struct in
+/// lParam on WM_GETMINMAXINFO. We patch the `ptMinTrackSize` /
+/// `ptMaxTrackSize` fields when the WindowCtx has constraints set.
+const MINMAXINFO = extern struct {
+    ptReserved: POINT,
+    ptMaxSize: POINT,
+    ptMaxPosition: POINT,
+    ptMinTrackSize: POINT,
+    ptMaxTrackSize: POINT,
+};
 const WM_USER: UINT = 0x0400;
 /// Tray-icon callback message. Set as `NOTIFYICONDATAW.uCallbackMessage`
 /// by `tray.zig` so Shell32 routes mouse events on the tray icon back
@@ -659,6 +671,13 @@ const WindowCtx = struct {
     fullscreen: bool = false,
     saved_style: c_long = 0,
     saved_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    /// Min/max size constraints applied via `WM_GETMINMAXINFO` in
+    /// wndProc. `0` means "no constraint" (unbounded). Defaults
+    /// leave the OS at its defaults (no per-window constraint).
+    min_width: u32 = 0,
+    min_height: u32 = 0,
+    max_width: u32 = 0,
+    max_height: u32 = 0,
 };
 
 /// Win32 messages dispatch through wndProc which receives the HWND
@@ -1010,6 +1029,18 @@ pub const Window = struct {
     pub fn setCloseHandler(self: *Window, cb: ?opts_mod.CloseHandler, ctx: ?*anyopaque) void {
         self.ctx.on_close = cb;
         self.ctx.on_close_ctx = ctx;
+    }
+
+    /// Constraints honored by wndProc's WM_GETMINMAXINFO case. `(0, 0)`
+    /// clears (no constraint).
+    pub fn setMinSize(self: *Window, width: u32, height: u32) void {
+        self.ctx.min_width = width;
+        self.ctx.min_height = height;
+    }
+
+    pub fn setMaxSize(self: *Window, width: u32, height: u32) void {
+        self.ctx.max_width = width;
+        self.ctx.max_height = height;
     }
 
     pub fn setResizable(self: *Window, on: bool) void {
@@ -1493,6 +1524,20 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 const state: u32 = @as(u32, @intCast(wparam & 0xFFFF));
                 cb(cx.on_focus_ctx, state != 0);
             };
+            return 0;
+        },
+        WM_GETMINMAXINFO => {
+            // Caller hasn't called setMinSize / setMaxSize? Fall
+            // through to default behavior.
+            const cx = lookupCtx(hwnd) orelse return DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (cx.min_width == 0 and cx.min_height == 0 and cx.max_width == 0 and cx.max_height == 0) {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            const mmi: *MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            if (cx.min_width != 0) mmi.ptMinTrackSize.x = @intCast(cx.min_width);
+            if (cx.min_height != 0) mmi.ptMinTrackSize.y = @intCast(cx.min_height);
+            if (cx.max_width != 0) mmi.ptMaxTrackSize.x = @intCast(cx.max_width);
+            if (cx.max_height != 0) mmi.ptMaxTrackSize.y = @intCast(cx.max_height);
             return 0;
         },
         WM_CLOSE => {

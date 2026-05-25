@@ -85,6 +85,15 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Window min/max size — `Window.setMinSize(w, h)` /
+  `setMaxSize(w, h)` on all 3 backends. `(0, 0)` clears the
+  constraint. macOS: `setContentMinSize:` / `setContentMaxSize:`
+  on NSWindow. Windows: new `WM_GETMINMAXINFO` case in wndProc
+  patches `ptMinTrackSize` / `ptMaxTrackSize` from cached
+  WindowCtx fields. Linux: shared `applyGeometryHints` helper
+  composes `GdkGeometry` + flag mask, calls
+  `gtk_window_set_geometry_hints` with `GDK_HINT_MIN_SIZE` /
+  `GDK_HINT_MAX_SIZE` flags.
 - Window event callbacks — `Window.setResizeHandler` /
   `setFocusHandler` / `setCloseHandler` (+ matching
   `WindowOptions.on_resize` / `on_focus` / `on_close` init-time

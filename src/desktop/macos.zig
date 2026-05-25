@@ -612,6 +612,25 @@ pub const Window = struct {
         if (cb != null and self.ctx.window_delegate == null) installWindowDelegate(self.window, self.ctx);
     }
 
+    /// Minimum content-area size enforced by the WM on user resize.
+    /// Pass `(0, 0)` to clear the constraint.
+    pub fn setMinSize(self: *Window, width: u32, height: u32) void {
+        const setMin = m.cast(*const fn (id, SEL, NSSize) callconv(.c) void);
+        setMin(self.window, m.sel("setContentMinSize:"), .{
+            .width = @floatFromInt(width),
+            .height = @floatFromInt(height),
+        });
+    }
+
+    /// Maximum content-area size. `(0, 0)` clears (= `CGFLOAT_MAX`
+    /// internally; AppKit reads 0 as "unbounded").
+    pub fn setMaxSize(self: *Window, width: u32, height: u32) void {
+        const setMax = m.cast(*const fn (id, SEL, NSSize) callconv(.c) void);
+        const w_val: f64 = if (width == 0) 1.0e9 else @floatFromInt(width);
+        const h_val: f64 = if (height == 0) 1.0e9 else @floatFromInt(height);
+        setMax(self.window, m.sel("setContentMaxSize:"), .{ .width = w_val, .height = h_val });
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;
