@@ -141,8 +141,8 @@ pub const Window = struct {
         const setTitleSel = m.cast(*const fn (id, SEL, id) callconv(.c) void);
         setTitleSel(window, m.sel("setTitle:"), nsString(opts.title));
 
-        const center = m.cast(*const fn (id, SEL) callconv(.c) void);
-        center(window, m.sel("center"));
+        const center_sel = m.cast(*const fn (id, SEL) callconv(.c) void);
+        center_sel(window, m.sel("center"));
 
         // Register (or reuse) the dynamic classes for the custom-
         // scheme handler and the script-message handler. Both subclass
@@ -385,11 +385,11 @@ pub const Window = struct {
 
             const NSDistributedNotificationCenter = m.getClass("NSDistributedNotificationCenter");
             const defaultCenter = m.cast(*const fn (id, SEL) callconv(.c) id);
-            const center = defaultCenter(@as(id, @ptrCast(NSDistributedNotificationCenter)), m.sel("defaultCenter"));
+            const notif_center = defaultCenter(@as(id, @ptrCast(NSDistributedNotificationCenter)), m.sel("defaultCenter"));
 
             const addObserver = m.cast(*const fn (id, SEL, id, SEL, id, ?id) callconv(.c) void);
             addObserver(
-                center,
+                notif_center,
                 m.sel("addObserver:selector:name:object:"),
                 observer,
                 m.sel("themeChanged:"),
@@ -471,6 +471,72 @@ pub const Window = struct {
         setOpaque(self.window, m.sel("setOpaque:"), value >= 1.0);
         const setAlpha = m.cast(*const fn (id, SEL, f64) callconv(.c) void);
         setAlpha(self.window, m.sel("setAlphaValue:"), std.math.clamp(value, 0.0, 1.0));
+    }
+
+    /// Resize the window's content rect. `setContentSize:` resizes
+    /// the visible content area; the title bar adds its own height
+    /// outside this rect.
+    pub fn setSize(self: *Window, width: u32, height: u32) void {
+        const setContentSize = m.cast(*const fn (id, SEL, NSSize) callconv(.c) void);
+        setContentSize(self.window, m.sel("setContentSize:"), .{
+            .width = @floatFromInt(width),
+            .height = @floatFromInt(height),
+        });
+    }
+
+    /// Move the window's top-left to screen-space `(x, y)`. Cocoa's
+    /// y-axis is inverted (origin = bottom-left); we accept top-left
+    /// to match the cross-platform convention and convert here.
+    pub fn setPosition(self: *Window, x: i32, y: i32) void {
+        const setFrameTopLeft = m.cast(*const fn (id, SEL, NSPoint) callconv(.c) void);
+        setFrameTopLeft(self.window, m.sel("setFrameTopLeftPoint:"), .{
+            .x = @floatFromInt(x),
+            .y = @floatFromInt(y),
+        });
+    }
+
+    /// Re-center on the active screen.
+    pub fn center(self: *Window) void {
+        const c = m.cast(*const fn (id, SEL) callconv(.c) void);
+        c(self.window, m.sel("center"));
+    }
+
+    pub fn minimize(self: *Window) void {
+        const m_send = m.cast(*const fn (id, SEL, ?id) callconv(.c) void);
+        m_send(self.window, m.sel("miniaturize:"), null);
+    }
+
+    /// macOS has no separate "maximize" — `zoom:` toggles between
+    /// user size and screen size. For first-call semantics this lands
+    /// us at the maximized state; subsequent calls round-trip.
+    pub fn maximize(self: *Window) void {
+        const m_send = m.cast(*const fn (id, SEL, ?id) callconv(.c) void);
+        m_send(self.window, m.sel("zoom:"), null);
+    }
+
+    /// Restore from minimized + ensure the window's main+key. `zoom:`
+    /// is not invoked here — apps that want to undo a previous
+    /// `maximize` call should re-call it explicitly.
+    pub fn restore(self: *Window) void {
+        const m_send = m.cast(*const fn (id, SEL, ?id) callconv(.c) void);
+        m_send(self.window, m.sel("deminiaturize:"), null);
+        const makeKey = m.cast(*const fn (id, SEL, ?id) callconv(.c) void);
+        makeKey(self.window, m.sel("makeKeyAndOrderFront:"), null);
+    }
+
+    /// Toggle native full-screen via `toggleFullScreen:`. Honors the
+    /// system fullscreen animation + workspace assignment.
+    pub fn setFullscreen(self: *Window, on: bool) void {
+        // Read the current `styleMask` to see if we're already in
+        // fullscreen — `NSWindowStyleMaskFullScreen = 1 << 14`. Avoid
+        // a redundant toggle so calls are idempotent.
+        const NS_FS: usize = 1 << 14;
+        const get_mask = m.cast(*const fn (id, SEL) callconv(.c) usize);
+        const cur = get_mask(self.window, m.sel("styleMask"));
+        const is_full = (cur & NS_FS) != 0;
+        if (is_full == on) return;
+        const toggle = m.cast(*const fn (id, SEL, ?id) callconv(.c) void);
+        toggle(self.window, m.sel("toggleFullScreen:"), null);
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {

@@ -85,6 +85,18 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Window geometry + lifecycle — `Window.setSize`, `setPosition`,
+  `center`, `minimize`, `maximize`, `restore`, `setFullscreen` on
+  all 3 backends. macOS: `setContentSize:` / `setFrameTopLeftPoint:`
+  / `center` / `miniaturize:` / `zoom:` / `deminiaturize:` /
+  `toggleFullScreen:`. Windows: `SetWindowPos` (size + move) /
+  `ShowWindow` (SW_MINIMIZE/MAXIMIZE/RESTORE) / fullscreen via
+  strip-WS_OVERLAPPEDWINDOW + monitor-size SetWindowPos (saved
+  style + rect on `WindowCtx` so `setFullscreen(false)` round-
+  trips). Linux: `gtk_window_resize` / `gtk_window_move` /
+  `gtk_window_iconify` / `maximize` / `unmaximize` /
+  `fullscreen` / `unfullscreen` / `gtk_window_set_position` (for
+  `center`).
 
 ### Tray click handlers + submenus
 

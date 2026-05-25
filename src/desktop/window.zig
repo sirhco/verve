@@ -84,6 +84,13 @@ comptime {
         "setAccessibilityLabel",
         "setAlwaysOnTop",
         "setOpacity",
+        "setSize",
+        "setPosition",
+        "center",
+        "minimize",
+        "maximize",
+        "restore",
+        "setFullscreen",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

@@ -135,6 +135,8 @@ extern "user32" fn SetWindowPos(
 extern "user32" fn SetLayeredWindowAttributes(hwnd: HWND, color: DWORD, alpha: u8, flags: DWORD) callconv(.winapi) BOOL;
 extern "user32" fn GetWindowLongPtrW(hwnd: HWND, idx: c_int) callconv(.winapi) c_long;
 extern "user32" fn SetWindowLongPtrW(hwnd: HWND, idx: c_int, value: c_long) callconv(.winapi) c_long;
+extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
+extern "user32" fn GetSystemMetrics(idx: c_int) callconv(.winapi) c_int;
 
 // ---- Menu + accelerator externs ---------------------------------------------
 //
@@ -643,6 +645,12 @@ const WindowCtx = struct {
     msg_handler: IMessageReceivedHandler,
     res_handler: IResourceRequestedHandler,
     drop_target: IDropTarget,
+    /// Fullscreen state cache. `fullscreen` flag + saved style/rect
+    /// let `setFullscreen(false)` restore the pre-fullscreen window
+    /// without the caller threading state back.
+    fullscreen: bool = false,
+    saved_style: c_long = 0,
+    saved_rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 };
 
 /// Win32 messages dispatch through wndProc which receives the HWND
@@ -897,6 +905,100 @@ pub const Window = struct {
         const clamped = std.math.clamp(value, 0.0, 1.0);
         const alpha_byte: u8 = @intFromFloat(clamped * 255.0);
         _ = SetLayeredWindowAttributes(self.ctx.hwnd, 0, alpha_byte, LWA_ALPHA);
+    }
+
+    pub fn setSize(self: *Window, width: u32, height: u32) void {
+        const SWP_NOMOVE: UINT = 0x0002;
+        const SWP_NOZORDER: UINT = 0x0004;
+        _ = SetWindowPos(self.ctx.hwnd, null, 0, 0, @intCast(width), @intCast(height), SWP_NOMOVE | SWP_NOZORDER);
+    }
+
+    pub fn setPosition(self: *Window, x: i32, y: i32) void {
+        const SWP_NOSIZE: UINT = 0x0001;
+        const SWP_NOZORDER: UINT = 0x0004;
+        _ = SetWindowPos(self.ctx.hwnd, null, @intCast(x), @intCast(y), 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    }
+
+    pub fn center(self: *Window) void {
+        // Read the window's current size, the work-area rect of the
+        // primary monitor, then SetWindowPos to the centered origin.
+        var rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        _ = GetWindowRect(self.ctx.hwnd, &rect);
+        const w = rect.right - rect.left;
+        const h = rect.bottom - rect.top;
+        const SM_CXSCREEN: c_int = 0;
+        const SM_CYSCREEN: c_int = 1;
+        const screen_w = GetSystemMetrics(SM_CXSCREEN);
+        const screen_h = GetSystemMetrics(SM_CYSCREEN);
+        const SWP_NOSIZE: UINT = 0x0001;
+        const SWP_NOZORDER: UINT = 0x0004;
+        _ = SetWindowPos(
+            self.ctx.hwnd,
+            null,
+            @divTrunc(screen_w - w, 2),
+            @divTrunc(screen_h - h, 2),
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER,
+        );
+    }
+
+    pub fn minimize(self: *Window) void {
+        const SW_MINIMIZE: c_int = 6;
+        _ = ShowWindow(self.ctx.hwnd, SW_MINIMIZE);
+    }
+
+    pub fn maximize(self: *Window) void {
+        const SW_MAXIMIZE: c_int = 3;
+        _ = ShowWindow(self.ctx.hwnd, SW_MAXIMIZE);
+    }
+
+    pub fn restore(self: *Window) void {
+        const SW_RESTORE: c_int = 9;
+        _ = ShowWindow(self.ctx.hwnd, SW_RESTORE);
+    }
+
+    /// True fullscreen on Win32 = strip `WS_OVERLAPPEDWINDOW`, expand
+    /// to the monitor's full bounds. Stash the previous style + rect
+    /// in `WindowCtx` so restoring works without the caller passing
+    /// state back. The flag below is the previous-state cached on
+    /// the ctx; non-zero = currently fullscreen.
+    pub fn setFullscreen(self: *Window, on: bool) void {
+        const GWL_STYLE: c_int = -16;
+        const WS_OVERLAPPEDWINDOW_VAL: c_long = 0x00CF0000;
+        const SWP_NOZORDER: UINT = 0x0004;
+        const SWP_FRAMECHANGED: UINT = 0x0020;
+        const SM_CXSCREEN: c_int = 0;
+        const SM_CYSCREEN: c_int = 1;
+        if (on) {
+            if (self.ctx.fullscreen) return;
+            // Save current style + bounds.
+            self.ctx.saved_style = GetWindowLongPtrW(self.ctx.hwnd, GWL_STYLE);
+            _ = GetWindowRect(self.ctx.hwnd, &self.ctx.saved_rect);
+            _ = SetWindowLongPtrW(
+                self.ctx.hwnd,
+                GWL_STYLE,
+                self.ctx.saved_style & ~WS_OVERLAPPEDWINDOW_VAL,
+            );
+            const sw = GetSystemMetrics(SM_CXSCREEN);
+            const sh = GetSystemMetrics(SM_CYSCREEN);
+            _ = SetWindowPos(self.ctx.hwnd, null, 0, 0, sw, sh, SWP_NOZORDER | SWP_FRAMECHANGED);
+            self.ctx.fullscreen = true;
+        } else {
+            if (!self.ctx.fullscreen) return;
+            _ = SetWindowLongPtrW(self.ctx.hwnd, GWL_STYLE, self.ctx.saved_style);
+            const r = self.ctx.saved_rect;
+            _ = SetWindowPos(
+                self.ctx.hwnd,
+                null,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+            self.ctx.fullscreen = false;
+        }
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {

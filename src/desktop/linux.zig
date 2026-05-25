@@ -153,6 +153,16 @@ extern fn gtk_widget_get_accessible(w: *GtkWidget) *AtkObject;
 extern fn atk_object_set_name(obj: *AtkObject, name: [*:0]const u8) void;
 extern fn gtk_window_set_keep_above(w: *GtkWindow, on: gboolean) void;
 extern fn gtk_widget_set_opacity(w: *GtkWidget, value: f64) void;
+extern fn gtk_window_resize(w: *GtkWindow, width: c_int, height: c_int) void;
+extern fn gtk_window_move(w: *GtkWindow, x: c_int, y: c_int) void;
+extern fn gtk_window_set_position(w: *GtkWindow, position: c_uint) void;
+extern fn gtk_window_iconify(w: *GtkWindow) void;
+extern fn gtk_window_deiconify(w: *GtkWindow) void;
+extern fn gtk_window_maximize(w: *GtkWindow) void;
+extern fn gtk_window_unmaximize(w: *GtkWindow) void;
+extern fn gtk_window_fullscreen(w: *GtkWindow) void;
+extern fn gtk_window_unfullscreen(w: *GtkWindow) void;
+extern fn gtk_window_present(w: *GtkWindow) void;
 
 // ---- GTK dialog externs (used by openFileDialog / saveFileDialog / showAlert)
 //
@@ -714,6 +724,46 @@ pub const Window = struct {
     pub fn setOpacity(self: *Window, value: f64) void {
         const w = self.ctx.window orelse return;
         gtk_widget_set_opacity(w, std.math.clamp(value, 0.0, 1.0));
+    }
+
+    pub fn setSize(self: *Window, width: u32, height: u32) void {
+        const w = self.ctx.window orelse return;
+        gtk_window_resize(@ptrCast(w), @intCast(width), @intCast(height));
+    }
+
+    pub fn setPosition(self: *Window, x: i32, y: i32) void {
+        const w = self.ctx.window orelse return;
+        gtk_window_move(@ptrCast(w), @intCast(x), @intCast(y));
+    }
+
+    /// GTK_WIN_POS_CENTER = 1 — the WM positions the window at the
+    /// screen center on next show. For already-visible windows the
+    /// hint plus a no-op move re-applies.
+    pub fn center(self: *Window) void {
+        const w = self.ctx.window orelse return;
+        gtk_window_set_position(@ptrCast(w), 1);
+    }
+
+    pub fn minimize(self: *Window) void {
+        const w = self.ctx.window orelse return;
+        gtk_window_iconify(@ptrCast(w));
+    }
+
+    pub fn maximize(self: *Window) void {
+        const w = self.ctx.window orelse return;
+        gtk_window_maximize(@ptrCast(w));
+    }
+
+    pub fn restore(self: *Window) void {
+        const w = self.ctx.window orelse return;
+        gtk_window_unmaximize(@ptrCast(w));
+        gtk_window_deiconify(@ptrCast(w));
+        gtk_window_present(@ptrCast(w));
+    }
+
+    pub fn setFullscreen(self: *Window, on: bool) void {
+        const w = self.ctx.window orelse return;
+        if (on) gtk_window_fullscreen(@ptrCast(w)) else gtk_window_unfullscreen(@ptrCast(w));
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
