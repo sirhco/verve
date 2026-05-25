@@ -6,6 +6,141 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-26
+
+Seven post-`v0.1.2` polish bundles. Closes the navigation + shell
++ display ergonomics gap.
+
+### Added — Window event callbacks (2026-05-26)
+
+- `WindowOptions.on_resize` / `on_focus` / `on_close` + matching
+  `Window.setResizeHandler` / `setFocusHandler` / `setCloseHandler`
+  on all 3 backends. `ResizeHandler` fires with new content size;
+  `FocusHandler` with focused/blurred state; `CloseHandler` returns
+  `true` to allow close, `false` to keep window open (for "Unsaved
+  changes?" prompts).
+- macOS: `VerveWindowDelegate` NSObject subclass with
+  `windowDidResize:` + `windowDidBecomeKey:` + `windowDidResignKey:`
+  + `windowShouldClose:`. Windows: `WM_SIZE` + `WM_ACTIVATE` +
+  `WM_CLOSE` wndProc cases. Linux: `g_signal_connect_data` on
+  `configure-event`, `focus-in-event`, `focus-out-event`,
+  `delete-event`.
+
+### Added — Window min/max size (2026-05-26)
+
+- `Window.setMinSize(w, h)` / `setMaxSize(w, h)` on all 3 backends;
+  `(0, 0)` clears the bound. macOS: `setContentMinSize:` /
+  `setContentMaxSize:`. Windows: new `WM_GETMINMAXINFO` wndProc
+  case patches `ptMinTrackSize` / `ptMaxTrackSize`. Linux:
+  `gtk_window_set_geometry_hints` with `GDK_HINT_MIN_SIZE` /
+  `GDK_HINT_MAX_SIZE` flags.
+
+### Added — Multi-display enumeration (2026-05-26)
+
+- New `desktop.displays` module: `list(allocator) Error![]Display`.
+  `Display { x, y, width, height, scale, primary }`. macOS:
+  `[NSScreen screens]` + `backingScaleFactor` with Y-flip into
+  top-left coords for cross-platform parity. Windows:
+  `EnumDisplayMonitors` + `GetMonitorInfoW` + `GetDpiForMonitor`
+  (Shcore.dll). Linux: `gdk_display_get_default` +
+  `gdk_display_get_n_monitors` / `_get_monitor` / `_get_geometry` /
+  `_get_scale_factor`. Scaffold `build.zig` gains `Shcore` link
+  on the Windows branch.
+
+### Added — Shell helpers (2026-05-26)
+
+- New `desktop.shell` module: `openUrl(allocator, url) Error!void`.
+  Hands a URL to the OS shell so it opens externally (default
+  browser for http/https, registered handler for mailto/custom
+  schemes). macOS: `[NSWorkspace openURL:]`. Windows:
+  `ShellExecuteW(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL)`.
+  Linux: `posix.fork` + `execvp("xdg-open", ...)`.
+
+### Added — Navigation helpers (2026-05-26)
+
+- `Window.reload()` / `goBack()` / `goForward()` on all 3 backends.
+  macOS: `WKWebView reloadFromOrigin` / `goBack` / `goForward`.
+  Windows: vtSlots 31 / 40 / 41 on ICoreWebView2. Linux:
+  `webkit_web_view_reload` / `_go_back` / `_go_forward`.
+
+### Added — Navigation queries (2026-05-26)
+
+- `Window.canGoBack()` / `canGoForward()` / `currentUrl(allocator)
+  ![]u8` / `currentTitle(allocator) ![]u8` on all 3 backends.
+  Pairs with `goBack` / `goForward` for history-aware UI; URL +
+  title getters enable bookmark / share / address-bar features.
+  macOS: WKWebView selectors + new `nsStringToOwnedUtf8` helper.
+  Windows: vtSlots 38 / 39 / 4 / 48 + shared `wv2StringGetter`
+  for LPWSTR-out + UTF-16→UTF-8 + `CoTaskMemFree`. Linux:
+  `webkit_web_view_can_go_back` / `_can_go_forward` /
+  `_get_uri` / `_get_title`.
+
+### Added — Page title auto-sync (2026-05-26)
+
+- IPC `shim_js` now polls `document.title` every 500ms + posts a
+  `__verve_title:<title>` marker through the native bridge.
+  Each backend's script-message trampoline intercepts the prefix
+  before forwarding to the user's MessageHandler, calling the
+  native title setter (`setTitle:` / `gtk_window_set_title` /
+  `SetWindowTextW`). Pages mutating `<title>` propagate to the
+  OS title bar / taskbar / window list with no app-side code.
+
+## [0.1.2] - 2026-05-26
+
+Four post-`v0.1.1` bundles. Window state + lifecycle + checked
+auto-updater.
+
+### Added — Auto-updater check (2026-05-26)
+
+- New `desktop.updates` module:
+  `checkForUpdate(allocator, feed_url, current_version) Error!?UpdateInfo`.
+  Pure stdlib (`std.http.Client` + `std.json`); identical on all
+  3 platforms; no native frameworks linked. Returns `null` when
+  the caller is already up to date; otherwise `{ version,
+  download_url, notes }` — caller owns each string. Lower-level
+  `parseUpdateFeed(body, current)` lets apps drive their own HTTP
+  fetch. SemVer compare via `compareSemver` (numeric-prefix
+  ordering, tolerates leading `v` + `-rc1`-style suffixes).
+- Applying the update — download, signature verify, swap binary,
+  restart — stays out of scope. That's Sparkle / Squirrel /
+  AppImageUpdate per-platform polish, deferred.
+
+### Added — Window always-on-top + opacity (2026-05-26)
+
+- `Window.setAlwaysOnTop(bool)` toggles whether the window floats
+  above normal-stack peers. `Window.setOpacity(f64)` in `[0.0,
+  1.0]`. macOS: `setLevel:NSFloatingWindowLevel` + `setAlphaValue:`
+  / `setOpaque:`. Windows: `SetWindowPos(HWND_TOPMOST)` +
+  `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
+  stamped via `SetWindowLongPtrW`. Linux:
+  `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+
+### Added — Window geometry + lifecycle (2026-05-26)
+
+- Seven new methods: `setSize`, `setPosition`, `center`,
+  `minimize`, `maximize`, `restore`, `setFullscreen`. macOS:
+  `setContentSize:` / `setFrameTopLeftPoint:` / `center` /
+  `miniaturize:` / `zoom:` / `deminiaturize:` /
+  `toggleFullScreen:`. Windows: `SetWindowPos` + `ShowWindow(SW_*)`;
+  fullscreen via strip-WS_OVERLAPPEDWINDOW + monitor-size
+  SetWindowPos (saved style/rect cache on `WindowCtx`). Linux:
+  `gtk_window_resize` / `_move` / `_iconify` / `_maximize` /
+  `_unmaximize` / `_fullscreen` / `_unfullscreen` /
+  `_set_position(CENTER)` / `_present`.
+
+### Added — Window visibility + focus (2026-05-26)
+
+- `Window.show()` / `hide()` / `focus()` / `setResizable(bool)`
+  on all 3 backends. macOS: `makeKeyAndOrderFront:` +
+  `activateIgnoringOtherApps:` / `orderOut:` / styleMask toggle.
+  Windows: `ShowWindow(SW_SHOW/HIDE/RESTORE)` +
+  `SetForegroundWindow`; resizable via `WS_THICKFRAME` |
+  `WS_MAXIMIZEBOX` + `SetWindowPos(SWP_FRAMECHANGED)`. Linux:
+  `gtk_widget_show_all` / `_hide` / `gtk_window_present` /
+  `_set_resizable`. Template demo's tray "Show window" item now
+  actually calls `window.show()` + `window.focus()` (was faked
+  with evalJs before).
+
 ## [0.1.1] - 2026-05-26
 
 Six P3 bundles shipped post-`v0.1.0`. Mostly closes the desktop
