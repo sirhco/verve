@@ -473,6 +473,7 @@ Overrides:
 | Cookies | ✓ | ✓ | ✓ |
 | Multi-window | ✓ | ✓ | ✓ |
 | WASM hydration | ✓ | ✓ | ✓ |
+| Single-instance lock | ✓ | ✓ | ✓ |
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | — | — |

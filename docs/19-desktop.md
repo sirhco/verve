@@ -86,6 +86,14 @@ reference. Headline list:
   platform-native async cookie managers)
 - **Multi-window** — `Window.openChildWindow(opts)`; last-window-quit
   semantics on all three platforms
+- **Single-instance lock** — `desktop.single_instance.acquire(allocator, name)`
+  returns an opaque `Lock` held for process lifetime. macOS + Linux use
+  `flock(LOCK_EX | LOCK_NB)` on `<TMPDIR>/verve.<name>.lock`; Windows
+  uses `CreateMutexW` under `Local\Verve.<name>`. Second call from a
+  live sibling process returns `error.AlreadyRunning`. The kernel
+  reclaims the lock on process exit so crashes don't leave it stuck.
+  Activating the existing instance (raise window / forward argv) is
+  out of scope — apps that want it build on top of the lock primitive.
 - **Native dialogs** — `Window.openFileDialog`, `saveFileDialog`,
   `showAlert`. macOS uses NSOpenPanel/NSSavePanel/NSAlert; Linux uses
   `GtkFileChooserNative` + `GtkMessageDialog`; Windows uses
@@ -145,6 +153,7 @@ Zig calls via nested event-loop pumps.
 | Cookies | ✓ | ✓ | ✓ |
 | Multi-window | ✓ | ✓ | ✓ |
 | WASM hydration | ✓ | ✓ | ✓ |
+| Single-instance lock | ✓ | ✓ | ✓ |
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | — | — |

@@ -14,6 +14,7 @@ const options = @import("options.zig");
 comptime {
     _ = @import("cookies_test.zig");
     _ = @import("surface_test.zig");
+    _ = @import("single_instance.zig");
 }
 
 const entries = [_]options.AssetEntry{

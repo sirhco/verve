@@ -52,6 +52,25 @@ pub fn main(init: std.process.Init) !void {
     defer if (smoke_dir) |d| allocator.free(d);
     defer if (dev_dir) |d| allocator.free(d);
 
+    // Single-instance lock. Held for the lifetime of `main` — when the
+    // process exits the kernel reclaims the underlying flock / named
+    // mutex, so a second launch immediately picks up the slot. Skip in
+    // smoke runs so back-to-back CI invocations don't race on the
+    // tmp-file fd / mutex name.
+    var lock: ?desktop.single_instance.Lock = null;
+    defer if (lock) |*l| l.release();
+    if (smoke_dir == null) {
+        if (desktop.single_instance.acquire(allocator, "verve-desktop")) |l| {
+            lock = l;
+        } else |err| switch (err) {
+            error.AlreadyRunning => {
+                std.log.err("verve.desktop: another instance is already running", .{});
+                return;
+            },
+            else => |e| return e,
+        }
+    }
+
     // Caller is responsible for creating <smoke-dir> before launching;
     // the build step does this. App-side does not pull in std.Io just
     // to mkdir.
