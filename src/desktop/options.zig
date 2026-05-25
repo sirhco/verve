@@ -104,6 +104,20 @@ pub const ClipboardError = error{
 /// notified when the user toggles the OS setting at runtime.
 pub const ColorScheme = enum { light, dark, unknown };
 
+/// Callback fired when the OS delivers a deep-link URL to the app —
+/// the user clicked a `verve://...` link or opened a `.desktop`-handled
+/// MIME. `url` is the full URL string the OS received. Caller does not
+/// retain the slice; copy if you need to outlive the callback.
+///
+/// Cold-launch (app starts up because of the URL) and warm-launch (app
+/// already running, OS delivers via a process IPC) both funnel through
+/// the same callback. macOS handles both via `AppleEventManager`'s
+/// `kInternetEventClass`/`kAEGetURL` so the handler fires from inside
+/// the Cocoa run loop. Windows + Linux ship cold-launch via the
+/// process argv only in this pass — second-instance URL forwarding
+/// (WM_COPYDATA / AF_UNIX socket) is a follow-up.
+pub const UrlOpenHandler = *const fn (ctx: ?*anyopaque, url: []const u8) void;
+
 /// Callback fired when the OS color-scheme preference changes.
 /// `ctx` is the opaque pointer registered alongside the callback.
 /// Fires on the main / UI thread of the host platform — same thread
@@ -185,6 +199,15 @@ pub const WindowOptions = struct {
     /// follow-up call.
     on_message: ?MessageHandler = null,
     on_message_ctx: ?*anyopaque = null,
+
+    /// Optional deep-link handler + context registered before any URL
+    /// the OS delivers can fire. macOS installs the AppleEventManager
+    /// handler eagerly during `Window.init` when this is non-null, so
+    /// cold-launch URLs that arrive during the early Cocoa run-loop
+    /// pump are queued through the same callback. Set via
+    /// `Window.setUrlOpenHandler` if you need to install it later.
+    on_url_open: ?UrlOpenHandler = null,
+    on_url_open_ctx: ?*anyopaque = null,
 
     /// Install a default OS menu bar. Honored on all three backends:
     /// macOS gets App + Edit + Window menus; Windows and Linux get

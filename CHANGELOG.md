@@ -6,6 +6,32 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Desktop deep-link URL handlers (2026-05-25)
+
+- **`Window.setUrlOpenHandler(cb, ctx)` + `Window.deliverUrl(url)`**
+  on the public surface; new `UrlOpenHandler` type and
+  `on_url_open` / `on_url_open_ctx` fields on `WindowOptions`.
+- **macOS — `NSAppleEventManager` handler** for
+  `kInternetEventClass`/`kAEGetURL` (FourCharCode `'GURL'`,
+  0x4755524C). Installs lazily on the first non-null
+  `setUrlOpenHandler` call. Cocoa queues URL events that arrived
+  before the AEH installed, then drains them on the next run-loop
+  spin — so a `verve://...` URL clicked from Finder before
+  `Window.init` even ran still reaches the callback.
+- **Windows + Linux — cold-launch only.** Backend stores the
+  callback on `WindowCtx`; the scaffold template's `main.zig`
+  parses `--url <u>` or any positional starting with `verve://`
+  and feeds it through `Window.deliverUrl(url)` after the window
+  opens. Warm-launch second-instance forwarding (`WM_COPYDATA` on
+  Win, abstract `AF_UNIX` socket on Linux) is a follow-up.
+- **Scaffold `build.zig` — `-Durl-scheme=<name>`.** Injects
+  `CFBundleURLTypes` into the macOS `Info.plist` so Launch
+  Services routes `<scheme>://...` URLs to the .app.
+- **Template demo wiring.** `handlers.zig` ships an `onUrlOpen`
+  example that logs + dispatches the URL into the page via a new
+  `window.verve.handleDeepLink` bridge hook; `components.zig`
+  gains a "Deep link" card that mirrors the most-recent URL.
+
 ### Added — Desktop native menu bars on Windows + Linux (2026-05-25)
 
 - **Default menu bar on every backend.** `install_default_menu = true`

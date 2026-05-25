@@ -34,6 +34,7 @@ pub const SameSite = options.SameSite;
 pub const ClipboardError = options.ClipboardError;
 pub const ColorScheme = options.ColorScheme;
 pub const ColorSchemeHandler = options.ColorSchemeHandler;
+pub const UrlOpenHandler = options.UrlOpenHandler;
 pub const DevAssetsConfig = options.DevAssetsConfig;
 pub const CookieStore = cookies.CookieStore;
 
@@ -70,6 +71,8 @@ comptime {
         "clipboard",
         "colorScheme",
         "setColorSchemeHandler",
+        "setUrlOpenHandler",
+        "deliverUrl",
         "takeSnapshotPng",
     };
     for (required) |name| {

@@ -43,6 +43,8 @@ const WindowCtx = struct {
     on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
     on_color_scheme_ctx: ?*anyopaque = null,
     color_scheme_observer: ?id = null,
+    on_url_open: ?opts_mod.UrlOpenHandler = null,
+    on_url_open_ctx: ?*anyopaque = null,
     webview: id,
 };
 
@@ -67,6 +69,15 @@ var app_initialized: bool = false;
 var scheme_class_cached: ?m.Class = null;
 var message_class_cached: ?m.Class = null;
 var theme_class_cached: ?m.Class = null;
+var url_opener_class_cached: ?m.Class = null;
+
+// `NSAppleEventManager` accepts only one handler per (event class,
+// event id) pair per process — multi-window apps converge on a
+// single global URL handler instance that fans out to whichever
+// WindowCtx most-recently called `setUrlOpenHandler`. Apps that
+// want per-window routing keep ctx state in their own callback.
+var url_opener_singleton: ?id = null;
+var last_url_handler_ctx: ?*WindowCtx = null;
 
 // Maps NSDistributedNotificationCenter observer instance → owning
 // WindowCtx. Theme-change callbacks fire on the AppKit main thread
@@ -236,8 +247,13 @@ pub const Window = struct {
             .dev_assets = opts.dev_assets,
             .on_message = opts.on_message,
             .on_message_ctx = opts.on_message_ctx,
+            .on_url_open = opts.on_url_open,
+            .on_url_open_ctx = opts.on_url_open_ctx,
             .webview = webview,
         };
+        if (opts.on_url_open != null) {
+            installUrlOpenerIfNeeded(ctx_ptr);
+        }
         if (opts.dev_assets) |dev| {
             std.log.info("verve.desktop[macos]: dev-mode asset fallback enabled, dir='{s}'", .{dev.dir});
         }
@@ -365,6 +381,30 @@ pub const Window = struct {
             );
             self.ctx.color_scheme_observer = observer;
         }
+    }
+
+    /// Register / replace the deep-link URL handler. macOS routes
+    /// every `verve://...` URL the OS hands to the app through
+    /// `NSAppleEventManager` (`kInternetEventClass`/`kAEGetURL`),
+    /// regardless of whether the URL arrived at cold launch or while
+    /// the app was already running — Cocoa queues pre-launch URLs
+    /// until the AEH installs, then drains them. The framework
+    /// installs the AEH lazily on the first non-null call and keeps
+    /// it process-wide. Passing `null` clears the handler — the AEH
+    /// stays installed but fires nothing.
+    pub fn setUrlOpenHandler(self: *Window, cb: ?opts_mod.UrlOpenHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_url_open = cb;
+        self.ctx.on_url_open_ctx = ctx;
+        if (cb != null) installUrlOpenerIfNeeded(self.ctx);
+    }
+
+    /// Synthesize a URL delivery — call the registered handler with
+    /// `url` as if the OS had just delivered it. Templates use this
+    /// to feed cold-launch URLs that arrived through argv (the
+    /// AppleEvent path supersedes argv on macOS, so this code path
+    /// is mostly used by Windows + Linux templates for parity).
+    pub fn deliverUrl(self: *Window, url: []const u8) void {
+        if (self.ctx.on_url_open) |cb| cb(self.ctx.on_url_open_ctx, url);
     }
 
     /// Current macOS appearance: dark vs light, derived from
@@ -626,6 +666,71 @@ fn themeChangedTrampoline(self: id, _cmd: SEL, _notification: id) callconv(.c) v
         };
         cb(ctx_ptr.on_color_scheme_ctx, scheme);
     }
+}
+
+/// Lazily install the `NSAppleEventManager` URL handler for
+/// `kInternetEventClass`/`kAEGetURL` (both 'GURL' FourCharCodes
+/// historically — see Apple's URL Schemes / Launch Services docs).
+/// Subsequent calls are no-ops; only `last_url_handler_ctx` rotates so
+/// the trampoline knows which window's callback to fire. Cocoa queues
+/// any URL events that arrived before the AEH installed, then drains
+/// them on the next run-loop spin — so a cold-launch URL clicked from
+/// the Finder before `Window.init` even ran still reaches the handler.
+fn installUrlOpenerIfNeeded(ctx: *WindowCtx) void {
+    last_url_handler_ctx = ctx;
+    if (url_opener_singleton != null) return;
+
+    const NSObject = m.getClass("NSObject");
+    const klass = url_opener_class_cached orelse blk: {
+        const c = m.allocateClass(NSObject, "VerveUrlOpener");
+        m.addMethod(c, m.sel("getUrl:withReplyEvent:"), @ptrCast(&urlOpenTrampoline), "v@:@@");
+        m.registerClass(c);
+        url_opener_class_cached = c;
+        break :blk c;
+    };
+    const alloc_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const init_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const opener = init_id(alloc_id(@as(id, @ptrCast(klass)), m.sel("alloc")), m.sel("init"));
+
+    const NSAppleEventManager = m.getClass("NSAppleEventManager");
+    const sharedManager = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const manager = sharedManager(@as(id, @ptrCast(NSAppleEventManager)), m.sel("sharedAppleEventManager"));
+
+    // FourCharCode 'GURL' = 0x4755524C. Apple's `kInternetEventClass`
+    // and `kAEGetURL` constants both expand to this same code.
+    const four_cc: u32 = 0x4755524C;
+    const setEventHandler = m.cast(*const fn (id, SEL, id, SEL, u32, u32) callconv(.c) void);
+    setEventHandler(
+        manager,
+        m.sel("setEventHandler:andSelector:forEventClass:andEventID:"),
+        opener,
+        m.sel("getUrl:withReplyEvent:"),
+        four_cc,
+        four_cc,
+    );
+    url_opener_singleton = opener;
+    std.log.debug("verve.desktop[macos]: AppleEventManager URL handler installed", .{});
+}
+
+/// AEH trampoline. The event's direct-object parameter (keyword
+/// `'----'` = `keyDirectObject` = 0x2D2D2D2D) holds the URL as an
+/// NSAppleEventDescriptor; `stringValue` yields the NSString form.
+fn urlOpenTrampoline(self: id, _cmd: SEL, event: id, reply: id) callconv(.c) void {
+    _ = self;
+    _ = _cmd;
+    _ = reply;
+
+    const key_direct_object: u32 = 0x2D2D2D2D; // '----'
+    const paramSel = m.cast(*const fn (id, SEL, u32) callconv(.c) ?id);
+    const descriptor = paramSel(event, m.sel("paramDescriptorForKeyword:"), key_direct_object) orelse return;
+    const stringValue = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+    const ns_str = stringValue(descriptor, m.sel("stringValue")) orelse return;
+    const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+    const cstr = utf8(ns_str, m.sel("UTF8String")) orelse return;
+    const url = std.mem.span(cstr);
+
+    const ctx = last_url_handler_ctx orelse return;
+    if (ctx.on_url_open) |cb| cb(ctx.on_url_open_ctx, url);
 }
 
 fn handleSchemeStart(ctx_ptr: *WindowCtx, task: id) !void {

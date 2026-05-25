@@ -31,6 +31,11 @@ pub fn main(init: std.process.Init) !void {
     //                      traversal is rejected. Disabled by default.
     var smoke_dir: ?[]const u8 = null;
     var dev_dir: ?[]const u8 = null;
+    // Cold-launch deep-link URL. Set when argv has either `--url <u>`
+    // or a positional that starts with the app's custom scheme. macOS
+    // routes URLs through NSAppleEventManager instead (its AEH fires
+    // even for cold launches), so this path is mostly Windows + Linux.
+    var cold_url: ?[]const u8 = null;
     var initial_path: []const u8 = "index.html";
     {
         var arg_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
@@ -46,11 +51,18 @@ pub fn main(init: std.process.Init) !void {
                 if (arg_iter.next()) |val| {
                     dev_dir = try allocator.dupe(u8, val);
                 }
+            } else if (std.mem.eql(u8, arg, "--url")) {
+                if (arg_iter.next()) |val| {
+                    cold_url = try allocator.dupe(u8, val);
+                }
+            } else if (std.mem.startsWith(u8, arg, "verve://")) {
+                cold_url = try allocator.dupe(u8, arg);
             }
         }
     }
     defer if (smoke_dir) |d| allocator.free(d);
     defer if (dev_dir) |d| allocator.free(d);
+    defer if (cold_url) |u| allocator.free(u);
 
     // Single-instance lock. Held for the lifetime of `main` — when the
     // process exits the kernel reclaims the underlying flock / named
@@ -101,5 +113,15 @@ pub fn main(init: std.process.Init) !void {
 
     const ctx_ptr = handlers.attach(&window, asset_entries, smoke_dir, io);
     window.setMessageHandler(handlers.onMessage, ctx_ptr);
+    window.setUrlOpenHandler(handlers.onUrlOpen, ctx_ptr);
+
+    // Cold-launch URL: synthesize a delivery through the same
+    // callback so apps don't need a separate code path for argv vs.
+    // OS-delivered URLs. macOS already routes the URL via the AEH
+    // installed in setUrlOpenHandler; the cold_url branch is the
+    // Win/Linux argv path. Harmless on macOS (no `--url` arg expected
+    // there for non-dev usage).
+    if (cold_url) |u| window.deliverUrl(u);
+
     window.run();
 }

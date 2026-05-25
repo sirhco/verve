@@ -214,6 +214,19 @@ pub fn build(b: *std.Build) void {
             "Path to .icns file for the macOS bundle (default: none — generic app icon).",
         );
 
+        // Optional custom URL scheme registration. When set, the
+        // generated Info.plist gains a `CFBundleURLTypes` array so
+        // macOS knows this .app handles `<scheme>://...` URLs. Click
+        // a verve://... link in a browser and the OS launches (or
+        // foregrounds) this bundle, routing the URL through the
+        // AppleEventManager handler the framework installs at
+        // `setUrlOpenHandler` time.
+        const url_scheme = b.option(
+            []const u8,
+            "url-scheme",
+            "Register a custom URL scheme on macOS (e.g. -Durl-scheme=verve). Default: none.",
+        );
+
         const bundle_root = b.fmt("{s}.app", .{exe.name});
         const macos_dir = b.fmt("{s}/Contents/MacOS", .{bundle_root});
         const contents_dir = b.fmt("{s}/Contents", .{bundle_root});
@@ -230,6 +243,26 @@ pub fn build(b: *std.Build) void {
         // CFBundleIconFile entry of "AppIcon".
         const icon_plist_entry: []const u8 = if (icon_path != null)
             "    <key>CFBundleIconFile</key>\n    <string>AppIcon</string>\n"
+        else
+            "";
+
+        // CFBundleURLTypes is an array of dicts; one dict per scheme
+        // group. CFBundleURLName conventionally matches CFBundleIdentifier.
+        const url_plist_entry: []const u8 = if (url_scheme) |s|
+            b.fmt(
+                \\    <key>CFBundleURLTypes</key>
+                \\    <array>
+                \\        <dict>
+                \\            <key>CFBundleURLName</key>
+                \\            <string>{s}.url</string>
+                \\            <key>CFBundleURLSchemes</key>
+                \\            <array>
+                \\                <string>{s}</string>
+                \\            </array>
+                \\        </dict>
+                \\    </array>
+                \\
+            , .{ exe.name, s })
         else
             "";
 
@@ -263,10 +296,10 @@ pub fn build(b: *std.Build) void {
             \\    <true/>
             \\    <key>NSPrincipalClass</key>
             \\    <string>NSApplication</string>
-            \\{s}</dict>
+            \\{s}{s}</dict>
             \\</plist>
             \\
-        , .{ exe.name, bundle_id, exe.name, exe.name, bundle_version, bundle_version, icon_plist_entry });
+        , .{ exe.name, bundle_id, exe.name, exe.name, bundle_version, bundle_version, icon_plist_entry, url_plist_entry });
         const plist_wf = b.addWriteFiles();
         const plist_lazy = plist_wf.add("Info.plist", plist_src);
         const inst_plist = b.addInstallFileWithDir(plist_lazy, .{ .custom = contents_dir }, "Info.plist");

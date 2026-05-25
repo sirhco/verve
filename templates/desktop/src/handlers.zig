@@ -32,6 +32,29 @@ const Router = desktop.Router(RouterCtx, Routes);
 
 pub const onMessage = Router.dispatch;
 
+/// Deep-link URL handler. Logs the incoming URL and evalJs's it into
+/// the page so the demo UI shows the value. macOS uses
+/// `NSAppleEventManager` to deliver both warm-launch and cold-launch
+/// URLs; Win/Linux deliver cold-launch URLs through argv (the
+/// template's main.zig calls `Window.deliverUrl` for those).
+pub fn onUrlOpen(c: ?*anyopaque, url: []const u8) void {
+    const r: *RouterCtx = @ptrCast(@alignCast(c orelse return));
+    std.log.info("[url-open] {s}", .{url});
+    // JSON-escape via a tiny manual pass — only quotes + backslashes
+    // matter for a URL string fed into a JS string literal.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.heap.page_allocator);
+    buf.appendSlice(std.heap.page_allocator, "window.verve.handleDeepLink && window.verve.handleDeepLink(\"") catch return;
+    for (url) |b| switch (b) {
+        '"' => buf.appendSlice(std.heap.page_allocator, "\\\"") catch return,
+        '\\' => buf.appendSlice(std.heap.page_allocator, "\\\\") catch return,
+        '\n' => buf.appendSlice(std.heap.page_allocator, "\\n") catch return,
+        else => buf.append(std.heap.page_allocator, b) catch return,
+    };
+    buf.appendSlice(std.heap.page_allocator, "\");") catch return;
+    r.window.evalJs(buf.items);
+}
+
 pub fn attach(window: *desktop.Window, assets: []const desktop.AssetEntry, smoke_dir: ?[]const u8, io: std.Io) *RouterCtx {
     ctx = .{ .window = window, .assets = assets, .smoke_dir = smoke_dir, .io = io };
     return &ctx;

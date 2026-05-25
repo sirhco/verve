@@ -17,9 +17,9 @@ Fresh session? Do these four in order before writing code:
    shipped 2026-05-24/25 are listed under "Out of P1 scope — shipped"
    below. Remaining P3 backlog: GTK4 backend, tray icons +
    notifications, drag-drop with native paths, print API, hicolor /
-   Linux icon-theme install, deep-link URL handlers, accessibility
-   (NSAccessibility / UIA / ATK), and auto-updater
-   (Sparkle / Squirrel).
+   Linux icon-theme install, accessibility (NSAccessibility / UIA /
+   ATK), auto-updater (Sparkle / Squirrel), warm-launch URL
+   forwarding on Win/Linux (cold-launch is done).
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
@@ -375,7 +375,8 @@ now a Level-3 golden-diff harness:
 - Tray icons + system notifications
 - Drag-drop with native paths, print API
 - Hicolor / Linux app icon theme installation
-- Deep-link URL handlers
+- Warm-launch URL forwarding on Win/Linux (cold-launch landed
+  2026-05-25; WM_COPYDATA / AF_UNIX socket forwarding deferred)
 - Accessibility (NSAccessibility / UIA / ATK)
 - Auto-updater (Sparkle / Squirrel)
 
@@ -393,6 +394,19 @@ now a Level-3 golden-diff harness:
 
 ### Out of P1 scope — shipped 2026-05-25
 
+- Deep-link URL handlers — `Window.setUrlOpenHandler(cb, ctx)` +
+  `Window.deliverUrl(url)` on the public surface. macOS installs
+  a process-wide `NSAppleEventManager` URL handler
+  (`kInternetEventClass`/`kAEGetURL`), so warm-launch (app running)
+  and cold-launch (Finder click while not running) both funnel
+  through the same callback; Cocoa queues pre-launch URLs until the
+  AEH installs, then drains. Win + Linux ship cold-launch only —
+  the scaffold template's `main.zig` parses `--url <u>` or any
+  positional starting with the scheme and calls `deliverUrl(url)`
+  after the window opens. Second-instance forwarding
+  (`WM_COPYDATA` on Win, abstract `AF_UNIX` socket on Linux) is a
+  follow-up. Scaffold `build.zig` gains `-Durl-scheme=<name>` which
+  injects `CFBundleURLTypes` into the generated `Info.plist`.
 - Native menu bars on Windows + Linux — default File (Quit) + Edit
   (Undo/Redo/Cut/Copy/Paste/Select All) honoring the existing
   `install_default_menu` flag for parity with the macOS App + Edit
@@ -418,7 +432,7 @@ clipboard, color scheme + change events, app icons) all landed on
 |---|---|---|
 | **P3 GTK4** | GTK4 + WebKitGTK 6.0 behind `-Dgtk4` | Future-proofing once Ubuntu LTS / Fedora ship GTK4 webkit by default. New backend module; existing GTK3 path stays. |
 | **P3 tray + notifications** | NSStatusItem / `Shell_NotifyIconW` / Ayatana AppIndicator | Linux side requires an extra dep (libappindicator / Ayatana) since GtkStatusIcon is deprecated. |
-| **P3 deep-link URLs** | `CFBundleURLTypes` + AppleEventManager / registry write + WM_COPYDATA / `.desktop` MimeType | Install-time setup + first-instance forwarding. |
+| **P3 warm-launch URL fwd** | `WM_COPYDATA` on Win + abstract `AF_UNIX` socket on Linux | Cold-launch landed 2026-05-25; second-instance forwarding is the remaining piece for parity with macOS AEH semantics. |
 | **P3 drag-drop / print** | `NSDraggingDestination` / `IDropTarget` / GTK drag signals; `NSPrintOperation` / `PrintDlgExW` / `gtk_print_operation_run` | Drag-drop with native file paths (browser DataTransfer doesn't expose them). |
 | **P3 a11y** | NSAccessibility / UIA / ATK | Window-chrome + menu accessibility — web content already inherits from WebView. |
 | **P3 auto-updater** | Sparkle on macOS / Squirrel or MSIX on Windows / AppImage update on Linux | Multi-platform signing + delta channels. |

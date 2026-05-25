@@ -69,6 +69,11 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
                 }),
             }),
             ctx.section().class("card").children(.{
+                ctx.h2("Deep link"),
+                ctx.p().text("Open verve://app/anything from a terminal (or click a link on a registered scheme) — the URL appears here."),
+                ctx.pre().id("deep-link-url").text("(no URL received yet)"),
+            }),
+            ctx.section().class("card").children(.{
                 ctx.h2("Log"),
                 ctx.pre().id("log").text("bridge ready"),
             }),

@@ -399,6 +399,8 @@ const WindowCtx = struct {
     on_message_ctx: ?*anyopaque,
     on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
     on_color_scheme_ctx: ?*anyopaque = null,
+    on_url_open: ?opts_mod.UrlOpenHandler = null,
+    on_url_open_ctx: ?*anyopaque = null,
     color_scheme_signal: c_ulong = 0,
     window: ?*GtkWidget = null,
     webview: ?*WebKitWebView = null,
@@ -426,6 +428,8 @@ pub const Window = struct {
             .opts = opts,
             .on_message = opts.on_message,
             .on_message_ctx = opts.on_message_ctx,
+            .on_url_open = opts.on_url_open,
+            .on_url_open_ctx = opts.on_url_open_ctx,
         };
 
         const window_widget = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -585,6 +589,26 @@ pub const Window = struct {
             );
             self.ctx.color_scheme_signal = sig;
         }
+    }
+
+    /// Register a deep-link URL handler. Linux ships only the
+    /// receive-side wiring in this pass — cold-launch (OS spawns the
+    /// app with the URL in argv) is the supported delivery path,
+    /// driven by the template's argv parser feeding through
+    /// `deliverUrl`. Warm-launch URL forwarding via abstract Unix
+    /// socket from a second instance to the running window is a
+    /// follow-up.
+    pub fn setUrlOpenHandler(self: *Window, cb: ?opts_mod.UrlOpenHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_url_open = cb;
+        self.ctx.on_url_open_ctx = ctx;
+    }
+
+    /// Synthesize a URL delivery — call the registered handler with
+    /// `url`. Used by templates to feed argv-derived cold-launch URLs
+    /// through the same callback the future warm-launch socket
+    /// receiver will eventually drive.
+    pub fn deliverUrl(self: *Window, url: []const u8) void {
+        if (self.ctx.on_url_open) |cb| cb(self.ctx.on_url_open_ctx, url);
     }
 
     /// Read GTK's `gtk-application-prefer-dark-theme` boolean. This

@@ -335,6 +335,44 @@ platform:
 Set `.install_default_menu = false` to suppress the bar entirely
 (apps building their own).
 
+## Deep-link URLs
+
+```zig
+window.setUrlOpenHandler(onUrlOpen, ctx_ptr);
+// Optional: feed an argv-derived URL through the same callback.
+if (cold_launch_url) |u| window.deliverUrl(u);
+```
+
+`setUrlOpenHandler(cb, ctx)` registers a callback fired when the OS
+delivers a `verve://...` URL (or whatever scheme you register). The
+callback receives the full URL string; the slice is **not** retained
+across the call — copy if you need to outlive the trampoline.
+
+Platform delivery:
+
+- **macOS** — installs an `NSAppleEventManager` handler for
+  `kInternetEventClass`/`kAEGetURL`. Both warm-launch and
+  cold-launch URLs route through the same path; Cocoa queues
+  pre-launch URLs until the AEH installs, then drains them.
+- **Windows + Linux** — cold-launch only. The OS spawns the binary
+  with the URL in argv; the scaffold template's `main.zig` parses
+  `--url <u>` or any positional starting with `verve://` and calls
+  `Window.deliverUrl(url)` after the window opens. Warm-launch
+  forwarding (`WM_COPYDATA` / `AF_UNIX` socket) is a follow-up.
+
+Registering the scheme with the OS is install-time:
+
+- **macOS** — `zig build bundle -Durl-scheme=verve` injects
+  `CFBundleURLTypes` into the generated `Info.plist`. The .app
+  must be in `/Applications/` (or otherwise registered with
+  Launch Services) for the OS to route URLs to it.
+- **Windows** — write `HKCU\Software\Classes\verve\shell\open\command`
+  pointing at the exe (the framework does not ship a helper yet;
+  see the section in `docs/19-desktop.md` for the registry shape).
+- **Linux** — install a `.desktop` file with
+  `MimeType=x-scheme-handler/verve` and run
+  `update-desktop-database ~/.local/share/applications`.
+
 ## Window snapshot (macOS)
 
 ```zig

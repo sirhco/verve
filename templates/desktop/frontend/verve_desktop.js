@@ -106,6 +106,17 @@
 
   if (typeof exp.verve_hydrate === "function") exp.verve_hydrate();
 
+  // Deep-link receiver. The native side calls `window.verve.handleDeepLink(url)`
+  // via evalJs when a verve://... URL arrives — either through the
+  // macOS AppleEventManager handler (warm + cold) or the Win/Linux
+  // argv path (cold-launch only). Replace the default with your own
+  // assignment if you want a different UI.
+  window.verve.handleDeepLink = (url) => {
+    const el = document.getElementById("deep-link-url");
+    if (el) el.textContent = url;
+    console.log("verve: deep-link", url);
+  };
+
   // Delegated click handler: any `[z-on-click="<name>"]` calls the
   // matching wasm export by name. Falls back to a console warning when
   // the export is absent (typo / stale build).
