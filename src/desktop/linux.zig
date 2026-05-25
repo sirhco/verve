@@ -404,6 +404,10 @@ extern fn webkit_web_view_load_html(wv: *WebKitWebView, html: [*:0]const u8, bas
 extern fn webkit_web_view_reload(wv: *WebKitWebView) void;
 extern fn webkit_web_view_go_back(wv: *WebKitWebView) void;
 extern fn webkit_web_view_go_forward(wv: *WebKitWebView) void;
+extern fn webkit_web_view_can_go_back(wv: *WebKitWebView) gboolean;
+extern fn webkit_web_view_can_go_forward(wv: *WebKitWebView) gboolean;
+extern fn webkit_web_view_get_uri(wv: *WebKitWebView) ?[*:0]const u8;
+extern fn webkit_web_view_get_title(wv: *WebKitWebView) ?[*:0]const u8;
 extern fn webkit_web_view_run_javascript(
     wv: *WebKitWebView,
     script: [*:0]const u8,
@@ -964,6 +968,28 @@ pub const Window = struct {
     pub fn goForward(self: *Window) void {
         const wv = self.ctx.webview orelse return;
         webkit_web_view_go_forward(wv);
+    }
+
+    pub fn canGoBack(self: *Window) bool {
+        const wv = self.ctx.webview orelse return false;
+        return webkit_web_view_can_go_back(wv) != 0;
+    }
+
+    pub fn canGoForward(self: *Window) bool {
+        const wv = self.ctx.webview orelse return false;
+        return webkit_web_view_can_go_forward(wv) != 0;
+    }
+
+    pub fn currentUrl(self: *Window, allocator: std.mem.Allocator) ![]u8 {
+        const wv = self.ctx.webview orelse return allocator.dupe(u8, "");
+        const uri = webkit_web_view_get_uri(wv) orelse return allocator.dupe(u8, "");
+        return allocator.dupe(u8, std.mem.span(uri));
+    }
+
+    pub fn currentTitle(self: *Window, allocator: std.mem.Allocator) ![]u8 {
+        const wv = self.ctx.webview orelse return allocator.dupe(u8, "");
+        const title = webkit_web_view_get_title(wv) orelse return allocator.dupe(u8, "");
+        return allocator.dupe(u8, std.mem.span(title));
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {

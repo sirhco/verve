@@ -108,6 +108,10 @@ comptime {
         "reload",
         "goBack",
         "goForward",
+        "canGoBack",
+        "canGoForward",
+        "currentUrl",
+        "currentTitle",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

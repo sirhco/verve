@@ -85,6 +85,18 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Navigation queries — `Window.canGoBack()` / `canGoForward()` /
+  `currentUrl(allocator) ![]u8` / `currentTitle(allocator) ![]u8`
+  on all 3 backends. Pairs with `goBack` / `goForward` for back
+  / forward UI that grays out at history endpoints; `currentUrl`
+  + `currentTitle` enable bookmark / share / address-bar
+  features. macOS: `WKWebView` selectors `canGoBack` /
+  `canGoForward` / `URL` / `title` with a new
+  `nsStringToOwnedUtf8` helper. Windows: vtSlots 38 / 39 /
+  4 / 48 on ICoreWebView2; `CoTaskMemFree` releases the
+  WinRT-allocated LPWSTRs after UTF-16→UTF-8 conversion. Linux:
+  `webkit_web_view_can_go_back` / `_can_go_forward` /
+  `_get_uri` / `_get_title`.
 - Navigation helpers — `Window.reload()` / `goBack()` /
   `goForward()` on all 3 backends. macOS: `WKWebView reload` /
   `goBack` / `goForward`. Windows: vtSlots 31 / 40 / 41 on

@@ -649,6 +649,35 @@ pub const Window = struct {
         _ = fwd(self.webview, m.sel("goForward"));
     }
 
+    pub fn canGoBack(self: *Window) bool {
+        const sel = m.cast(*const fn (id, SEL) callconv(.c) bool);
+        return sel(self.webview, m.sel("canGoBack"));
+    }
+
+    pub fn canGoForward(self: *Window) bool {
+        const sel = m.cast(*const fn (id, SEL) callconv(.c) bool);
+        return sel(self.webview, m.sel("canGoForward"));
+    }
+
+    /// Allocator-owned UTF-8 copy of `[webview URL].absoluteString`.
+    /// Returns an empty slice when no URL is loaded (during the
+    /// initial async navigation).
+    pub fn currentUrl(self: *Window, allocator: std.mem.Allocator) ![]u8 {
+        const url_sel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+        const ns_url = url_sel(self.webview, m.sel("URL")) orelse return allocator.dupe(u8, "");
+        const abs_sel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+        const abs_str = abs_sel(ns_url, m.sel("absoluteString")) orelse return allocator.dupe(u8, "");
+        return nsStringToOwnedUtf8(allocator, abs_str);
+    }
+
+    /// Allocator-owned UTF-8 copy of `[webview title]`. Empty when
+    /// the page hasn't set a `<title>` (yet).
+    pub fn currentTitle(self: *Window, allocator: std.mem.Allocator) ![]u8 {
+        const title_sel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+        const ns_title = title_sel(self.webview, m.sel("title")) orelse return allocator.dupe(u8, "");
+        return nsStringToOwnedUtf8(allocator, ns_title);
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;
@@ -1575,6 +1604,17 @@ fn cookieMutate(cookieStore: id, selector: [*:0]const u8, cookie: id) void {
     const call = m.cast(*const fn (id, SEL, id, *VoidBlock) callconv(.c) void);
     call(cookieStore, m.sel(selector), cookie, &block);
     pumpUntilDone(&done);
+}
+
+/// Plain-error variant of `nsStringToOwned`. Returns `error.OutOfMemory`
+/// on allocator failure; empty slice when the NSString has no UTF-8
+/// representation. Used by `currentUrl` / `currentTitle` where the
+/// cookie-specific error set isn't appropriate.
+fn nsStringToOwnedUtf8(allocator: std.mem.Allocator, ns_str: id) error{OutOfMemory}![]u8 {
+    const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+    const cstr = utf8(ns_str, m.sel("UTF8String")) orelse return allocator.dupe(u8, "");
+    const slice = std.mem.span(cstr);
+    return allocator.dupe(u8, slice);
 }
 
 fn nsStringToOwned(allocator: std.mem.Allocator, ns_str: id) opts_mod.CookieError![]u8 {

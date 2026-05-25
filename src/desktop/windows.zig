@@ -505,6 +505,10 @@ const SLOT_WV2_Navigate: usize = 5;
 const SLOT_WV2_Reload: usize = 31;
 const SLOT_WV2_GoBack: usize = 40;
 const SLOT_WV2_GoForward: usize = 41;
+const SLOT_WV2_get_CanGoBack: usize = 38;
+const SLOT_WV2_get_CanGoForward: usize = 39;
+const SLOT_WV2_get_Source: usize = 4;
+const SLOT_WV2_get_DocumentTitle: usize = 48;
 const SLOT_WV2_NavigateToString: usize = 6;
 const SLOT_WV2_AddScriptToExecuteOnDocumentCreated: usize = 27;
 const SLOT_WV2_ExecuteScript: usize = 29;
@@ -569,6 +573,26 @@ const IID_ICoreWebView2_2: IID = .{
 fn vtSlot(comptime Fn: type, lpVtbl: *const anyopaque, slot: usize) Fn {
     const arr: [*]const *const anyopaque = @ptrCast(@alignCast(lpVtbl));
     return @ptrCast(arr[slot]);
+}
+
+/// Shared body for WebView2 string-getter calls. `get_Source` and
+/// `get_DocumentTitle` share the same shape: `(WV, LPWSTR*) →
+/// HRESULT`, caller frees via `CoTaskMemFree`. We allocate the
+/// UTF-8 copy via the caller's allocator and free the WinRT
+/// allocation immediately.
+fn wv2StringGetter(wv: *Wv2, slot: usize, allocator: std.mem.Allocator) ![]u8 {
+    const Getter = vtSlot(*const fn (*Wv2, *?[*:0]const u16) callconv(.winapi) HRESULT, wv.lpVtbl, slot);
+    var ptr: ?[*:0]const u16 = null;
+    if (Getter(wv, &ptr) < 0 or ptr == null) return allocator.dupe(u8, "");
+    defer CoTaskMemFree(@constCast(@as(?*anyopaque, @ptrCast(ptr.?))));
+    var len: usize = 0;
+    while (ptr.?[len] != 0) : (len += 1) {}
+    var buf = allocator.alloc(u8, len * 3 + 1) catch return error.OutOfMemory;
+    const written = std.unicode.utf16LeToUtf8(buf, ptr.?[0..len]) catch {
+        allocator.free(buf);
+        return allocator.dupe(u8, "");
+    };
+    return allocator.realloc(buf, written) catch buf[0..written];
 }
 
 // ---- COM interfaces we implement (full vtable) ------------------------------
@@ -1062,6 +1086,32 @@ pub const Window = struct {
         const wv = self.ctx.webview orelse return;
         const GoForward = vtSlot(*const fn (*Wv2) callconv(.winapi) HRESULT, wv.lpVtbl, SLOT_WV2_GoForward);
         _ = GoForward(wv);
+    }
+
+    pub fn canGoBack(self: *Window) bool {
+        const wv = self.ctx.webview orelse return false;
+        const G = vtSlot(*const fn (*Wv2, *BOOL) callconv(.winapi) HRESULT, wv.lpVtbl, SLOT_WV2_get_CanGoBack);
+        var out: BOOL = 0;
+        _ = G(wv, &out);
+        return out != 0;
+    }
+
+    pub fn canGoForward(self: *Window) bool {
+        const wv = self.ctx.webview orelse return false;
+        const G = vtSlot(*const fn (*Wv2, *BOOL) callconv(.winapi) HRESULT, wv.lpVtbl, SLOT_WV2_get_CanGoForward);
+        var out: BOOL = 0;
+        _ = G(wv, &out);
+        return out != 0;
+    }
+
+    pub fn currentUrl(self: *Window, allocator: std.mem.Allocator) ![]u8 {
+        const wv = self.ctx.webview orelse return allocator.dupe(u8, "");
+        return wv2StringGetter(wv, SLOT_WV2_get_Source, allocator);
+    }
+
+    pub fn currentTitle(self: *Window, allocator: std.mem.Allocator) ![]u8 {
+        const wv = self.ctx.webview orelse return allocator.dupe(u8, "");
+        return wv2StringGetter(wv, SLOT_WV2_get_DocumentTitle, allocator);
     }
 
     pub fn setResizable(self: *Window, on: bool) void {
