@@ -15,6 +15,7 @@ pub const ipc = @import("ipc.zig");
 pub const ipc_router = @import("ipc_router.zig");
 pub const asset_router = @import("asset_router.zig");
 pub const cookies = @import("cookies.zig");
+pub const clipboard = @import("clipboard.zig");
 pub const single_instance = @import("single_instance.zig");
 
 pub const Router = ipc_router.Router;
@@ -30,6 +31,7 @@ pub const Cookie = options.Cookie;
 pub const CookieError = options.CookieError;
 pub const SnapshotError = options.SnapshotError;
 pub const SameSite = options.SameSite;
+pub const ClipboardError = options.ClipboardError;
 pub const DevAssetsConfig = options.DevAssetsConfig;
 pub const CookieStore = cookies.CookieStore;
 
@@ -63,6 +65,7 @@ comptime {
         "showAlert",
         "openChildWindow",
         "cookies",
+        "clipboard",
         "takeSnapshotPng",
     };
     for (required) |name| {

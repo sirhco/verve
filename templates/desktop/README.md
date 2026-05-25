@@ -474,6 +474,7 @@ Overrides:
 | Multi-window | ✓ | ✓ | ✓ |
 | WASM hydration | ✓ | ✓ | ✓ |
 | Single-instance lock | ✓ | ✓ | ✓ |
+| Clipboard read / write | ✓ | ✓ | ✓ |
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | — | — |

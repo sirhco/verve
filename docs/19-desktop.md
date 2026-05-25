@@ -86,6 +86,13 @@ reference. Headline list:
   platform-native async cookie managers)
 - **Multi-window** — `Window.openChildWindow(opts)`; last-window-quit
   semantics on all three platforms
+- **Clipboard** — `Window.clipboard()` returns a handle with
+  `writeText(text)` and `readText(alloc) -> ?[]u8`. macOS uses
+  `NSPasteboard.generalPasteboard` + `public.utf8-plain-text`;
+  Windows uses `OpenClipboard` + `CF_UNICODETEXT` + an HGLOBAL
+  payload that ownership transfers to the system; Linux uses
+  `gtk_clipboard_get(CLIPBOARD)` + `gtk_clipboard_set_text` /
+  `wait_for_text`. All three are sync from the caller's view.
 - **Single-instance lock** — `desktop.single_instance.acquire(allocator, name)`
   returns an opaque `Lock` held for process lifetime. macOS + Linux use
   `flock(LOCK_EX | LOCK_NB)` on `<TMPDIR>/verve.<name>.lock`; Windows
@@ -154,6 +161,7 @@ Zig calls via nested event-loop pumps.
 | Multi-window | ✓ | ✓ | ✓ |
 | WASM hydration | ✓ | ✓ | ✓ |
 | Single-instance lock | ✓ | ✓ | ✓ |
+| Clipboard read / write | ✓ | ✓ | ✓ |
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | — | — |

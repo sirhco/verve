@@ -91,6 +91,12 @@ pub const CookieError = error{
     Backend,
 };
 
+pub const ClipboardError = error{
+    Unsupported,
+    OutOfMemory,
+    Backend,
+};
+
 pub const SnapshotError = error{
     Unsupported,
     /// Snapshot capture returned without an image (timeout / view not ready / GPU issue).

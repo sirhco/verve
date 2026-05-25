@@ -30,6 +30,7 @@ const opts_mod = @import("options.zig");
 const ipc = @import("ipc.zig");
 const router = @import("asset_router.zig");
 const cookies_mod = @import("cookies.zig");
+const clipboard_mod = @import("clipboard.zig");
 
 const WV2_INSTALL_URL = "https://developer.microsoft.com/microsoft-edge/webview2/";
 
@@ -122,6 +123,22 @@ extern "user32" fn DispatchMessageW(msg: *const MSG) callconv(.winapi) LRESULT;
 extern "user32" fn PostQuitMessage(code: c_int) callconv(.winapi) void;
 extern "user32" fn SendMessageW(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) callconv(.winapi) LRESULT;
 extern "user32" fn MessageBoxW(hwnd: HWND, text: LPCWSTR, caption: LPCWSTR, ty: UINT) callconv(.winapi) c_int;
+
+// ---- Clipboard externs ------------------------------------------------------
+extern "user32" fn OpenClipboard(hwnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
+extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
+extern "user32" fn SetClipboardData(format: UINT, mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "user32" fn GetClipboardData(format: UINT) callconv(.winapi) ?*anyopaque;
+extern "user32" fn IsClipboardFormatAvailable(format: UINT) callconv(.winapi) BOOL;
+extern "kernel32" fn GlobalAlloc(flags: UINT, bytes: usize) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalLock(mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(mem: ?*anyopaque) callconv(.winapi) BOOL;
+extern "kernel32" fn GlobalFree(mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalSize(mem: ?*anyopaque) callconv(.winapi) usize;
+
+const CF_UNICODETEXT: UINT = 13;
+const GMEM_MOVEABLE: UINT = 0x0002;
 
 // ---- Common-dialog struct (OPENFILENAMEW) -----------------------------------
 //
@@ -603,6 +620,12 @@ pub const Window = struct {
     /// Per-window cookie store. ICoreWebView2CookieManager wiring is
     /// a follow-up — see module-level stubs.
     pub fn cookies(self: *Window) cookies_mod.CookieStore {
+        return .{ .window = @ptrCast(self) };
+    }
+
+    /// System clipboard handle. Win32 clipboard is process-global; the
+    /// per-window scoping just gives API parity with `cookies()`.
+    pub fn clipboard(self: *Window) clipboard_mod.Clipboard {
         return .{ .window = @ptrCast(self) };
     }
 
@@ -1443,6 +1466,80 @@ pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
     const DeleteAll = vtSlot(*const fn (*CookieMgr) callconv(.winapi) HRESULT, handles.mgr.lpVtbl, SLOT_CM_DeleteAllCookies);
     const hr = DeleteAll(handles.mgr);
     if (hr < 0) return opts_mod.CookieError.Backend;
+}
+
+// ---- Clipboard --------------------------------------------------------------
+//
+// Win32 clipboard is owned process-globally. Acquire via
+// `OpenClipboard(hwnd)`, mutate, `CloseClipboard()`. For text we use
+// CF_UNICODETEXT (UTF-16LE, NUL-terminated) — the SetClipboardData
+// path transfers ownership of an HGLOBAL to the system, which then
+// frees it on the next EmptyClipboard.
+
+pub fn clipboardWriteText(window: *anyopaque, text: []const u8) opts_mod.ClipboardError!void {
+    const self: *Window = @ptrCast(@alignCast(window));
+
+    // Worst-case UTF-16 length is text.len + 1 (per code unit on input;
+    // bmp covers everything below U+10000 in a single u16, surrogates
+    // expand to two). The +1 is the NUL terminator.
+    const cap = text.len + 1;
+    const handle = GlobalAlloc(GMEM_MOVEABLE, cap * 2) orelse return opts_mod.ClipboardError.OutOfMemory;
+    errdefer _ = GlobalFree(handle);
+
+    const locked = GlobalLock(handle) orelse {
+        _ = GlobalFree(handle);
+        return opts_mod.ClipboardError.Backend;
+    };
+    const utf16_buf: [*]u16 = @ptrCast(@alignCast(locked));
+    const w_len = std.unicode.utf8ToUtf16Le(utf16_buf[0..cap], text) catch {
+        _ = GlobalUnlock(handle);
+        _ = GlobalFree(handle);
+        return opts_mod.ClipboardError.Backend;
+    };
+    if (w_len >= cap) {
+        _ = GlobalUnlock(handle);
+        _ = GlobalFree(handle);
+        return opts_mod.ClipboardError.Backend;
+    }
+    utf16_buf[w_len] = 0;
+    _ = GlobalUnlock(handle);
+
+    if (OpenClipboard(self.ctx.hwnd) == 0) return opts_mod.ClipboardError.Backend;
+    defer _ = CloseClipboard();
+
+    if (EmptyClipboard() == 0) return opts_mod.ClipboardError.Backend;
+    // SetClipboardData takes ownership; only free on failure.
+    if (SetClipboardData(CF_UNICODETEXT, handle) == null) {
+        _ = GlobalFree(handle);
+        return opts_mod.ClipboardError.Backend;
+    }
+}
+
+pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    const self: *Window = @ptrCast(@alignCast(window));
+
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT) == 0) return null;
+    if (OpenClipboard(self.ctx.hwnd) == 0) return opts_mod.ClipboardError.Backend;
+    defer _ = CloseClipboard();
+
+    const handle = GetClipboardData(CF_UNICODETEXT) orelse return null;
+    const locked = GlobalLock(handle) orelse return opts_mod.ClipboardError.Backend;
+    defer _ = GlobalUnlock(handle);
+
+    const total_bytes = GlobalSize(handle);
+    if (total_bytes < 2) return null;
+    const utf16_max_len = total_bytes / 2;
+
+    const utf16_buf: [*]const u16 = @ptrCast(@alignCast(locked));
+    // Walk until NUL or buffer end.
+    var w_len: usize = 0;
+    while (w_len < utf16_max_len and utf16_buf[w_len] != 0) : (w_len += 1) {}
+    if (w_len == 0) return null;
+
+    const out = allocator.alloc(u8, w_len * 3) catch return opts_mod.ClipboardError.OutOfMemory;
+    errdefer allocator.free(out);
+    const written = std.unicode.utf16LeToUtf8(out, utf16_buf[0..w_len]) catch return opts_mod.ClipboardError.Backend;
+    return allocator.realloc(out, written) catch return opts_mod.ClipboardError.OutOfMemory;
 }
 
 comptime {

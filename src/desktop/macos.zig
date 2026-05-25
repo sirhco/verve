@@ -22,6 +22,7 @@ const opts_mod = @import("options.zig");
 const ipc = @import("ipc.zig");
 const router = @import("asset_router.zig");
 const cookies_mod = @import("cookies.zig");
+const clipboard_mod = @import("clipboard.zig");
 
 const id = m.id;
 const SEL = m.SEL;
@@ -308,6 +309,12 @@ pub const Window = struct {
     /// Per-window cookie store. WKHTTPCookieStore wiring is a
     /// follow-up — see module-level cookieGet/Set/Delete/Clear stubs.
     pub fn cookies(self: *Window) cookies_mod.CookieStore {
+        return .{ .window = @ptrCast(self) };
+    }
+
+    /// System pasteboard handle. NSPasteboard is process-global; the
+    /// per-window wrapper is only there for API parity with cookies().
+    pub fn clipboard(self: *Window) clipboard_mod.Clipboard {
         return .{ .window = @ptrCast(self) };
     }
 
@@ -1065,4 +1072,39 @@ pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
         const c = objAt(arr, m.sel("objectAtIndex:"), i);
         cookieMutate(cookieStore, "deleteCookie:completionHandler:", c);
     }
+}
+
+// ---- Clipboard --------------------------------------------------------------
+//
+// NSPasteboard `generalPasteboard` is the system clipboard; both
+// reads and writes are synchronous on AppKit so no run-loop pump is
+// needed. UTF-8 in / UTF-8 out via `NSPasteboardTypeString`.
+
+pub fn clipboardWriteText(window: *anyopaque, text: []const u8) opts_mod.ClipboardError!void {
+    _ = window;
+    const NSPasteboard = m.getClass("NSPasteboard");
+    const generalPasteboard = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const pb = generalPasteboard(@as(id, @ptrCast(NSPasteboard)), m.sel("generalPasteboard"));
+
+    const clearContents = m.cast(*const fn (id, SEL) callconv(.c) isize);
+    _ = clearContents(pb, m.sel("clearContents"));
+
+    const setString = m.cast(*const fn (id, SEL, id, id) callconv(.c) bool);
+    const ok = setString(pb, m.sel("setString:forType:"), nsString(text), nsString("public.utf8-plain-text"));
+    if (!ok) return opts_mod.ClipboardError.Backend;
+}
+
+pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    _ = window;
+    const NSPasteboard = m.getClass("NSPasteboard");
+    const generalPasteboard = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const pb = generalPasteboard(@as(id, @ptrCast(NSPasteboard)), m.sel("generalPasteboard"));
+
+    const stringForType = m.cast(*const fn (id, SEL, id) callconv(.c) ?id);
+    const ns_str = stringForType(pb, m.sel("stringForType:"), nsString("public.utf8-plain-text")) orelse return null;
+
+    const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+    const cstr = utf8(ns_str, m.sel("UTF8String")) orelse return null;
+    const slice = std.mem.span(cstr);
+    return allocator.dupe(u8, slice) catch return opts_mod.ClipboardError.OutOfMemory;
 }

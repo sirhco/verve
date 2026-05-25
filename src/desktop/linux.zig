@@ -16,6 +16,7 @@ const opts_mod = @import("options.zig");
 const ipc = @import("ipc.zig");
 const router = @import("asset_router.zig");
 const cookies_mod = @import("cookies.zig");
+const clipboard_mod = @import("clipboard.zig");
 
 // ---- Opaque GTK/GLib/WebKit pointer types -----------------------------------
 
@@ -171,6 +172,20 @@ extern fn webkit_web_view_get_snapshot_finish(
 
 extern fn cairo_surface_write_to_png(surface: *CairoSurface, filename: [*:0]const u8) CairoStatus;
 extern fn cairo_surface_destroy(surface: *CairoSurface) void;
+
+// ---- GtkClipboard externs --------------------------------------------------
+const GtkClipboard = opaque {};
+const GdkAtom = ?*anyopaque;
+extern fn gtk_clipboard_get(selection: GdkAtom) *GtkClipboard;
+extern fn gtk_clipboard_set_text(clipboard: *GtkClipboard, text: [*:0]const u8, len: c_int) void;
+extern fn gtk_clipboard_store(clipboard: *GtkClipboard) void;
+extern fn gtk_clipboard_wait_for_text(clipboard: *GtkClipboard) ?[*:0]u8;
+// `GDK_SELECTION_CLIPBOARD` is the X11 atom for the CLIPBOARD
+// selection (system clipboard, as opposed to PRIMARY which is the
+// X11 middle-click buffer). It's a GdkAtom which on x86_64-linux is
+// a pointer-sized opaque. The internal `gdk_atom_intern_static_string`
+// path resolves the well-known string.
+extern fn gdk_atom_intern_static_string(name: [*:0]const u8) GdkAtom;
 
 extern fn g_signal_connect_data(
     instance: ?*anyopaque,
@@ -474,6 +489,13 @@ pub const Window = struct {
     /// Per-window cookie store. WebKitCookieManager wiring is a
     /// follow-up — see module-level stubs.
     pub fn cookies(self: *Window) cookies_mod.CookieStore {
+        return .{ .window = @ptrCast(self) };
+    }
+
+    /// System clipboard handle. GtkClipboard is keyed on a display +
+    /// selection (CLIPBOARD here, not PRIMARY); the per-window
+    /// scoping just gives API parity with `cookies()`.
+    pub fn clipboard(self: *Window) clipboard_mod.Clipboard {
         return .{ .window = @ptrCast(self) };
     }
 
@@ -938,4 +960,41 @@ pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
         webkit_cookie_manager_delete_cookie(mgr, c, null, &onSimpleAsyncDone, @ptrCast(&cell));
         pumpMainContextUntilDone(&cell.done);
     }
+}
+
+// ---- Clipboard --------------------------------------------------------------
+//
+// `gtk_clipboard_get(CLIPBOARD)` returns a process-global GtkClipboard
+// keyed on the display's CLIPBOARD selection (the system clipboard;
+// not PRIMARY, which is the middle-click selection). `set_text` is
+// synchronous; `wait_for_text` blocks the main loop until the owning
+// client responds — on X11/Wayland that's a single round-trip, so no
+// nested GMainContext pump is needed.
+
+fn clipboardHandle() *GtkClipboard {
+    return gtk_clipboard_get(gdk_atom_intern_static_string("CLIPBOARD"));
+}
+
+pub fn clipboardWriteText(window: *anyopaque, text: []const u8) opts_mod.ClipboardError!void {
+    const self: *Window = @ptrCast(@alignCast(window));
+
+    const text_z = self.ctx.allocator.dupeZ(u8, text) catch return opts_mod.ClipboardError.OutOfMemory;
+    defer self.ctx.allocator.free(text_z);
+
+    const clip = clipboardHandle();
+    gtk_clipboard_set_text(clip, text_z.ptr, @intCast(text.len));
+    // Persist past the app's exit so a paste in another window after
+    // we quit still sees the bytes (the X11 selection owner is the
+    // application by default).
+    gtk_clipboard_store(clip);
+}
+
+pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    _ = window;
+    const clip = clipboardHandle();
+    const raw = gtk_clipboard_wait_for_text(clip) orelse return null;
+    defer g_free(@ptrCast(raw));
+    const slice = std.mem.span(raw);
+    if (slice.len == 0) return null;
+    return allocator.dupe(u8, slice) catch return opts_mod.ClipboardError.OutOfMemory;
 }
