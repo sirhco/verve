@@ -85,6 +85,16 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Multi-display enumeration — new `desktop.displays` module:
+  `list(allocator) Error![]Display`. `Display { x, y, width,
+  height, scale, primary }`. macOS: `[NSScreen screens]` +
+  `backingScaleFactor`, with Y-flip to convert AppKit's bottom-
+  left origin into top-left for cross-platform parity. Windows:
+  `EnumDisplayMonitors` callback + `GetMonitorInfoW` +
+  `GetDpiForMonitor` (Shcore.dll). Linux: `gdk_display_get_default`
+  → `gdk_display_get_n_monitors` / `_get_monitor` /
+  `_get_geometry` / `_get_scale_factor`. New `Shcore`
+  link-line entry in `templates/desktop/build.zig` for Windows.
 - Window min/max size — `Window.setMinSize(w, h)` /
   `setMaxSize(w, h)` on all 3 backends. `(0, 0)` clears the
   constraint. macOS: `setContentMinSize:` / `setContentMaxSize:`

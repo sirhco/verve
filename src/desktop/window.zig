@@ -21,6 +21,7 @@ pub const deep_link = @import("deep_link.zig");
 pub const tray = @import("tray.zig");
 pub const notifications = @import("notifications.zig");
 pub const updates = @import("updates.zig");
+pub const displays = @import("displays.zig");
 
 pub const Router = ipc_router.Router;
 

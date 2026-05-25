@@ -16,6 +16,7 @@ comptime {
     _ = @import("surface_test.zig");
     _ = @import("single_instance.zig");
     _ = @import("updates.zig");
+    _ = @import("displays.zig");
 }
 
 const entries = [_]options.AssetEntry{

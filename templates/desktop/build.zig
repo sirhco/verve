@@ -126,6 +126,9 @@ pub fn build(b: *std.Build) void {
             desktop_mod.linkSystemLibrary("User32", .{});
             desktop_mod.linkSystemLibrary("Shell32", .{});
             desktop_mod.linkSystemLibrary("Shlwapi", .{});
+            // Shcore provides GetDpiForMonitor (used by
+            // `desktop.displays.list`). Available on Win 8.1+.
+            desktop_mod.linkSystemLibrary("Shcore", .{});
             // WebView2 loader. Ship the SDK under `third_party/webview2/`
             // or override with `-Dwebview2-sdk=...`. When the SDK is
             // not present, `tools/fetch_webview2.{sh,ps1}` downloads
