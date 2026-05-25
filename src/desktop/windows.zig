@@ -502,6 +502,9 @@ const SLOT_CTRL_putBounds: usize = 6;
 const SLOT_CTRL_getCoreWebView2: usize = 25;
 
 const SLOT_WV2_Navigate: usize = 5;
+const SLOT_WV2_Reload: usize = 31;
+const SLOT_WV2_GoBack: usize = 40;
+const SLOT_WV2_GoForward: usize = 41;
 const SLOT_WV2_NavigateToString: usize = 6;
 const SLOT_WV2_AddScriptToExecuteOnDocumentCreated: usize = 27;
 const SLOT_WV2_ExecuteScript: usize = 29;
@@ -1041,6 +1044,24 @@ pub const Window = struct {
     pub fn setMaxSize(self: *Window, width: u32, height: u32) void {
         self.ctx.max_width = width;
         self.ctx.max_height = height;
+    }
+
+    pub fn reload(self: *Window) void {
+        const wv = self.ctx.webview orelse return;
+        const Reload = vtSlot(*const fn (*Wv2) callconv(.winapi) HRESULT, wv.lpVtbl, SLOT_WV2_Reload);
+        _ = Reload(wv);
+    }
+
+    pub fn goBack(self: *Window) void {
+        const wv = self.ctx.webview orelse return;
+        const GoBack = vtSlot(*const fn (*Wv2) callconv(.winapi) HRESULT, wv.lpVtbl, SLOT_WV2_GoBack);
+        _ = GoBack(wv);
+    }
+
+    pub fn goForward(self: *Window) void {
+        const wv = self.ctx.webview orelse return;
+        const GoForward = vtSlot(*const fn (*Wv2) callconv(.winapi) HRESULT, wv.lpVtbl, SLOT_WV2_GoForward);
+        _ = GoForward(wv);
     }
 
     pub fn setResizable(self: *Window, on: bool) void {

@@ -401,6 +401,9 @@ extern fn webkit_web_view_get_type() GType;
 extern fn g_object_new(g_type: GType, first_prop: ?[*:0]const u8, ...) ?*anyopaque;
 extern fn webkit_web_view_load_uri(wv: *WebKitWebView, uri: [*:0]const u8) void;
 extern fn webkit_web_view_load_html(wv: *WebKitWebView, html: [*:0]const u8, base_uri: ?[*:0]const u8) void;
+extern fn webkit_web_view_reload(wv: *WebKitWebView) void;
+extern fn webkit_web_view_go_back(wv: *WebKitWebView) void;
+extern fn webkit_web_view_go_forward(wv: *WebKitWebView) void;
 extern fn webkit_web_view_run_javascript(
     wv: *WebKitWebView,
     script: [*:0]const u8,
@@ -946,6 +949,21 @@ pub const Window = struct {
         self.ctx.max_width = width;
         self.ctx.max_height = height;
         applyGeometryHints(self.ctx);
+    }
+
+    pub fn reload(self: *Window) void {
+        const wv = self.ctx.webview orelse return;
+        webkit_web_view_reload(wv);
+    }
+
+    pub fn goBack(self: *Window) void {
+        const wv = self.ctx.webview orelse return;
+        webkit_web_view_go_back(wv);
+    }
+
+    pub fn goForward(self: *Window) void {
+        const wv = self.ctx.webview orelse return;
+        webkit_web_view_go_forward(wv);
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {

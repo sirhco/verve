@@ -631,6 +631,24 @@ pub const Window = struct {
         setMax(self.window, m.sel("setContentMaxSize:"), .{ .width = w_val, .height = h_val });
     }
 
+    /// Reload the current page. Uses `reloadFromOrigin` which
+    /// re-fetches even if the response is in the cache — the
+    /// equivalent of Cmd+Shift+R in Safari.
+    pub fn reload(self: *Window) void {
+        const reloadSel = m.cast(*const fn (id, SEL) callconv(.c) id);
+        _ = reloadSel(self.webview, m.sel("reloadFromOrigin"));
+    }
+
+    pub fn goBack(self: *Window) void {
+        const back = m.cast(*const fn (id, SEL) callconv(.c) id);
+        _ = back(self.webview, m.sel("goBack"));
+    }
+
+    pub fn goForward(self: *Window) void {
+        const fwd = m.cast(*const fn (id, SEL) callconv(.c) id);
+        _ = fwd(self.webview, m.sel("goForward"));
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;

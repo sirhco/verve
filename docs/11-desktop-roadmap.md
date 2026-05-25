@@ -85,6 +85,12 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Navigation helpers — `Window.reload()` / `goBack()` /
+  `goForward()` on all 3 backends. macOS: `WKWebView reload` /
+  `goBack` / `goForward`. Windows: vtSlots 31 / 40 / 41 on
+  `ICoreWebView2`. Linux: `webkit_web_view_reload` /
+  `_go_back` / `_go_forward`. macOS uses `reloadFromOrigin` for
+  cache-bypass behavior matching Cmd+Shift+R.
 - Shell helpers — new `desktop.shell` module:
   `openUrl(allocator, url) Error!void`. Hands a URL to the OS
   shell so it opens in the system default browser (HTTP) or the

@@ -105,6 +105,9 @@ comptime {
         "setCloseHandler",
         "setMinSize",
         "setMaxSize",
+        "reload",
+        "goBack",
+        "goForward",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {
