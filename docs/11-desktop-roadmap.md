@@ -85,6 +85,15 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Shell helpers — new `desktop.shell` module:
+  `openUrl(allocator, url) Error!void`. Hands a URL to the OS
+  shell so it opens in the system default browser (HTTP) or the
+  registered handler app (mailto:, custom schemes). macOS:
+  `[NSWorkspace.sharedWorkspace openURL:]`. Windows:
+  `ShellExecuteW(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL)`.
+  Linux: `posix.fork` + `execvp("xdg-open", ...)`. Apps that
+  want web links to open externally (instead of navigating the
+  embedded WebView) call this from their IPC handler.
 - Multi-display enumeration — new `desktop.displays` module:
   `list(allocator) Error![]Display`. `Display { x, y, width,
   height, scale, primary }`. macOS: `[NSScreen screens]` +
