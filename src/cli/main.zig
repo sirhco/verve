@@ -103,11 +103,35 @@ pub fn main(init: std.process.Init) !void {
         return error.MissingTargetDir;
     };
 
-    const pkg_name = name_opt orelse basename(dir_path);
-    if (!isValidIdentifier(pkg_name)) {
-        log.err("invalid package name '{s}' — must be a Zig identifier (a-z A-Z 0-9 _, no leading digit)", .{pkg_name});
-        return error.InvalidName;
-    }
+    // Resolve package name. An explicit `--name` is taken verbatim and
+    // validated strictly. A basename-derived name (the common case
+    // when the user runs `verve-cli new my-project`) is sanitized: `-`
+    // and `.` become `_` so a hyphenated directory still yields a
+    // valid Zig identifier. If sanitization can't rescue the name
+    // (e.g. leading digit, empty after strip), fall back to a clear
+    // error pointing at `--name`.
+    var pkg_name_buf: []u8 = &.{};
+    defer if (pkg_name_buf.len > 0) init.gpa.free(pkg_name_buf);
+    const pkg_name: []const u8 = blk: {
+        if (name_opt) |n| {
+            if (!isValidIdentifier(n)) {
+                log.err("invalid package name '{s}' — must be a Zig identifier (a-z A-Z 0-9 _, no leading digit)", .{n});
+                return error.InvalidName;
+            }
+            break :blk n;
+        }
+        const raw = basename(dir_path);
+        if (isValidIdentifier(raw)) break :blk raw;
+        pkg_name_buf = sanitizeIdentifier(init.gpa, raw) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.Unsalvageable => {
+                log.err("cannot derive a Zig package name from directory '{s}'. Pass --name <pkg-name> explicitly (a-z A-Z 0-9 _, no leading digit).", .{raw});
+                return error.InvalidName;
+            },
+        };
+        log.info("derived package name '{s}' from directory '{s}' (override with --name)", .{ pkg_name_buf, raw });
+        break :blk pkg_name_buf;
+    };
 
     try scaffold(io, dir_path, pkg_name, kind, verve_path);
 
@@ -362,6 +386,35 @@ fn isValidIdentifier(name: []const u8) bool {
         if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
     }
     return true;
+}
+
+/// Convert a directory basename into a valid Zig identifier when
+/// possible. `-` and `.` collapse to `_`; any other non-identifier
+/// byte is also replaced with `_`. A leading digit gets a single
+/// underscore prefix. Returns `error.Unsalvageable` when the input
+/// contains no identifier-eligible byte at all (e.g. empty, all
+/// `/`s) — caller surfaces a hint to pass `--name` explicitly.
+fn sanitizeIdentifier(gpa: std.mem.Allocator, raw: []const u8) error{ OutOfMemory, Unsalvageable }![]u8 {
+    if (raw.len == 0) return error.Unsalvageable;
+
+    const needs_prefix = std.ascii.isDigit(raw[0]);
+    var buf = try gpa.alloc(u8, raw.len + @as(usize, if (needs_prefix) 1 else 0));
+    errdefer gpa.free(buf);
+    var idx: usize = 0;
+    if (needs_prefix) {
+        buf[0] = '_';
+        idx = 1;
+    }
+    for (raw) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_') {
+            buf[idx] = c;
+        } else {
+            buf[idx] = '_';
+        }
+        idx += 1;
+    }
+    if (!isValidIdentifier(buf[0..idx])) return error.Unsalvageable;
+    return buf[0..idx];
 }
 
 fn printUsage(program: []const u8) void {
