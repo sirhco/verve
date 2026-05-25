@@ -45,6 +45,9 @@ const WindowCtx = struct {
     color_scheme_observer: ?id = null,
     on_url_open: ?opts_mod.UrlOpenHandler = null,
     on_url_open_ctx: ?*anyopaque = null,
+    on_drag_drop: ?opts_mod.DragDropHandler = null,
+    on_drag_drop_ctx: ?*anyopaque = null,
+    drop_view: ?id = null,
     webview: id,
 };
 
@@ -70,6 +73,13 @@ var scheme_class_cached: ?m.Class = null;
 var message_class_cached: ?m.Class = null;
 var theme_class_cached: ?m.Class = null;
 var url_opener_class_cached: ?m.Class = null;
+var drag_window_class_cached: ?m.Class = null;
+
+// Maps the `VerveDragWindow`'d NSWindow instance to the owning
+// WindowCtx. The drag trampolines receive the window as self and
+// look up the ctx — separate from the webview→ctx registry because
+// drag events arrive at the window, not the webview.
+var window_registry: std.AutoHashMapUnmanaged(*anyopaque, *WindowCtx) = .{};
 
 // `NSAppleEventManager` accepts only one handler per (event class,
 // event id) pair per process — multi-window apps converge on a
@@ -249,10 +259,17 @@ pub const Window = struct {
             .on_message_ctx = opts.on_message_ctx,
             .on_url_open = opts.on_url_open,
             .on_url_open_ctx = opts.on_url_open_ctx,
+            .on_drag_drop = opts.on_drag_drop,
+            .on_drag_drop_ctx = opts.on_drag_drop_ctx,
             .webview = webview,
         };
         if (opts.on_url_open != null) {
             installUrlOpenerIfNeeded(ctx_ptr);
+        }
+        if (opts.on_drag_drop != null) {
+            installDragDestination(window, ctx_ptr) catch |err| {
+                std.log.warn("verve.desktop[macos]: drag-drop install failed: {s}", .{@errorName(err)});
+            };
         }
         if (opts.dev_assets) |dev| {
             std.log.info("verve.desktop[macos]: dev-mode asset fallback enabled, dir='{s}'", .{dev.dir});
@@ -405,6 +422,27 @@ pub const Window = struct {
     /// is mostly used by Windows + Linux templates for parity).
     pub fn deliverUrl(self: *Window, url: []const u8) void {
         if (self.ctx.on_url_open) |cb| cb(self.ctx.on_url_open_ctx, url);
+    }
+
+    /// Install / replace the drag-drop handler. Setting a non-null
+    /// callback registers the window as a drag destination for
+    /// `NSPasteboardTypeFileURL`; the trampolines on the
+    /// `VerveDragWindow` subclass extract file URLs from the
+    /// pasteboard on drop and fire the callback. Passing `null`
+    /// unregisters the destination.
+    pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_drag_drop = cb;
+        self.ctx.on_drag_drop_ctx = ctx;
+        if (cb != null) {
+            installDragDestination(self.window, self.ctx) catch |err| {
+                std.log.warn("verve.desktop[macos]: drag-drop install failed: {s}", .{@errorName(err)});
+            };
+        } else {
+            // Unregister types but leave the class swap in place —
+            // future setDragDropHandler(non-null) calls are cheap.
+            const unregister = m.cast(*const fn (id, SEL) callconv(.c) void);
+            unregister(self.window, m.sel("unregisterDraggedTypes"));
+        }
     }
 
     /// Current macOS appearance: dark vs light, derived from
@@ -666,6 +704,136 @@ fn themeChangedTrampoline(self: id, _cmd: SEL, _notification: id) callconv(.c) v
         };
         cb(ctx_ptr.on_color_scheme_ctx, scheme);
     }
+}
+
+/// Swap an existing NSWindow's class to `VerveDragWindow` and
+/// register the window for `NSPasteboardTypeFileURL`. The subclass
+/// only adds `draggingEntered:` + `performDragOperation:` methods —
+/// passing through to NSWindow for everything else. Idempotent:
+/// repeated calls just refresh the registry entry.
+fn installDragDestination(window: id, ctx_ptr: *WindowCtx) !void {
+    const NSWindow = m.getClass("NSWindow");
+    const klass = drag_window_class_cached orelse blk: {
+        const c = m.allocateClass(NSWindow, "VerveDragWindow");
+        m.addMethod(c, m.sel("draggingEntered:"), @ptrCast(&dragEnteredTrampoline), "L@:@");
+        m.addMethod(c, m.sel("performDragOperation:"), @ptrCast(&dragPerformTrampoline), "B@:@");
+        m.registerClass(c);
+        drag_window_class_cached = c;
+        break :blk c;
+    };
+    // `object_setClass` retains the existing instance state while
+    // swapping the isa pointer. Safe on documented NSObject
+    // subclasses since Snow Leopard.
+    const objc_setClass = @extern(*const fn (id, m.Class) callconv(.c) m.Class, .{ .name = "object_setClass" });
+    _ = objc_setClass(window, klass);
+
+    try window_registry.put(std.heap.page_allocator, @as(*anyopaque, @ptrCast(window)), ctx_ptr);
+
+    // `NSPasteboardTypeFileURL` is the modern (post-10.13) constant
+    // for file-URL pasteboard items. Older `NSFilenamesPboardType`
+    // is deprecated. The pasteboard type is a normal NSString;
+    // dlsyming the exported constant from AppKit is the canonical
+    // path but `[NSPasteboard nameFromUTI:]` works too — simplest
+    // is hard-coding the well-known string value
+    // ("public.file-url") since UTType maps it 1:1.
+    const NSArray = m.getClass("NSArray");
+    const arrayWithObject = m.cast(*const fn (id, SEL, id) callconv(.c) id);
+    const types_array = arrayWithObject(
+        @as(id, @ptrCast(NSArray)),
+        m.sel("arrayWithObject:"),
+        nsString("public.file-url"),
+    );
+
+    const registerForTypes = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+    registerForTypes(window, m.sel("registerForDraggedTypes:"), types_array);
+}
+
+// NSDragOperationCopy from `<AppKit/NSDragging.h>`.
+const NSDragOperationNone: usize = 0;
+const NSDragOperationCopy: usize = 1;
+
+fn dragEnteredTrampoline(self_window: id, _cmd: SEL, sender: id) callconv(.c) usize {
+    _ = _cmd;
+    const ctx = window_registry.get(@as(*anyopaque, @ptrCast(self_window))) orelse return NSDragOperationNone;
+    if (ctx.on_drag_drop == null) return NSDragOperationNone;
+    // `sender` is `id<NSDraggingInfo>`. Read its pasteboard and
+    // confirm a file-URL type is present.
+    const pasteboard_sel = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const pb = pasteboard_sel(sender, m.sel("draggingPasteboard"));
+    if (@intFromPtr(pb) == 0) return NSDragOperationNone;
+    // `[NSPasteboard.types containsObject:@"public.file-url"]`
+    const types_method = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const types = types_method(pb, m.sel("types"));
+    if (@intFromPtr(types) == 0) return NSDragOperationNone;
+    const containsObject = m.cast(*const fn (id, SEL, id) callconv(.c) bool);
+    if (!containsObject(types, m.sel("containsObject:"), nsString("public.file-url"))) return NSDragOperationNone;
+    return NSDragOperationCopy;
+}
+
+fn dragPerformTrampoline(self_window: id, _cmd: SEL, sender: id) callconv(.c) bool {
+    _ = _cmd;
+    const ctx = window_registry.get(@as(*anyopaque, @ptrCast(self_window))) orelse return false;
+    const cb = ctx.on_drag_drop orelse return false;
+
+    const pasteboard_sel = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const pb = pasteboard_sel(sender, m.sel("draggingPasteboard"));
+    if (@intFromPtr(pb) == 0) return false;
+
+    // `[NSPasteboard readObjectsForClasses:@[NSURL.class] options:nil]`
+    // returns an NSArray<NSURL*>. Walk it, extract UTF-8 paths.
+    const NSURL = m.getClass("NSURL");
+    const NSArray = m.getClass("NSArray");
+    const arrayWithObject = m.cast(*const fn (id, SEL, id) callconv(.c) id);
+    const classes = arrayWithObject(@as(id, @ptrCast(NSArray)), m.sel("arrayWithObject:"), @as(id, @ptrCast(NSURL)));
+
+    const readObjects = m.cast(*const fn (id, SEL, id, ?id) callconv(.c) id);
+    const urls = readObjects(pb, m.sel("readObjectsForClasses:options:"), classes, null);
+    if (@intFromPtr(urls) == 0) return false;
+
+    const count_sel = m.cast(*const fn (id, SEL) callconv(.c) usize);
+    const n = count_sel(urls, m.sel("count"));
+    if (n == 0) return false;
+
+    // Build a temporary slice of UTF-8 paths. We use the page
+    // allocator for the throw-away storage — the slice only lives
+    // until `cb` returns.
+    var gpa = std.heap.page_allocator;
+    var paths_buf = gpa.alloc([]const u8, n) catch return false;
+    defer gpa.free(paths_buf);
+
+    const objectAtIndex = m.cast(*const fn (id, SEL, usize) callconv(.c) id);
+    const path_sel = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+
+    var owned: usize = 0;
+    defer {
+        var i: usize = 0;
+        while (i < owned) : (i += 1) gpa.free(paths_buf[i]);
+    }
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const url = objectAtIndex(urls, m.sel("objectAtIndex:"), i);
+        const path_ns = path_sel(url, m.sel("path"));
+        if (@intFromPtr(path_ns) == 0) {
+            paths_buf[i] = "";
+            continue;
+        }
+        const cstr = utf8(path_ns, m.sel("UTF8String")) orelse {
+            paths_buf[i] = "";
+            continue;
+        };
+        const slice = std.mem.span(cstr);
+        const owned_copy = gpa.dupe(u8, slice) catch {
+            paths_buf[i] = "";
+            continue;
+        };
+        paths_buf[i] = owned_copy;
+        owned += 1;
+    }
+
+    cb(ctx.on_drag_drop_ctx, paths_buf);
+    return true;
 }
 
 /// Lazily install the `NSAppleEventManager` URL handler for

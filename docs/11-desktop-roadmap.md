@@ -56,6 +56,11 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
 - Hicolor / Linux desktop integration — `zig build install-icons`
   stages a freedesktop icon-theme + `.desktop` file tree under
   `zig-out/share/` for user / system install.
+- Drag-drop with native file paths — `Window.setDragDropHandler` +
+  `WindowOptions.on_drag_drop`. macOS via `VerveDragWindow` NSWindow
+  subclass + `registerForDraggedTypes:`; Windows via `IDropTarget`
+  COM + `RegisterDragDrop` + `DragQueryFileW`; Linux via
+  `gtk_drag_dest_set` + `drag-data-received` signal.
 
 ### Tray click handlers + submenus
 
@@ -273,6 +278,59 @@ and `update-desktop-database ~/.local/share/applications`.
 Step is invisible on non-Linux targets — the gate uses the
 resolved `target` so a `-Dtarget=x86_64-linux-gnu install-icons`
 cross-stage on macOS / Windows hosts still works.
+
+### Drag-drop with native file paths
+
+Closes the deferred drag-drop bundle. Adds a single cross-platform
+callback that surfaces dropped file paths the browser
+`DataTransfer` hides by design.
+
+- New `DragDropHandler` typedef in `options.zig`:
+  `fn(ctx, paths: []const []const u8) void`. Paths are UTF-8
+  absolute filesystem paths. Slice + strings only live for the
+  duration of the callback; apps copy if they want to outlive it.
+- `WindowOptions.on_drag_drop` + `on_drag_drop_ctx` for
+  init-time registration. `Window.setDragDropHandler(cb, ctx)`
+  for runtime install/replace/clear.
+- Cross-platform conformance enforced by the comptime check in
+  `window.zig` (the required-method list gained
+  `setDragDropHandler`).
+
+macOS: `objc_allocateClassPair(NSWindow, "VerveDragWindow")`
+registers a subclass with `draggingEntered:` +
+`performDragOperation:` methods. `object_setClass` swaps an
+existing NSWindow instance to it; `registerForDraggedTypes:` is
+then called with `@[NSPasteboardTypeFileURL]` (a.k.a.
+`public.file-url`). `draggingEntered:` returns
+`NSDragOperationCopy` when the pasteboard advertises a file URL;
+`performDragOperation:` reads `[NSPasteboard
+readObjectsForClasses:@[NSURL.class] options:nil]`, copies each
+URL's `path` UTF-8 into a temporary slice, fires the callback,
+then frees. A new `window_registry` keyed on the NSWindow ptr
+routes the trampoline back to the owning `WindowCtx`.
+
+Windows: minimal `IDropTarget` COM impl embedded in `WindowCtx`
+(`drop_target` field, like the existing
+`env_handler`/`ctrl_handler`/`msg_handler`/`res_handler`). The
+vtable reuses `comQI`/`comAddRef`/`comRelease` from the rest of
+the COM scaffolding. `OleInitialize(NULL)` runs once before
+`RegisterDragDrop(hwnd, &heap.drop_target)`. `Drop`:
+`IDataObject::GetData(CF_HDROP)` → `DragQueryFileW` to count and
+extract each path as UTF-16, converted to UTF-8 for the
+callback. `RevokeDragDrop` fires on `WM_DESTROY`.
+
+Linux: `gtk_drag_dest_set(window, GTK_DEST_DEFAULT_ALL, NULL, 0,
+GDK_ACTION_COPY)` + `gtk_drag_dest_add_uri_targets(window)` +
+`g_signal_connect_data(window, "drag-data-received", ...)`. The
+trampoline reads `gtk_selection_data_get_uris` (NUL-terminated
+`gchar**`), strips the `file://` scheme prefix from each URI,
+fires the callback, then `gtk_drag_finish(ctx, TRUE, FALSE,
+time)`. The connection id is stashed on `WindowCtx.drag_signal`
+so `setDragDropHandler(null, null)` can disconnect.
+
+In-app drag sources (drags originating inside the WebView) are
+out of scope — those continue to flow through standard HTML5
+drag-drop events on the JS side.
 
 ### Win balloon notifications
 
@@ -677,7 +735,9 @@ now a Level-3 golden-diff harness:
 ### Out of P1 scope (P3 — open)
 
 - GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
-- Drag-drop with native paths, print API
+- Print API (`NSPrintOperation` / `PrintDlgExW` /
+  `gtk_print_operation_run`) — drag-drop's native-path counterpart
+  shipped 2026-05-26.
 - Win Toast (WinRT) notifications — balloon path shipped 2026-05-26;
   Toast remains future polish for richer styling + Action Center
   grouping.

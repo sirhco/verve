@@ -38,6 +38,7 @@ pub const ClipboardError = options.ClipboardError;
 pub const ColorScheme = options.ColorScheme;
 pub const ColorSchemeHandler = options.ColorSchemeHandler;
 pub const UrlOpenHandler = options.UrlOpenHandler;
+pub const DragDropHandler = options.DragDropHandler;
 pub const DevAssetsConfig = options.DevAssetsConfig;
 pub const CookieStore = cookies.CookieStore;
 
@@ -77,6 +78,7 @@ comptime {
         "setUrlOpenHandler",
         "deliverUrl",
         "takeSnapshotPng",
+        "setDragDropHandler",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

@@ -290,6 +290,55 @@ const COPYDATASTRUCT = extern struct {
 const URL_COPYDATA_SENTINEL: usize = 0x55524C00; // "URL\0"
 
 extern "ole32" fn CoTaskMemFree(p: LPVOID) callconv(.winapi) void;
+extern "ole32" fn OleInitialize(reserved: ?*anyopaque) callconv(.winapi) HRESULT;
+extern "ole32" fn OleUninitialize() callconv(.winapi) void;
+extern "ole32" fn RegisterDragDrop(hwnd: HWND, dropTarget: *IDropTarget) callconv(.winapi) HRESULT;
+extern "ole32" fn RevokeDragDrop(hwnd: HWND) callconv(.winapi) HRESULT;
+extern "ole32" fn ReleaseStgMedium(stgmedium: *STGMEDIUM) callconv(.winapi) void;
+extern "shell32" fn DragQueryFileW(hdrop: ?*anyopaque, idx: UINT, buf: ?[*]u16, size: UINT) callconv(.winapi) UINT;
+
+// ---- IDropTarget COM machinery ----------------------------------------------
+// Minimal viable IDropTarget implementation — file drops only, copy-effect
+// always. Wired to the window's HWND via `RegisterDragDrop` during init;
+// torn down via `RevokeDragDrop` on `WM_DESTROY`.
+
+const POINTL = extern struct { x: c_long, y: c_long };
+const FORMATETC = extern struct {
+    cfFormat: u16,
+    ptd: ?*anyopaque,
+    dwAspect: DWORD,
+    lindex: c_long,
+    tymed: DWORD,
+};
+const STGMEDIUM = extern struct {
+    tymed: DWORD,
+    handle: ?*anyopaque,
+    pUnkForRelease: ?*anyopaque,
+};
+const DROPEFFECT_NONE: DWORD = 0;
+const DROPEFFECT_COPY: DWORD = 1;
+const CF_HDROP: u16 = 15;
+const DVASPECT_CONTENT: DWORD = 1;
+const TYMED_HGLOBAL: DWORD = 1;
+
+/// `IDataObject` is opaque to us — we only call `GetData` (slot 3) on
+/// it. The remaining vtable slots stay unbound.
+const IDataObject = extern struct { lpVtbl: *const anyopaque };
+const SLOT_IDataObject_GetData: usize = 3;
+
+const IDropTargetVtbl = extern struct {
+    QueryInterface: *const fn (this: ?*const IUnknown, iid: *const IID, ppv: *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (this: ?*const IUnknown) callconv(.winapi) ULONG,
+    Release: *const fn (this: ?*const IUnknown) callconv(.winapi) ULONG,
+    DragEnter: *const fn (this: ?*const IDropTarget, dataObj: *IDataObject, key_state: DWORD, pt: POINTL, effect: *DWORD) callconv(.winapi) HRESULT,
+    DragOver: *const fn (this: ?*const IDropTarget, key_state: DWORD, pt: POINTL, effect: *DWORD) callconv(.winapi) HRESULT,
+    DragLeave: *const fn (this: ?*const IDropTarget) callconv(.winapi) HRESULT,
+    Drop: *const fn (this: ?*const IDropTarget, dataObj: *IDataObject, key_state: DWORD, pt: POINTL, effect: *DWORD) callconv(.winapi) HRESULT,
+};
+const IDropTarget = extern struct {
+    lpVtbl: *const IDropTargetVtbl,
+    ctx: *WindowCtx,
+};
 extern "shlwapi" fn SHCreateMemStream(bytes: ?[*]const u8, size: UINT) callconv(.winapi) ?*IStream;
 
 // `CapturePreview` writes through a writable IStream. `shlwapi`'s
@@ -568,6 +617,9 @@ const WindowCtx = struct {
     on_color_scheme_ctx: ?*anyopaque = null,
     on_url_open: ?opts_mod.UrlOpenHandler = null,
     on_url_open_ctx: ?*anyopaque = null,
+    on_drag_drop: ?opts_mod.DragDropHandler = null,
+    on_drag_drop_ctx: ?*anyopaque = null,
+    drop_registered: bool = false,
     hwnd: HWND = null,
     menu: HMENU = null,
     accel: HACCEL = null,
@@ -578,6 +630,7 @@ const WindowCtx = struct {
     ctrl_handler: ICtrlCreatedHandler,
     msg_handler: IMessageReceivedHandler,
     res_handler: IResourceRequestedHandler,
+    drop_target: IDropTarget,
 };
 
 /// Win32 messages dispatch through wndProc which receives the HWND
@@ -621,10 +674,13 @@ pub const Window = struct {
             .on_message_ctx = opts.on_message_ctx,
             .on_url_open = opts.on_url_open,
             .on_url_open_ctx = opts.on_url_open_ctx,
+            .on_drag_drop = opts.on_drag_drop,
+            .on_drag_drop_ctx = opts.on_drag_drop_ctx,
             .env_handler = .{ .lpVtbl = &env_created_handler_vtbl, .ctx = heap },
             .ctrl_handler = .{ .lpVtbl = &ctrl_created_handler_vtbl, .ctx = heap },
             .msg_handler = .{ .lpVtbl = &message_handler_vtbl, .ctx = heap },
             .res_handler = .{ .lpVtbl = &resource_handler_vtbl, .ctx = heap },
+            .drop_target = .{ .lpVtbl = &drop_target_vtbl, .ctx = heap },
         };
 
         const class_name = std.unicode.utf8ToUtf16LeStringLiteral("VerveWindow");
@@ -660,6 +716,19 @@ pub const Window = struct {
 
         if (opts.install_default_menu) {
             installDefaultMenuBar(heap);
+        }
+
+        if (opts.on_drag_drop != null) {
+            // `RegisterDragDrop` requires OleInitialize on the calling
+            // thread. Idempotent — repeat calls return RPC_E_CHANGED_MODE
+            // / S_FALSE, both of which are non-fatal here.
+            _ = OleInitialize(null);
+            const dd_hr = RegisterDragDrop(hwnd, &heap.drop_target);
+            if (dd_hr >= 0) {
+                heap.drop_registered = true;
+            } else {
+                std.log.warn("verve.desktop[windows]: RegisterDragDrop failed (hr=0x{x:0>8})", .{@as(u32, @bitCast(dd_hr))});
+            }
         }
 
         _ = ShowWindow(hwnd, SW_SHOW);
@@ -760,6 +829,26 @@ pub const Window = struct {
     pub fn setUrlOpenHandler(self: *Window, cb: ?opts_mod.UrlOpenHandler, ctx: ?*anyopaque) void {
         self.ctx.on_url_open = cb;
         self.ctx.on_url_open_ctx = ctx;
+    }
+
+    /// Install / replace the drag-drop handler. Registers the HWND as
+    /// a drop target via `RegisterDragDrop` on first non-null call;
+    /// later calls just swap the callback fields. Setting `null`
+    /// revokes the registration.
+    pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_drag_drop = cb;
+        self.ctx.on_drag_drop_ctx = ctx;
+        if (cb == null) {
+            if (self.ctx.drop_registered) {
+                _ = RevokeDragDrop(self.ctx.hwnd);
+                self.ctx.drop_registered = false;
+            }
+            return;
+        }
+        if (self.ctx.drop_registered) return;
+        _ = OleInitialize(null);
+        const hr = RegisterDragDrop(self.ctx.hwnd, &self.ctx.drop_target);
+        if (hr >= 0) self.ctx.drop_registered = true;
     }
 
     /// Synthesize a URL delivery — call the registered handler with
@@ -1161,10 +1250,16 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             // WM_QUIT when the last live window destroys. Win32 has
             // no equivalent of NSApp's automatic last-window tracking
             // so the registry size IS the live-window count.
-            if (lookupCtx(hwnd)) |cx| if (cx.accel) |a| {
-                _ = DestroyAcceleratorTable(a);
-                cx.accel = null;
-            };
+            if (lookupCtx(hwnd)) |cx| {
+                if (cx.accel) |a| {
+                    _ = DestroyAcceleratorTable(a);
+                    cx.accel = null;
+                }
+                if (cx.drop_registered) {
+                    _ = RevokeDragDrop(hwnd);
+                    cx.drop_registered = false;
+                }
+            }
             unregisterCtx(hwnd);
             if (registry.count() == 0) PostQuitMessage(0);
             return 0;
@@ -1277,6 +1372,107 @@ const resource_handler_vtbl: IResourceRequestedHandlerVtbl = .{
     .Release = @ptrCast(&comRelease),
     .Invoke = &onResourceRequested,
 };
+
+const drop_target_vtbl: IDropTargetVtbl = .{
+    .QueryInterface = @ptrCast(&comQI),
+    .AddRef = @ptrCast(&comAddRef),
+    .Release = @ptrCast(&comRelease),
+    .DragEnter = &dropEnter,
+    .DragOver = &dropOver,
+    .DragLeave = &dropLeave,
+    .Drop = &dropPerform,
+};
+
+fn dropEnter(_this: ?*const IDropTarget, _data: *IDataObject, _ks: DWORD, _pt: POINTL, effect: *DWORD) callconv(.winapi) HRESULT {
+    _ = _this;
+    _ = _data;
+    _ = _ks;
+    _ = _pt;
+    effect.* = DROPEFFECT_COPY;
+    return 0;
+}
+
+fn dropOver(_this: ?*const IDropTarget, _ks: DWORD, _pt: POINTL, effect: *DWORD) callconv(.winapi) HRESULT {
+    _ = _this;
+    _ = _ks;
+    _ = _pt;
+    effect.* = DROPEFFECT_COPY;
+    return 0;
+}
+
+fn dropLeave(_this: ?*const IDropTarget) callconv(.winapi) HRESULT {
+    _ = _this;
+    return 0;
+}
+
+fn dropPerform(this: ?*const IDropTarget, dataObj: *IDataObject, _ks: DWORD, _pt: POINTL, effect: *DWORD) callconv(.winapi) HRESULT {
+    _ = _ks;
+    _ = _pt;
+    effect.* = DROPEFFECT_NONE;
+    const self = this orelse return 0;
+    const ctx = self.ctx;
+    const cb = ctx.on_drag_drop orelse return 0;
+
+    var fmt: FORMATETC = .{
+        .cfFormat = CF_HDROP,
+        .ptd = null,
+        .dwAspect = DVASPECT_CONTENT,
+        .lindex = -1,
+        .tymed = TYMED_HGLOBAL,
+    };
+    var medium: STGMEDIUM = .{ .tymed = 0, .handle = null, .pUnkForRelease = null };
+
+    const GetData = vtSlot(
+        *const fn (*IDataObject, *const FORMATETC, *STGMEDIUM) callconv(.winapi) HRESULT,
+        dataObj.lpVtbl,
+        SLOT_IDataObject_GetData,
+    );
+    const hr = GetData(dataObj, &fmt, &medium);
+    if (hr < 0) return 0;
+    defer ReleaseStgMedium(&medium);
+
+    const hdrop = medium.handle orelse return 0;
+
+    const SENTINEL_COUNT: UINT = 0xFFFFFFFF;
+    const n = DragQueryFileW(hdrop, SENTINEL_COUNT, null, 0);
+    if (n == 0) return 0;
+
+    var gpa = std.heap.page_allocator;
+    var paths_buf = gpa.alloc([]const u8, n) catch return 0;
+    defer gpa.free(paths_buf);
+    var owned: usize = 0;
+    defer {
+        var i: usize = 0;
+        while (i < owned) : (i += 1) gpa.free(paths_buf[i]);
+    }
+
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const wlen = DragQueryFileW(hdrop, i, null, 0);
+        const w_buf = gpa.alloc(u16, wlen + 1) catch {
+            paths_buf[i] = "";
+            continue;
+        };
+        defer gpa.free(w_buf);
+        _ = DragQueryFileW(hdrop, i, w_buf.ptr, @intCast(w_buf.len));
+        var u8_buf = gpa.alloc(u8, @as(usize, wlen) * 4) catch {
+            paths_buf[i] = "";
+            continue;
+        };
+        const u8_len = std.unicode.utf16LeToUtf8(u8_buf, w_buf[0..wlen]) catch {
+            gpa.free(u8_buf);
+            paths_buf[i] = "";
+            continue;
+        };
+        const final = gpa.realloc(u8_buf, u8_len) catch u8_buf[0..u8_len];
+        paths_buf[i] = final;
+        owned += 1;
+    }
+
+    cb(ctx.on_drag_drop_ctx, paths_buf);
+    effect.* = DROPEFFECT_COPY;
+    return 0;
+}
 
 // ---- Async creation flow ----------------------------------------------------
 

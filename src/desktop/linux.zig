@@ -115,6 +115,38 @@ extern fn gtk_widget_add_accelerator(
 ) void;
 extern fn gtk_accelerator_parse(s: [*:0]const u8, key_out: *c_uint, mods_out: *GdkModifierType) void;
 
+// ---- GTK drag-and-drop externs ---------------------------------------------
+//
+// `gtk_drag_dest_set` marks a widget as a drop destination; `add_uri_targets`
+// is the convenience helper that enrolls all the URI-list target atoms (so
+// file drops from Nautilus / Dolphin / etc all arrive on one signal).
+// `drag-data-received` then fires once per drop with the pasteboard data.
+const GtkDestDefaults = c_uint;
+const GdkDragAction = c_uint;
+const GtkTargetList = opaque {};
+const GdkDragContext = opaque {};
+const GtkSelectionData = opaque {};
+
+const GTK_DEST_DEFAULT_MOTION: GtkDestDefaults = 1;
+const GTK_DEST_DEFAULT_HIGHLIGHT: GtkDestDefaults = 2;
+const GTK_DEST_DEFAULT_DROP: GtkDestDefaults = 4;
+const GTK_DEST_DEFAULT_ALL: GtkDestDefaults = 7;
+const GDK_ACTION_COPY: GdkDragAction = 4;
+
+extern fn gtk_drag_dest_set(
+    widget: *GtkWidget,
+    flags: GtkDestDefaults,
+    targets: ?*GtkTargetList,
+    n_targets: c_int,
+    actions: GdkDragAction,
+) void;
+extern fn gtk_drag_dest_add_uri_targets(widget: *GtkWidget) void;
+extern fn gtk_drag_dest_unset(widget: *GtkWidget) void;
+extern fn gtk_drag_finish(ctx: *GdkDragContext, success: gboolean, delete: gboolean, time: c_uint) void;
+extern fn gtk_selection_data_get_uris(data: *GtkSelectionData) ?[*]const ?[*:0]const u8;
+extern fn g_strfreev(strv: ?[*]const ?[*:0]const u8) void;
+extern fn g_signal_handler_disconnect(instance: *anyopaque, handler_id: c_ulong) void;
+
 // ---- GTK dialog externs (used by openFileDialog / saveFileDialog / showAlert)
 //
 // File chooser uses the native variant: portal-aware on modern hosts,
@@ -421,6 +453,9 @@ const WindowCtx = struct {
     on_color_scheme_ctx: ?*anyopaque = null,
     on_url_open: ?opts_mod.UrlOpenHandler = null,
     on_url_open_ctx: ?*anyopaque = null,
+    on_drag_drop: ?opts_mod.DragDropHandler = null,
+    on_drag_drop_ctx: ?*anyopaque = null,
+    drag_signal: c_ulong = 0,
     url_socket_fd: c_int = -1,
     url_socket_watch: c_uint = 0,
     color_scheme_signal: c_ulong = 0,
@@ -452,6 +487,8 @@ pub const Window = struct {
             .on_message_ctx = opts.on_message_ctx,
             .on_url_open = opts.on_url_open,
             .on_url_open_ctx = opts.on_url_open_ctx,
+            .on_drag_drop = opts.on_drag_drop,
+            .on_drag_drop_ctx = opts.on_drag_drop_ctx,
         };
 
         const window_widget = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -528,6 +565,10 @@ pub const Window = struct {
             const url = try std.fmt.bufPrintZ(&url_buf, "{s}://app/{s}", .{ opts.scheme, opts.initial_path });
             std.log.debug("verve.desktop[linux]: navigate {s}", .{url});
             webkit_web_view_load_uri(wv, url.ptr);
+        }
+
+        if (opts.on_drag_drop != null) {
+            installDragDestination(heap, window_widget);
         }
 
         gtk_widget_show_all(window_widget);
@@ -623,6 +664,25 @@ pub const Window = struct {
     pub fn setUrlOpenHandler(self: *Window, cb: ?opts_mod.UrlOpenHandler, ctx: ?*anyopaque) void {
         self.ctx.on_url_open = cb;
         self.ctx.on_url_open_ctx = ctx;
+    }
+
+    /// Install / replace the drag-drop handler. Wires
+    /// `gtk_drag_dest_set` + URI-list targets + a `drag-data-received`
+    /// signal on the window widget. Passing `null` disconnects the
+    /// signal and clears the destination.
+    pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_drag_drop = cb;
+        self.ctx.on_drag_drop_ctx = ctx;
+        const window_widget = self.ctx.window orelse return;
+        if (cb == null) {
+            if (self.ctx.drag_signal != 0) {
+                g_signal_handler_disconnect(@ptrCast(window_widget), self.ctx.drag_signal);
+                self.ctx.drag_signal = 0;
+            }
+            gtk_drag_dest_unset(window_widget);
+            return;
+        }
+        if (self.ctx.drag_signal == 0) installDragDestination(self.ctx, window_widget);
     }
 
     /// Synthesize a URL delivery — call the registered handler with
@@ -856,6 +916,97 @@ fn onUrlSocketReadable(source: *GIOChannel, _cond: GIOCondition, data: ?*anyopaq
 fn onQuitActivate(_: ?*GtkMenuItem, user_data: ?*anyopaque) callconv(.c) void {
     const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return));
     if (cx.window) |w| gtk_widget_destroy(w);
+}
+
+/// Mark the window as a URI-list drop destination + connect the
+/// `drag-data-received` signal. Idempotent through the
+/// `drag_signal` guard.
+fn installDragDestination(ctx: *WindowCtx, window_widget: *GtkWidget) void {
+    gtk_drag_dest_set(window_widget, GTK_DEST_DEFAULT_ALL, null, 0, GDK_ACTION_COPY);
+    gtk_drag_dest_add_uri_targets(window_widget);
+    ctx.drag_signal = g_signal_connect_data(
+        window_widget,
+        "drag-data-received",
+        @as(GCallback, @ptrCast(&onDragDataReceived)),
+        @ptrCast(ctx),
+        null,
+        0,
+    );
+}
+
+/// GTK `drag-data-received` signal handler. Parses the URI list,
+/// converts `file://...` URIs to filesystem paths, and invokes the
+/// app callback. We always call `gtk_drag_finish(success=TRUE)`
+/// — even on empty drops — so the drag source UI clears properly.
+fn onDragDataReceived(
+    widget: *GtkWidget,
+    drag_context: *GdkDragContext,
+    _x: c_int,
+    _y: c_int,
+    data: *GtkSelectionData,
+    _info: c_uint,
+    time: c_uint,
+    user_data: ?*anyopaque,
+) callconv(.c) void {
+    _ = widget;
+    _ = _x;
+    _ = _y;
+    _ = _info;
+    const ctx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return));
+    const cb = ctx.on_drag_drop orelse {
+        gtk_drag_finish(drag_context, 1, 0, time);
+        return;
+    };
+
+    const uri_array = gtk_selection_data_get_uris(data) orelse {
+        gtk_drag_finish(drag_context, 1, 0, time);
+        return;
+    };
+    defer g_strfreev(uri_array);
+
+    // Count entries (NUL-terminated array).
+    var n: usize = 0;
+    while (uri_array[n] != null) : (n += 1) {}
+    if (n == 0) {
+        gtk_drag_finish(drag_context, 1, 0, time);
+        return;
+    }
+
+    var paths_buf = ctx.allocator.alloc([]const u8, n) catch {
+        gtk_drag_finish(drag_context, 0, 0, time);
+        return;
+    };
+    defer ctx.allocator.free(paths_buf);
+
+    var owned: usize = 0;
+    defer {
+        var i: usize = 0;
+        while (i < owned) : (i += 1) ctx.allocator.free(paths_buf[i]);
+    }
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const uri_ptr = uri_array[i] orelse {
+            paths_buf[i] = "";
+            continue;
+        };
+        const uri = std.mem.span(uri_ptr);
+        // `file://path` — strip the scheme. Skip non-file URIs.
+        const file_prefix = "file://";
+        const path: []const u8 = if (std.mem.startsWith(u8, uri, file_prefix))
+            uri[file_prefix.len..]
+        else
+            uri;
+        const copy = ctx.allocator.dupe(u8, path) catch {
+            paths_buf[i] = "";
+            continue;
+        };
+        paths_buf[i] = copy;
+        owned += 1;
+    }
+
+    cb(ctx.on_drag_drop_ctx, paths_buf);
+    gtk_drag_finish(drag_context, 1, 0, time);
 }
 
 fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callconv(.c) void {

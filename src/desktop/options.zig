@@ -125,6 +125,19 @@ pub const UrlOpenHandler = *const fn (ctx: ?*anyopaque, url: []const u8) void;
 /// `Window` method without crossing threads.
 pub const ColorSchemeHandler = *const fn (ctx: ?*anyopaque, scheme: ColorScheme) void;
 
+/// Callback fired when the user drops one or more files onto the
+/// window from outside the app (Finder / Explorer / file manager).
+/// `paths` is a slice of UTF-8 absolute filesystem paths — the
+/// browser's drag-drop DataTransfer hides these by design, so this
+/// callback is the only way to learn them from native code. The
+/// slice (and the strings it points at) live only for the duration
+/// of the callback; copy if you need to outlive it.
+///
+/// In-app drag sources (drags originating inside the webview) are
+/// out of scope — those still flow through standard HTML5 drag-drop
+/// events on the JS side.
+pub const DragDropHandler = *const fn (ctx: ?*anyopaque, paths: []const []const u8) void;
+
 pub const SnapshotError = error{
     Unsupported,
     /// Snapshot capture returned without an image (timeout / view not ready / GPU issue).
@@ -208,6 +221,13 @@ pub const WindowOptions = struct {
     /// `Window.setUrlOpenHandler` if you need to install it later.
     on_url_open: ?UrlOpenHandler = null,
     on_url_open_ctx: ?*anyopaque = null,
+
+    /// Optional drag-drop handler + context for file drops from outside
+    /// the app. When non-null, the backend registers the platform-
+    /// native drag-destination and routes incoming file drops through
+    /// this callback. `Window.setDragDropHandler` swaps it at runtime.
+    on_drag_drop: ?DragDropHandler = null,
+    on_drag_drop_ctx: ?*anyopaque = null,
 
     /// Install a default OS menu bar. Honored on all three backends:
     /// macOS gets App + Edit + Window menus; Windows and Linux get
