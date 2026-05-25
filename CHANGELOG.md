@@ -6,7 +6,75 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Pipeline ready for the next surface change. Nothing on deck yet.
+### Added — Desktop framework polish (2026-05-24)
+
+- **`--dev <dir>` runtime asset fallback.** Desktop scheme handler
+  checks `<dir>/<path>` before the embedded `public_assets` table
+  on every request, so hand-written frontend assets (`style.css`,
+  `verve_desktop.js`, …) reload with Cmd+R instead of triggering a
+  full process-restart rebuild. Rejects `..` and post-strip
+  absolute paths; 16 MB per-file ceiling. Wired through
+  `WindowOptions.dev_assets: ?DevAssetsConfig`.
+- **Win + Linux ports of `openFileDialog` / `saveFileDialog` /
+  `showAlert`.** Linux uses `GtkFileChooserNative` + `GtkMessageDialog`;
+  Windows uses `GetOpenFileNameW` / `GetSaveFileNameW` + `MessageBoxW`.
+  Win folder-picking returns `Unsupported` (needs `IFileOpenDialog`);
+  custom alert labels honored on mac + Linux, mapped to standard
+  buttons on Windows.
+- **Win + Linux `takeSnapshotPng` ports.** Linux uses
+  `webkit_web_view_get_snapshot` → cairo PNG; Windows uses
+  `ICoreWebView2::CapturePreview` → `IStream` → `WriteFile`. Same
+  byte-deterministic PNG output as the macOS reference.
+- **Single-instance enforcement.**
+  `desktop.single_instance.acquire(allocator, name)` returns an
+  opaque `Lock` held for process lifetime. macOS + Linux use POSIX
+  `flock(LOCK_EX | LOCK_NB)` on `<TMPDIR>/verve.<name>.lock`;
+  Windows uses `CreateMutexW` under `Local\Verve.<name>`. Scaffold
+  template wires it at startup automatically.
+- **Cross-platform clipboard read/write.** `Window.clipboard()`
+  returns a handle with `writeText` / `readText`. macOS:
+  `NSPasteboard.generalPasteboard`; Windows: `OpenClipboard` +
+  `CF_UNICODETEXT` + HGLOBAL ownership transfer; Linux:
+  `gtk_clipboard_get(CLIPBOARD)` + `set_text` / `wait_for_text` +
+  `gtk_clipboard_store`.
+- **`Window.colorScheme()`** returns `.light` / `.dark` /
+  `.unknown`. macOS: `[NSApp.effectiveAppearance].name`; Windows:
+  `RegGetValueW(HKCU\…\Personalize\AppsUseLightTheme)`; Linux:
+  GtkSettings' `gtk-application-prefer-dark-theme`. Pair with
+  `Window.setColorSchemeHandler(cb, ctx)` for live change events
+  via NSDistributedNotificationCenter (mac), WM_SETTINGCHANGE
+  (win), GtkSettings notify signal (linux).
+- **App icons (macOS `.app` bundle).** Scaffold `build.zig` gains
+  a `-Dicon=<path>` option. Bundle step copies the supplied
+  `.icns` into `Contents/Resources/AppIcon.icns` and injects
+  `CFBundleIconFile = "AppIcon"` into the generated Info.plist.
+  Absolute and build-root-relative paths both work.
+
+### Fixed — Desktop framework
+
+- **`openChildWindow` crash on multi-window apps.** The macOS
+  backend re-registered `VerveSchemeHandler` and
+  `VerveMessageHandler` Obj-C classes for every `Window.init`,
+  but the Objective-C runtime rejects duplicate class names with
+  `objc_allocateClassPair failed`. Classes are now cached at
+  module scope and reused for every window.
+- **`webview2.pinned.txt` SHA-512 populated.** Previously blank
+  with TODO; reproducible Windows builds now actually verify the
+  downloaded SDK. Also fixed `fetch_webview2.sh` `cut -d= -f2`
+  truncating the trailing `==` base64 padding.
+- **CI smoke server CSRF.** `--csrf=disable` added to the
+  workflow's smoke-test invocation; form-encoded `/api/<fn>` POSTs
+  no longer fail with `403`.
+- **`verve-cli new <hyphenated-dir>`.** Basename-derived package
+  names previously errored with `InvalidName` on hyphens. Hyphens
+  / dots in basename now sanitize to `_`; explicit `--name=<n>`
+  keeps the strict validation.
+
+### Fixed — Docs
+
+- **`docs/11-desktop-roadmap.md` #18 status.** Item was marked open
+  even though commits 49b053d (J1 build-time SSR) and 3338d45
+  (J2+J3 WASM + bridge) had landed. Doc now reflects shipped state.
 
 ## [0.1.0] — 2026-05-21
 

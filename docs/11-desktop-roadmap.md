@@ -12,15 +12,14 @@ Fresh session? Do these four in order before writing code:
    step fails, state matches description no longer — stop and surface
    the drift before proceeding.
 3. **Pick one bundle** from the "Suggested next-session bundles"
-   table. All P1 items (#16–#23) are now closed, the `webview2.pinned.txt`
-   SHA-512 is populated, the #19 HMR follow-up (`--dev <dir>` runtime
-   disk-read fallback) shipped on 2026-05-24, all P2 platform ports
-   (Win/Linux dialogs + alerts + snapshot) landed the same day, and
-   single-instance enforcement (`desktop.single_instance.acquire`)
-   shipped alongside. The cross-platform support matrix is full ✓ for
-   every surface except the explicitly-P3-only items. Remaining work
-   is the P3 backlog (GTK4, native menu bars on Win/Linux, tray,
-   drag-drop, accessibility, auto-updater).
+   table. All P1 items (#16–#23) are closed; every P2 platform port
+   (Win/Linux dialogs, alerts, snapshot) is in. The P3 items that
+   shipped 2026-05-24 are listed under "Out of P1 scope — shipped"
+   below. Remaining P3 backlog: GTK4 backend, native menu bars on
+   Win + Linux, tray icons + notifications, drag-drop with native
+   paths, print API, hicolor / Linux icon-theme install, deep-link
+   URL handlers, accessibility (NSAccessibility / UIA / ATK), and
+   auto-updater (Sparkle / Squirrel).
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
@@ -370,31 +369,45 @@ now a Level-3 golden-diff harness:
   call into stubs — port follows the same shape once those backends
   get `takeSnapshotPng` real impls.
 
-### Out of P1 scope (P2/P3)
+### Out of P1 scope (P3 — open)
 
 - GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
 - Native menu bars on Windows + Linux
 - Tray icons + system notifications
-- Drag-drop, clipboard programmatic access, print API
-- App icons / icns / hicolor theme
-- Single-instance enforcement
+- Drag-drop with native paths, print API
+- Hicolor / Linux app icon theme installation
 - Deep-link URL handlers
-- Theme follow (light/dark to JS)
 - Accessibility (NSAccessibility / UIA / ATK)
 - Auto-updater (Sparkle / Squirrel)
 
+### Out of P1 scope — shipped 2026-05-24
+
+- Single-instance enforcement — `desktop.single_instance.acquire`
+  with POSIX flock + Windows named mutex.
+- Cross-platform clipboard read/write — `Window.clipboard()`
+  (NSPasteboard / CF_UNICODETEXT / GtkClipboard).
+- Theme follow — `Window.colorScheme()` getter + live change
+  events via `Window.setColorSchemeHandler` on all three backends.
+- App icons (macOS `.app` bundle) — `-Dicon=<path>` build flag
+  copies an `.icns` into `Contents/Resources/AppIcon.icns` and
+  references it from `CFBundleIconFile`.
+
 ## Suggested next-session bundles
 
-All P1 items (#16–#23) closed; the `webview2.pinned.txt` SHA-512 pin,
-the #19 HMR follow-up (`--dev <dir>` runtime fallback), the P2
-dialogs+alerts port, and the P2 snapshot port all landed on
-2026-05-24. Remaining work is the broader P3 backlog:
+All P1 + every P2 platform port closed; the high-value P3 items
+that user-facing apps reach for immediately (single-instance,
+clipboard, color scheme + change events, app icons) all landed on
+2026-05-24. Remaining work is the lower-frequency P3 surface:
 
 | Bundle | Items | Best for |
 |---|---|---|
-| **P3 GTK4** | GTK4 + WebKitGTK 6.0 behind `-Dgtk4` | Future-proofing once Ubuntu LTS / Fedora ship GTK4 webkit by default. |
-| **P3 menu bars** | Win/Linux native menus | Tray-adjacent feature; current `install_default_menu` is macOS-only. |
-| **P3 misc** | Tray icons, drag-drop, clipboard, deep-link URLs, app icons, accessibility, auto-updater | Each is a self-contained bundle; see the P2/P3 list above. Single-instance enforcement landed 2026-05-24 (cross-platform `desktop.single_instance.acquire`). |
+| **P3 GTK4** | GTK4 + WebKitGTK 6.0 behind `-Dgtk4` | Future-proofing once Ubuntu LTS / Fedora ship GTK4 webkit by default. New backend module; existing GTK3 path stays. |
+| **P3 menu bars** | Win/Linux native menus | Cross-platform menu API design first, then `CreateMenu`/`AppendMenuW`/`SetMenu` on Win and GtkMenuBar / GMenuModel on Linux. Current `install_default_menu` is macOS-only. |
+| **P3 tray + notifications** | NSStatusItem / `Shell_NotifyIconW` / Ayatana AppIndicator | Linux side requires an extra dep (libappindicator / Ayatana) since GtkStatusIcon is deprecated. |
+| **P3 deep-link URLs** | `CFBundleURLTypes` + AppleEventManager / registry write + WM_COPYDATA / `.desktop` MimeType | Install-time setup + first-instance forwarding. |
+| **P3 drag-drop / print** | `NSDraggingDestination` / `IDropTarget` / GTK drag signals; `NSPrintOperation` / `PrintDlgExW` / `gtk_print_operation_run` | Drag-drop with native file paths (browser DataTransfer doesn't expose them). |
+| **P3 a11y** | NSAccessibility / UIA / ATK | Window-chrome + menu accessibility — web content already inherits from WebView. |
+| **P3 auto-updater** | Sparkle on macOS / Squirrel or MSIX on Windows / AppImage update on Linux | Multi-platform signing + delta channels. |
 
 Pick one. Each remaining bundle is ~2–4 hours focused work plus
 testing.

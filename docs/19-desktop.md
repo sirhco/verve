@@ -195,13 +195,15 @@ Zig calls via nested event-loop pumps.
 
 ## Roadmap status
 
-All P1 desktop items per `docs/11-desktop-roadmap.md` are closed.
-Remaining work is P2/P3 follow-ups: GTK4 + WebKitGTK 6.0 backend,
-native menu bars on Windows + Linux, tray icons + system
-notifications, drag-drop / clipboard programmatic access, deep-link
-URL handlers, runtime disk-read fallback (true HMR), app icons /
-icns / hicolor theme, accessibility (NSAccessibility / UIA / ATK),
-auto-updater (Sparkle / Squirrel).
+All P1 and all P2 desktop items per `docs/11-desktop-roadmap.md`
+are closed; clipboard, single-instance enforcement, color-scheme
+follow (getter + live change events), runtime asset-disk fallback,
+and macOS app-icon bundling shipped 2026-05-24. Remaining P3
+follow-ups: GTK4 + WebKitGTK 6.0 backend, native menu bars on
+Windows + Linux, tray icons + system notifications, drag-drop with
+native paths, print API, hicolor / Linux app-icon theme install,
+deep-link URL handlers, accessibility (NSAccessibility / UIA /
+ATK), auto-updater (Sparkle / Squirrel).
 
 ## Constraints
 

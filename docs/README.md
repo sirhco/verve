@@ -28,7 +28,7 @@ you know what you need.
 ## Reference
 
 - [Top-level README](../README.md) — quickstart + feature matrix + why-Verve
-- [HANDOFF.md](../HANDOFF.md) — non-obvious context across sessions
+- [CHANGELOG](../CHANGELOG.md) — what shipped, when
 - [Examples](../examples/README.md) — runnable sample apps
 
 ## Conventions used throughout
