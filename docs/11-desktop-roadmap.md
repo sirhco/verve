@@ -85,6 +85,16 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- System info — new `desktop.system` module:
+  `locale(allocator, environ) ![]u8` + `osVersion(allocator) ![]u8`.
+  macOS: `[NSLocale currentLocale].localeIdentifier` +
+  `[NSProcessInfo processInfo].operatingSystemVersionString`.
+  Windows: `GetUserDefaultLocaleName` + `RtlGetVersion`
+  (OSVERSIONINFOEXW from ntdll.dll). Linux: `LC_ALL` / `LANG`
+  env vars (with `.UTF-8` / `@modifier` stripped) +
+  `/etc/os-release` `PRETTY_NAME` parse. Three headless tests
+  fire on `zig build test` (os-release with quotes, unquoted,
+  locale codeset strip).
 - Standard directories — new `desktop.paths` module:
   `dataDir` / `cacheDir` / `configDir` / `homeDir` / `tempDir`.
   Takes `std.process.Environ` (typically `init.minimal.environ`)
