@@ -40,6 +40,9 @@ const WindowCtx = struct {
     dev_assets: ?opts_mod.DevAssetsConfig,
     on_message: ?opts_mod.MessageHandler,
     on_message_ctx: ?*anyopaque,
+    on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
+    on_color_scheme_ctx: ?*anyopaque = null,
+    color_scheme_observer: ?id = null,
     webview: id,
 };
 
@@ -57,12 +60,18 @@ var app_initialized: bool = false;
 
 // The Objective-C runtime rejects a second `objc_allocateClassPair`
 // with the same name in the same process, so the per-window dynamic
-// classes (`VerveSchemeHandler`, `VerveMessageHandler`) are registered
-// at the first Window.init and reused for every subsequent window.
-// Without this, `openChildWindow` crashes with
-// "objc_allocateClassPair failed".
+// classes (`VerveSchemeHandler`, `VerveMessageHandler`,
+// `VerveThemeObserver`) are registered at the first Window.init and
+// reused for every subsequent window. Without this, `openChildWindow`
+// crashes with "objc_allocateClassPair failed".
 var scheme_class_cached: ?m.Class = null;
 var message_class_cached: ?m.Class = null;
+var theme_class_cached: ?m.Class = null;
+
+// Maps NSDistributedNotificationCenter observer instance → owning
+// WindowCtx. Theme-change callbacks fire on the AppKit main thread
+// so the map needs no locking.
+var theme_registry: std.AutoHashMapUnmanaged(*anyopaque, *WindowCtx) = .{};
 
 fn registerCtx(webview: id, ctx_ptr: *WindowCtx) !void {
     try registry.put(std.heap.page_allocator, @ptrCast(webview), ctx_ptr);
@@ -318,6 +327,46 @@ pub const Window = struct {
         return .{ .window = @ptrCast(self) };
     }
 
+    /// Register a callback fired on AppleInterfaceThemeChangedNotification.
+    /// The observer subscribes to `NSDistributedNotificationCenter`
+    /// with a lazily-allocated `VerveThemeObserver` class. Passing a
+    /// `null` handler removes any prior observer for this window.
+    pub fn setColorSchemeHandler(self: *Window, cb: ?opts_mod.ColorSchemeHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_color_scheme = cb;
+        self.ctx.on_color_scheme_ctx = ctx;
+
+        if (self.ctx.color_scheme_observer == null and cb != null) {
+            const NSObject = m.getClass("NSObject");
+            const theme_class = theme_class_cached orelse blk: {
+                const c = m.allocateClass(NSObject, "VerveThemeObserver");
+                m.addMethod(c, m.sel("themeChanged:"), @ptrCast(&themeChangedTrampoline), "v@:@");
+                m.registerClass(c);
+                theme_class_cached = c;
+                break :blk c;
+            };
+            const alloc_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+            const init_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+            const observer = init_id(alloc_id(@as(id, @ptrCast(theme_class)), m.sel("alloc")), m.sel("init"));
+
+            theme_registry.put(std.heap.page_allocator, @ptrCast(observer), self.ctx) catch return;
+
+            const NSDistributedNotificationCenter = m.getClass("NSDistributedNotificationCenter");
+            const defaultCenter = m.cast(*const fn (id, SEL) callconv(.c) id);
+            const center = defaultCenter(@as(id, @ptrCast(NSDistributedNotificationCenter)), m.sel("defaultCenter"));
+
+            const addObserver = m.cast(*const fn (id, SEL, id, SEL, id, ?id) callconv(.c) void);
+            addObserver(
+                center,
+                m.sel("addObserver:selector:name:object:"),
+                observer,
+                m.sel("themeChanged:"),
+                nsString("AppleInterfaceThemeChangedNotification"),
+                null,
+            );
+            self.ctx.color_scheme_observer = observer;
+        }
+    }
+
     /// Current macOS appearance: dark vs light, derived from
     /// `[NSApp.effectiveAppearance].name`. The string is one of
     /// `NSAppearanceNameAqua`, `NSAppearanceNameDarkAqua`,
@@ -545,6 +594,38 @@ fn didReceiveTrampoline(self: id, _cmd: SEL, controller: id, message: id) callco
     const wv = m.cast(*const fn (id, SEL) callconv(.c) id)(message, m.sel("webView"));
     const ctx_ptr = lookupCtx(wv) orelse return;
     handleScriptMessage(ctx_ptr, message);
+}
+
+/// Trampoline for the NSDistributedNotificationCenter observer that
+/// watches `AppleInterfaceThemeChangedNotification`. Looks up the
+/// owning WindowCtx via the per-observer registry, re-reads the
+/// current appearance through the same path `Window.colorScheme()`
+/// uses, and dispatches to the caller-registered handler.
+fn themeChangedTrampoline(self: id, _cmd: SEL, _notification: id) callconv(.c) void {
+    _ = _cmd;
+    _ = _notification;
+    const ctx_ptr = theme_registry.get(@ptrCast(self)) orelse return;
+    if (ctx_ptr.on_color_scheme) |cb| {
+        // Re-derive scheme via the same path the public getter uses
+        // so the value the caller sees is the new one, not whatever
+        // was current when the observer registered.
+        const app_class = m.getClass("NSApplication");
+        const sharedApp = m.cast(*const fn (id, SEL) callconv(.c) id);
+        const app = sharedApp(@as(id, @ptrCast(app_class)), m.sel("sharedApplication"));
+        const appearanceSel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+        const appearance = appearanceSel(app, m.sel("effectiveAppearance"));
+        const scheme: opts_mod.ColorScheme = blk: {
+            const ap = appearance orelse break :blk .unknown;
+            const nameSel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+            const name_str = nameSel(ap, m.sel("name")) orelse break :blk .unknown;
+            const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+            const cstr = utf8(name_str, m.sel("UTF8String")) orelse break :blk .unknown;
+            const slice = std.mem.span(cstr);
+            if (std.mem.indexOf(u8, slice, "Dark") != null) break :blk .dark;
+            break :blk .light;
+        };
+        cb(ctx_ptr.on_color_scheme_ctx, scheme);
+    }
 }
 
 fn handleSchemeStart(ctx_ptr: *WindowCtx, task: id) !void {

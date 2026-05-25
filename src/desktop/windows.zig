@@ -218,6 +218,7 @@ const IDYES: c_int = 6;
 const IDNO: c_int = 7;
 
 const WM_CLOSE: UINT = 0x0010;
+const WM_SETTINGCHANGE: UINT = 0x001A;
 
 extern "ole32" fn CoTaskMemFree(p: LPVOID) callconv(.winapi) void;
 extern "shlwapi" fn SHCreateMemStream(bytes: ?[*]const u8, size: UINT) callconv(.winapi) ?*IStream;
@@ -494,6 +495,8 @@ const WindowCtx = struct {
     opts: opts_mod.WindowOptions,
     on_message: ?opts_mod.MessageHandler,
     on_message_ctx: ?*anyopaque,
+    on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
+    on_color_scheme_ctx: ?*anyopaque = null,
     hwnd: HWND = null,
     controller: ?*Ctrl = null,
     webview: ?*Wv2 = null,
@@ -650,17 +653,22 @@ pub const Window = struct {
         return .{ .window = @ptrCast(self) };
     }
 
+    /// Register a callback fired when Windows broadcasts
+    /// `WM_SETTINGCHANGE` with `lParam == "ImmersiveColorSet"` — the
+    /// standard signal a light/dark theme toggle was applied. wndProc
+    /// hooks the message and dispatches to the registered handler
+    /// after re-reading the registry. Passing `null` clears the
+    /// handler.
+    pub fn setColorSchemeHandler(self: *Window, cb: ?opts_mod.ColorSchemeHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_color_scheme = cb;
+        self.ctx.on_color_scheme_ctx = ctx;
+    }
+
     /// Read `HKCU\…\Personalize\AppsUseLightTheme`. The key only
     /// exists on Windows 10 1809+; absence falls back to .unknown.
     pub fn colorScheme(self: *Window) opts_mod.ColorScheme {
         _ = self;
-        const subkey = std.unicode.utf8ToUtf16LeStringLiteral("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
-        const value = std.unicode.utf8ToUtf16LeStringLiteral("AppsUseLightTheme");
-        var data: DWORD = 0;
-        var size: DWORD = @sizeOf(DWORD);
-        const r = RegGetValueW(HKEY_CURRENT_USER, subkey, value, RRF_RT_REG_DWORD, null, &data, &size);
-        if (r != ERROR_SUCCESS) return .unknown;
-        return if (data == 0) .dark else .light;
+        return readColorSchemeRegistry();
     }
 
     pub fn run(self: *Window) void {
@@ -966,6 +974,26 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             };
             return 0;
         },
+        WM_SETTINGCHANGE => {
+            // lParam → LPCWSTR area name; Windows fires
+            // `ImmersiveColorSet` when the user toggles the theme via
+            // Settings → Personalization → Colors. wParam is unused
+            // on this branch (it carries the SPI_* code for other
+            // setting changes, which we don't act on).
+            if (lparam != 0) {
+                if (lookupCtx(hwnd)) |cx| if (cx.on_color_scheme) |cb| {
+                    const area_ptr: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    var len: usize = 0;
+                    while (area_ptr[len] != 0) : (len += 1) {}
+                    var utf8_buf: [128]u8 = undefined;
+                    const written = std.unicode.utf16LeToUtf8(&utf8_buf, area_ptr[0..len]) catch return 0;
+                    if (std.mem.eql(u8, utf8_buf[0..written], "ImmersiveColorSet")) {
+                        cb(cx.on_color_scheme_ctx, readColorSchemeRegistry());
+                    }
+                };
+            }
+            return 0;
+        },
         WM_DESTROY => {
             // Multi-window quit: unregister this HWND, only post
             // WM_QUIT when the last live window destroys. Win32 has
@@ -977,6 +1005,19 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         },
         else => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// Module-level color-scheme reader used by both `Window.colorScheme`
+/// and the WM_SETTINGCHANGE handler. Encapsulates the registry probe
+/// so the message path doesn't depend on having a `*Window`.
+fn readColorSchemeRegistry() opts_mod.ColorScheme {
+    const subkey = std.unicode.utf8ToUtf16LeStringLiteral("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+    const value = std.unicode.utf8ToUtf16LeStringLiteral("AppsUseLightTheme");
+    var data: DWORD = 0;
+    var size: DWORD = @sizeOf(DWORD);
+    const r = RegGetValueW(HKEY_CURRENT_USER, subkey, value, RRF_RT_REG_DWORD, null, &data, &size);
+    if (r != ERROR_SUCCESS) return .unknown;
+    return if (data == 0) .dark else .light;
 }
 
 // ---- Completion handler vtables ---------------------------------------------

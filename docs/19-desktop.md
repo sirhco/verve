@@ -93,8 +93,12 @@ reference. Headline list:
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`
   (0 = dark, 1 = light, absent → unknown); Linux reads
   `gtk-application-prefer-dark-theme` via `gtk_settings_get_default`.
-  Change-notification events to JS are deferred — apps poll on
-  window restore or wire their own listener for now.
+  Pair with `Window.setColorSchemeHandler(cb, ctx)` to react
+  live: macOS observes
+  `AppleInterfaceThemeChangedNotification` on
+  `NSDistributedNotificationCenter`; Windows hooks
+  `WM_SETTINGCHANGE` with `lParam == "ImmersiveColorSet"`; Linux
+  connects to `GtkSettings notify::gtk-application-prefer-dark-theme`.
 - **Clipboard** — `Window.clipboard()` returns a handle with
   `writeText(text)` and `readText(alloc) -> ?[]u8`. macOS uses
   `NSPasteboard.generalPasteboard` + `public.utf8-plain-text`;

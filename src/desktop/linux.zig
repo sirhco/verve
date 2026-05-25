@@ -358,6 +358,9 @@ const WindowCtx = struct {
     opts: opts_mod.WindowOptions,
     on_message: ?opts_mod.MessageHandler,
     on_message_ctx: ?*anyopaque,
+    on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
+    on_color_scheme_ctx: ?*anyopaque = null,
+    color_scheme_signal: c_ulong = 0,
     window: ?*GtkWidget = null,
     webview: ?*WebKitWebView = null,
     web_context: ?*WebKitWebContext = null,
@@ -509,6 +512,29 @@ pub const Window = struct {
     /// scoping just gives API parity with `cookies()`.
     pub fn clipboard(self: *Window) clipboard_mod.Clipboard {
         return .{ .window = @ptrCast(self) };
+    }
+
+    /// Register a callback fired on GtkSettings'
+    /// `notify::gtk-application-prefer-dark-theme` signal — emitted
+    /// when GTK reapplies its theme (e.g. user toggles dark mode in
+    /// the desktop's appearance settings). `g_signal_connect_data`
+    /// returns the connection id; we stash it on the ctx so a
+    /// follow-up `setColorSchemeHandler(null, null)` can disconnect.
+    pub fn setColorSchemeHandler(self: *Window, cb: ?opts_mod.ColorSchemeHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_color_scheme = cb;
+        self.ctx.on_color_scheme_ctx = ctx;
+        if (self.ctx.color_scheme_signal == 0 and cb != null) {
+            const settings = gtk_settings_get_default() orelse return;
+            const sig = g_signal_connect_data(
+                @ptrCast(settings),
+                "notify::gtk-application-prefer-dark-theme",
+                @as(GCallback, @ptrCast(&onColorSchemeChanged)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+            self.ctx.color_scheme_signal = sig;
+        }
     }
 
     /// Read GTK's `gtk-application-prefer-dark-theme` boolean. This
@@ -832,6 +858,24 @@ fn onSnapshotDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaque) c
     const cell: *SnapshotCell = @ptrCast(@alignCast(user_data orelse return));
     cell.result = res;
     cell.done = true;
+}
+
+/// GtkSettings property-notify trampoline. The signal fires every
+/// time the `gtk-application-prefer-dark-theme` property changes;
+/// we re-read it and pass the resulting ColorScheme to the user
+/// handler. Signature matches `GCallback` (variadic at the C ABI;
+/// the GObject framework prepends the instance pointer and any
+/// signal-specific args, so we accept them by `?*anyopaque`).
+fn onColorSchemeChanged(_: ?*anyopaque, _: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return));
+    const cb = cx.on_color_scheme orelse return;
+    const settings = gtk_settings_get_default() orelse {
+        cb(cx.on_color_scheme_ctx, .unknown);
+        return;
+    };
+    var prefer_dark: gboolean = 0;
+    g_object_get(settings, "gtk-application-prefer-dark-theme", &prefer_dark, null);
+    cb(cx.on_color_scheme_ctx, if (prefer_dark != 0) .dark else .light);
 }
 
 fn pumpMainContextUntilDone(done: *const bool) void {

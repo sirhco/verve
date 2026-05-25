@@ -99,10 +99,17 @@ pub const ClipboardError = error{
 
 /// Current system color preference. Apps that style their UI to
 /// match the OS appearance should call `Window.colorScheme()` at
-/// startup and re-check on each window restore. Change-notifications
-/// are not yet wired — the value can drift if the user toggles the
-/// OS setting while the app is running.
+/// startup and either re-check on window restore or register a
+/// `ColorSchemeHandler` via `Window.setColorSchemeHandler` to be
+/// notified when the user toggles the OS setting at runtime.
 pub const ColorScheme = enum { light, dark, unknown };
+
+/// Callback fired when the OS color-scheme preference changes.
+/// `ctx` is the opaque pointer registered alongside the callback.
+/// Fires on the main / UI thread of the host platform — same thread
+/// that drives the event loop — so consumers can call any other
+/// `Window` method without crossing threads.
+pub const ColorSchemeHandler = *const fn (ctx: ?*anyopaque, scheme: ColorScheme) void;
 
 pub const SnapshotError = error{
     Unsupported,
