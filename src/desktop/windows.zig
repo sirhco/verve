@@ -259,6 +259,20 @@ const IDNO: c_int = 7;
 const WM_CLOSE: UINT = 0x0010;
 const WM_SETTINGCHANGE: UINT = 0x001A;
 const WM_COPYDATA: UINT = 0x004A;
+const WM_USER: UINT = 0x0400;
+/// Tray-icon callback message. Set as `NOTIFYICONDATAW.uCallbackMessage`
+/// by `tray.zig` so Shell32 routes mouse events on the tray icon back
+/// through this window's `wndProc`. Exposed pub so `tray.zig` can read
+/// the canonical value without redefining a parallel constant.
+pub const WM_VERVE_TRAY: UINT = WM_USER + 100;
+
+/// Optional forwarders registered by `tray.zig` once `Tray.init` runs
+/// on Windows. wndProc invokes them on `WM_VERVE_TRAY` and on
+/// `WM_COMMAND` IDs in the tray-reserved `0xC000` block. Left null in
+/// builds that never create a tray — the cost is one nullable load per
+/// matching message, which is noise next to `DefWindowProcW`.
+pub var tray_dispatch_command: ?*const fn (hwnd: ?*anyopaque, cmd_id: u16) bool = null;
+pub var tray_dispatch_message: ?*const fn (hwnd: ?*anyopaque, wparam: usize, lparam: isize) void = null;
 
 /// `COPYDATASTRUCT` from `<winuser.h>`. WM_COPYDATA carries a pointer
 /// to one of these in `lParam`. The receiver must not retain `lpData`
@@ -1124,10 +1138,22 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             // Quit posts WM_CLOSE rather than PostQuitMessage so the
             // standard close path runs — last-window-quit semantics
             // route through the registry count in WM_DESTROY below.
+            // Tray menu IDs (`0xC000` block) are forwarded into
+            // `tray.zig` via the optional dispatcher registered when a
+            // tray exists.
             const id: u16 = @truncate(wparam & 0xFFFF);
             if (id == ID_FILE_QUIT) {
                 _ = SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            } else if ((id & 0xF000) == 0xC000) {
+                if (tray_dispatch_command) |dispatch| _ = dispatch(@ptrCast(hwnd), id);
             }
+            return 0;
+        },
+        WM_VERVE_TRAY => {
+            // Shell32 fires this on tray-icon mouse events; the
+            // forwarder is installed by `tray.zig` on first `Tray.init`.
+            // No-op if no tray was created in this process.
+            if (tray_dispatch_message) |dispatch| dispatch(@ptrCast(hwnd), wparam, lparam);
             return 0;
         },
         WM_DESTROY => {

@@ -132,12 +132,24 @@ pub fn main(init: std.process.Init) !void {
     window.setMessageHandler(handlers.onMessage, ctx_ptr);
     window.setUrlOpenHandler(handlers.onUrlOpen, ctx_ptr);
 
-    // Optional tray icon. Best-effort: a runtime error (libayatana
-    // missing on Linux, status-bar unavailable in headless macOS, …)
-    // just logs + drops the tray; the rest of the app keeps running.
+    // Optional tray icon with a submenu. Best-effort: a runtime error
+    // (libayatana missing on Linux, status-bar unavailable in headless
+    // macOS, …) just logs + drops the tray; the rest of the app keeps
+    // running. Menu items surface via `handlers.onTrayItem` keyed on
+    // the per-item `id` (1 = focus window, 2 = fire native notify, 99
+    // = quit).
+    const tray_menu = [_]desktop.tray.TrayMenuItem{
+        .{ .label = "Show window", .id = 1 },
+        .{ .label = "Notify", .id = 2 },
+        .{ .label = null }, // separator
+        .{ .label = "Quit", .id = 99 },
+    };
     var tray_handle: ?desktop.tray.Tray = desktop.tray.init(allocator, &window, .{
         .label = "V",
         .tooltip = "Verve Desktop",
+        .menu = &tray_menu,
+        .on_menu_item = handlers.onTrayItem,
+        .on_menu_item_ctx = ctx_ptr,
     }) catch |err| blk: {
         std.log.warn("verve.desktop: tray init failed: {s}", .{@errorName(err)});
         break :blk null;

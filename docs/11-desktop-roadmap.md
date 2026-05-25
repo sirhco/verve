@@ -14,21 +14,93 @@ Fresh session? Do these four in order before writing code:
 3. **Pick one bundle** from the "Suggested next-session bundles"
    table. All P1 items (#16–#23) are closed; every P2 platform port
    (Win/Linux dialogs, alerts, snapshot) is in. The P3 items that
-   shipped 2026-05-24/25 are listed under "Out of P1 scope — shipped"
-   below. Remaining P3 backlog: GTK4 backend, drag-drop with native
-   paths, print API, hicolor / Linux icon-theme install,
+   shipped 2026-05-24/25/26 are listed under "Out of P1 scope —
+   shipped" below. Remaining P3 backlog: GTK4 backend, drag-drop with
+   native paths, print API, hicolor / Linux icon-theme install,
    accessibility (NSAccessibility / UIA / ATK), auto-updater
    (Sparkle / Squirrel), Win tray-balloon / Toast notifications
-   (macOS + Linux notifications already landed), tray click
-   handlers + submenus on all 3 platforms.
+   (macOS + Linux notifications already landed). Tray click handlers
+   + submenus on all 3 platforms shipped 2026-05-26.
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
 
 Authoritative state of the desktop scaffold subsystem and the remaining
 work needed to call it "fully functional." Written 2026-05-22, last
-updated 2026-05-25. Fresh sessions should be able to pick up without
+updated 2026-05-26. Fresh sessions should be able to pick up without
 prior context.
+
+## Done in the 2026-05-26 session
+
+One P3 bundle shipped to `ui-ki`: tray click handlers + submenus on
+all three platforms. Builds directly on the 2026-05-25 tray work
+(commit `68af576`).
+
+- [x] **Tray click handlers + submenus** (all 3 backends). Cross-
+  platform additions to `src/desktop/tray.zig`:
+  - New `TrayMenuItem { label, id, enabled, children }` value type
+    (null label = separator; non-empty `children` = submenu parent).
+  - `TrayOptions` grew `menu`, `on_click` + `on_click_ctx`,
+    `on_menu_item` + `on_menu_item_ctx`. ABI matches
+    `MessageHandler` / `UrlOpenHandler` / `ColorSchemeHandler` —
+    `fn(ctx: ?*anyopaque, ...) void`.
+  - New methods on `Tray`: `setMenu(items)` (deep-copies),
+    `setClickHandler`, `setMenuItemHandler`.
+  - `Tray.impl` heap-allocates per-platform impl so the singleton
+    pointers used by Cocoa target/action and the Win wndProc
+    forwarder see a stable address after `init` returns by value.
+  - **macOS**: NSMenu built via `objc_msgSend`; menu items target
+    a process-wide `VerveTrayTarget` NSObject (registered lazily
+    via `objc_allocateClassPair`) with `verveTrayItem:` /
+    `verveTrayClick:` selectors. Each `NSMenuItem.setTag:` carries
+    the user-defined id; the trampoline reads `[sender tag]` and
+    dispatches to the singleton tray's `on_menu_item`. Cocoa
+    attaches the menu via `setMenu:` and shows it on any click of
+    the status item — `on_click` only fires when no menu is set.
+  - **Windows**: `NOTIFYICONDATAW.uCallbackMessage =
+    WM_VERVE_TRAY` (= `WM_USER + 100`, declared pub in
+    `windows.zig` so `tray.zig` references one canonical value).
+    `windows.zig` wndProc gained two cases: `WM_VERVE_TRAY`
+    forwards mouse events to `tray_dispatch_message`, and
+    `WM_COMMAND` checks for the tray's `0xC000` ID block before
+    falling through. `tray.zig` registers both dispatchers on
+    first `Tray.init`. Menu items use IDs `0xC000 | (user_id &
+    0x0FFF)` — collisions with the default `0x8000` File/Edit
+    range are impossible. Right-click + WM_CONTEXTMENU show the
+    menu via `TrackPopupMenu` (with the MSDN-mandated
+    `SetForegroundWindow` + `PostMessage(WM_NULL)` dance); left
+    click fires `on_click` or shows the menu as a fallback.
+  - **Linux**: GtkMenu built from items via
+    `gtk_menu_item_new_with_label` + `gtk_menu_shell_append`.
+    Submenus via `gtk_menu_item_set_submenu`; separators via
+    `gtk_separator_menu_item_new`; disabled rows via
+    `gtk_widget_set_sensitive(item, 0)`. Each leaf gets a
+    `g_signal_connect_data("activate", trampoline, ItemBox)`
+    where `ItemBox = { *LinuxTray, id }` lives on the tray's
+    allocator and is freed in `deinit`. AppIndicator doesn't
+    expose icon-click signals, so `on_click` is a no-op on Linux
+    when a menu is set (the indicator only shows the menu).
+  - Template demo: `templates/desktop/src/main.zig` now passes a
+    4-item menu (Show window, Notify, separator, Quit) with id
+    routing in the new `handlers.onTrayItem`. Components grew a
+    "Tray menu" card explaining the click behavior. Golden
+    checksum bumped from `284` → `605`.
+  - **v1 single-tray-per-process assumption** documented in
+    module header. Multi-tray would need per-target ivars on
+    macOS + HWND-keyed registry on Windows instead of the current
+    `g_macos_tray` / `g_windows_tray` singletons — deferred until
+    a use case shows up.
+
+### Verification
+
+- Framework `zig build` + `zig build test` PASS.
+- 3-backend cross-compile (`aarch64-macos`, `x86_64-linux-gnu`,
+  `x86_64-windows-gnu`) clean for `window.zig`, `tray.zig`, and
+  `windows.zig`.
+- macOS scaffold live boot: app boots, tray icon appears in the
+  menu bar, no log warnings. Smoke harness PASS (`checksum=605`).
+- Live Win/Linux validation deferred — no hosts. Same convention
+  as cookies / clipboard / color-scheme / menus / tray init.
 
 ## Done in the 2026-05-25 session
 
@@ -141,7 +213,6 @@ cookies / clipboard / color-scheme / menus on those backends.
 - GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
 - Drag-drop with native paths, print API
 - Hicolor / Linux app-icon theme installation
-- Deep-link tray click handlers + submenus on all 3 platforms
 - Win Toast notifications (`Windows.UI.Notifications.ToastNotificationManager`)
 - Accessibility (NSAccessibility / UIA / ATK)
 - Auto-updater (Sparkle / Squirrel / AppImage update)
@@ -489,9 +560,9 @@ now a Level-3 golden-diff harness:
 ### Out of P1 scope (P3 — open)
 
 - GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
-- Tray icons + system notifications
 - Drag-drop with native paths, print API
 - Hicolor / Linux app icon theme installation
+- Win Toast notifications
 - Accessibility (NSAccessibility / UIA / ATK)
 - Auto-updater (Sparkle / Squirrel)
 
@@ -563,19 +634,46 @@ now a Level-3 golden-diff harness:
   validated live; Win/Linux compile-clean cross-compile (live
   validation deferred).
 
+### Out of P1 scope — shipped 2026-05-26
+
+- Tray click handlers + submenus — `TrayMenuItem { label, id,
+  enabled, children }` + `TrayOptions.menu` + `on_click` +
+  `on_menu_item` on all three backends. `Tray.impl` is now heap-
+  allocated so callback singletons see a stable address after the
+  by-value `init` return. macOS dispatches via a process-wide
+  `VerveTrayTarget` NSObject with `verveTrayItem:` /
+  `verveTrayClick:` selectors and per-item `setTag:`. Windows
+  registers `NOTIFYICONDATAW.uCallbackMessage = WM_VERVE_TRAY`
+  (= `WM_USER + 100`, declared pub in `windows.zig`); wndProc
+  forwards via `tray_dispatch_message` (mouse events) +
+  `tray_dispatch_command` (`WM_COMMAND` in the `0xC000` ID
+  block). Right-click / WM_CONTEXTMENU shows the menu via
+  `TrackPopupMenu` with the MSDN-required `SetForegroundWindow` +
+  `PostMessage(WM_NULL)` dance. Linux builds a GtkMenu via
+  `gtk_menu_item_new_with_label` + `gtk_menu_shell_append`;
+  submenus via `gtk_menu_item_set_submenu`; per-item
+  `g_signal_connect_data("activate")` trampoline with an
+  allocator-owned `ItemBox { *LinuxTray, id }` as user_data.
+  Single-tray-per-process v1 assumption documented (singletons
+  unguarded). macOS validated live; Win/Linux compile-clean
+  cross-compile (live validation deferred). Template demo
+  ships a 4-item tray menu (Show window / Notify / Quit) routed
+  through `handlers.onTrayItem`.
+
 ## Suggested next-session bundles
 
 All P1 + every P2 platform port closed. The high-value P3 items
-landed across 2026-05-24/25: clipboard, single-instance, color
+landed across 2026-05-24/25/26: clipboard, single-instance, color
 scheme + change events, app icons, native menu bars (all 3),
 deep-link URL handlers (warm + cold, all 3), tray icons (all 3),
-notifications (macOS + Linux). Remaining work is the lower-
-frequency P3 surface:
+notifications (macOS + Linux), tray click handlers + submenus (all
+3). Remaining work is the lower-frequency P3 surface:
 
 | Bundle | Items | Best for |
 |---|---|---|
 | **P3 GTK4** | GTK4 + WebKitGTK 6.0 behind `-Dgtk4` | Future-proofing once Ubuntu LTS / Fedora ship GTK4 webkit by default. New backend module; existing GTK3 path stays. |
 | **P3 drag-drop / print** | `NSDraggingDestination` / `IDropTarget` / GTK drag signals; `NSPrintOperation` / `PrintDlgExW` / `gtk_print_operation_run` | Drag-drop with native file paths (browser DataTransfer doesn't expose them). |
+| **P3 Win Toast** | `Windows.UI.Notifications.ToastNotificationManager` via COM + AUMID + Start-menu shortcut | Closes the Windows side of the notifications API. |
 | **P3 a11y** | NSAccessibility / UIA / ATK | Window-chrome + menu accessibility — web content already inherits from WebView. |
 | **P3 auto-updater** | Sparkle on macOS / Squirrel or MSIX on Windows / AppImage update on Linux | Multi-platform signing + delta channels. |
 
@@ -655,5 +753,10 @@ ls zig-out/app.app/Contents/{Info.plist,MacOS/app}   # both should exist
   prompt + a bundled app (LSUIElement / NSPrincipalClass).
   Deferred.
 - Windows tray uses the stock `IDI_APPLICATION` icon. Custom icons
-  need a `setIcon` API on `desktop.tray` — deferred to the same
-  follow-up that adds tray click handlers + submenus.
+  need a `setIcon` API on `desktop.tray` — deferred. (Tray click
+  handlers + submenus shipped 2026-05-26; custom tray icons are a
+  separate follow-up.)
+- Tray click handlers + submenus shipped 2026-05-26. v1 assumes a
+  single tray per process — multi-tray would need per-target ivars
+  on macOS + the Windows registry keyed beyond HWND. No use case
+  yet.

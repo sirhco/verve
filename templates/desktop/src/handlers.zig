@@ -32,6 +32,34 @@ const Router = desktop.Router(RouterCtx, Routes);
 
 pub const onMessage = Router.dispatch;
 
+/// Tray-menu item click. Ids match the menu spec wired in `main.zig`
+/// (1 = focus window, 2 = fire the same `notify` route as the IPC
+/// button, 99 = quit). Unknown ids log + ignore.
+pub fn onTrayItem(c: ?*anyopaque, item_id: u32) void {
+    const r: *RouterCtx = @ptrCast(@alignCast(c orelse return));
+    switch (item_id) {
+        1 => {
+            std.log.info("[tray] show window", .{});
+            // Surfacing focus on the existing window is a backend
+            // concern — for the demo, an evalJs ping is enough to
+            // visualize the click on the page.
+            r.window.evalJs("document.getElementById('log') && (document.getElementById('log').textContent = 'tray: show window\\n' + document.getElementById('log').textContent);");
+        },
+        2 => {
+            std.log.info("[tray] notify", .{});
+            desktop.notifications.show(std.heap.page_allocator, .{
+                .title = "Verve Desktop",
+                .body = "Notification from the tray menu.",
+            }) catch {};
+        },
+        99 => {
+            std.log.info("[tray] quit", .{});
+            r.window.terminate();
+        },
+        else => std.log.warn("[tray] unknown id {d}", .{item_id}),
+    }
+}
+
 /// Deep-link URL handler. Logs the incoming URL and evalJs's it into
 /// the page so the demo UI shows the value. macOS uses
 /// `NSAppleEventManager` to deliver both warm-launch and cold-launch

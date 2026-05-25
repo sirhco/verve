@@ -80,6 +80,10 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
                 ctx.pre().id("deep-link-url").text("(no URL received yet)"),
             }),
             ctx.section().class("card").children(.{
+                ctx.h2("Tray menu"),
+                ctx.p().text("Click the status-bar icon (right-click on Windows) for Show window, Notify, and Quit. Item clicks dispatch to handlers.onTrayItem in native code."),
+            }),
+            ctx.section().class("card").children(.{
                 ctx.h2("Log"),
                 ctx.pre().id("log").text("bridge ready"),
             }),
