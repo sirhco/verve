@@ -71,6 +71,13 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `atk_object_set_name` on the window's AtkObject. Windows: routes
   through `setTitle` since Win32 has no separate a11y-label
   channel without a custom UIA provider.
+- Auto-updater check — new `desktop.updates` module:
+  `checkForUpdate(allocator, feed_url, current_version) Error!?UpdateInfo`.
+  Pure stdlib (`std.http.Client` + `std.json`); identical on all 3
+  platforms; no native frameworks linked. Returns `null` when the
+  caller is already up to date. Applying the update (download,
+  signature verify, swap binary, restart) stays out of scope —
+  Sparkle / Squirrel / AppImageUpdate handle that per platform.
 
 ### Tray click handlers + submenus
 
@@ -758,7 +765,11 @@ now a Level-3 golden-diff harness:
   remain future polish. Web content + default menu items already
   publish their own labels through the WebView engines + native
   menu APIs.
-- Auto-updater (Sparkle / Squirrel)
+- Auto-updater apply phase — `desktop.updates.checkForUpdate`
+  shipped 2026-05-26. Actually downloading + verifying signatures +
+  swapping the running executable remains per-platform polish
+  (Sparkle on macOS, Squirrel or MSIX on Windows, AppImageUpdate
+  on Linux).
 
 ### Out of P1 scope — shipped 2026-05-24
 
