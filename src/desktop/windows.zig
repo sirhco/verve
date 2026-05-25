@@ -139,6 +139,14 @@ extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL
 extern "user32" fn GetSystemMetrics(idx: c_int) callconv(.winapi) c_int;
 extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn GetDpiForWindow(hwnd: HWND) callconv(.winapi) c_uint;
+const FLASHWINFO = extern struct {
+    cbSize: u32 = 0,
+    hwnd: HWND = null,
+    dwFlags: u32 = 0,
+    uCount: u32 = 0,
+    dwTimeout: u32 = 0,
+};
+extern "user32" fn FlashWindowEx(info: *FLASHWINFO) callconv(.winapi) BOOL;
 
 // ---- Menu + accelerator externs ---------------------------------------------
 //
@@ -1142,6 +1150,21 @@ pub const Window = struct {
     pub fn scaleFactor(self: *Window) f32 {
         const dpi = GetDpiForWindow(self.ctx.hwnd);
         return @as(f32, @floatFromInt(dpi)) / 96.0;
+    }
+
+    /// Flash the taskbar entry. `critical = true` → flash until
+    /// the user clicks (FLASHW_TIMERNOFG). `false` → flash a
+    /// fixed count then stop.
+    pub fn requestAttention(self: *Window, critical: bool) void {
+        const FLASHW_ALL: u32 = 0x3;
+        const FLASHW_TIMERNOFG: u32 = 0xC;
+        var fwi: FLASHWINFO = .{};
+        fwi.cbSize = @sizeOf(FLASHWINFO);
+        fwi.hwnd = self.ctx.hwnd;
+        fwi.dwFlags = if (critical) FLASHW_ALL | FLASHW_TIMERNOFG else FLASHW_ALL;
+        fwi.uCount = if (critical) 0 else 5;
+        fwi.dwTimeout = 0;
+        _ = FlashWindowEx(&fwi);
     }
 
     pub fn setResizable(self: *Window, on: bool) void {

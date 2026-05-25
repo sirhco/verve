@@ -99,6 +99,12 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   the OS audible alert (NSBeep / MessageBeep / stdout BEL).
   `desktop.system.processId()` returns the current PID for log
   correlation / IPC keying. Pure stdlib + per-platform externs.
+- Window attention request — `Window.requestAttention(critical)`
+  pulses dock icon / flashes taskbar / sets WM urgency hint.
+  macOS: `[NSApp requestUserAttention:NSCriticalRequest|NSInformationalRequest]`.
+  Windows: `FlashWindowEx(FLASHW_ALL | FLASHW_TIMERNOFG)` for
+  critical (flash until user clicks), `FLASHW_ALL` with count=5
+  for informational. Linux: `gtk_window_set_urgency_hint(true)`.
 - Window scale factor — `Window.scaleFactor()` returns the
   HiDPI multiplier of the window's current screen. macOS:
   `[window backingScaleFactor]` (tracks the monitor the window

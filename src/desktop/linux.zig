@@ -411,6 +411,7 @@ extern fn webkit_web_view_get_title(wv: *WebKitWebView) ?[*:0]const u8;
 extern fn webkit_web_view_set_zoom_level(wv: *WebKitWebView, level: f64) void;
 extern fn webkit_web_view_get_zoom_level(wv: *WebKitWebView) f64;
 extern fn gtk_widget_get_scale_factor(w: *GtkWidget) c_int;
+extern fn gtk_window_set_urgency_hint(w: *GtkWindow, on: gboolean) void;
 extern fn webkit_web_view_run_javascript(
     wv: *WebKitWebView,
     script: [*:0]const u8,
@@ -1008,6 +1009,17 @@ pub const Window = struct {
     pub fn scaleFactor(self: *Window) f32 {
         const w = self.ctx.window orelse return 1.0;
         return @floatFromInt(gtk_widget_get_scale_factor(w));
+    }
+
+    /// Set the WM urgency hint. Compositors that honor it (most
+    /// freedesktop ones) animate the taskbar entry. `critical` has
+    /// no separate state on GTK — both critical and informational
+    /// map to `urgency_hint(TRUE)`; the WM decides how loud to
+    /// surface it.
+    pub fn requestAttention(self: *Window, critical: bool) void {
+        _ = critical;
+        const w = self.ctx.window orelse return;
+        gtk_window_set_urgency_hint(@ptrCast(w), 1);
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {

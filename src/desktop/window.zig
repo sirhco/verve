@@ -118,6 +118,7 @@ comptime {
         "setZoom",
         "getZoom",
         "scaleFactor",
+        "requestAttention",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

@@ -699,6 +699,17 @@ pub const Window = struct {
         return @floatCast(sel(self.window, m.sel("backingScaleFactor")));
     }
 
+    /// Pulse the Dock icon to request user attention.
+    /// `critical = true` → `NSCriticalRequest` (bounces until the
+    /// user activates the app). `false` → `NSInformationalRequest`
+    /// (bounces once). No-op when the app is already foreground.
+    pub fn requestAttention(self: *Window, critical: bool) void {
+        const NSCriticalRequest: isize = 0;
+        const NSInformationalRequest: isize = 10;
+        const sel = m.cast(*const fn (id, SEL, isize) callconv(.c) isize);
+        _ = sel(self.app, m.sel("requestUserAttention:"), if (critical) NSCriticalRequest else NSInformationalRequest);
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;
