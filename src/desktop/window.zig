@@ -23,6 +23,7 @@ pub const notifications = @import("notifications.zig");
 pub const updates = @import("updates.zig");
 pub const displays = @import("displays.zig");
 pub const shell = @import("shell.zig");
+pub const paths = @import("paths.zig");
 
 pub const Router = ipc_router.Router;
 

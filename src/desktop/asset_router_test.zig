@@ -18,6 +18,7 @@ comptime {
     _ = @import("updates.zig");
     _ = @import("displays.zig");
     _ = @import("shell.zig");
+    _ = @import("paths.zig");
 }
 
 const entries = [_]options.AssetEntry{

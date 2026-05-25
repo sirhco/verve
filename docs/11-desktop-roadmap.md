@@ -85,6 +85,16 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Standard directories — new `desktop.paths` module:
+  `dataDir` / `cacheDir` / `configDir` / `homeDir` / `tempDir`.
+  Takes `std.process.Environ` (typically `init.minimal.environ`)
+  + allocator + app name; returns owned UTF-8 absolute path.
+  macOS: `~/Library/Application Support/<app>` +
+  `~/Library/Caches/<app>`. Windows: `%APPDATA%\<app>` +
+  `%LOCALAPPDATA%\<app>`. Linux: XDG ($XDG_DATA_HOME /
+  $XDG_CACHE_HOME / $XDG_CONFIG_HOME) with `$HOME/.local/share`
+  / `$HOME/.cache` / `$HOME/.config` fallbacks. Pure stdlib, no
+  native APIs.
 - Page title auto-sync — the IPC shim_js polls `document.title`
   every 500ms and posts a `__verve_title:<title>` marker via the
   native bridge whenever it changes. Each backend's script-message
