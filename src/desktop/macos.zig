@@ -54,6 +54,15 @@ var registry: std.AutoHashMapUnmanaged(*anyopaque, *WindowCtx) = .{};
 // re-installing the delegate or clobbering the menu bar.
 var app_initialized: bool = false;
 
+// The Objective-C runtime rejects a second `objc_allocateClassPair`
+// with the same name in the same process, so the per-window dynamic
+// classes (`VerveSchemeHandler`, `VerveMessageHandler`) are registered
+// at the first Window.init and reused for every subsequent window.
+// Without this, `openChildWindow` crashes with
+// "objc_allocateClassPair failed".
+var scheme_class_cached: ?m.Class = null;
+var message_class_cached: ?m.Class = null;
+
 fn registerCtx(webview: id, ctx_ptr: *WindowCtx) !void {
     try registry.put(std.heap.page_allocator, @ptrCast(webview), ctx_ptr);
 }
@@ -104,20 +113,31 @@ pub const Window = struct {
         const center = m.cast(*const fn (id, SEL) callconv(.c) void);
         center(window, m.sel("center"));
 
-        // Register dynamic classes for the custom-scheme handler and
-        // the script-message handler. Both subclass NSObject. Methods
-        // are added before `objc_registerClassPair`.
+        // Register (or reuse) the dynamic classes for the custom-
+        // scheme handler and the script-message handler. Both subclass
+        // NSObject. The Objective-C runtime won't accept a second
+        // `objc_allocateClassPair` with the same name, so cache after
+        // the first window and hand the existing class to every
+        // subsequent `openChildWindow` call.
         const NSObject = m.getClass("NSObject");
-        const scheme_class = m.allocateClass(NSObject, "VerveSchemeHandler");
-        m.addMethod(scheme_class, m.sel("webView:startURLSchemeTask:"), @ptrCast(&schemeStartTrampoline), "v@:@@");
-        m.addMethod(scheme_class, m.sel("webView:stopURLSchemeTask:"), @ptrCast(&schemeStopTrampoline), "v@:@@");
-        m.addProtocol(scheme_class, "WKURLSchemeHandler");
-        m.registerClass(scheme_class);
+        const scheme_class = scheme_class_cached orelse blk: {
+            const c = m.allocateClass(NSObject, "VerveSchemeHandler");
+            m.addMethod(c, m.sel("webView:startURLSchemeTask:"), @ptrCast(&schemeStartTrampoline), "v@:@@");
+            m.addMethod(c, m.sel("webView:stopURLSchemeTask:"), @ptrCast(&schemeStopTrampoline), "v@:@@");
+            m.addProtocol(c, "WKURLSchemeHandler");
+            m.registerClass(c);
+            scheme_class_cached = c;
+            break :blk c;
+        };
 
-        const message_class = m.allocateClass(NSObject, "VerveMessageHandler");
-        m.addMethod(message_class, m.sel("userContentController:didReceiveScriptMessage:"), @ptrCast(&didReceiveTrampoline), "v@:@@");
-        m.addProtocol(message_class, "WKScriptMessageHandler");
-        m.registerClass(message_class);
+        const message_class = message_class_cached orelse blk: {
+            const c = m.allocateClass(NSObject, "VerveMessageHandler");
+            m.addMethod(c, m.sel("userContentController:didReceiveScriptMessage:"), @ptrCast(&didReceiveTrampoline), "v@:@@");
+            m.addProtocol(c, "WKScriptMessageHandler");
+            m.registerClass(c);
+            message_class_cached = c;
+            break :blk c;
+        };
 
         if (!app_initialized) {
             // NSApplicationDelegate. Without one, closing the last window
