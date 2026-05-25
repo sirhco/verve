@@ -6,6 +6,30 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Desktop native menu bars on Windows + Linux (2026-05-25)
+
+- **Default menu bar on every backend.** `install_default_menu = true`
+  (the existing flag, previously honored only on macOS) now stamps a
+  File + Edit bar on Windows and Linux for parity with the macOS
+  App + Edit + Window default. Only File→Quit (Ctrl+Q) binds a real
+  OS accelerator; Edit items render the shortcut hint in the label
+  but do not attach an accelerator, because WebView2 and WebKitGTK
+  handle Ctrl+C/V/X/Z/Y/A natively inside text inputs and a real
+  OS-level binding would consume the key event before the webview
+  saw it.
+- **Win32 wiring.** `CreateMenu` + `CreatePopupMenu` + `AppendMenuW`
+  + `SetMenu`; one-entry `HACCEL` driven through
+  `TranslateAcceleratorW` in the main `GetMessageW` loop. Quit posts
+  `WM_CLOSE` so multi-window last-window-quit semantics keep firing
+  through the existing HWND registry. Accelerator table freed in
+  `WM_DESTROY`.
+- **GTK wiring.** `GtkBox(GTK_ORIENTATION_VERTICAL)` wrap stacks
+  `gtk_menu_bar_new` above the webview; `gtk_accel_group_new` carries
+  Ctrl+Q; Quit routes through `gtk_widget_destroy(window)` so the
+  `live_windows` counter triggers `gtk_main_quit` only on the last
+  close. Layout switch is conditional on the flag — opt-out apps keep
+  the unchanged `gtk_container_add(window, webview)` tree.
+
 ### Added — Desktop framework polish (2026-05-24)
 
 - **`--dev <dir>` runtime asset fallback.** Desktop scheme handler

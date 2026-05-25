@@ -124,6 +124,45 @@ extern "user32" fn PostQuitMessage(code: c_int) callconv(.winapi) void;
 extern "user32" fn SendMessageW(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) callconv(.winapi) LRESULT;
 extern "user32" fn MessageBoxW(hwnd: HWND, text: LPCWSTR, caption: LPCWSTR, ty: UINT) callconv(.winapi) c_int;
 
+// ---- Menu + accelerator externs ---------------------------------------------
+//
+// Default menu bar (File + Edit) for parity with the macOS App + Edit
+// menu. Only File→Quit has a real handler; Edit items are decorative
+// (label hints) — WebView2 handles Ctrl+C/V/X/Z/Y/A natively when it
+// has focus, and `WM_COPY`-style messages don't reach the OOP HTML
+// input on the parent HWND.
+const HACCEL = ?*opaque {};
+const ACCEL = extern struct { fVirt: u8, key: u16, cmd: u16 };
+
+const MF_STRING: UINT = 0x0000;
+const MF_POPUP: UINT = 0x0010;
+const MF_SEPARATOR: UINT = 0x0800;
+const WM_COMMAND: UINT = 0x0111;
+const FVIRTKEY: u8 = 0x01;
+const FCONTROL: u8 = 0x08;
+
+extern "user32" fn CreateMenu() callconv(.winapi) HMENU;
+extern "user32" fn CreatePopupMenu() callconv(.winapi) HMENU;
+extern "user32" fn AppendMenuW(menu: HMENU, flags: UINT, id: usize, name: LPCWSTR) callconv(.winapi) BOOL;
+extern "user32" fn SetMenu(hwnd: HWND, menu: HMENU) callconv(.winapi) BOOL;
+extern "user32" fn DestroyMenu(menu: HMENU) callconv(.winapi) BOOL;
+extern "user32" fn CreateAcceleratorTableW(accel: [*]const ACCEL, count: c_int) callconv(.winapi) HACCEL;
+extern "user32" fn TranslateAcceleratorW(hwnd: HWND, accel: HACCEL, msg: *MSG) callconv(.winapi) c_int;
+extern "user32" fn DestroyAcceleratorTable(accel: HACCEL) callconv(.winapi) BOOL;
+
+// Command IDs for the default menu. 0x8000+ is the private app range
+// (0x0000–0x7FFF is reserved by Microsoft for predefined commands).
+// Edit IDs exist so `AppendMenuW` has a valid `id` parameter and so
+// future hooks can intercept them; the accelerator table omits them
+// because the WebView2 OOP host handles those keystrokes itself.
+const ID_FILE_QUIT: u16 = 0x8001;
+const ID_EDIT_UNDO: u16 = 0x8010;
+const ID_EDIT_REDO: u16 = 0x8011;
+const ID_EDIT_CUT: u16 = 0x8013;
+const ID_EDIT_COPY: u16 = 0x8014;
+const ID_EDIT_PASTE: u16 = 0x8015;
+const ID_EDIT_SELECT_ALL: u16 = 0x8016;
+
 // ---- Clipboard externs ------------------------------------------------------
 extern "user32" fn OpenClipboard(hwnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
@@ -498,6 +537,8 @@ const WindowCtx = struct {
     on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
     on_color_scheme_ctx: ?*anyopaque = null,
     hwnd: HWND = null,
+    menu: HMENU = null,
+    accel: HACCEL = null,
     controller: ?*Ctrl = null,
     webview: ?*Wv2 = null,
     environment: ?*Env = null,
@@ -574,6 +615,10 @@ pub const Window = struct {
         heap.hwnd = hwnd;
         try registerCtx(hwnd, heap);
         errdefer unregisterCtx(hwnd);
+
+        if (opts.install_default_menu) {
+            installDefaultMenuBar(heap);
+        }
 
         _ = ShowWindow(hwnd, SW_SHOW);
         _ = UpdateWindow(hwnd);
@@ -675,6 +720,19 @@ pub const Window = struct {
         _ = self;
         var msg: MSG = undefined;
         while (GetMessageW(&msg, null, 0, 0) > 0) {
+            // Route the keystroke through the per-window accelerator
+            // table first. `TranslateAcceleratorW` returns non-zero
+            // when the message was consumed (becomes a `WM_COMMAND`)
+            // — fall through to dispatch only otherwise. `msg.hwnd`
+            // is the foreground HWND for keyboard messages, so the
+            // simple lookup is the correct match. Dialog / modal HWNDs
+            // have no ctx entry so `accel` stays null and the early-
+            // out matches the pre-menu behavior.
+            const accel: HACCEL = if (msg.hwnd) |h| blk: {
+                const cx = lookupCtx(h) orelse break :blk null;
+                break :blk cx.accel;
+            } else null;
+            if (accel != null and TranslateAcceleratorW(msg.hwnd, accel, &msg) != 0) continue;
             _ = TranslateMessage(&msg);
             _ = DispatchMessageW(&msg);
         }
@@ -994,17 +1052,91 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             }
             return 0;
         },
+        WM_COMMAND => {
+            // Default menu commands. Only File→Quit fires real work;
+            // Edit items intentionally fall through to no-op so the
+            // OOP WebView2 host keeps handling Ctrl+C/V/X/Z/Y/A itself.
+            // Quit posts WM_CLOSE rather than PostQuitMessage so the
+            // standard close path runs — last-window-quit semantics
+            // route through the registry count in WM_DESTROY below.
+            const id: u16 = @truncate(wparam & 0xFFFF);
+            if (id == ID_FILE_QUIT) {
+                _ = SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            return 0;
+        },
         WM_DESTROY => {
             // Multi-window quit: unregister this HWND, only post
             // WM_QUIT when the last live window destroys. Win32 has
             // no equivalent of NSApp's automatic last-window tracking
             // so the registry size IS the live-window count.
+            if (lookupCtx(hwnd)) |cx| if (cx.accel) |a| {
+                _ = DestroyAcceleratorTable(a);
+                cx.accel = null;
+            };
             unregisterCtx(hwnd);
             if (registry.count() == 0) PostQuitMessage(0);
             return 0;
         },
         else => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// Build + install the default File + Edit menu bar for `ctx.hwnd`.
+/// Stores the HMENU and HACCEL on the ctx so `WM_DESTROY` can free
+/// the accelerator table (the HMENU is freed transitively when the
+/// window is destroyed). Failures are non-fatal — the window opens
+/// menu-less and logs at debug level.
+fn installDefaultMenuBar(ctx: *WindowCtx) void {
+    const bar = CreateMenu() orelse {
+        std.log.debug("verve.desktop[windows]: CreateMenu failed", .{});
+        return;
+    };
+    const file_menu = CreatePopupMenu() orelse {
+        _ = DestroyMenu(bar);
+        return;
+    };
+    const edit_menu = CreatePopupMenu() orelse {
+        _ = DestroyMenu(file_menu);
+        _ = DestroyMenu(bar);
+        return;
+    };
+
+    // `\t` in the menu label tells Win32 to right-align the rest of
+    // the text as the shortcut hint, matching the standard look.
+    _ = AppendMenuW(file_menu, MF_STRING, ID_FILE_QUIT, wstr("&Quit\tCtrl+Q"));
+    _ = AppendMenuW(bar, MF_POPUP, @intCast(@intFromPtr(file_menu)), wstr("&File"));
+
+    _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_UNDO, wstr("&Undo\tCtrl+Z"));
+    _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_REDO, wstr("&Redo\tCtrl+Y"));
+    _ = AppendMenuW(edit_menu, MF_SEPARATOR, 0, null);
+    _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_CUT, wstr("Cu&t\tCtrl+X"));
+    _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_COPY, wstr("&Copy\tCtrl+C"));
+    _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_PASTE, wstr("&Paste\tCtrl+V"));
+    _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_SELECT_ALL, wstr("Select &All\tCtrl+A"));
+    _ = AppendMenuW(bar, MF_POPUP, @intCast(@intFromPtr(edit_menu)), wstr("&Edit"));
+
+    if (SetMenu(ctx.hwnd, bar) == 0) {
+        _ = DestroyMenu(bar);
+        return;
+    }
+    ctx.menu = bar;
+
+    // Only Quit gets an accelerator-table entry. Edit shortcuts are
+    // intentionally absent so the WebView2 OOP host keeps owning
+    // them — adding an accel-table entry would route the key through
+    // `WM_COMMAND` first and break clipboard inside HTML inputs.
+    const accels = [_]ACCEL{
+        .{ .fVirt = FVIRTKEY | FCONTROL, .key = 'Q', .cmd = ID_FILE_QUIT },
+    };
+    ctx.accel = CreateAcceleratorTableW(&accels, accels.len);
+}
+
+/// Compile-time UTF-16 literal helper for menu labels. Wraps
+/// `std.unicode.utf8ToUtf16LeStringLiteral` so the call sites stay
+/// short and the cast to `LPCWSTR` is implicit.
+fn wstr(comptime s: []const u8) LPCWSTR {
+    return std.unicode.utf8ToUtf16LeStringLiteral(s);
 }
 
 /// Module-level color-scheme reader used by both `Window.colorScheme`

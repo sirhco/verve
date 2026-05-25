@@ -184,7 +184,7 @@ const window = try desktop.Window.init(allocator, .{
     .assets         = asset_entries,              // default &.{}
     .on_message     = null,                       // default null
     .on_message_ctx = null,                       // default null
-    .install_default_menu = true,                 // macOS only; default true
+    .install_default_menu = true,                 // all 3 platforms; default true
 });
 ```
 
@@ -307,10 +307,12 @@ const clicked_idx = window.showAlert(.{
 
 `buttons` empty defaults to `["OK"]`. Win/Linux return 0.
 
-## Native menu bar (macOS)
+## Native menu bar
 
-The default `install_default_menu = true` builds three menus on first
-window:
+The default `install_default_menu = true` stamps a menu bar on every
+platform:
+
+**macOS** — three menus on first window:
 
 - **App menu** — Quit (Cmd+Q)
 - **Edit menu** — Undo / Redo / Cut / Copy / Paste / Select All. The
@@ -318,9 +320,20 @@ window:
   fire; without it, Cmd+C / Cmd+V in a text input does nothing.
 - **Window menu** — Minimize / Close
 
-Set `.install_default_menu = false` if you build menus from scratch.
-Win/Linux currently ignore the field (custom menu bars on those
-platforms are a follow-up).
+**Windows + Linux** — File + Edit:
+
+- **File menu** — Quit (Ctrl+Q). Routes through `WM_CLOSE` (Win) or
+  `gtk_widget_destroy` (Linux) so multi-window last-window-quit
+  semantics keep working.
+- **Edit menu** — Undo / Redo / Cut / Copy / Paste / Select All.
+  Items render their shortcut hint in the label but the embedded
+  webview (WebView2 / WebKitGTK) keeps owning the actual
+  Ctrl+C/V/X/Z/Y/A keystrokes. Binding an OS-level accelerator for
+  those keys would consume the event before the webview saw it and
+  silently break clipboard inside HTML inputs.
+
+Set `.install_default_menu = false` to suppress the bar entirely
+(apps building their own).
 
 ## Window snapshot (macOS)
 
@@ -491,7 +504,7 @@ Overrides:
 | Color scheme (light/dark) | ✓ | ✓ | ✓ |
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
-| Native menu bar | ✓ | — | — |
+| Native menu bar | ✓ | ✓ | ✓ |
 | Window snapshot (PNG) | ✓ | ✓ | ✓ |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |

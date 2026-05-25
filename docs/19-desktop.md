@@ -122,9 +122,16 @@ reference. Headline list:
   → MB_OK / MB_YESNO / MB_YESNOCANCEL) but not arbitrary labels;
   directory-picking via `pick_directory` is macOS + Linux only on this
   surface (Win32 splits dir-picking into `IFileOpenDialog` — port TBD).
-- **Native menu bar (macOS)** — App + Edit + Window menus stamped by
-  default (`install_default_menu = true`); Edit menu is what makes
-  Cmd+C / Cmd+V actually fire inside WKWebView text inputs
+- **Native menu bar** — `install_default_menu = true` (the default)
+  stamps a default menu bar on all three platforms. macOS gets App +
+  Edit + Window menus; the Edit menu is what makes Cmd+C / Cmd+V
+  actually fire inside WKWebView text inputs. Windows and Linux get
+  File (Quit) + Edit (Undo/Redo/Cut/Copy/Paste/Select All); only
+  Quit binds a real shortcut (Ctrl+Q). The Edit items render their
+  shortcut hint in the label but do **not** attach an OS accelerator
+  — WebView2 and WebKitGTK handle Ctrl+C/V/X/Z/Y/A inside text
+  inputs natively, and an OS-level accelerator would consume the key
+  before the webview saw it.
 - **Window snapshot** — `Window.takeSnapshotPng(path)` ships on all
   three backends. macOS uses
   `WKWebView.takeSnapshotWithConfiguration:completionHandler:` →
@@ -182,7 +189,7 @@ Zig calls via nested event-loop pumps.
 | Color scheme (light/dark) | ✓ | ✓ | ✓ |
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
-| Native menu bar | ✓ | — | — |
+| Native menu bar | ✓ | ✓ | ✓ |
 | Window snapshot (PNG) | ✓ | ✓ | ✓ |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
@@ -198,12 +205,13 @@ Zig calls via nested event-loop pumps.
 All P1 and all P2 desktop items per `docs/11-desktop-roadmap.md`
 are closed; clipboard, single-instance enforcement, color-scheme
 follow (getter + live change events), runtime asset-disk fallback,
-and macOS app-icon bundling shipped 2026-05-24. Remaining P3
-follow-ups: GTK4 + WebKitGTK 6.0 backend, native menu bars on
-Windows + Linux, tray icons + system notifications, drag-drop with
-native paths, print API, hicolor / Linux app-icon theme install,
-deep-link URL handlers, accessibility (NSAccessibility / UIA /
-ATK), auto-updater (Sparkle / Squirrel).
+and macOS app-icon bundling shipped 2026-05-24. Native menu bars
+on Windows + Linux landed 2026-05-25 (default File + Edit, parity
+with the macOS App + Edit). Remaining P3 follow-ups: GTK4 +
+WebKitGTK 6.0 backend, tray icons + system notifications,
+drag-drop with native paths, print API, hicolor / Linux app-icon
+theme install, deep-link URL handlers, accessibility
+(NSAccessibility / UIA / ATK), auto-updater (Sparkle / Squirrel).
 
 ## Constraints
 

@@ -14,12 +14,12 @@ Fresh session? Do these four in order before writing code:
 3. **Pick one bundle** from the "Suggested next-session bundles"
    table. All P1 items (#16–#23) are closed; every P2 platform port
    (Win/Linux dialogs, alerts, snapshot) is in. The P3 items that
-   shipped 2026-05-24 are listed under "Out of P1 scope — shipped"
-   below. Remaining P3 backlog: GTK4 backend, native menu bars on
-   Win + Linux, tray icons + notifications, drag-drop with native
-   paths, print API, hicolor / Linux icon-theme install, deep-link
-   URL handlers, accessibility (NSAccessibility / UIA / ATK), and
-   auto-updater (Sparkle / Squirrel).
+   shipped 2026-05-24/25 are listed under "Out of P1 scope — shipped"
+   below. Remaining P3 backlog: GTK4 backend, tray icons +
+   notifications, drag-drop with native paths, print API, hicolor /
+   Linux icon-theme install, deep-link URL handlers, accessibility
+   (NSAccessibility / UIA / ATK), and auto-updater
+   (Sparkle / Squirrel).
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
@@ -372,7 +372,6 @@ now a Level-3 golden-diff harness:
 ### Out of P1 scope (P3 — open)
 
 - GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
-- Native menu bars on Windows + Linux
 - Tray icons + system notifications
 - Drag-drop with native paths, print API
 - Hicolor / Linux app icon theme installation
@@ -392,6 +391,22 @@ now a Level-3 golden-diff harness:
   copies an `.icns` into `Contents/Resources/AppIcon.icns` and
   references it from `CFBundleIconFile`.
 
+### Out of P1 scope — shipped 2026-05-25
+
+- Native menu bars on Windows + Linux — default File (Quit) + Edit
+  (Undo/Redo/Cut/Copy/Paste/Select All) honoring the existing
+  `install_default_menu` flag for parity with the macOS App + Edit
+  + Window menus. Win32 uses `CreateMenu` + `SetMenu` + a one-entry
+  `HACCEL` for Ctrl+Q routed through `TranslateAcceleratorW` and
+  `WM_COMMAND`; Linux wraps the webview in a `GtkBox` + `GtkMenuBar`
+  with a single Ctrl+Q binding on the accel group. Edit items
+  render the shortcut hint in the label only — WebView2 and
+  WebKitGTK keep handling Ctrl+C/V/X/Z/Y/A inside text inputs
+  natively, since binding an OS-level accelerator on those keys
+  would consume the event before the webview saw it. macOS
+  validated live; Win/Linux compile-clean cross-compile (live
+  validation deferred).
+
 ## Suggested next-session bundles
 
 All P1 + every P2 platform port closed; the high-value P3 items
@@ -402,7 +417,6 @@ clipboard, color scheme + change events, app icons) all landed on
 | Bundle | Items | Best for |
 |---|---|---|
 | **P3 GTK4** | GTK4 + WebKitGTK 6.0 behind `-Dgtk4` | Future-proofing once Ubuntu LTS / Fedora ship GTK4 webkit by default. New backend module; existing GTK3 path stays. |
-| **P3 menu bars** | Win/Linux native menus | Cross-platform menu API design first, then `CreateMenu`/`AppendMenuW`/`SetMenu` on Win and GtkMenuBar / GMenuModel on Linux. Current `install_default_menu` is macOS-only. |
 | **P3 tray + notifications** | NSStatusItem / `Shell_NotifyIconW` / Ayatana AppIndicator | Linux side requires an extra dep (libappindicator / Ayatana) since GtkStatusIcon is deprecated. |
 | **P3 deep-link URLs** | `CFBundleURLTypes` + AppleEventManager / registry write + WM_COPYDATA / `.desktop` MimeType | Install-time setup + first-instance forwarding. |
 | **P3 drag-drop / print** | `NSDraggingDestination` / `IDropTarget` / GTK drag signals; `NSPrintOperation` / `PrintDlgExW` / `gtk_print_operation_run` | Drag-drop with native file paths (browser DataTransfer doesn't expose them). |

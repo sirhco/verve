@@ -76,6 +76,45 @@ extern fn gtk_widget_destroy(w: *GtkWidget) void;
 extern fn gtk_main() void;
 extern fn gtk_main_quit() void;
 
+// ---- GTK menu bar + accel group externs ------------------------------------
+//
+// Default menu bar (File + Edit) for parity with the macOS App + Edit
+// menu. Only File→Quit binds an accelerator; Edit items render their
+// shortcut hint in the label text via `gtk_menu_item_new_with_mnemonic`
+// markup but do not attach a `gtk_widget_add_accelerator` binding —
+// otherwise GTK would consume Ctrl+C/V/X before WebKit sees them and
+// silently break clipboard inside HTML inputs.
+const GtkBox = opaque {};
+const GtkMenuShell = opaque {};
+const GtkMenuItem = opaque {};
+const GtkAccelGroup = opaque {};
+const GtkOrientation = c_uint;
+const GdkModifierType = c_uint;
+const GtkAccelFlags = c_uint;
+
+const GTK_ORIENTATION_VERTICAL: GtkOrientation = 1;
+const GTK_ACCEL_VISIBLE: GtkAccelFlags = 1;
+
+extern fn gtk_box_new(orientation: GtkOrientation, spacing: c_int) *GtkWidget;
+extern fn gtk_box_pack_start(box: *GtkBox, child: *GtkWidget, expand: gboolean, fill: gboolean, padding: c_uint) void;
+extern fn gtk_menu_bar_new() *GtkWidget;
+extern fn gtk_menu_new() *GtkWidget;
+extern fn gtk_menu_item_new_with_mnemonic(label: [*:0]const u8) *GtkWidget;
+extern fn gtk_separator_menu_item_new() *GtkWidget;
+extern fn gtk_menu_item_set_submenu(item: *GtkMenuItem, submenu: *GtkWidget) void;
+extern fn gtk_menu_shell_append(shell: *GtkMenuShell, child: *GtkWidget) void;
+extern fn gtk_accel_group_new() *GtkAccelGroup;
+extern fn gtk_window_add_accel_group(win: *GtkWindow, ag: *GtkAccelGroup) void;
+extern fn gtk_widget_add_accelerator(
+    widget: *GtkWidget,
+    signal: [*:0]const u8,
+    ag: *GtkAccelGroup,
+    key: c_uint,
+    mods: GdkModifierType,
+    flags: GtkAccelFlags,
+) void;
+extern fn gtk_accelerator_parse(s: [*:0]const u8, key_out: *c_uint, mods_out: *GdkModifierType) void;
+
 // ---- GTK dialog externs (used by openFileDialog / saveFileDialog / showAlert)
 //
 // File chooser uses the native variant: portal-aware on modern hosts,
@@ -364,6 +403,7 @@ const WindowCtx = struct {
     window: ?*GtkWidget = null,
     webview: ?*WebKitWebView = null,
     web_context: ?*WebKitWebContext = null,
+    accel_group: ?*GtkAccelGroup = null,
 };
 
 // GTK's main loop has no automatic last-window tracking, so we count
@@ -445,7 +485,17 @@ pub const Window = struct {
             webkit_settings_set_enable_developer_extras(settings, 1);
         }
 
-        gtk_container_add(@ptrCast(window_widget), wv_widget);
+        if (opts.install_default_menu) {
+            // GtkBox wraps the menu bar + webview vertically. Failure
+            // to allocate any menu piece falls back to the opt-out
+            // shape (webview as the sole window child) — apps still
+            // boot, just menu-less.
+            installDefaultMenuBar(heap, window_widget, wv_widget) catch {
+                gtk_container_add(@ptrCast(window_widget), wv_widget);
+            };
+        } else {
+            gtk_container_add(@ptrCast(window_widget), wv_widget);
+        }
 
         if (opts.initial_path.len > 0) {
             var url_buf: [1024]u8 = undefined;
@@ -666,6 +716,72 @@ pub const Window = struct {
 fn onDestroy(_: ?*GtkWidget, _: ?*anyopaque) callconv(.c) void {
     if (live_windows > 0) live_windows -= 1;
     if (live_windows == 0) gtk_main_quit();
+}
+
+/// Build the default File + Edit menu bar and pack it above the
+/// webview in a vertical GtkBox. Stores the accel group on `ctx`
+/// (transitively freed when the window is destroyed — GTK ref-counts
+/// the whole widget tree). Returns an error so the caller can fall
+/// back to the menu-less layout on allocation failure.
+fn installDefaultMenuBar(ctx: *WindowCtx, window_widget: *GtkWidget, wv_widget: *GtkWidget) !void {
+    const box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(@ptrCast(window_widget), box);
+
+    const menu_bar = gtk_menu_bar_new();
+    const accel_group = gtk_accel_group_new();
+    gtk_window_add_accel_group(@ptrCast(window_widget), accel_group);
+    ctx.accel_group = accel_group;
+
+    // File → Quit (Ctrl+Q is the only real shortcut binding).
+    const file_item_widget = gtk_menu_item_new_with_mnemonic("_File");
+    const file_menu = gtk_menu_new();
+    gtk_menu_item_set_submenu(@ptrCast(file_item_widget), file_menu);
+    gtk_menu_shell_append(@ptrCast(menu_bar), file_item_widget);
+
+    const quit_item = gtk_menu_item_new_with_mnemonic("_Quit");
+    _ = g_signal_connect_data(
+        quit_item,
+        "activate",
+        @as(GCallback, @ptrCast(&onQuitActivate)),
+        @ptrCast(ctx),
+        null,
+        0,
+    );
+    var quit_key: c_uint = 0;
+    var quit_mods: GdkModifierType = 0;
+    gtk_accelerator_parse("<Control>q", &quit_key, &quit_mods);
+    gtk_widget_add_accelerator(quit_item, "activate", accel_group, quit_key, quit_mods, GTK_ACCEL_VISIBLE);
+    gtk_menu_shell_append(@ptrCast(file_menu), quit_item);
+
+    // Edit → standard items. NO `gtk_widget_add_accelerator` call —
+    // WebKitGTK handles Ctrl+C/V/X/Z/Y/A inside text inputs natively,
+    // and adding a GTK accelerator would consume the key event before
+    // WebKit sees it. The mnemonic-with-tab labels render the shortcut
+    // hint without binding a real accelerator.
+    const edit_item_widget = gtk_menu_item_new_with_mnemonic("_Edit");
+    const edit_menu = gtk_menu_new();
+    gtk_menu_item_set_submenu(@ptrCast(edit_item_widget), edit_menu);
+    gtk_menu_shell_append(@ptrCast(menu_bar), edit_item_widget);
+
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("_Undo    Ctrl+Z"));
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("_Redo    Ctrl+Y"));
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_separator_menu_item_new());
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("Cu_t    Ctrl+X"));
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("_Copy    Ctrl+C"));
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("_Paste    Ctrl+V"));
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("Select _All    Ctrl+A"));
+
+    gtk_box_pack_start(@ptrCast(box), menu_bar, 0, 0, 0);
+    gtk_box_pack_start(@ptrCast(box), wv_widget, 1, 1, 0);
+}
+
+/// `activate` handler for File → Quit. Routes through the per-window
+/// close path so the existing `live_windows` counter fires
+/// `gtk_main_quit` only when the last window closes — matches the
+/// multi-window semantics on the macOS + Windows backends.
+fn onQuitActivate(_: ?*GtkMenuItem, user_data: ?*anyopaque) callconv(.c) void {
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return));
+    if (cx.window) |w| gtk_widget_destroy(w);
 }
 
 fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callconv(.c) void {

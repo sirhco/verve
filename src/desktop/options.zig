@@ -186,9 +186,13 @@ pub const WindowOptions = struct {
     on_message: ?MessageHandler = null,
     on_message_ctx: ?*anyopaque = null,
 
-    /// Install a default OS menu bar on macOS (App + Edit + Window).
-    /// Disable when the app builds its own menu from scratch. On
-    /// Windows/Linux the field is currently ignored — menu bars on
-    /// those platforms are a follow-up.
+    /// Install a default OS menu bar. Honored on all three backends:
+    /// macOS gets App + Edit + Window menus; Windows and Linux get
+    /// File (Quit) + Edit (Undo/Redo/Cut/Copy/Paste/Select All). On
+    /// Win/Linux the Edit shortcuts are rendered as hints — the
+    /// embedded webview handles the actual clipboard keystrokes
+    /// natively, and attaching a real OS-level accelerator would
+    /// consume the key event before the webview saw it. Set to
+    /// `false` to suppress the bar (apps building their own).
     install_default_menu: bool = true,
 };
