@@ -6,6 +6,44 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-26
+
+Four small post-`v0.1.4` window + system additions.
+
+### Added — Window attention request (2026-05-26)
+
+- `Window.requestAttention(critical: bool)` pulses dock icon /
+  flashes taskbar / sets WM urgency hint. macOS: `[NSApp
+  requestUserAttention:]` with NSCriticalRequest /
+  NSInformationalRequest. Windows: `FlashWindowEx(FLASHW_ALL [|
+  FLASHW_TIMERNOFG])` with new FLASHWINFO extern struct. Linux:
+  `gtk_window_set_urgency_hint(TRUE)`.
+
+### Added — System resource info (2026-05-26)
+
+- `desktop.system.cpuCount() usize` — logical CPU count incl.
+  hyperthreads (fallback 1).
+- `desktop.system.totalMemory() u64` — physical RAM bytes
+  (fallback 0).
+- Thin wrappers over `std.Thread.getCpuCount` and
+  `std.process.totalSystemMemory`.
+
+### Added — Disk space query (2026-05-26)
+
+- New `desktop.disk` module: `spaceAt(allocator, path)
+  Error!Space`. `Space { total, available, free }` in bytes.
+  POSIX: `statvfs` (f_blocks/f_bavail/f_bfree × f_frsize).
+  Windows: `GetDiskFreeSpaceExW`. Useful for capacity dashboards
+  + pre-flight checks before large writes.
+
+### Added — Window state queries (2026-05-26)
+
+- `Window.isMinimized()` / `isMaximized()` / `isFullscreen()` on
+  all 3 backends. macOS: `isMiniaturized` / `isZoomed` /
+  `styleMask` bit-check. Windows: `IsIconic` / `IsZoomed` from
+  user32 + cached `fullscreen` flag. Linux:
+  `gdk_window_get_state` mask checks + `gtk_window_is_maximized`.
+
 ## [0.1.4] - 2026-05-26
 
 Six post-`v0.1.3` polish bundles. Standard directories, system
