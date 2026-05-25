@@ -30,11 +30,29 @@ work needed to call it "fully functional." Written 2026-05-22, last
 updated 2026-05-26. Fresh sessions should be able to pick up without
 prior context.
 
+## v0.1.0 — first tagged release (2026-05-26)
+
+Pushed to `sirhco/verve` as `v0.1.0`. Release workflow built and
+published binaries for x86_64-linux-gnu, aarch64-linux-gnu,
+x86_64-macos, aarch64-macos, x86_64-windows-gnu. Each platform
+ships a `verve-<version>-<arch>-<os>.tar.gz` with the verve-cli +
+verve-server binaries, LICENSE, README, CHANGELOG and a `.sha256`
+sibling. `verve-cli` gained `--release <tag>` + `--release-hash
+<h>` flags so scaffolded `build.zig.zon` can pin a URL+hash dep
+against the published tag.
+
 ## Done in the 2026-05-26 session
 
-One P3 bundle shipped to `ui-ki`: tray click handlers + submenus on
-all three platforms. Builds directly on the 2026-05-25 tray work
-(commit `68af576`).
+Three P3 bundles shipped to `ui-ki` and tagged as `v0.1.0`:
+- Tray click handlers + submenus (all 3 backends).
+- Release prep — `verve-cli new --release` flag + CHANGELOG bump to
+  0.1.0 + working release.yml run.
+- Custom tray icons via `Tray.setIcon(path)` + `TrayOptions.icon_path`
+  (all 3 backends).
+
+### Tray click handlers + submenus
+
+Builds directly on the 2026-05-25 tray work (commit `68af576`).
 
 - [x] **Tray click handlers + submenus** (all 3 backends). Cross-
   platform additions to `src/desktop/tray.zig`:
@@ -181,6 +199,40 @@ a31ac6c desktop: native menu bars on Windows + Linux
   - Template demo: scaffold opens a tray on startup; new `notify`
     IPC route fires a native notification; "Notify" button card in
     the demo page.
+
+### Custom tray icons (`setIcon` API)
+
+Closes the deferred `setIcon` follow-up from the 2026-05-25 notes.
+Added 2026-05-26 to `src/desktop/tray.zig`:
+
+- `TrayOptions.icon_path: ?[]const u8` — null falls back to the
+  stock per-platform icon. macOS reads anything `NSImage` parses
+  (PNG / JPEG / ICNS / TIFF); Windows expects a `.ico` file; Linux
+  accepts a PNG path or a theme icon name (both go through
+  `app_indicator_set_icon_full`).
+- `Tray.setIcon(path)` on the public surface — same accepted-format
+  rules. Returns `error.Backend` when the OS rejects the file.
+- macOS: `[[NSImage alloc] initWithContentsOfFile:]` + `setImage:`
+  on the status item's button. Loaded image marked
+  `setTemplate:true` so the menu bar applies its standard
+  light/dark tint (best with monochrome PNGs); colored icons still
+  show but don't tint. Old image released after the button takes
+  its own ref; the existing label is cleared on icon set so the
+  status bar doesn't render both.
+- Windows: `LoadImageW(NULL, path, IMAGE_ICON, 0, 0,
+  LR_LOADFROMFILE | LR_DEFAULTSIZE)` then `Shell_NotifyIconW(NIM_
+  MODIFY, NIF_ICON)`. The previous HICON is `DestroyIcon`'d ONLY
+  when we loaded it ourselves — the stock `IDI_APPLICATION` HICON
+  from `LoadIconW(NULL, ...)` is process-shared and must never be
+  destroyed. `owns_icon` tracks that distinction.
+- Linux: `app_indicator_set_icon_full(ind, path_or_name, desc)`.
+  Description string is a fixed "verve tray" for accessibility
+  tooling — apps can layer their own atop later.
+
+No template demo wiring — would need a real icon file embedded in
+the scaffold, which isn't worth the bytes for a v1 feature. Apps
+add their own icon path in `TrayOptions` or call `setIcon` after
+init.
 
 ### Verification across all four bundles
 
@@ -752,10 +804,9 @@ ls zig-out/app.app/Contents/{Info.plist,MacOS/app}   # both should exist
   `UNUserNotificationCenter` requires entitlements + a permission
   prompt + a bundled app (LSUIElement / NSPrincipalClass).
   Deferred.
-- Windows tray uses the stock `IDI_APPLICATION` icon. Custom icons
-  need a `setIcon` API on `desktop.tray` — deferred. (Tray click
-  handlers + submenus shipped 2026-05-26; custom tray icons are a
-  separate follow-up.)
+- Windows tray defaults to the stock `IDI_APPLICATION` icon.
+  Custom icons via `Tray.setIcon(path)` / `TrayOptions.icon_path`
+  shipped 2026-05-26.
 - Tray click handlers + submenus shipped 2026-05-26. v1 assumes a
   single tray per process — multi-tray would need per-target ivars
   on macOS + the Windows registry keyed beyond HWND. No use case

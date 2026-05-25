@@ -73,6 +73,18 @@ pub const TrayOptions = struct {
     /// in the menubar; Win + Linux ignore it (Win shows the tooltip,
     /// Linux uses the indicator's `id` / theme icon name).
     label: []const u8 = "Verve",
+    /// Path to a platform-appropriate icon file. `null` = stock
+    /// per-platform default (NSStatusItem's label-only button on
+    /// macOS, `IDI_APPLICATION` on Windows, the
+    /// `application-x-executable` theme icon on Linux). Format per
+    /// platform:
+    /// - macOS: anything `NSImage` reads (PNG, JPEG, ICNS, TIFF, …).
+    ///   Use a template (black/transparent) PNG for menu-bar tinting.
+    /// - Windows: an `.ico` file. Other formats won't load.
+    /// - Linux: an absolute path to a PNG (Ayatana accepts), OR a
+    ///   theme icon name (e.g. "applications-system") — both go
+    ///   straight through `app_indicator_set_icon_full`.
+    icon_path: ?[]const u8 = null,
     /// Optional menu. Empty slice means no menu attached — `on_click`
     /// then becomes the only interaction surface (and Linux loses any
     /// way to interact since AppIndicator has no click signal).
@@ -99,6 +111,14 @@ pub const Tray = struct {
 
     pub fn setTooltip(self: *Tray, tooltip: []const u8) void {
         self.impl.setTooltip(tooltip);
+    }
+
+    /// Swap the tray icon to one loaded from `path`. See `icon_path`
+    /// on `TrayOptions` for the per-platform format expectations.
+    /// Returns `error.Backend` when the OS rejects the file (missing,
+    /// wrong format, no menu-bar context, …).
+    pub fn setIcon(self: *Tray, path: []const u8) Error!void {
+        try self.impl.setIcon(path);
     }
 
     /// Replace the attached menu. Pass an empty slice to detach. Deep-
@@ -132,6 +152,7 @@ pub fn init(
             // Singleton wires here so callbacks read from the heap
             // address, not the about-to-be-copied stack-return.
             g_macos_tray = heap;
+            if (opts.icon_path) |p| try heap.setIcon(p);
             if (opts.menu.len > 0) {
                 try heap.setMenu(opts.menu);
             } else if (opts.on_click != null) {
@@ -146,6 +167,7 @@ pub fn init(
             errdefer heap.deinit();
             g_windows_tray = heap;
             installWindowsDispatchHooks();
+            if (opts.icon_path) |p| try heap.setIcon(p);
             if (opts.menu.len > 0) try heap.setMenu(opts.menu);
             return .{ .impl = heap, .allocator = allocator };
         },
@@ -154,6 +176,7 @@ pub fn init(
             errdefer allocator.destroy(heap);
             heap.* = try LinuxTray.bareInit(allocator, window, opts);
             errdefer heap.deinit();
+            if (opts.icon_path) |p| try heap.setIcon(p);
             try heap.setMenu(opts.menu);
             return .{ .impl = heap, .allocator = allocator };
         },
@@ -290,6 +313,50 @@ const MacosTray = struct {
         if (@intFromPtr(button) == 0) return;
         const setToolTip = m.cast(*const fn (id, SEL, id) callconv(.c) void);
         setToolTip(button, m.sel("setToolTip:"), nsString(tooltip));
+    }
+
+    /// Load `path` via `[[NSImage alloc] initWithContentsOfFile:]`
+    /// and assign to the status item's button. Sets the image as
+    /// `template` so the menu bar applies its standard light/dark
+    /// tint — works best with monochrome PNGs (transparent + black).
+    /// Color icons still render but won't tint with the bar.
+    fn setIcon(self: *MacosTray, path: []const u8) Error!void {
+        if (builtin.os.tag != .macos) return error.Unsupported;
+        const item = self.status_item orelse return error.Backend;
+        const button_sel = m.cast(*const fn (id, SEL) callconv(.c) id);
+        const button = button_sel(item, m.sel("button"));
+        if (@intFromPtr(button) == 0) return error.Backend;
+
+        const NSImage = m.getClass("NSImage");
+        const alloc_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+        const init_with_file = m.cast(*const fn (id, SEL, id) callconv(.c) id);
+        const img_raw = alloc_id(@as(id, @ptrCast(NSImage)), m.sel("alloc"));
+        const img = init_with_file(img_raw, m.sel("initWithContentsOfFile:"), nsString(path));
+        if (@intFromPtr(img) == 0) {
+            // Release the alloc'd shell so we don't leak.
+            const release = m.cast(*const fn (id, SEL) callconv(.c) void);
+            release(img_raw, m.sel("release"));
+            return error.Backend;
+        }
+
+        // Template = tint follows menu bar style. Safe default; if a
+        // future caller wants color-preserved icons it can layer a
+        // `setTemplate:` toggle on top.
+        const set_template = m.cast(*const fn (id, SEL, bool) callconv(.c) void);
+        set_template(img, m.sel("setTemplate:"), true);
+
+        const set_image = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+        set_image(button, m.sel("setImage:"), img);
+
+        // Clear the label when an icon is set — having both reads
+        // poorly in the menu bar. Callers can still re-`setTitle:`
+        // through their own NSStatusItem if they want both.
+        const setTitle = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+        setTitle(button, m.sel("setTitle:"), nsString(""));
+
+        // Release our retain — the button holds its own ref now.
+        const release = m.cast(*const fn (id, SEL) callconv(.c) void);
+        release(img, m.sel("release"));
     }
 
     fn setMenu(self: *MacosTray, items: []const TrayMenuItem) Error!void {
@@ -465,6 +532,12 @@ const WindowsTray = struct {
     /// then issues the matching `NIM_DELETE`.
     added: bool = false,
     menu: ?*anyopaque = null,
+    /// Currently displayed icon. Owned by us — `DestroyIcon` on
+    /// teardown / replacement when this came from `LoadImageW` (the
+    /// stock `IDI_APPLICATION` HICON from `LoadIconW` is shared and
+    /// must NOT be destroyed). `owns_icon` tracks the distinction.
+    icon: ?*anyopaque = null,
+    owns_icon: bool = false,
     allocator: std.mem.Allocator = undefined,
     items_storage: []const TrayMenuItem = &.{},
     on_click: ?TrayClickHandler = null,
@@ -542,6 +615,8 @@ const WindowsTray = struct {
 
     extern "shell32" fn Shell_NotifyIconW(message: DWORD, data: *NOTIFYICONDATAW) callconv(.winapi) BOOL;
     extern "user32" fn LoadIconW(hinst: HINSTANCE, name: LPCWSTR) callconv(.winapi) HICON;
+    extern "user32" fn LoadImageW(hinst: HINSTANCE, name: LPCWSTR, ty: UINT, cx_size: c_int, cy_size: c_int, fuLoad: UINT) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn DestroyIcon(icon: HICON) callconv(.winapi) BOOL;
     extern "user32" fn CreatePopupMenu() callconv(.winapi) HMENU;
     extern "user32" fn AppendMenuW(menu: HMENU, flags: UINT, id: usize, name: LPCWSTR) callconv(.winapi) BOOL;
     extern "user32" fn DestroyMenu(menu: HMENU) callconv(.winapi) BOOL;
@@ -584,12 +659,63 @@ const WindowsTray = struct {
             .hwnd = @ptrCast(hwnd),
             .uid = 1,
             .added = true,
+            .icon = @ptrCast(icon),
+            .owns_icon = false,
             .allocator = allocator,
             .on_click = opts.on_click,
             .on_click_ctx = opts.on_click_ctx,
             .on_menu_item = opts.on_menu_item,
             .on_menu_item_ctx = opts.on_menu_item_ctx,
         };
+    }
+
+    /// Load `path` (expected `.ico`) via `LoadImageW(LR_LOADFROMFILE
+    /// | LR_DEFAULTSIZE)` and ship to the tray via
+    /// `Shell_NotifyIconW(NIM_MODIFY, NIF_ICON)`. Previous icon is
+    /// destroyed when we owned it (loaded ourselves); the initial
+    /// stock `IDI_APPLICATION` HICON is shared and never destroyed.
+    fn setIcon(self: *WindowsTray, path: []const u8) Error!void {
+        if (builtin.os.tag != .windows) return error.Unsupported;
+        if (!self.added) return error.Backend;
+
+        const IMAGE_ICON: UINT = 1;
+        const LR_LOADFROMFILE: UINT = 0x10;
+        const LR_DEFAULTSIZE: UINT = 0x40;
+
+        // Convert path → UTF-16 NUL-terminated.
+        var wbuf: [1024]u16 = std.mem.zeroes([1024]u16);
+        const written = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return error.Backend;
+        if (written >= wbuf.len) return error.Backend;
+        wbuf[written] = 0;
+
+        const new_icon = LoadImageW(
+            null,
+            @ptrCast(&wbuf),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_LOADFROMFILE | LR_DEFAULTSIZE,
+        ) orelse return error.Backend;
+
+        var nid: NOTIFYICONDATAW = .{};
+        nid.cbSize = @sizeOf(NOTIFYICONDATAW);
+        nid.hWnd = @ptrCast(@alignCast(self.hwnd));
+        nid.uID = self.uid;
+        nid.uFlags = NIF_ICON;
+        nid.hIcon = @ptrCast(@alignCast(new_icon));
+        if (Shell_NotifyIconW(NIM_MODIFY, &nid) == 0) {
+            _ = DestroyIcon(@ptrCast(@alignCast(new_icon)));
+            return error.Backend;
+        }
+
+        // Drop the previous icon if we owned it (LoadImageW loads
+        // are caller-owned). The stock IDI_APPLICATION HICON from
+        // LoadIconW is process-shared — never destroy it.
+        if (self.owns_icon) {
+            if (self.icon) |old| _ = DestroyIcon(@ptrCast(@alignCast(old)));
+        }
+        self.icon = @ptrCast(new_icon);
+        self.owns_icon = true;
     }
 
     fn deinit(self: *WindowsTray) void {
@@ -602,6 +728,11 @@ const WindowsTray = struct {
             _ = Shell_NotifyIconW(NIM_DELETE, &nid);
             self.added = false;
         }
+        if (self.owns_icon) {
+            if (self.icon) |old| _ = DestroyIcon(@ptrCast(@alignCast(old)));
+        }
+        self.icon = null;
+        self.owns_icon = false;
         if (self.menu) |m_ptr| {
             _ = DestroyMenu(@as(HMENU, @ptrCast(@alignCast(m_ptr))));
             self.menu = null;
@@ -786,6 +917,7 @@ const LinuxTray = struct {
     extern fn app_indicator_set_status(self: *AppIndicator, status: AppIndicatorStatus) void;
     extern fn app_indicator_set_title(self: *AppIndicator, title: [*:0]const u8) void;
     extern fn app_indicator_set_label(self: *AppIndicator, label: [*:0]const u8, guide: [*:0]const u8) void;
+    extern fn app_indicator_set_icon_full(self: *AppIndicator, icon_name: [*:0]const u8, icon_desc: [*:0]const u8) void;
     extern fn app_indicator_set_menu(self: *AppIndicator, menu: *GtkWidget) void;
     extern fn g_object_unref(o: ?*anyopaque) void;
 
@@ -861,6 +993,20 @@ const LinuxTray = struct {
         const z = self.allocator.dupeZ(u8, tooltip) catch return;
         defer self.allocator.free(z);
         app_indicator_set_title(ind, z.ptr);
+    }
+
+    /// Forward to `app_indicator_set_icon_full`. Path may be an
+    /// absolute filename (PNG — Ayatana accepts) or a theme icon
+    /// name; both signatures route through the same API call.
+    fn setIcon(self: *LinuxTray, path: []const u8) Error!void {
+        if (builtin.os.tag != .linux) return error.Unsupported;
+        const ind_raw = self.indicator orelse return error.Backend;
+        const ind: *AppIndicator = @ptrCast(@alignCast(ind_raw));
+        const z = self.allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+        defer self.allocator.free(z);
+        const desc = self.allocator.dupeZ(u8, "verve tray") catch return error.OutOfMemory;
+        defer self.allocator.free(desc);
+        app_indicator_set_icon_full(ind, z.ptr, desc.ptr);
     }
 
     fn setMenu(self: *LinuxTray, items: []const TrayMenuItem) Error!void {
