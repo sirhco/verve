@@ -95,6 +95,11 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   writes `~/.config/autostart/<name>.desktop` (every
   freedesktop session). Options struct carries
   `name`/`exe_path`/`display_name`/`args`.
+- System resource info — `desktop.system.cpuCount() usize` (incl.
+  hyperthreads, falls back to 1 on failure) +
+  `desktop.system.totalMemory() u64` (physical RAM in bytes,
+  falls back to 0). Thin wrappers over `std.Thread.getCpuCount`
+  and `std.process.totalSystemMemory`.
 - System bell + process ID — `desktop.system.beep()` triggers
   the OS audible alert (NSBeep / MessageBeep / stdout BEL).
   `desktop.system.processId()` returns the current PID for log

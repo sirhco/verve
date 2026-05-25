@@ -74,6 +74,19 @@ pub fn processId() u32 {
     };
 }
 
+/// Logical CPU count. Includes hyperthreads. Returns 1 on
+/// platforms where the stdlib query fails.
+pub fn cpuCount() usize {
+    return std.Thread.getCpuCount() catch 1;
+}
+
+/// Total physical RAM in bytes, or 0 if the stdlib query fails
+/// (unsupported platform / sandbox blocks). Useful for log
+/// diagnostics + capacity-aware caching.
+pub fn totalMemory() u64 {
+    return std.process.totalSystemMemory() catch 0;
+}
+
 extern "AppKit" fn NSBeep() void;
 extern "user32" fn MessageBeep(ty: c_uint) callconv(.winapi) c_int;
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) c_ulong;
