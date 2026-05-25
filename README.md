@@ -103,7 +103,7 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - **Typed IPC** — `desktop.Router(Ctx, Routes)` with comptime `Args` + `Reply` types; JS callers `await window.verve.request({type, ...})` and get a typed Promise back.
 - **Cookies** — per-window `CookieStore` with real implementations on all three backends (sync wrappers over the native async cookie managers via nested run-loop pumps).
 - **Multi-window** — `Window.openChildWindow(opts)`; last-window-quit semantics on all three platforms.
-- **Native dialogs / alerts / menu bar (macOS)** — `openFileDialog`, `saveFileDialog`, `showAlert`, default App+Edit+Window menus (Edit menu is what makes Cmd+C / Cmd+V fire inside WKWebView text inputs).
+- **Native dialogs / alerts** — `openFileDialog`, `saveFileDialog`, `showAlert` wired against the system picker on all three backends (NSOpenPanel/NSSavePanel/NSAlert on macOS, `GtkFileChooserNative` + `GtkMessageDialog` on Linux, `GetOpenFileNameW` / `GetSaveFileNameW` + `MessageBoxW` on Windows). **Native menu bar (macOS)** — default App+Edit+Window menus (Edit menu is what makes Cmd+C / Cmd+V fire inside WKWebView text inputs).
 - **macOS `.app` bundle** — `zig build bundle` lays out `Info.plist` + `MacOS/<name>`; `-Dbundle-id` / `-Dbundle-version` / `-Dcodesign=<identity>` flags.
 - **Level-3 golden-diff smoke** — `zig build smoke` runs the app under `--smoke`, drives a deterministic interaction sequence, captures a PNG via `Window.takeSnapshotPng`, diffs a DOM checksum vs `tests/golden/`.
 - **Dev-loop watcher** — `zig build dev` polls watched sources and respawns the app on change.

@@ -473,8 +473,8 @@ Overrides:
 | Cookies | ✓ | ✓ | ✓ |
 | Multi-window | ✓ | ✓ | ✓ |
 | WASM hydration | ✓ | ✓ | ✓ |
-| File / save dialogs | ✓ | stub | stub |
-| Alerts | ✓ | stub | stub |
+| File / save dialogs | ✓ | ✓ (file only) | ✓ |
+| Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | — | — |
 | Window snapshot (PNG) | ✓ | stub | stub |
 | `.app` bundle | ✓ | — | — |

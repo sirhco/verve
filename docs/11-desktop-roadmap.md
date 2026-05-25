@@ -13,11 +13,12 @@ Fresh session? Do these four in order before writing code:
    the drift before proceeding.
 3. **Pick one bundle** from the "Suggested next-session bundles"
    table. All P1 items (#16–#23) are now closed, the `webview2.pinned.txt`
-   SHA-512 is populated, and the #19 HMR follow-up (`--dev <dir>`
-   runtime disk-read fallback) shipped on 2026-05-24. Remaining work
-   is the P2 platform ports (Win/Linux `takeSnapshotPng` /
-   dialogs / alerts) and the broader P3 backlog (GTK4, menu bars,
-   tray, drag-drop, accessibility, auto-updater).
+   SHA-512 is populated, the #19 HMR follow-up (`--dev <dir>` runtime
+   disk-read fallback) shipped on 2026-05-24, and Win/Linux
+   `openFileDialog` / `saveFileDialog` / `showAlert` ports landed the
+   same day. Remaining work is the Win/Linux `takeSnapshotPng` port
+   and the broader P3 backlog (GTK4, menu bars, tray, drag-drop,
+   accessibility, auto-updater).
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
@@ -384,12 +385,12 @@ now a Level-3 golden-diff harness:
 
 All P1 items (#16–#23) closed; the `webview2.pinned.txt` SHA-512 pin
 and the #19 HMR follow-up (`--dev <dir>` runtime fallback) landed on
-2026-05-24. Remaining work is the P2 platform ports and the P3 backlog:
+2026-05-24, and the P2 dialogs+alerts port followed the same day.
+Remaining work is the snapshot port and the broader P3 backlog:
 
 | Bundle | Items | Best for |
 |---|---|---|
 | **P2 port (snapshot)** | Win/Linux | Port `takeSnapshotPng` to WebView2 + WebKitGTK (macOS impl is the reference). |
-| **P2 port (dialogs+alerts)** | Win/Linux | Port `openFileDialog` / `saveFileDialog` / `showAlert` from the macOS NSPanel impl to Win32 common dialogs + GtkDialog. Stubs return `error.Unsupported` today. |
 | **P3** | GTK4, menu bars, tray, drag-drop, accessibility, auto-updater | See the P2/P3 list above for the full set. |
 
 Pick one. Each remaining bundle is ~2–4 hours focused work plus

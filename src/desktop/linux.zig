@@ -22,6 +22,12 @@ const cookies_mod = @import("cookies.zig");
 const GtkWidget = opaque {};
 const GtkWindow = opaque {};
 const GtkContainer = opaque {};
+const GtkDialog = opaque {};
+const GtkFileChooser = opaque {};
+const GtkFileChooserNative = opaque {};
+const GtkNativeDialog = opaque {};
+const GtkMessageDialog = opaque {};
+const GtkFileFilter = opaque {};
 const WebKitWebView = opaque {};
 const WebKitWebContext = opaque {};
 const WebKitUserContentManager = opaque {};
@@ -66,6 +72,70 @@ extern fn gtk_widget_show_all(w: *GtkWidget) void;
 extern fn gtk_widget_destroy(w: *GtkWidget) void;
 extern fn gtk_main() void;
 extern fn gtk_main_quit() void;
+
+// ---- GTK dialog externs (used by openFileDialog / saveFileDialog / showAlert)
+//
+// File chooser uses the native variant: portal-aware on modern hosts,
+// graceful GtkFileChooserDialog fallback elsewhere. NativeDialog and
+// MessageDialog implement the GtkFileChooser / GtkDialog interfaces
+// respectively, so the getter/setter helpers below operate on the
+// returned widget via interface casts (`@ptrCast` in callers).
+const GtkFileChooserAction = c_uint;
+const GtkResponseType = c_int;
+const GtkDialogFlags = c_uint;
+const GtkMessageType = c_uint;
+const GtkButtonsType = c_uint;
+
+const GTK_FILE_CHOOSER_ACTION_OPEN: GtkFileChooserAction = 0;
+const GTK_FILE_CHOOSER_ACTION_SAVE: GtkFileChooserAction = 1;
+const GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER: GtkFileChooserAction = 2;
+
+const GTK_RESPONSE_ACCEPT: GtkResponseType = -3;
+const GTK_RESPONSE_CANCEL: GtkResponseType = -6;
+const GTK_RESPONSE_DELETE_EVENT: GtkResponseType = -4;
+
+const GTK_DIALOG_MODAL: GtkDialogFlags = 1;
+
+const GTK_MESSAGE_INFO: GtkMessageType = 0;
+const GTK_MESSAGE_WARNING: GtkMessageType = 1;
+const GTK_MESSAGE_ERROR: GtkMessageType = 3;
+
+const GTK_BUTTONS_NONE: GtkButtonsType = 0;
+
+extern fn gtk_file_chooser_native_new(
+    title: [*:0]const u8,
+    parent: ?*GtkWindow,
+    action: GtkFileChooserAction,
+    accept_label: ?[*:0]const u8,
+    cancel_label: ?[*:0]const u8,
+) *GtkFileChooserNative;
+extern fn gtk_native_dialog_run(dialog: *GtkNativeDialog) c_int;
+extern fn gtk_native_dialog_destroy(dialog: *GtkNativeDialog) void;
+extern fn gtk_file_chooser_set_select_multiple(chooser: *GtkFileChooser, select: gboolean) void;
+extern fn gtk_file_chooser_set_current_name(chooser: *GtkFileChooser, name: [*:0]const u8) void;
+extern fn gtk_file_chooser_set_current_folder(chooser: *GtkFileChooser, path: [*:0]const u8) c_int;
+extern fn gtk_file_chooser_get_filename(chooser: *GtkFileChooser) ?[*:0]u8;
+extern fn gtk_file_chooser_add_filter(chooser: *GtkFileChooser, filter: *GtkFileFilter) void;
+
+extern fn gtk_file_filter_new() *GtkFileFilter;
+extern fn gtk_file_filter_set_name(filter: *GtkFileFilter, name: [*:0]const u8) void;
+extern fn gtk_file_filter_add_pattern(filter: *GtkFileFilter, pattern: [*:0]const u8) void;
+
+// `gtk_message_dialog_new` is varargs in C (`format, ...`). The
+// trailing format pointer is declared optional + nullable here so
+// passing `null` matches the no-format call shape; the message text
+// is then set via `gtk_message_dialog_set_markup` to avoid passing
+// any actual format spec.
+extern fn gtk_message_dialog_new(
+    parent: ?*GtkWindow,
+    flags: GtkDialogFlags,
+    msg_type: GtkMessageType,
+    buttons: GtkButtonsType,
+    format: ?[*:0]const u8,
+) *GtkWidget;
+extern fn gtk_message_dialog_set_markup(dialog: *GtkMessageDialog, str: [*:0]const u8) void;
+extern fn gtk_dialog_add_button(dialog: *GtkDialog, text: [*:0]const u8, response_id: c_int) *GtkWidget;
+extern fn gtk_dialog_run(dialog: *GtkDialog) c_int;
 
 extern fn g_signal_connect_data(
     instance: ?*anyopaque,
@@ -392,28 +462,62 @@ pub const Window = struct {
     }
 
     // ---- Dialogs ------------------------------------------------------------
-    // Real GtkFileChooserDialog + GtkMessageDialog wiring is a follow-up;
-    // returning Unsupported lets cross-platform call sites compile and
-    // makes the missing surface visible at runtime.
+    //
+    // File / save dialogs use `GtkFileChooserNative` so the system file
+    // picker (portal on modern hosts, GtkFileChooserDialog fallback
+    // elsewhere) shows up rather than a custom-rendered window. Alerts
+    // use `GtkMessageDialog` with `gtk_dialog_run` for sync modal
+    // behavior — same shape as the macOS NSAlert wrapper.
 
     pub fn openFileDialog(self: *Window, allocator: std.mem.Allocator, opts: opts_mod.FileDialogOptions) opts_mod.DialogError![]u8 {
-        _ = self;
-        _ = allocator;
-        _ = opts;
-        return opts_mod.DialogError.Unsupported;
+        return runFileChooserNative(self, allocator, opts, .open);
     }
 
     pub fn saveFileDialog(self: *Window, allocator: std.mem.Allocator, opts: opts_mod.FileDialogOptions) opts_mod.DialogError![]u8 {
-        _ = self;
-        _ = allocator;
-        _ = opts;
-        return opts_mod.DialogError.Unsupported;
+        return runFileChooserNative(self, allocator, opts, .save);
     }
 
     pub fn showAlert(self: *Window, opts: opts_mod.AlertOptions) usize {
-        _ = self;
-        _ = opts;
-        return 0;
+        const msg_type: GtkMessageType = switch (opts.style) {
+            .informational => GTK_MESSAGE_INFO,
+            .warning => GTK_MESSAGE_WARNING,
+            .critical => GTK_MESSAGE_ERROR,
+        };
+        const parent: ?*GtkWindow = if (self.ctx.window) |w| @ptrCast(w) else null;
+        const dialog_widget = gtk_message_dialog_new(parent, GTK_DIALOG_MODAL, msg_type, GTK_BUTTONS_NONE, null);
+        const dialog: *GtkDialog = @ptrCast(dialog_widget);
+
+        // Set title bar + body. `gtk_window_set_title` is safe on
+        // GtkMessageDialog (it inherits GtkWindow).
+        if (opts.title.len > 0) {
+            const title_z = self.ctx.allocator.dupeZ(u8, opts.title) catch return 0;
+            defer self.ctx.allocator.free(title_z);
+            gtk_window_set_title(@ptrCast(dialog_widget), title_z.ptr);
+        }
+        if (opts.message.len > 0) {
+            const msg_z = self.ctx.allocator.dupeZ(u8, opts.message) catch return 0;
+            defer self.ctx.allocator.free(msg_z);
+            gtk_message_dialog_set_markup(@ptrCast(dialog_widget), msg_z.ptr);
+        }
+
+        const buttons = if (opts.buttons.len == 0)
+            &[_][]const u8{"OK"}
+        else
+            opts.buttons;
+        for (buttons, 0..) |label, i| {
+            const z = self.ctx.allocator.dupeZ(u8, label) catch continue;
+            defer self.ctx.allocator.free(z);
+            // Response IDs 0..N map directly to button index in
+            // `opts.buttons` order. Cocoa returns the same convention
+            // (first button = 0, default action) so the surface stays
+            // consistent across platforms.
+            _ = gtk_dialog_add_button(dialog, z.ptr, @intCast(i));
+        }
+
+        const response = gtk_dialog_run(dialog);
+        gtk_widget_destroy(dialog_widget);
+        if (response < 0) return 0; // delete / escape — fall back to default action
+        return @intCast(response);
     }
 
     pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
@@ -499,6 +603,84 @@ fn onScriptMessage(_: *WebKitUserContentManager, message: *WebKitJavascriptResul
     defer g_free(raw);
     const slice = std.mem.span(raw);
     if (cx.on_message) |h| h(cx.on_message_ctx, slice);
+}
+
+// ---- File chooser ----------------------------------------------------------
+
+const FileChooserKind = enum { open, save };
+
+fn runFileChooserNative(
+    self: *Window,
+    allocator: std.mem.Allocator,
+    opts: opts_mod.FileDialogOptions,
+    kind: FileChooserKind,
+) opts_mod.DialogError![]u8 {
+    const action: GtkFileChooserAction = switch (kind) {
+        .open => if (opts.pick_directory) GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER else GTK_FILE_CHOOSER_ACTION_OPEN,
+        .save => GTK_FILE_CHOOSER_ACTION_SAVE,
+    };
+
+    const title_default: []const u8 = switch (kind) {
+        .open => "Open",
+        .save => "Save",
+    };
+    const title_src = if (opts.title.len > 0) opts.title else title_default;
+    const title_z = allocator.dupeZ(u8, title_src) catch return opts_mod.DialogError.OutOfMemory;
+    defer allocator.free(title_z);
+
+    const accept_label_default: []const u8 = switch (kind) {
+        .open => "_Open",
+        .save => "_Save",
+    };
+    const accept_z = allocator.dupeZ(u8, accept_label_default) catch return opts_mod.DialogError.OutOfMemory;
+    defer allocator.free(accept_z);
+    const cancel_z = allocator.dupeZ(u8, "_Cancel") catch return opts_mod.DialogError.OutOfMemory;
+    defer allocator.free(cancel_z);
+
+    const parent: ?*GtkWindow = if (self.ctx.window) |w| @ptrCast(w) else null;
+    const dialog = gtk_file_chooser_native_new(title_z.ptr, parent, action, accept_z.ptr, cancel_z.ptr);
+    defer g_object_unref(@ptrCast(dialog));
+    const chooser: *GtkFileChooser = @ptrCast(dialog);
+
+    // Open: optionally allow multi-select. Save: cannot multi-select
+    // (Gtk enforces this), so only honor for open.
+    if (kind == .open and opts.allow_multiple) {
+        gtk_file_chooser_set_select_multiple(chooser, 1);
+    }
+
+    if (opts.default_path.len > 0) {
+        const path_z = allocator.dupeZ(u8, opts.default_path) catch return opts_mod.DialogError.OutOfMemory;
+        defer allocator.free(path_z);
+        _ = gtk_file_chooser_set_current_folder(chooser, path_z.ptr);
+    }
+
+    if (kind == .save and opts.default_name.len > 0) {
+        const name_z = allocator.dupeZ(u8, opts.default_name) catch return opts_mod.DialogError.OutOfMemory;
+        defer allocator.free(name_z);
+        gtk_file_chooser_set_current_name(chooser, name_z.ptr);
+    }
+
+    if (opts.allowed_extensions.len > 0) {
+        const filter = gtk_file_filter_new();
+        var name_buf: [256]u8 = undefined;
+        if (std.fmt.bufPrintZ(&name_buf, "Allowed types", .{})) |z| {
+            gtk_file_filter_set_name(filter, z.ptr);
+        } else |_| {}
+        for (opts.allowed_extensions) |ext| {
+            var pat_buf: [128]u8 = undefined;
+            const pat = std.fmt.bufPrintZ(&pat_buf, "*.{s}", .{ext}) catch continue;
+            gtk_file_filter_add_pattern(filter, pat.ptr);
+        }
+        gtk_file_chooser_add_filter(chooser, filter);
+    }
+
+    const response = gtk_native_dialog_run(@ptrCast(dialog));
+    if (response != GTK_RESPONSE_ACCEPT) return opts_mod.DialogError.Cancelled;
+
+    const raw = gtk_file_chooser_get_filename(chooser) orelse return opts_mod.DialogError.Cancelled;
+    defer g_free(@ptrCast(raw));
+    const slice = std.mem.span(raw);
+    return allocator.dupe(u8, slice) catch return opts_mod.DialogError.OutOfMemory;
 }
 
 // ---- Cookie store -----------------------------------------------------------

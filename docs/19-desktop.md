@@ -86,8 +86,14 @@ reference. Headline list:
   platform-native async cookie managers)
 - **Multi-window** — `Window.openChildWindow(opts)`; last-window-quit
   semantics on all three platforms
-- **Native dialogs (macOS)** — `Window.openFileDialog`,
-  `saveFileDialog`, `showAlert` against NSOpenPanel/NSSavePanel/NSAlert
+- **Native dialogs** — `Window.openFileDialog`, `saveFileDialog`,
+  `showAlert`. macOS uses NSOpenPanel/NSSavePanel/NSAlert; Linux uses
+  `GtkFileChooserNative` + `GtkMessageDialog`; Windows uses
+  `GetOpenFileNameW` / `GetSaveFileNameW` (`comdlg32`) + `MessageBoxW`.
+  Per-platform caveats: Win32 alerts honor the button *count* (1/2/3
+  → MB_OK / MB_YESNO / MB_YESNOCANCEL) but not arbitrary labels;
+  directory-picking via `pick_directory` is macOS + Linux only on this
+  surface (Win32 splits dir-picking into `IFileOpenDialog` — port TBD).
 - **Native menu bar (macOS)** — App + Edit + Window menus stamped by
   default (`install_default_menu = true`); Edit menu is what makes
   Cmd+C / Cmd+V actually fire inside WKWebView text inputs
@@ -133,8 +139,8 @@ Zig calls via nested event-loop pumps.
 | Cookies | ✓ | ✓ | ✓ |
 | Multi-window | ✓ | ✓ | ✓ |
 | WASM hydration | ✓ | ✓ | ✓ |
-| File / save dialogs | ✓ | stub | stub |
-| Alerts | ✓ | stub | stub |
+| File / save dialogs | ✓ | ✓ (file only) | ✓ |
+| Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | — | — |
 | Window snapshot (PNG) | ✓ | stub | stub |
 | `.app` bundle | ✓ | — | — |

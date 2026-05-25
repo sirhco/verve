@@ -121,6 +121,63 @@ extern "user32" fn TranslateMessage(msg: *const MSG) callconv(.winapi) BOOL;
 extern "user32" fn DispatchMessageW(msg: *const MSG) callconv(.winapi) LRESULT;
 extern "user32" fn PostQuitMessage(code: c_int) callconv(.winapi) void;
 extern "user32" fn SendMessageW(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) callconv(.winapi) LRESULT;
+extern "user32" fn MessageBoxW(hwnd: HWND, text: LPCWSTR, caption: LPCWSTR, ty: UINT) callconv(.winapi) c_int;
+
+// ---- Common-dialog struct (OPENFILENAMEW) -----------------------------------
+//
+// Canonical Win32 layout from <commdlg.h>. The trailing `FlagsEx`
+// field is present even on legacy Windows because Microsoft has kept
+// the struct ABI-stable since XP. Caller fills `lStructSize` with
+// `@sizeOf(OPENFILENAMEW)`; the rest defaults to zeros via the
+// `OPENFILENAMEW{}` literal.
+
+const OPENFILENAMEW = extern struct {
+    lStructSize: DWORD = 0,
+    hwndOwner: HWND = null,
+    hInstance: HINSTANCE = null,
+    lpstrFilter: LPCWSTR = null,
+    lpstrCustomFilter: LPWSTR = null,
+    nMaxCustFilter: DWORD = 0,
+    nFilterIndex: DWORD = 0,
+    lpstrFile: LPWSTR = null,
+    nMaxFile: DWORD = 0,
+    lpstrFileTitle: LPWSTR = null,
+    nMaxFileTitle: DWORD = 0,
+    lpstrInitialDir: LPCWSTR = null,
+    lpstrTitle: LPCWSTR = null,
+    Flags: DWORD = 0,
+    nFileOffset: u16 = 0,
+    nFileExtension: u16 = 0,
+    lpstrDefExt: LPCWSTR = null,
+    lCustData: LPARAM = 0,
+    lpfnHook: ?*const anyopaque = null,
+    lpTemplateName: LPCWSTR = null,
+    pvReserved: ?*anyopaque = null,
+    dwReserved: DWORD = 0,
+    FlagsEx: DWORD = 0,
+};
+
+const OFN_OVERWRITEPROMPT: DWORD = 0x00000002;
+const OFN_PATHMUSTEXIST: DWORD = 0x00000800;
+const OFN_FILEMUSTEXIST: DWORD = 0x00001000;
+const OFN_ALLOWMULTISELECT: DWORD = 0x00000200;
+const OFN_EXPLORER: DWORD = 0x00080000;
+
+extern "comdlg32" fn GetOpenFileNameW(ofn: *OPENFILENAMEW) callconv(.winapi) BOOL;
+extern "comdlg32" fn GetSaveFileNameW(ofn: *OPENFILENAMEW) callconv(.winapi) BOOL;
+
+const MB_OK: UINT = 0x00000000;
+const MB_OKCANCEL: UINT = 0x00000001;
+const MB_YESNO: UINT = 0x00000004;
+const MB_YESNOCANCEL: UINT = 0x00000003;
+const MB_ICONINFORMATION: UINT = 0x00000040;
+const MB_ICONWARNING: UINT = 0x00000030;
+const MB_ICONERROR: UINT = 0x00000010;
+
+const IDOK: c_int = 1;
+const IDCANCEL: c_int = 2;
+const IDYES: c_int = 6;
+const IDNO: c_int = 7;
 
 const WM_CLOSE: UINT = 0x0010;
 
@@ -487,23 +544,68 @@ pub const Window = struct {
     // runtime.
 
     pub fn openFileDialog(self: *Window, allocator: std.mem.Allocator, opts: opts_mod.FileDialogOptions) opts_mod.DialogError![]u8 {
-        _ = self;
-        _ = allocator;
-        _ = opts;
-        return opts_mod.DialogError.Unsupported;
+        return runFileDialogWindows(self, allocator, opts, .open);
     }
 
     pub fn saveFileDialog(self: *Window, allocator: std.mem.Allocator, opts: opts_mod.FileDialogOptions) opts_mod.DialogError![]u8 {
-        _ = self;
-        _ = allocator;
-        _ = opts;
-        return opts_mod.DialogError.Unsupported;
+        return runFileDialogWindows(self, allocator, opts, .save);
     }
 
+    /// Modal alert via `MessageBoxW`. Win32 doesn't honor arbitrary
+    /// button labels — the surface accepts up to three buttons and
+    /// maps the count onto MB_OK / MB_YESNO / MB_YESNOCANCEL, then
+    /// translates the return code back into the caller's button index
+    /// (0 = first button). The custom label strings in `opts.buttons`
+    /// are ignored on Windows; macOS honors them. Document accordingly.
     pub fn showAlert(self: *Window, opts: opts_mod.AlertOptions) usize {
-        _ = self;
-        _ = opts;
-        return 0;
+        const icon: UINT = switch (opts.style) {
+            .informational => MB_ICONINFORMATION,
+            .warning => MB_ICONWARNING,
+            .critical => MB_ICONERROR,
+        };
+        const button_count: usize = if (opts.buttons.len == 0) 1 else opts.buttons.len;
+        const button_flag: UINT = switch (button_count) {
+            1 => MB_OK,
+            2 => MB_YESNO,
+            else => MB_YESNOCANCEL,
+        };
+
+        var msg_buf: [1024]u16 = undefined;
+        var title_buf: [256]u16 = undefined;
+
+        const msg_ptr: LPCWSTR = if (opts.message.len > 0) blk: {
+            const w = std.unicode.utf8ToUtf16Le(&msg_buf, opts.message) catch break :blk null;
+            const idx = @min(msg_buf.len - 1, w);
+            msg_buf[idx] = 0;
+            break :blk @ptrCast(&msg_buf);
+        } else null;
+
+        const title_ptr: LPCWSTR = if (opts.title.len > 0) blk: {
+            const w = std.unicode.utf8ToUtf16Le(&title_buf, opts.title) catch break :blk null;
+            const idx = @min(title_buf.len - 1, w);
+            title_buf[idx] = 0;
+            break :blk @ptrCast(&title_buf);
+        } else null;
+
+        const hwnd: HWND = self.ctx.hwnd;
+        const ret = MessageBoxW(hwnd, msg_ptr, title_ptr, button_flag | icon);
+        // Map Win32 return codes back to button index in opts.buttons order.
+        // Single-button case: IDOK → 0. Two-button: IDYES → 0, IDNO → 1.
+        // Three-button: IDYES → 0, IDNO → 1, IDCANCEL → 2.
+        return switch (button_count) {
+            1 => 0,
+            2 => switch (ret) {
+                IDYES => 0,
+                IDNO => 1,
+                else => 0,
+            },
+            else => switch (ret) {
+                IDYES => 0,
+                IDNO => 1,
+                IDCANCEL => 2,
+                else => 0,
+            },
+        };
     }
 
     pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
@@ -512,6 +614,117 @@ pub const Window = struct {
         return opts_mod.SnapshotError.Unsupported;
     }
 };
+
+const FileDialogKind = enum { open, save };
+
+fn runFileDialogWindows(
+    self: *Window,
+    allocator: std.mem.Allocator,
+    opts: opts_mod.FileDialogOptions,
+    kind: FileDialogKind,
+) opts_mod.DialogError![]u8 {
+    // pick_directory isn't natively supported by GetOpenFileNameW
+    // (Win32 splits dir-picking into IFileOpenDialog). Surface a clear
+    // error so callers know to use a different API on Windows until
+    // the IFileDialog port lands.
+    if (kind == .open and opts.pick_directory) return opts_mod.DialogError.Unsupported;
+
+    const PATH_BUF_LEN: usize = std.fs.max_path_bytes; // 4096 on x86_64
+    var file_buf = allocator.alloc(u16, PATH_BUF_LEN) catch return opts_mod.DialogError.OutOfMemory;
+    defer allocator.free(file_buf);
+    @memset(file_buf, 0);
+
+    // Pre-populate save dialogs with the default name so the picker
+    // opens with a sane suggestion.
+    if (kind == .save and opts.default_name.len > 0) {
+        const written = std.unicode.utf8ToUtf16Le(file_buf, opts.default_name) catch return opts_mod.DialogError.PathTooLong;
+        if (written < file_buf.len) file_buf[written] = 0;
+    }
+
+    var title_buf: [256]u16 = undefined;
+    @memset(&title_buf, 0);
+    const title_ptr: LPCWSTR = if (opts.title.len > 0) blk: {
+        const w = std.unicode.utf8ToUtf16Le(&title_buf, opts.title) catch break :blk null;
+        const idx = @min(title_buf.len - 1, w);
+        title_buf[idx] = 0;
+        break :blk @ptrCast(&title_buf);
+    } else null;
+
+    var initial_dir_buf: [1024]u16 = undefined;
+    @memset(&initial_dir_buf, 0);
+    const initial_dir_ptr: LPCWSTR = if (opts.default_path.len > 0) blk: {
+        const w = std.unicode.utf8ToUtf16Le(&initial_dir_buf, opts.default_path) catch break :blk null;
+        const idx = @min(initial_dir_buf.len - 1, w);
+        initial_dir_buf[idx] = 0;
+        break :blk @ptrCast(&initial_dir_buf);
+    } else null;
+
+    // Filter string format: null-separated pairs, double-null
+    // terminated. Each pair is "<description>\0<pattern>\0". Example:
+    //   "Allowed types\0*.txt;*.json\0\0"
+    var filter_buf: [512]u16 = undefined;
+    @memset(&filter_buf, 0);
+    const filter_ptr: LPCWSTR = if (opts.allowed_extensions.len > 0) blk: {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var pattern_buf = std.ArrayList(u8).init(arena.allocator());
+        for (opts.allowed_extensions, 0..) |ext, i| {
+            if (i > 0) pattern_buf.append(';') catch break :blk null;
+            pattern_buf.appendSlice("*.") catch break :blk null;
+            pattern_buf.appendSlice(ext) catch break :blk null;
+        }
+        const description = "Allowed types";
+        var idx: usize = 0;
+        const w1 = std.unicode.utf8ToUtf16Le(filter_buf[idx..], description) catch break :blk null;
+        idx += w1;
+        if (idx >= filter_buf.len - 3) break :blk null;
+        filter_buf[idx] = 0;
+        idx += 1;
+        const w2 = std.unicode.utf8ToUtf16Le(filter_buf[idx..], pattern_buf.items) catch break :blk null;
+        idx += w2;
+        if (idx >= filter_buf.len - 2) break :blk null;
+        filter_buf[idx] = 0;
+        idx += 1;
+        filter_buf[idx] = 0;
+        break :blk @ptrCast(&filter_buf);
+    } else null;
+
+    var ofn: OPENFILENAMEW = .{
+        .lStructSize = @sizeOf(OPENFILENAMEW),
+        .hwndOwner = self.ctx.hwnd,
+        .lpstrFile = @ptrCast(file_buf.ptr),
+        .nMaxFile = @intCast(file_buf.len),
+        .lpstrFilter = filter_ptr,
+        .lpstrInitialDir = initial_dir_ptr,
+        .lpstrTitle = title_ptr,
+        .Flags = OFN_EXPLORER | switch (kind) {
+            .open => OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | (if (opts.allow_multiple) OFN_ALLOWMULTISELECT else @as(DWORD, 0)),
+            .save => OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST,
+        },
+    };
+
+    const ok = switch (kind) {
+        .open => GetOpenFileNameW(&ofn),
+        .save => GetSaveFileNameW(&ofn),
+    };
+    if (ok == 0) return opts_mod.DialogError.Cancelled;
+
+    // The result is a UTF-16 null-terminated string. Multi-select
+    // mode returns a different format (dir\0file1\0file2\0\0) that
+    // we don't unpack here — callers asking for multi-select get the
+    // raw dir string today; full multi-select parsing is a follow-up.
+    var utf16_len: usize = 0;
+    while (utf16_len < file_buf.len and file_buf[utf16_len] != 0) : (utf16_len += 1) {}
+
+    const utf8_buf = allocator.alloc(u8, utf16_len * 3 + 1) catch return opts_mod.DialogError.OutOfMemory;
+    errdefer allocator.free(utf8_buf);
+    const utf8_len = std.unicode.utf16LeToUtf8(utf8_buf, file_buf[0..utf16_len]) catch return opts_mod.DialogError.PathTooLong;
+    // Shrink to the actual used length. realloc on shrink either
+    // returns the same pointer with a smaller len or migrates to a
+    // smaller block — failure path propagates as OOM rather than
+    // returning an undersized slice that won't free correctly.
+    return allocator.realloc(utf8_buf, utf8_len) catch return opts_mod.DialogError.OutOfMemory;
+}
 
 fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
