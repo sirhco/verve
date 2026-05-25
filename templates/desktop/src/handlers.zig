@@ -32,6 +32,57 @@ const Router = desktop.Router(RouterCtx, Routes);
 
 pub const onMessage = Router.dispatch;
 
+/// Tray-menu item click. Ids match the menu spec wired in `main.zig`
+/// (1 = focus window, 2 = fire the same `notify` route as the IPC
+/// button, 99 = quit). Unknown ids log + ignore.
+pub fn onTrayItem(c: ?*anyopaque, item_id: u32) void {
+    const r: *RouterCtx = @ptrCast(@alignCast(c orelse return));
+    switch (item_id) {
+        1 => {
+            std.log.info("[tray] show window", .{});
+            // Surfacing focus on the existing window is a backend
+            // concern — for the demo, an evalJs ping is enough to
+            // visualize the click on the page.
+            r.window.evalJs("document.getElementById('log') && (document.getElementById('log').textContent = 'tray: show window\\n' + document.getElementById('log').textContent);");
+        },
+        2 => {
+            std.log.info("[tray] notify", .{});
+            desktop.notifications.show(std.heap.page_allocator, .{
+                .title = "Verve Desktop",
+                .body = "Notification from the tray menu.",
+            }) catch {};
+        },
+        99 => {
+            std.log.info("[tray] quit", .{});
+            r.window.terminate();
+        },
+        else => std.log.warn("[tray] unknown id {d}", .{item_id}),
+    }
+}
+
+/// Deep-link URL handler. Logs the incoming URL and evalJs's it into
+/// the page so the demo UI shows the value. macOS uses
+/// `NSAppleEventManager` to deliver both warm-launch and cold-launch
+/// URLs; Win/Linux deliver cold-launch URLs through argv (the
+/// template's main.zig calls `Window.deliverUrl` for those).
+pub fn onUrlOpen(c: ?*anyopaque, url: []const u8) void {
+    const r: *RouterCtx = @ptrCast(@alignCast(c orelse return));
+    std.log.info("[url-open] {s}", .{url});
+    // JSON-escape via a tiny manual pass — only quotes + backslashes
+    // matter for a URL string fed into a JS string literal.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.heap.page_allocator);
+    buf.appendSlice(std.heap.page_allocator, "window.verve.handleDeepLink && window.verve.handleDeepLink(\"") catch return;
+    for (url) |b| switch (b) {
+        '"' => buf.appendSlice(std.heap.page_allocator, "\\\"") catch return,
+        '\\' => buf.appendSlice(std.heap.page_allocator, "\\\\") catch return,
+        '\n' => buf.appendSlice(std.heap.page_allocator, "\\n") catch return,
+        else => buf.append(std.heap.page_allocator, b) catch return,
+    };
+    buf.appendSlice(std.heap.page_allocator, "\");") catch return;
+    r.window.evalJs(buf.items);
+}
+
 pub fn attach(window: *desktop.Window, assets: []const desktop.AssetEntry, smoke_dir: ?[]const u8, io: std.Io) *RouterCtx {
     ctx = .{ .window = window, .assets = assets, .smoke_dir = smoke_dir, .io = io };
     return &ctx;
@@ -45,6 +96,27 @@ const Routes = struct {
         pub const Reply = struct { echo: bool, sent_at: i64 };
         pub fn handle(_: *RouterCtx, _: std.mem.Allocator, args: Args) !Reply {
             return .{ .echo = true, .sent_at = args.sent_at };
+        }
+    };
+
+    pub const notify = struct {
+        pub const Args = struct {
+            title: []const u8 = "Verve Desktop",
+            body: []const u8 = "Hello from the native side.",
+        };
+        pub const Reply = struct { ok: bool };
+        pub fn handle(_: *RouterCtx, alloc: std.mem.Allocator, args: Args) !Reply {
+            // Notifications are best-effort. macOS + Linux fire the
+            // native API; Win returns Unsupported (deferred to a
+            // future tray-balloon / Toast bundle).
+            desktop.notifications.show(alloc, .{
+                .title = args.title,
+                .body = args.body,
+            }) catch |err| switch (err) {
+                error.Unsupported => return .{ .ok = false },
+                else => return err,
+            };
+            return .{ .ok = true };
         }
     };
 

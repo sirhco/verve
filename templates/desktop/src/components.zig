@@ -69,6 +69,21 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
                 }),
             }),
             ctx.section().class("card").children(.{
+                ctx.h2("Notifications"),
+                ctx.div().class("row").children(.{
+                    ctx.button("Notify").id("notify"),
+                }),
+            }),
+            ctx.section().class("card").children(.{
+                ctx.h2("Deep link"),
+                ctx.p().text("Open verve://app/anything from a terminal (or click a link on a registered scheme) — the URL appears here."),
+                ctx.pre().id("deep-link-url").text("(no URL received yet)"),
+            }),
+            ctx.section().class("card").children(.{
+                ctx.h2("Tray menu"),
+                ctx.p().text("Click the status-bar icon (right-click on Windows) for Show window, Notify, and Quit. Item clicks dispatch to handlers.onTrayItem in native code."),
+            }),
+            ctx.section().class("card").children(.{
                 ctx.h2("Log"),
                 ctx.pre().id("log").text("bridge ready"),
             }),
@@ -115,5 +130,9 @@ const inline_js =
     \\
     \\document.getElementById('open-child').addEventListener('click', () => {
     \\  call('open_child');
+    \\});
+    \\
+    \\document.getElementById('notify').addEventListener('click', () => {
+    \\  call('notify', { title: 'Verve', body: 'Notification from the desktop demo.' });
     \\});
 ;

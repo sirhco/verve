@@ -22,6 +22,7 @@ const opts_mod = @import("options.zig");
 const ipc = @import("ipc.zig");
 const router = @import("asset_router.zig");
 const cookies_mod = @import("cookies.zig");
+const clipboard_mod = @import("clipboard.zig");
 
 const id = m.id;
 const SEL = m.SEL;
@@ -36,8 +37,14 @@ const nil: ?id = null;
 const WindowCtx = struct {
     allocator: std.mem.Allocator,
     assets: []const opts_mod.AssetEntry,
+    dev_assets: ?opts_mod.DevAssetsConfig,
     on_message: ?opts_mod.MessageHandler,
     on_message_ctx: ?*anyopaque,
+    on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
+    on_color_scheme_ctx: ?*anyopaque = null,
+    color_scheme_observer: ?id = null,
+    on_url_open: ?opts_mod.UrlOpenHandler = null,
+    on_url_open_ctx: ?*anyopaque = null,
     webview: id,
 };
 
@@ -52,6 +59,30 @@ var registry: std.AutoHashMapUnmanaged(*anyopaque, *WindowCtx) = .{};
 // flag so openChildWindow can call it for additional windows without
 // re-installing the delegate or clobbering the menu bar.
 var app_initialized: bool = false;
+
+// The Objective-C runtime rejects a second `objc_allocateClassPair`
+// with the same name in the same process, so the per-window dynamic
+// classes (`VerveSchemeHandler`, `VerveMessageHandler`,
+// `VerveThemeObserver`) are registered at the first Window.init and
+// reused for every subsequent window. Without this, `openChildWindow`
+// crashes with "objc_allocateClassPair failed".
+var scheme_class_cached: ?m.Class = null;
+var message_class_cached: ?m.Class = null;
+var theme_class_cached: ?m.Class = null;
+var url_opener_class_cached: ?m.Class = null;
+
+// `NSAppleEventManager` accepts only one handler per (event class,
+// event id) pair per process — multi-window apps converge on a
+// single global URL handler instance that fans out to whichever
+// WindowCtx most-recently called `setUrlOpenHandler`. Apps that
+// want per-window routing keep ctx state in their own callback.
+var url_opener_singleton: ?id = null;
+var last_url_handler_ctx: ?*WindowCtx = null;
+
+// Maps NSDistributedNotificationCenter observer instance → owning
+// WindowCtx. Theme-change callbacks fire on the AppKit main thread
+// so the map needs no locking.
+var theme_registry: std.AutoHashMapUnmanaged(*anyopaque, *WindowCtx) = .{};
 
 fn registerCtx(webview: id, ctx_ptr: *WindowCtx) !void {
     try registry.put(std.heap.page_allocator, @ptrCast(webview), ctx_ptr);
@@ -103,20 +134,31 @@ pub const Window = struct {
         const center = m.cast(*const fn (id, SEL) callconv(.c) void);
         center(window, m.sel("center"));
 
-        // Register dynamic classes for the custom-scheme handler and
-        // the script-message handler. Both subclass NSObject. Methods
-        // are added before `objc_registerClassPair`.
+        // Register (or reuse) the dynamic classes for the custom-
+        // scheme handler and the script-message handler. Both subclass
+        // NSObject. The Objective-C runtime won't accept a second
+        // `objc_allocateClassPair` with the same name, so cache after
+        // the first window and hand the existing class to every
+        // subsequent `openChildWindow` call.
         const NSObject = m.getClass("NSObject");
-        const scheme_class = m.allocateClass(NSObject, "VerveSchemeHandler");
-        m.addMethod(scheme_class, m.sel("webView:startURLSchemeTask:"), @ptrCast(&schemeStartTrampoline), "v@:@@");
-        m.addMethod(scheme_class, m.sel("webView:stopURLSchemeTask:"), @ptrCast(&schemeStopTrampoline), "v@:@@");
-        m.addProtocol(scheme_class, "WKURLSchemeHandler");
-        m.registerClass(scheme_class);
+        const scheme_class = scheme_class_cached orelse blk: {
+            const c = m.allocateClass(NSObject, "VerveSchemeHandler");
+            m.addMethod(c, m.sel("webView:startURLSchemeTask:"), @ptrCast(&schemeStartTrampoline), "v@:@@");
+            m.addMethod(c, m.sel("webView:stopURLSchemeTask:"), @ptrCast(&schemeStopTrampoline), "v@:@@");
+            m.addProtocol(c, "WKURLSchemeHandler");
+            m.registerClass(c);
+            scheme_class_cached = c;
+            break :blk c;
+        };
 
-        const message_class = m.allocateClass(NSObject, "VerveMessageHandler");
-        m.addMethod(message_class, m.sel("userContentController:didReceiveScriptMessage:"), @ptrCast(&didReceiveTrampoline), "v@:@@");
-        m.addProtocol(message_class, "WKScriptMessageHandler");
-        m.registerClass(message_class);
+        const message_class = message_class_cached orelse blk: {
+            const c = m.allocateClass(NSObject, "VerveMessageHandler");
+            m.addMethod(c, m.sel("userContentController:didReceiveScriptMessage:"), @ptrCast(&didReceiveTrampoline), "v@:@@");
+            m.addProtocol(c, "WKScriptMessageHandler");
+            m.registerClass(c);
+            message_class_cached = c;
+            break :blk c;
+        };
 
         if (!app_initialized) {
             // NSApplicationDelegate. Without one, closing the last window
@@ -202,10 +244,19 @@ pub const Window = struct {
         ctx_ptr.* = .{
             .allocator = allocator,
             .assets = opts.assets,
+            .dev_assets = opts.dev_assets,
             .on_message = opts.on_message,
             .on_message_ctx = opts.on_message_ctx,
+            .on_url_open = opts.on_url_open,
+            .on_url_open_ctx = opts.on_url_open_ctx,
             .webview = webview,
         };
+        if (opts.on_url_open != null) {
+            installUrlOpenerIfNeeded(ctx_ptr);
+        }
+        if (opts.dev_assets) |dev| {
+            std.log.info("verve.desktop[macos]: dev-mode asset fallback enabled, dir='{s}'", .{dev.dir});
+        }
         try registerCtx(webview, ctx_ptr);
         errdefer unregisterCtx(webview);
 
@@ -284,6 +335,93 @@ pub const Window = struct {
     /// follow-up — see module-level cookieGet/Set/Delete/Clear stubs.
     pub fn cookies(self: *Window) cookies_mod.CookieStore {
         return .{ .window = @ptrCast(self) };
+    }
+
+    /// System pasteboard handle. NSPasteboard is process-global; the
+    /// per-window wrapper is only there for API parity with cookies().
+    pub fn clipboard(self: *Window) clipboard_mod.Clipboard {
+        return .{ .window = @ptrCast(self) };
+    }
+
+    /// Register a callback fired on AppleInterfaceThemeChangedNotification.
+    /// The observer subscribes to `NSDistributedNotificationCenter`
+    /// with a lazily-allocated `VerveThemeObserver` class. Passing a
+    /// `null` handler removes any prior observer for this window.
+    pub fn setColorSchemeHandler(self: *Window, cb: ?opts_mod.ColorSchemeHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_color_scheme = cb;
+        self.ctx.on_color_scheme_ctx = ctx;
+
+        if (self.ctx.color_scheme_observer == null and cb != null) {
+            const NSObject = m.getClass("NSObject");
+            const theme_class = theme_class_cached orelse blk: {
+                const c = m.allocateClass(NSObject, "VerveThemeObserver");
+                m.addMethod(c, m.sel("themeChanged:"), @ptrCast(&themeChangedTrampoline), "v@:@");
+                m.registerClass(c);
+                theme_class_cached = c;
+                break :blk c;
+            };
+            const alloc_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+            const init_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+            const observer = init_id(alloc_id(@as(id, @ptrCast(theme_class)), m.sel("alloc")), m.sel("init"));
+
+            theme_registry.put(std.heap.page_allocator, @ptrCast(observer), self.ctx) catch return;
+
+            const NSDistributedNotificationCenter = m.getClass("NSDistributedNotificationCenter");
+            const defaultCenter = m.cast(*const fn (id, SEL) callconv(.c) id);
+            const center = defaultCenter(@as(id, @ptrCast(NSDistributedNotificationCenter)), m.sel("defaultCenter"));
+
+            const addObserver = m.cast(*const fn (id, SEL, id, SEL, id, ?id) callconv(.c) void);
+            addObserver(
+                center,
+                m.sel("addObserver:selector:name:object:"),
+                observer,
+                m.sel("themeChanged:"),
+                nsString("AppleInterfaceThemeChangedNotification"),
+                null,
+            );
+            self.ctx.color_scheme_observer = observer;
+        }
+    }
+
+    /// Register / replace the deep-link URL handler. macOS routes
+    /// every `verve://...` URL the OS hands to the app through
+    /// `NSAppleEventManager` (`kInternetEventClass`/`kAEGetURL`),
+    /// regardless of whether the URL arrived at cold launch or while
+    /// the app was already running — Cocoa queues pre-launch URLs
+    /// until the AEH installs, then drains them. The framework
+    /// installs the AEH lazily on the first non-null call and keeps
+    /// it process-wide. Passing `null` clears the handler — the AEH
+    /// stays installed but fires nothing.
+    pub fn setUrlOpenHandler(self: *Window, cb: ?opts_mod.UrlOpenHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_url_open = cb;
+        self.ctx.on_url_open_ctx = ctx;
+        if (cb != null) installUrlOpenerIfNeeded(self.ctx);
+    }
+
+    /// Synthesize a URL delivery — call the registered handler with
+    /// `url` as if the OS had just delivered it. Templates use this
+    /// to feed cold-launch URLs that arrived through argv (the
+    /// AppleEvent path supersedes argv on macOS, so this code path
+    /// is mostly used by Windows + Linux templates for parity).
+    pub fn deliverUrl(self: *Window, url: []const u8) void {
+        if (self.ctx.on_url_open) |cb| cb(self.ctx.on_url_open_ctx, url);
+    }
+
+    /// Current macOS appearance: dark vs light, derived from
+    /// `[NSApp.effectiveAppearance].name`. The string is one of
+    /// `NSAppearanceNameAqua`, `NSAppearanceNameDarkAqua`,
+    /// `NSAppearanceNameAccessibilityHighContrastAqua`, etc — any
+    /// name containing the substring "Dark" maps to .dark.
+    pub fn colorScheme(self: *Window) opts_mod.ColorScheme {
+        const appearanceSel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+        const appearance = appearanceSel(self.app, m.sel("effectiveAppearance")) orelse return .unknown;
+        const nameSel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+        const name_str = nameSel(appearance, m.sel("name")) orelse return .unknown;
+        const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+        const cstr = utf8(name_str, m.sel("UTF8String")) orelse return .unknown;
+        const slice = std.mem.span(cstr);
+        if (std.mem.indexOf(u8, slice, "Dark") != null) return .dark;
+        return .light;
     }
 
     /// Render a PNG snapshot of the current WKWebView contents to
@@ -498,6 +636,103 @@ fn didReceiveTrampoline(self: id, _cmd: SEL, controller: id, message: id) callco
     handleScriptMessage(ctx_ptr, message);
 }
 
+/// Trampoline for the NSDistributedNotificationCenter observer that
+/// watches `AppleInterfaceThemeChangedNotification`. Looks up the
+/// owning WindowCtx via the per-observer registry, re-reads the
+/// current appearance through the same path `Window.colorScheme()`
+/// uses, and dispatches to the caller-registered handler.
+fn themeChangedTrampoline(self: id, _cmd: SEL, _notification: id) callconv(.c) void {
+    _ = _cmd;
+    _ = _notification;
+    const ctx_ptr = theme_registry.get(@ptrCast(self)) orelse return;
+    if (ctx_ptr.on_color_scheme) |cb| {
+        // Re-derive scheme via the same path the public getter uses
+        // so the value the caller sees is the new one, not whatever
+        // was current when the observer registered.
+        const app_class = m.getClass("NSApplication");
+        const sharedApp = m.cast(*const fn (id, SEL) callconv(.c) id);
+        const app = sharedApp(@as(id, @ptrCast(app_class)), m.sel("sharedApplication"));
+        const appearanceSel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+        const appearance = appearanceSel(app, m.sel("effectiveAppearance"));
+        const scheme: opts_mod.ColorScheme = blk: {
+            const ap = appearance orelse break :blk .unknown;
+            const nameSel = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+            const name_str = nameSel(ap, m.sel("name")) orelse break :blk .unknown;
+            const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+            const cstr = utf8(name_str, m.sel("UTF8String")) orelse break :blk .unknown;
+            const slice = std.mem.span(cstr);
+            if (std.mem.indexOf(u8, slice, "Dark") != null) break :blk .dark;
+            break :blk .light;
+        };
+        cb(ctx_ptr.on_color_scheme_ctx, scheme);
+    }
+}
+
+/// Lazily install the `NSAppleEventManager` URL handler for
+/// `kInternetEventClass`/`kAEGetURL` (both 'GURL' FourCharCodes
+/// historically — see Apple's URL Schemes / Launch Services docs).
+/// Subsequent calls are no-ops; only `last_url_handler_ctx` rotates so
+/// the trampoline knows which window's callback to fire. Cocoa queues
+/// any URL events that arrived before the AEH installed, then drains
+/// them on the next run-loop spin — so a cold-launch URL clicked from
+/// the Finder before `Window.init` even ran still reaches the handler.
+fn installUrlOpenerIfNeeded(ctx: *WindowCtx) void {
+    last_url_handler_ctx = ctx;
+    if (url_opener_singleton != null) return;
+
+    const NSObject = m.getClass("NSObject");
+    const klass = url_opener_class_cached orelse blk: {
+        const c = m.allocateClass(NSObject, "VerveUrlOpener");
+        m.addMethod(c, m.sel("getUrl:withReplyEvent:"), @ptrCast(&urlOpenTrampoline), "v@:@@");
+        m.registerClass(c);
+        url_opener_class_cached = c;
+        break :blk c;
+    };
+    const alloc_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const init_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const opener = init_id(alloc_id(@as(id, @ptrCast(klass)), m.sel("alloc")), m.sel("init"));
+
+    const NSAppleEventManager = m.getClass("NSAppleEventManager");
+    const sharedManager = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const manager = sharedManager(@as(id, @ptrCast(NSAppleEventManager)), m.sel("sharedAppleEventManager"));
+
+    // FourCharCode 'GURL' = 0x4755524C. Apple's `kInternetEventClass`
+    // and `kAEGetURL` constants both expand to this same code.
+    const four_cc: u32 = 0x4755524C;
+    const setEventHandler = m.cast(*const fn (id, SEL, id, SEL, u32, u32) callconv(.c) void);
+    setEventHandler(
+        manager,
+        m.sel("setEventHandler:andSelector:forEventClass:andEventID:"),
+        opener,
+        m.sel("getUrl:withReplyEvent:"),
+        four_cc,
+        four_cc,
+    );
+    url_opener_singleton = opener;
+    std.log.debug("verve.desktop[macos]: AppleEventManager URL handler installed", .{});
+}
+
+/// AEH trampoline. The event's direct-object parameter (keyword
+/// `'----'` = `keyDirectObject` = 0x2D2D2D2D) holds the URL as an
+/// NSAppleEventDescriptor; `stringValue` yields the NSString form.
+fn urlOpenTrampoline(self: id, _cmd: SEL, event: id, reply: id) callconv(.c) void {
+    _ = self;
+    _ = _cmd;
+    _ = reply;
+
+    const key_direct_object: u32 = 0x2D2D2D2D; // '----'
+    const paramSel = m.cast(*const fn (id, SEL, u32) callconv(.c) ?id);
+    const descriptor = paramSel(event, m.sel("paramDescriptorForKeyword:"), key_direct_object) orelse return;
+    const stringValue = m.cast(*const fn (id, SEL) callconv(.c) ?id);
+    const ns_str = stringValue(descriptor, m.sel("stringValue")) orelse return;
+    const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+    const cstr = utf8(ns_str, m.sel("UTF8String")) orelse return;
+    const url = std.mem.span(cstr);
+
+    const ctx = last_url_handler_ctx orelse return;
+    if (ctx.on_url_open) |cb| cb(ctx.on_url_open_ctx, url);
+}
+
 fn handleSchemeStart(ctx_ptr: *WindowCtx, task: id) !void {
     const requestSel = m.cast(*const fn (id, SEL) callconv(.c) id);
     const req = requestSel(task, m.sel("request"));
@@ -511,11 +746,22 @@ fn handleSchemeStart(ctx_ptr: *WindowCtx, task: id) !void {
     const path_slice = path_cstr[0..path_len];
     std.log.debug("verve.desktop[macos]: scheme '{s}'", .{path_slice});
 
-    const resolved = router.resolve(ctx_ptr.assets, path_slice) catch |err| {
-        std.log.warn("verve.desktop[macos]: scheme miss '{s}' ({s})", .{ path_slice, @errorName(err) });
-        sendError(task, err);
-        return;
-    };
+    const resolved = if (ctx_ptr.dev_assets) |dev|
+        router.resolveWithFallback(ctx_ptr.allocator, dev.io, ctx_ptr.assets, path_slice, dev.dir) catch |err| {
+            std.log.warn("verve.desktop[macos]: scheme miss '{s}' ({s})", .{ path_slice, @errorName(err) });
+            sendError(task, err);
+            return;
+        }
+    else
+        router.resolve(ctx_ptr.assets, path_slice) catch |err| {
+            std.log.warn("verve.desktop[macos]: scheme miss '{s}' ({s})", .{ path_slice, @errorName(err) });
+            sendError(task, err);
+            return;
+        };
+    defer resolved.deinit(ctx_ptr.allocator);
+    if (resolved.owned) {
+        std.log.debug("verve.desktop[macos]: scheme '{s}' served from dev fallback ({d} B)", .{ path_slice, resolved.bytes.len });
+    }
 
     const NSURLResponse = m.getClass("NSHTTPURLResponse");
     const ns_alloc = m.cast(*const fn (id, SEL) callconv(.c) id);
@@ -1029,4 +1275,39 @@ pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
         const c = objAt(arr, m.sel("objectAtIndex:"), i);
         cookieMutate(cookieStore, "deleteCookie:completionHandler:", c);
     }
+}
+
+// ---- Clipboard --------------------------------------------------------------
+//
+// NSPasteboard `generalPasteboard` is the system clipboard; both
+// reads and writes are synchronous on AppKit so no run-loop pump is
+// needed. UTF-8 in / UTF-8 out via `NSPasteboardTypeString`.
+
+pub fn clipboardWriteText(window: *anyopaque, text: []const u8) opts_mod.ClipboardError!void {
+    _ = window;
+    const NSPasteboard = m.getClass("NSPasteboard");
+    const generalPasteboard = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const pb = generalPasteboard(@as(id, @ptrCast(NSPasteboard)), m.sel("generalPasteboard"));
+
+    const clearContents = m.cast(*const fn (id, SEL) callconv(.c) isize);
+    _ = clearContents(pb, m.sel("clearContents"));
+
+    const setString = m.cast(*const fn (id, SEL, id, id) callconv(.c) bool);
+    const ok = setString(pb, m.sel("setString:forType:"), nsString(text), nsString("public.utf8-plain-text"));
+    if (!ok) return opts_mod.ClipboardError.Backend;
+}
+
+pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    _ = window;
+    const NSPasteboard = m.getClass("NSPasteboard");
+    const generalPasteboard = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const pb = generalPasteboard(@as(id, @ptrCast(NSPasteboard)), m.sel("generalPasteboard"));
+
+    const stringForType = m.cast(*const fn (id, SEL, id) callconv(.c) ?id);
+    const ns_str = stringForType(pb, m.sel("stringForType:"), nsString("public.utf8-plain-text")) orelse return null;
+
+    const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+    const cstr = utf8(ns_str, m.sel("UTF8String")) orelse return null;
+    const slice = std.mem.span(cstr);
+    return allocator.dupe(u8, slice) catch return opts_mod.ClipboardError.OutOfMemory;
 }

@@ -16,12 +16,21 @@ const opts_mod = @import("options.zig");
 const ipc = @import("ipc.zig");
 const router = @import("asset_router.zig");
 const cookies_mod = @import("cookies.zig");
+const clipboard_mod = @import("clipboard.zig");
 
 // ---- Opaque GTK/GLib/WebKit pointer types -----------------------------------
 
 const GtkWidget = opaque {};
 const GtkWindow = opaque {};
 const GtkContainer = opaque {};
+const GtkDialog = opaque {};
+const GtkFileChooser = opaque {};
+const GtkFileChooserNative = opaque {};
+const GtkNativeDialog = opaque {};
+const GtkMessageDialog = opaque {};
+const GtkFileFilter = opaque {};
+const CairoSurface = opaque {};
+const GCancellable = opaque {};
 const WebKitWebView = opaque {};
 const WebKitWebContext = opaque {};
 const WebKitUserContentManager = opaque {};
@@ -67,6 +76,168 @@ extern fn gtk_widget_destroy(w: *GtkWidget) void;
 extern fn gtk_main() void;
 extern fn gtk_main_quit() void;
 
+// ---- GTK menu bar + accel group externs ------------------------------------
+//
+// Default menu bar (File + Edit) for parity with the macOS App + Edit
+// menu. Only File→Quit binds an accelerator; Edit items render their
+// shortcut hint in the label text via `gtk_menu_item_new_with_mnemonic`
+// markup but do not attach a `gtk_widget_add_accelerator` binding —
+// otherwise GTK would consume Ctrl+C/V/X before WebKit sees them and
+// silently break clipboard inside HTML inputs.
+const GtkBox = opaque {};
+const GtkMenuShell = opaque {};
+const GtkMenuItem = opaque {};
+const GtkAccelGroup = opaque {};
+const GtkOrientation = c_uint;
+const GdkModifierType = c_uint;
+const GtkAccelFlags = c_uint;
+
+const GTK_ORIENTATION_VERTICAL: GtkOrientation = 1;
+const GTK_ACCEL_VISIBLE: GtkAccelFlags = 1;
+
+extern fn gtk_box_new(orientation: GtkOrientation, spacing: c_int) *GtkWidget;
+extern fn gtk_box_pack_start(box: *GtkBox, child: *GtkWidget, expand: gboolean, fill: gboolean, padding: c_uint) void;
+extern fn gtk_menu_bar_new() *GtkWidget;
+extern fn gtk_menu_new() *GtkWidget;
+extern fn gtk_menu_item_new_with_mnemonic(label: [*:0]const u8) *GtkWidget;
+extern fn gtk_separator_menu_item_new() *GtkWidget;
+extern fn gtk_menu_item_set_submenu(item: *GtkMenuItem, submenu: *GtkWidget) void;
+extern fn gtk_menu_shell_append(shell: *GtkMenuShell, child: *GtkWidget) void;
+extern fn gtk_accel_group_new() *GtkAccelGroup;
+extern fn gtk_window_add_accel_group(win: *GtkWindow, ag: *GtkAccelGroup) void;
+extern fn gtk_widget_add_accelerator(
+    widget: *GtkWidget,
+    signal: [*:0]const u8,
+    ag: *GtkAccelGroup,
+    key: c_uint,
+    mods: GdkModifierType,
+    flags: GtkAccelFlags,
+) void;
+extern fn gtk_accelerator_parse(s: [*:0]const u8, key_out: *c_uint, mods_out: *GdkModifierType) void;
+
+// ---- GTK dialog externs (used by openFileDialog / saveFileDialog / showAlert)
+//
+// File chooser uses the native variant: portal-aware on modern hosts,
+// graceful GtkFileChooserDialog fallback elsewhere. NativeDialog and
+// MessageDialog implement the GtkFileChooser / GtkDialog interfaces
+// respectively, so the getter/setter helpers below operate on the
+// returned widget via interface casts (`@ptrCast` in callers).
+const GtkFileChooserAction = c_uint;
+const GtkResponseType = c_int;
+const GtkDialogFlags = c_uint;
+const GtkMessageType = c_uint;
+const GtkButtonsType = c_uint;
+
+const GTK_FILE_CHOOSER_ACTION_OPEN: GtkFileChooserAction = 0;
+const GTK_FILE_CHOOSER_ACTION_SAVE: GtkFileChooserAction = 1;
+const GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER: GtkFileChooserAction = 2;
+
+const GTK_RESPONSE_ACCEPT: GtkResponseType = -3;
+const GTK_RESPONSE_CANCEL: GtkResponseType = -6;
+const GTK_RESPONSE_DELETE_EVENT: GtkResponseType = -4;
+
+const GTK_DIALOG_MODAL: GtkDialogFlags = 1;
+
+const GTK_MESSAGE_INFO: GtkMessageType = 0;
+const GTK_MESSAGE_WARNING: GtkMessageType = 1;
+const GTK_MESSAGE_ERROR: GtkMessageType = 3;
+
+const GTK_BUTTONS_NONE: GtkButtonsType = 0;
+
+extern fn gtk_file_chooser_native_new(
+    title: [*:0]const u8,
+    parent: ?*GtkWindow,
+    action: GtkFileChooserAction,
+    accept_label: ?[*:0]const u8,
+    cancel_label: ?[*:0]const u8,
+) *GtkFileChooserNative;
+extern fn gtk_native_dialog_run(dialog: *GtkNativeDialog) c_int;
+extern fn gtk_native_dialog_destroy(dialog: *GtkNativeDialog) void;
+extern fn gtk_file_chooser_set_select_multiple(chooser: *GtkFileChooser, select: gboolean) void;
+extern fn gtk_file_chooser_set_current_name(chooser: *GtkFileChooser, name: [*:0]const u8) void;
+extern fn gtk_file_chooser_set_current_folder(chooser: *GtkFileChooser, path: [*:0]const u8) c_int;
+extern fn gtk_file_chooser_get_filename(chooser: *GtkFileChooser) ?[*:0]u8;
+extern fn gtk_file_chooser_add_filter(chooser: *GtkFileChooser, filter: *GtkFileFilter) void;
+
+extern fn gtk_file_filter_new() *GtkFileFilter;
+extern fn gtk_file_filter_set_name(filter: *GtkFileFilter, name: [*:0]const u8) void;
+extern fn gtk_file_filter_add_pattern(filter: *GtkFileFilter, pattern: [*:0]const u8) void;
+
+// `gtk_message_dialog_new` is varargs in C (`format, ...`). The
+// trailing format pointer is declared optional + nullable here so
+// passing `null` matches the no-format call shape; the message text
+// is then set via `gtk_message_dialog_set_markup` to avoid passing
+// any actual format spec.
+extern fn gtk_message_dialog_new(
+    parent: ?*GtkWindow,
+    flags: GtkDialogFlags,
+    msg_type: GtkMessageType,
+    buttons: GtkButtonsType,
+    format: ?[*:0]const u8,
+) *GtkWidget;
+extern fn gtk_message_dialog_set_markup(dialog: *GtkMessageDialog, str: [*:0]const u8) void;
+extern fn gtk_dialog_add_button(dialog: *GtkDialog, text: [*:0]const u8, response_id: c_int) *GtkWidget;
+extern fn gtk_dialog_run(dialog: *GtkDialog) c_int;
+
+// ---- Snapshot externs (used by takeSnapshotPng) ----------------------------
+//
+// `webkit_web_view_get_snapshot` is async — the standard
+// `g_main_context_iteration` pump wraps it sync (same shape as the
+// cookie-store getters). `cairo_surface_write_to_png` handles the
+// PNG encoding inline so no third-party encoder dependency lands in
+// the linker line.
+
+const WebKitSnapshotRegion = c_uint;
+const WebKitSnapshotOptions = c_uint;
+const CairoStatus = c_int;
+
+const WEBKIT_SNAPSHOT_REGION_VISIBLE: WebKitSnapshotRegion = 0;
+const WEBKIT_SNAPSHOT_OPTIONS_NONE: WebKitSnapshotOptions = 0;
+const CAIRO_STATUS_SUCCESS: CairoStatus = 0;
+
+extern fn webkit_web_view_get_snapshot(
+    web_view: *WebKitWebView,
+    region: WebKitSnapshotRegion,
+    options: WebKitSnapshotOptions,
+    cancellable: ?*GCancellable,
+    callback: GAsyncReadyCallback,
+    user_data: ?*anyopaque,
+) void;
+extern fn webkit_web_view_get_snapshot_finish(
+    web_view: *WebKitWebView,
+    result: *GAsyncResult,
+    err: ?*?*GError,
+) ?*CairoSurface;
+
+extern fn cairo_surface_write_to_png(surface: *CairoSurface, filename: [*:0]const u8) CairoStatus;
+extern fn cairo_surface_destroy(surface: *CairoSurface) void;
+
+// ---- GtkClipboard externs --------------------------------------------------
+const GtkClipboard = opaque {};
+const GdkAtom = ?*anyopaque;
+extern fn gtk_clipboard_get(selection: GdkAtom) *GtkClipboard;
+extern fn gtk_clipboard_set_text(clipboard: *GtkClipboard, text: [*:0]const u8, len: c_int) void;
+extern fn gtk_clipboard_store(clipboard: *GtkClipboard) void;
+extern fn gtk_clipboard_wait_for_text(clipboard: *GtkClipboard) ?[*:0]u8;
+// `GDK_SELECTION_CLIPBOARD` is the X11 atom for the CLIPBOARD
+// selection (system clipboard, as opposed to PRIMARY which is the
+// X11 middle-click buffer). It's a GdkAtom which on x86_64-linux is
+// a pointer-sized opaque. The internal `gdk_atom_intern_static_string`
+// path resolves the well-known string.
+extern fn gdk_atom_intern_static_string(name: [*:0]const u8) GdkAtom;
+
+// ---- GtkSettings (color-scheme query) --------------------------------------
+const GtkSettings = opaque {};
+extern fn gtk_settings_get_default() ?*GtkSettings;
+// g_object_get is varargs in C — declare with the exact arity we need.
+// Final NULL terminator is the sentinel; passing null pointer suffices.
+extern fn g_object_get(
+    object: *GtkSettings,
+    first_property_name: [*:0]const u8,
+    out: *gboolean,
+    sentinel: ?*anyopaque,
+) void;
+
 extern fn g_signal_connect_data(
     instance: ?*anyopaque,
     detailed_signal: [*:0]const u8,
@@ -77,6 +248,7 @@ extern fn g_signal_connect_data(
 ) c_ulong;
 extern fn g_object_unref(o: ?*anyopaque) void;
 extern fn g_free(p: ?*anyopaque) void;
+extern fn g_memdup2(mem: ?*const anyopaque, byte_size: usize) ?*anyopaque;
 extern fn g_quark_from_static_string(s: [*:0]const u8) GQuark;
 extern fn g_error_new_literal(domain: GQuark, code: c_int, message: [*:0]const u8) *GError;
 extern fn g_error_free(err: *GError) void;
@@ -87,6 +259,26 @@ extern fn g_memory_input_stream_new_from_data(
 ) *GInputStream;
 
 extern fn g_main_context_iteration(ctx: ?*anyopaque, may_block: gboolean) gboolean;
+
+// ---- GIOChannel externs (used by deep_link.attachUrlSocket) ----------------
+//
+// `g_io_channel_unix_new` wraps a raw POSIX fd in a GIOChannel so it
+// plugs into the GTK main loop's source dispatch. `g_io_add_watch`
+// installs a callback fired when the socket has bytes to read; we
+// pass `G_IO_IN` (= 1) plus the per-window WindowCtx pointer as
+// user_data so the trampoline can route inbound URLs through the
+// stored handler.
+const GIOChannel = opaque {};
+const GIOCondition = c_uint;
+const G_IO_IN: GIOCondition = 1;
+const GIOFunc = *const fn (source: *GIOChannel, cond: GIOCondition, data: ?*anyopaque) callconv(.c) gboolean;
+
+extern fn g_io_channel_unix_new(fd: c_int) *GIOChannel;
+extern fn g_io_channel_set_close_on_unref(channel: *GIOChannel, do_close: gboolean) void;
+extern fn g_io_add_watch(channel: *GIOChannel, cond: GIOCondition, func: GIOFunc, data: ?*anyopaque) c_uint;
+extern fn g_io_channel_unref(channel: *GIOChannel) void;
+
+extern "c" fn recv(fd: c_int, buf: *anyopaque, len: usize, flags: c_int) isize;
 extern fn g_list_length(list: ?*GList) c_uint;
 extern fn g_list_nth_data(list: ?*GList, n: c_uint) ?*anyopaque;
 extern fn g_list_free_full(list: ?*GList, destroy: GDestroyNotify) void;
@@ -225,9 +417,17 @@ const WindowCtx = struct {
     opts: opts_mod.WindowOptions,
     on_message: ?opts_mod.MessageHandler,
     on_message_ctx: ?*anyopaque,
+    on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
+    on_color_scheme_ctx: ?*anyopaque = null,
+    on_url_open: ?opts_mod.UrlOpenHandler = null,
+    on_url_open_ctx: ?*anyopaque = null,
+    url_socket_fd: c_int = -1,
+    url_socket_watch: c_uint = 0,
+    color_scheme_signal: c_ulong = 0,
     window: ?*GtkWidget = null,
     webview: ?*WebKitWebView = null,
     web_context: ?*WebKitWebContext = null,
+    accel_group: ?*GtkAccelGroup = null,
 };
 
 // GTK's main loop has no automatic last-window tracking, so we count
@@ -250,6 +450,8 @@ pub const Window = struct {
             .opts = opts,
             .on_message = opts.on_message,
             .on_message_ctx = opts.on_message_ctx,
+            .on_url_open = opts.on_url_open,
+            .on_url_open_ctx = opts.on_url_open_ctx,
         };
 
         const window_widget = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -309,7 +511,17 @@ pub const Window = struct {
             webkit_settings_set_enable_developer_extras(settings, 1);
         }
 
-        gtk_container_add(@ptrCast(window_widget), wv_widget);
+        if (opts.install_default_menu) {
+            // GtkBox wraps the menu bar + webview vertically. Failure
+            // to allocate any menu piece falls back to the opt-out
+            // shape (webview as the sole window child) — apps still
+            // boot, just menu-less.
+            installDefaultMenuBar(heap, window_widget, wv_widget) catch {
+                gtk_container_add(@ptrCast(window_widget), wv_widget);
+            };
+        } else {
+            gtk_container_add(@ptrCast(window_widget), wv_widget);
+        }
 
         if (opts.initial_path.len > 0) {
             var url_buf: [1024]u8 = undefined;
@@ -371,6 +583,69 @@ pub const Window = struct {
         return .{ .window = @ptrCast(self) };
     }
 
+    /// System clipboard handle. GtkClipboard is keyed on a display +
+    /// selection (CLIPBOARD here, not PRIMARY); the per-window
+    /// scoping just gives API parity with `cookies()`.
+    pub fn clipboard(self: *Window) clipboard_mod.Clipboard {
+        return .{ .window = @ptrCast(self) };
+    }
+
+    /// Register a callback fired on GtkSettings'
+    /// `notify::gtk-application-prefer-dark-theme` signal — emitted
+    /// when GTK reapplies its theme (e.g. user toggles dark mode in
+    /// the desktop's appearance settings). `g_signal_connect_data`
+    /// returns the connection id; we stash it on the ctx so a
+    /// follow-up `setColorSchemeHandler(null, null)` can disconnect.
+    pub fn setColorSchemeHandler(self: *Window, cb: ?opts_mod.ColorSchemeHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_color_scheme = cb;
+        self.ctx.on_color_scheme_ctx = ctx;
+        if (self.ctx.color_scheme_signal == 0 and cb != null) {
+            const settings = gtk_settings_get_default() orelse return;
+            const sig = g_signal_connect_data(
+                @ptrCast(settings),
+                "notify::gtk-application-prefer-dark-theme",
+                @as(GCallback, @ptrCast(&onColorSchemeChanged)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+            self.ctx.color_scheme_signal = sig;
+        }
+    }
+
+    /// Register a deep-link URL handler. Linux ships only the
+    /// receive-side wiring in this pass — cold-launch (OS spawns the
+    /// app with the URL in argv) is the supported delivery path,
+    /// driven by the template's argv parser feeding through
+    /// `deliverUrl`. Warm-launch URL forwarding via abstract Unix
+    /// socket from a second instance to the running window is a
+    /// follow-up.
+    pub fn setUrlOpenHandler(self: *Window, cb: ?opts_mod.UrlOpenHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_url_open = cb;
+        self.ctx.on_url_open_ctx = ctx;
+    }
+
+    /// Synthesize a URL delivery — call the registered handler with
+    /// `url`. Used by templates to feed argv-derived cold-launch URLs
+    /// through the same callback the future warm-launch socket
+    /// receiver will eventually drive.
+    pub fn deliverUrl(self: *Window, url: []const u8) void {
+        if (self.ctx.on_url_open) |cb| cb(self.ctx.on_url_open_ctx, url);
+    }
+
+    /// Read GTK's `gtk-application-prefer-dark-theme` boolean. This
+    /// reflects the user's theme choice on most GNOME / KDE desktops
+    /// and matches what GTK uses internally to flip widget colors.
+    /// On hosts without a GtkSettings backend (uncommon — `gtk_init`
+    /// already failed earlier in that case), collapses to .unknown.
+    pub fn colorScheme(self: *Window) opts_mod.ColorScheme {
+        _ = self;
+        const settings = gtk_settings_get_default() orelse return .unknown;
+        var prefer_dark: gboolean = 0;
+        g_object_get(settings, "gtk-application-prefer-dark-theme", &prefer_dark, null);
+        return if (prefer_dark != 0) .dark else .light;
+    }
+
     pub fn run(self: *Window) void {
         _ = self;
         gtk_main();
@@ -391,34 +666,94 @@ pub const Window = struct {
     }
 
     // ---- Dialogs ------------------------------------------------------------
-    // Real GtkFileChooserDialog + GtkMessageDialog wiring is a follow-up;
-    // returning Unsupported lets cross-platform call sites compile and
-    // makes the missing surface visible at runtime.
+    //
+    // File / save dialogs use `GtkFileChooserNative` so the system file
+    // picker (portal on modern hosts, GtkFileChooserDialog fallback
+    // elsewhere) shows up rather than a custom-rendered window. Alerts
+    // use `GtkMessageDialog` with `gtk_dialog_run` for sync modal
+    // behavior — same shape as the macOS NSAlert wrapper.
 
     pub fn openFileDialog(self: *Window, allocator: std.mem.Allocator, opts: opts_mod.FileDialogOptions) opts_mod.DialogError![]u8 {
-        _ = self;
-        _ = allocator;
-        _ = opts;
-        return opts_mod.DialogError.Unsupported;
+        return runFileChooserNative(self, allocator, opts, .open);
     }
 
     pub fn saveFileDialog(self: *Window, allocator: std.mem.Allocator, opts: opts_mod.FileDialogOptions) opts_mod.DialogError![]u8 {
-        _ = self;
-        _ = allocator;
-        _ = opts;
-        return opts_mod.DialogError.Unsupported;
+        return runFileChooserNative(self, allocator, opts, .save);
     }
 
     pub fn showAlert(self: *Window, opts: opts_mod.AlertOptions) usize {
-        _ = self;
-        _ = opts;
-        return 0;
+        const msg_type: GtkMessageType = switch (opts.style) {
+            .informational => GTK_MESSAGE_INFO,
+            .warning => GTK_MESSAGE_WARNING,
+            .critical => GTK_MESSAGE_ERROR,
+        };
+        const parent: ?*GtkWindow = if (self.ctx.window) |w| @ptrCast(w) else null;
+        const dialog_widget = gtk_message_dialog_new(parent, GTK_DIALOG_MODAL, msg_type, GTK_BUTTONS_NONE, null);
+        const dialog: *GtkDialog = @ptrCast(dialog_widget);
+
+        // Set title bar + body. `gtk_window_set_title` is safe on
+        // GtkMessageDialog (it inherits GtkWindow).
+        if (opts.title.len > 0) {
+            const title_z = self.ctx.allocator.dupeZ(u8, opts.title) catch return 0;
+            defer self.ctx.allocator.free(title_z);
+            gtk_window_set_title(@ptrCast(dialog_widget), title_z.ptr);
+        }
+        if (opts.message.len > 0) {
+            const msg_z = self.ctx.allocator.dupeZ(u8, opts.message) catch return 0;
+            defer self.ctx.allocator.free(msg_z);
+            gtk_message_dialog_set_markup(@ptrCast(dialog_widget), msg_z.ptr);
+        }
+
+        const buttons = if (opts.buttons.len == 0)
+            &[_][]const u8{"OK"}
+        else
+            opts.buttons;
+        for (buttons, 0..) |label, i| {
+            const z = self.ctx.allocator.dupeZ(u8, label) catch continue;
+            defer self.ctx.allocator.free(z);
+            // Response IDs 0..N map directly to button index in
+            // `opts.buttons` order. Cocoa returns the same convention
+            // (first button = 0, default action) so the surface stays
+            // consistent across platforms.
+            _ = gtk_dialog_add_button(dialog, z.ptr, @intCast(i));
+        }
+
+        const response = gtk_dialog_run(dialog);
+        gtk_widget_destroy(dialog_widget);
+        if (response < 0) return 0; // delete / escape — fall back to default action
+        return @intCast(response);
     }
 
+    /// Capture the visible WebView region as PNG via
+    /// `webkit_web_view_get_snapshot` (async, sync-wrapped through a
+    /// GMainContext pump) + `cairo_surface_write_to_png`. Same shape
+    /// as the macOS NSImage path; output is byte-for-byte deterministic
+    /// for a given DOM render at a given device pixel ratio, so it
+    /// plugs into the existing Level-3 golden-diff harness once the
+    /// Linux smoke runner exists.
     pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
-        _ = self;
-        _ = path;
-        return opts_mod.SnapshotError.Unsupported;
+        const wv = self.ctx.webview orelse return opts_mod.SnapshotError.Unsupported;
+
+        var cell: SnapshotCell = .{};
+        webkit_web_view_get_snapshot(
+            wv,
+            WEBKIT_SNAPSHOT_REGION_VISIBLE,
+            WEBKIT_SNAPSHOT_OPTIONS_NONE,
+            null,
+            onSnapshotDone,
+            @ptrCast(&cell),
+        );
+        pumpMainContextUntilDone(&cell.done);
+
+        const result = cell.result orelse return opts_mod.SnapshotError.CaptureFailed;
+        const surface = webkit_web_view_get_snapshot_finish(wv, result, null) orelse return opts_mod.SnapshotError.CaptureFailed;
+        defer cairo_surface_destroy(surface);
+
+        const path_z = self.ctx.allocator.dupeZ(u8, path) catch return opts_mod.SnapshotError.WriteFailed;
+        defer self.ctx.allocator.free(path_z);
+        if (cairo_surface_write_to_png(surface, path_z.ptr) != CAIRO_STATUS_SUCCESS) {
+            return opts_mod.SnapshotError.WriteFailed;
+        }
     }
 };
 
@@ -427,6 +762,100 @@ pub const Window = struct {
 fn onDestroy(_: ?*GtkWidget, _: ?*anyopaque) callconv(.c) void {
     if (live_windows > 0) live_windows -= 1;
     if (live_windows == 0) gtk_main_quit();
+}
+
+/// Build the default File + Edit menu bar and pack it above the
+/// webview in a vertical GtkBox. Stores the accel group on `ctx`
+/// (transitively freed when the window is destroyed — GTK ref-counts
+/// the whole widget tree). Returns an error so the caller can fall
+/// back to the menu-less layout on allocation failure.
+fn installDefaultMenuBar(ctx: *WindowCtx, window_widget: *GtkWidget, wv_widget: *GtkWidget) !void {
+    const box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(@ptrCast(window_widget), box);
+
+    const menu_bar = gtk_menu_bar_new();
+    const accel_group = gtk_accel_group_new();
+    gtk_window_add_accel_group(@ptrCast(window_widget), accel_group);
+    ctx.accel_group = accel_group;
+
+    // File → Quit (Ctrl+Q is the only real shortcut binding).
+    const file_item_widget = gtk_menu_item_new_with_mnemonic("_File");
+    const file_menu = gtk_menu_new();
+    gtk_menu_item_set_submenu(@ptrCast(file_item_widget), file_menu);
+    gtk_menu_shell_append(@ptrCast(menu_bar), file_item_widget);
+
+    const quit_item = gtk_menu_item_new_with_mnemonic("_Quit");
+    _ = g_signal_connect_data(
+        quit_item,
+        "activate",
+        @as(GCallback, @ptrCast(&onQuitActivate)),
+        @ptrCast(ctx),
+        null,
+        0,
+    );
+    var quit_key: c_uint = 0;
+    var quit_mods: GdkModifierType = 0;
+    gtk_accelerator_parse("<Control>q", &quit_key, &quit_mods);
+    gtk_widget_add_accelerator(quit_item, "activate", accel_group, quit_key, quit_mods, GTK_ACCEL_VISIBLE);
+    gtk_menu_shell_append(@ptrCast(file_menu), quit_item);
+
+    // Edit → standard items. NO `gtk_widget_add_accelerator` call —
+    // WebKitGTK handles Ctrl+C/V/X/Z/Y/A inside text inputs natively,
+    // and adding a GTK accelerator would consume the key event before
+    // WebKit sees it. The mnemonic-with-tab labels render the shortcut
+    // hint without binding a real accelerator.
+    const edit_item_widget = gtk_menu_item_new_with_mnemonic("_Edit");
+    const edit_menu = gtk_menu_new();
+    gtk_menu_item_set_submenu(@ptrCast(edit_item_widget), edit_menu);
+    gtk_menu_shell_append(@ptrCast(menu_bar), edit_item_widget);
+
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("_Undo    Ctrl+Z"));
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("_Redo    Ctrl+Y"));
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_separator_menu_item_new());
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("Cu_t    Ctrl+X"));
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("_Copy    Ctrl+C"));
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("_Paste    Ctrl+V"));
+    gtk_menu_shell_append(@ptrCast(edit_menu), gtk_menu_item_new_with_mnemonic("Select _All    Ctrl+A"));
+
+    gtk_box_pack_start(@ptrCast(box), menu_bar, 0, 0, 0);
+    gtk_box_pack_start(@ptrCast(box), wv_widget, 1, 1, 0);
+}
+
+/// Wrap an already-bound `AF_UNIX` SOCK_DGRAM fd in a GIOChannel
+/// watch keyed on `G_IO_IN`. Called by `deep_link.startListener` on
+/// the Linux backend; the fd ownership transfers — we set
+/// `close_on_unref(true)` so the channel cleans the fd up at
+/// window destruction.
+pub fn attachUrlSocket(window: *Window, fd: c_int) !void {
+    const ch = g_io_channel_unix_new(fd);
+    g_io_channel_set_close_on_unref(ch, 1);
+    const watch = g_io_add_watch(ch, G_IO_IN, &onUrlSocketReadable, @ptrCast(window.ctx));
+    window.ctx.url_socket_fd = fd;
+    window.ctx.url_socket_watch = watch;
+}
+
+/// `G_IO_IN` callback. One datagram per `recv`; URL bytes are UTF-8
+/// with no terminator. Returns `1` (TRUE) to keep the watch active —
+/// returning `0` would unregister the source after the first URL.
+fn onUrlSocketReadable(source: *GIOChannel, _cond: GIOCondition, data: ?*anyopaque) callconv(.c) gboolean {
+    _ = source;
+    _ = _cond;
+    const cx: *WindowCtx = @ptrCast(@alignCast(data orelse return 1));
+    var buf: [4096]u8 = undefined;
+    const n = recv(cx.url_socket_fd, &buf, buf.len, 0);
+    if (n <= 0) return 1;
+    const url = buf[0..@intCast(n)];
+    if (cx.on_url_open) |cb| cb(cx.on_url_open_ctx, url);
+    return 1;
+}
+
+/// `activate` handler for File → Quit. Routes through the per-window
+/// close path so the existing `live_windows` counter fires
+/// `gtk_main_quit` only when the last window closes — matches the
+/// multi-window semantics on the macOS + Windows backends.
+fn onQuitActivate(_: ?*GtkMenuItem, user_data: ?*anyopaque) callconv(.c) void {
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return));
+    if (cx.window) |w| gtk_widget_destroy(w);
 }
 
 fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callconv(.c) void {
@@ -439,22 +868,54 @@ fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callcon
     const path: []const u8 = if (std.mem.indexOf(u8, uri_slice, auth)) |i| uri_slice[i + auth.len ..] else uri_slice;
     std.log.debug("verve.desktop[linux]: scheme '{s}' → '{s}'", .{ uri_slice, path });
 
-    const resolved = router.resolve(cx.opts.assets, path) catch {
-        std.log.warn("verve.desktop[linux]: 404 {s}", .{path});
-        const err = g_error_new_literal(g_quark_from_static_string("verve"), 404, "not found");
-        webkit_uri_scheme_request_finish_error(req, err);
-        g_error_free(err);
-        return;
+    const resolved = blk: {
+        if (cx.opts.dev_assets) |dev| {
+            break :blk router.resolveWithFallback(cx.allocator, dev.io, cx.opts.assets, path, dev.dir) catch {
+                std.log.warn("verve.desktop[linux]: 404 {s}", .{path});
+                const err = g_error_new_literal(g_quark_from_static_string("verve"), 404, "not found");
+                webkit_uri_scheme_request_finish_error(req, err);
+                g_error_free(err);
+                return;
+            };
+        }
+        break :blk router.resolve(cx.opts.assets, path) catch {
+            std.log.warn("verve.desktop[linux]: 404 {s}", .{path});
+            const err = g_error_new_literal(g_quark_from_static_string("verve"), 404, "not found");
+            webkit_uri_scheme_request_finish_error(req, err);
+            g_error_free(err);
+            return;
+        };
     };
+    defer resolved.deinit(cx.allocator);
 
-    const stream = g_memory_input_stream_new_from_data(resolved.bytes.ptr, @intCast(resolved.bytes.len), null);
+    // WebKitGTK's `from_data` does NOT copy the input buffer — the
+    // bytes must outlive the stream. Embedded entries are static, so
+    // passing the slice directly with a null destroy notify is fine.
+    // Dev-mode owned bytes are about to be freed by the defer above,
+    // so we hand a glib-allocated copy to the stream with `g_free` as
+    // the destroy notify.
+    const len_c: c_long = @intCast(resolved.bytes.len);
+    var stream: *GInputStream = undefined;
+    if (resolved.owned) {
+        const copy = g_memdup2(resolved.bytes.ptr, resolved.bytes.len) orelse {
+            std.log.warn("verve.desktop[linux]: g_memdup2 OOM", .{});
+            const err = g_error_new_literal(g_quark_from_static_string("verve"), 500, "out of memory");
+            webkit_uri_scheme_request_finish_error(req, err);
+            g_error_free(err);
+            return;
+        };
+        stream = g_memory_input_stream_new_from_data(@ptrCast(copy), len_c, g_free);
+    } else {
+        stream = g_memory_input_stream_new_from_data(resolved.bytes.ptr, len_c, null);
+    }
+
     var ct_buf: [128]u8 = undefined;
     const ct_z = std.fmt.bufPrintZ(&ct_buf, "{s}", .{resolved.content_type}) catch {
-        webkit_uri_scheme_request_finish(req, stream, @intCast(resolved.bytes.len), "application/octet-stream");
+        webkit_uri_scheme_request_finish(req, stream, len_c, "application/octet-stream");
         g_object_unref(stream);
         return;
     };
-    webkit_uri_scheme_request_finish(req, stream, @intCast(resolved.bytes.len), ct_z.ptr);
+    webkit_uri_scheme_request_finish(req, stream, len_c, ct_z.ptr);
     g_object_unref(stream);
 }
 
@@ -466,6 +927,84 @@ fn onScriptMessage(_: *WebKitUserContentManager, message: *WebKitJavascriptResul
     defer g_free(raw);
     const slice = std.mem.span(raw);
     if (cx.on_message) |h| h(cx.on_message_ctx, slice);
+}
+
+// ---- File chooser ----------------------------------------------------------
+
+const FileChooserKind = enum { open, save };
+
+fn runFileChooserNative(
+    self: *Window,
+    allocator: std.mem.Allocator,
+    opts: opts_mod.FileDialogOptions,
+    kind: FileChooserKind,
+) opts_mod.DialogError![]u8 {
+    const action: GtkFileChooserAction = switch (kind) {
+        .open => if (opts.pick_directory) GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER else GTK_FILE_CHOOSER_ACTION_OPEN,
+        .save => GTK_FILE_CHOOSER_ACTION_SAVE,
+    };
+
+    const title_default: []const u8 = switch (kind) {
+        .open => "Open",
+        .save => "Save",
+    };
+    const title_src = if (opts.title.len > 0) opts.title else title_default;
+    const title_z = allocator.dupeZ(u8, title_src) catch return opts_mod.DialogError.OutOfMemory;
+    defer allocator.free(title_z);
+
+    const accept_label_default: []const u8 = switch (kind) {
+        .open => "_Open",
+        .save => "_Save",
+    };
+    const accept_z = allocator.dupeZ(u8, accept_label_default) catch return opts_mod.DialogError.OutOfMemory;
+    defer allocator.free(accept_z);
+    const cancel_z = allocator.dupeZ(u8, "_Cancel") catch return opts_mod.DialogError.OutOfMemory;
+    defer allocator.free(cancel_z);
+
+    const parent: ?*GtkWindow = if (self.ctx.window) |w| @ptrCast(w) else null;
+    const dialog = gtk_file_chooser_native_new(title_z.ptr, parent, action, accept_z.ptr, cancel_z.ptr);
+    defer g_object_unref(@ptrCast(dialog));
+    const chooser: *GtkFileChooser = @ptrCast(dialog);
+
+    // Open: optionally allow multi-select. Save: cannot multi-select
+    // (Gtk enforces this), so only honor for open.
+    if (kind == .open and opts.allow_multiple) {
+        gtk_file_chooser_set_select_multiple(chooser, 1);
+    }
+
+    if (opts.default_path.len > 0) {
+        const path_z = allocator.dupeZ(u8, opts.default_path) catch return opts_mod.DialogError.OutOfMemory;
+        defer allocator.free(path_z);
+        _ = gtk_file_chooser_set_current_folder(chooser, path_z.ptr);
+    }
+
+    if (kind == .save and opts.default_name.len > 0) {
+        const name_z = allocator.dupeZ(u8, opts.default_name) catch return opts_mod.DialogError.OutOfMemory;
+        defer allocator.free(name_z);
+        gtk_file_chooser_set_current_name(chooser, name_z.ptr);
+    }
+
+    if (opts.allowed_extensions.len > 0) {
+        const filter = gtk_file_filter_new();
+        var name_buf: [256]u8 = undefined;
+        if (std.fmt.bufPrintZ(&name_buf, "Allowed types", .{})) |z| {
+            gtk_file_filter_set_name(filter, z.ptr);
+        } else |_| {}
+        for (opts.allowed_extensions) |ext| {
+            var pat_buf: [128]u8 = undefined;
+            const pat = std.fmt.bufPrintZ(&pat_buf, "*.{s}", .{ext}) catch continue;
+            gtk_file_filter_add_pattern(filter, pat.ptr);
+        }
+        gtk_file_chooser_add_filter(chooser, filter);
+    }
+
+    const response = gtk_native_dialog_run(@ptrCast(dialog));
+    if (response != GTK_RESPONSE_ACCEPT) return opts_mod.DialogError.Cancelled;
+
+    const raw = gtk_file_chooser_get_filename(chooser) orelse return opts_mod.DialogError.Cancelled;
+    defer g_free(@ptrCast(raw));
+    const slice = std.mem.span(raw);
+    return allocator.dupe(u8, slice) catch return opts_mod.DialogError.OutOfMemory;
 }
 
 // ---- Cookie store -----------------------------------------------------------
@@ -498,6 +1037,35 @@ fn onGetAllCookiesDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaq
 fn onSimpleAsyncDone(_: ?*anyopaque, _: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     const cell: *SimpleAsyncCell = @ptrCast(@alignCast(user_data orelse return));
     cell.done = true;
+}
+
+const SnapshotCell = extern struct {
+    result: ?*GAsyncResult = null,
+    done: bool = false,
+};
+
+fn onSnapshotDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *SnapshotCell = @ptrCast(@alignCast(user_data orelse return));
+    cell.result = res;
+    cell.done = true;
+}
+
+/// GtkSettings property-notify trampoline. The signal fires every
+/// time the `gtk-application-prefer-dark-theme` property changes;
+/// we re-read it and pass the resulting ColorScheme to the user
+/// handler. Signature matches `GCallback` (variadic at the C ABI;
+/// the GObject framework prepends the instance pointer and any
+/// signal-specific args, so we accept them by `?*anyopaque`).
+fn onColorSchemeChanged(_: ?*anyopaque, _: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return));
+    const cb = cx.on_color_scheme orelse return;
+    const settings = gtk_settings_get_default() orelse {
+        cb(cx.on_color_scheme_ctx, .unknown);
+        return;
+    };
+    var prefer_dark: gboolean = 0;
+    g_object_get(settings, "gtk-application-prefer-dark-theme", &prefer_dark, null);
+    cb(cx.on_color_scheme_ctx, if (prefer_dark != 0) .dark else .light);
 }
 
 fn pumpMainContextUntilDone(done: *const bool) void {
@@ -651,4 +1219,41 @@ pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
         webkit_cookie_manager_delete_cookie(mgr, c, null, &onSimpleAsyncDone, @ptrCast(&cell));
         pumpMainContextUntilDone(&cell.done);
     }
+}
+
+// ---- Clipboard --------------------------------------------------------------
+//
+// `gtk_clipboard_get(CLIPBOARD)` returns a process-global GtkClipboard
+// keyed on the display's CLIPBOARD selection (the system clipboard;
+// not PRIMARY, which is the middle-click selection). `set_text` is
+// synchronous; `wait_for_text` blocks the main loop until the owning
+// client responds — on X11/Wayland that's a single round-trip, so no
+// nested GMainContext pump is needed.
+
+fn clipboardHandle() *GtkClipboard {
+    return gtk_clipboard_get(gdk_atom_intern_static_string("CLIPBOARD"));
+}
+
+pub fn clipboardWriteText(window: *anyopaque, text: []const u8) opts_mod.ClipboardError!void {
+    const self: *Window = @ptrCast(@alignCast(window));
+
+    const text_z = self.ctx.allocator.dupeZ(u8, text) catch return opts_mod.ClipboardError.OutOfMemory;
+    defer self.ctx.allocator.free(text_z);
+
+    const clip = clipboardHandle();
+    gtk_clipboard_set_text(clip, text_z.ptr, @intCast(text.len));
+    // Persist past the app's exit so a paste in another window after
+    // we quit still sees the bytes (the X11 selection owner is the
+    // application by default).
+    gtk_clipboard_store(clip);
+}
+
+pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    _ = window;
+    const clip = clipboardHandle();
+    const raw = gtk_clipboard_wait_for_text(clip) orelse return null;
+    defer g_free(@ptrCast(raw));
+    const slice = std.mem.span(raw);
+    if (slice.len == 0) return null;
+    return allocator.dupe(u8, slice) catch return opts_mod.ClipboardError.OutOfMemory;
 }

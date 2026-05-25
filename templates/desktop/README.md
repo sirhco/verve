@@ -184,7 +184,7 @@ const window = try desktop.Window.init(allocator, .{
     .assets         = asset_entries,              // default &.{}
     .on_message     = null,                       // default null
     .on_message_ctx = null,                       // default null
-    .install_default_menu = true,                 // macOS only; default true
+    .install_default_menu = true,                 // all 3 platforms; default true
 });
 ```
 
@@ -307,10 +307,12 @@ const clicked_idx = window.showAlert(.{
 
 `buttons` empty defaults to `["OK"]`. Win/Linux return 0.
 
-## Native menu bar (macOS)
+## Native menu bar
 
-The default `install_default_menu = true` builds three menus on first
-window:
+The default `install_default_menu = true` stamps a menu bar on every
+platform:
+
+**macOS** — three menus on first window:
 
 - **App menu** — Quit (Cmd+Q)
 - **Edit menu** — Undo / Redo / Cut / Copy / Paste / Select All. The
@@ -318,9 +320,110 @@ window:
   fire; without it, Cmd+C / Cmd+V in a text input does nothing.
 - **Window menu** — Minimize / Close
 
-Set `.install_default_menu = false` if you build menus from scratch.
-Win/Linux currently ignore the field (custom menu bars on those
-platforms are a follow-up).
+**Windows + Linux** — File + Edit:
+
+- **File menu** — Quit (Ctrl+Q). Routes through `WM_CLOSE` (Win) or
+  `gtk_widget_destroy` (Linux) so multi-window last-window-quit
+  semantics keep working.
+- **Edit menu** — Undo / Redo / Cut / Copy / Paste / Select All.
+  Items render their shortcut hint in the label but the embedded
+  webview (WebView2 / WebKitGTK) keeps owning the actual
+  Ctrl+C/V/X/Z/Y/A keystrokes. Binding an OS-level accelerator for
+  those keys would consume the event before the webview saw it and
+  silently break clipboard inside HTML inputs.
+
+Set `.install_default_menu = false` to suppress the bar entirely
+(apps building their own).
+
+## Tray icon
+
+```zig
+var tray = try desktop.tray.init(allocator, &window, .{
+    .label   = "V",                // macOS status-bar text; ignored on Win/Linux
+    .tooltip = "Verve Desktop",    // hover tooltip
+});
+defer tray.deinit();
+
+// Optional later update:
+tray.setTooltip("Now with 30% more cowbell");
+```
+
+Platform delivery:
+
+- **macOS** — `NSStatusItem` from `[NSStatusBar systemStatusBar]`.
+  `label` renders next to the icon in the menubar.
+- **Windows** — `Shell_NotifyIconW(NIM_ADD)` with stock
+  `IDI_APPLICATION` icon. Tooltip shows on hover.
+- **Linux** — `libayatana-appindicator3` (`app_indicator_new`).
+  Requires `libayatana-appindicator3-1` at runtime; nearly every
+  GNOME/KDE distro ships it.
+
+Click handlers + submenus are deferred to a future bundle. The
+tray icon is purely presence + tooltip in this release.
+
+## Notifications
+
+```zig
+try desktop.notifications.show(allocator, .{
+    .title = "Hello",
+    .body  = "From the native side.",
+});
+```
+
+- **macOS** — `NSUserNotification` + `NSUserNotificationCenter`.
+  Deprecated by Apple but still works without a permission grant.
+- **Linux** — `libnotify` (`notify_init` + `notify_notification_new`
+  + `notify_notification_show`). Requires `libnotify` at runtime.
+- **Windows** — returns `error.Unsupported`. Toast notifications
+  need COM + AUMID + Start-menu registration; deferred. Apps that
+  need Win notifications today combine `desktop.tray` with a manual
+  `Shell_NotifyIconW(NIF_INFO)` call against the tray icon.
+
+## Deep-link URLs
+
+```zig
+window.setUrlOpenHandler(onUrlOpen, ctx_ptr);
+// Optional: feed an argv-derived URL through the same callback.
+if (cold_launch_url) |u| window.deliverUrl(u);
+```
+
+`setUrlOpenHandler(cb, ctx)` registers a callback fired when the OS
+delivers a `verve://...` URL (or whatever scheme you register). The
+callback receives the full URL string; the slice is **not** retained
+across the call — copy if you need to outlive the trampoline.
+
+Platform delivery:
+
+- **macOS** — installs an `NSAppleEventManager` handler for
+  `kInternetEventClass`/`kAEGetURL`. Both warm-launch and
+  cold-launch URLs route through the same path; Cocoa queues
+  pre-launch URLs until the AEH installs, then drains them.
+- **Windows + Linux** — both cold-launch and warm-launch.
+  Cold-launch: the OS spawns the binary with the URL in argv; the
+  scaffold template's `main.zig` parses `--url <u>` or any
+  positional starting with `verve://` and calls
+  `Window.deliverUrl(url)` after the window opens. Warm-launch: the
+  same template detects `single_instance.acquire` returning
+  `AlreadyRunning`, calls
+  `desktop.deep_link.forwardToRunningInstance(allocator, name, url)`,
+  and exits — the forwarder uses `FindWindowW` + `WM_COPYDATA` on
+  Win and an abstract `AF_UNIX SOCK_DGRAM` socket on Linux. The
+  receive side is auto-installed: Win sits in the wndProc, Linux
+  binds via `desktop.deep_link.startListener(&window, name)` after
+  the window opens.
+
+Registering the scheme with the OS is install-time:
+
+- **macOS** — `zig build bundle -Durl-scheme=verve` injects
+  `CFBundleURLTypes` into the generated `Info.plist`. The .app
+  must be in `/Applications/` (or otherwise registered with
+  Launch Services) for the OS to route URLs to it.
+- **Windows** — write `HKCU\Software\Classes\verve\shell\open\command`
+  pointing at the exe (the framework does not ship a helper yet;
+  see the section in `docs/19-desktop.md` for the registry shape).
+- **Linux** — install a `.desktop` file with
+  `MimeType=x-scheme-handler/verve` and run
+  `update-desktop-database ~/.local/share/applications`.
 
 ## Window snapshot (macOS)
 
@@ -356,6 +459,7 @@ Build options:
 |------|---------|---------|
 | `-Dbundle-id=...` | `dev.verve.<name>` | `CFBundleIdentifier` in Info.plist |
 | `-Dbundle-version=...` | `0.0.0` | `CFBundleVersion` + `CFBundleShortVersionString` |
+| `-Dicon=<path>` | (none) | Copy `<path>` into `Contents/Resources/AppIcon.icns` and reference it from `CFBundleIconFile`. Accept absolute or build-root-relative paths. Without it the bundle falls back to the generic macOS app glyph. |
 | `-Dcodesign=<identity>` | (none) | Sign the bundle after layout. Use `-` for ad-hoc |
 
 Example:
@@ -364,7 +468,18 @@ Example:
 zig build bundle \
   -Dbundle-id=com.example.app \
   -Dbundle-version=1.2.0 \
+  -Dicon=assets/AppIcon.icns \
   -Dcodesign="Developer ID Application: ACME Inc"
+```
+
+Generate `AppIcon.icns` from a square master PNG:
+
+```sh
+mkdir -p AppIcon.iconset
+for SZ in 16 32 64 128 256 512 1024; do
+  sips -z $SZ $SZ master.png --out AppIcon.iconset/icon_${SZ}x${SZ}.png
+done
+iconutil -c icns AppIcon.iconset -o assets/AppIcon.icns
 ```
 
 With `-Dcodesign=...` set a `zig build codesign` step also becomes
@@ -381,10 +496,31 @@ and `frontend/{style.css,verve_desktop.js}` for mtime changes (400 ms
 poll). On change: kills the running app, runs `zig build`, respawns.
 Press Ctrl-C to exit.
 
-Process-restart grain, not HMR — frontend assets are baked into the
-binary at build time (SSR'd `index.html`, wasm-compiled client,
-embedded CSS / bridge JS), so true in-place reload would need a
-runtime disk-read mode that's out of scope.
+For changes to the Zig source (`src/components.zig`,
+`src/handlers.zig`, `src/client/main.zig`), the rebuild + restart is
+mandatory — the SSR'd `index.html` and the wasm-compiled client are
+both baked at build time.
+
+### `--dev` runtime fallback (hot CSS / JS)
+
+For changes to **static frontend assets** (`style.css`,
+`verve_desktop.js`, anything you drop into `frontend/`), restart the
+app once with the `--dev <dir>` flag pointing at the same directory:
+
+```sh
+./zig-out/bin/app --dev ./frontend
+```
+
+The scheme handler now checks `<dir>/<path>` on every request first
+and falls through to the embedded copy only when the file is missing.
+Edit the file, press Cmd+R in the window, see the new bytes — no
+rebuild, no respawn. Pair it with `zig build dev` to keep the
+process-restart loop for code changes and use the runtime fallback
+for asset iteration.
+
+Sandboxing: requests with `..` segments or post-strip absolute paths
+are rejected with 404 so a misconfigured `--dev` value can't expose
+arbitrary files. The per-file ceiling is 16 MB.
 
 ## Smoke test (macOS — Level-3)
 
@@ -427,6 +563,7 @@ Overrides:
 | Flag | Effect |
 |------|--------|
 | `--smoke <dir>` | Enable smoke harness; loads page with `?smoke=1`, writes `<dir>/{shot.png,checksum.txt}`, terminates |
+| `--dev <dir>` | Enable runtime disk-read fallback for the asset router; scheme requests check `<dir>/<path>` before falling through to the embedded table. Hot-reload-friendly. Reject `..` segments + absolute paths; 16 MB per-file cap. |
 
 ## Build flags
 
@@ -437,6 +574,7 @@ Overrides:
 | `-Dpublic-dir=<dir>` | `frontend` | Source directory walked at build time for `public_assets` |
 | `-Dbundle-id=<id>` | `dev.verve.<name>` | macOS bundle identifier |
 | `-Dbundle-version=<v>` | `0.0.0` | macOS bundle version |
+| `-Dicon=<path>` | (none) | macOS bundle icon (`.icns`); copied to `Contents/Resources/AppIcon.icns` |
 | `-Dcodesign=<identity>` | (none) | macOS bundle signing identity |
 | `-Dwebview2-sdk=<path>` | `third_party/webview2` | Windows: WebView2 SDK location |
 | `-Dwebview2-no-fetch=<bool>` | `false` | Windows: skip NuGet fetch (use existing SDK) |
@@ -451,13 +589,19 @@ Overrides:
 | Cookies | ✓ | ✓ | ✓ |
 | Multi-window | ✓ | ✓ | ✓ |
 | WASM hydration | ✓ | ✓ | ✓ |
-| File / save dialogs | ✓ | stub | stub |
-| Alerts | ✓ | stub | stub |
-| Native menu bar | ✓ | — | — |
-| Window snapshot (PNG) | ✓ | stub | stub |
+| Single-instance lock | ✓ | ✓ | ✓ |
+| Clipboard read / write | ✓ | ✓ | ✓ |
+| Color scheme (light/dark) | ✓ | ✓ | ✓ |
+| File / save dialogs | ✓ | ✓ (file only) | ✓ |
+| Alerts | ✓ | ✓ (standard buttons) | ✓ |
+| Native menu bar | ✓ | ✓ | ✓ |
+| Tray icon | ✓ | ✓ | ✓ |
+| Notifications | ✓ | stub | ✓ |
+| Window snapshot (PNG) | ✓ | ✓ | ✓ |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
 | Dev-loop watcher | ✓ | ✓ | ✓ |
+| `--dev` runtime fallback | ✓ | ✓ | ✓ |
 
 ✓ = real implementation. `stub` = the API exists and returns
 `error.Unsupported` so cross-platform call sites compile.

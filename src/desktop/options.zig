@@ -91,6 +91,40 @@ pub const CookieError = error{
     Backend,
 };
 
+pub const ClipboardError = error{
+    Unsupported,
+    OutOfMemory,
+    Backend,
+};
+
+/// Current system color preference. Apps that style their UI to
+/// match the OS appearance should call `Window.colorScheme()` at
+/// startup and either re-check on window restore or register a
+/// `ColorSchemeHandler` via `Window.setColorSchemeHandler` to be
+/// notified when the user toggles the OS setting at runtime.
+pub const ColorScheme = enum { light, dark, unknown };
+
+/// Callback fired when the OS delivers a deep-link URL to the app —
+/// the user clicked a `verve://...` link or opened a `.desktop`-handled
+/// MIME. `url` is the full URL string the OS received. Caller does not
+/// retain the slice; copy if you need to outlive the callback.
+///
+/// Cold-launch (app starts up because of the URL) and warm-launch (app
+/// already running, OS delivers via a process IPC) both funnel through
+/// the same callback. macOS handles both via `AppleEventManager`'s
+/// `kInternetEventClass`/`kAEGetURL` so the handler fires from inside
+/// the Cocoa run loop. Windows + Linux ship cold-launch via the
+/// process argv only in this pass — second-instance URL forwarding
+/// (WM_COPYDATA / AF_UNIX socket) is a follow-up.
+pub const UrlOpenHandler = *const fn (ctx: ?*anyopaque, url: []const u8) void;
+
+/// Callback fired when the OS color-scheme preference changes.
+/// `ctx` is the opaque pointer registered alongside the callback.
+/// Fires on the main / UI thread of the host platform — same thread
+/// that drives the event loop — so consumers can call any other
+/// `Window` method without crossing threads.
+pub const ColorSchemeHandler = *const fn (ctx: ?*anyopaque, scheme: ColorScheme) void;
+
 pub const SnapshotError = error{
     Unsupported,
     /// Snapshot capture returned without an image (timeout / view not ready / GPU issue).
@@ -99,6 +133,19 @@ pub const SnapshotError = error{
     EncodeFailed,
     /// Write to disk failed (permissions / disk full / invalid path).
     WriteFailed,
+};
+
+/// Configuration for `WindowOptions.dev_assets`. Pairs the source
+/// directory with the `Io` the backend needs to perform the
+/// fallback file read.
+pub const DevAssetsConfig = struct {
+    /// Directory served as the disk fallback. May be relative to the
+    /// working directory the app was launched from. Caller owns the
+    /// slice; the backend captures by reference and never frees it.
+    dir: []const u8,
+    /// `Io` used for `openFile` / `stat` / `readPositionalAll`. Typically
+    /// `init.io` from the app's `main` entry point.
+    io: std.Io,
 };
 
 /// Construction parameters for `Window.init`. The platform layer
@@ -138,6 +185,14 @@ pub const WindowOptions = struct {
     /// that has not produced its production bundle yet.
     assets: []const AssetEntry = &.{},
 
+    /// Opt-in dev-mode fallback: when set, scheme-handler requests that
+    /// miss `assets` fall through to a sandboxed disk read against
+    /// `dev_assets.dir`. The `io` field is required for the file ops;
+    /// scaffolded apps pass `init.io` straight through. Leave `null`
+    /// for production builds — the asset table is the source of truth.
+    /// Path traversal (`..`) and post-strip absolute paths are rejected.
+    dev_assets: ?DevAssetsConfig = null,
+
     /// Optional message-handler callback + context registered before
     /// any page load. The same pointer pair can be set later via
     /// `Window.setMessageHandler`; supplying it here just saves the
@@ -145,9 +200,22 @@ pub const WindowOptions = struct {
     on_message: ?MessageHandler = null,
     on_message_ctx: ?*anyopaque = null,
 
-    /// Install a default OS menu bar on macOS (App + Edit + Window).
-    /// Disable when the app builds its own menu from scratch. On
-    /// Windows/Linux the field is currently ignored — menu bars on
-    /// those platforms are a follow-up.
+    /// Optional deep-link handler + context registered before any URL
+    /// the OS delivers can fire. macOS installs the AppleEventManager
+    /// handler eagerly during `Window.init` when this is non-null, so
+    /// cold-launch URLs that arrive during the early Cocoa run-loop
+    /// pump are queued through the same callback. Set via
+    /// `Window.setUrlOpenHandler` if you need to install it later.
+    on_url_open: ?UrlOpenHandler = null,
+    on_url_open_ctx: ?*anyopaque = null,
+
+    /// Install a default OS menu bar. Honored on all three backends:
+    /// macOS gets App + Edit + Window menus; Windows and Linux get
+    /// File (Quit) + Edit (Undo/Redo/Cut/Copy/Paste/Select All). On
+    /// Win/Linux the Edit shortcuts are rendered as hints — the
+    /// embedded webview handles the actual clipboard keystrokes
+    /// natively, and attaching a real OS-level accelerator would
+    /// consume the key event before the webview saw it. Set to
+    /// `false` to suppress the bar (apps building their own).
     install_default_menu: bool = true,
 };

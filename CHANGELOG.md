@@ -6,7 +6,228 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Pipeline ready for the next surface change. Nothing on deck yet.
+## [0.1.0] - 2026-05-26
+
+First tagged release. Closes P1 (#16–#23), every P2 platform port,
+and the high-frequency P3 surface (clipboard, single-instance,
+color-scheme follow, app icons, native menu bars on all 3,
+deep-link URL handlers, tray icons + notifications, tray click
+handlers + submenus).
+
+### Added — Tray click handlers + submenus (2026-05-26)
+
+- **Expanded `desktop.tray` API.** `TrayMenuItem { label, id,
+  enabled, children }` value type — null label = separator,
+  non-empty children = submenu parent. `TrayOptions` grew `menu`,
+  `on_click` + `on_click_ctx`, `on_menu_item` + `on_menu_item_ctx`.
+  ABI matches `MessageHandler` / `UrlOpenHandler` /
+  `ColorSchemeHandler`. New `Tray.setMenu(items)` (deep-copies),
+  `setClickHandler`, `setMenuItemHandler`. `Tray.impl` is now
+  heap-allocated so callback singletons see a stable address after
+  `init` returns by value.
+- **macOS.** NSMenu via `objc_msgSend`; items target a process-wide
+  `VerveTrayTarget` NSObject (registered lazily via
+  `objc_allocateClassPair`) with `verveTrayItem:` /
+  `verveTrayClick:` selectors. Each `NSMenuItem.setTag:` carries
+  the user id; the trampoline reads `[sender tag]` and dispatches.
+- **Windows.** `NOTIFYICONDATAW.uCallbackMessage = WM_VERVE_TRAY`
+  (= `WM_USER + 100`, declared pub in `windows.zig`). wndProc
+  forwards mouse events to `tray_dispatch_message` and `WM_COMMAND`
+  IDs in the `0xC000` block to `tray_dispatch_command`. Right
+  click / WM_CONTEXTMENU show the menu via `TrackPopupMenu` with
+  the MSDN `SetForegroundWindow` + `PostMessage(WM_NULL)` dance.
+  Tray IDs use `0xC000 | (user_id & 0x0FFF)` — no collisions with
+  the default `0x8000` File/Edit range.
+- **Linux.** GtkMenu via `gtk_menu_item_new_with_label` +
+  `gtk_menu_shell_append`; submenus via
+  `gtk_menu_item_set_submenu`; disabled rows via
+  `gtk_widget_set_sensitive`. Each leaf gets `g_signal_connect_data`
+  with an allocator-owned `ItemBox { *LinuxTray, id }` as
+  user_data; boxes freed in `deinit`. AppIndicator has no
+  icon-click signal so `on_click` is a no-op when a menu is set.
+- **Template demo.** 4-item tray menu (Show window / Notify / sep /
+  Quit) wired to a new `handlers.onTrayItem`; new "Tray menu" card
+  in components; golden smoke checksum 284 → 605.
+- **v1 limitation.** Single-tray-per-process — `g_macos_tray` /
+  `g_windows_tray` are unguarded singletons. Multi-tray would need
+  per-target ivars + an HWND-keyed registry. Deferred.
+
+### Added — Tray icons + native notifications (2026-05-25)
+
+- **New `desktop.tray` module.** `tray.init(allocator, &window,
+  .{ .label, .tooltip })` creates a system-tray / status-bar icon;
+  `setTooltip(text)` updates the hover text; `deinit` removes it.
+  macOS: `NSStatusItem` from `[NSStatusBar systemStatusBar]`.
+  Windows: `Shell_NotifyIconW(NIM_ADD)` with stock
+  `IDI_APPLICATION` icon (`NIF_ICON | NIF_TIP`). Linux:
+  `app_indicator_new` (libayatana-appindicator3) with an empty
+  `GtkMenu` attached because some Ayatana versions silently refuse
+  to render the icon without one. Click handlers + submenus are
+  deferred to a future bundle.
+- **New `desktop.notifications` module.** `notifications.show(allocator,
+  .{ .title, .body })`. macOS: `NSUserNotification` +
+  `NSUserNotificationCenter.deliverNotification:`. Linux: `notify_init`
+  + `notify_notification_new` + `notify_notification_show` (libnotify).
+  Windows returns `error.Unsupported` — Toast notifications need
+  COM + AUMID + Start-menu registration, deferred to a future
+  bundle. Apps that need Win notifications today combine
+  `desktop.tray` with a manual `Shell_NotifyIconW(NIF_INFO)` call
+  against the tray icon.
+- **Backend exposure.** `src/desktop/windows.zig` gains `hwndOf(window)`
+  so sibling modules can reach the underlying HWND without going
+  through the cross-platform `Window` facade.
+- **Template demo wiring.** Scaffold `main.zig` opens a tray icon
+  on startup; `handlers.zig` ships a `notify` IPC route that fires
+  a native notification; `components.zig` adds a "Notify" button
+  card.
+
+### Added — Win/Linux warm-launch URL forwarding (2026-05-25)
+
+- **New `desktop.deep_link` module** with two halves:
+  `forwardToRunningInstance(allocator, name, url)` (second-instance
+  side) and `startListener(window, name)` (running-instance side).
+  macOS makes both calls no-ops because `NSAppleEventManager`
+  already routes URLs to the running process; Win + Linux now
+  implement real cross-process delivery.
+- **Windows** — `FindWindowW("VerveWindow", null)` locates the
+  running app's HWND; `SendMessageW(WM_COPYDATA)` ships the URL
+  with a `0x55524C00` ("URL\0") `dwData` sentinel so unrelated
+  WM_COPYDATA traffic doesn't trip the receiver. The wndProc
+  WM_COPYDATA case validates the sentinel, bounds-checks the
+  payload (≤4 KB), and fires `on_url_open` on the matched
+  `WindowCtx`.
+- **Linux** — abstract `AF_UNIX SOCK_DGRAM` socket bound to
+  `\0verve-deeplink-<single_instance_name>`. Sender `connect`s +
+  `send`s a single datagram with the URL bytes. Receiver wraps the
+  bound fd in a `GIOChannel` with a `G_IO_IN` watch so the GTK
+  main loop dispatches inbound URLs; `close_on_unref(true)` cleans
+  the fd up when the window is destroyed.
+- **Template `main.zig`** — second-instance `AlreadyRunning`
+  branch now calls `forwardToRunningInstance(allocator, name, u)`
+  when `--url <u>` was provided, then exits. After the primary
+  instance opens its window it calls
+  `deep_link.startListener(&window, instance_name)` to bind the
+  receive side.
+
+### Added — Desktop deep-link URL handlers (2026-05-25)
+
+- **`Window.setUrlOpenHandler(cb, ctx)` + `Window.deliverUrl(url)`**
+  on the public surface; new `UrlOpenHandler` type and
+  `on_url_open` / `on_url_open_ctx` fields on `WindowOptions`.
+- **macOS — `NSAppleEventManager` handler** for
+  `kInternetEventClass`/`kAEGetURL` (FourCharCode `'GURL'`,
+  0x4755524C). Installs lazily on the first non-null
+  `setUrlOpenHandler` call. Cocoa queues URL events that arrived
+  before the AEH installed, then drains them on the next run-loop
+  spin — so a `verve://...` URL clicked from Finder before
+  `Window.init` even ran still reaches the callback.
+- **Windows + Linux — cold-launch only.** Backend stores the
+  callback on `WindowCtx`; the scaffold template's `main.zig`
+  parses `--url <u>` or any positional starting with `verve://`
+  and feeds it through `Window.deliverUrl(url)` after the window
+  opens. Warm-launch second-instance forwarding (`WM_COPYDATA` on
+  Win, abstract `AF_UNIX` socket on Linux) is a follow-up.
+- **Scaffold `build.zig` — `-Durl-scheme=<name>`.** Injects
+  `CFBundleURLTypes` into the macOS `Info.plist` so Launch
+  Services routes `<scheme>://...` URLs to the .app.
+- **Template demo wiring.** `handlers.zig` ships an `onUrlOpen`
+  example that logs + dispatches the URL into the page via a new
+  `window.verve.handleDeepLink` bridge hook; `components.zig`
+  gains a "Deep link" card that mirrors the most-recent URL.
+
+### Added — Desktop native menu bars on Windows + Linux (2026-05-25)
+
+- **Default menu bar on every backend.** `install_default_menu = true`
+  (the existing flag, previously honored only on macOS) now stamps a
+  File + Edit bar on Windows and Linux for parity with the macOS
+  App + Edit + Window default. Only File→Quit (Ctrl+Q) binds a real
+  OS accelerator; Edit items render the shortcut hint in the label
+  but do not attach an accelerator, because WebView2 and WebKitGTK
+  handle Ctrl+C/V/X/Z/Y/A natively inside text inputs and a real
+  OS-level binding would consume the key event before the webview
+  saw it.
+- **Win32 wiring.** `CreateMenu` + `CreatePopupMenu` + `AppendMenuW`
+  + `SetMenu`; one-entry `HACCEL` driven through
+  `TranslateAcceleratorW` in the main `GetMessageW` loop. Quit posts
+  `WM_CLOSE` so multi-window last-window-quit semantics keep firing
+  through the existing HWND registry. Accelerator table freed in
+  `WM_DESTROY`.
+- **GTK wiring.** `GtkBox(GTK_ORIENTATION_VERTICAL)` wrap stacks
+  `gtk_menu_bar_new` above the webview; `gtk_accel_group_new` carries
+  Ctrl+Q; Quit routes through `gtk_widget_destroy(window)` so the
+  `live_windows` counter triggers `gtk_main_quit` only on the last
+  close. Layout switch is conditional on the flag — opt-out apps keep
+  the unchanged `gtk_container_add(window, webview)` tree.
+
+### Added — Desktop framework polish (2026-05-24)
+
+- **`--dev <dir>` runtime asset fallback.** Desktop scheme handler
+  checks `<dir>/<path>` before the embedded `public_assets` table
+  on every request, so hand-written frontend assets (`style.css`,
+  `verve_desktop.js`, …) reload with Cmd+R instead of triggering a
+  full process-restart rebuild. Rejects `..` and post-strip
+  absolute paths; 16 MB per-file ceiling. Wired through
+  `WindowOptions.dev_assets: ?DevAssetsConfig`.
+- **Win + Linux ports of `openFileDialog` / `saveFileDialog` /
+  `showAlert`.** Linux uses `GtkFileChooserNative` + `GtkMessageDialog`;
+  Windows uses `GetOpenFileNameW` / `GetSaveFileNameW` + `MessageBoxW`.
+  Win folder-picking returns `Unsupported` (needs `IFileOpenDialog`);
+  custom alert labels honored on mac + Linux, mapped to standard
+  buttons on Windows.
+- **Win + Linux `takeSnapshotPng` ports.** Linux uses
+  `webkit_web_view_get_snapshot` → cairo PNG; Windows uses
+  `ICoreWebView2::CapturePreview` → `IStream` → `WriteFile`. Same
+  byte-deterministic PNG output as the macOS reference.
+- **Single-instance enforcement.**
+  `desktop.single_instance.acquire(allocator, name)` returns an
+  opaque `Lock` held for process lifetime. macOS + Linux use POSIX
+  `flock(LOCK_EX | LOCK_NB)` on `<TMPDIR>/verve.<name>.lock`;
+  Windows uses `CreateMutexW` under `Local\Verve.<name>`. Scaffold
+  template wires it at startup automatically.
+- **Cross-platform clipboard read/write.** `Window.clipboard()`
+  returns a handle with `writeText` / `readText`. macOS:
+  `NSPasteboard.generalPasteboard`; Windows: `OpenClipboard` +
+  `CF_UNICODETEXT` + HGLOBAL ownership transfer; Linux:
+  `gtk_clipboard_get(CLIPBOARD)` + `set_text` / `wait_for_text` +
+  `gtk_clipboard_store`.
+- **`Window.colorScheme()`** returns `.light` / `.dark` /
+  `.unknown`. macOS: `[NSApp.effectiveAppearance].name`; Windows:
+  `RegGetValueW(HKCU\…\Personalize\AppsUseLightTheme)`; Linux:
+  GtkSettings' `gtk-application-prefer-dark-theme`. Pair with
+  `Window.setColorSchemeHandler(cb, ctx)` for live change events
+  via NSDistributedNotificationCenter (mac), WM_SETTINGCHANGE
+  (win), GtkSettings notify signal (linux).
+- **App icons (macOS `.app` bundle).** Scaffold `build.zig` gains
+  a `-Dicon=<path>` option. Bundle step copies the supplied
+  `.icns` into `Contents/Resources/AppIcon.icns` and injects
+  `CFBundleIconFile = "AppIcon"` into the generated Info.plist.
+  Absolute and build-root-relative paths both work.
+
+### Fixed — Desktop framework
+
+- **`openChildWindow` crash on multi-window apps.** The macOS
+  backend re-registered `VerveSchemeHandler` and
+  `VerveMessageHandler` Obj-C classes for every `Window.init`,
+  but the Objective-C runtime rejects duplicate class names with
+  `objc_allocateClassPair failed`. Classes are now cached at
+  module scope and reused for every window.
+- **`webview2.pinned.txt` SHA-512 populated.** Previously blank
+  with TODO; reproducible Windows builds now actually verify the
+  downloaded SDK. Also fixed `fetch_webview2.sh` `cut -d= -f2`
+  truncating the trailing `==` base64 padding.
+- **CI smoke server CSRF.** `--csrf=disable` added to the
+  workflow's smoke-test invocation; form-encoded `/api/<fn>` POSTs
+  no longer fail with `403`.
+- **`verve-cli new <hyphenated-dir>`.** Basename-derived package
+  names previously errored with `InvalidName` on hyphens. Hyphens
+  / dots in basename now sanitize to `_`; explicit `--name=<n>`
+  keeps the strict validation.
+
+### Fixed — Docs
+
+- **`docs/11-desktop-roadmap.md` #18 status.** Item was marked open
+  even though commits 49b053d (J1 build-time SSR) and 3338d45
+  (J2+J3 WASM + bridge) had landed. Doc now reflects shipped state.
 
 ## [0.1.0] — 2026-05-21
 

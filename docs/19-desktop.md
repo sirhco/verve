@@ -86,19 +86,111 @@ reference. Headline list:
   platform-native async cookie managers)
 - **Multi-window** — `Window.openChildWindow(opts)`; last-window-quit
   semantics on all three platforms
-- **Native dialogs (macOS)** — `Window.openFileDialog`,
-  `saveFileDialog`, `showAlert` against NSOpenPanel/NSSavePanel/NSAlert
-- **Native menu bar (macOS)** — App + Edit + Window menus stamped by
-  default (`install_default_menu = true`); Edit menu is what makes
-  Cmd+C / Cmd+V actually fire inside WKWebView text inputs
-- **Window snapshot (macOS)** — `Window.takeSnapshotPng(path)` via
-  WKWebView's `takeSnapshotWithConfiguration:completionHandler:`,
-  encoded as PNG via NSBitmapImageRep
+- **Color scheme** — `Window.colorScheme()` returns
+  `.light` / `.dark` / `.unknown`. macOS reads
+  `[NSApp.effectiveAppearance].name` and matches "Dark"; Windows
+  reads
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`
+  (0 = dark, 1 = light, absent → unknown); Linux reads
+  `gtk-application-prefer-dark-theme` via `gtk_settings_get_default`.
+  Pair with `Window.setColorSchemeHandler(cb, ctx)` to react
+  live: macOS observes
+  `AppleInterfaceThemeChangedNotification` on
+  `NSDistributedNotificationCenter`; Windows hooks
+  `WM_SETTINGCHANGE` with `lParam == "ImmersiveColorSet"`; Linux
+  connects to `GtkSettings notify::gtk-application-prefer-dark-theme`.
+- **Clipboard** — `Window.clipboard()` returns a handle with
+  `writeText(text)` and `readText(alloc) -> ?[]u8`. macOS uses
+  `NSPasteboard.generalPasteboard` + `public.utf8-plain-text`;
+  Windows uses `OpenClipboard` + `CF_UNICODETEXT` + an HGLOBAL
+  payload that ownership transfers to the system; Linux uses
+  `gtk_clipboard_get(CLIPBOARD)` + `gtk_clipboard_set_text` /
+  `wait_for_text`. All three are sync from the caller's view.
+- **Single-instance lock** — `desktop.single_instance.acquire(allocator, name)`
+  returns an opaque `Lock` held for process lifetime. macOS + Linux use
+  `flock(LOCK_EX | LOCK_NB)` on `<TMPDIR>/verve.<name>.lock`; Windows
+  uses `CreateMutexW` under `Local\Verve.<name>`. Second call from a
+  live sibling process returns `error.AlreadyRunning`. The kernel
+  reclaims the lock on process exit so crashes don't leave it stuck.
+  Activating the existing instance (raise window / forward argv) is
+  out of scope — apps that want it build on top of the lock primitive.
+- **Native dialogs** — `Window.openFileDialog`, `saveFileDialog`,
+  `showAlert`. macOS uses NSOpenPanel/NSSavePanel/NSAlert; Linux uses
+  `GtkFileChooserNative` + `GtkMessageDialog`; Windows uses
+  `GetOpenFileNameW` / `GetSaveFileNameW` (`comdlg32`) + `MessageBoxW`.
+  Per-platform caveats: Win32 alerts honor the button *count* (1/2/3
+  → MB_OK / MB_YESNO / MB_YESNOCANCEL) but not arbitrary labels;
+  directory-picking via `pick_directory` is macOS + Linux only on this
+  surface (Win32 splits dir-picking into `IFileOpenDialog` — port TBD).
+- **Tray icon** — `desktop.tray.init(allocator, &window, .{ .label,
+  .tooltip })` creates a system-tray / status-bar icon, `setTooltip`
+  updates the hover text, `deinit` removes it. macOS:
+  `NSStatusItem` from `[NSStatusBar systemStatusBar]`. Windows:
+  `Shell_NotifyIconW(NIM_ADD)` with stock `IDI_APPLICATION` icon.
+  Linux: `app_indicator_new` (libayatana-appindicator3) with an
+  empty menu attached (some Ayatana versions refuse to draw the
+  icon without one). Click handlers + submenus are a future bundle.
+- **Notifications** — `desktop.notifications.show(allocator, .{ .title,
+  .body })`. macOS uses `NSUserNotification` +
+  `[NSUserNotificationCenter deliverNotification:]`; Linux uses
+  `notify_init` + `notify_notification_new` +
+  `notify_notification_show` (libnotify). Windows returns
+  `error.Unsupported` — Toast notifications need COM + AUMID + a
+  Start-menu registration, deferred to a future bundle. Apps that
+  need Win notifications today layer on `tray.zig` plus a manual
+  `Shell_NotifyIconW(NIF_INFO)` call.
+- **Deep-link URL handlers** — register a custom scheme at install
+  time (`-Durl-scheme=verve` injects `CFBundleURLTypes` into the
+  macOS `Info.plist`; Win/Linux registration is app-controlled),
+  then receive URLs through `Window.setUrlOpenHandler(cb, ctx)`.
+  macOS uses `NSAppleEventManager` (`kInternetEventClass` /
+  `kAEGetURL`) so warm-launch (app already running) and cold-launch
+  (Finder click while not running) both funnel through the same
+  callback. Windows + Linux deliver cold-launch URLs via the
+  process argv — the scaffold template parses `--url <u>` and any
+  positional starting with `verve://` and calls
+  `Window.deliverUrl(url)` after the window opens. Warm-launch
+  forwarding on Win/Linux uses `desktop.deep_link`: the second
+  instance calls `forwardToRunningInstance(allocator, name, url)`
+  which `FindWindowW` + `SendMessageW(WM_COPYDATA)` on Win, or
+  opens an abstract `AF_UNIX SOCK_DGRAM` socket
+  (`\0verve-deeplink-<name>`) and `send`s on Linux. The running
+  instance receives via the wndProc `WM_COPYDATA` case (Win) or a
+  GIOChannel watch on the bound socket (Linux), routed back through
+  the same `setUrlOpenHandler` callback.
+- **Native menu bar** — `install_default_menu = true` (the default)
+  stamps a default menu bar on all three platforms. macOS gets App +
+  Edit + Window menus; the Edit menu is what makes Cmd+C / Cmd+V
+  actually fire inside WKWebView text inputs. Windows and Linux get
+  File (Quit) + Edit (Undo/Redo/Cut/Copy/Paste/Select All); only
+  Quit binds a real shortcut (Ctrl+Q). The Edit items render their
+  shortcut hint in the label but do **not** attach an OS accelerator
+  — WebView2 and WebKitGTK handle Ctrl+C/V/X/Z/Y/A inside text
+  inputs natively, and an OS-level accelerator would consume the key
+  before the webview saw it.
+- **Window snapshot** — `Window.takeSnapshotPng(path)` ships on all
+  three backends. macOS uses
+  `WKWebView.takeSnapshotWithConfiguration:completionHandler:` →
+  NSBitmapImageRep → PNG. Linux uses
+  `webkit_web_view_get_snapshot` (async, GMainContext-pumped) →
+  cairo surface → `cairo_surface_write_to_png`. Windows uses
+  `ICoreWebView2::CapturePreview` (PNG format, message-pumped) into
+  an `SHCreateStreamOnHGlobal` IStream, then writes via `CreateFileW` /
+  `WriteFile`.
 - **macOS `.app` bundle** — `zig build bundle` + `-Dbundle-id` /
-  `-Dbundle-version` / `-Dcodesign`
+  `-Dbundle-version` / `-Dicon=<path-to-icns>` / `-Dcodesign`. The
+  icon path can be absolute or build-root-relative; the bundle step
+  copies it into `Contents/Resources/AppIcon.icns` and adds the
+  matching `CFBundleIconFile` key to `Info.plist`. Without it Finder
+  falls back to the generic app glyph.
 - **WebView2 auto-vendor** — Windows builds fetch the pinned SDK
   from NuGet on first build (idempotent)
 - **Dev loop** — `zig build dev` watches sources, rebuilds, respawns
+- **`--dev <dir>` runtime fallback** — scheme handler tries
+  `<dir>/<path>` before the embedded asset table on every request, so
+  hand-written frontend assets (`style.css`, `verve_desktop.js`, …)
+  hot-reload with Cmd+R instead of a rebuild. Rejects `..` and
+  post-strip absolute paths; 16 MB per-file cap.
 - **Level-3 smoke** — golden-diff CI: scripted interaction sequence
   computes a DOM checksum + captures PNG, build step diffs vs
   `tests/golden/`
@@ -128,13 +220,19 @@ Zig calls via nested event-loop pumps.
 | Cookies | ✓ | ✓ | ✓ |
 | Multi-window | ✓ | ✓ | ✓ |
 | WASM hydration | ✓ | ✓ | ✓ |
-| File / save dialogs | ✓ | stub | stub |
-| Alerts | ✓ | stub | stub |
-| Native menu bar | ✓ | — | — |
-| Window snapshot (PNG) | ✓ | stub | stub |
+| Single-instance lock | ✓ | ✓ | ✓ |
+| Clipboard read / write | ✓ | ✓ | ✓ |
+| Color scheme (light/dark) | ✓ | ✓ | ✓ |
+| File / save dialogs | ✓ | ✓ (file only) | ✓ |
+| Alerts | ✓ | ✓ (standard buttons) | ✓ |
+| Native menu bar | ✓ | ✓ | ✓ |
+| Tray icon | ✓ | ✓ | ✓ |
+| Notifications | ✓ | stub | ✓ |
+| Window snapshot (PNG) | ✓ | ✓ | ✓ |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
 | Dev-loop watcher | ✓ | ✓ | ✓ |
+| `--dev` runtime fallback | ✓ | ✓ | ✓ |
 
 ✓ = real implementation. `stub` = the API exists and returns
 `error.Unsupported` so cross-platform call sites compile.
@@ -142,13 +240,18 @@ Zig calls via nested event-loop pumps.
 
 ## Roadmap status
 
-All P1 desktop items per `docs/11-desktop-roadmap.md` are closed.
-Remaining work is P2/P3 follow-ups: GTK4 + WebKitGTK 6.0 backend,
-native menu bars on Windows + Linux, tray icons + system
-notifications, drag-drop / clipboard programmatic access, deep-link
-URL handlers, runtime disk-read fallback (true HMR), app icons /
-icns / hicolor theme, accessibility (NSAccessibility / UIA / ATK),
-auto-updater (Sparkle / Squirrel).
+All P1 and all P2 desktop items per `docs/11-desktop-roadmap.md`
+are closed; clipboard, single-instance enforcement, color-scheme
+follow (getter + live change events), runtime asset-disk fallback,
+and macOS app-icon bundling shipped 2026-05-24. Native menu bars
+on Windows + Linux, deep-link URL handlers, Win/Linux warm-launch
+URL forwarding (`WM_COPYDATA` + abstract `AF_UNIX` socket), and
+tray icons + notifications (macOS + Linux real, Win tray real and
+notifications stubbed) all landed 2026-05-25. Remaining P3
+follow-ups: GTK4 + WebKitGTK 6.0 backend, drag-drop with native
+paths, print API, hicolor / Linux app-icon theme install,
+accessibility (NSAccessibility / UIA / ATK), auto-updater
+(Sparkle / Squirrel).
 
 ## Constraints
 
