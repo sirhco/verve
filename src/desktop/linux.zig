@@ -163,6 +163,8 @@ extern fn gtk_window_unmaximize(w: *GtkWindow) void;
 extern fn gtk_window_fullscreen(w: *GtkWindow) void;
 extern fn gtk_window_unfullscreen(w: *GtkWindow) void;
 extern fn gtk_window_present(w: *GtkWindow) void;
+extern fn gtk_widget_hide(w: *GtkWidget) void;
+extern fn gtk_window_set_resizable(w: *GtkWindow, on: gboolean) void;
 
 // ---- GTK dialog externs (used by openFileDialog / saveFileDialog / showAlert)
 //
@@ -764,6 +766,27 @@ pub const Window = struct {
     pub fn setFullscreen(self: *Window, on: bool) void {
         const w = self.ctx.window orelse return;
         if (on) gtk_window_fullscreen(@ptrCast(w)) else gtk_window_unfullscreen(@ptrCast(w));
+    }
+
+    pub fn show(self: *Window) void {
+        const w = self.ctx.window orelse return;
+        gtk_widget_show_all(w);
+        gtk_window_present(@ptrCast(w));
+    }
+
+    pub fn hide(self: *Window) void {
+        const w = self.ctx.window orelse return;
+        gtk_widget_hide(w);
+    }
+
+    pub fn focus(self: *Window) void {
+        const w = self.ctx.window orelse return;
+        gtk_window_present(@ptrCast(w));
+    }
+
+    pub fn setResizable(self: *Window, on: bool) void {
+        const w = self.ctx.window orelse return;
+        gtk_window_set_resizable(@ptrCast(w), if (on) 1 else 0);
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {

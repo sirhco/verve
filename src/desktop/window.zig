@@ -91,6 +91,10 @@ comptime {
         "maximize",
         "restore",
         "setFullscreen",
+        "show",
+        "hide",
+        "focus",
+        "setResizable",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

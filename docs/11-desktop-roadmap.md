@@ -85,6 +85,17 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Window visibility + focus — `Window.show()` / `hide()` /
+  `focus()` / `setResizable(bool)` on all 3 backends. macOS:
+  `makeKeyAndOrderFront:` + `activateIgnoringOtherApps:` /
+  `orderOut:` / styleMask toggle for resizable. Windows:
+  `ShowWindow(SW_SHOW/SW_HIDE/SW_RESTORE)` +
+  `SetForegroundWindow`; resizable via `WS_THICKFRAME` |
+  `WS_MAXIMIZEBOX` style toggle with `SWP_FRAMECHANGED`. Linux:
+  `gtk_widget_show_all` / `gtk_widget_hide` / `gtk_window_present` /
+  `gtk_window_set_resizable`. Template demo's tray "Show window"
+  menu item now actually calls `window.show()` + `window.focus()`
+  instead of faking it with evalJs.
 - Window geometry + lifecycle — `Window.setSize`, `setPosition`,
   `center`, `minimize`, `maximize`, `restore`, `setFullscreen` on
   all 3 backends. macOS: `setContentSize:` / `setFrameTopLeftPoint:`

@@ -40,10 +40,8 @@ pub fn onTrayItem(c: ?*anyopaque, item_id: u32) void {
     switch (item_id) {
         1 => {
             std.log.info("[tray] show window", .{});
-            // Surfacing focus on the existing window is a backend
-            // concern — for the demo, an evalJs ping is enough to
-            // visualize the click on the page.
-            r.window.evalJs("document.getElementById('log') && (document.getElementById('log').textContent = 'tray: show window\\n' + document.getElementById('log').textContent);");
+            r.window.show();
+            r.window.focus();
         },
         2 => {
             std.log.info("[tray] notify", .{});

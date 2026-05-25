@@ -137,6 +137,7 @@ extern "user32" fn GetWindowLongPtrW(hwnd: HWND, idx: c_int) callconv(.winapi) c
 extern "user32" fn SetWindowLongPtrW(hwnd: HWND, idx: c_int, value: c_long) callconv(.winapi) c_long;
 extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
 extern "user32" fn GetSystemMetrics(idx: c_int) callconv(.winapi) c_int;
+extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
 
 // ---- Menu + accelerator externs ---------------------------------------------
 //
@@ -963,6 +964,41 @@ pub const Window = struct {
     /// in `WindowCtx` so restoring works without the caller passing
     /// state back. The flag below is the previous-state cached on
     /// the ctx; non-zero = currently fullscreen.
+    pub fn show(self: *Window) void {
+        _ = ShowWindow(self.ctx.hwnd, SW_SHOW);
+        _ = SetForegroundWindow(self.ctx.hwnd);
+    }
+
+    pub fn hide(self: *Window) void {
+        const SW_HIDE: c_int = 0;
+        _ = ShowWindow(self.ctx.hwnd, SW_HIDE);
+    }
+
+    pub fn focus(self: *Window) void {
+        const SW_RESTORE: c_int = 9;
+        _ = ShowWindow(self.ctx.hwnd, SW_RESTORE);
+        _ = SetForegroundWindow(self.ctx.hwnd);
+    }
+
+    /// Toggle the `WS_THICKFRAME` style bit (resize handles) +
+    /// `WS_MAXIMIZEBOX` (max button). `SetWindowPos` with
+    /// `SWP_FRAMECHANGED` repaints the title-bar so the changes are
+    /// visible without a restart.
+    pub fn setResizable(self: *Window, on: bool) void {
+        const GWL_STYLE: c_int = -16;
+        const WS_THICKFRAME: c_long = 0x00040000;
+        const WS_MAXIMIZEBOX: c_long = 0x00010000;
+        const SWP_NOMOVE: UINT = 0x0002;
+        const SWP_NOSIZE: UINT = 0x0001;
+        const SWP_NOZORDER: UINT = 0x0004;
+        const SWP_FRAMECHANGED: UINT = 0x0020;
+        const mask = WS_THICKFRAME | WS_MAXIMIZEBOX;
+        const cur = GetWindowLongPtrW(self.ctx.hwnd, GWL_STYLE);
+        const next: c_long = if (on) cur | mask else cur & ~mask;
+        _ = SetWindowLongPtrW(self.ctx.hwnd, GWL_STYLE, next);
+        _ = SetWindowPos(self.ctx.hwnd, null, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+
     pub fn setFullscreen(self: *Window, on: bool) void {
         const GWL_STYLE: c_int = -16;
         const WS_OVERLAPPEDWINDOW_VAL: c_long = 0x00CF0000;

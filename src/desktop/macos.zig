@@ -539,6 +539,42 @@ pub const Window = struct {
         toggle(self.window, m.sel("toggleFullScreen:"), null);
     }
 
+    /// Show the window + bring to front + activate the app. Pairs
+    /// with `hide` for tray-only apps that close-to-tray instead of
+    /// quitting.
+    pub fn show(self: *Window) void {
+        const makeKey = m.cast(*const fn (id, SEL, ?id) callconv(.c) void);
+        makeKey(self.window, m.sel("makeKeyAndOrderFront:"), null);
+        const activate = m.cast(*const fn (id, SEL, bool) callconv(.c) void);
+        activate(self.app, m.sel("activateIgnoringOtherApps:"), true);
+    }
+
+    /// Detach from the screen without destroying the window. State
+    /// (size, position, web contents) survives a follow-up `show`.
+    pub fn hide(self: *Window) void {
+        const orderOut = m.cast(*const fn (id, SEL, ?id) callconv(.c) void);
+        orderOut(self.window, m.sel("orderOut:"), null);
+    }
+
+    /// Bring the window to the front + give it input focus.
+    /// Equivalent to `show` on macOS — Cocoa's foreground / key-window
+    /// semantics couple visibility and focus together.
+    pub fn focus(self: *Window) void {
+        self.show();
+    }
+
+    /// Toggle the user-resize affordance via the `NSWindowStyleMaskResizable`
+    /// bit on `styleMask` (= `1 << 3`). Does not affect programmatic
+    /// `setSize` — only the user-drag handles.
+    pub fn setResizable(self: *Window, on: bool) void {
+        const RESIZABLE: usize = 1 << 3;
+        const get_mask = m.cast(*const fn (id, SEL) callconv(.c) usize);
+        const set_mask = m.cast(*const fn (id, SEL, usize) callconv(.c) void);
+        const cur = get_mask(self.window, m.sel("styleMask"));
+        const next = if (on) cur | RESIZABLE else cur & ~RESIZABLE;
+        set_mask(self.window, m.sel("setStyleMask:"), next);
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;
