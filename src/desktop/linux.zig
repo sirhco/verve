@@ -475,6 +475,16 @@ const WindowCtx = struct {
     on_drag_drop: ?opts_mod.DragDropHandler = null,
     on_drag_drop_ctx: ?*anyopaque = null,
     drag_signal: c_ulong = 0,
+    on_resize: ?opts_mod.ResizeHandler = null,
+    on_resize_ctx: ?*anyopaque = null,
+    on_focus: ?opts_mod.FocusHandler = null,
+    on_focus_ctx: ?*anyopaque = null,
+    on_close: ?opts_mod.CloseHandler = null,
+    on_close_ctx: ?*anyopaque = null,
+    resize_signal: c_ulong = 0,
+    focus_in_signal: c_ulong = 0,
+    focus_out_signal: c_ulong = 0,
+    close_signal: c_ulong = 0,
     url_socket_fd: c_int = -1,
     url_socket_watch: c_uint = 0,
     color_scheme_signal: c_ulong = 0,
@@ -508,6 +518,12 @@ pub const Window = struct {
             .on_url_open_ctx = opts.on_url_open_ctx,
             .on_drag_drop = opts.on_drag_drop,
             .on_drag_drop_ctx = opts.on_drag_drop_ctx,
+            .on_resize = opts.on_resize,
+            .on_resize_ctx = opts.on_resize_ctx,
+            .on_focus = opts.on_focus,
+            .on_focus_ctx = opts.on_focus_ctx,
+            .on_close = opts.on_close,
+            .on_close_ctx = opts.on_close_ctx,
         };
 
         const window_widget = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -588,6 +604,45 @@ pub const Window = struct {
 
         if (opts.on_drag_drop != null) {
             installDragDestination(heap, window_widget);
+        }
+
+        if (opts.on_resize != null) {
+            heap.resize_signal = g_signal_connect_data(
+                window_widget,
+                "configure-event",
+                @as(GCallback, @ptrCast(&onConfigureEvent)),
+                @ptrCast(heap),
+                null,
+                0,
+            );
+        }
+        if (opts.on_focus != null) {
+            heap.focus_in_signal = g_signal_connect_data(
+                window_widget,
+                "focus-in-event",
+                @as(GCallback, @ptrCast(&onFocusIn)),
+                @ptrCast(heap),
+                null,
+                0,
+            );
+            heap.focus_out_signal = g_signal_connect_data(
+                window_widget,
+                "focus-out-event",
+                @as(GCallback, @ptrCast(&onFocusOut)),
+                @ptrCast(heap),
+                null,
+                0,
+            );
+        }
+        if (opts.on_close != null) {
+            heap.close_signal = g_signal_connect_data(
+                window_widget,
+                "delete-event",
+                @as(GCallback, @ptrCast(&onDeleteEvent)),
+                @ptrCast(heap),
+                null,
+                0,
+            );
         }
 
         gtk_widget_show_all(window_widget);
@@ -787,6 +842,62 @@ pub const Window = struct {
     pub fn setResizable(self: *Window, on: bool) void {
         const w = self.ctx.window orelse return;
         gtk_window_set_resizable(@ptrCast(w), if (on) 1 else 0);
+    }
+
+    pub fn setResizeHandler(self: *Window, cb: ?opts_mod.ResizeHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_resize = cb;
+        self.ctx.on_resize_ctx = ctx;
+        const w = self.ctx.window orelse return;
+        if (cb != null and self.ctx.resize_signal == 0) {
+            self.ctx.resize_signal = g_signal_connect_data(
+                w,
+                "configure-event",
+                @as(GCallback, @ptrCast(&onConfigureEvent)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+        }
+    }
+
+    pub fn setFocusHandler(self: *Window, cb: ?opts_mod.FocusHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_focus = cb;
+        self.ctx.on_focus_ctx = ctx;
+        const w = self.ctx.window orelse return;
+        if (cb != null and self.ctx.focus_in_signal == 0) {
+            self.ctx.focus_in_signal = g_signal_connect_data(
+                w,
+                "focus-in-event",
+                @as(GCallback, @ptrCast(&onFocusIn)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+            self.ctx.focus_out_signal = g_signal_connect_data(
+                w,
+                "focus-out-event",
+                @as(GCallback, @ptrCast(&onFocusOut)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+        }
+    }
+
+    pub fn setCloseHandler(self: *Window, cb: ?opts_mod.CloseHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_close = cb;
+        self.ctx.on_close_ctx = ctx;
+        const w = self.ctx.window orelse return;
+        if (cb != null and self.ctx.close_signal == 0) {
+            self.ctx.close_signal = g_signal_connect_data(
+                w,
+                "delete-event",
+                @as(GCallback, @ptrCast(&onDeleteEvent)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+        }
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
@@ -1035,6 +1146,62 @@ fn onUrlSocketReadable(source: *GIOChannel, _cond: GIOCondition, data: ?*anyopaq
 fn onQuitActivate(_: ?*GtkMenuItem, user_data: ?*anyopaque) callconv(.c) void {
     const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return));
     if (cx.window) |w| gtk_widget_destroy(w);
+}
+
+/// GTK `configure-event` fires on resize + reposition. Event struct
+/// is `GdkEventConfigure { type, window, send_event, x, y, width,
+/// height }`. We only read width + height — the layout matches the
+/// stable GDK3 ABI.
+const GdkEventConfigure = extern struct {
+    type: c_int,
+    window: ?*anyopaque,
+    send_event: i8,
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+};
+
+fn onConfigureEvent(_widget: *GtkWidget, event: *GdkEventConfigure, user_data: ?*anyopaque) callconv(.c) gboolean {
+    _ = _widget;
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return 0));
+    if (cx.on_resize) |cb| {
+        const w: u32 = @intCast(@max(event.width, 0));
+        const h: u32 = @intCast(@max(event.height, 0));
+        cb(cx.on_resize_ctx, w, h);
+    }
+    // Returning 0 = don't stop propagation; GTK continues its
+    // standard configure handling (layout invalidation etc.).
+    return 0;
+}
+
+fn onFocusIn(_widget: *GtkWidget, _event: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) gboolean {
+    _ = _widget;
+    _ = _event;
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return 0));
+    if (cx.on_focus) |cb| cb(cx.on_focus_ctx, true);
+    return 0;
+}
+
+fn onFocusOut(_widget: *GtkWidget, _event: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) gboolean {
+    _ = _widget;
+    _ = _event;
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return 0));
+    if (cx.on_focus) |cb| cb(cx.on_focus_ctx, false);
+    return 0;
+}
+
+/// `delete-event` fires when the WM requests window close. Returning
+/// `TRUE` (1) blocks the standard destroy; `FALSE` (0) lets GTK
+/// proceed to emit `destroy`. We map our `on_close` callback's
+/// return value: caller returns `true` to allow close, so we
+/// return 0 to GTK ("don't block").
+fn onDeleteEvent(_widget: *GtkWidget, _event: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) gboolean {
+    _ = _widget;
+    _ = _event;
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return 0));
+    const cb = cx.on_close orelse return 0;
+    return if (cb(cx.on_close_ctx)) 0 else 1;
 }
 
 /// Mark the window as a URI-list drop destination + connect the

@@ -138,6 +138,22 @@ pub const ColorSchemeHandler = *const fn (ctx: ?*anyopaque, scheme: ColorScheme)
 /// events on the JS side.
 pub const DragDropHandler = *const fn (ctx: ?*anyopaque, paths: []const []const u8) void;
 
+/// Fired when the window is resized by the user (window-chrome drag,
+/// maximize, fullscreen, restore). `width` and `height` are the new
+/// content-area dimensions in OS-logical pixels. The callback fires
+/// on the main / UI thread.
+pub const ResizeHandler = *const fn (ctx: ?*anyopaque, width: u32, height: u32) void;
+
+/// Fired when the window gains (`focused = true`) or loses
+/// (`focused = false`) keyboard focus.
+pub const FocusHandler = *const fn (ctx: ?*anyopaque, focused: bool) void;
+
+/// Fired when the user requests close (title-bar X, OS shortcut).
+/// Return `true` to allow the close; return `false` to keep the
+/// window open (apps prompting "Unsaved changes?" return false
+/// until the user confirms). Without a handler, close proceeds.
+pub const CloseHandler = *const fn (ctx: ?*anyopaque) bool;
+
 pub const SnapshotError = error{
     Unsupported,
     /// Snapshot capture returned without an image (timeout / view not ready / GPU issue).
@@ -228,6 +244,16 @@ pub const WindowOptions = struct {
     /// this callback. `Window.setDragDropHandler` swaps it at runtime.
     on_drag_drop: ?DragDropHandler = null,
     on_drag_drop_ctx: ?*anyopaque = null,
+
+    /// Optional resize / focus / close handlers. All fire on the
+    /// main / UI thread. Setters on `Window` (`setResizeHandler`,
+    /// `setFocusHandler`, `setCloseHandler`) swap at runtime.
+    on_resize: ?ResizeHandler = null,
+    on_resize_ctx: ?*anyopaque = null,
+    on_focus: ?FocusHandler = null,
+    on_focus_ctx: ?*anyopaque = null,
+    on_close: ?CloseHandler = null,
+    on_close_ctx: ?*anyopaque = null,
 
     /// Install a default OS menu bar. Honored on all three backends:
     /// macOS gets App + Edit + Window menus; Windows and Linux get

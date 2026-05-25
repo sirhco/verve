@@ -48,6 +48,14 @@ const WindowCtx = struct {
     on_drag_drop: ?opts_mod.DragDropHandler = null,
     on_drag_drop_ctx: ?*anyopaque = null,
     drop_view: ?id = null,
+    on_resize: ?opts_mod.ResizeHandler = null,
+    on_resize_ctx: ?*anyopaque = null,
+    on_focus: ?opts_mod.FocusHandler = null,
+    on_focus_ctx: ?*anyopaque = null,
+    on_close: ?opts_mod.CloseHandler = null,
+    on_close_ctx: ?*anyopaque = null,
+    window_delegate: ?id = null,
+    window_obj: ?id = null,
     webview: id,
 };
 
@@ -74,6 +82,7 @@ var message_class_cached: ?m.Class = null;
 var theme_class_cached: ?m.Class = null;
 var url_opener_class_cached: ?m.Class = null;
 var drag_window_class_cached: ?m.Class = null;
+var window_delegate_class_cached: ?m.Class = null;
 
 // Maps the `VerveDragWindow`'d NSWindow instance to the owning
 // WindowCtx. The drag trampolines receive the window as self and
@@ -261,6 +270,13 @@ pub const Window = struct {
             .on_url_open_ctx = opts.on_url_open_ctx,
             .on_drag_drop = opts.on_drag_drop,
             .on_drag_drop_ctx = opts.on_drag_drop_ctx,
+            .on_resize = opts.on_resize,
+            .on_resize_ctx = opts.on_resize_ctx,
+            .on_focus = opts.on_focus,
+            .on_focus_ctx = opts.on_focus_ctx,
+            .on_close = opts.on_close,
+            .on_close_ctx = opts.on_close_ctx,
+            .window_obj = window,
             .webview = webview,
         };
         if (opts.on_url_open != null) {
@@ -270,6 +286,9 @@ pub const Window = struct {
             installDragDestination(window, ctx_ptr) catch |err| {
                 std.log.warn("verve.desktop[macos]: drag-drop install failed: {s}", .{@errorName(err)});
             };
+        }
+        if (opts.on_resize != null or opts.on_focus != null or opts.on_close != null) {
+            installWindowDelegate(window, ctx_ptr);
         }
         if (opts.dev_assets) |dev| {
             std.log.info("verve.desktop[macos]: dev-mode asset fallback enabled, dir='{s}'", .{dev.dir});
@@ -573,6 +592,24 @@ pub const Window = struct {
         const cur = get_mask(self.window, m.sel("styleMask"));
         const next = if (on) cur | RESIZABLE else cur & ~RESIZABLE;
         set_mask(self.window, m.sel("setStyleMask:"), next);
+    }
+
+    pub fn setResizeHandler(self: *Window, cb: ?opts_mod.ResizeHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_resize = cb;
+        self.ctx.on_resize_ctx = ctx;
+        if (cb != null and self.ctx.window_delegate == null) installWindowDelegate(self.window, self.ctx);
+    }
+
+    pub fn setFocusHandler(self: *Window, cb: ?opts_mod.FocusHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_focus = cb;
+        self.ctx.on_focus_ctx = ctx;
+        if (cb != null and self.ctx.window_delegate == null) installWindowDelegate(self.window, self.ctx);
+    }
+
+    pub fn setCloseHandler(self: *Window, cb: ?opts_mod.CloseHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_close = cb;
+        self.ctx.on_close_ctx = ctx;
+        if (cb != null and self.ctx.window_delegate == null) installWindowDelegate(self.window, self.ctx);
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
@@ -979,6 +1016,83 @@ fn dragPerformTrampoline(self_window: id, _cmd: SEL, sender: id) callconv(.c) bo
 
     cb(ctx.on_drag_drop_ctx, paths_buf);
     return true;
+}
+
+/// Lazily register `VerveWindowDelegate` (NSObject subclass) and
+/// attach an instance as the NSWindow's `delegate`. The delegate
+/// fields fire NSWindowDelegate protocol methods on resize / focus
+/// / close, which we translate into our `WindowCtx` callbacks. Same
+/// `window_registry` (HWND → ctx, used by drag-drop) routes the
+/// trampoline back to the owning ctx.
+fn installWindowDelegate(window: id, ctx_ptr: *WindowCtx) void {
+    if (ctx_ptr.window_delegate != null) return;
+
+    const NSObject = m.getClass("NSObject");
+    const klass = window_delegate_class_cached orelse blk: {
+        const c = m.allocateClass(NSObject, "VerveWindowDelegate");
+        m.addMethod(c, m.sel("windowDidResize:"), @ptrCast(&windowDidResizeTrampoline), "v@:@");
+        m.addMethod(c, m.sel("windowDidBecomeKey:"), @ptrCast(&windowDidBecomeKeyTrampoline), "v@:@");
+        m.addMethod(c, m.sel("windowDidResignKey:"), @ptrCast(&windowDidResignKeyTrampoline), "v@:@");
+        m.addMethod(c, m.sel("windowShouldClose:"), @ptrCast(&windowShouldCloseTrampoline), "B@:@");
+        m.registerClass(c);
+        window_delegate_class_cached = c;
+        break :blk c;
+    };
+
+    const alloc_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const init_id = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const delegate = init_id(alloc_id(@as(id, @ptrCast(klass)), m.sel("alloc")), m.sel("init"));
+
+    // Register the window→ctx mapping (drag-drop already registers
+    // this for windows with on_drag_drop; the put is idempotent).
+    window_registry.put(std.heap.page_allocator, @as(*anyopaque, @ptrCast(window)), ctx_ptr) catch {};
+
+    const setDelegate = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+    setDelegate(window, m.sel("setDelegate:"), delegate);
+    ctx_ptr.window_delegate = delegate;
+}
+
+fn windowDidResizeTrampoline(_self: id, _cmd: SEL, notification: id) callconv(.c) void {
+    _ = _self;
+    _ = _cmd;
+    // `notification.object` is the NSWindow that resized.
+    const object_sel = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const win = object_sel(notification, m.sel("object"));
+    const ctx = window_registry.get(@as(*anyopaque, @ptrCast(win))) orelse return;
+    const cb = ctx.on_resize orelse return;
+    // Pull the content rect size; that's the area our caller cares
+    // about (not the title-bar-inclusive frame).
+    const contentLayoutRect = m.cast(*const fn (id, SEL) callconv(.c) NSRect);
+    const r = contentLayoutRect(win, m.sel("contentLayoutRect"));
+    const w: u32 = @intFromFloat(@max(r.size.width, 0));
+    const h: u32 = @intFromFloat(@max(r.size.height, 0));
+    cb(ctx.on_resize_ctx, w, h);
+}
+
+fn windowDidBecomeKeyTrampoline(_self: id, _cmd: SEL, notification: id) callconv(.c) void {
+    _ = _self;
+    _ = _cmd;
+    const object_sel = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const win = object_sel(notification, m.sel("object"));
+    const ctx = window_registry.get(@as(*anyopaque, @ptrCast(win))) orelse return;
+    if (ctx.on_focus) |cb| cb(ctx.on_focus_ctx, true);
+}
+
+fn windowDidResignKeyTrampoline(_self: id, _cmd: SEL, notification: id) callconv(.c) void {
+    _ = _self;
+    _ = _cmd;
+    const object_sel = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const win = object_sel(notification, m.sel("object"));
+    const ctx = window_registry.get(@as(*anyopaque, @ptrCast(win))) orelse return;
+    if (ctx.on_focus) |cb| cb(ctx.on_focus_ctx, false);
+}
+
+fn windowShouldCloseTrampoline(_self: id, _cmd: SEL, sender: id) callconv(.c) bool {
+    _ = _self;
+    _ = _cmd;
+    const ctx = window_registry.get(@as(*anyopaque, @ptrCast(sender))) orelse return true;
+    const cb = ctx.on_close orelse return true;
+    return cb(ctx.on_close_ctx);
 }
 
 /// Lazily install the `NSAppleEventManager` URL handler for

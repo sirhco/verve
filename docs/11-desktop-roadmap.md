@@ -85,6 +85,22 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Window event callbacks — `Window.setResizeHandler` /
+  `setFocusHandler` / `setCloseHandler` (+ matching
+  `WindowOptions.on_resize` / `on_focus` / `on_close` init-time
+  fields) on all 3 backends. `ResizeHandler` fires with the new
+  content size; `FocusHandler` with focused/blurred state;
+  `CloseHandler` returns `true` to allow close, `false` to keep
+  the window open (for "Unsaved changes?" prompts). macOS:
+  `VerveWindowDelegate` NSObject subclass; `windowDidResize:` +
+  `windowDidBecomeKey:` + `windowDidResignKey:` +
+  `windowShouldClose:`. Windows: `WM_SIZE` + `WM_ACTIVATE` +
+  `WM_CLOSE` cases in wndProc; `WM_CLOSE` falls through to
+  `DefWindowProcW` when the handler returns `true` or no handler
+  is set. Linux: `g_signal_connect_data` on `configure-event`,
+  `focus-in-event` / `focus-out-event`, `delete-event` — the
+  delete handler returning 1 ("don't propagate") maps to "block
+  close."
 - Window visibility + focus — `Window.show()` / `hide()` /
   `focus()` / `setResizable(bool)` on all 3 backends. macOS:
   `makeKeyAndOrderFront:` + `activateIgnoringOtherApps:` /

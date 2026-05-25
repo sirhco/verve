@@ -40,6 +40,9 @@ pub const ColorScheme = options.ColorScheme;
 pub const ColorSchemeHandler = options.ColorSchemeHandler;
 pub const UrlOpenHandler = options.UrlOpenHandler;
 pub const DragDropHandler = options.DragDropHandler;
+pub const ResizeHandler = options.ResizeHandler;
+pub const FocusHandler = options.FocusHandler;
+pub const CloseHandler = options.CloseHandler;
 pub const DevAssetsConfig = options.DevAssetsConfig;
 pub const CookieStore = cookies.CookieStore;
 
@@ -95,6 +98,9 @@ comptime {
         "hide",
         "focus",
         "setResizable",
+        "setResizeHandler",
+        "setFocusHandler",
+        "setCloseHandler",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

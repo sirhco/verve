@@ -272,6 +272,7 @@ const IDYES: c_int = 6;
 const IDNO: c_int = 7;
 
 const WM_CLOSE: UINT = 0x0010;
+const WM_ACTIVATE: UINT = 0x0006;
 const WM_SETTINGCHANGE: UINT = 0x001A;
 const WM_COPYDATA: UINT = 0x004A;
 const WM_USER: UINT = 0x0400;
@@ -635,6 +636,12 @@ const WindowCtx = struct {
     on_drag_drop: ?opts_mod.DragDropHandler = null,
     on_drag_drop_ctx: ?*anyopaque = null,
     drop_registered: bool = false,
+    on_resize: ?opts_mod.ResizeHandler = null,
+    on_resize_ctx: ?*anyopaque = null,
+    on_focus: ?opts_mod.FocusHandler = null,
+    on_focus_ctx: ?*anyopaque = null,
+    on_close: ?opts_mod.CloseHandler = null,
+    on_close_ctx: ?*anyopaque = null,
     hwnd: HWND = null,
     menu: HMENU = null,
     accel: HACCEL = null,
@@ -697,6 +704,12 @@ pub const Window = struct {
             .on_url_open_ctx = opts.on_url_open_ctx,
             .on_drag_drop = opts.on_drag_drop,
             .on_drag_drop_ctx = opts.on_drag_drop_ctx,
+            .on_resize = opts.on_resize,
+            .on_resize_ctx = opts.on_resize_ctx,
+            .on_focus = opts.on_focus,
+            .on_focus_ctx = opts.on_focus_ctx,
+            .on_close = opts.on_close,
+            .on_close_ctx = opts.on_close_ctx,
             .env_handler = .{ .lpVtbl = &env_created_handler_vtbl, .ctx = heap },
             .ctrl_handler = .{ .lpVtbl = &ctrl_created_handler_vtbl, .ctx = heap },
             .msg_handler = .{ .lpVtbl = &message_handler_vtbl, .ctx = heap },
@@ -984,6 +997,21 @@ pub const Window = struct {
     /// `WS_MAXIMIZEBOX` (max button). `SetWindowPos` with
     /// `SWP_FRAMECHANGED` repaints the title-bar so the changes are
     /// visible without a restart.
+    pub fn setResizeHandler(self: *Window, cb: ?opts_mod.ResizeHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_resize = cb;
+        self.ctx.on_resize_ctx = ctx;
+    }
+
+    pub fn setFocusHandler(self: *Window, cb: ?opts_mod.FocusHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_focus = cb;
+        self.ctx.on_focus_ctx = ctx;
+    }
+
+    pub fn setCloseHandler(self: *Window, cb: ?opts_mod.CloseHandler, ctx: ?*anyopaque) void {
+        self.ctx.on_close = cb;
+        self.ctx.on_close_ctx = ctx;
+    }
+
     pub fn setResizable(self: *Window, on: bool) void {
         const GWL_STYLE: c_int = -16;
         const WS_THICKFRAME: c_long = 0x00040000;
@@ -1446,6 +1474,36 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             // No-op if no tray was created in this process.
             if (tray_dispatch_message) |dispatch| dispatch(@ptrCast(hwnd), wparam, lparam);
             return 0;
+        },
+        WM_SIZE => {
+            // lParam low word = client-area width, high word = height.
+            // Fire the resize callback when set.
+            if (lookupCtx(hwnd)) |cx| if (cx.on_resize) |cb| {
+                const lp_u: usize = @bitCast(lparam);
+                const w: u32 = @intCast(lp_u & 0xFFFF);
+                const h: u32 = @intCast((lp_u >> 16) & 0xFFFF);
+                cb(cx.on_resize_ctx, w, h);
+            };
+            return 0;
+        },
+        WM_ACTIVATE => {
+            // wParam low word: 0 = inactive (focus lost),
+            // 1 = active by-non-mouse, 2 = activated by click.
+            if (lookupCtx(hwnd)) |cx| if (cx.on_focus) |cb| {
+                const state: u32 = @as(u32, @intCast(wparam & 0xFFFF));
+                cb(cx.on_focus_ctx, state != 0);
+            };
+            return 0;
+        },
+        WM_CLOSE => {
+            // User clicked the title-bar X (or System menu → Close).
+            // Run the close handler if present; non-true return
+            // suppresses the standard close path. Without a handler,
+            // fall through to DefWindowProc which calls DestroyWindow.
+            if (lookupCtx(hwnd)) |cx| if (cx.on_close) |cb| {
+                if (!cb(cx.on_close_ctx)) return 0;
+            };
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         WM_DESTROY => {
             // Multi-window quit: unregister this HWND, only post
