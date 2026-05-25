@@ -23,6 +23,20 @@ const build_options = @import("build_options");
 
 const Kind = enum { web, desktop };
 
+/// When the user passes `--release <tag>`, the desktop scaffold's
+/// `build.zig.zon` swaps the path-dep for a `.url + .hash` GitHub
+/// archive dep. `hash` is optional — when null, the scaffold emits a
+/// placeholder + a top-of-file comment instructing the user to run
+/// `zig fetch --save <url>` once to fill it in.
+const ReleaseSpec = struct {
+    tag: []const u8,
+    hash: ?[]const u8,
+};
+
+const RELEASE_REPO_OWNER = "sirhco";
+const RELEASE_REPO_NAME = "verve";
+const RELEASE_HASH_PLACEHOLDER = "REPLACE_ME_RUN_ZIG_FETCH";
+
 const log = std.log.scoped(.@"verve-cli");
 
 pub const std_options: std.Options = .{ .log_level = .info };
@@ -53,6 +67,8 @@ pub fn main(init: std.process.Init) !void {
     var verve_path: []const u8 = build_options.default_verve_path;
     var kind: Kind = .web;
     var kind_explicit = false;
+    var release_tag: ?[]const u8 = null;
+    var release_hash: ?[]const u8 = null;
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -89,6 +105,24 @@ pub fn main(init: std.process.Init) !void {
             }
             kind = .web;
             kind_explicit = true;
+        } else if (std.mem.startsWith(u8, a, "--release=")) {
+            release_tag = a["--release=".len..];
+        } else if (std.mem.eql(u8, a, "--release")) {
+            i += 1;
+            if (i >= args.len) {
+                log.err("--release requires a tag value (e.g. --release v0.1.0)", .{});
+                return error.MissingValue;
+            }
+            release_tag = args[i];
+        } else if (std.mem.startsWith(u8, a, "--release-hash=")) {
+            release_hash = a["--release-hash=".len..];
+        } else if (std.mem.eql(u8, a, "--release-hash")) {
+            i += 1;
+            if (i >= args.len) {
+                log.err("--release-hash requires a value", .{});
+                return error.MissingValue;
+            }
+            release_hash = args[i];
         } else if (target_dir == null) {
             target_dir = a;
         } else {
@@ -102,6 +136,20 @@ pub fn main(init: std.process.Init) !void {
         printUsage(program);
         return error.MissingTargetDir;
     };
+
+    if (release_hash != null and release_tag == null) {
+        log.err("--release-hash requires --release <tag>", .{});
+        return error.InvalidArgs;
+    }
+    if (release_tag != null and kind != .desktop) {
+        log.warn("--release only affects desktop scaffolds; ignoring for --web", .{});
+        release_tag = null;
+        release_hash = null;
+    }
+    const release_spec: ?ReleaseSpec = if (release_tag) |t|
+        .{ .tag = t, .hash = release_hash }
+    else
+        null;
 
     // Resolve package name. An explicit `--name` is taken verbatim and
     // validated strictly. A basename-derived name (the common case
@@ -139,7 +187,13 @@ pub fn main(init: std.process.Init) !void {
     // compiler knows how to compute. Probe `zig build` once to learn the
     // value and patch build.zig.zon — failures here are non-fatal; the
     // user can fill in the suggested value manually.
-    fixFingerprint(io, init.gpa, dir_path, pkg_name, kind, verve_path) catch |err| {
+    //
+    // The fingerprint probe always builds against the path-dep form of
+    // the zon (that's what `scaffold` writes). After the probe finds
+    // the fingerprint, `fixFingerprint` rewrites the zon — at that
+    // point it folds in any `--release` form so the final on-disk zon
+    // matches what the user asked for.
+    fixFingerprint(io, init.gpa, dir_path, pkg_name, kind, verve_path, release_spec) catch |err| {
         log.warn(
             "could not auto-fill build.zig.zon fingerprint ({s}). Run `zig build` once and copy the suggested value into build.zig.zon.",
             .{@errorName(err)},
@@ -156,7 +210,7 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn fixFingerprint(io: std.Io, gpa: std.mem.Allocator, dir_path: []const u8, pkg_name: []const u8, kind: Kind, verve_path: []const u8) !void {
+fn fixFingerprint(io: std.Io, gpa: std.mem.Allocator, dir_path: []const u8, pkg_name: []const u8, kind: Kind, verve_path: []const u8, release: ?ReleaseSpec) !void {
     var child = std.process.spawn(io, .{
         .argv = &.{ "zig", "build" },
         .cwd = .{ .path = dir_path },
@@ -199,7 +253,7 @@ fn fixFingerprint(io: std.Io, gpa: std.mem.Allocator, dir_path: []const u8, pkg_
         try gpa.dupe(u8, "");
     defer gpa.free(rel_verve);
 
-    const new_zon = try renderZonWithFingerprint(pkg_name, fp, gpa, kind, rel_verve);
+    const new_zon = try renderZonFull(pkg_name, fp, gpa, kind, rel_verve, release);
     defer gpa.free(new_zon);
 
     var file = try root.createFile(io, "build.zig.zon", .{});
@@ -314,10 +368,27 @@ fn writeFileWithParents(io: std.Io, root: std.Io.Dir, rel: []const u8, bytes: []
 }
 
 fn renderZon(pkg_name: []const u8, gpa: std.mem.Allocator, kind: Kind, verve_path: []const u8) ![]u8 {
-    return renderZonWithFingerprint(pkg_name, 0, gpa, kind, verve_path);
+    return renderZonFull(pkg_name, 0, gpa, kind, verve_path, null);
 }
 
 fn renderZonWithFingerprint(pkg_name: []const u8, fingerprint: u64, gpa: std.mem.Allocator, kind: Kind, verve_path: []const u8) ![]u8 {
+    return renderZonFull(pkg_name, fingerprint, gpa, kind, verve_path, null);
+}
+
+/// Render the scaffolded `build.zig.zon`. When `release` is non-null
+/// on a desktop scaffold, emits `.verve = .{ .url = ..., .hash = ... }`
+/// pointing at the tagged GitHub archive instead of the path-dep
+/// form. When the user supplied `--release` without a hash, the hash
+/// field carries a sentinel + a comment with the exact `zig fetch`
+/// command to fill it in.
+fn renderZonFull(
+    pkg_name: []const u8,
+    fingerprint: u64,
+    gpa: std.mem.Allocator,
+    kind: Kind,
+    verve_path: []const u8,
+    release: ?ReleaseSpec,
+) ![]u8 {
     return switch (kind) {
         .web => std.fmt.allocPrint(gpa,
             \\.{{
@@ -337,7 +408,7 @@ fn renderZonWithFingerprint(pkg_name: []const u8, fingerprint: u64, gpa: std.mem
             \\}}
             \\
         , .{ pkg_name, fingerprint }),
-        .desktop => std.fmt.allocPrint(gpa,
+        .desktop => if (release) |r| try renderDesktopReleaseZon(gpa, pkg_name, fingerprint, r) else std.fmt.allocPrint(gpa,
             \\.{{
             \\    .name = .{s},
             \\    .version = "0.0.0",
@@ -348,9 +419,10 @@ fn renderZonWithFingerprint(pkg_name: []const u8, fingerprint: u64, gpa: std.mem
             \\        // default. Override per-scaffold with
             \\        //     verve-cli new ... --verve-path /abs/path
             \\        //
-            \\        // To swap to a tagged release once Verve ships
-            \\        // one, comment out the line below and run:
-            \\        //     zig fetch --save https://github.com/chrisolson22/verve/archive/refs/tags/vX.Y.Z.tar.gz
+            \\        // To swap to a tagged release, re-scaffold with
+            \\        //     verve-cli new ... --desktop --release vX.Y.Z [--release-hash <h>]
+            \\        // or run, in this project root,
+            \\        //     zig fetch --save https://github.com/sirhco/verve/archive/refs/tags/vX.Y.Z.tar.gz
             \\        // which will rewrite this dep as
             \\        //     .verve = .{{ .url = "...", .hash = "..." }},
             \\        .verve = .{{ .path = "{s}" }},
@@ -368,6 +440,82 @@ fn renderZonWithFingerprint(pkg_name: []const u8, fingerprint: u64, gpa: std.mem
             \\
         , .{ pkg_name, fingerprint, verve_path }),
     };
+}
+
+fn renderDesktopReleaseZon(
+    gpa: std.mem.Allocator,
+    pkg_name: []const u8,
+    fingerprint: u64,
+    release: ReleaseSpec,
+) ![]u8 {
+    const url = try std.fmt.allocPrint(
+        gpa,
+        "https://github.com/{s}/{s}/archive/refs/tags/{s}.tar.gz",
+        .{ RELEASE_REPO_OWNER, RELEASE_REPO_NAME, release.tag },
+    );
+    defer gpa.free(url);
+
+    if (release.hash) |hash| {
+        return std.fmt.allocPrint(gpa,
+            \\.{{
+            \\    .name = .{s},
+            \\    .version = "0.0.0",
+            \\    .fingerprint = 0x{x:0>16},
+            \\    .minimum_zig_version = "0.16.0",
+            \\    .dependencies = .{{
+            \\        // Tagged release dep emitted by
+            \\        // `verve-cli new --desktop --release {s}`.
+            \\        .verve = .{{
+            \\            .url = "{s}",
+            \\            .hash = "{s}",
+            \\        }},
+            \\    }},
+            \\    .paths = .{{
+            \\        "build.zig",
+            \\        "build.zig.zon",
+            \\        "src",
+            \\        "frontend",
+            \\        "public",
+            \\        "tools",
+            \\        "LICENSE",
+            \\    }},
+            \\}}
+            \\
+        , .{ pkg_name, fingerprint, release.tag, url, hash });
+    }
+    // No hash given — emit the URL with a placeholder + clear comment.
+    // The first `zig build` will fail with Zig's hash-mismatch error
+    // showing the real value; rerun `zig fetch --save <url>` to
+    // overwrite the placeholder atomically.
+    return std.fmt.allocPrint(gpa,
+        \\.{{
+        \\    .name = .{s},
+        \\    .version = "0.0.0",
+        \\    .fingerprint = 0x{x:0>16},
+        \\    .minimum_zig_version = "0.16.0",
+        \\    .dependencies = .{{
+        \\        // Tagged release dep emitted by
+        \\        // `verve-cli new --desktop --release {s}`. The hash
+        \\        // below is a placeholder — run once to fill it in:
+        \\        //     zig fetch --save {s}
+        \\        // Or pass `--release-hash <h>` to verve-cli next time.
+        \\        .verve = .{{
+        \\            .url = "{s}",
+        \\            .hash = "{s}",
+        \\        }},
+        \\    }},
+        \\    .paths = .{{
+        \\        "build.zig",
+        \\        "build.zig.zon",
+        \\        "src",
+        \\        "frontend",
+        \\        "public",
+        \\        "tools",
+        \\        "LICENSE",
+        \\    }},
+        \\}}
+        \\
+    , .{ pkg_name, fingerprint, release.tag, url, url, RELEASE_HASH_PLACEHOLDER });
 }
 
 fn basename(path: []const u8) []const u8 {
@@ -432,17 +580,25 @@ fn printUsage(program: []const u8) void {
         \\             sample IPC bridge.
         \\
         \\Options:
-        \\  --name NAME         Package name (Zig identifier). Defaults to the
-        \\                      basename of the target directory.
-        \\  --verve-path PATH   Absolute path to the Verve checkout used as the
-        \\                      `.verve` dependency in generated build.zig.zon
-        \\                      (desktop scaffolds only). Defaults to the build
-        \\                      root baked into this CLI binary.
-        \\  -h, --help          Show this message and exit.
+        \\  --name NAME           Package name (Zig identifier). Defaults to the
+        \\                        basename of the target directory.
+        \\  --verve-path PATH     Absolute path to the Verve checkout used as the
+        \\                        `.verve` dependency in generated build.zig.zon
+        \\                        (desktop scaffolds only). Defaults to the build
+        \\                        root baked into this CLI binary.
+        \\  --release TAG         Emit a `.url + .hash` GitHub-archive dep in the
+        \\                        scaffolded `build.zig.zon` (desktop only) instead
+        \\                        of the default local path-dep. TAG is the Verve
+        \\                        release tag (e.g. v0.1.0).
+        \\  --release-hash HASH   Multihash for the release tarball. When omitted,
+        \\                        the zon ships with a placeholder + instructions
+        \\                        to run `zig fetch --save <url>` to fill it in.
+        \\  -h, --help            Show this message and exit.
         \\
         \\Examples:
         \\  {s} new ~/code/my-app
         \\  {s} new ~/code/my-desktop-app --desktop
+        \\  {s} new ~/code/my-pinned-app --desktop --release v0.1.0
         \\
-    , .{ program, program, program });
+    , .{ program, program, program, program });
 }

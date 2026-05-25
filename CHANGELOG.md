@@ -6,6 +6,52 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-26
+
+First tagged release. Closes P1 (#16–#23), every P2 platform port,
+and the high-frequency P3 surface (clipboard, single-instance,
+color-scheme follow, app icons, native menu bars on all 3,
+deep-link URL handlers, tray icons + notifications, tray click
+handlers + submenus).
+
+### Added — Tray click handlers + submenus (2026-05-26)
+
+- **Expanded `desktop.tray` API.** `TrayMenuItem { label, id,
+  enabled, children }` value type — null label = separator,
+  non-empty children = submenu parent. `TrayOptions` grew `menu`,
+  `on_click` + `on_click_ctx`, `on_menu_item` + `on_menu_item_ctx`.
+  ABI matches `MessageHandler` / `UrlOpenHandler` /
+  `ColorSchemeHandler`. New `Tray.setMenu(items)` (deep-copies),
+  `setClickHandler`, `setMenuItemHandler`. `Tray.impl` is now
+  heap-allocated so callback singletons see a stable address after
+  `init` returns by value.
+- **macOS.** NSMenu via `objc_msgSend`; items target a process-wide
+  `VerveTrayTarget` NSObject (registered lazily via
+  `objc_allocateClassPair`) with `verveTrayItem:` /
+  `verveTrayClick:` selectors. Each `NSMenuItem.setTag:` carries
+  the user id; the trampoline reads `[sender tag]` and dispatches.
+- **Windows.** `NOTIFYICONDATAW.uCallbackMessage = WM_VERVE_TRAY`
+  (= `WM_USER + 100`, declared pub in `windows.zig`). wndProc
+  forwards mouse events to `tray_dispatch_message` and `WM_COMMAND`
+  IDs in the `0xC000` block to `tray_dispatch_command`. Right
+  click / WM_CONTEXTMENU show the menu via `TrackPopupMenu` with
+  the MSDN `SetForegroundWindow` + `PostMessage(WM_NULL)` dance.
+  Tray IDs use `0xC000 | (user_id & 0x0FFF)` — no collisions with
+  the default `0x8000` File/Edit range.
+- **Linux.** GtkMenu via `gtk_menu_item_new_with_label` +
+  `gtk_menu_shell_append`; submenus via
+  `gtk_menu_item_set_submenu`; disabled rows via
+  `gtk_widget_set_sensitive`. Each leaf gets `g_signal_connect_data`
+  with an allocator-owned `ItemBox { *LinuxTray, id }` as
+  user_data; boxes freed in `deinit`. AppIndicator has no
+  icon-click signal so `on_click` is a no-op when a menu is set.
+- **Template demo.** 4-item tray menu (Show window / Notify / sep /
+  Quit) wired to a new `handlers.onTrayItem`; new "Tray menu" card
+  in components; golden smoke checksum 284 → 605.
+- **v1 limitation.** Single-tray-per-process — `g_macos_tray` /
+  `g_windows_tray` are unguarded singletons. Multi-tray would need
+  per-target ivars + an HWND-keyed registry. Deferred.
+
 ### Added — Tray icons + native notifications (2026-05-25)
 
 - **New `desktop.tray` module.** `tray.init(allocator, &window,
