@@ -26,6 +26,7 @@ pub const shell = @import("shell.zig");
 pub const paths = @import("paths.zig");
 pub const system = @import("system.zig");
 pub const autostart = @import("autostart.zig");
+pub const disk = @import("disk.zig");
 
 pub const Router = ipc_router.Router;
 

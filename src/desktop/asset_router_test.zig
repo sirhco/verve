@@ -21,6 +21,7 @@ comptime {
     _ = @import("paths.zig");
     _ = @import("system.zig");
     _ = @import("autostart.zig");
+    _ = @import("disk.zig");
 }
 
 const entries = [_]options.AssetEntry{

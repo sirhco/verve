@@ -95,6 +95,13 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   writes `~/.config/autostart/<name>.desktop` (every
   freedesktop session). Options struct carries
   `name`/`exe_path`/`display_name`/`args`.
+- Disk space — new `desktop.disk` module:
+  `spaceAt(allocator, path) Error!Space`. `Space { total,
+  available, free }` in bytes. POSIX: `statvfs` with
+  `f_blocks * f_frsize`, `f_bavail * f_frsize`, `f_bfree *
+  f_frsize`. Windows: `GetDiskFreeSpaceExW(path, free_for_caller,
+  total, total_free)`. Useful for capacity dashboards, pre-flight
+  checks before large writes.
 - System resource info — `desktop.system.cpuCount() usize` (incl.
   hyperthreads, falls back to 1 on failure) +
   `desktop.system.totalMemory() u64` (physical RAM in bytes,
