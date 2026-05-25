@@ -82,6 +82,8 @@ comptime {
         "setDragDropHandler",
         "print",
         "setAccessibilityLabel",
+        "setAlwaysOnTop",
+        "setOpacity",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

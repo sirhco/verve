@@ -78,6 +78,13 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   caller is already up to date. Applying the update (download,
   signature verify, swap binary, restart) stays out of scope —
   Sparkle / Squirrel / AppImageUpdate handle that per platform.
+- Window state — `Window.setAlwaysOnTop(bool)` +
+  `Window.setOpacity(f64)` on all 3 backends. macOS:
+  `setLevel:NSFloatingWindowLevel` + `setAlphaValue:` / `setOpaque:`.
+  Windows: `SetWindowPos(HWND_TOPMOST)` +
+  `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
+  stamped via `SetWindowLongPtrW`. Linux:
+  `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
 
 ### Tray click handlers + submenus
 

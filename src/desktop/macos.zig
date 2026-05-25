@@ -452,6 +452,27 @@ pub const Window = struct {
         setLabel(self.window, m.sel("setAccessibilityLabel:"), nsString(label));
     }
 
+    /// Toggle whether this window floats above normal-level windows.
+    /// `true` switches to `NSFloatingWindowLevel` (3); `false` back
+    /// to `NSNormalWindowLevel` (0).
+    pub fn setAlwaysOnTop(self: *Window, on: bool) void {
+        const NSNormalWindowLevel: isize = 0;
+        const NSFloatingWindowLevel: isize = 3;
+        const setLevel = m.cast(*const fn (id, SEL, isize) callconv(.c) void);
+        setLevel(self.window, m.sel("setLevel:"), if (on) NSFloatingWindowLevel else NSNormalWindowLevel);
+    }
+
+    /// Window-wide opacity in `[0.0, 1.0]`. `1.0` is opaque; `0.0`
+    /// fully transparent. Forces `setOpaque:NO` so the alpha
+    /// channel actually composites — without it AppKit may rely on
+    /// an opaque shortcut and ignore alpha.
+    pub fn setOpacity(self: *Window, value: f64) void {
+        const setOpaque = m.cast(*const fn (id, SEL, bool) callconv(.c) void);
+        setOpaque(self.window, m.sel("setOpaque:"), value >= 1.0);
+        const setAlpha = m.cast(*const fn (id, SEL, f64) callconv(.c) void);
+        setAlpha(self.window, m.sel("setAlphaValue:"), std.math.clamp(value, 0.0, 1.0));
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;

@@ -151,6 +151,8 @@ extern fn g_signal_handler_disconnect(instance: *anyopaque, handler_id: c_ulong)
 const AtkObject = opaque {};
 extern fn gtk_widget_get_accessible(w: *GtkWidget) *AtkObject;
 extern fn atk_object_set_name(obj: *AtkObject, name: [*:0]const u8) void;
+extern fn gtk_window_set_keep_above(w: *GtkWindow, on: gboolean) void;
+extern fn gtk_widget_set_opacity(w: *GtkWidget, value: f64) void;
 
 // ---- GTK dialog externs (used by openFileDialog / saveFileDialog / showAlert)
 //
@@ -696,6 +698,22 @@ pub const Window = struct {
         defer self.ctx.allocator.free(z);
         const atk_obj = gtk_widget_get_accessible(w);
         atk_object_set_name(atk_obj, z.ptr);
+    }
+
+    /// Toggle whether the window stays above normal-stack peers.
+    /// `gtk_window_set_keep_above` is the WM-coordinated hint —
+    /// effective on every freedesktop-compliant compositor.
+    pub fn setAlwaysOnTop(self: *Window, on: bool) void {
+        const w = self.ctx.window orelse return;
+        gtk_window_set_keep_above(@ptrCast(w), if (on) 1 else 0);
+    }
+
+    /// Window-wide opacity in `[0.0, 1.0]`. `gtk_widget_set_opacity`
+    /// composites through the active compositor; opaque-only Wayland
+    /// sessions silently clamp to 1.0.
+    pub fn setOpacity(self: *Window, value: f64) void {
+        const w = self.ctx.window orelse return;
+        gtk_widget_set_opacity(w, std.math.clamp(value, 0.0, 1.0));
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {

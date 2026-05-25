@@ -123,6 +123,18 @@ extern "user32" fn DispatchMessageW(msg: *const MSG) callconv(.winapi) LRESULT;
 extern "user32" fn PostQuitMessage(code: c_int) callconv(.winapi) void;
 extern "user32" fn SendMessageW(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) callconv(.winapi) LRESULT;
 extern "user32" fn MessageBoxW(hwnd: HWND, text: LPCWSTR, caption: LPCWSTR, ty: UINT) callconv(.winapi) c_int;
+extern "user32" fn SetWindowPos(
+    hwnd: HWND,
+    insert_after: HWND,
+    x: c_int,
+    y: c_int,
+    cx: c_int,
+    cy: c_int,
+    flags: UINT,
+) callconv(.winapi) BOOL;
+extern "user32" fn SetLayeredWindowAttributes(hwnd: HWND, color: DWORD, alpha: u8, flags: DWORD) callconv(.winapi) BOOL;
+extern "user32" fn GetWindowLongPtrW(hwnd: HWND, idx: c_int) callconv(.winapi) c_long;
+extern "user32" fn SetWindowLongPtrW(hwnd: HWND, idx: c_int, value: c_long) callconv(.winapi) c_long;
 
 // ---- Menu + accelerator externs ---------------------------------------------
 //
@@ -852,6 +864,39 @@ pub const Window = struct {
     /// ship a UIA provider; that scope is deferred.
     pub fn setAccessibilityLabel(self: *Window, label: []const u8) void {
         self.setTitle(label);
+    }
+
+    /// Toggle topmost via `SetWindowPos(HWND_TOPMOST | HWND_NOTOPMOST)`.
+    pub fn setAlwaysOnTop(self: *Window, on: bool) void {
+        const HWND_TOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+        const HWND_NOTOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
+        const SWP_NOMOVE: UINT = 0x0002;
+        const SWP_NOSIZE: UINT = 0x0001;
+        _ = SetWindowPos(
+            self.ctx.hwnd,
+            if (on) HWND_TOPMOST else HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
+    }
+
+    /// Window opacity in `[0.0, 1.0]`. Stamps `WS_EX_LAYERED` into
+    /// the extended style (idempotent — `GetWindowLongPtrW` then OR)
+    /// and applies the alpha via `SetLayeredWindowAttributes(LWA_ALPHA)`.
+    pub fn setOpacity(self: *Window, value: f64) void {
+        const GWL_EXSTYLE: c_int = -20;
+        const WS_EX_LAYERED: c_long = 0x00080000;
+        const LWA_ALPHA: DWORD = 0x2;
+        const cur = GetWindowLongPtrW(self.ctx.hwnd, GWL_EXSTYLE);
+        if ((cur & WS_EX_LAYERED) == 0) {
+            _ = SetWindowLongPtrW(self.ctx.hwnd, GWL_EXSTYLE, cur | WS_EX_LAYERED);
+        }
+        const clamped = std.math.clamp(value, 0.0, 1.0);
+        const alpha_byte: u8 = @intFromFloat(clamped * 255.0);
+        _ = SetLayeredWindowAttributes(self.ctx.hwnd, 0, alpha_byte, LWA_ALPHA);
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
