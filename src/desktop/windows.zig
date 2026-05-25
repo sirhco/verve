@@ -147,6 +147,8 @@ const FLASHWINFO = extern struct {
     dwTimeout: u32 = 0,
 };
 extern "user32" fn FlashWindowEx(info: *FLASHWINFO) callconv(.winapi) BOOL;
+extern "user32" fn IsIconic(hwnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn IsZoomed(hwnd: HWND) callconv(.winapi) BOOL;
 
 // ---- Menu + accelerator externs ---------------------------------------------
 //
@@ -1155,6 +1157,18 @@ pub const Window = struct {
     /// Flash the taskbar entry. `critical = true` → flash until
     /// the user clicks (FLASHW_TIMERNOFG). `false` → flash a
     /// fixed count then stop.
+    pub fn isMinimized(self: *Window) bool {
+        return IsIconic(self.ctx.hwnd) != 0;
+    }
+
+    pub fn isMaximized(self: *Window) bool {
+        return IsZoomed(self.ctx.hwnd) != 0;
+    }
+
+    pub fn isFullscreen(self: *Window) bool {
+        return self.ctx.fullscreen;
+    }
+
     pub fn requestAttention(self: *Window, critical: bool) void {
         const FLASHW_ALL: u32 = 0x3;
         const FLASHW_TIMERNOFG: u32 = 0xC;

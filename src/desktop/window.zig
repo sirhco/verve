@@ -120,6 +120,9 @@ comptime {
         "getZoom",
         "scaleFactor",
         "requestAttention",
+        "isMinimized",
+        "isMaximized",
+        "isFullscreen",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

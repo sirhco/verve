@@ -412,6 +412,10 @@ extern fn webkit_web_view_set_zoom_level(wv: *WebKitWebView, level: f64) void;
 extern fn webkit_web_view_get_zoom_level(wv: *WebKitWebView) f64;
 extern fn gtk_widget_get_scale_factor(w: *GtkWidget) c_int;
 extern fn gtk_window_set_urgency_hint(w: *GtkWindow, on: gboolean) void;
+const GdkWindow = opaque {};
+extern fn gtk_widget_get_window(w: *GtkWidget) ?*GdkWindow;
+extern fn gdk_window_get_state(w: *GdkWindow) c_uint;
+extern fn gtk_window_is_maximized(w: *GtkWindow) gboolean;
 extern fn webkit_web_view_run_javascript(
     wv: *WebKitWebView,
     script: [*:0]const u8,
@@ -1016,6 +1020,27 @@ pub const Window = struct {
     /// no separate state on GTK — both critical and informational
     /// map to `urgency_hint(TRUE)`; the WM decides how loud to
     /// surface it.
+    pub fn isMinimized(self: *Window) bool {
+        const w = self.ctx.window orelse return false;
+        const gdk = gtk_widget_get_window(w) orelse return false;
+        const state = gdk_window_get_state(gdk);
+        const GDK_WINDOW_STATE_ICONIFIED: c_uint = 1 << 1;
+        return (state & GDK_WINDOW_STATE_ICONIFIED) != 0;
+    }
+
+    pub fn isMaximized(self: *Window) bool {
+        const w = self.ctx.window orelse return false;
+        return gtk_window_is_maximized(@ptrCast(w)) != 0;
+    }
+
+    pub fn isFullscreen(self: *Window) bool {
+        const w = self.ctx.window orelse return false;
+        const gdk = gtk_widget_get_window(w) orelse return false;
+        const state = gdk_window_get_state(gdk);
+        const GDK_WINDOW_STATE_FULLSCREEN: c_uint = 1 << 4;
+        return (state & GDK_WINDOW_STATE_FULLSCREEN) != 0;
+    }
+
     pub fn requestAttention(self: *Window, critical: bool) void {
         _ = critical;
         const w = self.ctx.window orelse return;

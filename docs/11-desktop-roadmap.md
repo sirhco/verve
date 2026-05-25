@@ -111,6 +111,13 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   the OS audible alert (NSBeep / MessageBeep / stdout BEL).
   `desktop.system.processId()` returns the current PID for log
   correlation / IPC keying. Pure stdlib + per-platform externs.
+- Window state queries — `Window.isMinimized()` / `isMaximized()`
+  / `isFullscreen()` on all 3 backends. macOS:
+  `isMiniaturized` / `isZoomed` / `styleMask &
+  NSWindowStyleMaskFullScreen`. Windows: `IsIconic` /
+  `IsZoomed` from user32 + cached `fullscreen` flag from
+  `setFullscreen`. Linux: `gdk_window_get_state` mask checks +
+  `gtk_window_is_maximized`.
 - Window attention request — `Window.requestAttention(critical)`
   pulses dock icon / flashes taskbar / sets WM urgency hint.
   macOS: `[NSApp requestUserAttention:NSCriticalRequest|NSInformationalRequest]`.

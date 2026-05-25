@@ -703,6 +703,22 @@ pub const Window = struct {
     /// `critical = true` → `NSCriticalRequest` (bounces until the
     /// user activates the app). `false` → `NSInformationalRequest`
     /// (bounces once). No-op when the app is already foreground.
+    pub fn isMinimized(self: *Window) bool {
+        const sel = m.cast(*const fn (id, SEL) callconv(.c) bool);
+        return sel(self.window, m.sel("isMiniaturized"));
+    }
+
+    pub fn isMaximized(self: *Window) bool {
+        const sel = m.cast(*const fn (id, SEL) callconv(.c) bool);
+        return sel(self.window, m.sel("isZoomed"));
+    }
+
+    pub fn isFullscreen(self: *Window) bool {
+        const NS_FS: usize = 1 << 14;
+        const sel = m.cast(*const fn (id, SEL) callconv(.c) usize);
+        return (sel(self.window, m.sel("styleMask")) & NS_FS) != 0;
+    }
+
     pub fn requestAttention(self: *Window, critical: bool) void {
         const NSCriticalRequest: isize = 0;
         const NSInformationalRequest: isize = 10;
