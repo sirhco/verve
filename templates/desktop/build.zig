@@ -202,15 +202,36 @@ pub fn build(b: *std.Build) void {
             "codesign",
             "Apple Developer signing identity. When set, the bundle is signed (use \"-\" for ad-hoc).",
         );
+        // Path to a `.icns` file. Copied into Contents/Resources/ and
+        // referenced from Info.plist via CFBundleIconFile. Generate one
+        // from a square PNG with: `mkdir AppIcon.iconset && sips -z N N
+        // src.png --out AppIcon.iconset/icon_NxN.png` per size, then
+        // `iconutil -c icns AppIcon.iconset`. The bundle still works
+        // without an icon; Finder falls back to the generic app glyph.
+        const icon_path = b.option(
+            []const u8,
+            "icon",
+            "Path to .icns file for the macOS bundle (default: none — generic app icon).",
+        );
 
         const bundle_root = b.fmt("{s}.app", .{exe.name});
         const macos_dir = b.fmt("{s}/Contents/MacOS", .{bundle_root});
         const contents_dir = b.fmt("{s}/Contents", .{bundle_root});
+        const resources_dir = b.fmt("{s}/Contents/Resources", .{bundle_root});
 
         // Drop the binary in Contents/MacOS/<name>.
         const inst_bin = b.addInstallArtifact(exe, .{
             .dest_dir = .{ .override = .{ .custom = macos_dir } },
         });
+
+        // CFBundleIconFile names the icon WITHOUT its extension —
+        // macOS appends `.icns`. So with icon=path/to/AppIcon.icns
+        // the bundle ends up with Resources/AppIcon.icns and a
+        // CFBundleIconFile entry of "AppIcon".
+        const icon_plist_entry: []const u8 = if (icon_path != null)
+            "    <key>CFBundleIconFile</key>\n    <string>AppIcon</string>\n"
+        else
+            "";
 
         // Generate Info.plist with substituted name + bundle id +
         // version. Written through addWriteFiles so the source is
@@ -242,10 +263,10 @@ pub fn build(b: *std.Build) void {
             \\    <true/>
             \\    <key>NSPrincipalClass</key>
             \\    <string>NSApplication</string>
-            \\</dict>
+            \\{s}</dict>
             \\</plist>
             \\
-        , .{ exe.name, bundle_id, exe.name, exe.name, bundle_version, bundle_version });
+        , .{ exe.name, bundle_id, exe.name, exe.name, bundle_version, bundle_version, icon_plist_entry });
         const plist_wf = b.addWriteFiles();
         const plist_lazy = plist_wf.add("Info.plist", plist_src);
         const inst_plist = b.addInstallFileWithDir(plist_lazy, .{ .custom = contents_dir }, "Info.plist");
@@ -253,6 +274,23 @@ pub fn build(b: *std.Build) void {
         const bundle_step = b.step("bundle", "Lay out the macOS .app bundle in zig-out/");
         bundle_step.dependOn(&inst_bin.step);
         bundle_step.dependOn(&inst_plist.step);
+
+        if (icon_path) |ip| {
+            // Accept both build-root-relative paths (`assets/icon.icns`)
+            // and absolute paths (`/Users/.../icon.icns`); `b.path()`
+            // rejects the latter. `LazyPath.cwd_relative` is the
+            // documented escape hatch and copes with both.
+            const icon_lazy: std.Build.LazyPath = if (std.fs.path.isAbsolute(ip))
+                .{ .cwd_relative = ip }
+            else
+                b.path(ip);
+            const inst_icon = b.addInstallFileWithDir(
+                icon_lazy,
+                .{ .custom = resources_dir },
+                "AppIcon.icns",
+            );
+            bundle_step.dependOn(&inst_icon.step);
+        }
 
         if (codesign_id) |ident| {
             const bundle_path = b.fmt("zig-out/{s}", .{bundle_root});

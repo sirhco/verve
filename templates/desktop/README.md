@@ -356,6 +356,7 @@ Build options:
 |------|---------|---------|
 | `-Dbundle-id=...` | `dev.verve.<name>` | `CFBundleIdentifier` in Info.plist |
 | `-Dbundle-version=...` | `0.0.0` | `CFBundleVersion` + `CFBundleShortVersionString` |
+| `-Dicon=<path>` | (none) | Copy `<path>` into `Contents/Resources/AppIcon.icns` and reference it from `CFBundleIconFile`. Accept absolute or build-root-relative paths. Without it the bundle falls back to the generic macOS app glyph. |
 | `-Dcodesign=<identity>` | (none) | Sign the bundle after layout. Use `-` for ad-hoc |
 
 Example:
@@ -364,7 +365,18 @@ Example:
 zig build bundle \
   -Dbundle-id=com.example.app \
   -Dbundle-version=1.2.0 \
+  -Dicon=assets/AppIcon.icns \
   -Dcodesign="Developer ID Application: ACME Inc"
+```
+
+Generate `AppIcon.icns` from a square master PNG:
+
+```sh
+mkdir -p AppIcon.iconset
+for SZ in 16 32 64 128 256 512 1024; do
+  sips -z $SZ $SZ master.png --out AppIcon.iconset/icon_${SZ}x${SZ}.png
+done
+iconutil -c icns AppIcon.iconset -o assets/AppIcon.icns
 ```
 
 With `-Dcodesign=...` set a `zig build codesign` step also becomes
@@ -459,6 +471,7 @@ Overrides:
 | `-Dpublic-dir=<dir>` | `frontend` | Source directory walked at build time for `public_assets` |
 | `-Dbundle-id=<id>` | `dev.verve.<name>` | macOS bundle identifier |
 | `-Dbundle-version=<v>` | `0.0.0` | macOS bundle version |
+| `-Dicon=<path>` | (none) | macOS bundle icon (`.icns`); copied to `Contents/Resources/AppIcon.icns` |
 | `-Dcodesign=<identity>` | (none) | macOS bundle signing identity |
 | `-Dwebview2-sdk=<path>` | `third_party/webview2` | Windows: WebView2 SDK location |
 | `-Dwebview2-no-fetch=<bool>` | `false` | Windows: skip NuGet fetch (use existing SDK) |

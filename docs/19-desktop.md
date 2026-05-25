@@ -135,7 +135,11 @@ reference. Headline list:
   an `SHCreateStreamOnHGlobal` IStream, then writes via `CreateFileW` /
   `WriteFile`.
 - **macOS `.app` bundle** — `zig build bundle` + `-Dbundle-id` /
-  `-Dbundle-version` / `-Dcodesign`
+  `-Dbundle-version` / `-Dicon=<path-to-icns>` / `-Dcodesign`. The
+  icon path can be absolute or build-root-relative; the bundle step
+  copies it into `Contents/Resources/AppIcon.icns` and adds the
+  matching `CFBundleIconFile` key to `Info.plist`. Without it Finder
+  falls back to the generic app glyph.
 - **WebView2 auto-vendor** — Windows builds fetch the pinned SDK
   from NuGet on first build (idempotent)
 - **Dev loop** — `zig build dev` watches sources, rebuilds, respawns
