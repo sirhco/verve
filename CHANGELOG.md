@@ -6,6 +6,72 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-26
+
+Six post-`v0.1.3` polish bundles. Standard directories, system
+queries, launch-at-login, plus webview + window controls
+(zoom + scale factor + system bell).
+
+### Added — Standard directories (2026-05-26)
+
+- New `desktop.paths` module: `dataDir` / `cacheDir` /
+  `configDir` / `homeDir` / `tempDir`. Takes
+  `std.process.Environ` (typically `init.minimal.environ`) +
+  allocator + app name; returns owned UTF-8 absolute path.
+- macOS: `~/Library/Application Support/<app>` +
+  `~/Library/Caches/<app>`. Windows: `%APPDATA%\<app>` +
+  `%LOCALAPPDATA%\<app>`. Linux: XDG ($XDG_DATA_HOME /
+  $XDG_CACHE_HOME / $XDG_CONFIG_HOME) with
+  `$HOME/.local/share` / `$HOME/.cache` / `$HOME/.config`
+  fallbacks. Pure stdlib.
+
+### Added — System info (2026-05-26)
+
+- New `desktop.system` module:
+  `locale(allocator, environ) ![]u8` returns IETF-style locale
+  tag (e.g. `en_US`); `osVersion(allocator) ![]u8` returns the
+  host OS version string. macOS:
+  `[NSLocale currentLocale].localeIdentifier` +
+  `[NSProcessInfo processInfo].operatingSystemVersionString`.
+  Windows: `GetUserDefaultLocaleName` + `RtlGetVersion`
+  (OSVERSIONINFOEXW from ntdll.dll). Linux: `LC_ALL` / `LANG`
+  env vars with `.UTF-8` / `@modifier` suffixes stripped, +
+  `/etc/os-release` `PRETTY_NAME` parse.
+
+### Added — Window zoom level (2026-05-26)
+
+- `Window.setZoom(level)` / `Window.getZoom()` on all 3
+  backends. `1.0` = 100%. macOS: `WKWebView setPageZoom:` /
+  `pageZoom`. Windows: `ICoreWebView2Controller::get_ZoomFactor`
+  / `put_ZoomFactor` (vtSlots 11 / 12). Linux:
+  `webkit_web_view_set_zoom_level` / `_get_zoom_level`.
+
+### Added — System bell + processId (2026-05-26)
+
+- `desktop.system.beep()` triggers the OS audible alert
+  (NSBeep / MessageBeep / stdout BEL).
+- `desktop.system.processId()` returns the current PID as u32
+  (POSIX `getpid` / Win `GetCurrentProcessId`).
+
+### Added — Auto-launch on login (2026-05-26)
+
+- New `desktop.autostart` module: `enable(allocator, io,
+  environ, opts)` / `disable(...)` / `isEnabled(...)`.
+  User-scoped (no admin prompt). macOS writes
+  `~/Library/LaunchAgents/<name>.plist`; Windows writes
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` registry
+  value via advapi32; Linux writes
+  `~/.config/autostart/<name>.desktop`. `Options` struct carries
+  `name` / `exe_path` / `display_name` / `args`. Pure stdlib +
+  per-platform externs.
+
+### Added — Window scale factor (2026-05-26)
+
+- `Window.scaleFactor()` returns HiDPI multiplier of the
+  window's current screen as f32. macOS:
+  `[window backingScaleFactor]`. Windows: `GetDpiForWindow(hwnd)
+  / 96.0`. Linux: `gtk_widget_get_scale_factor`.
+
 ## [0.1.3] - 2026-05-26
 
 Seven post-`v0.1.2` polish bundles. Closes the navigation + shell
