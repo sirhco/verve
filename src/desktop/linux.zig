@@ -410,6 +410,7 @@ extern fn webkit_web_view_get_uri(wv: *WebKitWebView) ?[*:0]const u8;
 extern fn webkit_web_view_get_title(wv: *WebKitWebView) ?[*:0]const u8;
 extern fn webkit_web_view_set_zoom_level(wv: *WebKitWebView, level: f64) void;
 extern fn webkit_web_view_get_zoom_level(wv: *WebKitWebView) f64;
+extern fn gtk_widget_get_scale_factor(w: *GtkWidget) c_int;
 extern fn webkit_web_view_run_javascript(
     wv: *WebKitWebView,
     script: [*:0]const u8,
@@ -1002,6 +1003,11 @@ pub const Window = struct {
     pub fn getZoom(self: *Window) f64 {
         const wv = self.ctx.webview orelse return 1.0;
         return webkit_web_view_get_zoom_level(wv);
+    }
+
+    pub fn scaleFactor(self: *Window) f32 {
+        const w = self.ctx.window orelse return 1.0;
+        return @floatFromInt(gtk_widget_get_scale_factor(w));
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {

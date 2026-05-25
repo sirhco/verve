@@ -99,6 +99,11 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   the OS audible alert (NSBeep / MessageBeep / stdout BEL).
   `desktop.system.processId()` returns the current PID for log
   correlation / IPC keying. Pure stdlib + per-platform externs.
+- Window scale factor — `Window.scaleFactor()` returns the
+  HiDPI multiplier of the window's current screen. macOS:
+  `[window backingScaleFactor]` (tracks the monitor the window
+  sits on). Windows: `GetDpiForWindow(hwnd) / 96.0`. Linux:
+  `gtk_widget_get_scale_factor`.
 - Window zoom — `Window.setZoom(level)` / `getZoom()` on all 3
   backends. `1.0` = 100%; engines clamp to their supported range.
   macOS: `WKWebView setPageZoom:` / `pageZoom`. Windows:

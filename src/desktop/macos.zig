@@ -690,6 +690,15 @@ pub const Window = struct {
         return sel(self.webview, m.sel("pageZoom"));
     }
 
+    /// HiDPI scale of the window's current screen (`1.0` =
+    /// standard, `2.0` = Retina, fractional on some Linux DEs).
+    /// Reads `[window backingScaleFactor]` which tracks the
+    /// monitor the window currently sits on, not a static value.
+    pub fn scaleFactor(self: *Window) f32 {
+        const sel = m.cast(*const fn (id, SEL) callconv(.c) f64);
+        return @floatCast(sel(self.window, m.sel("backingScaleFactor")));
+    }
+
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx;

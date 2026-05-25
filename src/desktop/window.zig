@@ -117,6 +117,7 @@ comptime {
         "currentTitle",
         "setZoom",
         "getZoom",
+        "scaleFactor",
     };
     for (required) |name| {
         if (!@hasDecl(Window, name)) {

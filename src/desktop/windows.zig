@@ -138,6 +138,7 @@ extern "user32" fn SetWindowLongPtrW(hwnd: HWND, idx: c_int, value: c_long) call
 extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
 extern "user32" fn GetSystemMetrics(idx: c_int) callconv(.winapi) c_int;
 extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn GetDpiForWindow(hwnd: HWND) callconv(.winapi) c_uint;
 
 // ---- Menu + accelerator externs ---------------------------------------------
 //
@@ -1132,6 +1133,15 @@ pub const Window = struct {
         var out: f64 = 1.0;
         _ = Get(ctrl, &out);
         return out;
+    }
+
+    /// HiDPI scale of the window's monitor. `GetDpiForWindow`
+    /// reports the actual per-window DPI value on Win10 1607+;
+    /// divide by 96 (the standard "unscaled" DPI) for the
+    /// multiplier most apps actually want.
+    pub fn scaleFactor(self: *Window) f32 {
+        const dpi = GetDpiForWindow(self.ctx.hwnd);
+        return @as(f32, @floatFromInt(dpi)) / 96.0;
     }
 
     pub fn setResizable(self: *Window, on: bool) void {
