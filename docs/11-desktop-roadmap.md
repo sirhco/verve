@@ -85,6 +85,16 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `SetLayeredWindowAttributes(LWA_ALPHA)` with `WS_EX_LAYERED`
   stamped via `SetWindowLongPtrW`. Linux:
   `gtk_window_set_keep_above` + `gtk_widget_set_opacity`.
+- Auto-launch on login — new `desktop.autostart` module:
+  `enable(allocator, io, environ, opts)` / `disable(...)` /
+  `isEnabled(...)`. User-scoped, no admin prompt. macOS writes
+  `~/Library/LaunchAgents/<name>.plist` (launchd picks up on
+  next session). Windows writes
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` registry
+  value via advapi32 RegSetValueExW / RegDeleteValueW. Linux
+  writes `~/.config/autostart/<name>.desktop` (every
+  freedesktop session). Options struct carries
+  `name`/`exe_path`/`display_name`/`args`.
 - System bell + process ID — `desktop.system.beep()` triggers
   the OS audible alert (NSBeep / MessageBeep / stdout BEL).
   `desktop.system.processId()` returns the current PID for log
