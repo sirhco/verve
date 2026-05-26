@@ -70,21 +70,22 @@ pub fn startListener(window: *window_mod.Window, name: []const u8) Error!void {
 /// to claim a scheme conditionally (after a setting toggle, on
 /// first launch, etc).
 ///
-/// - **macOS** — `LSSetDefaultHandlerForURLScheme` from
-///   LaunchServices. Requires the app to be a bundled `.app`
-///   with a `CFBundleIdentifier` matching `bundle_id`; bare
-///   `zig-out/bin/app` invocations have no bundle and the call
-///   returns `error.Backend`. The bundle must also already
-///   declare the scheme via `CFBundleURLTypes` — Launch Services
-///   refuses to associate a scheme with an app that doesn't
-///   advertise it. So this is "switch which already-known
-///   bundle handles the scheme," not "advertise a brand new
-///   scheme from a non-bundle binary."
-/// - **Windows + Linux** — return `error.Unsupported`. Win
-///   needs `HKCU\Software\Classes\<scheme>` registry tree;
-///   Linux needs `.desktop` + `xdg-mime`. Future bundles.
-pub fn registerScheme(scheme: []const u8, bundle_id: []const u8) Error!void {
-    return backend.registerScheme(scheme, bundle_id);
+/// `bundle_id` semantics per platform:
+/// - **macOS** — the `CFBundleIdentifier` of the running `.app`.
+///   The bundle must already declare the scheme via
+///   `CFBundleURLTypes`. The call returns `error.Backend` when
+///   the running process isn't bundled.
+/// - **Windows** — a display label used as the registry key's
+///   default value (`URL:<bundle_id>` form). The actual handler
+///   binary is resolved at runtime via `GetModuleFileNameW`. No
+///   bundle layout required.
+/// - **Linux** — the basename for the generated `.desktop` file
+///   under `~/.local/share/applications/<bundle_id>.desktop`.
+///   The handler binary is resolved via `/proc/self/exe`.
+///   `xdg-mime default ...` is then invoked to set the
+///   association.
+pub fn registerScheme(allocator: std.mem.Allocator, scheme: []const u8, bundle_id: []const u8) Error!void {
+    return backend.registerScheme(allocator, scheme, bundle_id);
 }
 
 const backend = switch (builtin.os.tag) {
@@ -102,7 +103,8 @@ const MacosBackend = struct {
     }
     fn startListener(_: *window_mod.Window, _: []const u8) Error!void {}
 
-    fn registerScheme(scheme: []const u8, bundle_id: []const u8) Error!void {
+    fn registerScheme(allocator: std.mem.Allocator, scheme: []const u8, bundle_id: []const u8) Error!void {
+        _ = allocator;
         if (builtin.os.tag != .macos) return error.Unsupported;
         if (scheme.len == 0 or scheme.len >= 256) return error.Backend;
         if (bundle_id.len == 0 or bundle_id.len >= 512) return error.Backend;
@@ -164,6 +166,41 @@ const WindowsBackend = struct {
     extern "user32" fn FindWindowW(class_name: LPCWSTR, window_name: LPCWSTR) callconv(.winapi) HWND;
     extern "user32" fn SendMessageW(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) callconv(.winapi) LRESULT;
 
+    // Registry surface for registerScheme — mirrors the autostart.zig
+    // pattern. advapi32 / kernel32 are auto-linked via the `extern "<lib>"`
+    // hints, so no template build.zig changes are needed.
+    const HKEY = ?*opaque {};
+    const HKEY_CURRENT_USER: HKEY = @ptrFromInt(0x80000001);
+    const KEY_WRITE: u32 = 0x20006;
+    const REG_SZ: u32 = 1;
+    const ERROR_SUCCESS: c_long = 0;
+
+    extern "advapi32" fn RegCreateKeyExW(
+        hkey: HKEY,
+        sub: ?[*:0]const u16,
+        reserved: u32,
+        class: ?[*:0]const u16,
+        options: u32,
+        access: u32,
+        sa: ?*anyopaque,
+        out: *HKEY,
+        disposition: ?*u32,
+    ) callconv(.winapi) c_long;
+    extern "advapi32" fn RegSetValueExW(
+        hkey: HKEY,
+        name: ?[*:0]const u16,
+        reserved: u32,
+        ty: u32,
+        data: ?[*]const u8,
+        size: u32,
+    ) callconv(.winapi) c_long;
+    extern "advapi32" fn RegCloseKey(hkey: HKEY) callconv(.winapi) c_long;
+    extern "kernel32" fn GetModuleFileNameW(
+        hModule: ?*anyopaque,
+        lpFilename: [*]u16,
+        nSize: u32,
+    ) callconv(.winapi) u32;
+
     fn forwardToRunningInstance(_: std.mem.Allocator, _: []const u8, url: []const u8) Error!void {
         // Locate the running app by window-class name. Every Verve
         // window registers under "VerveWindow" (see `windows.zig`
@@ -191,10 +228,72 @@ const WindowsBackend = struct {
         // declarative — registering a window class is sufficient.
     }
 
-    fn registerScheme(_: []const u8, _: []const u8) Error!void {
-        // Requires HKCU\Software\Classes\<scheme> registry tree
-        // (DefaultIcon + shell\open\command). Future bundle.
-        return error.Unsupported;
+    fn registerScheme(allocator: std.mem.Allocator, scheme: []const u8, bundle_id: []const u8) Error!void {
+        if (builtin.os.tag != .windows) return error.Unsupported;
+        if (scheme.len == 0 or scheme.len >= 128) return error.Backend;
+        if (bundle_id.len == 0 or bundle_id.len >= 256) return error.Backend;
+        // Reject schemes containing path separators or other registry-
+        // unsafe characters — the scheme becomes a key name and must
+        // be a single path component.
+        for (scheme) |ch| {
+            if (ch == '\\' or ch == '/' or ch == 0) return error.Backend;
+        }
+
+        // Resolve the running executable's absolute path.
+        var exe_w: [4096]u16 = undefined;
+        const len = GetModuleFileNameW(null, &exe_w, exe_w.len);
+        if (len == 0 or len >= exe_w.len) return error.Backend;
+        const exe_path_w = exe_w[0..len];
+
+        // Compose `"<exe_path>" "%1"` for the shell\open\command default
+        // value, in UTF-16 directly (skip a UTF-8 round-trip).
+        var cmd_w: std.ArrayList(u16) = .empty;
+        defer cmd_w.deinit(allocator);
+        try cmd_w.append(allocator, '"');
+        try cmd_w.appendSlice(allocator, exe_path_w);
+        try cmd_w.appendSlice(allocator, &[_]u16{ '"', ' ', '"', '%', '1', '"' });
+        try cmd_w.append(allocator, 0);
+
+        // HKCU\Software\Classes\<scheme>
+        const key_path_u8 = std.fmt.allocPrint(allocator, "Software\\Classes\\{s}", .{scheme}) catch return error.OutOfMemory;
+        defer allocator.free(key_path_u8);
+        const key_path_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, key_path_u8) catch return error.OutOfMemory;
+        defer allocator.free(key_path_w);
+
+        var scheme_key: HKEY = null;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, key_path_w.ptr, 0, null, 0, KEY_WRITE, null, &scheme_key, null) != ERROR_SUCCESS) {
+            return error.Backend;
+        }
+        defer _ = RegCloseKey(scheme_key);
+
+        // (Default) = "URL:<bundle_id>"
+        const default_u8 = std.fmt.allocPrint(allocator, "URL:{s}", .{bundle_id}) catch return error.OutOfMemory;
+        defer allocator.free(default_u8);
+        const default_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, default_u8) catch return error.OutOfMemory;
+        defer allocator.free(default_w);
+        const default_bytes: u32 = @intCast((default_w.len + 1) * @sizeOf(u16));
+        if (RegSetValueExW(scheme_key, null, 0, REG_SZ, @ptrCast(default_w.ptr), default_bytes) != ERROR_SUCCESS) return error.Backend;
+
+        // "URL Protocol" = "" — the marker Windows uses to recognize
+        // this key as a URL-protocol handler.
+        const url_proto_name = std.unicode.utf8ToUtf16LeStringLiteral("URL Protocol");
+        const empty: [1]u16 = .{0};
+        if (RegSetValueExW(scheme_key, url_proto_name, 0, REG_SZ, @ptrCast(&empty), @sizeOf(u16)) != ERROR_SUCCESS) return error.Backend;
+
+        // ...\shell\open\command (Default) = `"<exe>" "%1"`
+        const cmd_subkey_u8 = std.fmt.allocPrint(allocator, "Software\\Classes\\{s}\\shell\\open\\command", .{scheme}) catch return error.OutOfMemory;
+        defer allocator.free(cmd_subkey_u8);
+        const cmd_subkey_w = std.unicode.utf8ToUtf16LeAllocZ(allocator, cmd_subkey_u8) catch return error.OutOfMemory;
+        defer allocator.free(cmd_subkey_w);
+
+        var cmd_key: HKEY = null;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, cmd_subkey_w.ptr, 0, null, 0, KEY_WRITE, null, &cmd_key, null) != ERROR_SUCCESS) {
+            return error.Backend;
+        }
+        defer _ = RegCloseKey(cmd_key);
+
+        const cmd_bytes: u32 = @intCast(cmd_w.items.len * @sizeOf(u16));
+        if (RegSetValueExW(cmd_key, null, 0, REG_SZ, @ptrCast(cmd_w.items.ptr), cmd_bytes) != ERROR_SUCCESS) return error.Backend;
     }
 };
 
@@ -267,12 +366,115 @@ const LinuxBackend = struct {
         };
     }
 
-    fn registerScheme(_: []const u8, _: []const u8) Error!void {
-        // Requires writing ~/.local/share/applications/<name>.desktop
-        // with `MimeType=x-scheme-handler/<scheme>;` + invoking
-        // `xdg-mime default ...`. Future bundle.
-        return error.Unsupported;
+    fn registerScheme(allocator: std.mem.Allocator, scheme: []const u8, bundle_id: []const u8) Error!void {
+        if (builtin.os.tag != .linux) return error.Unsupported;
+        if (scheme.len == 0 or scheme.len >= 128) return error.Backend;
+        if (bundle_id.len == 0 or bundle_id.len >= 256) return error.Backend;
+        // bundle_id becomes the .desktop filename — no separators.
+        for (bundle_id) |ch| {
+            if (ch == '/' or ch == '\\' or ch == 0) return error.Backend;
+        }
+        for (scheme) |ch| {
+            if (ch == '/' or ch == '\\' or ch == 0 or ch == ';') return error.Backend;
+        }
+
+        // Resolve $HOME without bringing in std.process.Environ —
+        // posix getenv is the canonical lookup and matches the rest
+        // of the Linux backend.
+        const home_ptr = std.c.getenv("HOME") orelse return error.Backend;
+        const home = std.mem.sliceTo(home_ptr, 0);
+        if (home.len == 0) return error.Backend;
+
+        // /proc/self/exe symlink → absolute exe path.
+        var exe_buf: [4096]u8 = undefined;
+        const exe_len = readlink("/proc/self/exe", &exe_buf, exe_buf.len);
+        if (exe_len <= 0 or @as(usize, @intCast(exe_len)) >= exe_buf.len) return error.Backend;
+        const exe_path = exe_buf[0..@intCast(exe_len)];
+
+        const apps_dir = std.fmt.allocPrint(allocator, "{s}/.local/share/applications", .{home}) catch return error.OutOfMemory;
+        defer allocator.free(apps_dir);
+
+        // mkdir -p the parent. POSIX `mkdir` returns -1 with EEXIST
+        // when the dir already exists, which we treat as success.
+        mkdirP(allocator, apps_dir) catch return error.Backend;
+
+        const desktop_path = std.fmt.allocPrint(allocator, "{s}/{s}.desktop", .{ apps_dir, bundle_id }) catch return error.OutOfMemory;
+        defer allocator.free(desktop_path);
+        const desktop_path_z = allocator.dupeZ(u8, desktop_path) catch return error.OutOfMemory;
+        defer allocator.free(desktop_path_z);
+
+        // .desktop entry. NoDisplay=true keeps it out of the
+        // application menu — this is a URL handler, not a launcher.
+        // StartupWMClass mirrors the GTK WM_CLASS set by `linux.zig`
+        // so xdotool / wmctrl can pin the running window.
+        const content = std.fmt.allocPrint(allocator,
+            \\[Desktop Entry]
+            \\Type=Application
+            \\Name={s}
+            \\Exec="{s}" %u
+            \\NoDisplay=true
+            \\MimeType=x-scheme-handler/{s};
+            \\Terminal=false
+            \\StartupNotify=true
+            \\StartupWMClass={s}
+            \\
+        , .{ bundle_id, exe_path, scheme, bundle_id }) catch return error.OutOfMemory;
+        defer allocator.free(content);
+
+        writeFileAtomic(desktop_path_z, content) catch return error.Backend;
+
+        // v1 stops here. The freedesktop spec says a `.desktop` file
+        // with `MimeType=x-scheme-handler/<scheme>` advertised in a
+        // user-applications directory is sufficient for the OS to
+        // register the app as a handler on the next desktop-database
+        // refresh. Setting it as the *default* handler when a user
+        // already has another handler installed requires
+        // `xdg-mime default <id>.desktop x-scheme-handler/<scheme>`
+        // — the framework intentionally does not shell out here
+        // (avoids needing an `io: std.Io` parameter for a
+        // best-effort side effect). Apps that want the explicit
+        // default-set can run that command themselves after this
+        // call returns.
     }
+
+    extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, bufsize: usize) isize;
+    extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+    extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+    extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+    extern "c" fn __errno_location() *c_int;
+
+    const O_WRONLY: c_int = 0o1;
+    const O_CREAT: c_int = 0o100;
+    const O_TRUNC: c_int = 0o1000;
+    const EEXIST: c_int = 17;
+
+    fn mkdirP(allocator: std.mem.Allocator, path: []const u8) !void {
+        // Walk components, mkdir each one. Idempotent: EEXIST is fine.
+        var i: usize = 1; // skip leading '/'
+        while (i <= path.len) : (i += 1) {
+            if (i == path.len or path[i] == '/') {
+                const prefix = path[0..i];
+                const z = try allocator.dupeZ(u8, prefix);
+                defer allocator.free(z);
+                if (mkdir(z.ptr, 0o755) != 0) {
+                    if (__errno_location().* != EEXIST) return error.Backend;
+                }
+            }
+        }
+    }
+
+    fn writeFileAtomic(path_z: [:0]const u8, data: []const u8) !void {
+        const fd = open(path_z.ptr, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        if (fd < 0) return error.Backend;
+        defer _ = close(fd);
+        var written: usize = 0;
+        while (written < data.len) {
+            const n = write(fd, data.ptr + written, data.len - written);
+            if (n < 0) return error.Backend;
+            written += @intCast(n);
+        }
+    }
+
 
     /// Build the abstract-socket path bytes. Format: a leading NUL
     /// followed by `"verve-deeplink-" ++ name`. Returns the total

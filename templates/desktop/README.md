@@ -227,7 +227,7 @@ Side-modules under `desktop.*` (not on the `Window` surface):
 | `desktop.shell` | `openUrl(alloc, url)`, `showInFolder(alloc, path)` | All 3 real |
 | `desktop.tray` | `init(alloc, &win, opts)` + `TrayOptions { label, tooltip, icon_path, icon_symbol, menu, on_click, on_menu_item }` | All 3 real (icon_symbol macOS only) |
 | `desktop.notifications` | `show(alloc, .{title, body})` | macOS + Linux real; Win via tray balloon |
-| `desktop.deep_link` | `forwardToRunningInstance`, `startListener`, `registerScheme(scheme, bundle_id)` | All 3 real (registerScheme macOS only) |
+| `desktop.deep_link` | `forwardToRunningInstance`, `startListener`, `registerScheme(allocator, scheme, bundle_id)` | All 3 real on all 3 backends |
 | `desktop.displays` | `list(alloc) []Display` | All 3 real |
 | `desktop.clipboard` | (via `Window.clipboard()`) `writeText` / `readText` (all 3), `writeHtml` / `readHtml` (macOS only) | mixed |
 | `desktop.updates` | `checkForUpdate(alloc, feed_url, current_version)` | Cross-platform via `std.http.Client` |

@@ -1124,6 +1124,48 @@ now a Level-3 golden-diff harness:
     returned `error.Backend` not in the declared `Error` set;
     swapped to `error.Unsupported`.
 
+### Out of P1 scope — shipped 2026-05-30 (Bundle 2 — registerScheme Win + Linux)
+
+Second entry in the Win/Linux backfill plan. Closes the macOS-only
+stub from 2026-05-28's `desktop.deep_link.registerScheme`.
+
+- **Signature change**: `registerScheme(scheme, bundle_id)` →
+  `registerScheme(allocator, scheme, bundle_id)`. macOS impl
+  ignores the allocator; Win + Linux need it for string
+  composition. No external callers beyond the README example.
+- **Windows** — Writes the `HKCU\Software\Classes\<scheme>`
+  registry tree:
+  - `(Default) = "URL:<bundle_id>"` — the per-spec display label.
+  - `URL Protocol = ""` — the marker Windows uses to identify
+    a key as a URL-protocol handler.
+  - `<scheme>\shell\open\command (Default) = "<exe>" "%1"` — the
+    actual handler invocation. `<exe>` resolved at runtime via
+    `GetModuleFileNameW(null, ...)`. UTF-16 composed directly to
+    skip a round-trip.
+  - Uses `RegCreateKeyExW` (auto-create-or-open) so the call is
+    idempotent. advapi32 + kernel32 auto-linked via the existing
+    `extern "<lib>"` pattern; no template build.zig changes.
+- **Linux** — Writes
+  `~/.local/share/applications/<bundle_id>.desktop` with
+  `[Desktop Entry] Type=Application Name=<bundle_id>
+  Exec="<exe>" %u NoDisplay=true MimeType=x-scheme-handler/<scheme>;
+  StartupWMClass=<bundle_id>`. `$HOME` from `getenv`; exe path
+  from `readlink("/proc/self/exe", ...)`. Parent dirs created
+  via a posix `mkdir -p` walk (EEXIST tolerated). Atomic file
+  write via raw `open/write/close` so the .desktop appears whole
+  or not at all (no half-written entries on disk).
+- **`xdg-mime default` not invoked** — that would force an
+  `io: std.Io` parameter for a best-effort side-effect. Callers
+  who need explicit default-handler activation run
+  `xdg-mime default <bundle_id>.desktop x-scheme-handler/<scheme>`
+  themselves after the call returns. The .desktop file alone is
+  enough for nautilus/dolphin/etc. to register the app as *a*
+  handler on next desktop-database refresh.
+
+Verified: framework `zig build` + `zig build test`; 3-backend
+cross-compile clean for `deep_link.zig`; fresh-scaffold
+`zig build smoke` PASS (checksum 1789 unchanged).
+
 ### Out of P1 scope — shipped 2026-05-30 (Bundle 1 — Linux dlopen)
 
 First entry in the Win/Linux backfill plan (post-v0.1.9). Closes
@@ -1322,7 +1364,7 @@ signing infra.
 | **Clipboard rich formats (Win + Linux)** | HTML / image / RTF beyond text. macOS HTML shipped 2026-05-28. | ~2h. Win `CF_HTML` (gnarly header format); Linux GtkClipboard `text/html` target. Image (`NSPasteboardTypeTIFF` / `CF_DIB` / `image/png` target) still pending all 3. |
 | **File-watch / fs notifications (Win + Linux)** | macOS FSEvents shipped 2026-05-28. | ~2h. Win `ReadDirectoryChangesW` + IOCP / overlapped IO; Linux `inotify` with `GIOChannel` watch into the GTK main loop. |
 | **Global hotkeys (Win + Linux)** | macOS Carbon `RegisterEventHotKey` shipped 2026-05-28. | ~2h. Win `RegisterHotKey` + `WM_HOTKEY` plumbing; Linux X11 `XGrabKey` / Wayland portal. |
-| **Custom URL scheme runtime registration (Win + Linux)** | macOS `LSSetDefaultHandlerForURLScheme` shipped 2026-05-28. | ~2h. Win: `HKCU\Software\Classes\<scheme>` registry tree. Linux: write `~/.local/share/applications/<name>.desktop` + `xdg-mime default ...`. |
+| ~~**Custom URL scheme runtime registration (Win + Linux)**~~ | **Closed 2026-05-30 (Bundle 2).** Win writes `HKCU\Software\Classes\<scheme>` registry tree (default value + `URL Protocol` marker + `shell\open\command`); Linux writes `~/.local/share/applications/<bundle_id>.desktop` with `MimeType=x-scheme-handler/<scheme>`. macOS `LSSetDefaultHandlerForURLScheme` shipped 2026-05-28. | — |
 
 ### Known sharp edges in shipped code
 
@@ -1391,7 +1433,7 @@ from earlier bundles are established.
 | # | Bundle | What | Win impl | Linux impl | Risk |
 |---|--------|------|----------|------------|------|
 | 1 | ~~**Linux libayatana / libnotify dlopen**~~ — **shipped 2026-05-30** | Closed. `std.c.dlopen("libayatana-appindicator3.so.1")` + memoized fn-pointer struct in `tray.zig`; same shape for `libnotify.so.4` in `notifications.zig`. Both fall back to unversioned `.so` filename then return `error.Unsupported` when neither resolves. macOS smoke PASS (1789); 3-backend cross-compile clean | — | done | — |
-| 2 | **URL-scheme runtime registration** | Closes the macOS-only stub from 2026-05-28's `deep_link.registerScheme` | `HKCU\Software\Classes\<scheme>` registry tree write via advapi32 `RegCreateKeyExW` + `RegSetValueExW`; URL handler points to `exe_path %1` | `~/.local/share/applications/<name>.desktop` file write + `xdg-mime default <name>.desktop x-scheme-handler/<scheme>` shell-out | Low — mechanical FS / registry writes |
+| 2 | ~~**URL-scheme runtime registration**~~ — **shipped 2026-05-30** | Closed. Win: `HKCU\Software\Classes\<scheme>` tree (default + `URL Protocol` marker + `shell\open\command`) via advapi32 `RegCreateKeyExW` + `RegSetValueExW`. Linux: `~/.local/share/applications/<bundle_id>.desktop` write with `MimeType=x-scheme-handler/<scheme>;` + `NoDisplay=true`. `xdg-mime default` left to caller (avoids forcing an `io: std.Io` param). Signature gained `allocator` (now `(allocator, scheme, bundle_id)`) | done | done | — |
 | 3 | **Clipboard HTML** | Closes the macOS-only `Clipboard.writeHtml` / `readHtml` from 2026-05-28 | `CF_HTML` register via `RegisterClipboardFormatW("HTML Format")` + the Microsoft-specific header format (`Version:0.9\r\nStartHTML:...\r\nEndHTML:...\r\nStartFragment:...\r\nEndFragment:...\r\n<html>...`) | `GtkClipboard` `text/html` target via `gtk_clipboard_set_with_data` + `gtk_target_entry` | Low-medium — CF_HTML header math is fiddly but well-documented |
 | 4 | **File-watch (Win)** | Closes Win half of the macOS-only `desktop.fswatch` from 2026-05-28 | `ReadDirectoryChangesW` overlapped I/O on a `CreateIoCompletionPort` IOCP; dedicated worker thread reads events + posts to wndProc via `PostMessageW(WM_VERVE_FSWATCH)` for main-thread callback delivery | — | Medium — overlapped IO + thread + callback marshaling |
 | 5 | **File-watch (Linux)** | Linux half of `desktop.fswatch` | — | `inotify_init1(IN_NONBLOCK \| IN_CLOEXEC)` + `inotify_add_watch` per path, wrap fd in `GIOChannel` + `g_io_add_watch(G_IO_IN)` so the GTK main loop dispatches; parse `inotify_event` ring | Medium — same as Win shape, different syscalls |

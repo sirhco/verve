@@ -6,8 +6,27 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `desktop.deep_link.registerScheme` Win + Linux implementations
+  (Bundle 2 of the Win/Linux backfill plan). Closes the macOS-only
+  stub. Win writes the `HKCU\Software\Classes\<scheme>` registry
+  tree (default value + `URL Protocol` marker +
+  `shell\open\command` with `"<exe>" "%1"`); exe path resolved via
+  `GetModuleFileNameW`. Linux writes
+  `~/.local/share/applications/<bundle_id>.desktop` with
+  `MimeType=x-scheme-handler/<scheme>;` + `NoDisplay=true`; exe
+  path from `readlink("/proc/self/exe")`. `xdg-mime default ...`
+  is not invoked — callers run that command themselves to set
+  the explicit default handler. macOS impl unchanged.
+
 ### Changed
 
+- **Breaking**: `desktop.deep_link.registerScheme` signature gained
+  an `allocator` parameter — now `(allocator, scheme, bundle_id)`.
+  Required by the new Win + Linux impls for string composition;
+  macOS impl ignores the value. Existing callers must add their
+  allocator. Pre-1.0, no compatibility shim.
 - Linux `libayatana-appindicator3` (tray) + `libnotify`
   (notifications) are now loaded at runtime via `std.c.dlopen` +
   memoized fn-pointer structs instead of link-time `extern fn`
