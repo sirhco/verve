@@ -44,19 +44,24 @@ pub fn spaceAt(allocator: std.mem.Allocator, path: []const u8) Error!Space {
 
 // ---- POSIX — statvfs --------------------------------------------------------
 
-// macOS uses 32-bit fsblkcnt_t; Linux uses 64-bit. Both share the
-// field names; we only read the four counts we care about so the
-// per-platform width difference resolves at compile time via the
-// `usize` mapping (matches typedef in the OS headers).
+// macOS `fsblkcnt_t` / `fsfilcnt_t` are `unsigned int` (32-bit);
+// Linux's are `unsigned long` (64-bit on LP64). Sharing one extern
+// struct across both backends mis-aligns every field after f_frsize
+// on macOS — reading f_blocks as c_ulong picks up the high half of
+// the next field, producing huge garbage values that overflow when
+// multiplied by f_frsize. Split per platform.
+const fsblkcnt_t = if (builtin.os.tag == .macos) c_uint else c_ulong;
+const fsfilcnt_t = fsblkcnt_t;
+
 const StatvfsPosix = extern struct {
     f_bsize: c_ulong = 0,
     f_frsize: c_ulong = 0,
-    f_blocks: c_ulong = 0,
-    f_bfree: c_ulong = 0,
-    f_bavail: c_ulong = 0,
-    f_files: c_ulong = 0,
-    f_ffree: c_ulong = 0,
-    f_favail: c_ulong = 0,
+    f_blocks: fsblkcnt_t = 0,
+    f_bfree: fsblkcnt_t = 0,
+    f_bavail: fsblkcnt_t = 0,
+    f_files: fsfilcnt_t = 0,
+    f_ffree: fsfilcnt_t = 0,
+    f_favail: fsfilcnt_t = 0,
     f_fsid: c_ulong = 0,
     f_flag: c_ulong = 0,
     f_namemax: c_ulong = 0,
