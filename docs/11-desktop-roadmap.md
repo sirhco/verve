@@ -1338,6 +1338,76 @@ Pick by platform completeness:
   drag-drop / print / new fswatch / hotkeys / network paths) is
   diagnostic-instrumented but unverified.
 
+### Win + Linux backfill plan (post-v0.1.9, ~16-20h across 8 sessions)
+
+Recommended sequence for the next eight one-bundle-per-session
+cycles. Assumes no live Win or Linux hosts available — bundles
+that *need* a host (WinRT Toast, GTK4, full live validation,
+auto-updater apply via platform updaters) are deliberately
+deferred. Each bundle ships under the existing convention:
+cross-compile clean on all three backends + macOS smoke PASS +
+single commit + roadmap update.
+
+Ordering rationale: mechanical / format-conversion / filesystem-
+write bundles first (lowest implementation novelty → smallest
+chance of latent bugs without a live host). Bundles that exercise
+event-loop / async / callback plumbing land later, once patterns
+from earlier bundles are established.
+
+| # | Bundle | What | Win impl | Linux impl | Risk |
+|---|--------|------|----------|------------|------|
+| 1 | **Linux libayatana / libnotify dlopen** | Move tray + notification externs behind weak `dlopen` so distros lacking those libs can still build Verve apps that don't call the modules | — | `dlopen("libayatana-appindicator3.so.1")` + `dlsym` in `tray.zig`; same for `libnotify.so.4` in `notifications.zig`; `error.Unsupported` when symbol resolution fails | Low — pure refactor of existing extern declarations |
+| 2 | **URL-scheme runtime registration** | Closes the macOS-only stub from 2026-05-28's `deep_link.registerScheme` | `HKCU\Software\Classes\<scheme>` registry tree write via advapi32 `RegCreateKeyExW` + `RegSetValueExW`; URL handler points to `exe_path %1` | `~/.local/share/applications/<name>.desktop` file write + `xdg-mime default <name>.desktop x-scheme-handler/<scheme>` shell-out | Low — mechanical FS / registry writes |
+| 3 | **Clipboard HTML** | Closes the macOS-only `Clipboard.writeHtml` / `readHtml` from 2026-05-28 | `CF_HTML` register via `RegisterClipboardFormatW("HTML Format")` + the Microsoft-specific header format (`Version:0.9\r\nStartHTML:...\r\nEndHTML:...\r\nStartFragment:...\r\nEndFragment:...\r\n<html>...`) | `GtkClipboard` `text/html` target via `gtk_clipboard_set_with_data` + `gtk_target_entry` | Low-medium — CF_HTML header math is fiddly but well-documented |
+| 4 | **File-watch (Win)** | Closes Win half of the macOS-only `desktop.fswatch` from 2026-05-28 | `ReadDirectoryChangesW` overlapped I/O on a `CreateIoCompletionPort` IOCP; dedicated worker thread reads events + posts to wndProc via `PostMessageW(WM_VERVE_FSWATCH)` for main-thread callback delivery | — | Medium — overlapped IO + thread + callback marshaling |
+| 5 | **File-watch (Linux)** | Linux half of `desktop.fswatch` | — | `inotify_init1(IN_NONBLOCK \| IN_CLOEXEC)` + `inotify_add_watch` per path, wrap fd in `GIOChannel` + `g_io_add_watch(G_IO_IN)` so the GTK main loop dispatches; parse `inotify_event` ring | Medium — same as Win shape, different syscalls |
+| 6 | **Global hotkeys (Win)** | Closes Win half of macOS-only `desktop.hotkeys` from 2026-05-28 | `RegisterHotKey(hwnd, id, fsModifiers, vk)` with `MOD_*` mapping + `WM_HOTKEY` case in `wndProc`. Modifier mapping: `cmd` → `MOD_WIN`, `ctrl` → `MOD_CONTROL`, `option` → `MOD_ALT`, `shift` → `MOD_SHIFT` | — | Medium |
+| 7 | **Global hotkeys (Linux X11)** | Linux half. Wayland portal deferred (separate D-Bus call; needs portal infra) | — | `XGrabKey(dpy, keycode, modifiers, DefaultRootWindow(dpy), True, GrabModeAsync, GrabModeAsync)` after `XKeysymToKeycode`; hook a key-press handler on the root window via `XSelectInput`. X11-only — Wayland session returns `error.Unsupported` (detected via `XDG_SESSION_TYPE=wayland`) | Medium-high — X11 keymap quirks (NumLock / CapsLock mask combinations need iteration) |
+| 8 | **Print extras (Win + Linux)** | Page-range / copies / printer-selection. Closes the macOS-only NSPrintInfo dict path from 2026-05-27 | New `SLOT_WV2_PrintSettings` vtable slot on `ICoreWebView2PrintSettings` (factory via `ICoreWebView2Environment6::CreatePrintSettings`). Set `Copies`, `PageRange` (`"1-5,8"` string format), `PrinterName` then pass to `ShowPrintUI` / `PrintToPdf` | `GtkPrintSettings` via `gtk_print_settings_new` → `gtk_print_settings_set_n_copies` / `_set_page_ranges` / `_set_printer`; attach to `WebKitPrintOperation` via `webkit_print_operation_set_print_settings` before `_run_dialog` | Medium — Win adds another vtable slot to the hand-extracted set; document the slot index source in the same convention as existing slots |
+
+Bundles **deferred** (host-required or scope-too-large):
+- **Bundle 9** — WinRT Toast. Needs Windows host for AUMID +
+  Start-menu shortcut + COM init validation.
+- **Bundle 10** — GTK4 + WebKitGTK 6.0 behind `-Dgtk4`. Needs
+  Linux host for live validation against Ubuntu 24 LTS / Fedora 41.
+- **Bundle 11** — Win/Linux auto-updater apply. Squirrel or MSIX
+  on Win, AppImageUpdate on Linux. Each is a full framework
+  integration with its own signing model. Defer until update
+  signing infra is picked.
+- **Bundle 12** — Live validation pass on a real Linux host
+  followed by a real Windows host. Boot every code path; fix
+  what breaks; verify WebView2 vtable slot indexes against
+  actual SDK headers. Cannot be planned without host availability.
+- **Bundle 13** — Full a11y provider (UIA on Win + ATK on
+  Linux). Polish vs. shipped `setAccessibilityLabel`. Web content
+  + menus already self-publish; remaining gap is window-chrome
+  semantics. Cross-compile clean is feasible but live validation
+  is the entire value, so this is host-gated too.
+
+Per-bundle session checklist (lifted from 2026-05-22 →
+2026-05-29 conventions, applies to every bundle 1-8):
+
+1. New module / impl behind feature flag if breaking, or extend
+   existing module if additive (most of these are additive
+   per-platform impls of macOS-shipped surfaces).
+2. `zig build` + `zig build test` PASS in the framework.
+3. 3-backend cross-compile of the touched files
+   (`window.zig` + any new module).
+4. Fresh-scaffold `zig build smoke` PASS on macOS (golden
+   checksum unchanged unless the bundle is additive to the demo
+   page — bump golden in same commit when it is).
+5. Update `docs/11-desktop-roadmap.md` "Open P3" / "Uncovered
+   gaps" tables — strike the closed line.
+6. Update `CHANGELOG.md` `[Unreleased]` section.
+7. Single commit, message follows `desktop: <bundle name>` shape.
+
+Estimated cumulative effort: bundles 1-3 (~4-6h) close the
+quick-wins band; bundles 4-7 (~10-12h) close the medium-novelty
+band; bundle 8 (~3h) closes the print polish. After all eight,
+non-host-gated Win/Linux work is exhausted — every remaining
+roadmap item needs either a live host or a distribution-signing
+decision.
+
 ## Verification commands for fresh sessions
 
 ```sh
