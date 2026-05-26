@@ -8,6 +8,22 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `desktop.fswatch.Watcher` Windows implementation (Bundle 4 of
+  the Win/Linux backfill plan). macOS FSEvents impl unchanged.
+  Linux still pending (Bundle 5). Windows uses
+  `ReadDirectoryChangesW` against a `FILE_FLAG_BACKUP_SEMANTICS
+  | FILE_FLAG_OVERLAPPED` directory handle, pumped by a dedicated
+  worker thread blocking on `GetOverlappedResult(..., TRUE)`.
+  Recursive watch (`bWatchSubtree=TRUE`) covers file + dir name
+  changes, attributes, size, last-write, and creation events.
+  Shutdown via `CancelIoEx` + atomic stop flag from `deinit`.
+  16 KiB buffer per watcher. **v1 callback threading**:
+  callback fires from the worker thread, not the UI thread —
+  apps that need main-thread delivery should marshal across
+  themselves (PostMessage / queue drain from the main loop).
+  `Watcher` struct gained per-platform `macos_impl` /
+  `windows_impl` slots; `deinit` cleans up whichever the
+  factory populated.
 - `Clipboard.writeHtml` / `readHtml` Win + Linux implementations
   (Bundle 3 of the Win/Linux backfill plan). macOS impl unchanged.
   Win uses the CF_HTML clipboard format with a dynamically

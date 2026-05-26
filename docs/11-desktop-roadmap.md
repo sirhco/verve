@@ -1124,6 +1124,53 @@ now a Level-3 golden-diff harness:
     returned `error.Backend` not in the declared `Error` set;
     swapped to `error.Unsupported`.
 
+### Out of P1 scope — shipped 2026-05-30 (Bundle 4 — Win file-watch)
+
+Fourth entry in the Win/Linux backfill plan. Closes the Win half
+of the macOS-only `desktop.fswatch` from 2026-05-28. Linux half
+remains pending (Bundle 5).
+
+- `Watcher` struct gained per-platform `macos_impl` /
+  `windows_impl` slots; `init` switches on `builtin.os.tag` and
+  populates the right one. `deinit` cleans up whichever was set.
+- Windows impl (`WindowsWatcher`):
+  - Opens the directory with `CreateFileW` +
+    `FILE_LIST_DIRECTORY | GENERIC_READ` + share-everything +
+    `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED`. Backup
+    semantics is what lets you open a directory as a handle.
+  - Allocates a 16 KiB u32-aligned buffer for
+    `FILE_NOTIFY_INFORMATION` entries (enough for ~150-500
+    coalesced events per read; larger reduces the chance of
+    kernel-side buffer overflow on bursty FS activity).
+  - Creates a manual-reset event for the OVERLAPPED structure.
+  - Spawns a worker thread via `std.Thread.spawn` that loops:
+    `ReadDirectoryChangesW(...)` →
+    `GetOverlappedResult(..., bWait=TRUE)` (blocks until
+    completion or cancellation) → parse FILE_NOTIFY_INFORMATION
+    chain → compose `<watch_root>\<relative_path>` UTF-8 →
+    fire callback. Recursive (`bWatchSubtree=TRUE`) to match
+    FSEvents shape on macOS. Filter mask covers FILE_NAME +
+    DIR_NAME + ATTRIBUTES + SIZE + LAST_WRITE + CREATION.
+  - Shutdown: set `stop_flag` atomic + `CancelIoEx(dir, null)`
+    so the blocking `GetOverlappedResult` returns; worker
+    sees the flag and exits; `Thread.join` from `deinit`;
+    handles + buffer freed.
+  - **v1 callback threading**: fires from the worker thread,
+    not the UI thread. macOS FSEvents schedules onto the main
+    run loop; Win has no equivalent built-in. Apps that need
+    main-thread delivery should marshal across themselves
+    (PostMessage to the window + drain from wndProc, or a
+    thread-safe queue drained from the GTK/Cocoa main loop).
+    Documented in the module header.
+
+Externs added to `fswatch.zig`: `CreateFileW`, `CreateEventW`,
+`ReadDirectoryChangesW`, `GetOverlappedResult`, `CancelIoEx`,
+`CloseHandle` — all kernel32, auto-linked via `extern "kernel32"`.
+
+Verified: framework `zig build test` (205 pass); 3-backend
+cross-compile clean for `fswatch.zig`; fresh-scaffold
+`zig build smoke` PASS (checksum 1789 unchanged).
+
 ### Out of P1 scope — shipped 2026-05-30 (Bundle 3 — clipboard HTML Win + Linux)
 
 Third entry in the Win/Linux backfill plan. Closes the macOS-only
@@ -1404,7 +1451,7 @@ signing infra.
 | Gap | What | Estimated scope |
 |---|---|---|
 | ~~**Clipboard HTML (Win + Linux)**~~ | **Closed 2026-05-30 (Bundle 3).** Win CF_HTML format with the Microsoft-spec Version / Start/End HTML / Start/End Fragment header offsets. Linux GtkClipboard `text/html` target via `gtk_clipboard_set_with_data` + a get-callback that reads a process-global cached payload. Image clipboard (`NSPasteboardTypeTIFF` / `CF_DIB` / `image/png` target) still pending all 3. | — |
-| **File-watch / fs notifications (Win + Linux)** | macOS FSEvents shipped 2026-05-28. | ~2h. Win `ReadDirectoryChangesW` + IOCP / overlapped IO; Linux `inotify` with `GIOChannel` watch into the GTK main loop. |
+| **File-watch (Win shipped 2026-05-30 Bundle 4 / Linux pending Bundle 5)** | macOS FSEvents shipped 2026-05-28. Win: `ReadDirectoryChangesW` + overlapped IO on a dedicated worker thread + `GetOverlappedResult` blocking pump + `CancelIoEx`-driven shutdown. Linux still pending: `inotify` with `GIOChannel` watch into the GTK main loop. | Linux ~2h |
 | **Global hotkeys (Win + Linux)** | macOS Carbon `RegisterEventHotKey` shipped 2026-05-28. | ~2h. Win `RegisterHotKey` + `WM_HOTKEY` plumbing; Linux X11 `XGrabKey` / Wayland portal. |
 | ~~**Custom URL scheme runtime registration (Win + Linux)**~~ | **Closed 2026-05-30 (Bundle 2).** Win writes `HKCU\Software\Classes\<scheme>` registry tree (default value + `URL Protocol` marker + `shell\open\command`); Linux writes `~/.local/share/applications/<bundle_id>.desktop` with `MimeType=x-scheme-handler/<scheme>`. macOS `LSSetDefaultHandlerForURLScheme` shipped 2026-05-28. | — |
 
@@ -1477,7 +1524,7 @@ from earlier bundles are established.
 | 1 | ~~**Linux libayatana / libnotify dlopen**~~ — **shipped 2026-05-30** | Closed. `std.c.dlopen("libayatana-appindicator3.so.1")` + memoized fn-pointer struct in `tray.zig`; same shape for `libnotify.so.4` in `notifications.zig`. Both fall back to unversioned `.so` filename then return `error.Unsupported` when neither resolves. macOS smoke PASS (1789); 3-backend cross-compile clean | — | done | — |
 | 2 | ~~**URL-scheme runtime registration**~~ — **shipped 2026-05-30** | Closed. Win: `HKCU\Software\Classes\<scheme>` tree (default + `URL Protocol` marker + `shell\open\command`) via advapi32 `RegCreateKeyExW` + `RegSetValueExW`. Linux: `~/.local/share/applications/<bundle_id>.desktop` write with `MimeType=x-scheme-handler/<scheme>;` + `NoDisplay=true`. `xdg-mime default` left to caller (avoids forcing an `io: std.Io` param). Signature gained `allocator` (now `(allocator, scheme, bundle_id)`) | done | done | — |
 | 3 | ~~**Clipboard HTML**~~ — **shipped 2026-05-30** | Closed. Win: CF_HTML via `RegisterClipboardFormatW("HTML Format")` + zero-padded 10-digit header offsets (StartHTML / EndHTML / StartFragment / EndFragment); read parses the StartFragment/EndFragment offsets to slice out the original fragment. Linux: `gtk_clipboard_set_with_data` with a `text/html` GtkTargetEntry + a get_func reading a process-global cached payload (single-window assumption matches the rest of tray / notifications); read via `gtk_clipboard_wait_for_contents` + `gtk_selection_data_get_data` | done | done | — |
-| 4 | **File-watch (Win)** | Closes Win half of the macOS-only `desktop.fswatch` from 2026-05-28 | `ReadDirectoryChangesW` overlapped I/O on a `CreateIoCompletionPort` IOCP; dedicated worker thread reads events + posts to wndProc via `PostMessageW(WM_VERVE_FSWATCH)` for main-thread callback delivery | — | Medium — overlapped IO + thread + callback marshaling |
+| 4 | ~~**File-watch (Win)**~~ — **shipped 2026-05-30** | Closed. `ReadDirectoryChangesW` against a `FILE_FLAG_BACKUP_SEMANTICS \| FILE_FLAG_OVERLAPPED` directory handle; dedicated worker thread blocks on `GetOverlappedResult(hDir, &ovl, &n, TRUE)`. v1 fires the callback **from the worker thread** (not the UI thread) — docstring instructs apps that need main-thread delivery to marshal. Shutdown via `CancelIoEx(hDir, null)` from `deinit` so the blocking `GetOverlappedResult` returns; stop_flag atomic checked between iterations. 16 KiB buffer carries ~150-500 events per read | done | — | — |
 | 5 | **File-watch (Linux)** | Linux half of `desktop.fswatch` | — | `inotify_init1(IN_NONBLOCK \| IN_CLOEXEC)` + `inotify_add_watch` per path, wrap fd in `GIOChannel` + `g_io_add_watch(G_IO_IN)` so the GTK main loop dispatches; parse `inotify_event` ring | Medium — same as Win shape, different syscalls |
 | 6 | **Global hotkeys (Win)** | Closes Win half of macOS-only `desktop.hotkeys` from 2026-05-28 | `RegisterHotKey(hwnd, id, fsModifiers, vk)` with `MOD_*` mapping + `WM_HOTKEY` case in `wndProc`. Modifier mapping: `cmd` → `MOD_WIN`, `ctrl` → `MOD_CONTROL`, `option` → `MOD_ALT`, `shift` → `MOD_SHIFT` | — | Medium |
 | 7 | **Global hotkeys (Linux X11)** | Linux half. Wayland portal deferred (separate D-Bus call; needs portal infra) | — | `XGrabKey(dpy, keycode, modifiers, DefaultRootWindow(dpy), True, GrabModeAsync, GrabModeAsync)` after `XKeysymToKeycode`; hook a key-press handler on the root window via `XSelectInput`. X11-only — Wayland session returns `error.Unsupported` (detected via `XDG_SESSION_TYPE=wayland`) | Medium-high — X11 keymap quirks (NumLock / CapsLock mask combinations need iteration) |
