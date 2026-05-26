@@ -443,4 +443,4 @@ CI runs the same on ubuntu-latest and macos-latest and adds a curl smoke test ag
 
 ## License
 
-MIT. See `LICENSE`.
+Apache 2.0. See `LICENSE`.
