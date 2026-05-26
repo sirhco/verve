@@ -44,6 +44,15 @@ pub fn build(b: *std.Build) void {
             desktop_mod.linkFramework("Cocoa", .{});
             desktop_mod.linkFramework("WebKit", .{});
             desktop_mod.linkFramework("Foundation", .{});
+            // IOKit: desktop.power battery / charging readout.
+            desktop_mod.linkFramework("IOKit", .{});
+            desktop_mod.linkFramework("CoreFoundation", .{});
+            // SystemConfiguration: desktop.network reachability probe.
+            desktop_mod.linkFramework("SystemConfiguration", .{});
+            // CoreServices: desktop.fswatch FSEvents stream API.
+            desktop_mod.linkFramework("CoreServices", .{});
+            // Carbon: desktop.hotkeys RegisterEventHotKey.
+            desktop_mod.linkFramework("Carbon", .{});
             desktop_mod.linkSystemLibrary("objc", .{});
         },
         .windows => {

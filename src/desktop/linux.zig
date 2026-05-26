@@ -1892,3 +1892,18 @@ pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_
     if (slice.len == 0) return null;
     return allocator.dupe(u8, slice) catch return opts_mod.ClipboardError.OutOfMemory;
 }
+
+// HTML clipboard stubs — GtkClipboard `text/html` target needs
+// gtk_clipboard_set_with_data + a custom GtkSelectionData provider.
+// Future bundle.
+pub fn clipboardWriteHtml(window: *anyopaque, html: []const u8) opts_mod.ClipboardError!void {
+    _ = window;
+    _ = html;
+    return opts_mod.ClipboardError.Unsupported;
+}
+
+pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    _ = window;
+    _ = allocator;
+    return opts_mod.ClipboardError.Unsupported;
+}

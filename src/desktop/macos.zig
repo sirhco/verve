@@ -458,16 +458,70 @@ pub const Window = struct {
         self.printWithOptions(.{}) catch {};
     }
 
-    /// Native print dialog via NSPrintOperation. macOS shows the
-    /// standard system print sheet attached to the user's last
-    /// presentation preference (sheet vs detached modal).
-    /// `opts.kind` is ignored on macOS — there is no
-    /// browser-vs-system distinction at this layer.
+    /// Native print dialog via NSPrintOperation. Honors
+    /// `opts.copies`, `opts.pages`, and `opts.printer_name` by
+    /// patching the NSPrintInfo dictionary before
+    /// `printOperationWithPrintInfo:` produces the operation.
+    /// `opts.kind` is ignored — macOS has no browser-vs-system
+    /// distinction at this layer.
     pub fn printWithOptions(self: *Window, opts: opts_mod.PrintOptions) opts_mod.PrintError!void {
-        _ = opts;
         const NSPrintInfo = m.getClass("NSPrintInfo");
+        // sharedPrintInfo returns the process-wide singleton; copy
+        // before mutating so our settings don't bleed into other
+        // print operations the app launches later.
         const sharedInfo = m.cast(*const fn (id, SEL) callconv(.c) id);
-        const print_info = sharedInfo(@as(id, @ptrCast(NSPrintInfo)), m.sel("sharedPrintInfo"));
+        const shared = sharedInfo(@as(id, @ptrCast(NSPrintInfo)), m.sel("sharedPrintInfo"));
+        const copySel = m.cast(*const fn (id, SEL) callconv(.c) id);
+        const print_info = copySel(shared, m.sel("copy"));
+        if (@intFromPtr(print_info) == 0) return opts_mod.PrintError.Backend;
+        defer {
+            const release = m.cast(*const fn (id, SEL) callconv(.c) void);
+            release(print_info, m.sel("release"));
+        }
+
+        // Patch dictionary fields. dictionary() returns the mutable
+        // NSMutableDictionary backing the NSPrintInfo; setObject:forKey:
+        // mutates it in place. NSPrintInfo re-reads from the dict
+        // when NSPrintOperation packages the job.
+        const dictSel = m.cast(*const fn (id, SEL) callconv(.c) id);
+        const dict = dictSel(print_info, m.sel("dictionary"));
+        if (@intFromPtr(dict) != 0) {
+            const NSNumber = m.getClass("NSNumber");
+            const numberWithInt = m.cast(*const fn (id, SEL, isize) callconv(.c) id);
+            const numberWithBool = m.cast(*const fn (id, SEL, bool) callconv(.c) id);
+            const setKey = m.cast(*const fn (id, SEL, id, id) callconv(.c) void);
+
+            if (opts.copies > 1) {
+                const n = numberWithInt(@as(id, @ptrCast(NSNumber)), m.sel("numberWithInteger:"), @intCast(opts.copies));
+                setKey(dict, m.sel("setObject:forKey:"), n, nsString("NSCopies"));
+            }
+
+            if (opts.pages) |range| {
+                if (range.from > 0) {
+                    const n_from = numberWithInt(@as(id, @ptrCast(NSNumber)), m.sel("numberWithInteger:"), @intCast(range.from));
+                    setKey(dict, m.sel("setObject:forKey:"), n_from, nsString("NSFirstPage"));
+                }
+                if (range.to > 0) {
+                    const n_to = numberWithInt(@as(id, @ptrCast(NSNumber)), m.sel("numberWithInteger:"), @intCast(range.to));
+                    setKey(dict, m.sel("setObject:forKey:"), n_to, nsString("NSLastPage"));
+                    // Disable "print all pages" so the range is honored.
+                    const false_n = numberWithBool(@as(id, @ptrCast(NSNumber)), m.sel("numberWithBool:"), false);
+                    setKey(dict, m.sel("setObject:forKey:"), false_n, nsString("NSPrintAllPages"));
+                }
+            }
+        }
+
+        if (opts.printer_name) |pname| {
+            const NSPrinter = m.getClass("NSPrinter");
+            const printerWithName = m.cast(*const fn (id, SEL, id) callconv(.c) ?id);
+            const printer = printerWithName(@as(id, @ptrCast(NSPrinter)), m.sel("printerWithName:"), nsString(pname));
+            if (printer) |p| {
+                const setPrinter = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+                setPrinter(print_info, m.sel("setPrinter:"), p);
+            } else {
+                std.log.warn("verve.desktop[macos]: printer '{s}' not found; using default", .{pname});
+            }
+        }
 
         const makeOp = m.cast(*const fn (id, SEL, id) callconv(.c) ?id);
         const op = makeOp(self.webview, m.sel("printOperationWithPrintInfo:"), print_info) orelse {
@@ -478,7 +532,7 @@ pub const Window = struct {
         const runOp = m.cast(*const fn (id, SEL) callconv(.c) bool);
         const ok = runOp(op, m.sel("runOperation"));
         if (!ok) return opts_mod.PrintError.Cancelled;
-        std.log.info("verve.desktop[macos]: print operation completed", .{});
+        std.log.info("verve.desktop[macos]: print operation completed (copies={d})", .{opts.copies});
     }
 
     /// Set the window's `NSAccessibilityLabel` — the string
@@ -1629,6 +1683,30 @@ fn snapshotBlockInvoke(block: *SnapshotBlock, image: id, err: ?id) callconv(.c) 
     block.done.* = true;
 }
 
+/// Spin the calling thread's run loop in default mode until `done`
+/// flips. Used to bridge Cocoa's async APIs (WKHTTPCookieStore,
+/// WKWebView snapshot, NSPasteboard read-after-write) into a
+/// synchronous Zig surface.
+///
+/// **Re-entrancy hazard.** Calling `pumpUntilDone` from inside
+/// another run loop running in the same mode is safe — Cocoa is
+/// designed for nested default-mode loops and unblocks the inner
+/// completion handler before the outer loop sees control again.
+/// What is NOT safe is calling this from inside a **modal** run
+/// loop (e.g. while `NSAlert.runModal` / `NSPrintOperation.runOperation`
+/// is on the stack). The modal loop runs in `NSModalPanelRunLoopMode`,
+/// which `kCFRunLoopDefaultMode` does NOT match — so any callback
+/// scheduled in the default mode will not fire until the modal
+/// loop ends, and this helper deadlocks.
+///
+/// Practical guidance:
+///  - Safe from IPC handlers (script message dispatch is the
+///    dominant call site — runs in default mode).
+///  - Safe from button / menu click trampolines (also default mode).
+///  - **Unsafe** if your handler invokes a sync wrapper while a
+///    modal dialog is already on screen. If you need cookies /
+///    snapshot from inside a modal completion handler, defer the
+///    work to a `dispatch_after` or close the modal first.
 fn pumpUntilDone(done: *const bool) void {
     const NSRunLoop = m.getClass("NSRunLoop");
     const NSDate = m.getClass("NSDate");
@@ -1891,6 +1969,38 @@ pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_
 
     const stringForType = m.cast(*const fn (id, SEL, id) callconv(.c) ?id);
     const ns_str = stringForType(pb, m.sel("stringForType:"), nsString("public.utf8-plain-text")) orelse return null;
+
+    const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
+    const cstr = utf8(ns_str, m.sel("UTF8String")) orelse return null;
+    const slice = std.mem.span(cstr);
+    return allocator.dupe(u8, slice) catch return opts_mod.ClipboardError.OutOfMemory;
+}
+
+pub fn clipboardWriteHtml(window: *anyopaque, html: []const u8) opts_mod.ClipboardError!void {
+    _ = window;
+    const NSPasteboard = m.getClass("NSPasteboard");
+    const generalPasteboard = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const pb = generalPasteboard(@as(id, @ptrCast(NSPasteboard)), m.sel("generalPasteboard"));
+
+    const clearContents = m.cast(*const fn (id, SEL) callconv(.c) isize);
+    _ = clearContents(pb, m.sel("clearContents"));
+
+    // NSPasteboardTypeHTML = "public.html". setString:forType: is the
+    // simplest route — declareTypes:owner: is implicit on clearContents
+    // for the modern API.
+    const setString = m.cast(*const fn (id, SEL, id, id) callconv(.c) bool);
+    const ok = setString(pb, m.sel("setString:forType:"), nsString(html), nsString("public.html"));
+    if (!ok) return opts_mod.ClipboardError.Backend;
+}
+
+pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    _ = window;
+    const NSPasteboard = m.getClass("NSPasteboard");
+    const generalPasteboard = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const pb = generalPasteboard(@as(id, @ptrCast(NSPasteboard)), m.sel("generalPasteboard"));
+
+    const stringForType = m.cast(*const fn (id, SEL, id) callconv(.c) ?id);
+    const ns_str = stringForType(pb, m.sel("stringForType:"), nsString("public.html")) orelse return null;
 
     const utf8 = m.cast(*const fn (id, SEL) callconv(.c) ?[*:0]const u8);
     const cstr = utf8(ns_str, m.sel("UTF8String")) orelse return null;

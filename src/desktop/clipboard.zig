@@ -46,4 +46,21 @@ pub const Clipboard = struct {
     pub fn readText(self: Clipboard, allocator: std.mem.Allocator) ClipboardError!?[]u8 {
         return backend.clipboardReadText(self.window, allocator);
     }
+
+    /// Replace the system clipboard with an HTML fragment.
+    /// macOS uses `NSPasteboardTypeHTML` (writes as
+    /// `public.html`). Windows + Linux currently return
+    /// `error.Unsupported` — Win needs the gnarly `CF_HTML`
+    /// header format and Linux GtkClipboard `text/html` target
+    /// needs custom serialization; both follow-up bundles.
+    pub fn writeHtml(self: Clipboard, html: []const u8) ClipboardError!void {
+        return backend.clipboardWriteHtml(self.window, html);
+    }
+
+    /// Read the system clipboard's HTML payload. Returns `null`
+    /// when no HTML is on the pasteboard. macOS only on this
+    /// surface today; Win + Linux return `error.Unsupported`.
+    pub fn readHtml(self: Clipboard, allocator: std.mem.Allocator) ClipboardError!?[]u8 {
+        return backend.clipboardReadHtml(self.window, allocator);
+    }
 };

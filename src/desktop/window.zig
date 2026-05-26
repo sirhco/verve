@@ -28,6 +28,10 @@ pub const system = @import("system.zig");
 pub const autostart = @import("autostart.zig");
 pub const disk = @import("disk.zig");
 pub const power = @import("power.zig");
+pub const network = @import("network.zig");
+pub const fswatch = @import("fswatch.zig");
+pub const hotkeys = @import("hotkeys.zig");
+pub const process = @import("process.zig");
 
 pub const Router = ipc_router.Router;
 
@@ -46,6 +50,7 @@ pub const ClipboardError = options.ClipboardError;
 pub const PrintDialogKind = options.PrintDialogKind;
 pub const PrintOptions = options.PrintOptions;
 pub const PrintError = options.PrintError;
+pub const PageRange = options.PageRange;
 pub const ColorScheme = options.ColorScheme;
 pub const ColorSchemeHandler = options.ColorSchemeHandler;
 pub const UrlOpenHandler = options.UrlOpenHandler;

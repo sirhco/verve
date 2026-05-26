@@ -23,6 +23,10 @@ comptime {
     _ = @import("autostart.zig");
     _ = @import("disk.zig");
     _ = @import("power.zig");
+    _ = @import("network.zig");
+    _ = @import("fswatch.zig");
+    _ = @import("hotkeys.zig");
+    _ = @import("process.zig");
 }
 
 const entries = [_]options.AssetEntry{

@@ -63,6 +63,30 @@ pub fn startListener(window: *window_mod.Window, name: []const u8) Error!void {
     return backend.startListener(window, name);
 }
 
+/// Register this app as the default handler for `<scheme>://...`
+/// URLs at runtime. Complements the build-time path
+/// (`-Durl-scheme=verve` on macOS injects `CFBundleURLTypes` into
+/// `Info.plist`); the runtime call is useful when the app wants
+/// to claim a scheme conditionally (after a setting toggle, on
+/// first launch, etc).
+///
+/// - **macOS** — `LSSetDefaultHandlerForURLScheme` from
+///   LaunchServices. Requires the app to be a bundled `.app`
+///   with a `CFBundleIdentifier` matching `bundle_id`; bare
+///   `zig-out/bin/app` invocations have no bundle and the call
+///   returns `error.Backend`. The bundle must also already
+///   declare the scheme via `CFBundleURLTypes` — Launch Services
+///   refuses to associate a scheme with an app that doesn't
+///   advertise it. So this is "switch which already-known
+///   bundle handles the scheme," not "advertise a brand new
+///   scheme from a non-bundle binary."
+/// - **Windows + Linux** — return `error.Unsupported`. Win
+///   needs `HKCU\Software\Classes\<scheme>` registry tree;
+///   Linux needs `.desktop` + `xdg-mime`. Future bundles.
+pub fn registerScheme(scheme: []const u8, bundle_id: []const u8) Error!void {
+    return backend.registerScheme(scheme, bundle_id);
+}
+
 const backend = switch (builtin.os.tag) {
     .macos => MacosBackend,
     .windows => WindowsBackend,
@@ -77,7 +101,42 @@ const MacosBackend = struct {
         return error.Unsupported;
     }
     fn startListener(_: *window_mod.Window, _: []const u8) Error!void {}
+
+    fn registerScheme(scheme: []const u8, bundle_id: []const u8) Error!void {
+        if (builtin.os.tag != .macos) return error.Unsupported;
+        if (scheme.len == 0 or scheme.len >= 256) return error.Backend;
+        if (bundle_id.len == 0 or bundle_id.len >= 512) return error.Backend;
+
+        var s_buf: [256]u8 = undefined;
+        @memcpy(s_buf[0..scheme.len], scheme);
+        s_buf[scheme.len] = 0;
+        var b_buf: [512]u8 = undefined;
+        @memcpy(b_buf[0..bundle_id.len], bundle_id);
+        b_buf[bundle_id.len] = 0;
+
+        const cf_scheme = CFStringCreateWithCString(null, @ptrCast(&s_buf), kCFStringEncodingUTF8) orelse return error.Backend;
+        defer CFRelease(cf_scheme);
+        const cf_bundle = CFStringCreateWithCString(null, @ptrCast(&b_buf), kCFStringEncodingUTF8) orelse return error.Backend;
+        defer CFRelease(cf_bundle);
+
+        const status = LSSetDefaultHandlerForURLScheme(cf_scheme, cf_bundle);
+        if (status != 0) return error.Backend;
+    }
 };
+
+// LaunchServices: claim default handler for a URL scheme. Returns
+// 0 on success, non-zero OSStatus on failure.
+const kCFStringEncodingUTF8: u32 = 0x08000100;
+extern "CoreFoundation" fn CFStringCreateWithCString(
+    allocator: ?*anyopaque,
+    cstr: [*:0]const u8,
+    encoding: u32,
+) ?*anyopaque;
+extern "CoreFoundation" fn CFRelease(cf: *anyopaque) void;
+extern "CoreServices" fn LSSetDefaultHandlerForURLScheme(
+    scheme: *anyopaque,
+    bundle_id: *anyopaque,
+) i32;
 
 // ---- Windows — FindWindowW + SendMessageW(WM_COPYDATA) ---------------------
 
@@ -130,6 +189,12 @@ const WindowsBackend = struct {
         // No-op on Windows: the wndProc already handles WM_COPYDATA
         // (added alongside this module). The listener side is purely
         // declarative — registering a window class is sufficient.
+    }
+
+    fn registerScheme(_: []const u8, _: []const u8) Error!void {
+        // Requires HKCU\Software\Classes\<scheme> registry tree
+        // (DefaultIcon + shell\open\command). Future bundle.
+        return error.Unsupported;
     }
 };
 
@@ -200,6 +265,13 @@ const LinuxBackend = struct {
                 else => return error.Backend,
             }
         };
+    }
+
+    fn registerScheme(_: []const u8, _: []const u8) Error!void {
+        // Requires writing ~/.local/share/applications/<name>.desktop
+        // with `MimeType=x-scheme-handler/<scheme>;` + invoking
+        // `xdg-mime default ...`. Future bundle.
+        return error.Unsupported;
     }
 
     /// Build the abstract-socket path bytes. Format: a leading NUL

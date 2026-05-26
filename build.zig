@@ -374,6 +374,20 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        // power.zig + (future modules) extern CoreFoundation / IOKit
+        // symbols. Lazy compilation skips bodies on non-matching OSes,
+        // but the host-target test build compiles + links the macOS
+        // branch when run on macOS — link the frameworks so symbols
+        // resolve. The link is a no-op when test runs on Linux / Win
+        // since the macOS branch ifs out before any extern is called.
+        if (target.result.os.tag == .macos) {
+            desktop_test_mod.link_libc = true;
+            desktop_test_mod.linkFramework("IOKit", .{});
+            desktop_test_mod.linkFramework("CoreFoundation", .{});
+            desktop_test_mod.linkFramework("SystemConfiguration", .{});
+            desktop_test_mod.linkFramework("CoreServices", .{});
+            desktop_test_mod.linkFramework("Carbon", .{});
+        }
         const desktop_tests = b.addTest(.{ .root_module = desktop_test_mod });
         const run_desktop_tests = b.addRunArtifact(desktop_tests);
 

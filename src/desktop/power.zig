@@ -15,11 +15,12 @@
 //!   state ("Charging" / "Discharging" / "Full" / "Not charging").
 //!   Iterates `BAT0`..`BAT9` since some laptops use higher
 //!   indices.
-//! - **macOS** — currently returns null / false. IOKit
-//!   integration is deferred (needs `linkFramework("IOKit")` +
-//!   `IOPSCopyPowerSourcesInfo` + `IOPSCopyPowerSourcesList`
-//!   plumbing). Apps that need macOS battery status today shell
-//!   out to `pmset -g batt` via `std.process.Child.run`.
+//! - **macOS** — IOKit via `IOPSCopyPowerSourcesInfo` +
+//!   `IOPSCopyPowerSourcesList`. Reads `kIOPSCurrentCapacityKey` /
+//!   `kIOPSMaxCapacityKey` from the first power source for the
+//!   percentage; `kIOPSIsChargingKey` (CFBoolean) for charging
+//!   state. Scaffold must link the `IOKit` framework — the bundled
+//!   template `build.zig` does so on `target.result.os.tag == .macos`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -30,6 +31,7 @@ const builtin = @import("builtin");
 /// - the OS returned "unknown" (Win value 255).
 pub fn batteryPercent() ?u32 {
     return switch (builtin.os.tag) {
+        .macos => batteryPercentMacos(),
         .windows => batteryPercentWindows(),
         .linux => batteryPercentLinux(),
         else => null,
@@ -40,10 +42,116 @@ pub fn batteryPercent() ?u32 {
 /// battery or the platform isn't implemented.
 pub fn isCharging() bool {
     return switch (builtin.os.tag) {
+        .macos => isChargingMacos(),
         .windows => isChargingWindows(),
         .linux => isChargingLinux(),
         else => false,
     };
+}
+
+// ---- macOS — IOKit IOPSCopyPowerSourcesInfo --------------------------------
+
+// CoreFoundation opaque types. We never dereference; we just hand them
+// back through CF / IOPS calls.
+const CFTypeRef = *anyopaque;
+const CFArrayRef = *anyopaque;
+const CFDictionaryRef = *anyopaque;
+const CFNumberRef = *anyopaque;
+const CFBooleanRef = *anyopaque;
+const CFStringRef = *anyopaque;
+const CFIndex = isize;
+const kCFNumberSInt32Type: CFIndex = 3;
+
+extern "CoreFoundation" fn CFRelease(cf: CFTypeRef) void;
+extern "CoreFoundation" fn CFArrayGetCount(arr: CFArrayRef) CFIndex;
+extern "CoreFoundation" fn CFArrayGetValueAtIndex(arr: CFArrayRef, idx: CFIndex) ?*anyopaque;
+extern "CoreFoundation" fn CFDictionaryGetValue(d: CFDictionaryRef, key: ?*const anyopaque) ?*anyopaque;
+extern "CoreFoundation" fn CFNumberGetValue(num: CFNumberRef, ty: CFIndex, out: *anyopaque) bool;
+extern "CoreFoundation" fn CFBooleanGetValue(b: CFBooleanRef) bool;
+
+extern "IOKit" fn IOPSCopyPowerSourcesInfo() ?CFTypeRef;
+extern "IOKit" fn IOPSCopyPowerSourcesList(snapshot: CFTypeRef) ?CFArrayRef;
+extern "IOKit" fn IOPSGetPowerSourceDescription(snapshot: CFTypeRef, source: *anyopaque) ?CFDictionaryRef;
+
+// The IOPS keys are `#define`d in IOPSKeys.h as C string literals
+// (not extern CFString symbols), so we build CFString equivalents
+// at runtime via CFStringCreateWithCString. Cached after first use.
+const kCFStringEncodingUTF8: u32 = 0x08000100;
+extern "CoreFoundation" fn CFStringCreateWithCString(
+    allocator: ?*anyopaque,
+    cstr: [*:0]const u8,
+    encoding: u32,
+) ?CFStringRef;
+
+var key_current_capacity: ?CFStringRef = null;
+var key_max_capacity: ?CFStringRef = null;
+var key_is_charging: ?CFStringRef = null;
+
+fn ensureIopsKeys() bool {
+    if (builtin.os.tag != .macos) return false;
+    if (key_current_capacity == null) {
+        key_current_capacity = CFStringCreateWithCString(null, "Current Capacity", kCFStringEncodingUTF8);
+    }
+    if (key_max_capacity == null) {
+        key_max_capacity = CFStringCreateWithCString(null, "Max Capacity", kCFStringEncodingUTF8);
+    }
+    if (key_is_charging == null) {
+        key_is_charging = CFStringCreateWithCString(null, "Is Charging", kCFStringEncodingUTF8);
+    }
+    return key_current_capacity != null and key_max_capacity != null and key_is_charging != null;
+}
+
+const MacosBattery = struct {
+    percent: ?u32 = null,
+    charging: bool = false,
+};
+
+fn readMacosBattery() MacosBattery {
+    if (builtin.os.tag != .macos) return .{};
+    if (!ensureIopsKeys()) return .{};
+    const snapshot = IOPSCopyPowerSourcesInfo() orelse return .{};
+    defer CFRelease(snapshot);
+    const list = IOPSCopyPowerSourcesList(snapshot) orelse return .{};
+    defer CFRelease(list);
+    const n = CFArrayGetCount(list);
+    if (n <= 0) return .{};
+
+    // First source is typically the internal battery. Apps with
+    // multiple sources (USB battery packs, UPS) would need to filter
+    // by kIOPSTypeKey == "InternalBattery"; v1 ships the simple path.
+    const src = CFArrayGetValueAtIndex(list, 0) orelse return .{};
+    const dict = IOPSGetPowerSourceDescription(snapshot, src) orelse return .{};
+
+    var out: MacosBattery = .{};
+
+    if (CFDictionaryGetValue(dict, key_current_capacity.?)) |cur_raw| {
+        if (CFDictionaryGetValue(dict, key_max_capacity.?)) |max_raw| {
+            var cur: i32 = 0;
+            var max: i32 = 0;
+            const cur_ok = CFNumberGetValue(@ptrCast(cur_raw), kCFNumberSInt32Type, @ptrCast(&cur));
+            const max_ok = CFNumberGetValue(@ptrCast(max_raw), kCFNumberSInt32Type, @ptrCast(&max));
+            if (cur_ok and max_ok and max > 0 and cur >= 0) {
+                const pct: u32 = @intCast(@divTrunc(cur * 100, max));
+                out.percent = if (pct > 100) 100 else pct;
+            }
+        }
+    }
+
+    if (CFDictionaryGetValue(dict, key_is_charging.?)) |chg_raw| {
+        out.charging = CFBooleanGetValue(@ptrCast(chg_raw));
+    }
+
+    return out;
+}
+
+fn batteryPercentMacos() ?u32 {
+    if (builtin.os.tag != .macos) return null;
+    return readMacosBattery().percent;
+}
+
+fn isChargingMacos() bool {
+    if (builtin.os.tag != .macos) return false;
+    return readMacosBattery().charging;
 }
 
 // ---- Windows — GetSystemPowerStatus ----------------------------------------

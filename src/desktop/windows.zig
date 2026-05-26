@@ -2543,6 +2543,21 @@ pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_
     return allocator.realloc(out, written) catch return opts_mod.ClipboardError.OutOfMemory;
 }
 
+// HTML clipboard stubs — Win needs the gnarly CF_HTML header
+// format (with Version / StartHTML / EndHTML / StartFragment /
+// EndFragment offsets). Future bundle.
+pub fn clipboardWriteHtml(window: *anyopaque, html: []const u8) opts_mod.ClipboardError!void {
+    _ = window;
+    _ = html;
+    return opts_mod.ClipboardError.Unsupported;
+}
+
+pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    _ = window;
+    _ = allocator;
+    return opts_mod.ClipboardError.Unsupported;
+}
+
 comptime {
     // Keep std + builtin alive in case future trimming inadvertently
     // drops references.

@@ -85,6 +85,15 @@ pub const TrayOptions = struct {
     ///   theme icon name (e.g. "applications-system") — both go
     ///   straight through `app_indicator_set_icon_full`.
     icon_path: ?[]const u8 = null,
+    /// macOS-only: name of an SF Symbol (e.g. "bolt.fill",
+    /// "circle.dashed", "doc.text") rendered as the status-bar
+    /// icon. macOS 11+ via `+[NSImage
+    /// imageWithSystemSymbolName:accessibilityDescription:]`. Useful
+    /// for "demo / dev tools" trays that don't want to ship a binary
+    /// asset. Ignored on Windows + Linux (those use the bytes-based
+    /// formats via `icon_path`). `icon_path` takes precedence when
+    /// both are set.
+    icon_symbol: ?[]const u8 = null,
     /// Optional menu. Empty slice means no menu attached — `on_click`
     /// then becomes the only interaction surface (and Linux loses any
     /// way to interact since AppIndicator has no click signal).
@@ -152,7 +161,8 @@ pub fn init(
             // Singleton wires here so callbacks read from the heap
             // address, not the about-to-be-copied stack-return.
             g_macos_tray = heap;
-            if (opts.icon_path) |p| try heap.setIcon(p);
+            if (opts.icon_path) |p| try heap.setIcon(p)
+            else if (opts.icon_symbol) |s| try heap.setIconSymbol(s);
             if (opts.menu.len > 0) {
                 try heap.setMenu(opts.menu);
             } else if (opts.on_click != null) {
@@ -357,6 +367,38 @@ const MacosTray = struct {
         // Release our retain — the button holds its own ref now.
         const release = m.cast(*const fn (id, SEL) callconv(.c) void);
         release(img, m.sel("release"));
+    }
+
+    /// Set the tray icon to an SF Symbol by name. macOS 11+ only —
+    /// older OSes return `error.Unsupported`. Pairs with
+    /// `TrayOptions.icon_symbol`; the rendered image is implicitly a
+    /// template so the menu bar tints it light/dark.
+    fn setIconSymbol(self: *MacosTray, symbol_name: []const u8) Error!void {
+        if (builtin.os.tag != .macos) return error.Unsupported;
+        const item = self.status_item orelse return error.Backend;
+        const button_sel = m.cast(*const fn (id, SEL) callconv(.c) id);
+        const button = button_sel(item, m.sel("button"));
+        if (@intFromPtr(button) == 0) return error.Backend;
+
+        const NSImage = m.getClass("NSImage");
+        const make = m.cast(*const fn (id, SEL, id, id) callconv(.c) id);
+        const img = make(
+            @as(id, @ptrCast(NSImage)),
+            m.sel("imageWithSystemSymbolName:accessibilityDescription:"),
+            nsString(symbol_name),
+            nsString("verve tray"),
+        );
+        // Returns nil if the symbol name isn't known to the running
+        // SF Symbols catalog — surface as Backend so the caller can
+        // fall back to a label.
+        if (@intFromPtr(img) == 0) return error.Backend;
+
+        const set_image = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+        set_image(button, m.sel("setImage:"), img);
+
+        // Clear the label when an icon is set (same rationale as setIcon).
+        const setTitle = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+        setTitle(button, m.sel("setTitle:"), nsString(""));
     }
 
     fn setMenu(self: *MacosTray, items: []const TrayMenuItem) Error!void {

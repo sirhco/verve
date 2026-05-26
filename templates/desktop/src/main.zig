@@ -146,6 +146,11 @@ pub fn main(init: std.process.Init) !void {
     };
     var tray_handle: ?desktop.tray.Tray = desktop.tray.init(allocator, &window, .{
         .label = "V",
+        // macOS-only: use an SF Symbol so the demo ships a real icon
+        // without bundling a binary asset. Ignored on Win + Linux —
+        // those default to stock platform icons (set icon_path instead
+        // when you have an .ico / themed PNG).
+        .icon_symbol = "bolt.fill",
         .tooltip = "Verve Desktop",
         .menu = &tray_menu,
         .on_menu_item = handlers.onTrayItem,

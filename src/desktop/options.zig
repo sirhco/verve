@@ -109,12 +109,30 @@ pub const ClipboardError = error{
 ///    `webkit_print_operation_run_dialog`.
 pub const PrintDialogKind = enum { default, browser, system };
 
-/// Parameters for `Window.printWithOptions`. v1 ships `kind` only;
-/// per-platform knobs (page range, printer name, copies, silent) are
-/// additive follow-ups since each backend exposes them through a
-/// different concrete type.
+/// Inclusive page range. `from` defaults to 1, `to` to 0 which
+/// the backends interpret as "all remaining pages".
+pub const PageRange = struct {
+    from: u32 = 1,
+    to: u32 = 0,
+};
+
+/// Parameters for `Window.printWithOptions`. macOS reads every
+/// optional field via NSPrintInfo dict keys; Windows + Linux ignore
+/// the extras for now (`copies`, `pages`, `printer_name`) — those
+/// platforms only honor `kind`.
 pub const PrintOptions = struct {
     kind: PrintDialogKind = .default,
+    /// Number of copies to print. macOS honors this; Win + Linux
+    /// fall back to whatever the dialog defaults to.
+    copies: u32 = 1,
+    /// Optional inclusive page range. `null` = print all pages.
+    /// macOS honors this; Win + Linux ignore (dialog default).
+    pages: ?PageRange = null,
+    /// Pre-select a specific printer by name (matches the OS-visible
+    /// printer name, not a queue identifier). macOS resolves via
+    /// `[NSPrinter printerWithName:]`. Win + Linux currently ignore.
+    /// `null` = whatever the OS treats as the default printer.
+    printer_name: ?[]const u8 = null,
 };
 
 pub const PrintError = error{

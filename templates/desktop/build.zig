@@ -118,6 +118,18 @@ pub fn build(b: *std.Build) void {
             desktop_mod.linkFramework("Cocoa", .{});
             desktop_mod.linkFramework("WebKit", .{});
             desktop_mod.linkFramework("Foundation", .{});
+            // IOKit: desktop.power battery / charging readout.
+            desktop_mod.linkFramework("IOKit", .{});
+            // CoreFoundation: pulled in transitively by Cocoa/Foundation
+            // but linking explicitly so power.zig's CF externs resolve
+            // regardless of macOS SDK version.
+            desktop_mod.linkFramework("CoreFoundation", .{});
+            // SystemConfiguration: desktop.network reachability probe.
+            desktop_mod.linkFramework("SystemConfiguration", .{});
+            // CoreServices: desktop.fswatch FSEvents stream API.
+            desktop_mod.linkFramework("CoreServices", .{});
+            // Carbon: desktop.hotkeys RegisterEventHotKey.
+            desktop_mod.linkFramework("Carbon", .{});
             desktop_mod.linkSystemLibrary("objc", .{});
         },
         .windows => {
@@ -294,7 +306,7 @@ pub fn build(b: *std.Build) void {
             \\    <key>CFBundleInfoDictionaryVersion</key>
             \\    <string>6.0</string>
             \\    <key>LSMinimumSystemVersion</key>
-            \\    <string>10.15</string>
+            \\    <string>11.0</string>
             \\    <key>NSHighResolutionCapable</key>
             \\    <true/>
             \\    <key>NSPrincipalClass</key>
