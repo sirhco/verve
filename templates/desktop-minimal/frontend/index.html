@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Verve Desktop — minimal</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>Verve Desktop</h1>
+    <p class="subtitle">Type a name, click Greet.</p>
+
+    <form id="greet-form" autocomplete="off">
+      <label for="name">Name</label>
+      <input id="name" name="name" type="text" placeholder="Ada" autofocus>
+      <button type="submit">Greet</button>
+    </form>
+
+    <p id="greeting" class="greeting" aria-live="polite"></p>
+  </main>
+
+  <script>
+    // window.verve is injected at document-start by the framework, so
+    // it's already defined before this inline script runs.
+    const form = document.getElementById("greet-form");
+    const input = document.getElementById("name");
+    const out = document.getElementById("greeting");
+
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      out.textContent = "…";
+      try {
+        const reply = await window.verve.request({
+          type: "greet",
+          name: input.value,
+        });
+        out.textContent = reply.message;
+      } catch (err) {
+        out.textContent = "✗ " + err.message;
+      }
+    });
+  </script>
+</body>
+</html>

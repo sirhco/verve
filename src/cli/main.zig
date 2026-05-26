@@ -19,9 +19,17 @@
 const std = @import("std");
 const skeleton = @import("skeleton");
 const skeleton_desktop = @import("skeleton_desktop");
+const skeleton_desktop_minimal = @import("skeleton_desktop_minimal");
 const build_options = @import("build_options");
 
 const Kind = enum { web, desktop };
+
+/// Desktop scaffold variants. `full` is the demo-rich template
+/// (cookies, multi-window, WASM hydration, tray, notifications, deep
+/// links, print, smoke harness). `minimal` is a single-window app with
+/// one IPC route and a static HTML page — useful as a clean starting
+/// point. Only applies when `--desktop` is set.
+const DesktopTemplate = enum { full, minimal };
 
 /// When the user passes `--release <tag>`, the desktop scaffold's
 /// `build.zig.zon` swaps the path-dep for a `.url + .hash` GitHub
@@ -69,6 +77,8 @@ pub fn main(init: std.process.Init) !void {
     var kind_explicit = false;
     var release_tag: ?[]const u8 = null;
     var release_hash: ?[]const u8 = null;
+    var desktop_template: DesktopTemplate = .full;
+    var template_explicit = false;
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -114,6 +124,24 @@ pub fn main(init: std.process.Init) !void {
                 return error.MissingValue;
             }
             release_tag = args[i];
+        } else if (std.mem.startsWith(u8, a, "--template=")) {
+            const v = a["--template=".len..];
+            desktop_template = parseTemplate(v) catch {
+                log.err("invalid --template value '{s}' (expected 'full' or 'minimal')", .{v});
+                return error.InvalidArgs;
+            };
+            template_explicit = true;
+        } else if (std.mem.eql(u8, a, "--template")) {
+            i += 1;
+            if (i >= args.len) {
+                log.err("--template requires a value (full | minimal)", .{});
+                return error.MissingValue;
+            }
+            desktop_template = parseTemplate(args[i]) catch {
+                log.err("invalid --template value '{s}' (expected 'full' or 'minimal')", .{args[i]});
+                return error.InvalidArgs;
+            };
+            template_explicit = true;
         } else if (std.mem.startsWith(u8, a, "--release-hash=")) {
             release_hash = a["--release-hash=".len..];
         } else if (std.mem.eql(u8, a, "--release-hash")) {
@@ -145,6 +173,9 @@ pub fn main(init: std.process.Init) !void {
         log.warn("--release only affects desktop scaffolds; ignoring for --web", .{});
         release_tag = null;
         release_hash = null;
+    }
+    if (template_explicit and kind != .desktop) {
+        log.warn("--template only affects desktop scaffolds; ignoring for --web", .{});
     }
     const release_spec: ?ReleaseSpec = if (release_tag) |t|
         .{ .tag = t, .hash = release_hash }
@@ -181,7 +212,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk pkg_name_buf;
     };
 
-    try scaffold(io, dir_path, pkg_name, kind, verve_path);
+    try scaffold(io, dir_path, pkg_name, kind, desktop_template, verve_path);
 
     // Zig's package fingerprint contains a name-derived half that only the
     // compiler knows how to compute. Probe `zig build` once to learn the
@@ -303,7 +334,13 @@ fn resolveRelativeVervePath(io: std.Io, gpa: std.mem.Allocator, dir_path: []cons
     return std.fs.path.relativePosix(gpa, cwd_abs, abs_dir, abs_verve);
 }
 
-fn scaffold(io: std.Io, dir_path: []const u8, pkg_name: []const u8, kind: Kind, verve_path: []const u8) !void {
+fn parseTemplate(s: []const u8) !DesktopTemplate {
+    if (std.mem.eql(u8, s, "full")) return .full;
+    if (std.mem.eql(u8, s, "minimal")) return .minimal;
+    return error.InvalidTemplate;
+}
+
+fn scaffold(io: std.Io, dir_path: []const u8, pkg_name: []const u8, kind: Kind, template: DesktopTemplate, verve_path: []const u8) !void {
     var root = openOrCreateEmpty(io, dir_path) catch |err| switch (err) {
         error.NotEmpty => {
             log.err("target directory '{s}' is not empty — refusing to scaffold over existing files", .{dir_path});
@@ -318,9 +355,15 @@ fn scaffold(io: std.Io, dir_path: []const u8, pkg_name: []const u8, kind: Kind, 
             if (std.mem.eql(u8, entry.path, "build.zig.zon")) continue;
             try writeFileWithParents(io, root, entry.path, entry.bytes);
         },
-        .desktop => for (skeleton_desktop.entries) |entry| {
-            if (std.mem.eql(u8, entry.path, "build.zig.zon")) continue;
-            try writeFileWithParents(io, root, entry.path, entry.bytes);
+        .desktop => switch (template) {
+            .full => for (skeleton_desktop.entries) |entry| {
+                if (std.mem.eql(u8, entry.path, "build.zig.zon")) continue;
+                try writeFileWithParents(io, root, entry.path, entry.bytes);
+            },
+            .minimal => for (skeleton_desktop_minimal.entries) |entry| {
+                if (std.mem.eql(u8, entry.path, "build.zig.zon")) continue;
+                try writeFileWithParents(io, root, entry.path, entry.bytes);
+            },
         },
     }
 
@@ -593,12 +636,21 @@ fn printUsage(program: []const u8) void {
         \\  --release-hash HASH   Multihash for the release tarball. When omitted,
         \\                        the zon ships with a placeholder + instructions
         \\                        to run `zig fetch --save <url>` to fill it in.
+        \\  --template NAME       Desktop scaffold variant (desktop only):
+        \\                          full     (default) demo-rich app: cookies,
+        \\                                   multi-window, WASM hydration, tray,
+        \\                                   notifications, deep links, print,
+        \\                                   smoke harness.
+        \\                          minimal  single-window app, one IPC route,
+        \\                                   static HTML page. Clean starting
+        \\                                   point.
         \\  -h, --help            Show this message and exit.
         \\
         \\Examples:
         \\  {s} new ~/code/my-app
         \\  {s} new ~/code/my-desktop-app --desktop
+        \\  {s} new ~/code/my-min-app --desktop --template minimal
         \\  {s} new ~/code/my-pinned-app --desktop --release v0.1.0
         \\
-    , .{ program, program, program, program });
+    , .{ program, program, program, program, program });
 }

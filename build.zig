@@ -277,6 +277,7 @@ pub fn build(b: *std.Build) void {
         // writes it out as a self-contained starter app.
         const skeleton_mod = buildCliSkeleton(b);
         const skeleton_desktop_mod = buildCliSkeletonDesktop(b);
+        const skeleton_desktop_minimal_mod = buildCliSkeletonDesktopMinimal(b);
 
         // Default verve dependency path baked into `verve-cli`. Desktop
         // scaffolds reference verve through a `.path` dep — without a
@@ -300,6 +301,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "skeleton", .module = skeleton_mod },
                 .{ .name = "skeleton_desktop", .module = skeleton_desktop_mod },
+                .{ .name = "skeleton_desktop_minimal", .module = skeleton_desktop_minimal_mod },
             },
         });
         cli_mod.addOptions("build_options", cli_options);
@@ -631,6 +633,45 @@ fn buildCliSkeletonDesktop(b: *std.Build) *std.Build.Module {
 
     return b.createModule(.{
         .root_source_file = wf.getDirectory().path(b, "skeleton_desktop.zig"),
+    });
+}
+
+/// Sibling of `buildCliSkeletonDesktop` that produces the minimal
+/// desktop template — single window, single IPC route, static HTML.
+/// Same vendoring of `src/desktop/` so the scaffolded app is self-
+/// contained.
+fn buildCliSkeletonDesktopMinimal(b: *std.Build) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    var manifest: std.ArrayList(u8) = .empty;
+
+    manifest.appendSlice(b.allocator,
+        \\pub const Entry = struct {
+        \\    path: []const u8,
+        \\    bytes: []const u8,
+        \\};
+        \\
+        \\pub const entries: []const Entry = &.{
+        \\
+    ) catch @panic("OOM");
+
+    const io = b.graph.io;
+    const have_templates = blk: {
+        var probe = b.build_root.handle.openDir(io, "templates/desktop-minimal", .{}) catch break :blk false;
+        probe.close(io);
+        break :blk true;
+    };
+
+    if (have_templates) {
+        embedSingleFile(b, wf, &manifest, "LICENSE");
+        embedTreeAs(b, wf, &manifest, "templates/desktop-minimal", "");
+        embedTreeAs(b, wf, &manifest, "src/desktop", "src/desktop");
+    }
+
+    manifest.appendSlice(b.allocator, "};\n") catch @panic("OOM");
+    _ = wf.add("skeleton_desktop_minimal.zig", manifest.items);
+
+    return b.createModule(.{
+        .root_source_file = wf.getDirectory().path(b, "skeleton_desktop_minimal.zig"),
     });
 }
 
