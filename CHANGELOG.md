@@ -6,10 +6,104 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Six post-`v0.1.6` bundles. Native print on all three backends, a new
-minimal scaffold variant, a beefed-up demo scaffold, and two
-framework bug fixes that surfaced once the demo scaffold exercised
-more of the surface live.
+## [0.1.8] - 2026-05-28
+
+Complete macOS surface sweep — eleven items closing every macOS-
+only gap from the post-v0.1.7 roadmap. Four new framework modules
+(`desktop.network`, `desktop.fswatch`, `desktop.hotkeys`,
+`desktop.process`), IOKit battery completion, SF Symbol tray
+fallback, clipboard HTML, runtime URL-scheme registration, print
+page-range / copies / printer settings, plus a couple polish items.
+Cross-platform stubs (`error.Unsupported`) ship on Win + Linux
+where the macOS API has no portable counterpart yet.
+
+### Added — macOS surface completion (2026-05-28)
+
+Eleven items closing every macOS-only item from the post-v0.1.6
+roadmap. Cross-platform stubs (`error.Unsupported`) ship on
+Win + Linux where the macOS API has no portable counterpart yet.
+
+- `desktop.power` macOS battery — `batteryPercent` / `isCharging`
+  return real values via IOKit `IOPSCopyPowerSourcesInfo` +
+  `IOPSCopyPowerSourcesList` + `IOPSGetPowerSourceDescription`,
+  reading `kIOPSCurrentCapacityKey` / `kIOPSMaxCapacityKey` for
+  the percentage and `kIOPSIsChargingKey` (CFBoolean) for AC
+  state. Keys built at runtime via `CFStringCreateWithCString`
+  since `IOPSKeys.h` `#define`s them as C string literals (not
+  extern CFString symbols). Closes the only known per-platform
+  null in `desktop.power`.
+- `desktop.network` (new module) — `isOnline() bool`. macOS:
+  `SCNetworkReachabilityCreateWithName("apple.com")` +
+  `SCNetworkReachabilityGetFlags`, treating Reachable +
+  !ConnectionRequired as online. Windows:
+  `InternetGetConnectedState`. Linux: `getifaddrs` + scan for any
+  non-loopback iface in `IFF_UP | IFF_RUNNING`.
+- `desktop.fswatch` (new module) — `Watcher.init(allocator, path,
+  cb, ctx)`. macOS: `FSEventStreamCreate` with file-events flag,
+  scheduled on the main run loop, 1s coalescing latency; C
+  trampoline reads the event-paths array and fires the Zig
+  callback once per change. Windows + Linux return
+  `error.Unsupported` (ReadDirectoryChangesW + inotify follow-ups).
+- `desktop.hotkeys` (new module) — `Manager` that registers global
+  hotkeys (fire even when app is blurred) via Carbon
+  `RegisterEventHotKey` + `InstallEventHandler` on
+  `GetApplicationEventTarget`. Public surface:
+  `Modifiers { cmd, ctrl, option, shift }` packed struct +
+  `register(id, mods, keycode)` + `unregister(id)`.
+  Single-manager-per-process v1 (`g_singleton` routes the
+  event-handler trampoline). Windows + Linux return
+  `error.Unsupported`.
+- `desktop.process` (new module) — `runCapture` (block + collect
+  stdout / stderr + exit code) and `spawnDetached` (fire-and-
+  forget, stdio ignored). Thin wrapper over `std.process.Child`
+  with desktop-friendly defaults. Cross-platform stdlib reshape.
+- `desktop.deep_link.registerScheme(scheme, bundle_id)` — runtime
+  URL-scheme registration. macOS: LaunchServices
+  `LSSetDefaultHandlerForURLScheme`. Complements the build-time
+  `CFBundleURLTypes` path. Requires a bundled `.app` with the
+  scheme already declared in `Info.plist` — bare `zig-out/bin/app`
+  binaries return `error.Backend`. Windows + Linux return
+  `error.Unsupported` (HKCU registry + xdg-mime follow-ups).
+- `Clipboard.writeHtml(html)` / `readHtml(allocator)` — macOS uses
+  `NSPasteboardTypeHTML` (`public.html`). Windows + Linux return
+  `error.Unsupported` (CF_HTML header format + GtkClipboard
+  `text/html` target are future bundles).
+- `TrayOptions.icon_symbol` — macOS-only field reads an SF Symbol
+  name (e.g. `"bolt.fill"`, `"doc.text"`) and renders via
+  `+[NSImage imageWithSystemSymbolName:accessibilityDescription:]`
+  (macOS 11+). Lets demos ship a real tray icon without bundling
+  a PNG. Demo scaffold uses `"bolt.fill"`. Ignored on Win + Linux.
+- `PrintOptions` extended — new fields `copies: u32 = 1`,
+  `pages: ?PageRange = null` (`{ from, to }`), and
+  `printer_name: ?[]const u8 = null`. macOS reads each through
+  NSPrintInfo dictionary keys (`NSCopies` / `NSFirstPage` /
+  `NSLastPage` + `NSPrintAllPages = false` /
+  `[NSPrinter printerWithName:]` → `setPrinter:`) before
+  `printOperationWithPrintInfo:` packages the job. Print info is
+  copied off the shared singleton so settings don't bleed into
+  later operations. Win + Linux ignore the extras for now.
+- macOS `pumpUntilDone` re-entrancy hazard documented at
+  `src/desktop/macos.zig`. Safe from IPC handlers (default mode);
+  unsafe from inside another modal run loop. No code change.
+- macOS `LSMinimumSystemVersion` bumped 10.15 → 11.0 in
+  `templates/desktop/build.zig`'s Info.plist generator. Covers
+  the shipped selectors that need 11+
+  (`printOperationWithPrintInfo`, snapshot APIs, the new IOKit /
+  SF Symbols / LaunchServices paths added this session).
+
+### Framework linkage
+
+Templates (both full + minimal) now link IOKit, CoreFoundation,
+SystemConfiguration, CoreServices, Carbon on macOS. Root
+`build.zig` mirrors the linkage on the host-target test artifact
+so the framework's own headless tests resolve the symbols.
+
+## [0.1.7] - 2026-05-27
+
+Six post-`v0.1.6` bundles. Native print on all three backends,
+a new minimal scaffold variant, a beefed-up demo scaffold, and
+two framework bug fixes that surfaced once the demo scaffold
+exercised more of the surface live.
 
 ### Added — Native print API (2026-05-27)
 

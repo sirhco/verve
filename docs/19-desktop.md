@@ -117,12 +117,16 @@ reference. Headline list:
   `WM_SETTINGCHANGE` with `lParam == "ImmersiveColorSet"`; Linux
   connects to `GtkSettings notify::gtk-application-prefer-dark-theme`.
 - **Clipboard** — `Window.clipboard()` returns a handle with
-  `writeText(text)` and `readText(alloc) -> ?[]u8`. macOS uses
-  `NSPasteboard.generalPasteboard` + `public.utf8-plain-text`;
-  Windows uses `OpenClipboard` + `CF_UNICODETEXT` + an HGLOBAL
-  payload that ownership transfers to the system; Linux uses
-  `gtk_clipboard_get(CLIPBOARD)` + `gtk_clipboard_set_text` /
-  `wait_for_text`. All three are sync from the caller's view.
+  `writeText(text)` / `readText(alloc) -> ?[]u8` and
+  `writeHtml(html)` / `readHtml(alloc) -> ?[]u8` (macOS only on
+  the HTML pair — Win + Linux return `error.Unsupported`).
+  Text: macOS `NSPasteboard.generalPasteboard` +
+  `public.utf8-plain-text`; Windows `OpenClipboard` +
+  `CF_UNICODETEXT` + an HGLOBAL payload that ownership transfers
+  to the system; Linux `gtk_clipboard_get(CLIPBOARD)` +
+  `gtk_clipboard_set_text` / `wait_for_text`. HTML on macOS:
+  `NSPasteboardTypeHTML` (`public.html`). All sync from the
+  caller's view.
 - **Single-instance lock** — `desktop.single_instance.acquire(allocator, name)`
   returns an opaque `Lock` held for process lifetime. macOS + Linux use
   `flock(LOCK_EX | LOCK_NB)` on `<TMPDIR>/verve.<name>.lock`; Windows
@@ -140,13 +144,18 @@ reference. Headline list:
   directory-picking via `pick_directory` is macOS + Linux only on this
   surface (Win32 splits dir-picking into `IFileOpenDialog` — port TBD).
 - **Tray icon** — `desktop.tray.init(allocator, &window, .{ .label,
-  .tooltip })` creates a system-tray / status-bar icon, `setTooltip`
-  updates the hover text, `deinit` removes it. macOS:
+  .tooltip, .icon_path, .icon_symbol, .menu, .on_click,
+  .on_menu_item })`. Click handlers + submenus on all 3 backends
+  (`TrayMenuItem { label, id, enabled, children }`). Icons via
+  bytes-on-disk (`icon_path`: macOS NSImage formats; Win `.ico`;
+  Linux PNG or theme name) or — macOS 11+ only — `icon_symbol`
+  with an SF Symbol name (e.g. `"bolt.fill"`) rendered via
+  `+[NSImage imageWithSystemSymbolName:...]`. macOS:
   `NSStatusItem` from `[NSStatusBar systemStatusBar]`. Windows:
-  `Shell_NotifyIconW(NIM_ADD)` with stock `IDI_APPLICATION` icon.
-  Linux: `app_indicator_new` (libayatana-appindicator3) with an
-  empty menu attached (some Ayatana versions refuse to draw the
-  icon without one). Click handlers + submenus are a future bundle.
+  `Shell_NotifyIconW` + `WM_VERVE_TRAY` (= `WM_USER + 100`)
+  callback message + `TrackPopupMenu` on right-click. Linux:
+  `app_indicator_new` (libayatana-appindicator3) with a GtkMenu
+  built from `TrayMenuItem`s.
 - **Notifications** — `desktop.notifications.show(allocator, .{ .title,
   .body })`. macOS uses `NSUserNotification` +
   `[NSUserNotificationCenter deliverNotification:]`; Linux uses
@@ -174,7 +183,12 @@ reference. Headline list:
   (`\0verve-deeplink-<name>`) and `send`s on Linux. The running
   instance receives via the wndProc `WM_COPYDATA` case (Win) or a
   GIOChannel watch on the bound socket (Linux), routed back through
-  the same `setUrlOpenHandler` callback.
+  the same `setUrlOpenHandler` callback. Runtime scheme
+  registration via `desktop.deep_link.registerScheme(scheme,
+  bundle_id)` on macOS uses LaunchServices
+  `LSSetDefaultHandlerForURLScheme` (requires a bundled `.app` with
+  the scheme already in `CFBundleURLTypes`); Win + Linux runtime
+  registration are follow-ups.
 - **Native menu bar** — `install_default_menu = true` (the default)
   stamps a default menu bar on all three platforms. macOS gets App +
   Edit + Window menus; the Edit menu is what makes Cmd+C / Cmd+V
@@ -185,6 +199,55 @@ reference. Headline list:
   — WebView2 and WebKitGTK handle Ctrl+C/V/X/Z/Y/A inside text
   inputs natively, and an OS-level accelerator would consume the key
   before the webview saw it.
+- **Native print dialog** — `Window.print()` (legacy void wrapper)
+  and `Window.printWithOptions(opts)` with `PrintOptions { kind,
+  copies, pages: ?{from,to}, printer_name }`. macOS:
+  `NSPrintOperation` + NSPrintInfo dict patching (`NSCopies` /
+  `NSFirstPage` / `NSLastPage` / `[NSPrinter printerWithName:]`).
+  Windows: `ICoreWebView2_16::ShowPrintUI` with
+  `COREWEBVIEW2_PRINT_DIALOG_KIND_BROWSER` or `_SYSTEM` via
+  `opts.kind`. Linux: `webkit_print_operation_run_dialog`.
+  Win + Linux ignore `copies` / `pages` / `printer_name` today.
+- **System info** — `desktop.system.osVersion(a)`,
+  `locale(a, environ)`, `cpuCount()`, `totalMemory()`,
+  `uptime()`, `beep()`, `processId()`. macOS uses NSLocale /
+  NSProcessInfo / sysctlbyname + libc `time(NULL)`. Windows:
+  `GetUserDefaultLocaleName` / `RtlGetVersion` /
+  `GetTickCount64`. Linux: `/etc/os-release` parse + `LC_ALL` /
+  `LANG` env + `/proc/uptime`.
+- **Standard paths** — `desktop.paths.{dataDir, cacheDir,
+  configDir, homeDir, tempDir}(allocator, environ[, app_name])`.
+  Per-platform conventions: macOS `~/Library/Application
+  Support/<app>` / `~/Library/Caches/<app>`; Win `%APPDATA%\<app>`
+  / `%LOCALAPPDATA%\<app>`; Linux XDG with `$HOME/.local/share`
+  / `$HOME/.cache` / `$HOME/.config` fallbacks.
+- **Disk space** — `desktop.disk.spaceAt(allocator, path) Space`
+  with `{ total, available, free }` bytes. POSIX: `statvfs`
+  (macOS uses 32-bit `fsblkcnt_t` — handled). Windows:
+  `GetDiskFreeSpaceExW`.
+- **Power / battery** — `desktop.power.batteryPercent() ?u32` +
+  `isCharging() bool`. macOS: IOKit `IOPSCopyPowerSourcesInfo`
+  + `IOPSGetPowerSourceDescription` reading
+  `kIOPSCurrentCapacityKey` / `kIOPSMaxCapacityKey` /
+  `kIOPSIsChargingKey`. Windows: `GetSystemPowerStatus`. Linux:
+  `/sys/class/power_supply/BAT[0-9]/capacity` + `/status`.
+- **Network reachability** — `desktop.network.isOnline() bool`.
+  macOS: `SCNetworkReachabilityCreateWithName("apple.com")`.
+  Windows: `InternetGetConnectedState`. Linux: `getifaddrs` +
+  scan for non-loopback iface in `IFF_UP | IFF_RUNNING`.
+- **File watcher** — `desktop.fswatch.Watcher.init(allocator,
+  path, cb, ctx)`. macOS: `FSEventStreamCreate` with file-events
+  flag, scheduled on the main run loop, 1s coalescing. Win +
+  Linux return `error.Unsupported` (ReadDirectoryChangesW +
+  inotify follow-ups).
+- **Global hotkeys** — `desktop.hotkeys.Manager` with
+  `register(id, mods, keycode)`. macOS: Carbon
+  `RegisterEventHotKey` + `InstallEventHandler`. Win + Linux
+  return `error.Unsupported`.
+- **Process spawn** — `desktop.process.runCapture(a, io, argv)`
+  → `{ code, stdout, stderr }` and
+  `desktop.process.spawnDetached(a, io, argv)` for fire-and-
+  forget. Cross-platform via `std.process.Child`.
 - **Window snapshot** — `Window.takeSnapshotPng(path)` ships on all
   three backends. macOS uses
   `WKWebView.takeSnapshotWithConfiguration:completionHandler:` →
@@ -244,8 +307,23 @@ Zig calls via nested event-loop pumps.
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | ✓ | ✓ |
 | Tray icon | ✓ | ✓ | ✓ |
-| Notifications | ✓ | stub | ✓ |
+| Tray SF Symbol fallback | ✓ | — | — |
+| Notifications | ✓ | balloon | ✓ |
 | Window snapshot (PNG) | ✓ | ✓ | ✓ |
+| Native print dialog | ✓ | ✓ | ✓ |
+| Print copies / pages / printer | ✓ | stub | stub |
+| Clipboard (text) | ✓ | ✓ | ✓ |
+| Clipboard (HTML) | ✓ | stub | stub |
+| Battery / charging (`desktop.power`) | ✓ | ✓ | ✓ |
+| Disk space (`desktop.disk`) | ✓ | ✓ | ✓ |
+| System info (`desktop.system`) | ✓ | ✓ | ✓ |
+| Standard paths (`desktop.paths`) | ✓ | ✓ | ✓ |
+| Network reachability (`desktop.network`) | ✓ | ✓ | ✓ |
+| File watcher (`desktop.fswatch`) | ✓ | stub | stub |
+| Global hotkeys (`desktop.hotkeys`) | ✓ | stub | stub |
+| Process spawn (`desktop.process`) | ✓ | ✓ | ✓ |
+| Deep-link URL handler | ✓ | ✓ | ✓ |
+| Deep-link runtime scheme registration | ✓ | stub | stub |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
 | Dev-loop watcher | ✓ | ✓ | ✓ |
@@ -271,11 +349,20 @@ print via `window.print()`, and `desktop.updates.checkForUpdate`
 shipped 2026-05-26. Native print dialog
 (`NSPrintOperation` / `ICoreWebView2_16::ShowPrintUI` /
 `webkit_print_operation_run_dialog`) + `--template minimal`
-scaffold variant shipped 2026-05-27. Remaining P3 follow-ups:
-GTK4 + WebKitGTK 6.0 backend, print page-range / printer-selection
-settings, full a11y provider (NSAccessibility / UIA / ATK roles +
+scaffold variant shipped 2026-05-27 (v0.1.7). Complete macOS
+sweep shipped 2026-05-28 (v0.1.8): IOKit battery, SF Symbol
+tray, four new modules (`desktop.network`, `desktop.fswatch`,
+`desktop.hotkeys`, `desktop.process`), clipboard HTML, runtime
+URL-scheme registration, print page-range / copies / printer
+settings, plus `LSMinimumSystemVersion` bump to 11.0 and
+`pumpUntilDone` re-entrancy doc. Remaining P3 follow-ups: GTK4
++ WebKitGTK 6.0 backend, Win + Linux backfill for file-watch /
+hotkeys / clipboard-HTML / URL-scheme-registration / print
+extras, full a11y provider (NSAccessibility / UIA / ATK roles +
 states), Win Toast notifications (`ToastNotificationManager`),
-auto-updater apply phase (Sparkle / Squirrel / AppImageUpdate).
+auto-updater apply phase (Sparkle / Squirrel / AppImageUpdate),
+and macOS `UNUserNotificationCenter` migration (needs
+entitlements).
 
 ## Constraints
 

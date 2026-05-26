@@ -210,6 +210,30 @@ const window = try desktop.Window.init(allocator, .{
 | `print()` | Open the native print dialog (legacy no-error wrapper) |
 | `printWithOptions(opts)` | Native print dialog with cancel / unsupported / backend error reporting |
 
+## Utility modules
+
+Side-modules under `desktop.*` (not on the `Window` surface):
+
+| Module | API | Backends |
+|---|---|---|
+| `desktop.power` | `batteryPercent() ?u32`, `isCharging() bool` | macOS (IOKit) / Win (GetSystemPowerStatus) / Linux (/sys) |
+| `desktop.network` | `isOnline() bool` | macOS (SCNetworkReachability) / Win (InternetGetConnectedState) / Linux (getifaddrs) |
+| `desktop.fswatch` | `Watcher.init(alloc, path, cb, ctx)` | macOS (FSEvents); Win + Linux return `error.Unsupported` |
+| `desktop.hotkeys` | `Manager.register(id, mods, keycode)` | macOS (Carbon RegisterEventHotKey); Win + Linux return `error.Unsupported` |
+| `desktop.process` | `runCapture(...)`, `spawnDetached(...)` | Cross-platform via `std.process.Child` |
+| `desktop.system` | `osVersion(a)`, `locale(a, env)`, `cpuCount()`, `totalMemory()`, `uptime()`, `beep()`, `processId()` | All 3 real |
+| `desktop.paths` | `dataDir`, `cacheDir`, `configDir`, `homeDir`, `tempDir` | All 3 real (per-platform conventions) |
+| `desktop.disk` | `spaceAt(alloc, path) Space` | All 3 real |
+| `desktop.shell` | `openUrl(alloc, url)`, `showInFolder(alloc, path)` | All 3 real |
+| `desktop.tray` | `init(alloc, &win, opts)` + `TrayOptions { label, tooltip, icon_path, icon_symbol, menu, on_click, on_menu_item }` | All 3 real (icon_symbol macOS only) |
+| `desktop.notifications` | `show(alloc, .{title, body})` | macOS + Linux real; Win via tray balloon |
+| `desktop.deep_link` | `forwardToRunningInstance`, `startListener`, `registerScheme(scheme, bundle_id)` | All 3 real (registerScheme macOS only) |
+| `desktop.displays` | `list(alloc) []Display` | All 3 real |
+| `desktop.clipboard` | (via `Window.clipboard()`) `writeText` / `readText` (all 3), `writeHtml` / `readHtml` (macOS only) | mixed |
+| `desktop.updates` | `checkForUpdate(alloc, feed_url, current_version)` | Cross-platform via `std.http.Client` |
+| `desktop.autostart` | `enable`, `disable`, `isEnabled` | All 3 real |
+| `desktop.single_instance` | `acquire(alloc, name)` | All 3 real |
+
 ## Cookies
 
 Per-window cookie store. Sync wrappers around the platform-native

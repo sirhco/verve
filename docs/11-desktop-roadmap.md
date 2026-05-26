@@ -14,21 +14,26 @@ Fresh session? Do these four in order before writing code:
 3. **Pick one bundle** from the "Suggested next-session bundles"
    table. All P1 items (#16–#23) are closed; every P2 platform port
    (Win/Linux dialogs, alerts, snapshot) is in. The P3 items that
-   shipped 2026-05-24/25/26/27 are listed under "Out of P1 scope —
-   shipped" below. Remaining P3 backlog: GTK4 backend, drag-drop with
-   native paths, hicolor / Linux icon-theme install,
-   accessibility (NSAccessibility / UIA / ATK), auto-updater
-   (Sparkle / Squirrel), Win tray-balloon / Toast notifications
-   (macOS + Linux notifications already landed). Tray click handlers
-   + submenus on all 3 platforms shipped 2026-05-26; native print
-   dialog on all 3 platforms shipped 2026-05-27.
+   shipped 2026-05-24/25/26/27/28 are listed under "Out of P1 scope —
+   shipped" below. **macOS is feature-complete as of v0.1.8** (sweep
+   on 2026-05-28 added IOKit battery, SF Symbol tray, four new
+   modules — `desktop.network` / `desktop.fswatch` / `desktop.hotkeys`
+   / `desktop.process` — clipboard HTML, runtime URL-scheme
+   registration, and print page-range / copies / printer settings,
+   plus pumpUntilDone re-entrancy doc + LSMinimumSystemVersion bump
+   to 11.0). Remaining P3 backlog is Windows + Linux backfill
+   (file-watch, hotkeys, clipboard HTML, URL-scheme registration,
+   print extras), GTK4 backend, full a11y provider, auto-updater
+   apply (Sparkle / Squirrel / AppImageUpdate — needs signing
+   infra), WinRT Toast, and `UNUserNotificationCenter` migration on
+   macOS (deferred — needs entitlements).
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
 
 Authoritative state of the desktop scaffold subsystem and the remaining
 work needed to call it "fully functional." Written 2026-05-22, last
-updated 2026-05-27. Fresh sessions should be able to pick up without
+updated 2026-05-28. Fresh sessions should be able to pick up without
 prior context.
 
 ## v0.1.0 — first tagged release (2026-05-26)
@@ -1113,6 +1118,71 @@ now a Level-3 golden-diff harness:
     returned `error.Backend` not in the declared `Error` set;
     swapped to `error.Unsupported`.
 
+### Out of P1 scope — shipped 2026-05-28 (macOS sweep)
+
+Eleven items closing every macOS-only gap from the post-v0.1.6
+"Open P3" + "Uncovered gaps" tables. Cross-platform stubs
+(`error.Unsupported`) on Win + Linux per project convention.
+
+- `desktop.power` macOS battery — IOKit `IOPSCopyPowerSourcesInfo`
+  + `IOPSCopyPowerSourcesList`; reads `kIOPSCurrentCapacityKey` /
+  `kIOPSMaxCapacityKey` / `kIOPSIsChargingKey`. CFString keys
+  built at runtime via `CFStringCreateWithCString` (the IOKit
+  header `#define`s the keys as C string literals, not extern
+  CFStrings). Closes the only known per-platform null in
+  `desktop.power`.
+- `desktop.network` (new module) — `isOnline() bool`. macOS:
+  `SCNetworkReachabilityCreateWithName("apple.com")` +
+  `SCNetworkReachabilityGetFlags`. Windows:
+  `InternetGetConnectedState` from wininet. Linux: `getifaddrs`
+  + scan for non-loopback iface with `IFF_UP | IFF_RUNNING`.
+- `desktop.fswatch` (new module, macOS only) — `Watcher.init`
+  with `FSEventStreamCreate` (file-events flag, 1s coalescing)
+  scheduled on the main run loop. C trampoline fires the Zig
+  callback per changed path. Win + Linux return
+  `error.Unsupported`.
+- `desktop.hotkeys` (new module, macOS only) — global hotkey
+  `Manager` via Carbon `RegisterEventHotKey` +
+  `InstallEventHandler` on `GetApplicationEventTarget`.
+  `Modifiers { cmd, ctrl, option, shift }` packed struct +
+  `register(id, mods, keycode)` + `unregister(id)`. Single-
+  manager-per-process v1 (`g_singleton` routes the trampoline).
+- `desktop.process` (new module) — `runCapture` + `spawnDetached`
+  wrappers over `std.process.Child` with desktop-friendly
+  defaults. Cross-platform stdlib reshape.
+- `desktop.deep_link.registerScheme(scheme, bundle_id)` — runtime
+  URL-scheme registration via LaunchServices
+  `LSSetDefaultHandlerForURLScheme`. Requires a bundled `.app`
+  with `CFBundleURLTypes` already declaring the scheme. Win +
+  Linux stubs (HKCU registry + xdg-mime are follow-ups).
+- `Clipboard.writeHtml` / `readHtml` — macOS
+  `NSPasteboardTypeHTML` (`public.html`). Win + Linux stubs
+  (`CF_HTML` header format + GtkClipboard `text/html` target are
+  follow-ups).
+- `TrayOptions.icon_symbol` — macOS-only SF Symbol fallback
+  for the tray icon (uses `+[NSImage
+  imageWithSystemSymbolName:accessibilityDescription:]`, macOS
+  11+). Demo uses `"bolt.fill"`. Lets demos ship a real icon
+  without bundling a PNG.
+- `PrintOptions` extended — new `copies` / `pages: ?PageRange` /
+  `printer_name` fields. macOS patches NSPrintInfo via dict keys
+  (`NSCopies` / `NSFirstPage` / `NSLastPage` /
+  `NSPrintAllPages = false` / `[NSPrinter printerWithName:]` →
+  `setPrinter:`). NSPrintInfo is copied off the shared singleton
+  before mutation so settings don't bleed into later operations.
+  Win + Linux ignore the extras for now.
+- `pumpUntilDone` re-entrancy hazard documented at
+  `src/desktop/macos.zig`. Safe from IPC handlers (default mode);
+  unsafe inside another modal run loop.
+- macOS `LSMinimumSystemVersion` bumped 10.15 → 11.0 in
+  `templates/desktop/build.zig` to cover the 11+ selectors
+  shipped this cycle (NSPrintOperation, snapshot, IOKit / SF
+  Symbols / LaunchServices added now).
+
+Framework linkage on macOS now includes IOKit, CoreFoundation,
+SystemConfiguration, CoreServices, Carbon (templates +
+host-target test artifact in root `build.zig`).
+
 ### Out of P1 scope — shipped 2026-05-26
 
 - Tray click handlers + submenus — `TrayMenuItem { label, id,
@@ -1148,26 +1218,27 @@ edges in shipped code.
 
 ### Open P3 — polish for existing features
 
+macOS sweep on 2026-05-28 closed every macOS-only entry below.
+Remaining items are Linux- or Windows-only or need entitlement /
+signing infra.
+
 | Bundle | What | Status / scope |
 |---|---|---|
 | **GTK4 backend** | Parallel GTK4 + WebKitGTK 6.0 module behind `-Dgtk4`; existing GTK3 path stays | Largest remaining item (~5h). New backend module. Future-proofs Linux once Ubuntu LTS / Fedora ship GTK4 webkit by default. |
-| **Print page-range / printer-selection** | Per-platform settings on top of the shipped `printWithOptions` (NSPrintInfo dict / `ICoreWebView2PrintSettings` / `GtkPrintSettings`) | Native dialog path itself shipped 2026-05-27; programmatic settings are additive follow-up. ~3h. |
-| **WinRT Toast** | `Windows.UI.Notifications.ToastNotificationManager` via COM + AUMID + Start-menu shortcut | Polish vs current `Shell_NotifyIconW(NIF_INFO)` balloon. Richer styling + Action Center grouping. ~4h, needs Windows host for live validation. |
+| **Print page-range / printer-selection (Win + Linux)** | Per-platform settings on top of `printWithOptions`. `ICoreWebView2PrintSettings` (Win), `GtkPrintSettings` (Linux). | macOS landed 2026-05-28 via NSPrintInfo dict; Win + Linux ignore extras today. ~3h. |
+| **WinRT Toast** | `Windows.UI.Notifications.ToastNotificationManager` via COM + AUMID + Start-menu shortcut | Polish vs current `Shell_NotifyIconW(NIF_INFO)` balloon. Richer styling + Action Center grouping. ~4h, needs Windows host. |
 | **Full a11y provider** | NSAccessibility / UIA / ATK roles + states beyond labels | Polish vs current `setAccessibilityLabel`. Web content + menus already self-publish; remaining gap is window-chrome semantics. ~3h. |
-| **Auto-updater apply** | Sparkle (macOS) / Squirrel or MSIX (Win) / AppImageUpdate (Linux) | `desktop.updates.checkForUpdate` shipped; apply phase needs signing + delta channels + per-platform updater integration. ~5h+ + signing infrastructure. |
-| **Custom tray icons on macOS template** | macOS template demo doesn't bundle a tray icon | `setIcon` API shipped; scaffold demo skipped to avoid bloating the template. Cosmetic. |
+| **Auto-updater apply** | Sparkle (macOS) / Squirrel or MSIX (Win) / AppImageUpdate (Linux) | `desktop.updates.checkForUpdate` shipped; apply phase needs signing + delta channels + per-platform updater integration. ~5h+ + signing infra. |
+| **`UNUserNotificationCenter` migration (macOS)** | Current `notifications.show` uses deprecated NSUserNotification. UN center needs entitlements + permission prompt + bundled app. | ~2-3h + entitlement setup. Apple still ships NSUserNotification; not urgent. |
 
 ### Uncovered gaps (not in roadmap before)
 
 | Gap | What | Estimated scope |
 |---|---|---|
-| **Clipboard rich formats** | HTML / image / RTF beyond text. Current `Clipboard` is text-only. | ~3h. macOS `NSPasteboardTypeHTML`; Win `CF_HTML` (gnarly header format); Linux GtkClipboard `text/html` target. |
-| **Network online/offline** | `desktop.network.isOnline()` + reachability change events | ~2h. macOS `SCNetworkReachability` (needs SystemConfiguration framework); Win `InternetGetConnectedState`; Linux probe `getifaddrs` for non-loopback. |
-| **File-watch / fs notifications** | Watch a path for changes; fire callback on create/modify/delete | ~3h. macOS FSEvents; Win ReadDirectoryChangesW; Linux inotify. Useful for "auto-reload config" patterns. |
-| **Global hotkeys** | System-wide keyboard shortcut registration (active even when app blurred) | ~3h. macOS `RegisterEventHotKey` (Carbon, still works); Win `RegisterHotKey`; Linux X11 `XGrabKey` / Wayland portal. |
-| **macOS battery state** | `desktop.power` returns null on macOS today | ~2h. IOKit `IOPSCopyPowerSourcesInfo` + `IOPSCopyPowerSourcesList`. Needs `linkFramework("IOKit")` in scaffold. |
-| **Custom URL scheme runtime registration** | Win + Linux runtime registration (macOS is build-time via Info.plist) | ~2h. Win: `HKCU\Software\Classes\<scheme>` registry tree. Linux: write `~/.local/share/applications/<name>.desktop` with `MimeType=x-scheme-handler/<scheme>;` + `xdg-mime default ...`. |
-| **Spawn child process helper** | Thin wrapper over `std.process.Child.run` with desktop-friendly defaults (background, no terminal) | ~1h. Mostly stdlib reshape. Low priority since stdlib covers the core case. |
+| **Clipboard rich formats (Win + Linux)** | HTML / image / RTF beyond text. macOS HTML shipped 2026-05-28. | ~2h. Win `CF_HTML` (gnarly header format); Linux GtkClipboard `text/html` target. Image (`NSPasteboardTypeTIFF` / `CF_DIB` / `image/png` target) still pending all 3. |
+| **File-watch / fs notifications (Win + Linux)** | macOS FSEvents shipped 2026-05-28. | ~2h. Win `ReadDirectoryChangesW` + IOCP / overlapped IO; Linux `inotify` with `GIOChannel` watch into the GTK main loop. |
+| **Global hotkeys (Win + Linux)** | macOS Carbon `RegisterEventHotKey` shipped 2026-05-28. | ~2h. Win `RegisterHotKey` + `WM_HOTKEY` plumbing; Linux X11 `XGrabKey` / Wayland portal. |
+| **Custom URL scheme runtime registration (Win + Linux)** | macOS `LSSetDefaultHandlerForURLScheme` shipped 2026-05-28. | ~2h. Win: `HKCU\Software\Classes\<scheme>` registry tree. Linux: write `~/.local/share/applications/<name>.desktop` + `xdg-mime default ...`. |
 
 ### Known sharp edges in shipped code
 
@@ -1183,21 +1254,33 @@ edges in shipped code.
 
 ### Suggested next-session bundle picks
 
+macOS is feature-complete as of v0.1.8. Remaining work is Windows
+and Linux backfill + the entitlement-gated items.
+
 By scope:
-- **Small (~1-2h)**: Clipboard HTML; macOS battery via IOKit; Linux libayatana weak-symbol fix.
-- **Medium (~3h)**: Network online; file-watch; full a11y provider; URL scheme runtime registration; print page-range / printer-selection settings.
-- **Large (~5h+)**: GTK4 backend; auto-updater apply; WinRT Toast.
+- **Small (~1-2h)**: Linux libayatana weak-symbol fix; Win/Linux
+  clipboard HTML; Win/Linux URL-scheme runtime registration.
+- **Medium (~2-3h)**: Win/Linux file-watch (`ReadDirectoryChangesW` +
+  inotify); Win/Linux global hotkeys (`RegisterHotKey` + X11/Wayland);
+  full a11y provider; Win/Linux print page-range settings.
+- **Large (~5h+)**: GTK4 backend; auto-updater apply (needs signing
+  infra); WinRT Toast (needs Windows host); UNUserNotificationCenter
+  migration (needs entitlements).
 
 Pick by user-facing impact:
-- **Apps that need rich clipboard**: clipboard HTML / image formats.
-- **Apps that need keyboard shortcuts globally**: hotkeys.
-- **Apps watching config dirs**: file-watch.
-- **Apps shipping their own updater**: auto-updater apply (or just use OS-provided like the Mac App Store).
+- **Apps needing rich clipboard on Win/Linux**: clipboard HTML +
+  image formats.
+- **Apps using global hotkeys on Win/Linux**: hotkeys backfill.
+- **Apps watching config dirs on Win/Linux**: file-watch backfill.
+- **Apps shipping their own updater**: auto-updater apply.
 
 Pick by platform completeness:
-- **macOS battery** — closes the only known per-platform gap in `desktop.power`.
-- **WinRT Toast** — closes the polish gap on Windows notifications.
+- **WinRT Toast** — closes the Windows notifications polish gap.
 - **GTK4** — closes the long-term Linux story.
+- **Linux backend live validation** — never run on a real Linux
+  host; the existing surface (cookies / multi-window / tray menu /
+  drag-drop / print / new fswatch / hotkeys / network paths) is
+  diagnostic-instrumented but unverified.
 
 ## Verification commands for fresh sessions
 
