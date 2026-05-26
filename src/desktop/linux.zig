@@ -298,6 +298,32 @@ extern fn gtk_clipboard_get(selection: GdkAtom) *GtkClipboard;
 extern fn gtk_clipboard_set_text(clipboard: *GtkClipboard, text: [*:0]const u8, len: c_int) void;
 extern fn gtk_clipboard_store(clipboard: *GtkClipboard) void;
 extern fn gtk_clipboard_wait_for_text(clipboard: *GtkClipboard) ?[*:0]u8;
+
+// Generic-content path (text/html target).
+const GtkTargetEntry = extern struct {
+    target: [*:0]const u8,
+    flags: c_uint,
+    info: c_uint,
+};
+extern fn gtk_clipboard_set_with_data(
+    clipboard: *GtkClipboard,
+    targets: [*]const GtkTargetEntry,
+    n_targets: c_uint,
+    get_func: *const fn (*GtkClipboard, *GtkSelectionData, c_uint, ?*anyopaque) callconv(.c) void,
+    clear_func: *const fn (*GtkClipboard, ?*anyopaque) callconv(.c) void,
+    user_data: ?*anyopaque,
+) c_int;
+extern fn gtk_clipboard_wait_for_contents(clipboard: *GtkClipboard, target: GdkAtom) ?*GtkSelectionData;
+extern fn gtk_selection_data_set(
+    selection_data: *GtkSelectionData,
+    target: GdkAtom,
+    format: c_int,
+    data: [*]const u8,
+    length: c_int,
+) void;
+extern fn gtk_selection_data_get_data(selection_data: *GtkSelectionData) [*]const u8;
+extern fn gtk_selection_data_get_length(selection_data: *GtkSelectionData) c_int;
+extern fn gtk_selection_data_free(selection_data: *GtkSelectionData) void;
 // `GDK_SELECTION_CLIPBOARD` is the X11 atom for the CLIPBOARD
 // selection (system clipboard, as opposed to PRIMARY which is the
 // X11 middle-click buffer). It's a GdkAtom which on x86_64-linux is
@@ -1893,17 +1919,72 @@ pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_
     return allocator.dupe(u8, slice) catch return opts_mod.ClipboardError.OutOfMemory;
 }
 
-// HTML clipboard stubs — GtkClipboard `text/html` target needs
-// gtk_clipboard_set_with_data + a custom GtkSelectionData provider.
-// Future bundle.
+// HTML clipboard: GTK doesn't ship a "set HTML" convenience like it
+// does for text — you advertise a `text/html` target and a callback
+// that copies bytes into a GtkSelectionData when something pastes.
+// We keep the most-recent HTML payload in a process-global buffer
+// (single-window assumption, matches tray/notifications/single-
+// instance scope) and have the get_func read from it.
+
+var g_clip_html: ?[]u8 = null;
+var g_clip_html_allocator: ?std.mem.Allocator = null;
+
+const html_targets = [_]GtkTargetEntry{
+    .{ .target = "text/html", .flags = 0, .info = 0 },
+};
+
+fn clipHtmlGet(_: *GtkClipboard, sd: *GtkSelectionData, _: c_uint, _: ?*anyopaque) callconv(.c) void {
+    const html = g_clip_html orelse return;
+    const atom = gdk_atom_intern_static_string("text/html");
+    // format=8 = byte-stream payload (vs. 16/32 for typed arrays).
+    gtk_selection_data_set(sd, atom, 8, html.ptr, @intCast(html.len));
+}
+
+fn clipHtmlClear(_: *GtkClipboard, _: ?*anyopaque) callconv(.c) void {
+    // Clipboard ownership transferred to another app — the bytes
+    // we advertised are no longer needed. Caller of our writer
+    // already owns the most-recent buffer; we just drop the
+    // reference here so a later writer starts fresh.
+    if (g_clip_html) |buf| {
+        if (g_clip_html_allocator) |alloc| alloc.free(buf);
+        g_clip_html = null;
+        g_clip_html_allocator = null;
+    }
+}
+
 pub fn clipboardWriteHtml(window: *anyopaque, html: []const u8) opts_mod.ClipboardError!void {
-    _ = window;
-    _ = html;
-    return opts_mod.ClipboardError.Unsupported;
+    const self: *Window = @ptrCast(@alignCast(window));
+
+    // Replace the cached payload. We allocate a fresh copy because
+    // the caller may free `html` immediately after the write returns
+    // but GTK's get_func can fire arbitrarily later.
+    if (g_clip_html) |old| {
+        if (g_clip_html_allocator) |alloc| alloc.free(old);
+    }
+    const buf = self.ctx.allocator.dupe(u8, html) catch return opts_mod.ClipboardError.OutOfMemory;
+    g_clip_html = buf;
+    g_clip_html_allocator = self.ctx.allocator;
+
+    const clip = clipboardHandle();
+    if (gtk_clipboard_set_with_data(clip, &html_targets, html_targets.len, clipHtmlGet, clipHtmlClear, null) == 0) {
+        // Failed to take ownership — drop the cache so we don't keep
+        // unused bytes around.
+        clipHtmlClear(clip, null);
+        return opts_mod.ClipboardError.Backend;
+    }
+    gtk_clipboard_store(clip);
 }
 
 pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
     _ = window;
-    _ = allocator;
-    return opts_mod.ClipboardError.Unsupported;
+    const clip = clipboardHandle();
+    const atom = gdk_atom_intern_static_string("text/html");
+    const sd = gtk_clipboard_wait_for_contents(clip, atom) orelse return null;
+    defer gtk_selection_data_free(sd);
+
+    const len_c = gtk_selection_data_get_length(sd);
+    if (len_c <= 0) return null;
+    const len: usize = @intCast(len_c);
+    const data = gtk_selection_data_get_data(sd);
+    return allocator.dupe(u8, data[0..len]) catch return opts_mod.ClipboardError.OutOfMemory;
 }

@@ -1124,6 +1124,48 @@ now a Level-3 golden-diff harness:
     returned `error.Backend` not in the declared `Error` set;
     swapped to `error.Unsupported`.
 
+### Out of P1 scope — shipped 2026-05-30 (Bundle 3 — clipboard HTML Win + Linux)
+
+Third entry in the Win/Linux backfill plan. Closes the macOS-only
+`Clipboard.writeHtml` / `readHtml` from 2026-05-28.
+
+- **Windows** — CF_HTML format ID assigned dynamically via
+  `RegisterClipboardFormatW(L"HTML Format")` (cached by user32;
+  repeated calls cheap). `writeHtml` builds the Microsoft-spec
+  payload directly: header with `Version:0.9` + four 10-digit
+  zero-padded offsets (StartHTML / EndHTML / StartFragment /
+  EndFragment), then `<html>\r\n<body>\r\n<!--StartFragment-->`,
+  the user's fragment, then `<!--EndFragment-->\r\n</body>\r\n</html>`.
+  Offsets are byte counts from the start of the buffer.
+  `readHtml` parses StartFragment/EndFragment out of whatever
+  producer wrote the data (Chrome / Word / Edge all agree on the
+  header layout; only the fragment shape varies) and returns
+  just the fragment bytes — caller doesn't see the wrapper.
+- **Linux** — GtkClipboard offers a `text/html` MIME target via
+  `gtk_clipboard_set_with_data` + a `GtkTargetEntry` advertising
+  the target + a get_func callback that copies bytes into a
+  `GtkSelectionData` when something pastes. `writeHtml` caches
+  the most-recent payload in a process-global `g_clip_html` /
+  `g_clip_html_allocator` pair (single-window assumption matches
+  the rest of the framework — tray / notifications / single-
+  instance scope). `clipHtmlClear` callback runs when ownership
+  transfers to another app, freeing the cache. `readHtml` is
+  synchronous via `gtk_clipboard_wait_for_contents` +
+  `gtk_selection_data_get_data` (X11 / Wayland round-trip
+  blocks; no nested GMainContext pump needed).
+- New externs in `src/desktop/linux.zig`: `GtkTargetEntry`,
+  `gtk_clipboard_set_with_data`, `gtk_clipboard_wait_for_contents`,
+  `gtk_selection_data_set/_get_data/_get_length/_free`. All resolve
+  through gtk+-3.0 + libgtk-3 — already in the link line.
+- New extern in `src/desktop/windows.zig`:
+  `RegisterClipboardFormatW` from user32 (auto-linked).
+- Image clipboard formats (TIFF / DIB / image/png) still pending
+  all 3 backends. Future bundle.
+
+Verified: framework `zig build test` (205 pass); 3-backend
+cross-compile clean for `windows.zig` + `linux.zig`;
+fresh-scaffold `zig build smoke` PASS (checksum 1789 unchanged).
+
 ### Out of P1 scope — shipped 2026-05-30 (Bundle 2 — registerScheme Win + Linux)
 
 Second entry in the Win/Linux backfill plan. Closes the macOS-only
@@ -1361,7 +1403,7 @@ signing infra.
 
 | Gap | What | Estimated scope |
 |---|---|---|
-| **Clipboard rich formats (Win + Linux)** | HTML / image / RTF beyond text. macOS HTML shipped 2026-05-28. | ~2h. Win `CF_HTML` (gnarly header format); Linux GtkClipboard `text/html` target. Image (`NSPasteboardTypeTIFF` / `CF_DIB` / `image/png` target) still pending all 3. |
+| ~~**Clipboard HTML (Win + Linux)**~~ | **Closed 2026-05-30 (Bundle 3).** Win CF_HTML format with the Microsoft-spec Version / Start/End HTML / Start/End Fragment header offsets. Linux GtkClipboard `text/html` target via `gtk_clipboard_set_with_data` + a get-callback that reads a process-global cached payload. Image clipboard (`NSPasteboardTypeTIFF` / `CF_DIB` / `image/png` target) still pending all 3. | — |
 | **File-watch / fs notifications (Win + Linux)** | macOS FSEvents shipped 2026-05-28. | ~2h. Win `ReadDirectoryChangesW` + IOCP / overlapped IO; Linux `inotify` with `GIOChannel` watch into the GTK main loop. |
 | **Global hotkeys (Win + Linux)** | macOS Carbon `RegisterEventHotKey` shipped 2026-05-28. | ~2h. Win `RegisterHotKey` + `WM_HOTKEY` plumbing; Linux X11 `XGrabKey` / Wayland portal. |
 | ~~**Custom URL scheme runtime registration (Win + Linux)**~~ | **Closed 2026-05-30 (Bundle 2).** Win writes `HKCU\Software\Classes\<scheme>` registry tree (default value + `URL Protocol` marker + `shell\open\command`); Linux writes `~/.local/share/applications/<bundle_id>.desktop` with `MimeType=x-scheme-handler/<scheme>`. macOS `LSSetDefaultHandlerForURLScheme` shipped 2026-05-28. | — |
@@ -1434,7 +1476,7 @@ from earlier bundles are established.
 |---|--------|------|----------|------------|------|
 | 1 | ~~**Linux libayatana / libnotify dlopen**~~ — **shipped 2026-05-30** | Closed. `std.c.dlopen("libayatana-appindicator3.so.1")` + memoized fn-pointer struct in `tray.zig`; same shape for `libnotify.so.4` in `notifications.zig`. Both fall back to unversioned `.so` filename then return `error.Unsupported` when neither resolves. macOS smoke PASS (1789); 3-backend cross-compile clean | — | done | — |
 | 2 | ~~**URL-scheme runtime registration**~~ — **shipped 2026-05-30** | Closed. Win: `HKCU\Software\Classes\<scheme>` tree (default + `URL Protocol` marker + `shell\open\command`) via advapi32 `RegCreateKeyExW` + `RegSetValueExW`. Linux: `~/.local/share/applications/<bundle_id>.desktop` write with `MimeType=x-scheme-handler/<scheme>;` + `NoDisplay=true`. `xdg-mime default` left to caller (avoids forcing an `io: std.Io` param). Signature gained `allocator` (now `(allocator, scheme, bundle_id)`) | done | done | — |
-| 3 | **Clipboard HTML** | Closes the macOS-only `Clipboard.writeHtml` / `readHtml` from 2026-05-28 | `CF_HTML` register via `RegisterClipboardFormatW("HTML Format")` + the Microsoft-specific header format (`Version:0.9\r\nStartHTML:...\r\nEndHTML:...\r\nStartFragment:...\r\nEndFragment:...\r\n<html>...`) | `GtkClipboard` `text/html` target via `gtk_clipboard_set_with_data` + `gtk_target_entry` | Low-medium — CF_HTML header math is fiddly but well-documented |
+| 3 | ~~**Clipboard HTML**~~ — **shipped 2026-05-30** | Closed. Win: CF_HTML via `RegisterClipboardFormatW("HTML Format")` + zero-padded 10-digit header offsets (StartHTML / EndHTML / StartFragment / EndFragment); read parses the StartFragment/EndFragment offsets to slice out the original fragment. Linux: `gtk_clipboard_set_with_data` with a `text/html` GtkTargetEntry + a get_func reading a process-global cached payload (single-window assumption matches the rest of tray / notifications); read via `gtk_clipboard_wait_for_contents` + `gtk_selection_data_get_data` | done | done | — |
 | 4 | **File-watch (Win)** | Closes Win half of the macOS-only `desktop.fswatch` from 2026-05-28 | `ReadDirectoryChangesW` overlapped I/O on a `CreateIoCompletionPort` IOCP; dedicated worker thread reads events + posts to wndProc via `PostMessageW(WM_VERVE_FSWATCH)` for main-thread callback delivery | — | Medium — overlapped IO + thread + callback marshaling |
 | 5 | **File-watch (Linux)** | Linux half of `desktop.fswatch` | — | `inotify_init1(IN_NONBLOCK \| IN_CLOEXEC)` + `inotify_add_watch` per path, wrap fd in `GIOChannel` + `g_io_add_watch(G_IO_IN)` so the GTK main loop dispatches; parse `inotify_event` ring | Medium — same as Win shape, different syscalls |
 | 6 | **Global hotkeys (Win)** | Closes Win half of macOS-only `desktop.hotkeys` from 2026-05-28 | `RegisterHotKey(hwnd, id, fsModifiers, vk)` with `MOD_*` mapping + `WM_HOTKEY` case in `wndProc`. Modifier mapping: `cmd` → `MOD_WIN`, `ctrl` → `MOD_CONTROL`, `option` → `MOD_ALT`, `shift` → `MOD_SHIFT` | — | Medium |

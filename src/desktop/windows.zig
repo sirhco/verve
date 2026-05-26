@@ -196,6 +196,7 @@ extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
 extern "user32" fn SetClipboardData(format: UINT, mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "user32" fn GetClipboardData(format: UINT) callconv(.winapi) ?*anyopaque;
 extern "user32" fn IsClipboardFormatAvailable(format: UINT) callconv(.winapi) BOOL;
+extern "user32" fn RegisterClipboardFormatW(name: [*:0]const u16) callconv(.winapi) UINT;
 extern "kernel32" fn GlobalAlloc(flags: UINT, bytes: usize) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GlobalLock(mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GlobalUnlock(mem: ?*anyopaque) callconv(.winapi) BOOL;
@@ -2543,19 +2544,146 @@ pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_
     return allocator.realloc(out, written) catch return opts_mod.ClipboardError.OutOfMemory;
 }
 
-// HTML clipboard stubs — Win needs the gnarly CF_HTML header
-// format (with Version / StartHTML / EndHTML / StartFragment /
-// EndFragment offsets). Future bundle.
+// CF_HTML clipboard support — Microsoft-specific header format that
+// nests the fragment inside a minimal `<html><body>` shell with byte
+// offsets pointing at the fragment boundaries. The format ID is
+// dynamic (assigned per process via RegisterClipboardFormatW("HTML
+// Format")), unlike the static CF_* values for text/bitmap.
+//
+// Spec: https://learn.microsoft.com/en-us/windows/win32/dataxchg/html-clipboard-format
+
+const CF_HTML_NAME = std.unicode.utf8ToUtf16LeStringLiteral("HTML Format");
+
+fn cfHtmlFormatId() UINT {
+    // Idempotent — repeated calls return the same registered ID. No
+    // memoization needed; lookup is a fast table read in user32.
+    return RegisterClipboardFormatW(CF_HTML_NAME);
+}
+
 pub fn clipboardWriteHtml(window: *anyopaque, html: []const u8) opts_mod.ClipboardError!void {
-    _ = window;
-    _ = html;
-    return opts_mod.ClipboardError.Unsupported;
+    const self: *Window = @ptrCast(@alignCast(window));
+
+    // Build the CF_HTML payload. Header offsets are zero-padded to 10
+    // ASCII digits each so we can compute the total length up front:
+    //
+    //   Version:0.9\r\n
+    //   StartHTML:0000000XXX\r\n
+    //   EndHTML:0000000XXX\r\n
+    //   StartFragment:0000000XXX\r\n
+    //   EndFragment:0000000XXX\r\n
+    //   <html>\r\n<body>\r\n<!--StartFragment-->
+    //   <fragment>
+    //   <!--EndFragment-->\r\n</body>\r\n</html>
+    //
+    // Offsets are byte counts from the start of the buffer.
+    const header_template =
+        "Version:0.9\r\n" ++
+        "StartHTML:0000000000\r\n" ++
+        "EndHTML:0000000000\r\n" ++
+        "StartFragment:0000000000\r\n" ++
+        "EndFragment:0000000000\r\n";
+    const html_prefix = "<html>\r\n<body>\r\n<!--StartFragment-->";
+    const html_suffix = "<!--EndFragment-->\r\n</body>\r\n</html>";
+
+    const start_html = header_template.len;
+    const start_fragment = start_html + html_prefix.len;
+    const end_fragment = start_fragment + html.len;
+    const end_html = end_fragment + html_suffix.len;
+
+    const total = end_html;
+    const buf = self.ctx.allocator.alloc(u8, total + 1) catch return opts_mod.ClipboardError.OutOfMemory;
+    defer self.ctx.allocator.free(buf);
+
+    @memcpy(buf[0..header_template.len], header_template);
+    writeOffset(buf, "StartHTML:", start_html);
+    writeOffset(buf, "EndHTML:", end_html);
+    writeOffset(buf, "StartFragment:", start_fragment);
+    writeOffset(buf, "EndFragment:", end_fragment);
+    @memcpy(buf[start_html..][0..html_prefix.len], html_prefix);
+    @memcpy(buf[start_fragment..][0..html.len], html);
+    @memcpy(buf[end_fragment..][0..html_suffix.len], html_suffix);
+    buf[total] = 0;
+
+    const handle = GlobalAlloc(GMEM_MOVEABLE, total + 1) orelse return opts_mod.ClipboardError.OutOfMemory;
+    errdefer _ = GlobalFree(handle);
+
+    const locked = GlobalLock(handle) orelse {
+        _ = GlobalFree(handle);
+        return opts_mod.ClipboardError.Backend;
+    };
+    const dst: [*]u8 = @ptrCast(@alignCast(locked));
+    @memcpy(dst[0 .. total + 1], buf[0 .. total + 1]);
+    _ = GlobalUnlock(handle);
+
+    if (OpenClipboard(self.ctx.hwnd) == 0) return opts_mod.ClipboardError.Backend;
+    defer _ = CloseClipboard();
+    if (EmptyClipboard() == 0) return opts_mod.ClipboardError.Backend;
+
+    const fmt = cfHtmlFormatId();
+    if (fmt == 0) return opts_mod.ClipboardError.Backend;
+    if (SetClipboardData(fmt, handle) == null) {
+        _ = GlobalFree(handle);
+        return opts_mod.ClipboardError.Backend;
+    }
+}
+
+/// Patch a 10-digit zero-padded offset into `buf` immediately after
+/// the literal `label` (which is part of `header_template`). Caller
+/// has already populated `buf[0..header_template.len]` with the
+/// template; we just overwrite the `0000000000` placeholder bytes.
+fn writeOffset(buf: []u8, label: []const u8, offset: usize) void {
+    const idx = std.mem.indexOf(u8, buf, label) orelse return;
+    const digits_start = idx + label.len;
+    var n = offset;
+    var i: usize = 10;
+    while (i > 0) : (i -= 1) {
+        buf[digits_start + i - 1] = '0' + @as(u8, @intCast(n % 10));
+        n /= 10;
+    }
 }
 
 pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
-    _ = window;
-    _ = allocator;
-    return opts_mod.ClipboardError.Unsupported;
+    const self: *Window = @ptrCast(@alignCast(window));
+
+    const fmt = cfHtmlFormatId();
+    if (fmt == 0) return opts_mod.ClipboardError.Backend;
+    if (IsClipboardFormatAvailable(fmt) == 0) return null;
+    if (OpenClipboard(self.ctx.hwnd) == 0) return opts_mod.ClipboardError.Backend;
+    defer _ = CloseClipboard();
+
+    const handle = GetClipboardData(fmt) orelse return null;
+    const locked = GlobalLock(handle) orelse return opts_mod.ClipboardError.Backend;
+    defer _ = GlobalUnlock(handle);
+
+    const total = GlobalSize(handle);
+    if (total == 0) return null;
+    const src: [*]const u8 = @ptrCast(@alignCast(locked));
+    const bytes = src[0..total];
+
+    // Parse StartFragment / EndFragment offsets out of the header.
+    // Producers that wrap the fragment differently (Google Chrome,
+    // Word, etc.) all agree on the header format; only the fragment
+    // bytes vary.
+    const start = parseOffset(bytes, "StartFragment:") orelse return opts_mod.ClipboardError.Backend;
+    const end = parseOffset(bytes, "EndFragment:") orelse return opts_mod.ClipboardError.Backend;
+    if (start >= end or end > total) return opts_mod.ClipboardError.Backend;
+
+    const fragment = bytes[start..end];
+    return allocator.dupe(u8, fragment) catch return opts_mod.ClipboardError.OutOfMemory;
+}
+
+fn parseOffset(buf: []const u8, label: []const u8) ?usize {
+    const idx = std.mem.indexOf(u8, buf, label) orelse return null;
+    var i = idx + label.len;
+    // Skip optional whitespace; CF_HTML producers vary in padding.
+    while (i < buf.len and (buf[i] == ' ' or buf[i] == '\t')) : (i += 1) {}
+    var n: usize = 0;
+    var saw_digit = false;
+    while (i < buf.len and std.ascii.isDigit(buf[i])) : (i += 1) {
+        n = n * 10 + (buf[i] - '0');
+        saw_digit = true;
+    }
+    return if (saw_digit) n else null;
 }
 
 comptime {

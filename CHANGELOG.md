@@ -8,6 +8,20 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Clipboard.writeHtml` / `readHtml` Win + Linux implementations
+  (Bundle 3 of the Win/Linux backfill plan). macOS impl unchanged.
+  Win uses the CF_HTML clipboard format with a dynamically
+  registered format ID (`RegisterClipboardFormatW("HTML Format")`)
+  and the Microsoft-spec header (Version + zero-padded 10-digit
+  StartHTML / EndHTML / StartFragment / EndFragment byte
+  offsets). Read parses the fragment offsets and returns just the
+  fragment bytes — caller doesn't see the wrapper. Linux uses
+  `gtk_clipboard_set_with_data` with a `text/html` GtkTargetEntry
+  + get_func reading a process-global cached payload (single-window
+  assumption matches the rest of the framework). Read via
+  `gtk_clipboard_wait_for_contents` + `gtk_selection_data_get_data`.
+  Image clipboard formats (TIFF / DIB / image/png) still pending
+  on all 3 backends.
 - `desktop.deep_link.registerScheme` Win + Linux implementations
   (Bundle 2 of the Win/Linux backfill plan). Closes the macOS-only
   stub. Win writes the `HKCU\Software\Classes\<scheme>` registry
