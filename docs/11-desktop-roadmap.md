@@ -1124,6 +1124,40 @@ now a Level-3 golden-diff harness:
     returned `error.Backend` not in the declared `Error` set;
     swapped to `error.Unsupported`.
 
+### Out of P1 scope — shipped 2026-05-30 (Bundle 1 — Linux dlopen)
+
+First entry in the Win/Linux backfill plan (post-v0.1.9). Closes
+the "libayatana + libnotify linked unconditionally" sharp edge
+that blocked distros without those libs from building any Verve
+desktop scaffold — including scaffolds that never call `Tray.init`
+or `notifications.show`.
+
+- `src/desktop/tray.zig` Linux backend — six `app_indicator_*`
+  externs replaced by a `LibAyatana` fn-pointer struct loaded via
+  `std.c.dlopen` + `dlsym` on first call. Lazy + memoized — single
+  `dlopen` attempt per process lifetime, cached null result on
+  failure. Tries `libayatana-appindicator3.so.1` first (modern
+  soname), falls back to unversioned `libayatana-appindicator3.so`.
+  Returns `error.Unsupported` when neither resolves. All call
+  sites (bareInit / setTooltip / setIcon / setMenu) thread through
+  the loader; bareInit fails fast with `Unsupported`, downstream
+  setters skip silently.
+- `src/desktop/notifications.zig` Linux backend — same shape with
+  four `notify_*` externs (`init` / `is_initted` /
+  `notification_new` / `notification_show`) behind a `LibNotify`
+  fn-pointer struct + `loadLibnotify` loader. Tries
+  `libnotify.so.4` then `libnotify.so`.
+- `g_object_unref` (glib, linked transitively via gtk+-3.0) stays
+  as a direct extern — already in the link line, not part of the
+  optional surface.
+- Module headers updated to document the runtime-load contract +
+  the `error.Unsupported` failure mode.
+
+Verified: framework `zig build` + `zig build test` (205 pass);
+3-backend cross-compile clean for both modules; fresh-scaffold
+`zig build smoke` PASS (checksum 1789 unchanged — Bundle 1 is
+behavior-preserving for distros that already have the libs).
+
 ### Out of P1 scope — shipped 2026-05-29 (macOS updater + signing)
 
 Closes the last two macOS-touching roadmap items for self-built
@@ -1298,7 +1332,7 @@ signing infra.
 | Linux backend overall | Never run live on a real Linux host — diagnostic logs instrumented but no end-to-end validation | Medium. Cookies / multi-window / scheme handler / drag-drop / tray menu all unverified live. |
 | `src/desktop/windows.zig` vtable slot indexes | Hand-extracted from public MS docs (not generated from SDK headers) | Medium. First live Windows boot should verify against actual `webview2.h` slots. The newer cookie / zoom / nav-query slots are particularly load-bearing. |
 | `src/desktop/macos.zig` `pumpUntilDone` | Nested `[NSRunLoop runMode:beforeDate:]` re-entrant in modal contexts | Low. Safe from IPC handlers (the dominant call site); risky if a caller is already inside another modal run loop. |
-| Linux `libayatana-appindicator3` + `libnotify` | Linked unconditionally — distros without them fail at link time even for scaffolds that don't call the modules | Low-medium. Moving externs behind weak symbols / `dlopen` would let those distros build. |
+| ~~Linux `libayatana-appindicator3` + `libnotify` linked unconditionally~~ | **Closed 2026-05-30 (Bundle 1).** Both libs now loaded via `std.c.dlopen` + `dlsym` with a memoized fn-pointer struct; missing-lib paths return `error.Unsupported` at runtime. Distros without ayatana / libnotify build cleanly. | — |
 | `desktop.tray` single-tray-per-process v1 | `g_macos_tray` + `g_windows_tray` are unguarded singletons | Low. Multi-tray apps would need per-target ivars on macOS + HWND-keyed registry on Windows. No current use case. |
 | `notifications.show` on Windows | Requires `desktop.tray.init` first; without an active tray, returns `error.Backend` | Documented limitation, not a bug. WinRT Toast bundle (above) decouples them. |
 
@@ -1356,7 +1390,7 @@ from earlier bundles are established.
 
 | # | Bundle | What | Win impl | Linux impl | Risk |
 |---|--------|------|----------|------------|------|
-| 1 | **Linux libayatana / libnotify dlopen** | Move tray + notification externs behind weak `dlopen` so distros lacking those libs can still build Verve apps that don't call the modules | — | `dlopen("libayatana-appindicator3.so.1")` + `dlsym` in `tray.zig`; same for `libnotify.so.4` in `notifications.zig`; `error.Unsupported` when symbol resolution fails | Low — pure refactor of existing extern declarations |
+| 1 | ~~**Linux libayatana / libnotify dlopen**~~ — **shipped 2026-05-30** | Closed. `std.c.dlopen("libayatana-appindicator3.so.1")` + memoized fn-pointer struct in `tray.zig`; same shape for `libnotify.so.4` in `notifications.zig`. Both fall back to unversioned `.so` filename then return `error.Unsupported` when neither resolves. macOS smoke PASS (1789); 3-backend cross-compile clean | — | done | — |
 | 2 | **URL-scheme runtime registration** | Closes the macOS-only stub from 2026-05-28's `deep_link.registerScheme` | `HKCU\Software\Classes\<scheme>` registry tree write via advapi32 `RegCreateKeyExW` + `RegSetValueExW`; URL handler points to `exe_path %1` | `~/.local/share/applications/<name>.desktop` file write + `xdg-mime default <name>.desktop x-scheme-handler/<scheme>` shell-out | Low — mechanical FS / registry writes |
 | 3 | **Clipboard HTML** | Closes the macOS-only `Clipboard.writeHtml` / `readHtml` from 2026-05-28 | `CF_HTML` register via `RegisterClipboardFormatW("HTML Format")` + the Microsoft-specific header format (`Version:0.9\r\nStartHTML:...\r\nEndHTML:...\r\nStartFragment:...\r\nEndFragment:...\r\n<html>...`) | `GtkClipboard` `text/html` target via `gtk_clipboard_set_with_data` + `gtk_target_entry` | Low-medium — CF_HTML header math is fiddly but well-documented |
 | 4 | **File-watch (Win)** | Closes Win half of the macOS-only `desktop.fswatch` from 2026-05-28 | `ReadDirectoryChangesW` overlapped I/O on a `CreateIoCompletionPort` IOCP; dedicated worker thread reads events + posts to wndProc via `PostMessageW(WM_VERVE_FSWATCH)` for main-thread callback delivery | — | Medium — overlapped IO + thread + callback marshaling |
@@ -1468,13 +1502,11 @@ ls zig-out/app.app/Contents/{Info.plist,MacOS/app}   # both should exist
   cold-launch + warm-launch, tray + notifications). Same rubric
   applied: each bundle had its own commit + cross-compile + scaffold
   smoke. Tree clean at session end.
-- New Linux runtime deps as of 2026-05-25:
-  `libayatana-appindicator3` (tray) + `libnotify` (notifications).
-  Both are present by default on most Ubuntu / Fedora / Debian /
-  Arch GNOME + KDE installs. Distros without them will fail at
-  link time for any scaffolded app — including apps that don't use
-  the new modules. Moving the externs behind weak symbols /
-  `dlopen` is a polish item.
+- Linux runtime deps for the tray + notifications modules
+  (`libayatana-appindicator3` + `libnotify`) are loaded via
+  `std.c.dlopen` since Bundle 1 (2026-05-30). Distros without them
+  build cleanly; calls to `Tray.init` / `notifications.show` return
+  `error.Unsupported` at runtime instead of failing at link time.
 - macOS `NSUserNotification` is deprecated by Apple but still works
   without a permission grant. Migrating to
   `UNUserNotificationCenter` requires entitlements + a permission

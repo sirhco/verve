@@ -6,6 +6,20 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Linux `libayatana-appindicator3` (tray) + `libnotify`
+  (notifications) are now loaded at runtime via `std.c.dlopen` +
+  memoized fn-pointer structs instead of link-time `extern fn`
+  declarations. Scaffolds on distros that don't ship those libs
+  build cleanly; calls to `Tray.init` / `notifications.show`
+  return `error.Unsupported` at runtime instead of failing at
+  link time. Tries the modern soname (`libayatana-appindicator3.so.1`
+  / `libnotify.so.4`) first, falls back to the unversioned `.so`,
+  caches the null on miss so the `dlopen` attempt is one-shot
+  per process. Distros that already have the libs see no
+  behavior change. (Bundle 1 of the Win/Linux backfill plan.)
+
 ## [0.1.9] - 2026-05-29
 
 Closes the last two macOS-touching roadmap items for self-built

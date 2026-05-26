@@ -21,6 +21,11 @@
 //!   none); right click / WM_CONTEXTMENU always shows the menu via
 //!   `TrackPopupMenu`. Menu IDs occupy the `0xC000` block so they
 //!   don't collide with the default `0x8000` File/Edit IDs.
+//! Linux notes: libayatana-appindicator3 is loaded at runtime via
+//! `dlopen("libayatana-appindicator3.so.1")` so scaffolds on distros
+//! that don't ship it still build; `Tray.init` returns
+//! `error.Unsupported` when the library isn't present at runtime.
+//!
 //! - **Linux** — `app_indicator_set_menu` with a GtkMenu built from
 //!   the items. Each leaf item gets a `g_signal_connect("activate")`
 //!   to a trampoline that reads the per-item `ItemBox { tray, id }`
@@ -981,16 +986,68 @@ const LinuxTray = struct {
         id: u32,
     };
 
-    extern fn app_indicator_new(
-        id: [*:0]const u8,
-        icon_name: [*:0]const u8,
-        category: AppIndicatorCategory,
-    ) *AppIndicator;
-    extern fn app_indicator_set_status(self: *AppIndicator, status: AppIndicatorStatus) void;
-    extern fn app_indicator_set_title(self: *AppIndicator, title: [*:0]const u8) void;
-    extern fn app_indicator_set_label(self: *AppIndicator, label: [*:0]const u8, guide: [*:0]const u8) void;
-    extern fn app_indicator_set_icon_full(self: *AppIndicator, icon_name: [*:0]const u8, icon_desc: [*:0]const u8) void;
-    extern fn app_indicator_set_menu(self: *AppIndicator, menu: *GtkWidget) void;
+    // libayatana-appindicator3 is loaded at runtime via dlopen so
+    // Verve apps that never call `Tray.init` build and run on distros
+    // without it (Alpine, slim containers, headless servers). Apps
+    // that DO call init get `error.Unsupported` if the lib is missing
+    // instead of a link-time failure that affects every Linux scaffold.
+    const NewFn = *const fn ([*:0]const u8, [*:0]const u8, AppIndicatorCategory) callconv(.c) *AppIndicator;
+    const SetStatusFn = *const fn (*AppIndicator, AppIndicatorStatus) callconv(.c) void;
+    const SetTextFn = *const fn (*AppIndicator, [*:0]const u8) callconv(.c) void;
+    const SetLabelFn = *const fn (*AppIndicator, [*:0]const u8, [*:0]const u8) callconv(.c) void;
+    const SetIconFullFn = *const fn (*AppIndicator, [*:0]const u8, [*:0]const u8) callconv(.c) void;
+    const SetMenuFn = *const fn (*AppIndicator, *GtkWidget) callconv(.c) void;
+
+    const LibAyatana = struct {
+        new: NewFn,
+        set_status: SetStatusFn,
+        set_title: SetTextFn,
+        set_label: SetLabelFn,
+        set_icon_full: SetIconFullFn,
+        set_menu: SetMenuFn,
+    };
+
+    var g_ayatana: ?LibAyatana = null;
+    var g_ayatana_tried: bool = false;
+
+    fn loadAyatana() ?*const LibAyatana {
+        if (g_ayatana_tried) {
+            return if (g_ayatana) |*v| v else null;
+        }
+        g_ayatana_tried = true;
+
+        // Try the modern soname first, fall back to the unversioned
+        // dev-package name. Both link to the same .so on every distro
+        // shipping libayatana.
+        const candidates = [_][:0]const u8{
+            "libayatana-appindicator3.so.1",
+            "libayatana-appindicator3.so",
+        };
+        var handle: ?*anyopaque = null;
+        for (candidates) |name| {
+            handle = std.c.dlopen(name.ptr, .{ .LAZY = true });
+            if (handle != null) break;
+        }
+        if (handle == null) return null;
+
+        const new_p = std.c.dlsym(handle, "app_indicator_new") orelse return null;
+        const set_status_p = std.c.dlsym(handle, "app_indicator_set_status") orelse return null;
+        const set_title_p = std.c.dlsym(handle, "app_indicator_set_title") orelse return null;
+        const set_label_p = std.c.dlsym(handle, "app_indicator_set_label") orelse return null;
+        const set_icon_full_p = std.c.dlsym(handle, "app_indicator_set_icon_full") orelse return null;
+        const set_menu_p = std.c.dlsym(handle, "app_indicator_set_menu") orelse return null;
+
+        g_ayatana = .{
+            .new = @ptrCast(@alignCast(new_p)),
+            .set_status = @ptrCast(@alignCast(set_status_p)),
+            .set_title = @ptrCast(@alignCast(set_title_p)),
+            .set_label = @ptrCast(@alignCast(set_label_p)),
+            .set_icon_full = @ptrCast(@alignCast(set_icon_full_p)),
+            .set_menu = @ptrCast(@alignCast(set_menu_p)),
+        };
+        return &g_ayatana.?;
+    }
+
     extern fn g_object_unref(o: ?*anyopaque) void;
 
     extern fn gtk_menu_new() *GtkWidget;
@@ -1013,23 +1070,25 @@ const LinuxTray = struct {
     fn bareInit(allocator: std.mem.Allocator, _: *window_mod.Window, opts: TrayOptions) Error!LinuxTray {
         if (builtin.os.tag != .linux) return error.Unsupported;
 
+        const ay = loadAyatana() orelse return error.Unsupported;
+
         const id_z = allocator.dupeZ(u8, "verve-desktop") catch return error.OutOfMemory;
         defer allocator.free(id_z);
         const icon_z = allocator.dupeZ(u8, "application-x-executable") catch return error.OutOfMemory;
         defer allocator.free(icon_z);
 
-        const ind = app_indicator_new(id_z.ptr, icon_z.ptr, APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
-        app_indicator_set_status(ind, APP_INDICATOR_STATUS_ACTIVE);
+        const ind = ay.new(id_z.ptr, icon_z.ptr, APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
+        ay.set_status(ind, APP_INDICATOR_STATUS_ACTIVE);
 
         if (opts.tooltip.len > 0) {
             const t = allocator.dupeZ(u8, opts.tooltip) catch return error.OutOfMemory;
             defer allocator.free(t);
-            app_indicator_set_title(ind, t.ptr);
+            ay.set_title(ind, t.ptr);
         }
         if (opts.label.len > 0) {
             const l = allocator.dupeZ(u8, opts.label) catch return error.OutOfMemory;
             defer allocator.free(l);
-            app_indicator_set_label(ind, l.ptr, l.ptr);
+            ay.set_label(ind, l.ptr, l.ptr);
         }
 
         return .{
@@ -1060,11 +1119,12 @@ const LinuxTray = struct {
 
     fn setTooltip(self: *LinuxTray, tooltip: []const u8) void {
         if (builtin.os.tag != .linux) return;
+        const ay = loadAyatana() orelse return;
         const ind_raw = self.indicator orelse return;
         const ind: *AppIndicator = @ptrCast(@alignCast(ind_raw));
         const z = self.allocator.dupeZ(u8, tooltip) catch return;
         defer self.allocator.free(z);
-        app_indicator_set_title(ind, z.ptr);
+        ay.set_title(ind, z.ptr);
     }
 
     /// Forward to `app_indicator_set_icon_full`. Path may be an
@@ -1072,13 +1132,14 @@ const LinuxTray = struct {
     /// name; both signatures route through the same API call.
     fn setIcon(self: *LinuxTray, path: []const u8) Error!void {
         if (builtin.os.tag != .linux) return error.Unsupported;
+        const ay = loadAyatana() orelse return error.Unsupported;
         const ind_raw = self.indicator orelse return error.Backend;
         const ind: *AppIndicator = @ptrCast(@alignCast(ind_raw));
         const z = self.allocator.dupeZ(u8, path) catch return error.OutOfMemory;
         defer self.allocator.free(z);
         const desc = self.allocator.dupeZ(u8, "verve tray") catch return error.OutOfMemory;
         defer self.allocator.free(desc);
-        app_indicator_set_icon_full(ind, z.ptr, desc.ptr);
+        ay.set_icon_full(ind, z.ptr, desc.ptr);
     }
 
     fn setMenu(self: *LinuxTray, items: []const TrayMenuItem) Error!void {
@@ -1099,8 +1160,10 @@ const LinuxTray = struct {
         gtk_widget_show_all(built);
         self.menu = @ptrCast(built);
         if (self.indicator) |ind_raw| {
-            const ind: *AppIndicator = @ptrCast(@alignCast(ind_raw));
-            app_indicator_set_menu(ind, built);
+            if (loadAyatana()) |ay| {
+                const ind: *AppIndicator = @ptrCast(@alignCast(ind_raw));
+                ay.set_menu(ind, built);
+            }
         }
     }
 
