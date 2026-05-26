@@ -8,6 +8,17 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `desktop.fswatch.Watcher` Linux implementation (Bundle 5 of
+  the Win/Linux backfill plan). The module is now complete on all
+  three backends. Linux uses `inotify_init1(IN_NONBLOCK |
+  IN_CLOEXEC)` + `inotify_add_watch(IN_MODIFY | IN_ATTRIB |
+  IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE)`, wraps
+  the fd in `g_io_channel_unix_new`, and installs a
+  `g_io_add_watch(G_IO_IN, ...)` so events dispatch on the GTK
+  main loop. Callback fires on the **main thread**, matching
+  macOS FSEvents. v1 is non-recursive (single inode) — callers
+  walk subtrees themselves if needed. Shutdown via
+  `g_source_remove` + `inotify_rm_watch` + `g_io_channel_unref`.
 - `desktop.fswatch.Watcher` Windows implementation (Bundle 4 of
   the Win/Linux backfill plan). macOS FSEvents impl unchanged.
   Linux still pending (Bundle 5). Windows uses

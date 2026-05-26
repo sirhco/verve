@@ -20,8 +20,13 @@
 //!   (PostMessage to the window or a thread-safe queue drained
 //!   from the UI loop). Cancellation via `CancelIoEx` from
 //!   `deinit`.
-//! - **Linux** — stub. inotify integration is a future bundle
-//!   (needs GIOChannel watch wiring into the GTK main loop).
+//! - **Linux** — `inotify_init1` against the watch root, wrapped in
+//!   a `GIOChannel` with `g_io_add_watch(G_IO_IN, ...)` so events
+//!   dispatch through the GTK main loop. Callback fires on the
+//!   **main thread**, matching macOS. v1 is **non-recursive** —
+//!   inotify watches a single inode, not a subtree. Callers that
+//!   need recursive coverage walk + watch each subdirectory
+//!   themselves (a future polish bundle could automate that).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -41,6 +46,7 @@ pub const ChangeHandler = *const fn (ctx: ?*anyopaque, path: []const u8) void;
 pub const Watcher = struct {
     macos_impl: ?*MacosWatcher = null,
     windows_impl: ?*WindowsWatcher = null,
+    linux_impl: ?*LinuxWatcher = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Watcher) void {
@@ -53,6 +59,11 @@ pub const Watcher = struct {
             p.deinit();
             self.allocator.destroy(p);
             self.windows_impl = null;
+        }
+        if (self.linux_impl) |p| {
+            p.deinit();
+            self.allocator.destroy(p);
+            self.linux_impl = null;
         }
     }
 };
@@ -75,6 +86,12 @@ pub fn init(
             errdefer allocator.destroy(heap);
             try WindowsWatcher.start(heap, allocator, path, cb, ctx);
             return .{ .windows_impl = heap, .allocator = allocator };
+        },
+        .linux => {
+            const heap = allocator.create(LinuxWatcher) catch return error.OutOfMemory;
+            errdefer allocator.destroy(heap);
+            try LinuxWatcher.start(heap, allocator, path, cb, ctx);
+            return .{ .linux_impl = heap, .allocator = allocator };
         },
         else => return error.Unsupported,
     }
@@ -462,6 +479,181 @@ const WindowsWatcher = struct {
         }
     }
 };
+
+// ---- Linux — inotify + GIOChannel ------------------------------------------
+
+const IN_NONBLOCK: c_int = 0o4000;
+const IN_CLOEXEC: c_int = 0o2000000;
+const IN_MODIFY: u32 = 0x002;
+const IN_ATTRIB: u32 = 0x004;
+const IN_MOVED_FROM: u32 = 0x040;
+const IN_MOVED_TO: u32 = 0x080;
+const IN_CREATE: u32 = 0x100;
+const IN_DELETE: u32 = 0x200;
+const IN_MASK_ALL: u32 = IN_MODIFY | IN_ATTRIB | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE;
+
+// `struct inotify_event { int wd; uint32_t mask; uint32_t cookie;
+// uint32_t len; char name[]; }`. The header is fixed 16 bytes; the
+// trailing `name` is `len` bytes, NUL-padded to alignment.
+const InotifyEventHeader = extern struct {
+    wd: c_int,
+    mask: u32,
+    cookie: u32,
+    len: u32,
+};
+
+const GIOChannelOpaque = opaque {};
+const GIOCondMask: c_uint = 1; // G_IO_IN
+
+extern "c" fn inotify_init1(flags: c_int) c_int;
+extern "c" fn inotify_add_watch(fd: c_int, pathname: [*:0]const u8, mask: u32) c_int;
+extern "c" fn inotify_rm_watch(fd: c_int, wd: c_int) c_int;
+extern "c" fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+extern "c" fn close_c(fd: c_int) c_int;
+
+// Duplicated externs (also in linux.zig). glib symbols, linked
+// transitively via gtk+-3.0; the linker dedupes by name.
+extern fn g_io_channel_unix_new(fd: c_int) *GIOChannelOpaque;
+extern fn g_io_channel_set_close_on_unref(channel: *GIOChannelOpaque, do_close: c_int) void;
+extern fn g_io_add_watch(
+    channel: *GIOChannelOpaque,
+    cond: c_uint,
+    func: *const fn (*GIOChannelOpaque, c_uint, ?*anyopaque) callconv(.c) c_int,
+    data: ?*anyopaque,
+) c_uint;
+extern fn g_io_channel_unref(channel: *GIOChannelOpaque) void;
+extern fn g_source_remove(tag: c_uint) c_int;
+
+const LinuxWatcher = struct {
+    allocator: std.mem.Allocator,
+    cb: ChangeHandler,
+    cb_ctx: ?*anyopaque,
+    watch_root: []u8 = &.{},
+    inotify_fd: c_int = -1,
+    watch_descriptor: c_int = -1,
+    channel: ?*GIOChannelOpaque = null,
+    watch_tag: c_uint = 0,
+    buffer: []u8 = &.{},
+
+    // 4 KiB inotify read buffer — well above the kernel-side minimum
+    // of `sizeof(inotify_event) + NAME_MAX + 1` (276 bytes), enough
+    // to drain a typical batch in one read() without partial-record
+    // reassembly.
+    const BUFFER_BYTES: usize = 4096;
+
+    fn start(
+        self: *LinuxWatcher,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        cb: ChangeHandler,
+        ctx: ?*anyopaque,
+    ) Error!void {
+        if (builtin.os.tag != .linux) return error.Unsupported;
+        self.* = .{
+            .allocator = allocator,
+            .cb = cb,
+            .cb_ctx = ctx,
+        };
+
+        self.watch_root = allocator.dupe(u8, path) catch return error.OutOfMemory;
+        errdefer allocator.free(self.watch_root);
+        self.buffer = allocator.alloc(u8, BUFFER_BYTES) catch return error.OutOfMemory;
+        errdefer allocator.free(self.buffer);
+
+        const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+        defer allocator.free(path_z);
+
+        self.inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (self.inotify_fd < 0) return error.Backend;
+        errdefer _ = close_c(self.inotify_fd);
+
+        self.watch_descriptor = inotify_add_watch(self.inotify_fd, path_z.ptr, IN_MASK_ALL);
+        if (self.watch_descriptor < 0) return error.Backend;
+
+        // Wrap the inotify fd in a GIOChannel + add a G_IO_IN watch.
+        // close_on_unref=1 means destroying the channel closes the fd
+        // for us — we still call inotify_rm_watch explicitly to make
+        // shutdown order deterministic.
+        const ch = g_io_channel_unix_new(self.inotify_fd);
+        g_io_channel_set_close_on_unref(ch, 1);
+        const tag = g_io_add_watch(ch, GIOCondMask, inotifyTrampoline, @ptrCast(self));
+        self.channel = ch;
+        self.watch_tag = tag;
+    }
+
+    fn deinit(self: *LinuxWatcher) void {
+        if (builtin.os.tag != .linux) return;
+        if (self.watch_tag != 0) {
+            _ = g_source_remove(self.watch_tag);
+            self.watch_tag = 0;
+        }
+        if (self.watch_descriptor >= 0 and self.inotify_fd >= 0) {
+            _ = inotify_rm_watch(self.inotify_fd, self.watch_descriptor);
+            self.watch_descriptor = -1;
+        }
+        if (self.channel) |ch| {
+            g_io_channel_unref(ch);
+            self.channel = null;
+            // close_on_unref handles the fd; mark as closed locally.
+            self.inotify_fd = -1;
+        } else if (self.inotify_fd >= 0) {
+            _ = close_c(self.inotify_fd);
+            self.inotify_fd = -1;
+        }
+        if (self.buffer.len > 0) self.allocator.free(self.buffer);
+        if (self.watch_root.len > 0) self.allocator.free(self.watch_root);
+    }
+};
+
+fn inotifyTrampoline(
+    _: *GIOChannelOpaque,
+    _: c_uint,
+    data: ?*anyopaque,
+) callconv(.c) c_int {
+    const self: *LinuxWatcher = @ptrCast(@alignCast(data orelse return 1));
+    var scratch: [4096]u8 = undefined;
+
+    // Drain the kernel buffer in a loop — one g_io_add_watch dispatch
+    // can correspond to many queued inotify events. EAGAIN on the
+    // non-blocking fd means we're caught up.
+    while (true) {
+        const n = read(self.inotify_fd, self.buffer.ptr, self.buffer.len);
+        if (n <= 0) break;
+        const bytes_read: usize = @intCast(n);
+
+        var offset: usize = 0;
+        while (offset + @sizeOf(InotifyEventHeader) <= bytes_read) {
+            const hdr: *const InotifyEventHeader = @ptrCast(@alignCast(&self.buffer[offset]));
+            const name_start = offset + @sizeOf(InotifyEventHeader);
+            const name_end = name_start + hdr.len;
+            if (name_end > bytes_read) break;
+
+            // hdr.name is `len` bytes, NUL-padded. Trim trailing NULs.
+            const name_blob = self.buffer[name_start..name_end];
+            var name_len: usize = name_blob.len;
+            while (name_len > 0 and name_blob[name_len - 1] == 0) name_len -= 1;
+
+            // Compose `<watch_root>/<reported_name>` if a name was
+            // reported; emit the watch root itself otherwise (events
+            // on the watched inode have len=0).
+            const sep = "/";
+            const needed = self.watch_root.len + sep.len + name_len;
+            if (needed <= scratch.len) {
+                @memcpy(scratch[0..self.watch_root.len], self.watch_root);
+                if (name_len > 0) {
+                    @memcpy(scratch[self.watch_root.len..][0..sep.len], sep);
+                    @memcpy(scratch[self.watch_root.len + sep.len ..][0..name_len], name_blob[0..name_len]);
+                    self.cb(self.cb_ctx, scratch[0 .. self.watch_root.len + sep.len + name_len]);
+                } else {
+                    self.cb(self.cb_ctx, scratch[0..self.watch_root.len]);
+                }
+            }
+
+            offset = name_end;
+        }
+    }
+    return 1; // keep the watch installed
+}
 
 const testing = std.testing;
 

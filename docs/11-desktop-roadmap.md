@@ -1124,6 +1124,43 @@ now a Level-3 golden-diff harness:
     returned `error.Backend` not in the declared `Error` set;
     swapped to `error.Unsupported`.
 
+### Out of P1 scope — shipped 2026-05-30 (Bundle 5 — Linux file-watch)
+
+Fifth entry in the Win/Linux backfill plan. Closes the Linux half
+of `desktop.fswatch`. Now the module is complete on all three
+backends.
+
+- `Watcher` gained a third per-platform slot (`linux_impl`); init
+  switch now covers macos / windows / linux.
+- Linux impl (`LinuxWatcher`):
+  - `inotify_init1(IN_NONBLOCK | IN_CLOEXEC)` — non-blocking so
+    the trampoline can drain in a loop without parking.
+  - `inotify_add_watch(fd, path, IN_MASK_ALL)` — single inode.
+    v1 is non-recursive; callers needing subtree coverage walk
+    + add their own watches. Mask covers MODIFY + ATTRIB +
+    MOVED_FROM/TO + CREATE + DELETE.
+  - `g_io_channel_unix_new(fd)` + `g_io_add_watch(G_IO_IN,
+    trampoline, self)` so events dispatch on the GTK main loop.
+    Callback fires on the **main thread**, matching macOS
+    FSEvents. (Win remains the only worker-thread backend.)
+  - Trampoline drains the kernel buffer in a `read()` loop until
+    EAGAIN — one g_io_add_watch dispatch can correspond to many
+    queued events. Parses fixed 16-byte `inotify_event` header
+    + NUL-padded name. Composes `<watch_root>/<name>` UTF-8;
+    name-less events (operations on the watched inode itself,
+    `len=0`) emit the bare watch root.
+  - Shutdown: `g_source_remove(watch_tag)` first (prevents
+    re-entry), `inotify_rm_watch(fd, wd)`, `g_io_channel_unref`
+    (close_on_unref=1 closes the fd transitively).
+- Glib externs (`g_io_channel_unix_new` / `g_io_add_watch` /
+  `g_io_channel_unref` / `g_source_remove`) duplicated in
+  `fswatch.zig` — same shapes as `linux.zig`'s deep-link
+  implementation. The linker dedupes by name; no extra link line.
+
+Verified: framework `zig build test` (205 pass); 3-backend
+cross-compile clean for `fswatch.zig`; fresh-scaffold
+`zig build smoke` PASS (checksum 1789 unchanged).
+
 ### Out of P1 scope — shipped 2026-05-30 (Bundle 4 — Win file-watch)
 
 Fourth entry in the Win/Linux backfill plan. Closes the Win half
@@ -1451,7 +1488,7 @@ signing infra.
 | Gap | What | Estimated scope |
 |---|---|---|
 | ~~**Clipboard HTML (Win + Linux)**~~ | **Closed 2026-05-30 (Bundle 3).** Win CF_HTML format with the Microsoft-spec Version / Start/End HTML / Start/End Fragment header offsets. Linux GtkClipboard `text/html` target via `gtk_clipboard_set_with_data` + a get-callback that reads a process-global cached payload. Image clipboard (`NSPasteboardTypeTIFF` / `CF_DIB` / `image/png` target) still pending all 3. | — |
-| **File-watch (Win shipped 2026-05-30 Bundle 4 / Linux pending Bundle 5)** | macOS FSEvents shipped 2026-05-28. Win: `ReadDirectoryChangesW` + overlapped IO on a dedicated worker thread + `GetOverlappedResult` blocking pump + `CancelIoEx`-driven shutdown. Linux still pending: `inotify` with `GIOChannel` watch into the GTK main loop. | Linux ~2h |
+| ~~**File-watch (Win + Linux)**~~ | **Closed 2026-05-30 (Bundles 4 + 5).** Win: `ReadDirectoryChangesW` + overlapped IO on a dedicated worker thread + `GetOverlappedResult` pump + `CancelIoEx`-driven shutdown (callback fires from worker thread). Linux: `inotify_init1 + inotify_add_watch` + `GIOChannel` wrap + `g_io_add_watch(G_IO_IN)` so events dispatch on the GTK main loop (callback fires on main thread, matching macOS). v1 Linux is **non-recursive** — single-inode watch only; callers walk subtrees themselves. | — |
 | **Global hotkeys (Win + Linux)** | macOS Carbon `RegisterEventHotKey` shipped 2026-05-28. | ~2h. Win `RegisterHotKey` + `WM_HOTKEY` plumbing; Linux X11 `XGrabKey` / Wayland portal. |
 | ~~**Custom URL scheme runtime registration (Win + Linux)**~~ | **Closed 2026-05-30 (Bundle 2).** Win writes `HKCU\Software\Classes\<scheme>` registry tree (default value + `URL Protocol` marker + `shell\open\command`); Linux writes `~/.local/share/applications/<bundle_id>.desktop` with `MimeType=x-scheme-handler/<scheme>`. macOS `LSSetDefaultHandlerForURLScheme` shipped 2026-05-28. | — |
 
@@ -1525,7 +1562,7 @@ from earlier bundles are established.
 | 2 | ~~**URL-scheme runtime registration**~~ — **shipped 2026-05-30** | Closed. Win: `HKCU\Software\Classes\<scheme>` tree (default + `URL Protocol` marker + `shell\open\command`) via advapi32 `RegCreateKeyExW` + `RegSetValueExW`. Linux: `~/.local/share/applications/<bundle_id>.desktop` write with `MimeType=x-scheme-handler/<scheme>;` + `NoDisplay=true`. `xdg-mime default` left to caller (avoids forcing an `io: std.Io` param). Signature gained `allocator` (now `(allocator, scheme, bundle_id)`) | done | done | — |
 | 3 | ~~**Clipboard HTML**~~ — **shipped 2026-05-30** | Closed. Win: CF_HTML via `RegisterClipboardFormatW("HTML Format")` + zero-padded 10-digit header offsets (StartHTML / EndHTML / StartFragment / EndFragment); read parses the StartFragment/EndFragment offsets to slice out the original fragment. Linux: `gtk_clipboard_set_with_data` with a `text/html` GtkTargetEntry + a get_func reading a process-global cached payload (single-window assumption matches the rest of tray / notifications); read via `gtk_clipboard_wait_for_contents` + `gtk_selection_data_get_data` | done | done | — |
 | 4 | ~~**File-watch (Win)**~~ — **shipped 2026-05-30** | Closed. `ReadDirectoryChangesW` against a `FILE_FLAG_BACKUP_SEMANTICS \| FILE_FLAG_OVERLAPPED` directory handle; dedicated worker thread blocks on `GetOverlappedResult(hDir, &ovl, &n, TRUE)`. v1 fires the callback **from the worker thread** (not the UI thread) — docstring instructs apps that need main-thread delivery to marshal. Shutdown via `CancelIoEx(hDir, null)` from `deinit` so the blocking `GetOverlappedResult` returns; stop_flag atomic checked between iterations. 16 KiB buffer carries ~150-500 events per read | done | — | — |
-| 5 | **File-watch (Linux)** | Linux half of `desktop.fswatch` | — | `inotify_init1(IN_NONBLOCK \| IN_CLOEXEC)` + `inotify_add_watch` per path, wrap fd in `GIOChannel` + `g_io_add_watch(G_IO_IN)` so the GTK main loop dispatches; parse `inotify_event` ring | Medium — same as Win shape, different syscalls |
+| 5 | ~~**File-watch (Linux)**~~ — **shipped 2026-05-30** | Closed. `inotify_init1(IN_NONBLOCK \| IN_CLOEXEC)` → `inotify_add_watch(IN_MODIFY \| IN_ATTRIB \| IN_MOVED_FROM \| IN_MOVED_TO \| IN_CREATE \| IN_DELETE)` → wrap fd in `g_io_channel_unix_new` + `g_io_add_watch(G_IO_IN, trampoline)`. Trampoline drains the kernel buffer in a loop (one g_io_add_watch dispatch handles many queued events), parses `inotify_event` headers (16-byte fixed + NUL-padded name), composes `<watch_root>/<name>`. v1 non-recursive (single inode). Shutdown via `g_source_remove` + `inotify_rm_watch` + `g_io_channel_unref` (close_on_unref handles fd) | done | done | — |
 | 6 | **Global hotkeys (Win)** | Closes Win half of macOS-only `desktop.hotkeys` from 2026-05-28 | `RegisterHotKey(hwnd, id, fsModifiers, vk)` with `MOD_*` mapping + `WM_HOTKEY` case in `wndProc`. Modifier mapping: `cmd` → `MOD_WIN`, `ctrl` → `MOD_CONTROL`, `option` → `MOD_ALT`, `shift` → `MOD_SHIFT` | — | Medium |
 | 7 | **Global hotkeys (Linux X11)** | Linux half. Wayland portal deferred (separate D-Bus call; needs portal infra) | — | `XGrabKey(dpy, keycode, modifiers, DefaultRootWindow(dpy), True, GrabModeAsync, GrabModeAsync)` after `XKeysymToKeycode`; hook a key-press handler on the root window via `XSelectInput`. X11-only — Wayland session returns `error.Unsupported` (detected via `XDG_SESSION_TYPE=wayland`) | Medium-high — X11 keymap quirks (NumLock / CapsLock mask combinations need iteration) |
 | 8 | **Print extras (Win + Linux)** | Page-range / copies / printer-selection. Closes the macOS-only NSPrintInfo dict path from 2026-05-27 | New `SLOT_WV2_PrintSettings` vtable slot on `ICoreWebView2PrintSettings` (factory via `ICoreWebView2Environment6::CreatePrintSettings`). Set `Copies`, `PageRange` (`"1-5,8"` string format), `PrinterName` then pass to `ShowPrintUI` / `PrintToPdf` | `GtkPrintSettings` via `gtk_print_settings_new` → `gtk_print_settings_set_n_copies` / `_set_page_ranges` / `_set_printer`; attach to `WebKitPrintOperation` via `webkit_print_operation_set_print_settings` before `_run_dialog` | Medium — Win adds another vtable slot to the hand-extracted set; document the slot index source in the same convention as existing slots |
