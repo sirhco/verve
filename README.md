@@ -1,5 +1,12 @@
 # Verve
 
+> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.1.x. Public
+> APIs are not stable and **will** break between minor versions.
+> The Linux backend has never been booted on a real Linux host;
+> the Windows backend has been validated only via cross-compile.
+> macOS is the only surface verified live. Use for learning,
+> experiments, and personal projects. Not production-ready.
+
 Full-stack Zig framework for **both web apps and native desktop apps**.
 Server-side rendering with fine-grained reactivity, a wasm32-freestanding
 client runtime that hosts the real Signal/Effect graph, per-island WASM
@@ -11,13 +18,13 @@ No Chromium. No Electron. No third-party dependencies.
 
 Targets **Zig 0.16.0**.
 
-📚 **[Documentation](docs/README.md)** — 19 topic guides covering every feature.
+📚 **[Documentation](docs/README.md)** — 20 topic guides covering every feature.
 🧪 **[Examples](examples/README.md)** — runnable sample apps including a full [showcase](examples/showcase/).
 
 ```sh
 # Web app — HTTP server + wasm hydration
 zig build                           # native server + wasm client + per-island chunks
-zig build test --summary all        # 176+ tests across core + server + client + desktop + integration
+zig build test --summary all        # 205 tests across core + server + client + desktop + integration
 zig build docs                      # zig-out/docs/api/index.html — Zig autodoc for the public verve module
 ./zig-out/bin/verve-server          # open http://127.0.0.1:8080
 
@@ -119,7 +126,8 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - **Color-scheme follow** — `Window.colorScheme()` returns `.light` / `.dark` / `.unknown` from the OS preference; `Window.setColorSchemeHandler(cb, ctx)` fires live on toggle (NSDistributedNotificationCenter / WM_SETTINGCHANGE / GtkSettings notify).
 - **Native dialogs / alerts** — `openFileDialog`, `saveFileDialog`, `showAlert` wired against the system picker on all three backends (NSOpenPanel/NSSavePanel/NSAlert on macOS, `GtkFileChooserNative` + `GtkMessageDialog` on Linux, `GetOpenFileNameW` / `GetSaveFileNameW` + `MessageBoxW` on Windows). **Native menu bar (macOS)** — default App+Edit+Window menus (Edit menu is what makes Cmd+C / Cmd+V fire inside WKWebView text inputs).
 - **Window snapshot** — `Window.takeSnapshotPng(path)` on all three backends (WKWebView snapshot → NSBitmapImageRep on macOS; `webkit_web_view_get_snapshot` → cairo PNG on Linux; `ICoreWebView2::CapturePreview` → IStream → `WriteFile` on Windows).
-- **macOS `.app` bundle** — `zig build bundle` lays out `Info.plist` + `MacOS/<name>`; `-Dbundle-id` / `-Dbundle-version` / `-Dicon=<path-to-icns>` / `-Dcodesign=<identity>` flags.
+- **macOS `.app` bundle** — `zig build bundle` lays out `Info.plist` + `MacOS/<name>`; `-Dbundle-id` / `-Dbundle-version` / `-Dicon=<path-to-icns>` / `-Dcodesign=<identity>` / `-Dhardened=true` (hardened runtime + WKWebView entitlements) flags.
+- **Auto-updater** — `desktop.updates.checkForUpdate` (all 3 backends, pure stdlib JSON feed compare) + `applyUpdate` (macOS-only: SHA-256 verify + same-volume rename swap + `open -n` relaunch). Win + Linux apply paths remain platform-updater territory.
 - **Level-3 golden-diff smoke** — `zig build smoke` runs the app under `--smoke`, drives a deterministic interaction sequence, captures a PNG via `Window.takeSnapshotPng`, diffs a DOM checksum vs `tests/golden/`.
 - **Dev-loop watcher** — `zig build dev` polls watched sources and respawns the app on change.
 - **`--dev <dir>` hot-reload** — runtime asset fallback in the scheme handler. Edit `frontend/style.css` or `frontend/verve_desktop.js`, reload with Cmd+R, see the change without a rebuild. Path traversal rejected; 16 MB per-file cap.
@@ -130,17 +138,23 @@ tour and platform support matrix.
 
 ## Install
 
-Prebuilt binaries ship on every tagged release. Releases include
-`verve-server` + `verve-cli` for four targets:
+> Pre-1.0 — release artifacts are published for each tag, but
+> behavior is experimental. macOS is verified live; Linux and
+> Windows binaries are produced via cross-compile and have not
+> been booted by maintainers.
+
+Tagged releases publish `verve-server` + `verve-cli` tarballs for
+five targets:
 
 - `x86_64-linux`
 - `aarch64-linux`
 - `x86_64-macos`
 - `aarch64-macos`
+- `x86_64-windows`
 
 ```sh
-VERSION=0.1.0
-SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos
+VERSION=0.1.9
+SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256
 shasum -a 256 -c verve.tgz.sha256
@@ -151,6 +165,47 @@ tar -xzf verve.tgz
 Or build from source — see [Quickstart](#quickstart) below.
 
 The release history lives in [CHANGELOG.md](CHANGELOG.md).
+
+## Use as a Zig package
+
+Verve exposes a `verve` module that can be added as a dependency
+of any existing Zig project.
+
+### Add the dependency
+
+```sh
+zig fetch --save git+https://github.com/sirhco/verve#v0.1.9
+```
+
+This writes the `verve` entry into your `build.zig.zon` with the
+URL + computed hash pinned. Then wire it up in `build.zig`:
+
+```zig
+const verve_dep = b.dependency("verve", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe_mod.addImport("verve", verve_dep.module("verve"));
+```
+
+Now `@import("verve")` resolves inside your app code. The same
+`verve` module powers both the web server (`src/server/`) and the
+desktop scaffold's SSR pipeline.
+
+### Scaffold a new app pinned to a release
+
+`verve-cli` can pin scaffolded `build.zig.zon` to a tagged
+release instead of a path dep:
+
+```sh
+verve-cli new ~/my-app --release v0.1.9 \
+                       --release-hash <multihash-from-zig-fetch>
+```
+
+When `--release-hash` is omitted, the generated `build.zig.zon`
+ships with a commented `.url + .hash` block plus a `path = "../verve"`
+fallback so you can run `zig fetch --save <url>` once and let
+Zig compute the hash.
 
 ## Quickstart
 
