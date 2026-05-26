@@ -95,6 +95,14 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   writes `~/.config/autostart/<name>.desktop` (every
   freedesktop session). Options struct carries
   `name`/`exe_path`/`display_name`/`args`.
+- Power / battery — new `desktop.power` module:
+  `batteryPercent() ?u32` + `isCharging() bool`. Windows:
+  `GetSystemPowerStatus` (kernel32). Linux: reads
+  `/sys/class/power_supply/BAT[0-9]/capacity` + `status` via
+  posix open + bounded read (iterates BAT0..BAT9). macOS
+  currently returns null / false — IOKit
+  (`IOPSCopyPowerSourcesInfo`) deferred until scaffold links
+  the IOKit framework.
 - Disk space — new `desktop.disk` module:
   `spaceAt(allocator, path) Error!Space`. `Space { total,
   available, free }` in bytes. POSIX: `statvfs` with

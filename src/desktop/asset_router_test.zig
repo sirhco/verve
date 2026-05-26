@@ -22,6 +22,7 @@ comptime {
     _ = @import("system.zig");
     _ = @import("autostart.zig");
     _ = @import("disk.zig");
+    _ = @import("power.zig");
 }
 
 const entries = [_]options.AssetEntry{
