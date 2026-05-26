@@ -449,15 +449,36 @@ pub const Window = struct {
     /// `VerveDragWindow` subclass extract file URLs from the
     /// pasteboard on drop and fire the callback. Passing `null`
     /// unregisters the destination.
-    /// Trigger the platform print dialog for the WebView's current
-    /// document. v1 dispatches via the page's `window.print()` —
-    /// each native engine (WKWebView / WebView2 / WebKitGTK) renders
-    /// its own print UI off that call. Native print APIs
-    /// (`NSPrintOperation` / `ICoreWebView2_16::ShowPrintUI` /
-    /// `webkit_print_operation_run_dialog`) are deferred polish for
-    /// silent print + page-range / printer-selection controls.
+    /// Trigger the platform print dialog. Thin wrapper over
+    /// `printWithOptions(.{})`; preserved for backward compat with
+    /// pre-printWithOptions callers. Swallows the underlying error —
+    /// callers wanting Cancelled / Unsupported / Backend signals
+    /// should call `printWithOptions` directly.
     pub fn print(self: *Window) void {
-        self.evalJs("window.print();");
+        self.printWithOptions(.{}) catch {};
+    }
+
+    /// Native print dialog via NSPrintOperation. macOS shows the
+    /// standard system print sheet attached to the user's last
+    /// presentation preference (sheet vs detached modal).
+    /// `opts.kind` is ignored on macOS — there is no
+    /// browser-vs-system distinction at this layer.
+    pub fn printWithOptions(self: *Window, opts: opts_mod.PrintOptions) opts_mod.PrintError!void {
+        _ = opts;
+        const NSPrintInfo = m.getClass("NSPrintInfo");
+        const sharedInfo = m.cast(*const fn (id, SEL) callconv(.c) id);
+        const print_info = sharedInfo(@as(id, @ptrCast(NSPrintInfo)), m.sel("sharedPrintInfo"));
+
+        const makeOp = m.cast(*const fn (id, SEL, id) callconv(.c) ?id);
+        const op = makeOp(self.webview, m.sel("printOperationWithPrintInfo:"), print_info) orelse {
+            std.log.warn("verve.desktop[macos]: printOperationWithPrintInfo: returned nil", .{});
+            return opts_mod.PrintError.Backend;
+        };
+
+        const runOp = m.cast(*const fn (id, SEL) callconv(.c) bool);
+        const ok = runOp(op, m.sel("runOperation"));
+        if (!ok) return opts_mod.PrintError.Cancelled;
+        std.log.info("verve.desktop[macos]: print operation completed", .{});
     }
 
     /// Set the window's `NSAccessibilityLabel` — the string

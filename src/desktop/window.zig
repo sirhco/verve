@@ -43,6 +43,9 @@ pub const CookieError = options.CookieError;
 pub const SnapshotError = options.SnapshotError;
 pub const SameSite = options.SameSite;
 pub const ClipboardError = options.ClipboardError;
+pub const PrintDialogKind = options.PrintDialogKind;
+pub const PrintOptions = options.PrintOptions;
+pub const PrintError = options.PrintError;
 pub const ColorScheme = options.ColorScheme;
 pub const ColorSchemeHandler = options.ColorSchemeHandler;
 pub const UrlOpenHandler = options.UrlOpenHandler;
@@ -91,6 +94,7 @@ comptime {
         "takeSnapshotPng",
         "setDragDropHandler",
         "print",
+        "printWithOptions",
         "setAccessibilityLabel",
         "setAlwaysOnTop",
         "setOpacity",

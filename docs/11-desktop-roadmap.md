@@ -14,20 +14,21 @@ Fresh session? Do these four in order before writing code:
 3. **Pick one bundle** from the "Suggested next-session bundles"
    table. All P1 items (#16–#23) are closed; every P2 platform port
    (Win/Linux dialogs, alerts, snapshot) is in. The P3 items that
-   shipped 2026-05-24/25/26 are listed under "Out of P1 scope —
+   shipped 2026-05-24/25/26/27 are listed under "Out of P1 scope —
    shipped" below. Remaining P3 backlog: GTK4 backend, drag-drop with
-   native paths, print API, hicolor / Linux icon-theme install,
+   native paths, hicolor / Linux icon-theme install,
    accessibility (NSAccessibility / UIA / ATK), auto-updater
    (Sparkle / Squirrel), Win tray-balloon / Toast notifications
    (macOS + Linux notifications already landed). Tray click handlers
-   + submenus on all 3 platforms shipped 2026-05-26.
+   + submenus on all 3 platforms shipped 2026-05-26; native print
+   dialog on all 3 platforms shipped 2026-05-27.
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
    `src/desktop/` or the template tree.
 
 Authoritative state of the desktop scaffold subsystem and the remaining
 work needed to call it "fully functional." Written 2026-05-22, last
-updated 2026-05-26. Fresh sessions should be able to pick up without
+updated 2026-05-27. Fresh sessions should be able to pick up without
 prior context.
 
 ## v0.1.0 — first tagged release (2026-05-26)
@@ -942,11 +943,12 @@ now a Level-3 golden-diff harness:
 ### Out of P1 scope (P3 — open)
 
 - GTK4 + WebKitGTK 6.0 backend behind `-Dgtk4`
-- Native print APIs (`NSPrintOperation` /
+- Print page-range / printer-selection — native dialog path
+  shipped 2026-05-27 (`NSPrintOperation` /
   `ICoreWebView2_16::ShowPrintUI` /
-  `webkit_print_operation_run_dialog`) — `window.print()` path
-  shipped 2026-05-26; native APIs remain future polish for silent
-  print + page-range / printer-selection controls.
+  `webkit_print_operation_run_dialog`). Programmatic per-platform
+  settings (NSPrintInfo dict / `ICoreWebView2PrintSettings` /
+  `GtkPrintSettings`) remain future polish.
 - Win Toast (WinRT) notifications — balloon path shipped 2026-05-26;
   Toast remains future polish for richer styling + Action Center
   grouping.
@@ -1029,6 +1031,48 @@ now a Level-3 golden-diff harness:
   validated live; Win/Linux compile-clean cross-compile (live
   validation deferred).
 
+### Out of P1 scope — shipped 2026-05-27
+
+- Native print APIs — closes the deferred `Window.print()` polish on
+  all three backends. New `desktop.PrintOptions { kind: PrintDialogKind }`
+  + `PrintError = error{ Unsupported, Backend, Cancelled, OutOfMemory }`
+  in `options.zig`. `Window.printWithOptions(opts) PrintError!void` on
+  the public surface; legacy `Window.print() void` becomes a thin
+  wrapper (`printWithOptions(.{}) catch {}`) so existing callers
+  compile unchanged.
+  - macOS: `[NSPrintInfo sharedPrintInfo]` +
+    `[WKWebView printOperationWithPrintInfo:]` +
+    `[NSPrintOperation runOperation]`. `opts.kind` ignored —
+    NSPrintOperation always shows the system dialog. Cancel returns
+    `error.Cancelled`; nil op returns `error.Backend`.
+  - Windows: `ICoreWebView2_16::ShowPrintUI`. QI from base `Wv2` to
+    new `Wv2_16` interface via fresh `IID_ICoreWebView2_16` GUID;
+    `releaseRef` on the temporary after the call. `opts.kind`
+    `default` / `browser` → `COREWEBVIEW2_PRINT_DIALOG_KIND_BROWSER`,
+    `system` → `..._SYSTEM`. Edge WebView2 runtimes older than
+    version 111 (March 2023) answer `E_NOINTERFACE` to the QI and
+    surface `error.Unsupported`. New `SLOT_WV2_16_ShowPrintUI = 104`
+    is hand-extracted from `WebView2.h`; logs `hr` on both QI and
+    ShowPrintUI to disambiguate wrong-IID vs wrong-slot during the
+    first live Windows boot (same convention as
+    `SLOT_WV2_2_get_CookieManager`).
+  - Linux: `webkit_print_operation_new` +
+    `webkit_print_operation_run_dialog(op, parent)` + `g_object_unref`.
+    `opts.kind` ignored — WebKitGTK has one dialog path.
+    `WEBKIT_PRINT_OPERATION_RESPONSE_CANCEL` returns
+    `error.Cancelled`.
+  - `window.zig` conformance `required` array gained
+    `"printWithOptions"` between `"print"` and `"setAccessibilityLabel"`.
+  - Template demo: new `print_page` IPC route in `handlers.zig` maps
+    `default` / `browser` / `system` strings to the enum + maps
+    `Cancelled` / `Unsupported` / else to `{ ok: bool, status:
+    string }` reply. New "Print" feature card in `components.zig`
+    with default + system buttons. Smoke golden checksum bumped
+    605 → 857.
+  - macOS validated live (system print sheet opens, Cancel returns
+    expected reply); Win/Linux compile-clean cross-compile (live
+    validation deferred per project convention).
+
 ### Out of P1 scope — shipped 2026-05-26
 
 - Tray click handlers + submenus — `TrayMenuItem { label, id,
@@ -1067,7 +1111,7 @@ edges in shipped code.
 | Bundle | What | Status / scope |
 |---|---|---|
 | **GTK4 backend** | Parallel GTK4 + WebKitGTK 6.0 module behind `-Dgtk4`; existing GTK3 path stays | Largest remaining item (~5h). New backend module. Future-proofs Linux once Ubuntu LTS / Fedora ship GTK4 webkit by default. |
-| **Native print APIs** | `NSPrintOperation` (macOS) / `ICoreWebView2_16::ShowPrintUI` (Win) / `webkit_print_operation_run_dialog` (Linux) | Polish vs current `Window.print()` (`window.print()` JS delegate). Adds silent print + page-range / printer selection. ~3h. |
+| **Print page-range / printer-selection** | Per-platform settings on top of the shipped `printWithOptions` (NSPrintInfo dict / `ICoreWebView2PrintSettings` / `GtkPrintSettings`) | Native dialog path itself shipped 2026-05-27; programmatic settings are additive follow-up. ~3h. |
 | **WinRT Toast** | `Windows.UI.Notifications.ToastNotificationManager` via COM + AUMID + Start-menu shortcut | Polish vs current `Shell_NotifyIconW(NIF_INFO)` balloon. Richer styling + Action Center grouping. ~4h, needs Windows host for live validation. |
 | **Full a11y provider** | NSAccessibility / UIA / ATK roles + states beyond labels | Polish vs current `setAccessibilityLabel`. Web content + menus already self-publish; remaining gap is window-chrome semantics. ~3h. |
 | **Auto-updater apply** | Sparkle (macOS) / Squirrel or MSIX (Win) / AppImageUpdate (Linux) | `desktop.updates.checkForUpdate` shipped; apply phase needs signing + delta channels + per-platform updater integration. ~5h+ + signing infrastructure. |
@@ -1101,7 +1145,7 @@ edges in shipped code.
 
 By scope:
 - **Small (~1-2h)**: Clipboard HTML; macOS battery via IOKit; Linux libayatana weak-symbol fix.
-- **Medium (~3h)**: Network online; file-watch; native print APIs; full a11y provider; URL scheme runtime registration.
+- **Medium (~3h)**: Network online; file-watch; full a11y provider; URL scheme runtime registration; print page-range / printer-selection settings.
 - **Large (~5h+)**: GTK4 backend; auto-updater apply; WinRT Toast.
 
 Pick by user-facing impact:

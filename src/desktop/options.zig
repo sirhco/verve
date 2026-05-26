@@ -97,6 +97,38 @@ pub const ClipboardError = error{
     Backend,
 };
 
+/// Which print dialog the backend should present.
+///  - `default` → backend-natural choice (macOS / Linux use the OS
+///    system dialog; Windows uses the WebView2 browser print preview).
+///  - `browser` → Windows: WebView2's built-in preview. Ignored on
+///    macOS / Linux — they have no browser-vs-system distinction at
+///    this layer.
+///  - `system`  → macOS: NSPrintOperation modal sheet. Windows:
+///    `ICoreWebView2_16::ShowPrintUI` with
+///    `COREWEBVIEW2_PRINT_DIALOG_KIND_SYSTEM`. Linux:
+///    `webkit_print_operation_run_dialog`.
+pub const PrintDialogKind = enum { default, browser, system };
+
+/// Parameters for `Window.printWithOptions`. v1 ships `kind` only;
+/// per-platform knobs (page range, printer name, copies, silent) are
+/// additive follow-ups since each backend exposes them through a
+/// different concrete type.
+pub const PrintOptions = struct {
+    kind: PrintDialogKind = .default,
+};
+
+pub const PrintError = error{
+    /// Platform print API not available — typically Edge WebView2
+    /// runtime older than version 111 (March 2023) on Windows.
+    Unsupported,
+    /// Platform call returned a failure code (HRESULT < 0, NULL
+    /// NSPrintOperation, NULL WebKitPrintOperation, etc.).
+    Backend,
+    /// User dismissed the dialog.
+    Cancelled,
+    OutOfMemory,
+};
+
 /// Current system color preference. Apps that style their UI to
 /// match the OS appearance should call `Window.colorScheme()` at
 /// startup and either re-check on window restore or register a

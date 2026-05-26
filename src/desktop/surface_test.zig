@@ -34,6 +34,27 @@ test "ipc.shim_js exposes the verve bridge contract" {
     try std.testing.expect(std.mem.indexOf(u8, ipc.shim_js, "verve:ready") != null);
 }
 
+test "PrintOptions defaults to kind=default" {
+    const o: options.PrintOptions = .{};
+    try std.testing.expectEqual(options.PrintDialogKind.default, o.kind);
+}
+
+test "PrintDialogKind enumerates default/browser/system" {
+    // ABI guard: downstream apps switch on these tags.
+    _ = options.PrintDialogKind.default;
+    _ = options.PrintDialogKind.browser;
+    _ = options.PrintDialogKind.system;
+}
+
+test "PrintError set is stable" {
+    // ABI guard: downstream catch-prongs depend on these names.
+    const e: options.PrintError = error.Unsupported;
+    try std.testing.expect(e == error.Unsupported);
+    try std.testing.expect(@as(options.PrintError, error.Backend) == error.Backend);
+    try std.testing.expect(@as(options.PrintError, error.Cancelled) == error.Cancelled);
+    try std.testing.expect(@as(options.PrintError, error.OutOfMemory) == error.OutOfMemory);
+}
+
 test "AssetEntry shape matches public_assets.Entry contract" {
     // The desktop app casts `public_assets.entries` directly to
     // `[]const desktop.AssetEntry`; identical field order/types are a

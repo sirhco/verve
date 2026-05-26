@@ -410,6 +410,12 @@ extern fn webkit_web_view_get_uri(wv: *WebKitWebView) ?[*:0]const u8;
 extern fn webkit_web_view_get_title(wv: *WebKitWebView) ?[*:0]const u8;
 extern fn webkit_web_view_set_zoom_level(wv: *WebKitWebView, level: f64) void;
 extern fn webkit_web_view_get_zoom_level(wv: *WebKitWebView) f64;
+const WebKitPrintOperation = opaque {};
+extern fn webkit_print_operation_new(wv: *WebKitWebView) ?*WebKitPrintOperation;
+extern fn webkit_print_operation_run_dialog(op: *WebKitPrintOperation, parent: ?*GtkWindow) c_uint;
+// WebKitPrintOperationResponse enum values.
+const WEBKIT_PRINT_OPERATION_RESPONSE_PRINT: c_uint = 0;
+const WEBKIT_PRINT_OPERATION_RESPONSE_CANCEL: c_uint = 1;
 extern fn gtk_widget_get_scale_factor(w: *GtkWidget) c_int;
 extern fn gtk_window_set_urgency_hint(w: *GtkWindow, on: gboolean) void;
 const GdkWindow = opaque {};
@@ -791,12 +797,27 @@ pub const Window = struct {
     /// `gtk_drag_dest_set` + URI-list targets + a `drag-data-received`
     /// signal on the window widget. Passing `null` disconnects the
     /// signal and clears the destination.
-    /// Trigger the platform print dialog. v1 dispatches via the
-    /// page's `window.print()` — WebKitGTK shows its built-in print
-    /// dialog off that call. Native `webkit_print_operation_run_dialog`
-    /// is deferred polish for richer programmatic print control.
+    /// Trigger the platform print dialog. Thin wrapper over
+    /// `printWithOptions(.{})`; preserved for backward compat.
+    /// Swallows the underlying error.
     pub fn print(self: *Window) void {
-        self.evalJs("window.print();");
+        self.printWithOptions(.{}) catch {};
+    }
+
+    /// Native print dialog via `webkit_print_operation_run_dialog`.
+    /// Spins a nested GTK modal loop until the user prints or
+    /// cancels. `opts.kind` is ignored on Linux — WebKitGTK only
+    /// exposes one dialog path.
+    pub fn printWithOptions(self: *Window, opts: opts_mod.PrintOptions) opts_mod.PrintError!void {
+        _ = opts;
+        const wv = self.ctx.webview orelse return opts_mod.PrintError.Backend;
+        const op = webkit_print_operation_new(wv) orelse return opts_mod.PrintError.Backend;
+        defer g_object_unref(@ptrCast(op));
+
+        const parent: ?*GtkWindow = if (self.ctx.window) |w| @ptrCast(w) else null;
+        const response = webkit_print_operation_run_dialog(op, parent);
+        if (response == WEBKIT_PRINT_OPERATION_RESPONSE_CANCEL) return opts_mod.PrintError.Cancelled;
+        std.log.info("verve.desktop[linux]: print dialog response={d}", .{response});
     }
 
     /// Set the window's ATK accessible name. `gtk_widget_get_accessible`

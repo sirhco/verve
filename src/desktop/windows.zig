@@ -495,6 +495,7 @@ const Env = extern struct { lpVtbl: *const anyopaque };
 const Ctrl = extern struct { lpVtbl: *const anyopaque };
 const Wv2 = extern struct { lpVtbl: *const anyopaque };
 const Wv2_2 = extern struct { lpVtbl: *const anyopaque };
+const Wv2_16 = extern struct { lpVtbl: *const anyopaque };
 const CookieMgr = extern struct { lpVtbl: *const anyopaque };
 const CookieT = extern struct { lpVtbl: *const anyopaque };
 const CookieList = extern struct { lpVtbl: *const anyopaque };
@@ -549,6 +550,22 @@ const SLOT_MessageArgs_TryGetWebMessageAsString: usize = 5;
 // here.
 const SLOT_WV2_2_get_CookieManager: usize = 66;
 
+// ICoreWebView2_16 inherits every method of ICoreWebView2 through
+// ICoreWebView2_15, then adds Print / PrintToPdfStream / ShowPrintUI.
+// Slot 104 is the hand-extracted ShowPrintUI position counted from
+// WebView2.h:
+//   58 (Wv2) + 7 (_2) + 5 (_3) + 6 (_4) + 2 (_5) + 2 (_6) + 2 (_7) +
+//    5 (_8) + 2 (_9) + 2 (_10) + 2 (_11) + 2 (_12) + 2 (_13) +
+//    2 (_14) + 2 (_15) = 101 inherited, +3 in slots 102–104.
+// LOOK UP: verify against actual WebView2.h on first live Windows
+// boot; if QI returns S_OK but ShowPrintUI calls crash, this index
+// is wrong. Same convention as SLOT_WV2_2_get_CookieManager above.
+const SLOT_WV2_16_ShowPrintUI: usize = 104;
+
+// COREWEBVIEW2_PRINT_DIALOG_KIND.
+const PRINT_DIALOG_KIND_BROWSER: c_int = 0;
+const PRINT_DIALOG_KIND_SYSTEM: c_int = 1;
+
 // ICoreWebView2CookieManager.
 const SLOT_CM_CreateCookie: usize = 3;
 const SLOT_CM_GetCookies: usize = 5;
@@ -585,6 +602,14 @@ const IID_ICoreWebView2_2: IID = .{
     .Data2 = 0xE670,
     .Data3 = 0x4B5E,
     .Data4 = .{ 0xB2, 0xBC, 0x73, 0xE0, 0x61, 0xE3, 0x18, 0x4C },
+};
+
+// {0EB34DC9-9F91-41E1-BBBB-E7F04446A6C1}
+const IID_ICoreWebView2_16: IID = .{
+    .Data1 = 0x0EB34DC9,
+    .Data2 = 0x9F91,
+    .Data3 = 0x41E1,
+    .Data4 = .{ 0xBB, 0xBB, 0xE7, 0xF0, 0x44, 0x46, 0xA6, 0xC1 },
 };
 
 fn vtSlot(comptime Fn: type, lpVtbl: *const anyopaque, slot: usize) Fn {
@@ -932,13 +957,41 @@ pub const Window = struct {
     /// a drop target via `RegisterDragDrop` on first non-null call;
     /// later calls just swap the callback fields. Setting `null`
     /// revokes the registration.
-    /// Trigger the platform print dialog. v1 dispatches via the
-    /// page's `window.print()` — WebView2 renders its built-in print
-    /// preview off that call. Native `ICoreWebView2_16::ShowPrintUI`
-    /// is deferred polish for silent print + browser-vs-system
-    /// dialog selection.
+    /// Trigger the platform print dialog. Thin wrapper over
+    /// `printWithOptions(.{})`; preserved for backward compat.
+    /// Swallows the underlying error.
     pub fn print(self: *Window) void {
-        self.evalJs("window.print();");
+        self.printWithOptions(.{}) catch {};
+    }
+
+    /// Native print dialog via `ICoreWebView2_16::ShowPrintUI`.
+    /// Returns `error.Unsupported` when the Edge WebView2 runtime is
+    /// older than version 111 (March 2023) — the older runtime
+    /// answers `E_NOINTERFACE` to the QI for `ICoreWebView2_16`.
+    pub fn printWithOptions(self: *Window, opts: opts_mod.PrintOptions) opts_mod.PrintError!void {
+        const wv = self.ctx.webview orelse return opts_mod.PrintError.Backend;
+
+        var wv16_raw: ?*anyopaque = null;
+        const QI = vtSlot(*const fn (*Wv2, *const IID, *?*anyopaque) callconv(.winapi) HRESULT, wv.lpVtbl, 0);
+        const qhr = QI(wv, &IID_ICoreWebView2_16, &wv16_raw);
+        if (qhr < 0 or wv16_raw == null) {
+            std.log.warn("verve.desktop[windows]: QI ICoreWebView2_16 failed (hr=0x{x}); runtime too old", .{qhr});
+            return opts_mod.PrintError.Unsupported;
+        }
+        const wv16: *Wv2_16 = @ptrCast(@alignCast(wv16_raw.?));
+        defer releaseRef(@ptrCast(wv16));
+
+        const kind: c_int = switch (opts.kind) {
+            .default, .browser => PRINT_DIALOG_KIND_BROWSER,
+            .system => PRINT_DIALOG_KIND_SYSTEM,
+        };
+        const Show = vtSlot(*const fn (*Wv2_16, c_int) callconv(.winapi) HRESULT, wv16.lpVtbl, SLOT_WV2_16_ShowPrintUI);
+        const hr = Show(wv16, kind);
+        if (hr < 0) {
+            std.log.warn("verve.desktop[windows]: ShowPrintUI(kind={d}) hr=0x{x}", .{ kind, hr });
+            return opts_mod.PrintError.Backend;
+        }
+        std.log.info("verve.desktop[windows]: ShowPrintUI(kind={d}) ok", .{kind});
     }
 
     /// On Windows the window's accessible name (what screen readers
