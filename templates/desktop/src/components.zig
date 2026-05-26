@@ -76,7 +76,10 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
             }),
             ctx.section().class("card").children(.{
                 ctx.h2("Deep link"),
-                ctx.p().text("Open verve://app/anything from a terminal (or click a link on a registered scheme) — the URL appears here."),
+                ctx.p().text("Open verve://app/anything from a terminal (or click a link on a registered scheme) — the URL flows through handlers.onUrlOpen and the value appears below. The Test button fires a synthetic delivery via Window.deliverUrl so you can exercise the round-trip without leaving the app."),
+                ctx.div().class("row").children(.{
+                    ctx.button("Test").id("deep-link-test"),
+                }),
                 ctx.pre().id("deep-link-url").text("(no URL received yet)"),
             }),
             ctx.section().class("card").children(.{
@@ -122,6 +125,7 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
             ctx.section().class("card").children(.{
                 ctx.h2("HTTP fetch"),
                 ctx.p().text("Hits the GitHub public API for the Zig repo via std.http.Client in a Zig IPC handler. JSON parsed server-side; only the headline fields cross the bridge."),
+                ctx.p().text("Note: requests run server-side (Zig). DevTools Network tab won't show them — only the inspector Console tab logs the IPC request/reply."),
                 ctx.div().class("row").children(.{
                     ctx.button("Fetch ziglang/zig").id("fetch-zig"),
                 }),
@@ -253,6 +257,10 @@ const inline_js =
     \\      '<dt>Size</dt><dd>' + bytes(r.size_bytes) + '</dd>' +
     \\      '</dl>';
     \\  } catch (err) { out.textContent = '✗ ' + err.message; out.className = 'result-panel error'; }
+    \\});
+    \\
+    \\document.getElementById('deep-link-test').addEventListener('click', () => {
+    \\  call('deep_link_test', { url: 'verve://app/demo?from=ipc' });
     \\});
     \\
     \\function winAction(a) { return () => call('window_action', { action: a }); }

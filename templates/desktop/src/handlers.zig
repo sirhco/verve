@@ -180,6 +180,21 @@ const Routes = struct {
         }
     };
 
+    /// Fire `Window.deliverUrl` with a synthetic verve://app URL so
+    /// the demo deep-link card lights up without leaving the app.
+    /// Real cold-launch URLs arrive via NSAppleEventManager (macOS)
+    /// or argv (Win/Linux) — see main.zig for the production path.
+    pub const deep_link_test = struct {
+        pub const Args = struct {
+            url: []const u8 = "verve://app/demo?from=ipc",
+        };
+        pub const Reply = struct { ok: bool };
+        pub fn handle(c: *RouterCtx, _: std.mem.Allocator, args: Args) !Reply {
+            c.window.deliverUrl(args.url);
+            return .{ .ok = true };
+        }
+    };
+
     /// System / runtime info. Wraps the per-platform `desktop.system`
     /// readouts so the UI can render them as a `dl.kv` table. All
     /// fields best-effort: failures collapse to defaults rather than
