@@ -192,14 +192,20 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   `_go_back` / `_go_forward`. macOS uses `reloadFromOrigin` for
   cache-bypass behavior matching Cmd+Shift+R.
 - Shell helpers — new `desktop.shell` module:
-  `openUrl(allocator, url) Error!void`. Hands a URL to the OS
-  shell so it opens in the system default browser (HTTP) or the
-  registered handler app (mailto:, custom schemes). macOS:
-  `[NSWorkspace.sharedWorkspace openURL:]`. Windows:
-  `ShellExecuteW(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL)`.
-  Linux: `posix.fork` + `execvp("xdg-open", ...)`. Apps that
-  want web links to open externally (instead of navigating the
-  embedded WebView) call this from their IPC handler.
+  - `openUrl(allocator, url)` hands a URL to the OS shell so it
+    opens externally (system browser / registered handler app).
+    macOS: `[NSWorkspace openURL:]`. Windows:
+    `ShellExecuteW(NULL, "open", url, NULL, NULL,
+    SW_SHOWNORMAL)`. Linux: `posix.fork` + `execvp("xdg-open",
+    ...)`.
+  - `showInFolder(allocator, path)` reveals a file in the OS
+    file manager. macOS:
+    `[NSWorkspace selectFile:inFileViewerRootedAtPath:]` (Finder
+    pre-selects). Windows: `ShellExecuteW(NULL, "open",
+    "explorer.exe", "/select,<path>", ...)` (Explorer
+    pre-selects). Linux: `xdg-open <parent_dir>` — freedesktop
+    has no portable "select this file" verb, so the file's row
+    won't be pre-highlighted.
 - Multi-display enumeration — new `desktop.displays` module:
   `list(allocator) Error![]Display`. `Display { x, y, width,
   height, scale, primary }`. macOS: `[NSScreen screens]` +

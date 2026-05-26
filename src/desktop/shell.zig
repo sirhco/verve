@@ -42,6 +42,22 @@ pub fn openUrl(allocator: std.mem.Allocator, url: []const u8) Error!void {
     };
 }
 
+/// Reveal `path` in the OS file manager. macOS opens Finder with
+/// the file pre-selected (`selectFile:inFileViewerRootedAtPath:`).
+/// Windows opens Explorer with the same selection
+/// (`explorer.exe /select,<path>`). Linux opens the containing
+/// directory via `xdg-open <parent_dir>` — freedesktop has no
+/// portable "select this file" affordance, so the file's row
+/// won't be pre-highlighted.
+pub fn showInFolder(allocator: std.mem.Allocator, path: []const u8) Error!void {
+    return switch (builtin.os.tag) {
+        .macos => showInFolderMacos(path),
+        .windows => showInFolderWindows(allocator, path),
+        .linux => showInFolderLinux(allocator, path),
+        else => error.Unsupported,
+    };
+}
+
 // ---- macOS — NSWorkspace ----------------------------------------------------
 
 fn openUrlMacos(url: []const u8) Error!void {
@@ -70,6 +86,29 @@ fn openUrlMacos(url: []const u8) Error!void {
     if (!openUrlSel(ws, m.sel("openURL:"), ns_url)) return error.Backend;
 }
 
+fn showInFolderMacos(path: []const u8) Error!void {
+    if (builtin.os.tag != .macos) return error.Unsupported;
+    const m = @import("msg.zig");
+    const id = ?*anyopaque;
+    const SEL = ?*anyopaque;
+
+    const NSString = m.getClass("NSString");
+    const stringWithUTF8 = m.cast(*const fn (id, SEL, [*]const u8) callconv(.c) id);
+    var buf: [4096]u8 = undefined;
+    if (path.len >= buf.len) return error.OutOfMemory;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const ns_path = stringWithUTF8(@as(id, @ptrCast(NSString)), m.sel("stringWithUTF8String:"), &buf);
+
+    const NSWorkspace = m.getClass("NSWorkspace");
+    const sharedSel = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const ws = sharedSel(@as(id, @ptrCast(NSWorkspace)), m.sel("sharedWorkspace"));
+    const selectFile = m.cast(*const fn (id, SEL, id, id) callconv(.c) bool);
+    // Empty root string opens Finder at the file's parent.
+    const empty_root = stringWithUTF8(@as(id, @ptrCast(NSString)), m.sel("stringWithUTF8String:"), "");
+    if (!selectFile(ws, m.sel("selectFile:inFileViewerRootedAtPath:"), ns_path, empty_root)) return error.Backend;
+}
+
 // ---- Windows — ShellExecuteW ------------------------------------------------
 
 extern "shell32" fn ShellExecuteW(
@@ -91,6 +130,21 @@ fn openUrlWindows(allocator: std.mem.Allocator, url: []const u8) Error!void {
     // MSDN. The "instance" return is opaque, so cast to uintptr for
     // the threshold check.
     const rc = ShellExecuteW(null, verb, w_url.ptr, null, null, SW_SHOWNORMAL);
+    if (@intFromPtr(rc) <= 32) return error.Backend;
+}
+
+fn showInFolderWindows(allocator: std.mem.Allocator, path: []const u8) Error!void {
+    if (builtin.os.tag != .windows) return error.Unsupported;
+    const SW_SHOWNORMAL: c_int = 1;
+    // `/select,<path>` tells Explorer to open the parent directory
+    // and pre-select the file. Quote the path so spaces survive.
+    const params_str = std.fmt.allocPrint(allocator, "/select,\"{s}\"", .{path}) catch return error.OutOfMemory;
+    defer allocator.free(params_str);
+    const w_params = std.unicode.utf8ToUtf16LeAllocZ(allocator, params_str) catch return error.OutOfMemory;
+    defer allocator.free(w_params);
+    const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
+    const exe = std.unicode.utf8ToUtf16LeStringLiteral("explorer.exe");
+    const rc = ShellExecuteW(null, verb, exe, w_params.ptr, null, SW_SHOWNORMAL);
     if (@intFromPtr(rc) <= 32) return error.Backend;
 }
 
@@ -121,6 +175,24 @@ fn openUrlLinux(allocator: std.mem.Allocator, url: []const u8) Error!void {
     // Parent returns immediately; we don't waitpid because xdg-open
     // forks the actual browser and returns quickly. Wait would block
     // on long-running child processes.
+}
+
+fn showInFolderLinux(allocator: std.mem.Allocator, path: []const u8) Error!void {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    // freedesktop has no portable "open + select" affordance.
+    // Open the file's containing directory; users navigate the
+    // last few clicks themselves.
+    const parent = std.fs.path.dirname(path) orelse "/";
+    const parent_z = allocator.dupeZ(u8, parent) catch return error.OutOfMemory;
+    defer allocator.free(parent_z);
+
+    const pid = fork();
+    if (pid < 0) return error.Backend;
+    if (pid == 0) {
+        const argv = [_]?[*:0]const u8{ "xdg-open", parent_z.ptr, null };
+        _ = execvp("xdg-open", &argv);
+        _exit(127);
+    }
 }
 
 // ---- tests ------------------------------------------------------------------
