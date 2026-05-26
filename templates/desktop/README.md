@@ -515,6 +515,7 @@ Build options:
 | `-Dbundle-version=...` | `0.0.0` | `CFBundleVersion` + `CFBundleShortVersionString` |
 | `-Dicon=<path>` | (none) | Copy `<path>` into `Contents/Resources/AppIcon.icns` and reference it from `CFBundleIconFile`. Accept absolute or build-root-relative paths. Without it the bundle falls back to the generic macOS app glyph. |
 | `-Dcodesign=<identity>` | (none) | Sign the bundle after layout. Use `-` for ad-hoc |
+| `-Dhardened=true` | `false` | Sign with hardened runtime + WKWebView entitlements (precondition for notarization). Combined with `-Dcodesign=...` |
 
 Example:
 
@@ -538,6 +539,100 @@ iconutil -c icns AppIcon.iconset -o assets/AppIcon.icns
 
 With `-Dcodesign=...` set a `zig build codesign` step also becomes
 available; it signs the bundle in place.
+
+## Auto-update
+
+The framework ships a check + apply auto-updater in
+`desktop.updates`:
+
+```zig
+const updates = @import("desktop").updates;
+
+// 1. Check. Hit a JSON feed you host; returns null when up-to-date.
+const info = try updates.checkForUpdate(
+    allocator,
+    "https://example.com/updates.json",
+    "1.2.3",
+);
+defer if (info) |i| i.deinit();
+
+// 2. Apply. Downloads, verifies SHA-256, swaps the .app, relaunches.
+// Does not return on success. macOS only.
+if (info) |i| try updates.applyUpdate(allocator, io, &i);
+```
+
+Feed shape:
+
+```json
+{
+  "version": "1.2.4",
+  "download_url": "https://example.com/MyApp-1.2.4-aarch64-macos.tar.gz",
+  "sha256": "<64 lowercase hex chars>",
+  "notes": "What changed."
+}
+```
+
+The download URL must serve a `.tar.gz` whose root contains
+`<name>.app/`. Compute the SHA-256 the same way you'd publish it for
+a homebrew tap (`shasum -a 256 MyApp-1.2.4.tar.gz`); the apply phase
+verifies and aborts on mismatch.
+
+Limits today (v1, self-built apps):
+- macOS only. Win + Linux return `error.Unsupported`.
+- Requires the running process to live inside an `.app` bundle.
+  Bare `zig build run` returns `error.NotBundled`.
+- Trust anchor is the feed URL — host it on infrastructure you
+  control over HTTPS. SHA-256 catches CDN corruption, not a
+  compromised feed.
+
+## Distributing to other Macs
+
+Self-built apps for personal use can skip Gatekeeper signing —
+double-clicking the app from your own download throws a warning
+that you dismiss once. Shipping to other Macs (so they don't see
+that warning) needs the full Apple distribution dance:
+
+1. Enroll in the Apple Developer program; obtain a **Developer ID
+   Application** certificate from `developer.apple.com`.
+2. Build with hardened runtime + your identity:
+
+   ```sh
+   zig build bundle \
+     -Dcodesign="Developer ID Application: Your Name (TEAMID)" \
+     -Dhardened=true
+   zig build codesign \
+     -Dcodesign="Developer ID Application: Your Name (TEAMID)" \
+     -Dhardened=true
+   ```
+
+3. Zip the bundle for notarization upload (notarytool refuses
+   `.app` directories directly):
+
+   ```sh
+   ditto -c -k --keepParent zig-out/MyApp.app MyApp.zip
+   ```
+
+4. Submit + wait for notarization (~5 min):
+
+   ```sh
+   xcrun notarytool submit MyApp.zip \
+     --apple-id you@example.com \
+     --team-id TEAMID \
+     --password "<app-specific-password>" \
+     --wait
+   ```
+
+5. Staple the ticket so Gatekeeper accepts offline:
+
+   ```sh
+   xcrun stapler staple zig-out/MyApp.app
+   ```
+
+The framework does not automate steps 3–5 — they're documented
+once-per-release operations, and bolting them into `build.zig`
+would require shelling out for credentials that should never
+live in source. CI scripts (`fastlane match`, `gon`, raw shell)
+are the right home.
 
 ## Dev loop
 
@@ -630,6 +725,7 @@ Overrides:
 | `-Dbundle-version=<v>` | `0.0.0` | macOS bundle version |
 | `-Dicon=<path>` | (none) | macOS bundle icon (`.icns`); copied to `Contents/Resources/AppIcon.icns` |
 | `-Dcodesign=<identity>` | (none) | macOS bundle signing identity |
+| `-Dhardened=<bool>` | `false` | macOS: hardened runtime + WKWebView entitlements |
 | `-Dwebview2-sdk=<path>` | `third_party/webview2` | Windows: WebView2 SDK location |
 | `-Dwebview2-no-fetch=<bool>` | `false` | Windows: skip NuGet fetch (use existing SDK) |
 

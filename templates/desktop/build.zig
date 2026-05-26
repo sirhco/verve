@@ -217,6 +217,18 @@ pub fn build(b: *std.Build) void {
             "codesign",
             "Apple Developer signing identity. When set, the bundle is signed (use \"-\" for ad-hoc).",
         );
+        // Opt-in hardened runtime + entitlements. Required before
+        // notarization but not before ad-hoc signing — self-built apps
+        // can leave this off. When set, codesign runs with
+        // `--options=runtime --entitlements <generated.plist>` where
+        // the plist enables the three keys WKWebView needs under the
+        // hardened runtime (JIT, unsigned-executable-memory, library
+        // validation disable for embedded WebKit dylibs).
+        const hardened = b.option(
+            bool,
+            "hardened",
+            "Sign with hardened runtime + entitlements (required for future notarization).",
+        ) orelse false;
         // Path to a `.icns` file. Copied into Contents/Resources/ and
         // referenced from Info.plist via CFBundleIconFile. Generate one
         // from a square PNG with: `mkdir AppIcon.iconset && sips -z N N
@@ -343,8 +355,34 @@ pub fn build(b: *std.Build) void {
         if (codesign_id) |ident| {
             const bundle_path = b.fmt("zig-out/{s}", .{bundle_root});
             const sign = b.addSystemCommand(&.{
-                "codesign", "--force", "--deep", "--sign", ident, bundle_path,
+                "codesign", "--force", "--deep", "--sign", ident,
             });
+            if (hardened) {
+                // Hardened runtime forbids JIT and unsigned executable
+                // memory by default; WKWebView's JS engine needs both.
+                // `disable-library-validation` lets the bundled WebKit
+                // dylibs load without their own signature chain.
+                const entitlements_src =
+                    \\<?xml version="1.0" encoding="UTF-8"?>
+                    \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                    \\<plist version="1.0">
+                    \\<dict>
+                    \\    <key>com.apple.security.cs.allow-jit</key>
+                    \\    <true/>
+                    \\    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+                    \\    <true/>
+                    \\    <key>com.apple.security.cs.disable-library-validation</key>
+                    \\    <true/>
+                    \\</dict>
+                    \\</plist>
+                    \\
+                ;
+                const ent_wf = b.addWriteFiles();
+                const ent_lazy = ent_wf.add(b.fmt("{s}.entitlements", .{exe.name}), entitlements_src);
+                sign.addArg("--options=runtime");
+                sign.addPrefixedFileArg("--entitlements=", ent_lazy);
+            }
+            sign.addArg(bundle_path);
             sign.step.dependOn(bundle_step);
             const sign_step = b.step("codesign", "Sign the macOS bundle (-Dcodesign=<identity>)");
             sign_step.dependOn(&sign.step);

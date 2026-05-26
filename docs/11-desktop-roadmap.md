@@ -14,18 +14,22 @@ Fresh session? Do these four in order before writing code:
 3. **Pick one bundle** from the "Suggested next-session bundles"
    table. All P1 items (#16–#23) are closed; every P2 platform port
    (Win/Linux dialogs, alerts, snapshot) is in. The P3 items that
-   shipped 2026-05-24/25/26/27/28 are listed under "Out of P1 scope —
-   shipped" below. **macOS is feature-complete as of v0.1.8** (sweep
-   on 2026-05-28 added IOKit battery, SF Symbol tray, four new
-   modules — `desktop.network` / `desktop.fswatch` / `desktop.hotkeys`
-   / `desktop.process` — clipboard HTML, runtime URL-scheme
+   shipped 2026-05-24/25/26/27/28/29 are listed under "Out of P1
+   scope — shipped" below. **macOS is feature-complete for
+   self-built apps as of v0.1.9** — the 2026-05-29 close-out added
+   pure-Zig `applyUpdate` (download + SHA-256 verify + same-volume
+   rename swap + `open -n` relaunch) and the opt-in `-Dhardened=true`
+   build path (entitlements + `--options=runtime`). The 2026-05-28
+   sweep added IOKit battery, SF Symbol tray, four new modules
+   (`desktop.network` / `desktop.fswatch` / `desktop.hotkeys` /
+   `desktop.process`), clipboard HTML, runtime URL-scheme
    registration, and print page-range / copies / printer settings,
    plus pumpUntilDone re-entrancy doc + LSMinimumSystemVersion bump
-   to 11.0). Remaining P3 backlog is Windows + Linux backfill
+   to 11.0. Remaining P3 backlog is Windows + Linux backfill
    (file-watch, hotkeys, clipboard HTML, URL-scheme registration,
-   print extras), GTK4 backend, full a11y provider, auto-updater
-   apply (Sparkle / Squirrel / AppImageUpdate — needs signing
-   infra), WinRT Toast, and `UNUserNotificationCenter` migration on
+   print extras, update-apply), GTK4 backend, full a11y provider,
+   WinRT Toast, notarization automation (documented manual
+   sequence today), and `UNUserNotificationCenter` migration on
    macOS (deferred — needs entitlements).
 4. **Hard constraint: do not modify `src/verve.zig`.** Public web
    surface stays unchanged. Anything desktop-specific goes in
@@ -963,10 +967,12 @@ now a Level-3 golden-diff harness:
   publish their own labels through the WebView engines + native
   menu APIs.
 - Auto-updater apply phase — `desktop.updates.checkForUpdate`
-  shipped 2026-05-26. Actually downloading + verifying signatures +
-  swapping the running executable remains per-platform polish
-  (Sparkle on macOS, Squirrel or MSIX on Windows, AppImageUpdate
-  on Linux).
+  shipped 2026-05-26; macOS `applyUpdate` shipped 2026-05-29 (pure
+  stdlib: SHA-256 verify + `/usr/bin/tar` extract + same-volume
+  rename swap + `open -n` relaunch; requires running inside an
+  `.app` bundle, returns `error.NotBundled` for bare binaries).
+  Win + Linux apply remains platform-updater territory (Squirrel /
+  MSIX / AppImageUpdate).
 
 ### Out of P1 scope — shipped 2026-05-24
 
@@ -1118,6 +1124,50 @@ now a Level-3 golden-diff harness:
     returned `error.Backend` not in the declared `Error` set;
     swapped to `error.Unsupported`.
 
+### Out of P1 scope — shipped 2026-05-29 (macOS updater + signing)
+
+Closes the last two macOS-touching roadmap items for self-built
+apps. Pure-stdlib apply phase + opt-in hardened-runtime signing
+path. Notarization remains a documented manual sequence.
+
+- `desktop.updates.applyUpdate(allocator, io, info)` — macOS-only
+  apply phase. Algorithm: locate enclosing `.app` via
+  `_NSGetExecutablePath` walking up to the first `.app` ancestor;
+  download `info.download_url` into memory; SHA-256 over the bytes
+  and compare to `info.sha256` (case-insensitive lowercase hex);
+  stage `.{name}.app.verve-update/` next to the target so the
+  rename stays on a single volume; extract via `/usr/bin/tar -xzf`;
+  two-step rename swap (current → `.old`, new → current, restore
+  on failure); `open -n <bundle>` then `std.process.exit(0)`.
+  Win + Linux return `error.Unsupported`. Bare-binary callers
+  (running `./zig-out/bin/app`) get `error.NotBundled`. New
+  `ApplyError` set: `Unsupported, Network, BadChecksum, NotBundled,
+  ExtractFailed, SwapFailed, RelaunchFailed, MissingChecksum,
+  OutOfMemory`.
+- `UpdateInfo.sha256` — new required field on the feed schema.
+  `checkForUpdate` tolerates absence (defaults to ""); `applyUpdate`
+  returns `MissingChecksum` when the digest isn't 64 hex chars.
+- `-Dhardened=true` build option — opt-in hardened runtime +
+  entitlements path on `templates/desktop/build.zig`. Generates a
+  scaffold-local `.entitlements` plist with the three keys WKWebView
+  needs (allow-jit, allow-unsigned-executable-memory,
+  disable-library-validation) and threads
+  `--options=runtime --entitlements <generated>` into the existing
+  codesign step. Default (`hardened=false`) is byte-for-byte
+  identical to today's signing path.
+- Template README — new "Auto-update" + "Distributing to other
+  Macs" sections. Distribution sequence (Developer ID cert →
+  hardened build → notarytool submit → stapler staple) documented
+  as manual commands; framework deliberately does not automate
+  notarization because credential handling belongs in CI, not in
+  `build.zig`.
+
+macOS is now feature-complete for self-built personal-use apps.
+All P3 roadmap items that remain are either Windows/Linux backfill
+or entitlement-gated polish (WinRT Toast, GTK4, full a11y,
+UNUserNotificationCenter migration, Win/Linux update apply via
+platform updaters).
+
 ### Out of P1 scope — shipped 2026-05-28 (macOS sweep)
 
 Eleven items closing every macOS-only gap from the post-v0.1.6
@@ -1228,7 +1278,7 @@ signing infra.
 | **Print page-range / printer-selection (Win + Linux)** | Per-platform settings on top of `printWithOptions`. `ICoreWebView2PrintSettings` (Win), `GtkPrintSettings` (Linux). | macOS landed 2026-05-28 via NSPrintInfo dict; Win + Linux ignore extras today. ~3h. |
 | **WinRT Toast** | `Windows.UI.Notifications.ToastNotificationManager` via COM + AUMID + Start-menu shortcut | Polish vs current `Shell_NotifyIconW(NIF_INFO)` balloon. Richer styling + Action Center grouping. ~4h, needs Windows host. |
 | **Full a11y provider** | NSAccessibility / UIA / ATK roles + states beyond labels | Polish vs current `setAccessibilityLabel`. Web content + menus already self-publish; remaining gap is window-chrome semantics. ~3h. |
-| **Auto-updater apply** | Sparkle (macOS) / Squirrel or MSIX (Win) / AppImageUpdate (Linux) | `desktop.updates.checkForUpdate` shipped; apply phase needs signing + delta channels + per-platform updater integration. ~5h+ + signing infra. |
+| **Auto-updater apply (Win + Linux)** | Squirrel or MSIX (Win) / AppImageUpdate (Linux) | macOS apply shipped 2026-05-29 (pure-Zig download + SHA-256 verify + rename swap + `open -n` relaunch). Win + Linux apply still platform-updater territory. ~5h+ + signing infra. |
 | **`UNUserNotificationCenter` migration (macOS)** | Current `notifications.show` uses deprecated NSUserNotification. UN center needs entitlements + permission prompt + bundled app. | ~2-3h + entitlement setup. Apple still ships NSUserNotification; not urgent. |
 
 ### Uncovered gaps (not in roadmap before)
@@ -1254,8 +1304,11 @@ signing infra.
 
 ### Suggested next-session bundle picks
 
-macOS is feature-complete as of v0.1.8. Remaining work is Windows
-and Linux backfill + the entitlement-gated items.
+macOS is feature-complete for self-built apps as of v0.1.9 (the
+2026-05-29 updater + signing close-out built on the 2026-05-28
+sweep). Remaining work is Windows and Linux backfill + the
+entitlement-gated items + notarization automation if a CI flow
+wants to bundle that.
 
 By scope:
 - **Small (~1-2h)**: Linux libayatana weak-symbol fix; Win/Linux
@@ -1272,7 +1325,10 @@ Pick by user-facing impact:
   image formats.
 - **Apps using global hotkeys on Win/Linux**: hotkeys backfill.
 - **Apps watching config dirs on Win/Linux**: file-watch backfill.
-- **Apps shipping their own updater**: auto-updater apply.
+- **Apps shipping to other Macs via App Store / outside Gatekeeper
+  warnings**: notarization automation (Developer ID cert + hardened
+  build already wired; CI script needed for `xcrun notarytool` +
+  `stapler`).
 
 Pick by platform completeness:
 - **WinRT Toast** — closes the Windows notifications polish gap.
