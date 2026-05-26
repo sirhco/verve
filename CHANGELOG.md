@@ -6,6 +6,38 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-05-26
+
+Three small post-`v0.1.5` additions. Power state, file-reveal,
+uptime.
+
+### Added — Power / battery state (2026-05-26)
+
+- New `desktop.power` module: `batteryPercent() ?u32` +
+  `isCharging() bool`. Windows: `GetSystemPowerStatus`
+  (kernel32) reads `BatteryLifePercent` + `ACLineStatus`.
+  Linux: posix open + read on
+  `/sys/class/power_supply/BAT[0-9]/capacity` + `/status`
+  (iterates BAT0..BAT9). macOS returns null / false — IOKit
+  integration deferred until scaffold links the IOKit framework.
+
+### Added — shell.showInFolder (2026-05-26)
+
+- New `desktop.shell.showInFolder(allocator, path) Error!void`
+  pairs with `openUrl`. Reveals a file in the OS file manager.
+  macOS: `[NSWorkspace selectFile:inFileViewerRootedAtPath:]`
+  (Finder pre-selects). Windows: `ShellExecuteW(NULL, "open",
+  "explorer.exe", "/select,\"<path>\"", ...)` (Explorer
+  pre-selects). Linux: `xdg-open <parent_dir>` — freedesktop
+  has no portable "open + select" verb across file managers.
+
+### Added — System uptime (2026-05-26)
+
+- `desktop.system.uptime() u64` returns seconds since boot.
+  macOS: `sysctlbyname("kern.boottime")` + `time` delta.
+  Windows: `GetTickCount64() / 1000`. Linux: parses the
+  integer portion of the first float in `/proc/uptime`.
+
 ## [0.1.5] - 2026-05-26
 
 Four small post-`v0.1.4` window + system additions.
