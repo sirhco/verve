@@ -1055,25 +1055,65 @@ now a Level-3 golden-diff harness:
   ships a 4-item tray menu (Show window / Notify / Quit) routed
   through `handlers.onTrayItem`.
 
-## Suggested next-session bundles
+## Remaining work + gaps (post-v0.1.6)
 
-All P1 + every P2 platform port closed. The high-value P3 items
-landed across 2026-05-24/25/26: clipboard, single-instance, color
-scheme + change events, app icons, native menu bars (all 3),
-deep-link URL handlers (warm + cold, all 3), tray icons (all 3),
-notifications (macOS + Linux), tray click handlers + submenus (all
-3). Remaining work is the lower-frequency P3 surface:
+All P1 + every P2 platform port closed. Core desktop framework
+essentially done — what's left below is polish for niche
+features, large refactors (GTK4), or fixes for known sharp
+edges in shipped code.
 
-| Bundle | Items | Best for |
+### Open P3 — polish for existing features
+
+| Bundle | What | Status / scope |
 |---|---|---|
-| **P3 GTK4** | GTK4 + WebKitGTK 6.0 behind `-Dgtk4` | Future-proofing once Ubuntu LTS / Fedora ship GTK4 webkit by default. New backend module; existing GTK3 path stays. |
-| **P3 drag-drop / print** | `NSDraggingDestination` / `IDropTarget` / GTK drag signals; `NSPrintOperation` / `PrintDlgExW` / `gtk_print_operation_run` | Drag-drop with native file paths (browser DataTransfer doesn't expose them). |
-| **P3 Win Toast** | `Windows.UI.Notifications.ToastNotificationManager` via COM + AUMID + Start-menu shortcut | Closes the Windows side of the notifications API. |
-| **P3 a11y** | NSAccessibility / UIA / ATK | Window-chrome + menu accessibility — web content already inherits from WebView. |
-| **P3 auto-updater** | Sparkle on macOS / Squirrel or MSIX on Windows / AppImage update on Linux | Multi-platform signing + delta channels. |
+| **GTK4 backend** | Parallel GTK4 + WebKitGTK 6.0 module behind `-Dgtk4`; existing GTK3 path stays | Largest remaining item (~5h). New backend module. Future-proofs Linux once Ubuntu LTS / Fedora ship GTK4 webkit by default. |
+| **Native print APIs** | `NSPrintOperation` (macOS) / `ICoreWebView2_16::ShowPrintUI` (Win) / `webkit_print_operation_run_dialog` (Linux) | Polish vs current `Window.print()` (`window.print()` JS delegate). Adds silent print + page-range / printer selection. ~3h. |
+| **WinRT Toast** | `Windows.UI.Notifications.ToastNotificationManager` via COM + AUMID + Start-menu shortcut | Polish vs current `Shell_NotifyIconW(NIF_INFO)` balloon. Richer styling + Action Center grouping. ~4h, needs Windows host for live validation. |
+| **Full a11y provider** | NSAccessibility / UIA / ATK roles + states beyond labels | Polish vs current `setAccessibilityLabel`. Web content + menus already self-publish; remaining gap is window-chrome semantics. ~3h. |
+| **Auto-updater apply** | Sparkle (macOS) / Squirrel or MSIX (Win) / AppImageUpdate (Linux) | `desktop.updates.checkForUpdate` shipped; apply phase needs signing + delta channels + per-platform updater integration. ~5h+ + signing infrastructure. |
+| **Custom tray icons on macOS template** | macOS template demo doesn't bundle a tray icon | `setIcon` API shipped; scaffold demo skipped to avoid bloating the template. Cosmetic. |
 
-Pick one. Each remaining bundle is ~2–4 hours focused work plus
-testing.
+### Uncovered gaps (not in roadmap before)
+
+| Gap | What | Estimated scope |
+|---|---|---|
+| **Clipboard rich formats** | HTML / image / RTF beyond text. Current `Clipboard` is text-only. | ~3h. macOS `NSPasteboardTypeHTML`; Win `CF_HTML` (gnarly header format); Linux GtkClipboard `text/html` target. |
+| **Network online/offline** | `desktop.network.isOnline()` + reachability change events | ~2h. macOS `SCNetworkReachability` (needs SystemConfiguration framework); Win `InternetGetConnectedState`; Linux probe `getifaddrs` for non-loopback. |
+| **File-watch / fs notifications** | Watch a path for changes; fire callback on create/modify/delete | ~3h. macOS FSEvents; Win ReadDirectoryChangesW; Linux inotify. Useful for "auto-reload config" patterns. |
+| **Global hotkeys** | System-wide keyboard shortcut registration (active even when app blurred) | ~3h. macOS `RegisterEventHotKey` (Carbon, still works); Win `RegisterHotKey`; Linux X11 `XGrabKey` / Wayland portal. |
+| **macOS battery state** | `desktop.power` returns null on macOS today | ~2h. IOKit `IOPSCopyPowerSourcesInfo` + `IOPSCopyPowerSourcesList`. Needs `linkFramework("IOKit")` in scaffold. |
+| **Custom URL scheme runtime registration** | Win + Linux runtime registration (macOS is build-time via Info.plist) | ~2h. Win: `HKCU\Software\Classes\<scheme>` registry tree. Linux: write `~/.local/share/applications/<name>.desktop` with `MimeType=x-scheme-handler/<scheme>;` + `xdg-mime default ...`. |
+| **Spawn child process helper** | Thin wrapper over `std.process.Child.run` with desktop-friendly defaults (background, no terminal) | ~1h. Mostly stdlib reshape. Low priority since stdlib covers the core case. |
+
+### Known sharp edges in shipped code
+
+| File / area | Issue | Severity |
+|---|---|---|
+| `templates/desktop/tools/webview2.pinned.txt` | SHA-512 still blank — first CI run needs to populate after verifying the published value | Low (auto-vendor still works; integrity check skipped). |
+| Linux backend overall | Never run live on a real Linux host — diagnostic logs instrumented but no end-to-end validation | Medium. Cookies / multi-window / scheme handler / drag-drop / tray menu all unverified live. |
+| `src/desktop/windows.zig` vtable slot indexes | Hand-extracted from public MS docs (not generated from SDK headers) | Medium. First live Windows boot should verify against actual `webview2.h` slots. The newer cookie / zoom / nav-query slots are particularly load-bearing. |
+| `src/desktop/macos.zig` `pumpUntilDone` | Nested `[NSRunLoop runMode:beforeDate:]` re-entrant in modal contexts | Low. Safe from IPC handlers (the dominant call site); risky if a caller is already inside another modal run loop. |
+| Linux `libayatana-appindicator3` + `libnotify` | Linked unconditionally — distros without them fail at link time even for scaffolds that don't call the modules | Low-medium. Moving externs behind weak symbols / `dlopen` would let those distros build. |
+| `desktop.tray` single-tray-per-process v1 | `g_macos_tray` + `g_windows_tray` are unguarded singletons | Low. Multi-tray apps would need per-target ivars on macOS + HWND-keyed registry on Windows. No current use case. |
+| `notifications.show` on Windows | Requires `desktop.tray.init` first; without an active tray, returns `error.Backend` | Documented limitation, not a bug. WinRT Toast bundle (above) decouples them. |
+
+### Suggested next-session bundle picks
+
+By scope:
+- **Small (~1-2h)**: Clipboard HTML; macOS battery via IOKit; Linux libayatana weak-symbol fix.
+- **Medium (~3h)**: Network online; file-watch; native print APIs; full a11y provider; URL scheme runtime registration.
+- **Large (~5h+)**: GTK4 backend; auto-updater apply; WinRT Toast.
+
+Pick by user-facing impact:
+- **Apps that need rich clipboard**: clipboard HTML / image formats.
+- **Apps that need keyboard shortcuts globally**: hotkeys.
+- **Apps watching config dirs**: file-watch.
+- **Apps shipping their own updater**: auto-updater apply (or just use OS-provided like the Mac App Store).
+
+Pick by platform completeness:
+- **macOS battery** — closes the only known per-platform gap in `desktop.power`.
+- **WinRT Toast** — closes the polish gap on Windows notifications.
+- **GTK4** — closes the long-term Linux story.
 
 ## Verification commands for fresh sessions
 
