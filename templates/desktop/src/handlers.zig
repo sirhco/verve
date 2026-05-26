@@ -22,8 +22,13 @@ const RouterCtx = struct {
     /// set, then terminates the app.
     smoke_dir: ?[]const u8 = null,
     /// std.Io handle plumbed from main, used by handlers that touch
-    /// the filesystem (smoke_done writes checksum.txt via it).
+    /// the filesystem (smoke_done writes checksum.txt via it) or
+    /// open network sockets (fetch_url).
     io: std.Io,
+    /// Process environment block plumbed from main. Required by
+    /// `desktop.system.locale` + `desktop.paths.*` which read XDG /
+    /// HOME / LANG variables.
+    environ: std.process.Environ,
 };
 
 var ctx: RouterCtx = undefined;
@@ -81,8 +86,8 @@ pub fn onUrlOpen(c: ?*anyopaque, url: []const u8) void {
     r.window.evalJs(buf.items);
 }
 
-pub fn attach(window: *desktop.Window, assets: []const desktop.AssetEntry, smoke_dir: ?[]const u8, io: std.Io) *RouterCtx {
-    ctx = .{ .window = window, .assets = assets, .smoke_dir = smoke_dir, .io = io };
+pub fn attach(window: *desktop.Window, assets: []const desktop.AssetEntry, smoke_dir: ?[]const u8, io: std.Io, environ: std.process.Environ) *RouterCtx {
+    ctx = .{ .window = window, .assets = assets, .smoke_dir = smoke_dir, .io = io, .environ = environ };
     return &ctx;
 }
 
@@ -172,6 +177,188 @@ const Routes = struct {
         pub fn handle(c: *RouterCtx, _: std.mem.Allocator, _: Args) !Reply {
             try c.window.cookies().clear();
             return .{ .ok = true };
+        }
+    };
+
+    /// System / runtime info. Wraps the per-platform `desktop.system`
+    /// readouts so the UI can render them as a `dl.kv` table. All
+    /// fields best-effort: failures collapse to defaults rather than
+    /// failing the whole route.
+    pub const system_info = struct {
+        pub const Args = struct {};
+        pub const Reply = struct {
+            os_version: []const u8 = "",
+            locale: []const u8 = "",
+            cpu_count: usize = 0,
+            total_memory_bytes: u64 = 0,
+            uptime_seconds: u64 = 0,
+        };
+        pub fn handle(c: *RouterCtx, alloc: std.mem.Allocator, _: Args) !Reply {
+            const osv = desktop.system.osVersion(alloc) catch try alloc.dupe(u8, "unknown");
+            const loc = desktop.system.locale(alloc, c.environ) catch try alloc.dupe(u8, "unknown");
+            return .{
+                .os_version = osv,
+                .locale = loc,
+                .cpu_count = desktop.system.cpuCount(),
+                .total_memory_bytes = desktop.system.totalMemory(),
+                .uptime_seconds = desktop.system.uptime(),
+            };
+        }
+    };
+
+    /// Disk space at the user's home directory.
+    pub const disk_space = struct {
+        pub const Args = struct {};
+        pub const Reply = struct {
+            ok: bool,
+            path: []const u8 = "",
+            total_bytes: u64 = 0,
+            available_bytes: u64 = 0,
+        };
+        pub fn handle(c: *RouterCtx, alloc: std.mem.Allocator, _: Args) !Reply {
+            const home = desktop.paths.homeDir(alloc, c.environ) catch return .{ .ok = false };
+            const space = desktop.disk.spaceAt(alloc, home) catch return .{ .ok = false, .path = home };
+            return .{
+                .ok = true,
+                .path = home,
+                .total_bytes = space.total,
+                .available_bytes = space.available,
+            };
+        }
+    };
+
+    /// Native file-open dialog. Returns the chosen path + file size
+    /// in bytes. Cancellation maps to ok:false with status="cancelled".
+    pub const open_file = struct {
+        pub const Args = struct {};
+        pub const Reply = struct {
+            ok: bool,
+            status: []const u8 = "",
+            path: []const u8 = "",
+            size_bytes: u64 = 0,
+        };
+        pub fn handle(c: *RouterCtx, alloc: std.mem.Allocator, _: Args) !Reply {
+            const path = c.window.openFileDialog(alloc, .{
+                .title = "Pick any file",
+            }) catch |err| switch (err) {
+                error.Cancelled => return .{ .ok = false, .status = "cancelled" },
+                error.Unsupported => return .{ .ok = false, .status = "unsupported" },
+                else => return .{ .ok = false, .status = "backend_error" },
+            };
+            const st = std.Io.Dir.cwd().statFile(c.io, path, .{}) catch {
+                return .{ .ok = true, .status = "ok", .path = path, .size_bytes = 0 };
+            };
+            return .{ .ok = true, .status = "ok", .path = path, .size_bytes = st.size };
+        }
+    };
+
+    /// Window controls. `action` selects which Window method to fire.
+    /// Useful as a manual sanity check for the lifecycle methods.
+    pub const window_action = struct {
+        pub const Args = struct {
+            action: []const u8, // "minimize" | "maximize" | "restore" | "center" | "fullscreen_on" | "fullscreen_off"
+        };
+        pub const Reply = struct { ok: bool };
+        pub fn handle(c: *RouterCtx, _: std.mem.Allocator, args: Args) !Reply {
+            const w = c.window;
+            if (std.mem.eql(u8, args.action, "minimize")) w.minimize()
+            else if (std.mem.eql(u8, args.action, "maximize")) w.maximize()
+            else if (std.mem.eql(u8, args.action, "restore")) w.restore()
+            else if (std.mem.eql(u8, args.action, "center")) w.center()
+            else if (std.mem.eql(u8, args.action, "fullscreen_on")) w.setFullscreen(true)
+            else if (std.mem.eql(u8, args.action, "fullscreen_off")) w.setFullscreen(false)
+            else return .{ .ok = false };
+            return .{ .ok = true };
+        }
+    };
+
+    /// HTTP fetch demo. Hits the GitHub public REST API for the Zig
+    /// repo and surfaces a few headline fields. Demonstrates real
+    /// outbound HTTP from a Zig IPC handler with JSON parsing +
+    /// per-route error mapping. The dispatcher arena is the
+    /// allocator threaded in as `_alloc` — replies that reference
+    /// allocator-owned strings stay valid through the JSON-encode
+    /// step.
+    pub const fetch_url = struct {
+        pub const Args = struct {
+            /// Defaults to a known stable public endpoint. Override
+            /// from JS to exercise other GETs.
+            url: []const u8 = "https://api.github.com/repos/ziglang/zig",
+        };
+        pub const Reply = struct {
+            ok: bool,
+            status: []const u8 = "",
+            full_name: []const u8 = "",
+            description: []const u8 = "",
+            stars: u64 = 0,
+            forks: u64 = 0,
+        };
+        pub fn handle(c: *RouterCtx, alloc: std.mem.Allocator, args: Args) !Reply {
+            var client: std.http.Client = .{ .allocator = alloc, .io = c.io };
+            defer client.deinit();
+
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            defer aw.deinit();
+
+            const headers = [_]std.http.Header{
+                .{ .name = "User-Agent", .value = "verve-desktop-demo" },
+                .{ .name = "Accept", .value = "application/vnd.github+json" },
+            };
+
+            const result = client.fetch(.{
+                .location = .{ .url = args.url },
+                .method = .GET,
+                .extra_headers = &headers,
+                .response_writer = &aw.writer,
+            }) catch {
+                return .{ .ok = false, .status = "network_error" };
+            };
+            const code = @intFromEnum(result.status);
+            if (code < 200 or code >= 300) {
+                return .{ .ok = false, .status = "http_error" };
+            }
+
+            // GitHub returns ~30+ fields. Pull only the ones we render.
+            const Repo = struct {
+                full_name: []const u8 = "",
+                description: ?[]const u8 = null,
+                stargazers_count: u64 = 0,
+                forks_count: u64 = 0,
+            };
+            const parsed = std.json.parseFromSlice(Repo, alloc, aw.written(), .{
+                .ignore_unknown_fields = true,
+            }) catch {
+                return .{ .ok = false, .status = "parse_error" };
+            };
+            defer parsed.deinit();
+            return .{
+                .ok = true,
+                .status = "ok",
+                .full_name = try alloc.dupe(u8, parsed.value.full_name),
+                .description = try alloc.dupe(u8, parsed.value.description orelse ""),
+                .stars = parsed.value.stargazers_count,
+                .forks = parsed.value.forks_count,
+            };
+        }
+    };
+
+    pub const print_page = struct {
+        pub const Args = struct {
+            /// "default" | "browser" | "system"
+            kind: []const u8 = "default",
+        };
+        pub const Reply = struct { ok: bool, status: []const u8 };
+        pub fn handle(c: *RouterCtx, _: std.mem.Allocator, args: Args) !Reply {
+            const kind: desktop.PrintDialogKind =
+                if (std.mem.eql(u8, args.kind, "system")) .system
+                else if (std.mem.eql(u8, args.kind, "browser")) .browser
+                else .default;
+            c.window.printWithOptions(.{ .kind = kind }) catch |err| switch (err) {
+                error.Cancelled => return .{ .ok = false, .status = "cancelled" },
+                error.Unsupported => return .{ .ok = false, .status = "unsupported" },
+                else => return .{ .ok = false, .status = "backend_error" },
+            };
+            return .{ .ok = true, .status = "ok" };
         }
     };
 

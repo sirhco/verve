@@ -84,6 +84,58 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
                 ctx.p().text("Click the status-bar icon (right-click on Windows) for Show window, Notify, and Quit. Item clicks dispatch to handlers.onTrayItem in native code."),
             }),
             ctx.section().class("card").children(.{
+                ctx.h2("System info"),
+                ctx.p().text("Read-only OS / runtime fields from desktop.system + desktop.disk."),
+                ctx.div().class("row").children(.{
+                    ctx.button("Read").id("sysinfo-read"),
+                }),
+                ctx.div().id("sysinfo-result").class("result-panel").text(""),
+            }),
+            ctx.section().class("card").children(.{
+                ctx.h2("Disk space"),
+                ctx.p().text("desktop.disk.spaceAt(home) — POSIX statvfs / Win GetDiskFreeSpaceExW."),
+                ctx.div().class("row").children(.{
+                    ctx.button("Check home directory").id("disk-check"),
+                }),
+                ctx.div().id("disk-result").class("result-panel").text(""),
+            }),
+            ctx.section().class("card").children(.{
+                ctx.h2("File dialog"),
+                ctx.p().text("Native file-open panel (NSOpenPanel / IFileOpenDialog / GtkFileChooser). Cancel returns ok:false."),
+                ctx.div().class("row").children(.{
+                    ctx.button("Open file…").id("file-open"),
+                }),
+                ctx.div().id("file-result").class("result-panel").text(""),
+            }),
+            ctx.section().class("card").children(.{
+                ctx.h2("Window controls"),
+                ctx.p().text("Hits the cross-platform Window lifecycle methods."),
+                ctx.div().class("row").children(.{
+                    ctx.button("Minimize").id("win-min"),
+                    ctx.button("Maximize").id("win-max"),
+                    ctx.button("Restore").id("win-restore"),
+                    ctx.button("Center").id("win-center"),
+                    ctx.button("Fullscreen").id("win-fs-on"),
+                    ctx.button("Exit FS").id("win-fs-off"),
+                }),
+            }),
+            ctx.section().class("card").children(.{
+                ctx.h2("HTTP fetch"),
+                ctx.p().text("Hits the GitHub public API for the Zig repo via std.http.Client in a Zig IPC handler. JSON parsed server-side; only the headline fields cross the bridge."),
+                ctx.div().class("row").children(.{
+                    ctx.button("Fetch ziglang/zig").id("fetch-zig"),
+                }),
+                ctx.div().id("fetch-result").class("result-panel").text(""),
+            }),
+            ctx.section().class("card").children(.{
+                ctx.h2("Print"),
+                ctx.p().text("Native print dialog via NSPrintOperation (macOS), ICoreWebView2_16::ShowPrintUI (Windows), or webkit_print_operation_run_dialog (Linux). 'System' forces the OS dialog on Windows; default uses the browser preview."),
+                ctx.div().class("row").children(.{
+                    ctx.button("Print (default)").id("print-default"),
+                    ctx.button("Print (system)").id("print-system"),
+                }),
+            }),
+            ctx.section().class("card").children(.{
                 ctx.h2("Log"),
                 ctx.pre().id("log").text("bridge ready"),
             }),
@@ -134,5 +186,110 @@ const inline_js =
     \\
     \\document.getElementById('notify').addEventListener('click', () => {
     \\  call('notify', { title: 'Verve', body: 'Notification from the desktop demo.' });
+    \\});
+    \\
+    \\function bytes(n) {
+    \\  if (!n) return '0 B';
+    \\  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    \\  let i = 0;
+    \\  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    \\  return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+    \\}
+    \\function secs(n) {
+    \\  const d = Math.floor(n / 86400);
+    \\  const h = Math.floor((n % 86400) / 3600);
+    \\  const m = Math.floor((n % 3600) / 60);
+    \\  if (d) return d + 'd ' + h + 'h ' + m + 'm';
+    \\  if (h) return h + 'h ' + m + 'm';
+    \\  return m + 'm ' + (n % 60) + 's';
+    \\}
+    \\
+    \\document.getElementById('sysinfo-read').addEventListener('click', async () => {
+    \\  const out = document.getElementById('sysinfo-result');
+    \\  out.textContent = 'reading…';
+    \\  out.className = 'result-panel loading';
+    \\  try {
+    \\    const r = await window.verve.request({ type: 'system_info' });
+    \\    out.className = 'result-panel ok';
+    \\    out.innerHTML =
+    \\      '<dl class="kv">' +
+    \\      '<dt>OS</dt><dd>' + r.os_version + '</dd>' +
+    \\      '<dt>Locale</dt><dd>' + r.locale + '</dd>' +
+    \\      '<dt>CPUs</dt><dd>' + r.cpu_count + '</dd>' +
+    \\      '<dt>RAM</dt><dd>' + bytes(r.total_memory_bytes) + '</dd>' +
+    \\      '<dt>Uptime</dt><dd>' + secs(r.uptime_seconds) + '</dd>' +
+    \\      '</dl>';
+    \\  } catch (err) { out.textContent = '✗ ' + err.message; out.className = 'result-panel error'; }
+    \\});
+    \\
+    \\document.getElementById('disk-check').addEventListener('click', async () => {
+    \\  const out = document.getElementById('disk-result');
+    \\  out.textContent = 'reading…';
+    \\  out.className = 'result-panel loading';
+    \\  try {
+    \\    const r = await window.verve.request({ type: 'disk_space' });
+    \\    if (!r.ok) { out.textContent = '✗ unavailable'; out.className = 'result-panel error'; return; }
+    \\    out.className = 'result-panel ok';
+    \\    out.innerHTML =
+    \\      '<dl class="kv">' +
+    \\      '<dt>Path</dt><dd>' + r.path + '</dd>' +
+    \\      '<dt>Total</dt><dd>' + bytes(r.total_bytes) + '</dd>' +
+    \\      '<dt>Available</dt><dd>' + bytes(r.available_bytes) + '</dd>' +
+    \\      '</dl>';
+    \\  } catch (err) { out.textContent = '✗ ' + err.message; out.className = 'result-panel error'; }
+    \\});
+    \\
+    \\document.getElementById('file-open').addEventListener('click', async () => {
+    \\  const out = document.getElementById('file-result');
+    \\  out.textContent = 'opening…';
+    \\  out.className = 'result-panel loading';
+    \\  try {
+    \\    const r = await window.verve.request({ type: 'open_file' });
+    \\    if (!r.ok) { out.textContent = r.status; out.className = 'result-panel'; return; }
+    \\    out.className = 'result-panel ok';
+    \\    out.innerHTML =
+    \\      '<dl class="kv">' +
+    \\      '<dt>Path</dt><dd>' + r.path + '</dd>' +
+    \\      '<dt>Size</dt><dd>' + bytes(r.size_bytes) + '</dd>' +
+    \\      '</dl>';
+    \\  } catch (err) { out.textContent = '✗ ' + err.message; out.className = 'result-panel error'; }
+    \\});
+    \\
+    \\function winAction(a) { return () => call('window_action', { action: a }); }
+    \\document.getElementById('win-min').addEventListener('click', winAction('minimize'));
+    \\document.getElementById('win-max').addEventListener('click', winAction('maximize'));
+    \\document.getElementById('win-restore').addEventListener('click', winAction('restore'));
+    \\document.getElementById('win-center').addEventListener('click', winAction('center'));
+    \\document.getElementById('win-fs-on').addEventListener('click', winAction('fullscreen_on'));
+    \\document.getElementById('win-fs-off').addEventListener('click', winAction('fullscreen_off'));
+    \\
+    \\document.getElementById('fetch-zig').addEventListener('click', async () => {
+    \\  const out = document.getElementById('fetch-result');
+    \\  out.textContent = 'fetching…';
+    \\  out.className = 'result-panel loading';
+    \\  try {
+    \\    const r = await window.verve.request({ type: 'fetch_url' });
+    \\    if (!r.ok) {
+    \\      out.textContent = '✗ ' + r.status;
+    \\      out.className = 'result-panel error';
+    \\      return;
+    \\    }
+    \\    out.className = 'result-panel ok';
+    \\    out.innerHTML =
+    \\      '<strong>' + r.full_name + '</strong>' +
+    \\      '<div class="muted">' + (r.description || '(no description)') + '</div>' +
+    \\      '<div class="stats">★ ' + r.stars.toLocaleString() + ' · ⑂ ' + r.forks.toLocaleString() + '</div>';
+    \\  } catch (err) {
+    \\    out.textContent = '✗ ' + err.message;
+    \\    out.className = 'result-panel error';
+    \\  }
+    \\});
+    \\
+    \\document.getElementById('print-default').addEventListener('click', () => {
+    \\  call('print_page', { kind: 'default' });
+    \\});
+    \\
+    \\document.getElementById('print-system').addEventListener('click', () => {
+    \\  call('print_page', { kind: 'system' });
     \\});
 ;

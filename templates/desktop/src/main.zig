@@ -128,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer window.deinit();
 
-    const ctx_ptr = handlers.attach(&window, asset_entries, smoke_dir, io);
+    const ctx_ptr = handlers.attach(&window, asset_entries, smoke_dir, io, init.minimal.environ);
     window.setMessageHandler(handlers.onMessage, ctx_ptr);
     window.setUrlOpenHandler(handlers.onUrlOpen, ctx_ptr);
 
