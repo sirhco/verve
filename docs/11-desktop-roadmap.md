@@ -110,6 +110,10 @@ Shipped post-tag (will roll into a v0.1.1 / v0.2.0):
   f_frsize`. Windows: `GetDiskFreeSpaceExW(path, free_for_caller,
   total, total_free)`. Useful for capacity dashboards, pre-flight
   checks before large writes.
+- System uptime — `desktop.system.uptime() u64` returns seconds
+  since boot. macOS: `sysctlbyname("kern.boottime")` + `time(2)`
+  delta. Windows: `GetTickCount64() / 1000`. Linux: parses the
+  first float in `/proc/uptime`.
 - System resource info — `desktop.system.cpuCount() usize` (incl.
   hyperthreads, falls back to 1 on failure) +
   `desktop.system.totalMemory() u64` (physical RAM in bytes,

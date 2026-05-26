@@ -87,6 +87,55 @@ pub fn totalMemory() u64 {
     return std.process.totalSystemMemory() catch 0;
 }
 
+/// Seconds since the system booted. Returns 0 if the platform
+/// can't report it (sandbox blocks /proc/uptime, exotic target).
+pub fn uptime() u64 {
+    return switch (builtin.os.tag) {
+        .macos => uptimeMacos(),
+        .windows => uptimeWindows(),
+        .linux => uptimeLinux(),
+        else => 0,
+    };
+}
+
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+fn uptimeWindows() u64 {
+    if (builtin.os.tag != .windows) return 0;
+    return GetTickCount64() / 1000;
+}
+
+const Timeval = extern struct { tv_sec: c_long, tv_usec: c_long };
+extern fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
+
+fn uptimeMacos() u64 {
+    if (builtin.os.tag != .macos) return 0;
+    var boottime: Timeval = .{ .tv_sec = 0, .tv_usec = 0 };
+    var size: usize = @sizeOf(Timeval);
+    if (sysctlbyname("kern.boottime", &boottime, &size, null, 0) != 0) return 0;
+    // `time(NULL)` would be ideal but stdlib's clock APIs in 0.16
+    // changed shape; `std.time.timestamp` returns seconds since
+    // epoch as i64.
+    const now = std.time.timestamp();
+    if (now <= boottime.tv_sec) return 0;
+    return @intCast(now - @as(i64, boottime.tv_sec));
+}
+
+fn uptimeLinux() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    // /proc/uptime contains "<uptime_seconds> <idle_seconds>\n".
+    // We only want the first float, truncated to seconds.
+    const fd = std.posix.open("/proc/uptime", .{ .ACCMODE = .RDONLY }, 0) catch return 0;
+    defer std.posix.close(fd);
+    var buf: [64]u8 = undefined;
+    const n = std.posix.read(fd, &buf) catch return 0;
+    if (n == 0) return 0;
+    const space = std.mem.indexOfScalar(u8, buf[0..n], ' ') orelse return 0;
+    const seconds_str = buf[0..space];
+    const dot = std.mem.indexOfScalar(u8, seconds_str, '.') orelse seconds_str.len;
+    return std.fmt.parseInt(u64, seconds_str[0..dot], 10) catch 0;
+}
+
 extern "AppKit" fn NSBeep() void;
 extern "user32" fn MessageBeep(ty: c_uint) callconv(.winapi) c_int;
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) c_ulong;
