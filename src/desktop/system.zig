@@ -108,15 +108,17 @@ fn uptimeWindows() u64 {
 const Timeval = extern struct { tv_sec: c_long, tv_usec: c_long };
 extern fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
 
+extern "c" fn time(t: ?*c_long) c_long;
+
 fn uptimeMacos() u64 {
     if (builtin.os.tag != .macos) return 0;
     var boottime: Timeval = .{ .tv_sec = 0, .tv_usec = 0 };
     var size: usize = @sizeOf(Timeval);
     if (sysctlbyname("kern.boottime", &boottime, &size, null, 0) != 0) return 0;
-    // `time(NULL)` would be ideal but stdlib's clock APIs in 0.16
-    // changed shape; `std.time.timestamp` returns seconds since
-    // epoch as i64.
-    const now = std.time.timestamp();
+    // POSIX `time(NULL)` returns seconds since epoch. std.time has no
+    // timestamp() in Zig 0.16 and std.posix.clock_gettime isn't
+    // surfaced either, so go through libc directly.
+    const now: i64 = @intCast(time(null));
     if (now <= boottime.tv_sec) return 0;
     return @intCast(now - @as(i64, boottime.tv_sec));
 }
@@ -151,7 +153,7 @@ fn localeMacos(allocator: std.mem.Allocator) Error![]u8 {
     const NSLocale = m.getClass("NSLocale");
     const currentLocale = m.cast(*const fn (id, SEL) callconv(.c) id);
     const loc = currentLocale(@as(id, @ptrCast(NSLocale)), m.sel("currentLocale"));
-    if (@intFromPtr(loc) == 0) return error.Backend;
+    if (@intFromPtr(loc) == 0) return error.Unsupported;
     const identifier = m.cast(*const fn (id, SEL) callconv(.c) id);
     const ident = identifier(loc, m.sel("localeIdentifier"));
     return nsStringDupe(allocator, ident);
@@ -166,7 +168,7 @@ fn osVersionMacos(allocator: std.mem.Allocator) Error![]u8 {
     const NSProcessInfo = m.getClass("NSProcessInfo");
     const sharedSel = m.cast(*const fn (id, SEL) callconv(.c) id);
     const pi = sharedSel(@as(id, @ptrCast(NSProcessInfo)), m.sel("processInfo"));
-    if (@intFromPtr(pi) == 0) return error.Backend;
+    if (@intFromPtr(pi) == 0) return error.Unsupported;
     const verSel = m.cast(*const fn (id, SEL) callconv(.c) id);
     const ver = verSel(pi, m.sel("operatingSystemVersionString"));
     return nsStringDupe(allocator, ver);
