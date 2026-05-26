@@ -6,6 +6,81 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-05-29
+
+Closes the last two macOS-touching roadmap items for self-built
+apps: auto-updater apply phase + opt-in hardened runtime + signing
+docs. macOS is feature-complete for personal-use distribution as
+of this release. Notarization remains a documented manual sequence
+(framework deliberately does not automate it — credential handling
+belongs in CI, not `build.zig`).
+
+### Added
+
+- `desktop.updates.applyUpdate(allocator, io, info)` — macOS apply
+  phase. Pure stdlib, no Sparkle vendor. Algorithm: locate the
+  running `.app` via `_NSGetExecutablePath` walking up to the first
+  `.app` ancestor → download `info.download_url` into memory →
+  SHA-256 over the bytes, compare to `info.sha256` (lowercase hex,
+  case-insensitive) → stage `.{name}.app.verve-update/` next to the
+  target so the rename stays on a single volume → extract via
+  `/usr/bin/tar -xzf` → two-step rename swap (current → `.old`,
+  new → current, restore on failure) → `open -n <bundle>` then
+  `std.process.exit(0)`. Win + Linux return `error.Unsupported`
+  (Squirrel / MSIX / AppImageUpdate territory). Bare-binary callers
+  (`./zig-out/bin/app`) get `error.NotBundled`.
+- `UpdateInfo.sha256` — new required field on the feed schema.
+  `checkForUpdate` tolerates absence (defaults to ""); `applyUpdate`
+  returns `MissingChecksum` when the digest isn't 64 hex chars.
+  Feed schema gained `sha256` next to `version` / `download_url` /
+  `notes`. Trust anchor is the feed URL itself (HTTPS to
+  infrastructure you control); SHA-256 catches CDN corruption and
+  transport tampering but not a compromised feed host.
+- `ApplyError` set on `desktop.updates` — `Unsupported, Network,
+  BadChecksum, NotBundled, ExtractFailed, SwapFailed,
+  RelaunchFailed, MissingChecksum, OutOfMemory`.
+- `-Dhardened=true` scaffold build option — opt-in hardened
+  runtime + WKWebView entitlements on `templates/desktop/build.zig`.
+  Generates a scaffold-local `.entitlements` plist with the three
+  keys WKWebView needs under the hardened runtime
+  (`com.apple.security.cs.allow-jit`,
+  `...allow-unsigned-executable-memory`,
+  `...disable-library-validation`) and threads
+  `--options=runtime --entitlements <generated>` into the existing
+  codesign step via `addPrefixedFileArg`. Default (`hardened=false`)
+  is byte-for-byte identical to today's signing path.
+- Template README — new "Auto-update" section documenting the
+  feed shape + `checkForUpdate` → `applyUpdate` flow + v1 limits
+  (macOS-only, bundled-only). New "Distributing to other Macs"
+  section walking the Developer ID cert → hardened build →
+  `xcrun notarytool submit` → `xcrun stapler staple` sequence as
+  manual commands. `-Dhardened` added to both build-flag tables.
+
+### Changed
+
+- `desktop.updates` module header rewritten to describe the new
+  two-phase shape (check + apply). Trust model documented inline.
+- `parseUpdateFeed` accepts the new `sha256` field (optional in
+  feed JSON; defaults to "" when omitted so old feeds keep
+  parsing) and copies it into the returned `UpdateInfo`.
+
+### Verified
+
+- `zig build` + `zig build test` PASS (52 tests; 6 new unit tests
+  in `updates.zig` cover hex encoding, bundle resolution, missing-
+  checksum guard, sha256 parse).
+- 3-backend cross-compile (`aarch64-macos` / `x86_64-linux-gnu` /
+  `x86_64-windows-gnu`) clean for `updates.zig` + `window.zig`.
+- Fresh scaffold + `zig build smoke` PASS (checksum 1789 matches
+  golden).
+- Default codesign path (`zig build codesign -Dcodesign=-`) still
+  emits `Signature=adhoc` with `flags=0x2(adhoc)` — unchanged from
+  v0.1.8.
+- Hardened codesign path (`zig build codesign -Dcodesign=-
+  -Dhardened=true`) emits `flags=0x10002(adhoc,runtime)` with all
+  three WKWebView entitlement keys present in `--entitlements -`
+  dump.
+
 ## [0.1.8] - 2026-05-28
 
 Complete macOS surface sweep — eleven items closing every macOS-
