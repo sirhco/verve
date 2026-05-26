@@ -207,6 +207,8 @@ const window = try desktop.Window.init(allocator, .{
 | `saveFileDialog(alloc, opts)` | Modal save-as panel (macOS); stub elsewhere |
 | `showAlert(opts)` | Modal alert dialog (macOS); stub elsewhere |
 | `takeSnapshotPng(path)` | Render webview contents to PNG (macOS); stub elsewhere |
+| `print()` | Open the native print dialog (legacy no-error wrapper) |
+| `printWithOptions(opts)` | Native print dialog with cancel / unsupported / backend error reporting |
 
 ## Cookies
 
@@ -424,6 +426,34 @@ Registering the scheme with the OS is install-time:
 - **Linux** — install a `.desktop` file with
   `MimeType=x-scheme-handler/verve` and run
   `update-desktop-database ~/.local/share/applications`.
+
+## Print
+
+Native OS print dialog on all three backends.
+
+```zig
+// Legacy no-error wrapper. Swallows Cancelled / Unsupported / Backend.
+window.print();
+
+// Full surface with error reporting.
+try window.printWithOptions(.{ .kind = .system });
+```
+
+`PrintOptions.kind`:
+- `default` — backend's natural choice (macOS / Linux: native
+  dialog; Windows: WebView2 browser print preview).
+- `browser` — Windows only distinction (`PRINT_DIALOG_KIND_BROWSER`);
+  ignored on macOS / Linux.
+- `system` — OS print dialog. macOS = `NSPrintOperation`; Windows =
+  `ShowPrintUI(SYSTEM)`; Linux = `webkit_print_operation_run_dialog`.
+
+Errors: `Unsupported` | `Backend` | `Cancelled` | `OutOfMemory`.
+`Unsupported` on Windows means the Edge WebView2 runtime is older
+than version 111 (March 2023) — `QueryInterface` for
+`ICoreWebView2_16` returns `E_NOINTERFACE`.
+
+Page-range / printer-selection / silent print are future polish
+items; the v1 surface only carries the dialog-kind switch.
 
 ## Window snapshot (macOS)
 

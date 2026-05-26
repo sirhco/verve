@@ -13,7 +13,7 @@ compiled from your project. No Chromium bundled. No Electron.
 # 1. Build the framework + verve-cli
 zig build
 
-# 2. Scaffold a desktop project
+# 2. Scaffold a desktop project (demo-rich default)
 ./zig-out/bin/verve-cli new ~/code/my-app --desktop --name=my_app
 
 # 3. Build + run the new project
@@ -22,7 +22,24 @@ zig build run
 ```
 
 The first window opens with a demo page that exercises every wired
-feature (typed IPC, cookies, multi-window, WASM-hydrated counter).
+feature: typed IPC (`ping`), cookies, multi-window, WASM-hydrated
+counter, notifications, deep links (with a self-test Test button),
+tray menu, print, HTTP fetch, system info readout, disk space,
+file dialog, and window controls.
+
+### Minimal scaffold
+
+If you'd rather start from a single-window app with one IPC route
+and a static HTML page, pass `--template minimal`:
+
+```sh
+./zig-out/bin/verve-cli new ~/code/my-app --desktop --template minimal
+```
+
+The minimal tree has no SSR, no WASM, no smoke harness, no tray /
+notifications / multi-window wiring — just a window, a `greet`
+route, and a responsive HTML form. Add features back from the full
+scaffold one at a time as you need them.
 
 ## Layout the scaffolder writes
 
@@ -247,11 +264,18 @@ and macOS app-icon bundling shipped 2026-05-24. Native menu bars
 on Windows + Linux, deep-link URL handlers, Win/Linux warm-launch
 URL forwarding (`WM_COPYDATA` + abstract `AF_UNIX` socket), and
 tray icons + notifications (macOS + Linux real, Win tray real and
-notifications stubbed) all landed 2026-05-25. Remaining P3
-follow-ups: GTK4 + WebKitGTK 6.0 backend, drag-drop with native
-paths, print API, hicolor / Linux app-icon theme install,
-accessibility (NSAccessibility / UIA / ATK), auto-updater
-(Sparkle / Squirrel).
+notifications stubbed) all landed 2026-05-25. Tray click handlers +
+submenus, drag-drop with native paths, hicolor / Linux icon-theme
+install, basic accessibility labels, Win balloon notifications,
+print via `window.print()`, and `desktop.updates.checkForUpdate`
+shipped 2026-05-26. Native print dialog
+(`NSPrintOperation` / `ICoreWebView2_16::ShowPrintUI` /
+`webkit_print_operation_run_dialog`) + `--template minimal`
+scaffold variant shipped 2026-05-27. Remaining P3 follow-ups:
+GTK4 + WebKitGTK 6.0 backend, print page-range / printer-selection
+settings, full a11y provider (NSAccessibility / UIA / ATK roles +
+states), Win Toast notifications (`ToastNotificationManager`),
+auto-updater apply phase (Sparkle / Squirrel / AppImageUpdate).
 
 ## Constraints
 

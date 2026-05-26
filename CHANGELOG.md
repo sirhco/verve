@@ -6,6 +6,112 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Six post-`v0.1.6` bundles. Native print on all three backends, a new
+minimal scaffold variant, a beefed-up demo scaffold, and two
+framework bug fixes that surfaced once the demo scaffold exercised
+more of the surface live.
+
+### Added — Native print API (2026-05-27)
+
+- `Window.printWithOptions(opts: PrintOptions) PrintError!void` on
+  all three backends. Legacy `Window.print() void` preserved as a
+  thin wrapper (`printWithOptions(.{}) catch {}`) so existing
+  callers compile unchanged. New types in `options.zig`:
+  `PrintDialogKind = enum { default, browser, system }`,
+  `PrintOptions = struct { kind: PrintDialogKind = .default }`,
+  `PrintError = error { Unsupported, Backend, Cancelled, OutOfMemory }`.
+  macOS: `[NSPrintInfo sharedPrintInfo]` +
+  `[WKWebView printOperationWithPrintInfo:]` +
+  `[NSPrintOperation runOperation]`. `opts.kind` ignored (system
+  dialog is the only path). Windows:
+  `ICoreWebView2_16::ShowPrintUI` reached via QI from base `Wv2` to
+  new `Wv2_16` interface; `default | browser` →
+  `COREWEBVIEW2_PRINT_DIALOG_KIND_BROWSER`, `system` → `..._SYSTEM`.
+  Edge WebView2 runtimes older than version 111 (March 2023) answer
+  `E_NOINTERFACE` → `error.Unsupported`. `SLOT_WV2_16_ShowPrintUI =
+  104` is hand-extracted from `WebView2.h`. Linux:
+  `webkit_print_operation_new` + `webkit_print_operation_run_dialog`
+  + `g_object_unref`; `WEBKIT_PRINT_OPERATION_RESPONSE_CANCEL` →
+  `error.Cancelled`.
+
+### Added — `--template minimal` scaffold variant (2026-05-27)
+
+- `verve-cli new <dir> --desktop --template minimal` emits a
+  single-window app with one IPC route and a static HTML page.
+  Intended as a clean starting point for downstream apps that want
+  to opt in to features one at a time instead of pruning the
+  demo-rich scaffold. The minimal template ships:
+  `build.zig` (stripped — no SSR / WASM / dev / smoke / bundle steps),
+  `src/main.zig` (~30 lines), `src/handlers.zig` (one `greet` route
+  formatting `Hello, <name>!`), `frontend/index.html` (form + input
+  + button + greeting), responsive `style.css` (clamp + max-width
+  28rem + dark-mode + focus rings), and the `tools/fetch_webview2.*`
+  scripts (Windows prereq). `verve-cli` gained a `DesktopTemplate {
+  full, minimal }` enum + `--template <name>` flag; `--template`
+  with `--web` warns. The full (demo-rich) template is the default.
+
+### Added — Desktop scaffold demo enhancements (2026-05-27)
+
+- The full demo scaffold (`templates/desktop/`) grew six new IPC
+  routes + matching feature cards, all wired through the existing
+  Router + `dl.kv` markup pattern:
+  - `fetch_url` — real outbound HTTP via `std.http.Client` (with
+    User-Agent + Accept headers) hitting `api.github.com/repos/
+    ziglang/zig`, JSON parsed server-side with `ignore_unknown_fields`,
+    returns full_name / description / stars / forks. Network / HTTP /
+    parse failures map to explicit status strings.
+  - `system_info` — `osVersion` + `locale` + `cpuCount` +
+    `totalMemory` + `uptime` via `desktop.system`. Best-effort:
+    per-field failures collapse to defaults.
+  - `disk_space` — `desktop.disk.spaceAt(homeDir)` — total +
+    available bytes.
+  - `open_file` — native NSOpenPanel / IFileOpenDialog /
+    GtkFileChooser via `window.openFileDialog`, plus `statFile` for
+    size. Cancelled → `status="cancelled"`.
+  - `window_action` — switch on action string → `minimize` /
+    `maximize` / `restore` / `center` / `setFullscreen(true|false)`.
+  - `deep_link_test` — fires `Window.deliverUrl` with a synthetic
+    `verve://app/demo` URL so the deep-link card round-trip can be
+    exercised from inside the app (no need to leave + `open
+    verve://...` from a terminal).
+- `RouterCtx` gained `environ: std.process.Environ` (threaded from
+  `init.minimal.environ`) so system + paths handlers can read XDG /
+  HOME / LANG.
+- `frontend/style.css` rewritten responsive: CSS grid
+  `repeat(auto-fit, minmax(320px, 1fr))` replaces the fixed-width
+  card stack; cards reflow into 1/2/3/4 columns. Fluid `clamp()`
+  typography + padding + `max-width: 1280px` container. Mobile
+  breakpoint at 600px collapses `.row` to vertical with full-width
+  buttons. New themed `.result-panel` + `.result-panel.{loading,
+  ok, error}` patterns; new `dl.kv` markup for key/value readouts.
+  Log card spans the full row at every width via
+  `main > section:last-child { grid-column: 1 / -1 }`.
+
+### Fixed — `desktop.disk` integer overflow on macOS (2026-05-27)
+
+- `src/desktop/disk.zig`'s `StatvfsPosix` extern struct declared
+  every block-count field as `c_ulong` (64-bit on both LP64
+  targets). On macOS, `fsblkcnt_t` is actually `unsigned int` (32
+  bits), so `f_blocks` read picked up the high half of `f_bfree`
+  as garbage — multiplying by `f_frsize` panicked with `integer
+  overflow` the first time a scaffold IPC handler called
+  `desktop.disk.spaceAt` on a real volume. Fix: alias
+  `fsblkcnt_t = if (macos) c_uint else c_ulong` and use it for the
+  three block-count + three file-count fields. No public API
+  change.
+
+### Fixed — `desktop.system` Zig 0.16 + Error set (2026-05-27)
+
+- `system.zig` `uptimeMacos` called `std.time.timestamp()` — not a
+  member of `std.time` in Zig 0.16. Replaced with libc `time(null)`
+  extern.
+- `system.zig` `localeMacos` + `osVersionMacos` returned
+  `error.Backend` but the declared `Error` set is
+  `{ Unsupported, OutOfMemory, NotFound }`. Swapped to
+  `error.Unsupported` (closest in-set match). Both bugs were
+  latent because no framework caller exercised the paths before
+  the v0.1.7 scaffold demo wired them through.
+
 ## [0.1.6] - 2026-05-26
 
 Three small post-`v0.1.5` additions. Power state, file-reveal,

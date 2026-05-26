@@ -1073,6 +1073,46 @@ now a Level-3 golden-diff harness:
     expected reply); Win/Linux compile-clean cross-compile (live
     validation deferred per project convention).
 
+- `--template minimal` scaffold variant —
+  `verve-cli new <dir> --desktop --template minimal` emits a
+  single-window app with one IPC route (`greet` → `Hello, <name>!`)
+  and a static HTML page. Intended as a clean starting point.
+  `templates/desktop-minimal/` carries a stripped `build.zig` (no
+  SSR / WASM / dev / smoke / bundle steps), simple `main.zig`,
+  responsive `style.css` (clamp + max-width 28rem + dark-mode),
+  and the `tools/fetch_webview2.*` scripts (Win build prereq).
+  `verve-cli` gained `DesktopTemplate { full, minimal }` + the
+  `--template <name>` flag; `--template` with `--web` warns. Plumbed
+  via new `buildCliSkeletonDesktopMinimal()` in root `build.zig`
+  mirroring the existing full version.
+
+- Demo scaffold beefed up — `templates/desktop/` grew six new IPC
+  routes + matching feature cards (`fetch_url` via
+  `std.http.Client`, `system_info`, `disk_space`, `open_file`,
+  `window_action`, `deep_link_test`) and a responsive CSS rewrite
+  (CSS grid `repeat(auto-fit, minmax(320px, 1fr))`, fluid
+  `clamp()` typography + padding, mobile breakpoint at 600px,
+  themed `.result-panel` + `dl.kv` markup, log card spans full
+  row). `RouterCtx` gained `environ: std.process.Environ`
+  threaded from `init.minimal.environ` so the system + paths
+  handlers can read XDG / HOME / LANG. Smoke golden checksum
+  bumped 605 → 1474 → 1789 across the print + demo + deep-link
+  Test button additions.
+
+- Pre-existing framework bugs caught + fixed (latent before the
+  demo scaffold exercised these paths live):
+  - `desktop.disk` integer overflow on macOS — `StatvfsPosix`
+    extern struct used `c_ulong` for `f_blocks` / `f_bfree` /
+    `f_bavail`, but macOS `fsblkcnt_t` is `unsigned int` (32-bit);
+    `f_blocks` read picked up the high half of `f_bfree` as
+    garbage, multiplying by `f_frsize` panicked. Fix: alias
+    `fsblkcnt_t = if (macos) c_uint else c_ulong`.
+  - `desktop.system` `uptimeMacos` called `std.time.timestamp()`
+    which doesn't exist in Zig 0.16. Replaced with libc
+    `time(null)` extern. `localeMacos` + `osVersionMacos`
+    returned `error.Backend` not in the declared `Error` set;
+    swapped to `error.Unsupported`.
+
 ### Out of P1 scope — shipped 2026-05-26
 
 - Tray click handlers + submenus — `TrayMenuItem { label, id,

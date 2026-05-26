@@ -14,13 +14,34 @@ zig build              # in the Verve repo
 ## Usage
 
 ```sh
-verve-cli new <target-dir> [--name <pkg-name>]
+verve-cli new <target-dir> [--name <pkg-name>] [--web | --desktop]
+                          [--template full | minimal]
+                          [--release <tag> [--release-hash <h>]]
+                          [--verve-path <abs>]
 ```
 
 - `<target-dir>` — must not exist or must be empty. The scaffolder
   refuses to write over existing files.
 - `--name NAME` — Zig identifier (a-z, A-Z, 0-9, `_`; no leading
   digit). Defaults to the basename of the target directory.
+- `--web` / `--desktop` — pick a scaffold mode. Default `--web`
+  (full-stack HTTP server + WASM client). `--desktop` produces a
+  native desktop app embedding the OS standard webview (WKWebView /
+  WebView2 / WebKitGTK) via the platform layer at `src/desktop/`.
+- `--template NAME` — desktop scaffold variant. Default `full`
+  emits a demo-rich starter (typed IPC, cookies, multi-window,
+  WASM hydration, tray, notifications, deep links, print, smoke
+  harness, HTTP fetch, system info / disk / file dialog / window
+  controls). `--template minimal` emits a single-window app with
+  one IPC route and a static HTML page — clean starting point.
+  No-op when `--web` is selected.
+- `--release TAG` / `--release-hash HASH` — desktop only. Emit a
+  `.url + .hash` GitHub-archive dep in the scaffolded `build.zig.zon`
+  instead of the default local path-dep. Omit `--release-hash` to
+  ship a placeholder + instructions for `zig fetch --save <url>`.
+- `--verve-path PATH` — desktop only. Absolute path to the Verve
+  checkout used as the `.verve` dependency. Defaults to the build
+  root baked into this CLI binary.
 
 ```sh
 ./zig-out/bin/verve-cli new ~/code/my-app
