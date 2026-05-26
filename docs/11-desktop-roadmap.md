@@ -1124,6 +1124,56 @@ now a Level-3 golden-diff harness:
     returned `error.Backend` not in the declared `Error` set;
     swapped to `error.Unsupported`.
 
+### Out of P1 scope — shipped 2026-05-30 (Bundle 8 — print extras Linux full / Win advisory)
+
+Eighth and final entry in the Win/Linux backfill plan.
+
+- **Linux** (`linux.zig` `printWithOptions`):
+  - `gtk_print_settings_new` returns a fresh GtkPrintSettings.
+  - `gtk_print_settings_set_n_copies(settings, opts.copies)` —
+    when copies > 1.
+  - When `opts.pages` is set: translate the 1-indexed `PageRange`
+    to GTK's 0-indexed `GtkPageRange { start, end }`. The
+    `to == 0` "all remaining" sentinel becomes `maxInt(c_int)` —
+    we don't have the page count at this layer to expand it.
+    Set `gtk_print_settings_set_print_pages(settings,
+    GTK_PRINT_PAGES_RANGES = 2)` so the dialog respects the
+    range instead of defaulting to "print all".
+  - `gtk_print_settings_set_printer(settings, name_z)` —
+    pre-selects the printer by user-visible name.
+  - `webkit_print_operation_set_print_settings(op, settings)`
+    before `webkit_print_operation_run_dialog`. Settings
+    pre-fill the dialog; user can override before clicking
+    Print.
+- **Windows** (`windows.zig` `printWithOptions`):
+  - `ShowPrintUI(kind)` doesn't accept a PrintSettings struct.
+    The framework logs a warning when caller sets `copies > 1`
+    / `pages != null` / `printer_name != null` so the behavior
+    gap is visible. Otherwise proceeds with the existing
+    ShowPrintUI call.
+  - Full silent-print integration via
+    `ICoreWebView2_16::Print(printSettings, completionHandler)`
+    + `ICoreWebView2Environment6::CreatePrintSettings` + a
+    `ICoreWebView2PrintCompletedHandler` COM impostor is a
+    future bundle. Defer until a Windows host can verify the
+    vtable slot indexes against actual SDK headers — every Win
+    slot in the framework today is hand-extracted and
+    unvalidated live.
+- **PrintOptions docstring** (`options.zig`) updated to spell
+  out the per-platform contract: macOS + Linux honor every
+  field; Windows extras are advisory.
+
+New Linux externs in `linux.zig`: `webkit_print_operation_set_print_settings`,
+`gtk_print_settings_new`, `gtk_print_settings_set_n_copies`,
+`gtk_print_settings_set_page_ranges`,
+`gtk_print_settings_set_print_pages`,
+`gtk_print_settings_set_printer`. All gtk+-3.0 / webkit2gtk-4.1
+symbols — already in the link line.
+
+Verified: framework `zig build test` (205 pass); 3-backend
+cross-compile clean for `windows.zig` + `linux.zig`;
+fresh-scaffold `zig build smoke` PASS (checksum 1789 unchanged).
+
 ### Out of P1 scope — shipped 2026-05-30 (Bundles 6 + 7 — global hotkeys Win + Linux)
 
 Bundles 6 + 7 closed together in a single commit (same module +
@@ -1530,7 +1580,7 @@ signing infra.
 | Bundle | What | Status / scope |
 |---|---|---|
 | **GTK4 backend** | Parallel GTK4 + WebKitGTK 6.0 module behind `-Dgtk4`; existing GTK3 path stays | Largest remaining item (~5h). New backend module. Future-proofs Linux once Ubuntu LTS / Fedora ship GTK4 webkit by default. |
-| **Print page-range / printer-selection (Win + Linux)** | Per-platform settings on top of `printWithOptions`. `ICoreWebView2PrintSettings` (Win), `GtkPrintSettings` (Linux). | macOS landed 2026-05-28 via NSPrintInfo dict; Win + Linux ignore extras today. ~3h. |
+| **Print page-range / printer-selection (Win + Linux)** | **Linux closed 2026-05-30 (Bundle 8).** macOS landed 2026-05-28 via NSPrintInfo dict; Linux now honors `copies` / `pages` / `printer_name` via `GtkPrintSettings` attached to the operation before the dialog opens. Win remains **advisory** — `ShowPrintUI` doesn't accept a settings struct; the user picks values in the dialog. Full silent-print via `ICoreWebView2_16::Print` + `ICoreWebView2PrintSettings` + a completion-handler COM impostor is a future bundle (needs Windows host for vtable slot validation). | Win full path future |
 | **WinRT Toast** | `Windows.UI.Notifications.ToastNotificationManager` via COM + AUMID + Start-menu shortcut | Polish vs current `Shell_NotifyIconW(NIF_INFO)` balloon. Richer styling + Action Center grouping. ~4h, needs Windows host. |
 | **Full a11y provider** | NSAccessibility / UIA / ATK roles + states beyond labels | Polish vs current `setAccessibilityLabel`. Web content + menus already self-publish; remaining gap is window-chrome semantics. ~3h. |
 | **Auto-updater apply (Win + Linux)** | Squirrel or MSIX (Win) / AppImageUpdate (Linux) | macOS apply shipped 2026-05-29 (pure-Zig download + SHA-256 verify + rename swap + `open -n` relaunch). Win + Linux apply still platform-updater territory. ~5h+ + signing infra. |
@@ -1618,7 +1668,7 @@ from earlier bundles are established.
 | 5 | ~~**File-watch (Linux)**~~ — **shipped 2026-05-30** | Closed. `inotify_init1(IN_NONBLOCK \| IN_CLOEXEC)` → `inotify_add_watch(IN_MODIFY \| IN_ATTRIB \| IN_MOVED_FROM \| IN_MOVED_TO \| IN_CREATE \| IN_DELETE)` → wrap fd in `g_io_channel_unix_new` + `g_io_add_watch(G_IO_IN, trampoline)`. Trampoline drains the kernel buffer in a loop (one g_io_add_watch dispatch handles many queued events), parses `inotify_event` headers (16-byte fixed + NUL-padded name), composes `<watch_root>/<name>`. v1 non-recursive (single inode). Shutdown via `g_source_remove` + `inotify_rm_watch` + `g_io_channel_unref` (close_on_unref handles fd) | done | done | — |
 | 6 | ~~**Global hotkeys (Win)**~~ — **shipped 2026-05-30** | Closed. `RegisterHotKey(hwnd, id, fsModifiers, vk)` against a hidden message-only window (`HWND_MESSAGE` parent) owned by the manager, with a custom wndProc that handles `WM_HOTKEY`. Self-contained — no changes to windows.zig main loop; existing GetMessage/DispatchMessage flow delivers events. Modifier mapping: cmd→MOD_WIN, ctrl→MOD_CONTROL, option→MOD_ALT, shift→MOD_SHIFT. `MOD_NOREPEAT` added to suppress auto-repeat on held keys | done | — | — |
 | 7 | ~~**Global hotkeys (Linux X11)**~~ — **shipped 2026-05-30** | Closed. libX11 loaded at runtime via `std.c.dlopen("libX11.so.6")` so apps build cleanly on Wayland-only / headless installs (returns `error.Unsupported` when libX11 absent OR when `XDG_SESSION_TYPE=wayland`). Per binding, `XGrabKey` is called 4× to cover the (NumLock × CapsLock) toggle combos. Dedicated `std.Thread.spawn` worker runs `XNextEvent` and fires the callback from the worker thread; deinit closes the display to unblock the loop. `XSetErrorHandler` swallows BadAccess so other X11 clients holding the same combo don't crash the process | done | done | — |
-| 8 | **Print extras (Win + Linux)** | Page-range / copies / printer-selection. Closes the macOS-only NSPrintInfo dict path from 2026-05-27 | New `SLOT_WV2_PrintSettings` vtable slot on `ICoreWebView2PrintSettings` (factory via `ICoreWebView2Environment6::CreatePrintSettings`). Set `Copies`, `PageRange` (`"1-5,8"` string format), `PrinterName` then pass to `ShowPrintUI` / `PrintToPdf` | `GtkPrintSettings` via `gtk_print_settings_new` → `gtk_print_settings_set_n_copies` / `_set_page_ranges` / `_set_printer`; attach to `WebKitPrintOperation` via `webkit_print_operation_set_print_settings` before `_run_dialog` | Medium — Win adds another vtable slot to the hand-extracted set; document the slot index source in the same convention as existing slots |
+| 8 | ~~**Print extras (Linux full / Win advisory)**~~ — **shipped 2026-05-30** | Linux: `gtk_print_settings_new` → `_set_n_copies` / `_set_page_ranges` (1-indexed PageRange translated to GTK's 0-indexed GtkPageRange) / `_set_print_pages(RANGES)` / `_set_printer` → `webkit_print_operation_set_print_settings` before `_run_dialog`. Settings pre-fill the dialog; user can override. Win: `ShowPrintUI` doesn't accept settings — extras are advisory + the framework logs a warning when caller sets them. Full silent-print via `ICoreWebView2_16::Print` + `ICoreWebView2PrintSettings` + completion-handler COM impostor deferred (needs Windows host to validate vtable slot indexes) | advisory | done | — |
 
 Bundles **deferred** (host-required or scope-too-large):
 - **Bundle 9** — WinRT Toast. Needs Windows host for AUMID +

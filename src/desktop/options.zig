@@ -116,21 +116,31 @@ pub const PageRange = struct {
     to: u32 = 0,
 };
 
-/// Parameters for `Window.printWithOptions`. macOS reads every
-/// optional field via NSPrintInfo dict keys; Windows + Linux ignore
-/// the extras for now (`copies`, `pages`, `printer_name`) — those
-/// platforms only honor `kind`.
+/// Parameters for `Window.printWithOptions`.
+///
+/// Per-platform handling of the extras (`copies`, `pages`,
+/// `printer_name`):
+/// - **macOS** — every field honored via NSPrintInfo dict keys.
+/// - **Linux** — every field honored via `GtkPrintSettings`
+///   attached to the print operation before the dialog opens
+///   (pre-fills the dialog defaults; user can still override).
+/// - **Windows** — fields are **advisory only**. `ShowPrintUI`
+///   doesn't accept a settings struct; the user picks values in
+///   the dialog. The framework logs a warning when extras are
+///   non-default. Full silent-print integration via the Print()
+///   API + ICoreWebView2PrintSettings is a future bundle.
 pub const PrintOptions = struct {
     kind: PrintDialogKind = .default,
-    /// Number of copies to print. macOS honors this; Win + Linux
-    /// fall back to whatever the dialog defaults to.
+    /// Number of copies to print. macOS + Linux honor; Win is
+    /// advisory.
     copies: u32 = 1,
     /// Optional inclusive page range. `null` = print all pages.
-    /// macOS honors this; Win + Linux ignore (dialog default).
+    /// macOS + Linux honor; Win is advisory.
     pages: ?PageRange = null,
     /// Pre-select a specific printer by name (matches the OS-visible
     /// printer name, not a queue identifier). macOS resolves via
-    /// `[NSPrinter printerWithName:]`. Win + Linux currently ignore.
+    /// `[NSPrinter printerWithName:]`; Linux via
+    /// `gtk_print_settings_set_printer`. Win is advisory.
     /// `null` = whatever the OS treats as the default printer.
     printer_name: ?[]const u8 = null,
 };

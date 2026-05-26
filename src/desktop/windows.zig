@@ -969,8 +969,23 @@ pub const Window = struct {
     /// Returns `error.Unsupported` when the Edge WebView2 runtime is
     /// older than version 111 (March 2023) — the older runtime
     /// answers `E_NOINTERFACE` to the QI for `ICoreWebView2_16`.
+    ///
+    /// `opts.copies`, `opts.pages`, and `opts.printer_name` are
+    /// **advisory** on Windows today — `ShowPrintUI` doesn't accept
+    /// a PrintSettings struct; the user picks values from the
+    /// dialog. The framework logs a warning when those fields are
+    /// non-default so apps can see the behavior gap. Full silent
+    /// print with PrintSettings would route through
+    /// `ICoreWebView2_16::Print` + `ICoreWebView2Environment6::CreatePrintSettings`
+    /// + a `ICoreWebView2PrintCompletedHandler` COM impostor — a
+    /// future bundle that needs a Windows host to validate the
+    /// vtable slot indexes against the actual SDK headers.
     pub fn printWithOptions(self: *Window, opts: opts_mod.PrintOptions) opts_mod.PrintError!void {
         const wv = self.ctx.webview orelse return opts_mod.PrintError.Backend;
+
+        if (opts.copies > 1 or opts.pages != null or opts.printer_name != null) {
+            std.log.warn("verve.desktop[windows]: opts.copies/pages/printer_name are advisory — ShowPrintUI doesn't accept PrintSettings. User picks in the dialog.", .{});
+        }
 
         var wv16_raw: ?*anyopaque = null;
         const QI = vtSlot(*const fn (*Wv2, *const IID, *?*anyopaque) callconv(.winapi) HRESULT, wv.lpVtbl, 0);

@@ -437,8 +437,22 @@ extern fn webkit_web_view_get_title(wv: *WebKitWebView) ?[*:0]const u8;
 extern fn webkit_web_view_set_zoom_level(wv: *WebKitWebView, level: f64) void;
 extern fn webkit_web_view_get_zoom_level(wv: *WebKitWebView) f64;
 const WebKitPrintOperation = opaque {};
+const GtkPrintSettings = opaque {};
+const GtkPageRange = extern struct {
+    start: c_int,
+    end: c_int,
+};
 extern fn webkit_print_operation_new(wv: *WebKitWebView) ?*WebKitPrintOperation;
 extern fn webkit_print_operation_run_dialog(op: *WebKitPrintOperation, parent: ?*GtkWindow) c_uint;
+extern fn webkit_print_operation_set_print_settings(op: *WebKitPrintOperation, settings: *GtkPrintSettings) void;
+extern fn gtk_print_settings_new() *GtkPrintSettings;
+extern fn gtk_print_settings_set_n_copies(settings: *GtkPrintSettings, n: c_int) void;
+extern fn gtk_print_settings_set_page_ranges(settings: *GtkPrintSettings, ranges: [*]const GtkPageRange, num_ranges: c_int) void;
+extern fn gtk_print_settings_set_print_pages(settings: *GtkPrintSettings, pages: c_int) void;
+extern fn gtk_print_settings_set_printer(settings: *GtkPrintSettings, printer: [*:0]const u8) void;
+// GtkPrintPages enum: 0 = all, 1 = current, 2 = ranges. Set to 2
+// when a non-null PageRange is supplied.
+const GTK_PRINT_PAGES_RANGES: c_int = 2;
 // WebKitPrintOperationResponse enum values.
 const WEBKIT_PRINT_OPERATION_RESPONSE_PRINT: c_uint = 0;
 const WEBKIT_PRINT_OPERATION_RESPONSE_CANCEL: c_uint = 1;
@@ -833,17 +847,48 @@ pub const Window = struct {
     /// Native print dialog via `webkit_print_operation_run_dialog`.
     /// Spins a nested GTK modal loop until the user prints or
     /// cancels. `opts.kind` is ignored on Linux — WebKitGTK only
-    /// exposes one dialog path.
+    /// exposes one dialog path. `opts.copies`, `opts.pages`, and
+    /// `opts.printer_name` populate a `GtkPrintSettings` that is
+    /// attached to the operation before the dialog opens, so the
+    /// dialog pre-fills with those defaults; the user can still
+    /// override before clicking Print.
     pub fn printWithOptions(self: *Window, opts: opts_mod.PrintOptions) opts_mod.PrintError!void {
-        _ = opts;
         const wv = self.ctx.webview orelse return opts_mod.PrintError.Backend;
         const op = webkit_print_operation_new(wv) orelse return opts_mod.PrintError.Backend;
         defer g_object_unref(@ptrCast(op));
 
+        if (opts.copies > 1 or opts.pages != null or opts.printer_name != null) {
+            const settings = gtk_print_settings_new();
+            defer g_object_unref(@ptrCast(settings));
+
+            if (opts.copies > 1) gtk_print_settings_set_n_copies(settings, @intCast(opts.copies));
+
+            if (opts.pages) |range| {
+                // GtkPageRange is 0-indexed; PrintOptions.PageRange is
+                // 1-indexed (matches NSPrintInfo). Translate. `to == 0`
+                // is the "all remaining" sentinel — we don't have a
+                // page count to expand it against here, so cap at the
+                // max-int GTK can express.
+                const start: c_int = @intCast(@max(range.from, 1) - 1);
+                const end: c_int = if (range.to == 0) std.math.maxInt(c_int) else @intCast(range.to - 1);
+                const gtk_ranges = [_]GtkPageRange{.{ .start = start, .end = end }};
+                gtk_print_settings_set_page_ranges(settings, &gtk_ranges, 1);
+                gtk_print_settings_set_print_pages(settings, GTK_PRINT_PAGES_RANGES);
+            }
+
+            if (opts.printer_name) |pname| {
+                const z = self.ctx.allocator.dupeZ(u8, pname) catch return opts_mod.PrintError.OutOfMemory;
+                defer self.ctx.allocator.free(z);
+                gtk_print_settings_set_printer(settings, z.ptr);
+            }
+
+            webkit_print_operation_set_print_settings(op, settings);
+        }
+
         const parent: ?*GtkWindow = if (self.ctx.window) |w| @ptrCast(w) else null;
         const response = webkit_print_operation_run_dialog(op, parent);
         if (response == WEBKIT_PRINT_OPERATION_RESPONSE_CANCEL) return opts_mod.PrintError.Cancelled;
-        std.log.info("verve.desktop[linux]: print dialog response={d}", .{response});
+        std.log.info("verve.desktop[linux]: print dialog response={d} (copies={d})", .{ response, opts.copies });
     }
 
     /// Set the window's ATK accessible name. `gtk_widget_get_accessible`

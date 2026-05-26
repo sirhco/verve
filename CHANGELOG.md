@@ -8,6 +8,18 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Window.printWithOptions` Linux: full `GtkPrintSettings`
+  integration (Bundle 8 of the Win/Linux backfill plan). `copies`,
+  `pages` (translated 1-indexed PageRange → 0-indexed GtkPageRange),
+  and `printer_name` populate a `GtkPrintSettings` attached via
+  `webkit_print_operation_set_print_settings` before the dialog
+  opens. Settings pre-fill the dialog; user can still override.
+  Windows extras remain **advisory** — `ShowPrintUI` doesn't
+  accept a settings struct; framework now logs a warning when
+  caller sets non-default `copies` / `pages` / `printer_name`.
+  Full Windows silent-print via `ICoreWebView2_16::Print` +
+  `ICoreWebView2PrintSettings` + completion-handler impostor
+  deferred (needs Windows host for vtable-slot validation).
 - `desktop.hotkeys.Manager` Windows + Linux X11 implementations
   (Bundles 6 + 7 of the Win/Linux backfill plan). macOS Carbon
   impl unchanged. Wayland deferred (needs GlobalShortcuts xdg
