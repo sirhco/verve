@@ -8,6 +8,25 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `desktop.hotkeys.Manager` Windows + Linux X11 implementations
+  (Bundles 6 + 7 of the Win/Linux backfill plan). macOS Carbon
+  impl unchanged. Wayland deferred (needs GlobalShortcuts xdg
+  portal). Windows uses `RegisterHotKey` against a hidden
+  `HWND_MESSAGE` window owned by the manager + a small custom
+  wndProc that handles `WM_HOTKEY`. Self-contained — no
+  changes to the rest of the Win backend. `MOD_NOREPEAT` set
+  to suppress auto-fire on held keys. Linux uses libX11 loaded
+  at runtime via `std.c.dlopen("libX11.so.6")` + memoized
+  fn-pointer struct (lets the module load cleanly on
+  Wayland-only / headless installs). `XGrabKey` is called 4×
+  per binding to cover the (NumLock × CapsLock) toggle combos.
+  Dedicated worker thread runs `XNextEvent`; callback fires
+  from worker thread. `XSetErrorHandler` swallows BadAccess
+  globally so contested grabs don't abort the process.
+  Wayland sessions (detected via `XDG_SESSION_TYPE=wayland`)
+  return `error.Unsupported` from init — XGrabKey on the
+  XWayland root only fires when an X11 client has focus,
+  which breaks the "global" promise.
 - `desktop.fswatch.Watcher` Linux implementation (Bundle 5 of
   the Win/Linux backfill plan). The module is now complete on all
   three backends. Linux uses `inotify_init1(IN_NONBLOCK |
