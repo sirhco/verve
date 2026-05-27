@@ -116,6 +116,34 @@ the SSR'd island content stamps `z-on-click="counter_island_bump"`;
 the bridge JS click delegate looks up the export on the chunk's
 own instance and invokes it.
 
+### Multi-instance islands
+
+`<verve-island>` markers on a page get a document-order id stamped
+as `data-instance="N"` and passed to the chunk's `hydrate` as
+`root_id`. Two markers with the same `data-name` share the same
+chunk wasm but get distinct `root_id` values, so chunks can keep
+per-instance state by namespacing their bind-names:
+
+```zig
+const std = @import("std");
+const verve = @import("verve");
+
+export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
+    _ = props_ptr;
+    _ = props_len;
+    var buf: [32]u8 = undefined;
+    const bind = std.fmt.bufPrint(&buf, "counter_island_{d}", .{root_id}) catch return;
+    verve.registerI32(bind, 0);
+}
+```
+
+The SSR'd content's `[z-bind="counter_island_{N}"]` must use the
+matching namespaced form. Chunks that don't care about
+multi-instance can ignore `root_id` entirely — `registerI32` is
+idempotent on the bind-name, so a second `<verve-island
+data-name="Counter">` marker just shares the same Signal slot
+(no duplicate allocation, no warning).
+
 ## Shared linear memory
 
 Per-island chunks declare zero static state and import their memory

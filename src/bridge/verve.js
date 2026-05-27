@@ -430,8 +430,16 @@
     verve_ref_get_value_f32: exp.verve_ref_get_value_f32,
   };
 
+  // Per-page instance counter. Each `<verve-island>` gets a unique id
+  // passed to its chunk's `hydrate(props_ptr, props_len, root_id)` so
+  // multi-instance chunks can namespace their bind-names (e.g.
+  // `"counter_island_{root_id}"`). Document-order assignment matches
+  // the SSR'd HTML's order so id 0 is always the first marker on the
+  // page regardless of when the chunk happens to instantiate.
+  let nextIslandInstance = 0;
+
   const islandChunks = new Map();
-  const loadIslandChunk = async (el) => {
+  const loadIslandChunk = async (el, instanceId) => {
     const name = el.getAttribute("data-name") || "";
     if (!name) return;
     const url = `/islands/${name}.wasm`;
@@ -465,13 +473,15 @@
         return;
       }
       new Uint8Array(memory.buffer, ptr, cap).set(propsBytes, 0);
-      cexp.hydrate(ptr, propsBytes.length, 0);
+      cexp.hydrate(ptr, propsBytes.length, instanceId);
     } else {
-      cexp.hydrate(0, 0, 0);
+      cexp.hydrate(0, 0, instanceId);
     }
   };
   document.querySelectorAll("verve-island").forEach((el) => {
-    loadIslandChunk(el).catch(() => {});
+    const instanceId = nextIslandInstance++;
+    el.setAttribute("data-instance", String(instanceId));
+    loadIslandChunk(el, instanceId).catch(() => {});
   });
 
   // ---- Phase 14: out-of-order Suspense swap ---------------------------

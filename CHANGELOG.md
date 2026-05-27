@@ -4,6 +4,31 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.21] - 2026-05-27
+
+### Added
+
+- Multi-instance island support. Bridge JS now stamps a per-page
+  document-order id as `data-instance="N"` on each `<verve-island>`
+  marker and threads it through to the chunk's `hydrate(props_ptr,
+  props_len, root_id)` call (previously always passed 0). Chunks
+  needing per-instance state namespace their bind-names using
+  `root_id` — e.g.
+  `std.fmt.bufPrint(&buf, "counter_island_{d}", .{root_id})`.
+  Documented in `docs/15-islands.md`.
+
+### Changed
+
+- `runtime.registerI32` / `registerStr` / `registerBool` /
+  `registerF32` are now **idempotent on the bind-name**. A second
+  call with a name already in the slot table returns the existing
+  slot's pointer and discards the new initial value, instead of
+  silently allocating a duplicate slot whose state nobody else can
+  reach. Lets multi-instance islands and hot-reloaded chunks call
+  `register*` defensively without piling up dead allocations. Test
+  in `src/client/runtime.zig` covers the idempotent return + shared
+  mutation semantics.
+
 ## [0.1.20] - 2026-05-27
 
 ### Added

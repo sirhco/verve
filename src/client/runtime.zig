@@ -68,7 +68,15 @@ pub fn ensureOwner() *verve.Owner {
 /// `verve.Signal(i32)` under the root Owner and wires its `on_set` hook
 /// to push the new value into every `[data-vh="<name>"]` (and the
 /// legacy `[z-bind="<name>"]`) element via the JS bridge.
+///
+/// Idempotent on the name: a second call with the same name returns
+/// the existing slot's pointer and discards the new initial. Lets
+/// multi-instance islands and hot-reloaded chunks call `register*`
+/// without piling up duplicate slots. Callers that need a fresh slot
+/// per instance must namespace the name themselves (e.g. encode the
+/// `root_id` the chunk's `hydrate` receives into the bind-name).
 pub fn registerI32(name: []const u8, initial: i32) *verve.Signal(i32) {
+    if (signalI32(name)) |existing| return existing;
     if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
     const owner = ensureOwner();
     const gpa = owner.allocator();
@@ -107,8 +115,10 @@ fn onSetI32(ctx: *anyopaque, value: i32) void {
 /// Register a reactive string keyed by its bind-name. Allocates a
 /// `verve.Signal([]const u8)` under the root Owner and wires on_set
 /// to push the new text into every `[data-vh="<name>"]` element via
-/// the bridge's `set_text_by_bind_str` primitive.
+/// the bridge's `set_text_by_bind_str` primitive. Idempotent on the
+/// name — see `registerI32` for the contract.
 pub fn registerStr(name: []const u8, initial: []const u8) *verve.Signal([]const u8) {
+    if (signalStr(name)) |existing| return existing;
     if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
     const owner = ensureOwner();
     const gpa = owner.allocator();
@@ -145,8 +155,10 @@ fn onSetStr(ctx: *anyopaque, value: []const u8) void {
 /// Register a reactive bool that drives a single CSS class on every
 /// `[data-vh="<name>"]` element. The class is added when the Signal
 /// holds `true`, removed when false — the common idiom for `.active`
-/// / `.is-open` toggles without re-render.
+/// / `.is-open` toggles without re-render. Idempotent on the name —
+/// see `registerI32` for the contract.
 pub fn registerBool(name: []const u8, class_name: []const u8, initial: bool) *verve.Signal(bool) {
+    if (signalBool(name)) |existing| return existing;
     if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
     const owner = ensureOwner();
     const gpa = owner.allocator();
@@ -189,8 +201,10 @@ fn onSetBool(ctx: *anyopaque, value: bool) void {
 /// Register a reactive f32 keyed by its bind-name. on_set pushes the
 /// new float into every `[data-vh="<name>"]` element via the bridge's
 /// `set_text_by_bind_f32` primitive (JS formats with its default
-/// stringification).
+/// stringification). Idempotent on the name — see `registerI32` for
+/// the contract.
 pub fn registerF32(name: []const u8, initial: f32) *verve.Signal(f32) {
+    if (signalF32(name)) |existing| return existing;
     if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
     const owner = ensureOwner();
     const gpa = owner.allocator();
@@ -427,6 +441,23 @@ test "registerF32 stores and updates a float Signal" {
 
     sig.set(0.875);
     try testing.expectApproxEqAbs(@as(f32, 0.875), sig.peek(), 1e-6);
+}
+
+test "registerI32 is idempotent on the name" {
+    resetForTesting();
+
+    const first = registerI32("dup", 7);
+    try testing.expectEqual(@as(i32, 7), first.peek());
+
+    // Second call returns the existing slot pointer — initial value 99
+    // is discarded, the live value stays at 7.
+    const second = registerI32("dup", 99);
+    try testing.expectEqual(first, second);
+    try testing.expectEqual(@as(i32, 7), second.peek());
+
+    // Mutate via either pointer — both observe the new value.
+    first.set(42);
+    try testing.expectEqual(@as(i32, 42), second.peek());
 }
 
 test "registerEvent + dispatchEvent invoke the matching slot" {

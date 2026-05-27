@@ -8,6 +8,17 @@
 //! page. It registers a per-island Signal under the main runtime's
 //! root Owner; subsequent click handlers exported from this chunk
 //! call into the shared API to mutate it.
+//!
+//! Multi-instance: `root_id` is a per-page document-order id assigned
+//! by the bridge JS. Chunks that need distinct state per
+//! `<verve-island>` marker should namespace their bind-names using
+//! it — e.g. `std.fmt.bufPrint(&buf, "counter_island_{d}", .{root_id})`.
+//! The SSR'd content's `[z-bind=...]` must use the same namespaced
+//! form so the on_set hook reaches the right element. This demo
+//! ignores `root_id` and uses a single shared signal — multiple
+//! `<verve-island data-name="Counter">` markers on the same page
+//! would share state (which is what the idempotent `registerI32`
+//! contract delivers safely; no slot duplication).
 
 const verve = @import("verve");
 
