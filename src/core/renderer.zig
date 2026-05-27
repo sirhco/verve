@@ -117,6 +117,36 @@ pub const Renderer = struct {
             try w.writeAll(" data-vh=\"");
             try escapeAttr(w, bind);
             try w.writeAll("\"");
+            // Phase 14 auto-walker: typed-binding metadata. The bridge
+            // JS reads `data-vh-type` + `data-vh-initial` (+ optional
+            // `data-vh-class` for bool) after main wasm instantiation
+            // and calls the matching `verve_register_<kind>` export.
+            if (node.z_bind_kind) |kind| {
+                try w.print(" data-vh-type=\"{s}\"", .{kind.attrName()});
+                switch (kind) {
+                    .i32 => if (node.z_bind_initial_i32) |v| {
+                        try w.print(" data-vh-initial=\"{d}\"", .{v});
+                    },
+                    .str => if (node.z_bind_initial_str) |s| {
+                        try w.writeAll(" data-vh-initial=\"");
+                        try escapeAttr(w, s);
+                        try w.writeAll("\"");
+                    },
+                    .bool => {
+                        if (node.z_bind_initial_bool) |b| {
+                            try w.print(" data-vh-initial=\"{s}\"", .{if (b) "1" else "0"});
+                        }
+                        if (node.z_bind_class) |c| {
+                            try w.writeAll(" data-vh-class=\"");
+                            try escapeAttr(w, c);
+                            try w.writeAll("\"");
+                        }
+                    },
+                    .f32 => if (node.z_bind_initial_f32) |v| {
+                        try w.print(" data-vh-initial=\"{d}\"", .{v});
+                    },
+                }
+            }
         }
         if (node.z_on_click_action) |action| {
             try w.writeAll(" z-on-click=\"");

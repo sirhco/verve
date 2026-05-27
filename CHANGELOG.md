@@ -4,6 +4,41 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.23] - 2026-05-27
+
+### Added
+
+- Phase 14 — JS-driven auto-walker for typed bindings. Apps that
+  use the new `Node.bindI32` / `bindStr` / `bindBool` / `bindF32`
+  methods get zero per-bind wasm registration boilerplate: the
+  renderer stamps `data-vh-type` + `data-vh-initial` (and
+  `data-vh-class` for bool) on the bound element, and the bridge JS
+  walker calls the matching `verve_register_<kind>` export with the
+  name + initial value staged through the runtime's island scratch
+  buffer. The legacy `Node.bind` + `verve_init_<name>` +
+  `verve_hydrate` path still works — `register*` is idempotent on
+  the bind-name (since v0.1.21) so running both paths is safe.
+
+  Surface:
+  - `src/core/node.zig` — new `BindKind` enum + 4 typed binding
+    methods, 6 new optional fields on `Node`.
+  - `src/core/renderer.zig` — emit the three new attrs per typed
+    binding alongside the existing `z-bind` / `data-vh`.
+  - `src/bridge/verve.js` + `templates/desktop/frontend/verve_desktop.js`
+    — walker phase right after `verve_hydrate`. Uses the runtime's
+    `verve_island_scratch_*` exports to pass name + initial bytes
+    into wasm without needing a separate JS allocator.
+  - `src/client/verve_client.zig` — `comptime { _ = @import("runtime_exports.zig"); }`
+    so downstream wasm clients (the desktop template) ship the
+    `verve_register_<kind>` exports the walker calls.
+
+  Desktop template scaffold migrated as the reference example.
+  `components.zig` now uses `bindI32("count", 0)` /
+  `bindI32("clicks", 0)`; `src/client/main.zig` drops the
+  `verve_init_count`, `verve_init_clicks`, `verve_hydrate` exports
+  entirely and ships only the two click handlers. Smoke golden
+  checksum unchanged (1789) — DOM text output is identical.
+
 ## [0.1.22] - 2026-05-27
 
 ### Added

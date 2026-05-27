@@ -59,13 +59,13 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
             ctx.section().class("card").children(.{
                 ctx.h2("Counter (WASM hydration)"),
                 ctx.div().class("row").children(.{
-                    ctx.span().class("count").bind("count").textInt(@as(i32, 0)),
+                    ctx.span().class("count").bindI32("count", 0).textInt(@as(i32, 0)),
                     ctx.button("-").onClick("decrement_counter"),
                     ctx.button("+").onClick("increment_counter"),
                 }),
                 ctx.p().children(.{
                     ctx.span().text("Total clicks: "),
-                    ctx.span().bind("clicks").text("0"),
+                    ctx.span().bindI32("clicks", 0).text("0"),
                 }),
             }),
             ctx.section().class("card").children(.{

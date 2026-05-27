@@ -14,6 +14,24 @@ pub const Attr = struct {
     value: []const u8,
 };
 
+/// Kind tag on a typed binding. Mirrored on the rendered element as
+/// `data-vh-type="<lower>"` for the bridge JS auto-walker to dispatch.
+pub const BindKind = enum {
+    i32,
+    str,
+    bool,
+    f32,
+
+    pub fn attrName(self: BindKind) []const u8 {
+        return switch (self) {
+            .i32 => "i32",
+            .str => "str",
+            .bool => "bool",
+            .f32 => "f32",
+        };
+    }
+};
+
 pub const Node = struct {
     arena: ?std.mem.Allocator = null,
     tag: []const u8,
@@ -29,6 +47,21 @@ pub const Node = struct {
     /// (XML, Atom, SVG) set this via `.contentType()`.
     content_type_override: ?[]const u8 = null,
     z_bind_name: ?[]const u8 = null,
+    /// Typed-binding metadata for the auto-walker (Phase 14). When set,
+    /// the renderer stamps `data-vh-type="<kind>"` plus the matching
+    /// initial-value form so the bridge JS can call the right
+    /// `verve_register_<kind>` export at boot without per-bind glue.
+    /// `null` keeps the legacy `.bind()` behavior (caller registers
+    /// manually via `verve_init_<name>` + `verve_hydrate`).
+    z_bind_kind: ?BindKind = null,
+    z_bind_initial_i32: ?i32 = null,
+    z_bind_initial_str: ?[]const u8 = null,
+    z_bind_initial_bool: ?bool = null,
+    z_bind_initial_f32: ?f32 = null,
+    /// CSS class toggled by a bool binding. Only meaningful when
+    /// `z_bind_kind == .bool` — paired with `z_bind_initial_bool` for
+    /// the initial-state attribute on render.
+    z_bind_class: ?[]const u8 = null,
     z_on_click_action: ?[]const u8 = null,
     /// Closure-style event slot ids. Each corresponds to a `*const fn
     /// () void` registered via `verve.registerEvent(...)` in the wasm
@@ -163,6 +196,47 @@ pub const Node = struct {
     pub fn bind(self: *Node, signal_name: []const u8) *Node {
         if (self.err != null) return self;
         self.z_bind_name = signal_name;
+        return self;
+    }
+
+    /// Typed binding for the Phase-14 auto-walker. Stamps `z-bind` +
+    /// `data-vh` (existing behavior) plus `data-vh-type="i32"` +
+    /// `data-vh-initial="<n>"`. The bridge JS reads those after main
+    /// instantiation and calls `verve_register_i32(name, initial)` so
+    /// the app no longer needs a `verve_init_<name>` export per slot.
+    pub fn bindI32(self: *Node, signal_name: []const u8, initial: i32) *Node {
+        if (self.err != null) return self;
+        self.z_bind_name = signal_name;
+        self.z_bind_kind = .i32;
+        self.z_bind_initial_i32 = initial;
+        return self;
+    }
+
+    pub fn bindStr(self: *Node, signal_name: []const u8, initial: []const u8) *Node {
+        if (self.err != null) return self;
+        self.z_bind_name = signal_name;
+        self.z_bind_kind = .str;
+        self.z_bind_initial_str = initial;
+        return self;
+    }
+
+    /// Bool binding — `class_name` is the CSS class toggled on/off as
+    /// the signal flips. Stamped as `data-vh-class="<class>"` so the
+    /// walker can pass it to `verve_register_bool`.
+    pub fn bindBool(self: *Node, signal_name: []const u8, class_name: []const u8, initial: bool) *Node {
+        if (self.err != null) return self;
+        self.z_bind_name = signal_name;
+        self.z_bind_kind = .bool;
+        self.z_bind_initial_bool = initial;
+        self.z_bind_class = class_name;
+        return self;
+    }
+
+    pub fn bindF32(self: *Node, signal_name: []const u8, initial: f32) *Node {
+        if (self.err != null) return self;
+        self.z_bind_name = signal_name;
+        self.z_bind_kind = .f32;
+        self.z_bind_initial_f32 = initial;
         return self;
     }
 

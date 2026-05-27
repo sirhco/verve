@@ -79,6 +79,47 @@ Initial values come from caller-controlled state — the
 `verve_init_<name>(value)` walker remains the recommended way to
 source them from the server-rendered DOM.
 
+## Auto-walker (Phase 14)
+
+Apps that want zero per-bind wasm boilerplate use the typed binding
+methods on `Node`:
+
+```zig
+// components.zig
+ctx.span().bindI32("count", 0).textInt(@as(i32, 0))
+ctx.span().bindBool("panel_open", "is-open", false)
+ctx.span().bindStr("title", "Welcome")
+ctx.span().bindF32("ratio", 0.0)
+```
+
+The renderer stamps `data-vh-type` + `data-vh-initial` (plus
+`data-vh-class` for bool) alongside the existing `z-bind` / `data-vh`
+markers. After main wasm instantiation the bridge JS walks every
+`[data-vh-type]` element, stages name + initial bytes through the
+runtime's island scratch buffer, and calls the matching
+`verve_register_<kind>` export — same registrations the manual
+`verve_init_<name>` + `verve_hydrate` path would have made, but the
+app no longer ships any registration wasm code.
+
+Click handlers still get to look the Signal up by name:
+
+```zig
+// src/client/main.zig
+const verve = @import("verve");
+
+export fn increment_counter() void {
+    if (verve.signalI32("count")) |c| c.increment();
+}
+```
+
+The desktop template scaffold uses this pattern as the default — its
+`src/client/main.zig` ships just the export handlers; all
+registrations happen via the walker.
+
+The legacy `Node.bind(name)` + `verve_init_<name>` + `verve_hydrate`
+path still works — `register*` is idempotent on the bind-name so
+running both paths is safe. New apps default to typed bindings.
+
 ## Closure-style event handlers
 
 Alternative to the string-named `[z-on-click="exportName"]` dispatch.

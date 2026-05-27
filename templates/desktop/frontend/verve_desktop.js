@@ -261,6 +261,68 @@
 
   if (typeof exp.verve_hydrate === "function") exp.verve_hydrate();
 
+  // Phase 14 auto-walker — same shape as the web bridge. Walks every
+  // `[data-vh-type]` element stamped by `Node.bindI32` / `bindStr` /
+  // `bindBool` / `bindF32` and calls the matching `verve_register_<k>`
+  // export so the app no longer needs a `verve_init_<name>` per slot.
+  // Staging string args through the main runtime's island scratch
+  // buffer keeps the bridge alloc-free.
+  if (
+    typeof exp.verve_register_i32 === "function" &&
+    typeof exp.verve_island_scratch_ptr === "function" &&
+    typeof exp.verve_island_scratch_capacity === "function"
+  ) {
+    const walkerScratchPtr = exp.verve_island_scratch_ptr();
+    const walkerScratchCap = exp.verve_island_scratch_capacity();
+    const enc = new TextEncoder();
+    const stageOne = (s) => {
+      const bytes = enc.encode(s);
+      if (bytes.length > walkerScratchCap) {
+        console.warn("verve auto-walker: value exceeds scratch", s);
+        return null;
+      }
+      new Uint8Array(memory.buffer, walkerScratchPtr, walkerScratchCap).set(bytes, 0);
+      return { ptr: walkerScratchPtr, len: bytes.length };
+    };
+    const stageTwo = (s1, s2) => {
+      const b1 = enc.encode(s1);
+      const b2 = enc.encode(s2);
+      if (b1.length + b2.length > walkerScratchCap) {
+        console.warn("verve auto-walker: combined values exceed scratch", s1, s2);
+        return null;
+      }
+      const view = new Uint8Array(memory.buffer, walkerScratchPtr, walkerScratchCap);
+      view.set(b1, 0);
+      view.set(b2, b1.length);
+      return {
+        a: { ptr: walkerScratchPtr, len: b1.length },
+        b: { ptr: walkerScratchPtr + b1.length, len: b2.length },
+      };
+    };
+    document.querySelectorAll("[data-vh-type]").forEach((el) => {
+      const name = el.getAttribute("data-vh") || el.getAttribute("z-bind");
+      if (!name) return;
+      const kind = el.getAttribute("data-vh-type");
+      const initial = el.getAttribute("data-vh-initial") || "";
+      if (kind === "i32") {
+        const n = parseInt(initial, 10);
+        const r = stageOne(name);
+        if (r) exp.verve_register_i32(r.ptr, r.len, Number.isFinite(n) ? n | 0 : 0);
+      } else if (kind === "str" && typeof exp.verve_register_str === "function") {
+        const r = stageTwo(name, initial);
+        if (r) exp.verve_register_str(r.a.ptr, r.a.len, r.b.ptr, r.b.len);
+      } else if (kind === "bool" && typeof exp.verve_register_bool === "function") {
+        const cls = el.getAttribute("data-vh-class") || "";
+        const r = stageTwo(name, cls);
+        if (r) exp.verve_register_bool(r.a.ptr, r.a.len, r.b.ptr, r.b.len, initial === "1" || initial === "true" ? 1 : 0);
+      } else if (kind === "f32" && typeof exp.verve_register_f32 === "function") {
+        const f = parseFloat(initial);
+        const r = stageOne(name);
+        if (r) exp.verve_register_f32(r.ptr, r.len, Number.isFinite(f) ? f : 0);
+      }
+    });
+  }
+
   // Deep-link receiver. The native side calls `window.verve.handleDeepLink(url)`
   // via evalJs when a verve://... URL arrives — either through the
   // macOS AppleEventManager handler (warm + cold) or the Win/Linux

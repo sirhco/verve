@@ -147,6 +147,14 @@ pub const heap = struct {
     pub const capacity = allocator_mod.capacity;
 };
 
+// Force the chunk-callable wrapper surface into downstream wasm clients
+// so the bridge's Phase-14 auto-walker can call `verve_register_*` on
+// them too. Same pattern the main client uses internally. On host-target
+// test builds these become regular C-ABI symbols — harmless.
+comptime {
+    _ = @import("runtime_exports.zig");
+}
+
 test {
     _ = runtime;
     _ = scratch_mod;
