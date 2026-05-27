@@ -62,17 +62,28 @@ required for the chunk to ship.
 
 Each chunk's source lives at `src/client/islands/<Name>.zig`. When
 that file is absent the chunk falls back to the shared
-`src/client/islands/_default.zig` stub. A chunk source exports
-exactly one entry point:
+`src/client/islands/_default.zig` stub. A chunk source exports a
+`hydrate` entry point plus any click / submit / etc. handlers it
+needs:
 
 ```zig
 // src/client/islands/Counter.zig
+const verve = @import("verve");
+
+const BIND: []const u8 = "counter_island";
+
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
-    // `props_ptr` points into shared memory with the main runtime.
-    // `root_id` is reserved for the multi-instance case.
     _ = props_ptr;
     _ = props_len;
     _ = root_id;
+    // Register the per-island Signal in the main runtime's slot
+    // table. Its `on_set` hook wires straight to the matching
+    // `[z-bind="counter_island"]` element via the JS bridge.
+    verve.registerI32(BIND, 0);
+}
+
+export fn counter_island_bump() void {
+    verve.signalSetI32(BIND, verve.signalGetI32(BIND) + 1);
 }
 ```
 
@@ -81,6 +92,29 @@ The chunk runs *after* the universal `data-vh` walker in the main
 island. `hydrate` is the place island-specific bring-up lives —
 multi-step initialization, prop-driven Signal seeding, custom
 event handlers that aren't expressible via `[z-on-click]`.
+
+### Chunk-side `verve` API
+
+The `verve` module imported above is the chunk-side façade at
+`src/client/island_runtime.zig`. It carries `extern "verve_runtime"
+fn ...` declarations the bridge JS resolves against the main client's
+exports at instantiation. Surface:
+
+| Function | Purpose |
+|---|---|
+| `registerI32` / `registerStr` / `registerBool` / `registerF32` | Allocate a Signal under the main runtime's root Owner |
+| `signalSetI32` / `Str` / `Bool` / `F32` | Lookup-by-name + `Signal.set` (no-op on miss) |
+| `signalGetI32` / `Bool` / `F32` / `Str(name, buf)` / `signalGetStrLen` | Lookup-by-name + `Signal.peek` (zero / empty on miss) |
+| `queryRef(ref)` | Resolve `data-ref="<id>"` → handle (null on miss) |
+| `setRefText` / `setRefTextI32` / `setRefAttr` / `setRefValue` / `setRefClass` / `focusRef` / `removeRef` | Per-handle DOM mutation |
+| `refValueI32` / `refValueF32` | Per-handle value read (form inputs) |
+
+Closure-style event registration (passing a `*const fn () void`
+across the chunk → main-runtime boundary) is **not** wired today —
+the chunk exports a named handler (`counter_island_bump` above) and
+the SSR'd island content stamps `z-on-click="counter_island_bump"`;
+the bridge JS click delegate looks up the export on the chunk's
+own instance and invokes it.
 
 ## Shared linear memory
 
@@ -99,9 +133,10 @@ and the props string is staged through the main runtime's
 memory directly — no per-chunk scratch buffer, no per-chunk runtime
 preamble.
 
-Result: each chunk weighs **~73 bytes**. Pages without an island
-skip its chunk entirely; pages with one pay only the
-~73-byte cost plus the network round-trip.
+Result: a stub chunk weighs **~73 bytes**; a real chunk like
+`Counter` that registers a Signal + ships a click handler weighs
+**~290 bytes**. Pages without an island skip its chunk entirely;
+pages with one pay only that cost plus the network round-trip.
 
 ## Build artifacts
 
@@ -152,11 +187,12 @@ For type-safe calls from WASM, use the build-time generated
 
 ## Deferred work
 
-- **Phase 13F** — export the main runtime's Signal-registration +
-  DOM-primitive symbols to per-chunk imports so chunks can wire
-  reactive state from inside their own `hydrate` body. Today the
-  universal `data-vh` walker still handles every reactive span,
-  and per-chunk `hydrate` stays a no-op hook.
+- **Closure-style event registration** — passing a
+  `*const fn () void` across the chunk → main-runtime boundary
+  (so chunks could call `verve.registerEvent(myFn)` like the
+  main client does) needs cross-module function-table sharing.
+  Chunks today export named handler functions and use the
+  string-name dispatch path; closure events stay main-runtime-only.
 - **Binary codec dispatch** — parse `props_schema` at chunk
   hydration time and decode `data-props` into typed args.
 - **Per-island Effect ownership** — `root_id` will dispatch slots

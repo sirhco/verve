@@ -4,6 +4,54 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.20] - 2026-05-27
+
+### Added
+
+- Phase 13F — per-island WASM chunks can now call the main client's
+  reactive runtime. Each chunk imports a `verve_runtime` namespace
+  the bridge JS resolves against matching exports on the main
+  `client.wasm` instance at chunk instantiation time. Chunks
+  `@import("verve")` (resolved against `src/client/island_runtime.zig`
+  via a new `verve_island` build module) and call:
+
+  - `registerI32` / `registerStr` / `registerBool` / `registerF32` —
+    allocate per-island Signals under the main runtime's root Owner
+  - `signalSetI32` / `Str` / `Bool` / `F32` — name-keyed `Signal.set`
+  - `signalGetI32` / `Bool` / `F32` / `Str(name, buf)` /
+    `signalGetStrLen` — name-keyed `Signal.peek` (two-call read for
+    strings)
+  - `queryRef` + `setRefText` / `setRefTextI32` / `setRefAttr` /
+    `setRefValue` / `setRefClass` / `focusRef` / `removeRef` /
+    `refValueI32` / `refValueF32` — NodeRef resolution + per-handle ops
+
+  The wrappers live in `src/client/runtime_exports.zig` and are
+  pulled into the main client via `comptime { _ = @import(...); }`
+  in `src/client/main.zig` so their `export fn verve_*` decls land
+  in the main wasm's export table. Bridge JS (`src/bridge/verve.js`)
+  builds a `verveRuntime` import object from those exports once after
+  main instantiation and passes it to every per-island chunk's
+  `WebAssembly.instantiateStreaming` call.
+
+  Closure-style event registration (passing a `*const fn () void`
+  across the chunk boundary) deferred — needs cross-module function-
+  table sharing. Chunks export named handler functions and use the
+  existing `[z-on-click="<exportedName>"]` dispatch path; bridge
+  JS already routes string-name clicks to the chunk's instance.
+
+  `src/client/islands/Counter.zig` migrated to demonstrate the new
+  API end-to-end — registers `counter_island` signal in `hydrate`,
+  exports `counter_island_bump` which mutates it via `signalSet/GetI32`.
+  Stub chunks weigh ~73 bytes; Counter now weighs ~290 bytes (still
+  shipping only what the chunk actually does, no duplicated runtime).
+
+  Files: `src/client/runtime_exports.zig` (new), `src/client/island_runtime.zig`
+  (new), `src/client/main.zig` (pull runtime_exports), `src/client/tests.zig`
+  (aggregate), `build.zig` (new `verve_island` module + chunk imports),
+  `src/bridge/verve.js` (verveRuntime imports), `src/client/islands/Counter.zig`
+  + `_default.zig` (header refresh), `docs/12-wasm-client.md` +
+  `docs/15-islands.md` (chunk-side API documented).
+
 ## [0.1.19] - 2026-05-27
 
 ### Added

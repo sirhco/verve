@@ -18,6 +18,14 @@ const client_manifest = @import("client_manifest");
 
 pub const render = @import("render.zig");
 
+// Phase 13F — force semantic analysis of the chunk-callable wrapper
+// surface so its `export fn verve_*` declarations land in this wasm
+// module's export table. Bridge JS resolves per-island chunks'
+// `extern "verve_runtime"` imports against these exports.
+comptime {
+    _ = @import("runtime_exports.zig");
+}
+
 // ---- Phase 13: island dispatch scratch buffer ----------------------------
 // JS writes name+props as concatenated UTF-8 bytes into this buffer
 // then invokes `verve_island_dispatch(name_len, props_len)`. Sized for

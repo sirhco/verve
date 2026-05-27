@@ -11,6 +11,8 @@ a parallel write path.
 | Module | Purpose |
 |---|---|
 | `src/client/verve_client.zig` | Public façade for downstream wasm clients — re-exports `Signal` / `Effect` / `Owner` + `registerI32` / `registerStr` / `registerBool` / `registerF32` + `bindForEach` |
+| `src/client/runtime_exports.zig` | Chunk-callable `export fn verve_*` wrappers — every reactive API a per-island chunk needs, name-keyed dispatch |
+| `src/client/island_runtime.zig` | Chunk-side façade (`extern "verve_runtime"` decls + friendly slice wrappers) — imported as `verve` from per-island chunks |
 | `src/client/main.zig`      | Exported wasm symbols + per-bind Signal wiring |
 | `src/client/runtime.zig`   | `registerI32` / `registerStr` / `registerBool` / `registerF32` + `ForEachHandle` + `bindForEach` |
 | `src/client/reconciler.zig`| LIS-based keyed-list planner. See [17 — Reconciler](17-reconciler.md). |

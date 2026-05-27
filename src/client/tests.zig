@@ -11,4 +11,5 @@ test {
     _ = @import("island.zig");
     _ = @import("reconciler.zig");
     _ = @import("verve_client.zig");
+    _ = @import("runtime_exports.zig");
 }

@@ -32,6 +32,16 @@ pub fn build(b: *std.Build) void {
     });
     _ = verve_client_mod;
 
+    // Phase 13F — chunk-side façade. Each per-island chunk imports
+    // this module as `verve`; it carries the `extern "verve_runtime"`
+    // declarations the bridge JS resolves against the main client's
+    // exports at instantiation time. Wasm-only by construction (its
+    // externs don't exist on the native target) so per-island chunks
+    // are the only consumers.
+    const verve_island_mod = b.addModule("verve_island", .{
+        .root_source_file = b.path("src/client/island_runtime.zig"),
+    });
+
     const client_mod = b.createModule(.{
         .root_source_file = b.path("src/client/main.zig"),
         .target = wasm_target,
@@ -92,6 +102,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(rel),
             .target = wasm_target,
             .optimize = .ReleaseSmall,
+            .imports = &.{
+                .{ .name = "verve", .module = verve_island_mod },
+            },
         });
         const exe = b.addExecutable(.{
             .name = b.fmt("island_{s}", .{name}),

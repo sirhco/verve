@@ -399,6 +399,37 @@
   // the main runtime's island scratch buffer — JS writes them
   // there before calling the chunk's `hydrate(ptr, len, root_id)`,
   // which then reads the bytes directly from shared memory.
+  // Phase 13F — assemble the chunk-side reactive-runtime import object
+  // from the main client's matching exports. Built once after main
+  // instantiation; reused for every island chunk. Missing entries pass
+  // through as `undefined` so an older runtime + a newer chunk still
+  // fails with a clear `LinkError` at instantiate time.
+  const verveRuntime = {
+    verve_register_i32: exp.verve_register_i32,
+    verve_register_str: exp.verve_register_str,
+    verve_register_bool: exp.verve_register_bool,
+    verve_register_f32: exp.verve_register_f32,
+    verve_signal_set_i32: exp.verve_signal_set_i32,
+    verve_signal_set_str: exp.verve_signal_set_str,
+    verve_signal_set_bool: exp.verve_signal_set_bool,
+    verve_signal_set_f32: exp.verve_signal_set_f32,
+    verve_signal_get_i32: exp.verve_signal_get_i32,
+    verve_signal_get_bool: exp.verve_signal_get_bool,
+    verve_signal_get_f32: exp.verve_signal_get_f32,
+    verve_signal_get_str_len: exp.verve_signal_get_str_len,
+    verve_signal_get_str: exp.verve_signal_get_str,
+    verve_query_ref: exp.verve_query_ref,
+    verve_ref_set_text: exp.verve_ref_set_text,
+    verve_ref_set_text_i32: exp.verve_ref_set_text_i32,
+    verve_ref_set_attr: exp.verve_ref_set_attr,
+    verve_ref_set_value: exp.verve_ref_set_value,
+    verve_ref_set_class: exp.verve_ref_set_class,
+    verve_ref_focus: exp.verve_ref_focus,
+    verve_ref_remove: exp.verve_ref_remove,
+    verve_ref_get_value_i32: exp.verve_ref_get_value_i32,
+    verve_ref_get_value_f32: exp.verve_ref_get_value_f32,
+  };
+
   const islandChunks = new Map();
   const loadIslandChunk = async (el) => {
     const name = el.getAttribute("data-name") || "";
@@ -409,6 +440,7 @@
         name,
         WebAssembly.instantiateStreaming(fetch(url), {
           env: { memory },
+          verve_runtime: verveRuntime,
         }).catch((err) => {
           islandChunks.delete(name);
           console.warn("verve: island chunk fetch failed", name, err);
