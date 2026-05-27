@@ -206,6 +206,46 @@ const WasmBridge = struct {
     /// Read `el.value` parsed as a float. Returns 0 when the handle is
     /// bad or the value doesn't parse.
     pub extern "verve" fn ref_get_value_f32(handle: i32) f32;
+
+    // ---- Named templates (Phase 16) -----------------------------------------
+    // `clone_template(name)` looks up `[data-vt="<name>"]`, clones the
+    // template's content, and returns a `refHandles[]`-style handle to
+    // the cloned root element (or 0 when no template matches). The
+    // clone is detached — append it via `append_to_bind` (or graft it
+    // through any future NodeRef-keyed insert) to make it visible.
+    //
+    // `slot_text` / `slot_attr` locate `[data-vt-slot="<name>"]` inside
+    // the cloned subtree and fill it. Out-of-table handles or missing
+    // slots are silent no-ops.
+
+    pub extern "verve" fn clone_template(
+        name_ptr: [*]const u8,
+        name_len: usize,
+    ) i32;
+
+    pub extern "verve" fn slot_text(
+        handle: i32,
+        slot_ptr: [*]const u8,
+        slot_len: usize,
+        text_ptr: [*]const u8,
+        text_len: usize,
+    ) void;
+
+    pub extern "verve" fn slot_attr(
+        handle: i32,
+        slot_ptr: [*]const u8,
+        slot_len: usize,
+        name_ptr: [*]const u8,
+        name_len: usize,
+        value_ptr: [*]const u8,
+        value_len: usize,
+    ) void;
+
+    pub extern "verve" fn append_to_bind(
+        parent_bind_ptr: [*]const u8,
+        parent_bind_len: usize,
+        child_handle: i32,
+    ) void;
 };
 
 const NativeStub = struct {
@@ -240,6 +280,12 @@ const NativeStub = struct {
     pub fn ref_get_value_f32(_: i32) f32 {
         return 0;
     }
+    pub fn clone_template(_: [*]const u8, _: usize) i32 {
+        return 0;
+    }
+    pub fn slot_text(_: i32, _: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
+    pub fn slot_attr(_: i32, _: [*]const u8, _: usize, _: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
+    pub fn append_to_bind(_: [*]const u8, _: usize, _: i32) void {}
 };
 
 pub const set_text_by_bind = Bridge.set_text_by_bind;
@@ -267,3 +313,7 @@ pub const ref_focus = Bridge.ref_focus;
 pub const ref_remove = Bridge.ref_remove;
 pub const ref_get_value_i32 = Bridge.ref_get_value_i32;
 pub const ref_get_value_f32 = Bridge.ref_get_value_f32;
+pub const clone_template = Bridge.clone_template;
+pub const slot_text = Bridge.slot_text;
+pub const slot_attr = Bridge.slot_attr;
+pub const append_to_bind = Bridge.append_to_bind;

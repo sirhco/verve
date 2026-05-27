@@ -817,6 +817,41 @@ pub fn queryRef(ref: anytype) ?i32 {
     return if (handle <= 0) null else handle;
 }
 
+// ---- Named templates (Phase 16, G2) -------------------------------------
+//
+// Wasm-side composition flow: server stamps prototypes via
+// `ctx.template("<name>", inner)` + `Node.slot(name)`; chunks clone
+// at runtime, fill slots, append to a bound parent.
+
+/// Look up `[data-vt="<name>"]`, clone its content, return a handle
+/// to the cloned root element. `null` when no template matches.
+/// The clone is detached — append with `appendToBind` (or any
+/// future NodeRef-keyed insert) to make it visible.
+pub fn cloneTemplate(name: []const u8) ?i32 {
+    const h = dom.clone_template(name.ptr, name.len);
+    return if (h <= 0) null else h;
+}
+
+/// Fill `[data-vt-slot="<slot>"]` inside the cloned subtree with
+/// `text` (replaces `textContent`).
+pub fn slotText(handle: i32, slot: []const u8, text: []const u8) void {
+    dom.slot_text(handle, slot.ptr, slot.len, text.ptr, text.len);
+}
+
+/// Set `attr_name = attr_value` on `[data-vt-slot="<slot>"]` inside
+/// the cloned subtree.
+pub fn slotAttr(handle: i32, slot: []const u8, attr_name: []const u8, attr_value: []const u8) void {
+    dom.slot_attr(handle, slot.ptr, slot.len, attr_name.ptr, attr_name.len, attr_value.ptr, attr_value.len);
+}
+
+/// Append the cloned fragment as the last child of every element
+/// matching `[z-bind="<parent_bind>"]` (and `[data-vh]`). The
+/// fragment is re-cloned per parent so multiple bound parents
+/// don't share the same node reference.
+pub fn appendToBind(parent_bind: []const u8, child_handle: i32) void {
+    dom.append_to_bind(parent_bind.ptr, parent_bind.len, child_handle);
+}
+
 // ---- Per-handle NodeRef ops --------------------------------------------
 //
 // Once `queryRef` has resolved a handle, downstream code reaches into

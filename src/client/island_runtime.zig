@@ -61,6 +61,29 @@ extern "verve_runtime" fn verve_register_response_handler(
     handler_idx: u32,
 ) void;
 
+extern "verve_runtime" fn verve_clone_template(name_ptr: [*]const u8, name_len: u32) i32;
+extern "verve_runtime" fn verve_slot_text(
+    handle: i32,
+    slot_ptr: [*]const u8,
+    slot_len: u32,
+    text_ptr: [*]const u8,
+    text_len: u32,
+) void;
+extern "verve_runtime" fn verve_slot_attr(
+    handle: i32,
+    slot_ptr: [*]const u8,
+    slot_len: u32,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    value_ptr: [*]const u8,
+    value_len: u32,
+) void;
+extern "verve_runtime" fn verve_append_to_bind(
+    parent_bind_ptr: [*]const u8,
+    parent_bind_len: u32,
+    child_handle: i32,
+) void;
+
 extern "verve_runtime" fn verve_list_diff(
     parent_ptr: [*]const u8,
     parent_len: u32,
@@ -246,6 +269,43 @@ pub fn registerResponseHandler(
         @intCast(route.len),
         @intCast(@intFromPtr(handler)),
     );
+}
+
+// ---- Named templates (G2) -----------------------------------------------
+//
+// Clone a server-rendered prototype, fill its slots, append into the
+// live DOM. Row markup lives in `components.zig` via
+// `ctx.template("<name>", inner)`; chunks reach it here.
+
+pub fn cloneTemplate(name: []const u8) ?i32 {
+    const h = verve_clone_template(name.ptr, @intCast(name.len));
+    return if (h <= 0) null else h;
+}
+
+pub fn slotText(handle: i32, slot: []const u8, text: []const u8) void {
+    verve_slot_text(
+        handle,
+        slot.ptr,
+        @intCast(slot.len),
+        text.ptr,
+        @intCast(text.len),
+    );
+}
+
+pub fn slotAttr(handle: i32, slot: []const u8, attr_name: []const u8, attr_value: []const u8) void {
+    verve_slot_attr(
+        handle,
+        slot.ptr,
+        @intCast(slot.len),
+        attr_name.ptr,
+        @intCast(attr_name.len),
+        attr_value.ptr,
+        @intCast(attr_value.len),
+    );
+}
+
+pub fn appendToBind(parent_bind: []const u8, child_handle: i32) void {
+    verve_append_to_bind(parent_bind.ptr, @intCast(parent_bind.len), child_handle);
 }
 
 /// Reconcile a keyed list against the live DOM. `parent_bind` names

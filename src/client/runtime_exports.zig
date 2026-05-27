@@ -226,6 +226,50 @@ export fn verve_cleanup(handler_idx: u32) void {
     runtime.cleanup(handler) catch return;
 }
 
+// ---- Named templates (G2, chunk-callable) -------------------------------
+
+export fn verve_clone_template(name_ptr: [*]const u8, name_len: u32) i32 {
+    return dom.clone_template(name_ptr, @as(usize, name_len));
+}
+
+export fn verve_slot_text(
+    handle: i32,
+    slot_ptr: [*]const u8,
+    slot_len: u32,
+    text_ptr: [*]const u8,
+    text_len: u32,
+) void {
+    dom.slot_text(handle, slot_ptr, @as(usize, slot_len), text_ptr, @as(usize, text_len));
+}
+
+export fn verve_slot_attr(
+    handle: i32,
+    slot_ptr: [*]const u8,
+    slot_len: u32,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    value_ptr: [*]const u8,
+    value_len: u32,
+) void {
+    dom.slot_attr(
+        handle,
+        slot_ptr,
+        @as(usize, slot_len),
+        name_ptr,
+        @as(usize, name_len),
+        value_ptr,
+        @as(usize, value_len),
+    );
+}
+
+export fn verve_append_to_bind(
+    parent_bind_ptr: [*]const u8,
+    parent_bind_len: u32,
+    child_handle: i32,
+) void {
+    dom.append_to_bind(parent_bind_ptr, @as(usize, parent_bind_len), child_handle);
+}
+
 // ---- IPC response handlers (G3, chunk-callable) -------------------------
 //
 // `verve_register_response_handler(route, handler_idx)` records the

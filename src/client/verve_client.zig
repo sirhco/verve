@@ -90,6 +90,21 @@ pub const removeRef = runtime.removeRef;
 pub const refValueI32 = runtime.refValueI32;
 pub const refValueF32 = runtime.refValueF32;
 
+// ---- Named templates (G2) -----------------------------------------------
+//
+// `cloneTemplate(name) ?i32` clones a `[data-vt="<name>"]` prototype
+// rendered server-side via `ctx.template(...)`. Fill slots via
+// `slotText` / `slotAttr` (slots are marked with `Node.slot("<name>")`
+// at render time, stamped as `data-vt-slot`). `appendToBind` grafts
+// the clone into a `[z-bind]`-keyed parent. Row markup lives in
+// `components.zig` next to the rest of the page — no buried wasm
+// format strings.
+
+pub const cloneTemplate = runtime.cloneTemplate;
+pub const slotText = runtime.slotText;
+pub const slotAttr = runtime.slotAttr;
+pub const appendToBind = runtime.appendToBind;
+
 // ---- Declarative hydration -----------------------------------------------
 //
 // `autoHydrate(bindings)` batches register* calls behind a single
