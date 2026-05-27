@@ -74,6 +74,22 @@ pub const NodeRef = verve.NodeRef;
 pub const NodeRefTag = verve.NodeRefTag;
 pub const queryRef = runtime.queryRef;
 
+// ---- Per-handle NodeRef ops ---------------------------------------------
+//
+// Use the handle returned from `queryRef(ref)` to mutate or read the
+// live element. Out-of-range / stale handles are silently ignored at
+// the bridge — keeps wasm-side code resilient to a hot-swapped build.
+
+pub const setRefText = runtime.setRefText;
+pub const setRefTextI32 = runtime.setRefTextI32;
+pub const setRefAttr = runtime.setRefAttr;
+pub const setRefValue = runtime.setRefValue;
+pub const setRefClass = runtime.setRefClass;
+pub const focusRef = runtime.focusRef;
+pub const removeRef = runtime.removeRef;
+pub const refValueI32 = runtime.refValueI32;
+pub const refValueF32 = runtime.refValueF32;
+
 // ---- Declarative hydration -----------------------------------------------
 //
 // `autoHydrate(bindings)` batches register* calls behind a single

@@ -4,6 +4,29 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.18] - 2026-05-27
+
+### Added
+
+- Per-handle NodeRef mutation + introspection externs. Once
+  `verve.queryRef(ref)` resolves a handle, downstream code reaches
+  into the live element via:
+  - `setRefText(h, text)` / `setRefTextI32(h, v)` — replace text content
+  - `setRefAttr(h, name, value)` — `Element.setAttribute`
+  - `setRefValue(h, v)` — `el.value` for form inputs
+  - `setRefClass(h, class, on: bool)` — classList add/remove
+  - `focusRef(h)` / `removeRef(h)` — focus + remove
+  - `refValueI32(h)` / `refValueF32(h)` — parse `el.value` as number
+  Bridge JS looks up `refHandles[h]`; stale / out-of-range handles
+  short-circuit to a no-op (read variants return 0) so wasm code stays
+  resilient against a hot-swapped build.
+
+  Closes one of the two "natural follow-ons" called out in the
+  post-Bundle-5 gap audit. Files: `src/client/dom.zig` (9 new externs
+  + native stubs + exports), `src/client/runtime.zig` (Zig wrappers),
+  `src/client/verve_client.zig` (re-exports), `src/bridge/verve.js`
+  + `templates/desktop/frontend/verve_desktop.js` (9 new handlers each).
+
 ## [0.1.17] - 2026-05-27
 
 ### Added

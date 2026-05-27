@@ -167,6 +167,51 @@
         return refHandles.length - 1;
       },
 
+      // ---- Per-handle NodeRef ops -------------------------------------
+      ref_set_text: (h, tp, tl) => {
+        const el = refHandles[h];
+        if (el) el.textContent = readStr(tp, tl);
+      },
+      ref_set_text_i32: (h, v) => {
+        const el = refHandles[h];
+        if (el) el.textContent = String(v | 0);
+      },
+      ref_set_attr: (h, np, nl, vp, vl) => {
+        const el = refHandles[h];
+        if (el) el.setAttribute(readStr(np, nl), readStr(vp, vl));
+      },
+      ref_set_value: (h, vp, vl) => {
+        const el = refHandles[h];
+        if (el) el.value = readStr(vp, vl);
+      },
+      ref_set_class: (h, cp, cl, on) => {
+        const el = refHandles[h];
+        if (!el) return;
+        const cls = readStr(cp, cl);
+        if (on) el.classList.add(cls);
+        else el.classList.remove(cls);
+      },
+      ref_focus: (h) => {
+        const el = refHandles[h];
+        if (el && typeof el.focus === "function") el.focus();
+      },
+      ref_remove: (h) => {
+        const el = refHandles[h];
+        if (el) el.remove();
+      },
+      ref_get_value_i32: (h) => {
+        const el = refHandles[h];
+        if (!el) return 0;
+        const n = parseInt(el.value, 10);
+        return Number.isFinite(n) ? n | 0 : 0;
+      },
+      ref_get_value_f32: (h) => {
+        const el = refHandles[h];
+        if (!el) return 0;
+        const n = parseFloat(el.value);
+        return Number.isFinite(n) ? n : 0;
+      },
+
       console_log_i32: (v) => console.log("verve:", v | 0),
     },
   };

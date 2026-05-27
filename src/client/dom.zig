@@ -157,6 +157,53 @@ const WasmBridge = struct {
         id_ptr: [*]const u8,
         id_len: usize,
     ) i32;
+
+    // ---- Per-handle NodeRef mutation / introspection ------------------------
+    // `handle` is a value returned from `query_ref`. Bridge looks it up
+    // in its `refHandles[]` array. Out-of-range / unbound handles are
+    // silently ignored — keeps the wasm side resilient to a stale
+    // handle against a hot-swapped wasm build.
+
+    pub extern "verve" fn ref_set_text(
+        handle: i32,
+        text_ptr: [*]const u8,
+        text_len: usize,
+    ) void;
+
+    pub extern "verve" fn ref_set_text_i32(handle: i32, value: i32) void;
+
+    pub extern "verve" fn ref_set_attr(
+        handle: i32,
+        name_ptr: [*]const u8,
+        name_len: usize,
+        value_ptr: [*]const u8,
+        value_len: usize,
+    ) void;
+
+    pub extern "verve" fn ref_set_value(
+        handle: i32,
+        value_ptr: [*]const u8,
+        value_len: usize,
+    ) void;
+
+    pub extern "verve" fn ref_set_class(
+        handle: i32,
+        class_ptr: [*]const u8,
+        class_len: usize,
+        on: u32,
+    ) void;
+
+    pub extern "verve" fn ref_focus(handle: i32) void;
+    pub extern "verve" fn ref_remove(handle: i32) void;
+
+    /// Read `el.value` parsed as a base-10 integer. Returns 0 when the
+    /// handle is bad or the value doesn't parse — callers that need to
+    /// distinguish empty / unparseable should also read the text form.
+    pub extern "verve" fn ref_get_value_i32(handle: i32) i32;
+
+    /// Read `el.value` parsed as a float. Returns 0 when the handle is
+    /// bad or the value doesn't parse.
+    pub extern "verve" fn ref_get_value_f32(handle: i32) f32;
 };
 
 const NativeStub = struct {
@@ -178,6 +225,19 @@ const NativeStub = struct {
     pub fn query_ref(_: [*]const u8, _: usize) i32 {
         return 0;
     }
+    pub fn ref_set_text(_: i32, _: [*]const u8, _: usize) void {}
+    pub fn ref_set_text_i32(_: i32, _: i32) void {}
+    pub fn ref_set_attr(_: i32, _: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
+    pub fn ref_set_value(_: i32, _: [*]const u8, _: usize) void {}
+    pub fn ref_set_class(_: i32, _: [*]const u8, _: usize, _: u32) void {}
+    pub fn ref_focus(_: i32) void {}
+    pub fn ref_remove(_: i32) void {}
+    pub fn ref_get_value_i32(_: i32) i32 {
+        return 0;
+    }
+    pub fn ref_get_value_f32(_: i32) f32 {
+        return 0;
+    }
 };
 
 pub const set_text_by_bind = Bridge.set_text_by_bind;
@@ -196,3 +256,12 @@ pub const set_class_present_by_bind = Bridge.set_class_present_by_bind;
 pub const set_text_by_bind_f32 = Bridge.set_text_by_bind_f32;
 pub const server_fn_post = Bridge.server_fn_post;
 pub const query_ref = Bridge.query_ref;
+pub const ref_set_text = Bridge.ref_set_text;
+pub const ref_set_text_i32 = Bridge.ref_set_text_i32;
+pub const ref_set_attr = Bridge.ref_set_attr;
+pub const ref_set_value = Bridge.ref_set_value;
+pub const ref_set_class = Bridge.ref_set_class;
+pub const ref_focus = Bridge.ref_focus;
+pub const ref_remove = Bridge.ref_remove;
+pub const ref_get_value_i32 = Bridge.ref_get_value_i32;
+pub const ref_get_value_f32 = Bridge.ref_get_value_f32;

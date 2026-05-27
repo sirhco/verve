@@ -144,8 +144,7 @@
       // ---- NodeRef resolution -----------------------------------------
       // Map `data-ref="<id>"` to a JS-owned Element handle. Index 0 is
       // reserved for "not found"; live elements get indices >=1 in the
-      // module-scoped `refHandles` array. Per-handle mutation externs
-      // (set text / focus / etc.) land in a later bundle.
+      // module-scoped `refHandles` array.
       query_ref: (ip, il) => {
         const id = readStr(ip, il);
         const el = document.querySelector(
@@ -154,6 +153,53 @@
         if (!el) return 0;
         refHandles.push(el);
         return refHandles.length - 1;
+      },
+
+      // ---- Per-handle NodeRef ops -------------------------------------
+      // Each looks up `refHandles[h]`. Bad / stale handles short-circuit
+      // to a no-op so wasm code doesn't crash against a hot-swapped build.
+      ref_set_text: (h, tp, tl) => {
+        const el = refHandles[h];
+        if (el) el.textContent = readStr(tp, tl);
+      },
+      ref_set_text_i32: (h, v) => {
+        const el = refHandles[h];
+        if (el) el.textContent = String(v | 0);
+      },
+      ref_set_attr: (h, np, nl, vp, vl) => {
+        const el = refHandles[h];
+        if (el) el.setAttribute(readStr(np, nl), readStr(vp, vl));
+      },
+      ref_set_value: (h, vp, vl) => {
+        const el = refHandles[h];
+        if (el) el.value = readStr(vp, vl);
+      },
+      ref_set_class: (h, cp, cl, on) => {
+        const el = refHandles[h];
+        if (!el) return;
+        const cls = readStr(cp, cl);
+        if (on) el.classList.add(cls);
+        else el.classList.remove(cls);
+      },
+      ref_focus: (h) => {
+        const el = refHandles[h];
+        if (el && typeof el.focus === "function") el.focus();
+      },
+      ref_remove: (h) => {
+        const el = refHandles[h];
+        if (el) el.remove();
+      },
+      ref_get_value_i32: (h) => {
+        const el = refHandles[h];
+        if (!el) return 0;
+        const n = parseInt(el.value, 10);
+        return Number.isFinite(n) ? n | 0 : 0;
+      },
+      ref_get_value_f32: (h) => {
+        const el = refHandles[h];
+        if (!el) return 0;
+        const n = parseFloat(el.value);
+        return Number.isFinite(n) ? n : 0;
       },
     },
   };

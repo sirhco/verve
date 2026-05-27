@@ -586,6 +586,48 @@ pub fn queryRef(ref: anytype) ?i32 {
     return if (handle <= 0) null else handle;
 }
 
+// ---- Per-handle NodeRef ops --------------------------------------------
+//
+// Once `queryRef` has resolved a handle, downstream code reaches into
+// the live element through these wrappers. Each thin-wraps the matching
+// `dom.ref_*` extern; the bridge JS does the actual DOM work.
+
+pub fn setRefText(handle: i32, text: []const u8) void {
+    dom.ref_set_text(handle, text.ptr, text.len);
+}
+
+pub fn setRefTextI32(handle: i32, value: i32) void {
+    dom.ref_set_text_i32(handle, value);
+}
+
+pub fn setRefAttr(handle: i32, name: []const u8, value: []const u8) void {
+    dom.ref_set_attr(handle, name.ptr, name.len, value.ptr, value.len);
+}
+
+pub fn setRefValue(handle: i32, value: []const u8) void {
+    dom.ref_set_value(handle, value.ptr, value.len);
+}
+
+pub fn setRefClass(handle: i32, class: []const u8, on: bool) void {
+    dom.ref_set_class(handle, class.ptr, class.len, if (on) 1 else 0);
+}
+
+pub fn focusRef(handle: i32) void {
+    dom.ref_focus(handle);
+}
+
+pub fn removeRef(handle: i32) void {
+    dom.ref_remove(handle);
+}
+
+pub fn refValueI32(handle: i32) i32 {
+    return dom.ref_get_value_i32(handle);
+}
+
+pub fn refValueF32(handle: i32) f32 {
+    return dom.ref_get_value_f32(handle);
+}
+
 /// Reconcile a keyed parent against a new key/html pairing. Calls
 /// `reconciler.plan` to compute the minimum (insert | move | remove)
 /// op sequence then dispatches each op through the matching DOM
