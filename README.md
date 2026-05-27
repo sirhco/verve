@@ -61,11 +61,16 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 
 ### Reactivity (server + WASM client)
 - **Signal / Effect / Store / Resource** — full SolidJS/Leptos-style runtime, shared between server-side render and the WASM client.
-- **Owner tree** with `on_cleanup` (LIFO disposal).
+- **Owner tree** with `on_cleanup` (LIFO disposal); `verve.cleanup(handler)` registers teardown hooks against the runtime's root Owner.
 - **`untrack` / `batch`** escape hatches.
-- **Typed NodeRef** + `data-ref` markers.
+- **Typed NodeRef** + `data-ref` markers; `verve.queryRef(ref)` resolves to a JS-owned element handle, and `setRefText` / `setRefAttr` / `setRefValue` / `setRefClass` / `focusRef` / `removeRef` / `refValueI32` / `refValueF32` mutate or read the live element by handle.
 - **Reactive ErrorBoundary** — `Signal(?anyerror)` with `captureError` / `reset`.
 - **Client-side runtime** — the wasm bundle hosts the real reactive graph. `registerI32` / `registerStr` / `registerBool` / `registerF32` allocate Signals whose `on_set` hook drives DOM updates. Per-frame scratch allocator keeps memory bounded across re-runs.
+- **Typed bindings + auto-walker** (Phase 14) — `Node.bindI32` / `bindStr` / `bindBool` / `bindF32` stamp `data-vh-type` + `data-vh-initial` on the rendered element; the bridge JS walks every `[data-vh-type]` after instantiation and calls the matching `verve_register_<kind>` export. Apps no longer need to ship per-binding `verve_init_<name>` exports.
+- **Declarative `autoHydrate(bindings)`** — alternative to typed bindings; pass a slice of `Binding { name, initial }` and the runtime dispatches to the right registrar per entry.
+- **Idempotent register***. Second `register*` call with the same name returns the existing slot — safe for multi-instance islands and hot-reloaded chunks.
+- **Closure-style event handlers** — `verve.registerEvent(fn)` returns a `u32` slot id; stamp via `Node.onClickFn` / `onSubmitFn` / `onInputFn` / `onChangeFn` / `onKeydownFn` at render time. Bridge JS delegates route through `verve_event_dispatch(id)`; handler runs in WASM with whatever state it captured at registration.
+- **Slot-table introspection** — `slotCount` / `slotName(idx, buf)` / `slotKind(idx)` + the event-slot variants. Caps at 256 signal slots + 1024 event slots.
 - **Keyed-list reconciler** — LIS-based planner emits the minimum (insert | move | remove) op sequence; `ForEachHandle` caches key order so subsequent updates only diff the delta.
 
 ### Head + components
@@ -102,8 +107,16 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - `verve.island(ctx, opts, inner)` emits `<verve-island data-name=… data-props=…>` markers.
 - **Build-time manifest codegen** walks `app.islands` at comptime and emits `client_manifest.zig` listing every island's name, props schema, and chunk URL.
 - **Per-island WASM chunks** — `build.zig` parses `src/app/islands.zig` and builds one chunk per declared island (`src/client/islands/<Name>.zig` for custom logic, `_default.zig` as a shared stub).
-- **Shared linear memory** — chunks import their memory from the main `client.wasm` via `env.memory`, dropping per-chunk size to **~73 bytes** vs. ~180 B standalone. Total bytes-on-wire stays flat as you add more islands.
+- **Shared linear memory** — chunks import their memory from the main `client.wasm` via `env.memory`, dropping per-chunk size to **~73 bytes** for stubs (~290 B for chunks that ship real logic) vs. ~180 B standalone. Total bytes-on-wire stays flat as you add more islands.
 - **Lazy dispatch** — JS bridge fetches each chunk on first encounter, caches the instantiation, copies props through shared scratch, and calls `hydrate(ptr, len, root_id)`.
+- **Chunk-side reactive runtime** (Phase 13F) — chunks `@import("verve")` (the chunk-side façade) and call `registerI32` / `signalSetI32` / `signalGetI32` / `queryRef` / `setRefText` / `cleanup` / etc. via a `verve_runtime` import the bridge JS resolves against the main client's exports at instantiation. Per-island Signal registration without bouncing through the main client.
+- **Closure-style events from chunks** (Phase 13G) — `verve.registerEvent(&handler)` from a chunk lands in the main runtime's event-slot table; `call_indirect` dispatches via a **shared `__indirect_function_table`** (the main client exports it; chunks import it). No JS hops, no per-chunk handler-name registries.
+- **Multi-instance islands** — bridge JS assigns a document-order id to each `<verve-island>` marker and passes it through to the chunk's `hydrate(props_ptr, props_len, root_id)`. Chunks namespace per-instance state via `root_id` (e.g. `"counter_island_{d}"`).
+
+### Downstream wasm clients (`verve_client` module)
+- **`verve_client`** is a sibling module published from `build.zig` alongside `verve` — re-exports every reactive primitive a wasm client needs (Signal / Effect / Owner / Action / Resource / Store / ErrorBoundary), the DOM-wired adapter (`registerI32` + variants, `bindForEach` / `applyReconcile`, NodeRef ops, closure events, cleanup, slot introspection), and the SPA navigation + control-flow + suspense + i18n helpers.
+- **Drop-in for downstream apps** — the desktop template imports it as `@import("verve")` from its wasm client; downstream apps written against the same `verve_client` surface compile against both web and desktop targets unchanged.
+- **Bundled with the desktop scaffold** by default. `templates/desktop/src/client/main.zig` ships only the click handlers — every binding is registered automatically by the Phase-14 auto-walker.
 
 ### Dev + ops
 - **`--dev`** auto-reload: injects a WS-disconnect-reconnect script. Pair with `zig build --watch run -- --dev`.
@@ -191,6 +204,42 @@ exe_mod.addImport("verve", verve_dep.module("verve"));
 Now `@import("verve")` resolves inside your app code. The same
 `verve` module powers both the web server (`src/server/`) and the
 desktop scaffold's SSR pipeline.
+
+For wasm-target client code (the `src/client/main.zig` of a
+downstream app), use the sibling `verve_client` module — it carries
+the DOM-wired adapter, slot-table API, NodeRef ops, closure events,
+and cleanup hooks in addition to the reactive primitives:
+
+```zig
+const wasm_target = b.resolveTargetQuery(.{
+    .cpu_arch = .wasm32,
+    .os_tag = .freestanding,
+});
+const verve_client_mod = verve_dep.module("verve_client");
+
+const client_mod = b.createModule(.{
+    .root_source_file = b.path("src/client/main.zig"),
+    .target = wasm_target,
+    .optimize = .ReleaseSmall,
+    .imports = &.{
+        .{ .name = "verve", .module = verve_client_mod },
+    },
+});
+```
+
+Then the wasm client writes:
+
+```zig
+const verve = @import("verve");
+
+export fn increment_counter() void {
+    if (verve.signalI32("count")) |c| c.increment();
+}
+```
+
+No `verve_init_*` / `verve_hydrate` boilerplate when the SSR side
+uses `.bindI32("count", 0)` — the Phase-14 auto-walker registers
+every typed binding from the rendered HTML.
 
 ### Scaffold a new app pinned to a release
 

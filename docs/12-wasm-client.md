@@ -10,11 +10,11 @@ a parallel write path.
 
 | Module | Purpose |
 |---|---|
-| `src/client/verve_client.zig` | Public façade for downstream wasm clients — re-exports `Signal` / `Effect` / `Owner` + `registerI32` / `registerStr` / `registerBool` / `registerF32` + `bindForEach` |
-| `src/client/runtime_exports.zig` | Chunk-callable `export fn verve_*` wrappers — every reactive API a per-island chunk needs, name-keyed dispatch |
+| `src/client/verve_client.zig` | Public façade for downstream wasm clients — re-exports the full reactive surface: Signal / Effect / Owner / Action / Resource / Store / ErrorBoundary; register* + bindForEach + autoHydrate + cleanup; NodeRef ops; closure events; slot introspection; suspense + control-flow + link + i18n |
+| `src/client/runtime_exports.zig` | Chunk-callable `export fn verve_*` wrappers — every reactive API a per-island chunk needs, name-keyed dispatch + fn-pointer-as-u32 ABI for cross-module callbacks |
 | `src/client/island_runtime.zig` | Chunk-side façade (`extern "verve_runtime"` decls + friendly slice wrappers) — imported as `verve` from per-island chunks |
-| `src/client/main.zig`      | Exported wasm symbols + per-bind Signal wiring |
-| `src/client/runtime.zig`   | `registerI32` / `registerStr` / `registerBool` / `registerF32` + `ForEachHandle` + `bindForEach` |
+| `src/client/main.zig`      | Exported wasm symbols + per-bind Signal wiring; pulls `runtime_exports.zig` so the chunk-callable surface lands in the main client's export table |
+| `src/client/runtime.zig`   | `registerI32` / `registerStr` / `registerBool` / `registerF32` + `ForEachHandle` + `bindForEach` + `queryRef` + `setRef*` + `registerEvent` + `cleanup` + slot introspection |
 | `src/client/reconciler.zig`| LIS-based keyed-list planner. See [17 — Reconciler](17-reconciler.md). |
 | `src/client/island.zig`    | Per-binary island dispatch + registry |
 | `src/client/signal.zig`    | Legacy `ClientSignal(T)` — kept for pre-Phase-12 callers |
@@ -155,9 +155,60 @@ keep whatever state they captured at registration — no flat-namespace
 export name required.
 
 Both flavors coexist: `[z-on-click]` and `[z-on-click-id]` can land on
-the same node, with id-style winning. The id table holds up to 256
+the same node, with id-style winning. The id table holds up to 1024
 entries (raise `MAX_EVENT_SLOTS` in `runtime.zig` if a real app
 needs more).
+
+Beyond click, the same `registerEvent` + `onClickFn`-style binding
+applies to four other event types via `Node.onSubmitFn` /
+`onInputFn` / `onChangeFn` / `onKeydownFn`. Submit handlers get
+`preventDefault()` so the native form post is suppressed;
+input / change / keydown run alongside the native handling so the
+native input update isn't blocked. Handler signature stays
+`fn () void` — input-event handlers read the new value via the
+NodeRef primitives below.
+
+## NodeRef ops
+
+`Node.ref(noderef)` at render time stamps `data-ref="<id>"`. The
+client-side resolution is **two-step**:
+
+1. `verve.queryRef(ref) ?i32` looks up `[data-ref="<id>"]` and
+   returns a JS-owned element handle (`null` on miss).
+2. Mutation / introspection via the handle:
+   - `setRefText(h, text)` / `setRefTextI32(h, v)` — `el.textContent`
+   - `setRefAttr(h, name, value)` — `Element.setAttribute`
+   - `setRefValue(h, v)` — `el.value` for form inputs
+   - `setRefClass(h, class, on: bool)` — `classList` add/remove
+   - `focusRef(h)` / `removeRef(h)` — focus + remove
+   - `refValueI32(h)` / `refValueF32(h)` — parse `el.value` as number
+     (returns 0 on bad / empty)
+
+Out-of-range or stale handles short-circuit to a no-op (reads return
+0) so wasm-side code stays resilient against a hot-swapped build.
+
+## Cleanup hooks
+
+`verve.cleanup(handler)` registers a `*const fn () void` against the
+runtime's root Owner. Handlers run in LIFO order when the Owner
+disposes. Today the Owner only disposes on test reset, so the hook
+is dormant in production — the API exists so apps can declare
+resource teardown ahead of the future SPA-navigation work that will
+dispose per-route owners between pages.
+
+## Slot-table introspection
+
+| Function | Purpose |
+|---|---|
+| `slotCount() u32` | Number of signal slots currently allocated |
+| `slotCapacity() u32` | Static cap (256) — `@panic` past this; bump `MAX_SLOTS` |
+| `slotName(idx, buf) []const u8` | Copy the bind-name at `idx` into `buf` |
+| `slotKind(idx) ?TypeTag` | Type tag (i32 / str / bool / f32) of the slot |
+| `eventSlotCount() u32` | Number of closure-style event handlers registered |
+| `eventSlotCapacity() u32` | Static cap (1024) — bump `MAX_EVENT_SLOTS` |
+
+Useful for in-page debug overlays, hydration log lines that pin down
+which bindings registered, and capacity-watch dashboards.
 
 ## Consuming from a downstream app
 
@@ -182,29 +233,34 @@ const client_mod = b.createModule(.{
 });
 ```
 
+With typed bindings (recommended — Phase 14 auto-walker handles
+registration):
+
 ```zig
-// src/client/main.zig (downstream)
+// components.zig — server-side render
+ctx.span().bindI32("count", 0).textInt(@as(i32, 0))
+
+// src/client/main.zig (downstream) — only click handlers needed
 const verve = @import("verve");
 
-var count_sig: ?*verve.Signal(i32) = null;
-var initial_count: i32 = 0;
-
-export fn verve_init_count(v: i32) void { initial_count = v; }
-
-export fn verve_hydrate() void {
-    count_sig = verve.registerI32("count", initial_count);
-}
-
 export fn increment_counter() void {
-    if (count_sig) |c| c.increment();   // → on_set → DOM
+    if (verve.signalI32("count")) |c| c.increment();   // → on_set → DOM
 }
 ```
 
+The auto-walker, running right after `verve_hydrate`, finds the
+typed binding via `[data-vh-type="i32"]`, stages the name + initial
+through the runtime's island scratch buffer, and calls
+`verve_register_i32` — same registration the manual path would have
+made, no per-bind boilerplate. The legacy `.bind("count")` +
+`verve_init_count` + `verve_hydrate` flow still works (idempotent
+`register*` since v0.1.21 means both paths coexist safely).
+
 The bridge JS must provide the DOM externs the adapter calls
 (`set_text_by_bind_i32`, `set_class_present_by_bind`, the keyed-list
-primitives, …). `templates/desktop/frontend/verve_desktop.js` is the
-reference port; `src/bridge/verve.js` is the framework's own full
-implementation.
+primitives, the NodeRef ops, …). `templates/desktop/frontend/verve_desktop.js`
+is the reference port; `src/bridge/verve.js` is the framework's own
+full implementation.
 
 ## Exports
 

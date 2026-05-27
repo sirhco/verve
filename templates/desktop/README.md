@@ -84,28 +84,43 @@ Interactive state lives in `src/client/main.zig`, compiled to
 - Click delegate dispatches `[z-on-click="<name>"]` to the matching
   WASM export.
 
-To add a new reactive piece:
+To add a new reactive piece (typed bindings — recommended):
 
-1. Mark the element in `components.zig` with `.bind("name")` and an
-   initial value via `.textInt(0)` or `.text("...")`.
-2. Add a `verve_init_name(value: i32)` export in
-   `src/client/main.zig` that stashes the seed in a module-level
-   `var initial_name: i32 = 0;`.
-3. In `verve_hydrate`, allocate the Signal via
-   `name_sig = verve.registerI32("name", initial_name);` — the
-   runtime wires its `on_set` hook to the matching DOM element.
-4. In click / IPC handlers, mutate via `name_sig.?.set(value)` (or
-   `.increment()` / `.decrement()` for numeric types). DOM updates
+1. Mark the element in `components.zig` with `.bindI32("name", 0)`
+   (or `.bindStr` / `.bindBool` / `.bindF32`). The renderer stamps
+   `data-vh-type` + `data-vh-initial` (+ `data-vh-class` for bool)
+   alongside the existing `z-bind` / `data-vh` markers.
+2. After main wasm instantiation the bridge JS auto-walker finds
+   the element, stages the name + initial through the runtime's
+   island scratch buffer, and calls `verve_register_<kind>`.
+   No `verve_init_<name>` export needed.
+3. In click / IPC handlers, look the Signal up by name and mutate:
+   `if (verve.signalI32("name")) |c| c.increment();`. DOM updates
    fall out of the reactive graph — never call `set_text_by_bind_*`
    directly.
-5. Wire any UI control with `.onClick("handler")` to dispatch the
-   handler.
+4. Wire any UI control with `.onClick("handler_export_name")` for
+   string-name dispatch, or `.onClickFn(slot_id)` for closure-style
+   dispatch where `slot_id` came from `verve.registerEvent(&fn)`.
+   The same `onSubmitFn` / `onInputFn` / `onChangeFn` / `onKeydownFn`
+   variants cover the four other event kinds.
+
+For direct DOM access (e.g. focus an input from a click handler),
+attach a `NodeRef` via `.ref(noderef)`, resolve at runtime via
+`verve.queryRef(noderef)`, and mutate via `verve.setRefText` /
+`setRefAttr` / `setRefValue` / `focusRef` / `removeRef` /
+`refValueI32` / `refValueF32`.
 
 The wasm client imports the framework's reactive runtime via the
 public `verve_client` module — `const verve = @import("verve");`
 inside `src/client/main.zig` resolves to the wasm façade that
-re-exports `Signal` / `registerI32` / `bindForEach` / etc. See
-`docs/12-wasm-client.md` for the full surface.
+re-exports `Signal`, `registerI32` / `Str` / `Bool` / `F32`,
+`autoHydrate`, `registerEvent`, `cleanup`, `queryRef` + `setRef*`,
+plus `suspense` / `transition` / `show` / `forEach` / `portal` /
+`link` / i18n. See `docs/12-wasm-client.md` for the full surface.
+
+The scaffold's `src/client/main.zig` ships **only the click
+handlers** — registration happens entirely via typed bindings +
+the auto-walker.
 
 ## IPC — typed Router (recommended)
 

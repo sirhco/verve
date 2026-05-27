@@ -94,8 +94,14 @@ reference. Headline list:
 - **SSR pipeline** — Verve `Node` tree → `Renderer.render` → embedded
   `index.html` at build time
 - **WASM hydration** — `src/client/main.zig` compiled to
-  wasm32-freestanding, served at `verve://app/client.wasm`, seeded
-  by `verve_init_*` exports and click-delegated via `z-on-click`
+  wasm32-freestanding, served at `verve://app/client.wasm`, imports
+  the `verve_client` module for the full reactive surface.
+  Scaffold uses typed bindings (`.bindI32` / `.bindStr` / etc.) so
+  the Phase-14 JS auto-walker handles registration — no
+  `verve_init_*` boilerplate needed; the scaffold's `main.zig` ships
+  only the click handlers. Both `[z-on-click="<name>"]` (string
+  dispatch) and `[z-on-click-id="<id>"]` (closure dispatch via
+  `verve.registerEvent(&fn)`) are wired in the bridge JS delegate
 - **Typed IPC** — `desktop.Router(Ctx, Routes)` with `Args`/`Reply`
   types per route; JS callers `await window.verve.request({type, ...})`
 - **Cookies** — per-window `CookieStore` with `set`/`get`/`delete`/`clear`,
