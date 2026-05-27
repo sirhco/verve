@@ -272,6 +272,23 @@
     console.log("verve: deep-link", url);
   };
 
+  // Closure-style event dispatch. Looks for `z-on-<event>-id="<n>"`
+  // on the closest ancestor of `e.target`, parses the slot id, and
+  // calls `verve_event_dispatch(id)` — the runtime invokes the fn
+  // pointer registered via `verve.registerEvent(...)`. Returns true
+  // when a handler ran so the caller can decide whether to also fall
+  // through to other dispatch paths.
+  const dispatchEventId = (e, attr, prevent) => {
+    const node = e.target.closest(`[${attr}]`);
+    if (!node) return false;
+    const id = parseInt(node.getAttribute(attr), 10);
+    if (!Number.isFinite(id)) return false;
+    if (typeof exp.verve_event_dispatch !== "function") return false;
+    if (prevent) e.preventDefault();
+    exp.verve_event_dispatch(id >>> 0);
+    return true;
+  };
+
   // Delegated click handler. Two flavors coexist:
   //
   //   [z-on-click="<name>"]   → string-name dispatch; calls `exp[name]()`.
@@ -283,15 +300,7 @@
   // state it captured at registration. Both forms can appear on the
   // same node; id wins if both are stamped.
   document.addEventListener("click", (e) => {
-    const targetId = e.target.closest("[z-on-click-id]");
-    if (targetId) {
-      const id = parseInt(targetId.getAttribute("z-on-click-id"), 10);
-      if (Number.isFinite(id) && typeof exp.verve_event_dispatch === "function") {
-        e.preventDefault();
-        exp.verve_event_dispatch(id >>> 0);
-        return;
-      }
-    }
+    if (dispatchEventId(e, "z-on-click-id", true)) return;
     const target = e.target.closest("[z-on-click]");
     if (!target) return;
     const action = target.getAttribute("z-on-click");
@@ -302,6 +311,25 @@
     } else {
       console.warn("verve: no wasm export for action", action);
     }
+  });
+
+  // Delegated submit / input / change / keydown. Same dispatch model
+  // as click-id — handler is `fn () void`; reads incoming state via
+  // `verve.refValueI32` / `refValueF32` against a co-stamped NodeRef.
+  // Submit gets `preventDefault()` so the native form post doesn't
+  // fire; input / change / keydown do NOT, so the native input still
+  // updates and the handler runs alongside it.
+  document.addEventListener("submit", (e) => {
+    dispatchEventId(e, "z-on-submit-id", true);
+  });
+  document.addEventListener("input", (e) => {
+    dispatchEventId(e, "z-on-input-id", false);
+  });
+  document.addEventListener("change", (e) => {
+    dispatchEventId(e, "z-on-change-id", false);
+  });
+  document.addEventListener("keydown", (e) => {
+    dispatchEventId(e, "z-on-keydown-id", false);
   });
 
   // ---- Level-3 smoke driver ---------------------------------------------

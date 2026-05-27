@@ -30,13 +30,19 @@ pub const Node = struct {
     content_type_override: ?[]const u8 = null,
     z_bind_name: ?[]const u8 = null,
     z_on_click_action: ?[]const u8 = null,
-    /// Closure-style click handler: index into the wasm runtime's
-    /// `event_slots` table populated by `verve.registerEvent`. Stamped
-    /// onto the rendered HTML as `z-on-click-id="<n>"`; the JS bridge's
-    /// click delegate dispatches it through `verve_event_dispatch(n)`.
-    /// Mutually compatible with `z_on_click_action` — both can coexist
-    /// on one node, though apps typically pick a single style.
+    /// Closure-style event slot ids. Each corresponds to a `*const fn
+    /// () void` registered via `verve.registerEvent(...)` in the wasm
+    /// runtime. The renderer stamps `z-on-<event>-id="<n>"` and the JS
+    /// bridge's delegated listener for that event type dispatches the
+    /// id through `verve_event_dispatch(n)`. Handler runs in WASM with
+    /// whatever state it captured at registration; input/change
+    /// handlers typically read the new value via `refValueI32` /
+    /// `refValueF32` against a co-stamped NodeRef.
     z_on_click_id: ?u32 = null,
+    z_on_submit_id: ?u32 = null,
+    z_on_input_id: ?u32 = null,
+    z_on_change_id: ?u32 = null,
+    z_on_keydown_id: ?u32 = null,
     /// When set, the server short-circuits rendering and sends a
     /// redirect response (302/303) instead of HTML. Populated via
     /// `ctx.redirect("/login")`.
@@ -174,6 +180,44 @@ pub const Node = struct {
     pub fn onClickFn(self: *Node, slot_id: u32) *Node {
         if (self.err != null) return self;
         self.z_on_click_id = slot_id;
+        return self;
+    }
+
+    /// Closure-style `submit` handler. Renderer stamps
+    /// `z-on-submit-id="<slot_id>"`; the bridge's delegated submit
+    /// listener calls `verve_event_dispatch(slot_id)` and
+    /// `preventDefault()` so the native form post does not fire.
+    pub fn onSubmitFn(self: *Node, slot_id: u32) *Node {
+        if (self.err != null) return self;
+        self.z_on_submit_id = slot_id;
+        return self;
+    }
+
+    /// Closure-style `input` handler. Fires on every keystroke against
+    /// `<input>` / `<textarea>` — the bridge does NOT call
+    /// `preventDefault()` so the input still updates natively. Read the
+    /// new value via `verve.refValueI32` / `refValueF32` against a
+    /// co-stamped NodeRef.
+    pub fn onInputFn(self: *Node, slot_id: u32) *Node {
+        if (self.err != null) return self;
+        self.z_on_input_id = slot_id;
+        return self;
+    }
+
+    /// Closure-style `change` handler. Fires when an input commits
+    /// (blur / Enter on text inputs, selection on `<select>` /
+    /// checkbox / radio). No `preventDefault()`.
+    pub fn onChangeFn(self: *Node, slot_id: u32) *Node {
+        if (self.err != null) return self;
+        self.z_on_change_id = slot_id;
+        return self;
+    }
+
+    /// Closure-style `keydown` handler. No `preventDefault()` — the
+    /// native key handling still runs.
+    pub fn onKeydownFn(self: *Node, slot_id: u32) *Node {
+        if (self.err != null) return self;
+        self.z_on_keydown_id = slot_id;
         return self;
     }
 

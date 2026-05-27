@@ -4,6 +4,30 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.19] - 2026-05-27
+
+### Added
+
+- Closure-style event handlers for `submit`, `input`, `change`, and
+  `keydown` — companion methods to `Node.onClickFn` shipped in
+  v0.1.17. Each takes a `u32` slot id returned by
+  `verve.registerEvent(...)`; the renderer stamps
+  `z-on-<event>-id="<n>"`; bridge JS registers a delegated listener
+  per event type and routes the id through the same
+  `verve_event_dispatch(id)` export. Submit handlers run with
+  `preventDefault()` so the native form post does not fire;
+  input / change / keydown run alongside the native handling.
+  Handler signature stays `fn () void` — input-event handlers read
+  the new value via `verve.refValueI32` / `refValueF32` against a
+  co-stamped NodeRef (Bundle 6 surface).
+
+  Closes the second of the two "natural follow-ons" from the
+  post-Bundle-5 gap audit. Files: `src/core/node.zig` (4 new
+  fields + 4 new methods), `src/core/renderer.zig` (4 new attr
+  stamps), `src/bridge/verve.js` + `templates/desktop/frontend/
+  verve_desktop.js` (factored `dispatchEventId` helper + 4 new
+  delegated listeners).
+
 ## [0.1.18] - 2026-05-27
 
 ### Added

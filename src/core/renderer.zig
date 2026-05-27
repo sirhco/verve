@@ -126,6 +126,18 @@ pub const Renderer = struct {
         if (node.z_on_click_id) |id| {
             try w.print(" z-on-click-id=\"{d}\"", .{id});
         }
+        if (node.z_on_submit_id) |id| {
+            try w.print(" z-on-submit-id=\"{d}\"", .{id});
+        }
+        if (node.z_on_input_id) |id| {
+            try w.print(" z-on-input-id=\"{d}\"", .{id});
+        }
+        if (node.z_on_change_id) |id| {
+            try w.print(" z-on-change-id=\"{d}\"", .{id});
+        }
+        if (node.z_on_keydown_id) |id| {
+            try w.print(" z-on-keydown-id=\"{d}\"", .{id});
+        }
 
         if (node_mod.isVoidTag(node.tag)) {
             try w.writeAll(">");
