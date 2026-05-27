@@ -130,6 +130,21 @@ pub const dispatchEvent = runtime.dispatchEvent;
 
 pub const cleanup = runtime.cleanup;
 
+// ---- Reactive lists ------------------------------------------------------
+//
+// `listDiff(parent, old_keys, new_keys, new_html)` runs the keyed-list
+// reconciler against the live DOM. Caller renders each row's HTML
+// into its own buffer first; the runtime plans the minimum op
+// sequence (insert / move / remove) and dispatches via the bridge
+// JS's keyed-child primitives.
+//
+// Pairs naturally with the "list-of-keys + per-row scalar Signals"
+// pattern documented in `docs/12-wasm-client.md`. For an effect-
+// driven version that re-runs on Signal change + caches the previous
+// key order, reach for `bindForEach` instead.
+
+pub const listDiff = runtime.applyReconcile;
+
 pub const TypeTag = runtime.TypeTag;
 pub const slotCount = runtime.slotCount;
 pub const slotCapacity = runtime.slotCapacity;

@@ -20,8 +20,10 @@
 //! `z-on-click="<exportName>"` and the bridge JS string-name delegate
 //! routes into the chunk's own exported function.
 
+const std = @import("std");
 const runtime = @import("runtime.zig");
 const dom = @import("dom.zig");
+const client_alloc = @import("allocator.zig");
 
 // ---- Signal registration (register-and-forget) ---------------------------
 
@@ -224,6 +226,38 @@ export fn verve_cleanup(handler_idx: u32) void {
     runtime.cleanup(handler) catch return;
 }
 
+// ---- Keyed-list reconciler (chunk-callable) ------------------------------
+//
+// Wasm-MVP-callable wrapper around `runtime.applyReconcile`. Each
+// list-of-slices arg crosses as `(*[]const u8, count)` — Zig slices
+// are `(ptr, len)` pairs in linear memory, and that layout is shared
+// across chunk + main runtime so the pointer-to-slice-header form
+// resolves to the same bytes on both sides. The runtime allocates a
+// short-lived arena under the long-lived bump heap for the planner's
+// scratch; the arena disposes at function return so subsequent calls
+// don't leak.
+
+export fn verve_list_diff(
+    parent_ptr: [*]const u8,
+    parent_len: u32,
+    old_keys_ptr: [*]const []const u8,
+    old_keys_count: u32,
+    new_keys_ptr: [*]const []const u8,
+    new_keys_count: u32,
+    new_html_ptr: [*]const []const u8,
+    new_html_count: u32,
+) void {
+    if (new_keys_count != new_html_count) return;
+    const parent = parent_ptr[0..parent_len];
+    const old_keys = old_keys_ptr[0..old_keys_count];
+    const new_keys = new_keys_ptr[0..new_keys_count];
+    const new_html = new_html_ptr[0..new_html_count];
+
+    var arena = std.heap.ArenaAllocator.init(client_alloc.allocator());
+    defer arena.deinit();
+    runtime.applyReconcile(arena.allocator(), parent, old_keys, new_keys, new_html) catch return;
+}
+
 // ---- Slot-table introspection (chunk-callable) --------------------------
 
 export fn verve_slot_count() u32 {
@@ -260,7 +294,6 @@ export fn verve_slot_kind(idx: u32) u32 {
 
 // ---- Tests ---------------------------------------------------------------
 
-const std = @import("std");
 const testing = std.testing;
 
 test "verve_register_i32 + verve_signal_set_i32 + verve_signal_get_i32 round-trip" {
@@ -298,6 +331,45 @@ test "verve_register_str + verve_signal_get_str two-call read" {
     verve_signal_set_str(name.ptr, name.len, next.ptr, next.len);
     const wrote2 = verve_signal_get_str(name.ptr, name.len, &buf, buf.len);
     try testing.expectEqualStrings("world!", buf[0..wrote2]);
+}
+
+test "verve_list_diff plans + dispatches against native dom stubs" {
+    runtime.resetForTesting();
+
+    // Native dom stubs are no-ops; the load-bearing assertion is that
+    // the export accepts the slice-of-slices form and reaches
+    // applyReconcile without crashing.
+    const parent = "items";
+    const old_keys = [_][]const u8{ "a", "b", "c" };
+    const new_keys = [_][]const u8{ "c", "a", "d" };
+    const new_html = [_][]const u8{
+        "<li data-vkey=\"c\">C</li>",
+        "<li data-vkey=\"a\">A</li>",
+        "<li data-vkey=\"d\">D</li>",
+    };
+    verve_list_diff(
+        parent.ptr,
+        @intCast(parent.len),
+        &old_keys,
+        @intCast(old_keys.len),
+        &new_keys,
+        @intCast(new_keys.len),
+        &new_html,
+        @intCast(new_html.len),
+    );
+
+    // Length-mismatched call short-circuits without panicking.
+    const short_html = [_][]const u8{"<li>only</li>"};
+    verve_list_diff(
+        parent.ptr,
+        @intCast(parent.len),
+        &old_keys,
+        @intCast(old_keys.len),
+        &new_keys,
+        @intCast(new_keys.len),
+        &short_html,
+        @intCast(short_html.len),
+    );
 }
 
 test "verve_register_bool + verve_signal_set_bool + verve_signal_get_bool" {

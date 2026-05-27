@@ -55,6 +55,17 @@ extern "verve_runtime" fn verve_register_event(handler_idx: u32) u32;
 extern "verve_runtime" fn verve_dispatch_event(id: u32) void;
 extern "verve_runtime" fn verve_cleanup(handler_idx: u32) void;
 
+extern "verve_runtime" fn verve_list_diff(
+    parent_ptr: [*]const u8,
+    parent_len: u32,
+    old_keys_ptr: [*]const []const u8,
+    old_keys_count: u32,
+    new_keys_ptr: [*]const []const u8,
+    new_keys_count: u32,
+    new_html_ptr: [*]const []const u8,
+    new_html_count: u32,
+) void;
+
 extern "verve_runtime" fn verve_slot_count() u32;
 extern "verve_runtime" fn verve_slot_capacity() u32;
 extern "verve_runtime" fn verve_event_slot_count() u32;
@@ -207,6 +218,34 @@ pub fn dispatchEvent(id: u32) void {
 /// function table wired in Phase 13G.
 pub fn cleanup(handler: *const fn () void) void {
     verve_cleanup(@intCast(@intFromPtr(handler)));
+}
+
+/// Reconcile a keyed list against the live DOM. `parent_bind` names
+/// the `[z-bind]` / `[data-vh]` parent element; `old_keys` is the
+/// key order the parent currently holds; `new_keys` + `new_html` are
+/// parallel slices for the target order. The runtime plans the
+/// minimum (insert | move | remove) op sequence and dispatches each
+/// op through the bridge JS's keyed-child primitives.
+///
+/// Callers typically render `new_html[i]` for each `new_keys[i]` into
+/// their own buffer before this call. `new_keys.len` must equal
+/// `new_html.len` (mismatched lengths short-circuit to a no-op).
+pub fn listDiff(
+    parent_bind: []const u8,
+    old_keys: []const []const u8,
+    new_keys: []const []const u8,
+    new_html: []const []const u8,
+) void {
+    verve_list_diff(
+        parent_bind.ptr,
+        @intCast(parent_bind.len),
+        old_keys.ptr,
+        @intCast(old_keys.len),
+        new_keys.ptr,
+        @intCast(new_keys.len),
+        new_html.ptr,
+        @intCast(new_html.len),
+    );
 }
 
 /// Slot-table introspection from a chunk. Useful for in-chunk

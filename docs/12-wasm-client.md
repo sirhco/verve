@@ -187,6 +187,50 @@ client-side resolution is **two-step**:
 Out-of-range or stale handles short-circuit to a no-op (reads return
 0) so wasm-side code stays resilient against a hot-swapped build.
 
+## Reactive lists
+
+Client-side Signals are intentionally scalar-only (`i32` / `str` /
+`bool` / `f32`). A `Signal(struct { ... })` would force either
+per-set JSON serialization or VDOM-style diff — both fight the
+framework's "DOM as a consequence of `Signal.set`" model. For
+list-shaped state, decompose:
+
+- **List-of-keys** — a `Signal([]const u8)` or just a length scalar
+  plus a stable derivation. Holds the current ordering.
+- **Per-row scalars** — one `registerI32` / `registerStr` / etc. per
+  row × per field. Names are namespaced by the row's key
+  (e.g. `"todo_42_text"`). Idempotent `register*` makes re-registering
+  on row insert safe.
+- **`verve.listDiff(parent, old_keys, new_keys, new_html)`** —
+  reconciler call that plans the minimum (insert | move | remove)
+  op sequence and dispatches via the bridge JS's keyed-child
+  primitives. Each `new_html[i]` is the prerendered markup for
+  `new_keys[i]`; mismatched lengths short-circuit.
+
+```zig
+// Render each row's HTML into a per-frame scratch buffer, then
+// dispatch the diff. `scratch.allocator()` is the runtime's
+// 256 KB bump arena reset between effect re-runs.
+const verve = @import("verve");
+
+fn renderRows(arena: std.mem.Allocator, rows: []const Row) !ForEachData {
+    const keys = try arena.alloc([]const u8, rows.len);
+    const html = try arena.alloc([]const u8, rows.len);
+    for (rows, 0..) |row, i| {
+        keys[i] = try std.fmt.allocPrint(arena, "row_{d}", .{row.id});
+        html[i] = try std.fmt.allocPrint(arena,
+            "<li data-vkey=\"row_{d}\">{s}</li>", .{row.id, row.label});
+    }
+    return .{ .keys = keys, .html = html };
+}
+```
+
+For an effect-driven version that re-runs on Signal change and
+caches the previous key order automatically, reach for
+`verve.bindForEach(handle, ctx, render_fn)` instead — same
+reconciler underneath, scratch reset wrapped, key cache stored on
+the handle.
+
 ## Cleanup hooks
 
 `verve.cleanup(handler)` registers a `*const fn () void` against the

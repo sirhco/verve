@@ -4,6 +4,39 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.27] - 2026-05-27
+
+### Added
+
+- **Wasm-callable keyed-list reconciler** (G1). New
+  `verve_list_diff(parent_ptr, parent_len, old_keys_ptr,
+  old_keys_count, new_keys_ptr, new_keys_count, new_html_ptr,
+  new_html_count)` export wraps `runtime.applyReconcile` for
+  per-island chunks. Slice-of-slice args cross as
+  `[*]const []const u8` + count pairs — Zig slices share their
+  `(ptr, len)` layout across chunk + main runtime so no packing is
+  needed. The runtime allocates a short-lived arena under the
+  long-lived bump heap for the planner's scratch and disposes it on
+  return.
+
+  Chunk-side façade in `src/client/island_runtime.zig` exposes the
+  friendly `verve.listDiff(parent, old_keys, new_keys, new_html)`
+  wrapper. Re-exported through `verve_client` as `verve.listDiff`.
+  Bridge JS adds `verve_list_diff` to the `verveRuntime` import
+  object. Length-mismatched calls short-circuit; native dom stubs
+  let the unit test exercise the dispatch path without a real DOM.
+
+### Docs
+
+- **G4 — Reactive lists** pattern documented in
+  `docs/12-wasm-client.md`. Client-side Signals are intentionally
+  scalar-only (`i32` / `str` / `bool` / `f32`); for list-shaped
+  state, decompose into a list-of-keys Signal + per-row scalar
+  Signals + `verve.listDiff` for ordering. The legacy
+  `bindForEach(handle, ctx, render_fn)` path stays the
+  effect-driven option that re-runs on Signal change and caches
+  the previous key order.
+
 ## [0.1.26] - 2026-05-27
 
 ### Added

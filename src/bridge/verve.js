@@ -504,6 +504,7 @@
     verve_register_event: exp.verve_register_event,
     verve_dispatch_event: exp.verve_dispatch_event,
     verve_cleanup: exp.verve_cleanup,
+    verve_list_diff: exp.verve_list_diff,
     verve_slot_count: exp.verve_slot_count,
     verve_slot_capacity: exp.verve_slot_capacity,
     verve_event_slot_count: exp.verve_event_slot_count,
