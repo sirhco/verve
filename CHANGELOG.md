@@ -4,6 +4,23 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.14] - 2026-05-27
+
+### Added
+
+- Desktop bridge JS gains `server_fn_post` and `post_json_i32`
+  externs (Bundle 2 of the verve_client gap-close plan). Both
+  translate the web `/api/<name>` POST contract into a fire-and-
+  forget IPC message via `window.verve.send`, so wasm-side code
+  written against `verve.serverFnGen.post(...)` or `dom.post_json_i32`
+  runs identically on desktop builds. `post_json_i32` strips a
+  leading `/api/` prefix from the path and uses the remainder as
+  the IPC route `type`; routes without the prefix dispatch
+  verbatim. Schema drift between the action's `Args` and the
+  registered Router route surfaces as a parse failure in the
+  handler — the bridge logs invalid JSON bodies and IPC send
+  errors to the console.
+
 ## [0.1.13] - 2026-05-27
 
 ### Added

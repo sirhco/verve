@@ -109,6 +109,48 @@
         });
       },
 
+      // ---- Server-fn / typed POST externs routed through the IPC channel ----
+      //
+      // Desktop apps have no HTTP `/api/<name>` endpoint — the
+      // equivalent of an `Action.post(args)` is a fire-and-forget IPC
+      // message dispatched to a route registered in `src/handlers.zig`.
+      // Translate the externs so wasm-side code written against the
+      // web `server_fn_post` / `post_json_i32` contract Just Works.
+      //
+      // The IPC router expects each route's `Args` type to match the
+      // JSON payload shape. Schema drift surfaces as a parse failure
+      // in the matching route handler.
+      server_fn_post: (np, nl, bp, bl) => {
+        const name = readStr(np, nl);
+        const body = readStr(bp, bl);
+        let args = {};
+        try {
+          args = body.length > 0 ? JSON.parse(body) : {};
+        } catch (err) {
+          console.error("verve server_fn_post: invalid JSON body:", err);
+          return;
+        }
+        try {
+          window.verve.send(Object.assign({ type: name }, args));
+        } catch (err) {
+          console.error("verve server_fn_post failed:", err);
+        }
+      },
+      post_json_i32: (pp, pl, fp, fl, v) => {
+        const path = readStr(pp, pl);
+        const field = readStr(fp, fl);
+        // Web semantics: POST `/api/<name>` with `{<field>: <i32>}`.
+        // Desktop translation: strip a leading `/api/` segment and use
+        // the remainder as the IPC route type. Paths without that prefix
+        // are dispatched verbatim (lets callers reach non-/api routes too).
+        const route = path.startsWith("/api/") ? path.slice(5) : path;
+        try {
+          window.verve.send({ type: route, [field]: v | 0 });
+        } catch (err) {
+          console.error("verve post_json_i32 failed:", err);
+        }
+      },
+
       console_log_i32: (v) => console.log("verve:", v | 0),
     },
   };
