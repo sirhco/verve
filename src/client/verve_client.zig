@@ -121,6 +121,15 @@ pub const dispatchEvent = runtime.dispatchEvent;
 // for in-page debug overlays, hydration log lines, and capacity-watch
 // dashboards.
 
+// ---- Cleanup hooks ------------------------------------------------------
+//
+// `cleanup(fn)` registers a `*const fn() void` against the runtime's
+// root Owner. Handlers run in LIFO order when the Owner disposes
+// (today: only via test reset; future SPA navigation will dispose
+// per-route owners between pages).
+
+pub const cleanup = runtime.cleanup;
+
 pub const TypeTag = runtime.TypeTag;
 pub const slotCount = runtime.slotCount;
 pub const slotCapacity = runtime.slotCapacity;

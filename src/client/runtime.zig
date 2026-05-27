@@ -443,6 +443,30 @@ test "registerF32 stores and updates a float Signal" {
     try testing.expectApproxEqAbs(@as(f32, 0.875), sig.peek(), 1e-6);
 }
 
+test "cleanup runs registered handlers on owner dispose" {
+    resetForTesting();
+
+    const State = struct {
+        var ran_a: u32 = 0;
+        var ran_b: u32 = 0;
+        fn a() void { ran_a += 1; }
+        fn b() void { ran_b += 1; }
+    };
+    State.ran_a = 0;
+    State.ran_b = 0;
+
+    try cleanup(State.a);
+    try cleanup(State.b);
+
+    try testing.expectEqual(@as(u32, 0), State.ran_a);
+    try testing.expectEqual(@as(u32, 0), State.ran_b);
+
+    // resetForTesting disposes the root owner — handlers fire LIFO.
+    resetForTesting();
+    try testing.expectEqual(@as(u32, 1), State.ran_a);
+    try testing.expectEqual(@as(u32, 1), State.ran_b);
+}
+
 test "slot introspection helpers track register* calls" {
     resetForTesting();
 
@@ -637,6 +661,26 @@ pub fn slotName(idx: u32, buf: []u8) []const u8 {
 pub fn slotKind(idx: u32) ?TypeTag {
     if (idx >= slot_count) return null;
     return slots[idx].type_tag;
+}
+
+// ---- Cleanup hooks -------------------------------------------------------
+//
+// `cleanup(handler)` registers a `*const fn() void` against the
+// runtime's root Owner. When the Owner disposes (today: only via
+// `resetForTesting`; future SPA navigation will dispose per-route
+// owners) every registered handler runs in LIFO order. Chunks reach
+// this through the matching `verve_cleanup` extern in
+// `island_runtime.zig` — the cross-module function table sharing
+// wired in Phase 13G makes the fn pointer resolve cleanly.
+
+pub fn cleanup(handler: *const fn () void) !void {
+    const owner = ensureOwner();
+    const Wrap = struct {
+        fn run(h: *const fn () void) void {
+            h();
+        }
+    };
+    try owner.onCleanup(handler, Wrap.run);
 }
 
 /// Initial value carried by a `Binding` — picks which `register*`

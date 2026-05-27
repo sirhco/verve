@@ -4,6 +4,26 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.26] - 2026-05-27
+
+### Added
+
+- `verve.cleanup(handler)` helper. Registers a `*const fn () void`
+  against the runtime's root Owner; runs in LIFO order when the
+  Owner disposes. Today the Owner only disposes via test reset, so
+  cleanups are dormant in production — the API exists so apps can
+  declare resource teardown ahead of the future SPA-navigation work
+  that will dispose per-route owners between pages.
+
+  Re-exported through `verve_client.cleanup` and the chunk-side
+  `island_runtime.cleanup`. Chunks pass their fn pointer as a u32
+  table index — same ABI as `registerEvent`, same cross-module
+  function-table sharing that Phase 13G wired in. Bridge JS adds
+  `verve_cleanup` to the `verveRuntime` chunk import object.
+
+  Test in `src/client/runtime.zig` covers registration + LIFO
+  firing on dispose.
+
 ## [0.1.25] - 2026-05-27
 
 ### Added

@@ -214,6 +214,16 @@ export fn verve_dispatch_event(id: u32) void {
     runtime.dispatchEvent(id);
 }
 
+/// Register a cleanup handler on the runtime's root Owner. Same
+/// fn-pointer-as-u32 ABI as `verve_register_event`. Handler runs in
+/// LIFO order when the Owner disposes; silently dropped if the
+/// `onCleanup` allocation fails (owners are arena-backed, so this is
+/// effectively OOM territory).
+export fn verve_cleanup(handler_idx: u32) void {
+    const handler: *const fn () void = @ptrFromInt(@as(usize, handler_idx));
+    runtime.cleanup(handler) catch return;
+}
+
 // ---- Slot-table introspection (chunk-callable) --------------------------
 
 export fn verve_slot_count() u32 {

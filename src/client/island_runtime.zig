@@ -53,6 +53,7 @@ extern "verve_runtime" fn verve_ref_get_value_f32(handle: i32) f32;
 // `env.__indirect_function_table` at chunk instantiation.
 extern "verve_runtime" fn verve_register_event(handler_idx: u32) u32;
 extern "verve_runtime" fn verve_dispatch_event(id: u32) void;
+extern "verve_runtime" fn verve_cleanup(handler_idx: u32) void;
 
 extern "verve_runtime" fn verve_slot_count() u32;
 extern "verve_runtime" fn verve_slot_capacity() u32;
@@ -197,6 +198,15 @@ pub fn registerEvent(handler: *const fn () void) u32 {
 
 pub fn dispatchEvent(id: u32) void {
     verve_dispatch_event(id);
+}
+
+/// Register a cleanup handler on the runtime's root Owner from a
+/// chunk. The handler runs when the Owner disposes (today: only on
+/// test reset; future SPA navigation will dispose per-route owners).
+/// Fn pointer crosses the chunk boundary via the shared indirect
+/// function table wired in Phase 13G.
+pub fn cleanup(handler: *const fn () void) void {
+    verve_cleanup(@intCast(@intFromPtr(handler)));
 }
 
 /// Slot-table introspection from a chunk. Useful for in-chunk
