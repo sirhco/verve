@@ -145,6 +145,18 @@ const WasmBridge = struct {
         body_ptr: [*]const u8,
         body_len: usize,
     ) void;
+
+    // ---- NodeRef resolution -------------------------------------------------
+    // `query_ref(id)` looks up the live `Element` server-rendered with
+    // `data-ref="<id>"` and returns a JS-owned handle (>=1) the caller
+    // can pass back to future per-handle mutation externs. A 0 return
+    // means "no element matched" — caller decides whether that's a soft
+    // miss (timing race against hydration) or a fatal bug.
+
+    pub extern "verve" fn query_ref(
+        id_ptr: [*]const u8,
+        id_len: usize,
+    ) i32;
 };
 
 const NativeStub = struct {
@@ -163,6 +175,9 @@ const NativeStub = struct {
     pub fn set_class_present_by_bind(_: [*]const u8, _: usize, _: [*]const u8, _: usize, _: u32) void {}
     pub fn set_text_by_bind_f32(_: [*]const u8, _: usize, _: f32) void {}
     pub fn server_fn_post(_: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
+    pub fn query_ref(_: [*]const u8, _: usize) i32 {
+        return 0;
+    }
 };
 
 pub const set_text_by_bind = Bridge.set_text_by_bind;
@@ -180,3 +195,4 @@ pub const remove_keyed_child = Bridge.remove_keyed_child;
 pub const set_class_present_by_bind = Bridge.set_class_present_by_bind;
 pub const set_text_by_bind_f32 = Bridge.set_text_by_bind_f32;
 pub const server_fn_post = Bridge.server_fn_post;
+pub const query_ref = Bridge.query_ref;

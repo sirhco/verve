@@ -6,6 +6,10 @@
   const readStr = (ptr, len) =>
     new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
 
+  // NodeRef handles. Index 0 is the sentinel for "not found" so wasm
+  // can treat the return value as truthy/null without a separate flag.
+  const refHandles = [null];
+
   const setTextByBind = (bind, text) => {
     document
       .querySelectorAll(`[z-bind="${CSS.escape(bind)}"]`)
@@ -136,8 +140,29 @@
           body,
         }).catch((err) => console.error("verve server_fn_post failed:", err));
       },
+
+      // ---- NodeRef resolution -----------------------------------------
+      // Map `data-ref="<id>"` to a JS-owned Element handle. Index 0 is
+      // reserved for "not found"; live elements get indices >=1 in the
+      // module-scoped `refHandles` array. Per-handle mutation externs
+      // (set text / focus / etc.) land in a later bundle.
+      query_ref: (ip, il) => {
+        const id = readStr(ip, il);
+        const el = document.querySelector(
+          `[data-ref="${CSS.escape(id)}"]`,
+        );
+        if (!el) return 0;
+        refHandles.push(el);
+        return refHandles.length - 1;
+      },
     },
   };
+
+  // Exposed for hand-written JS that wants to round-trip a NodeRef.id
+  // without going through wasm — e.g. inline event handlers in
+  // `components.zig` raw HTML scripts. Identical lookup to the extern.
+  window.verveQueryRef = (id) =>
+    document.querySelector(`[data-ref="${CSS.escape(String(id))}"]`);
 
   const resp = await fetch("/client.wasm");
   const wasm = await WebAssembly.instantiateStreaming(resp, env);

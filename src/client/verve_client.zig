@@ -63,6 +63,17 @@ pub const createStore = verve.createStore;
 pub const ErrorBoundary = verve.ErrorBoundary;
 pub const createErrorBoundary = verve.createErrorBoundary;
 
+// ---- NodeRef -------------------------------------------------------------
+//
+// `NodeRef(.tag)` is the server-side handle stamped via `Node.ref(...)`
+// onto a rendered element as `data-ref="<id>"`. After hydration,
+// `queryRef(ref)` returns a JS-owned handle the caller can keep around
+// for future per-handle mutation externs (those land in a later bundle).
+
+pub const NodeRef = verve.NodeRef;
+pub const NodeRefTag = verve.NodeRefTag;
+pub const queryRef = runtime.queryRef;
+
 // ---- DOM-wired adapter (from src/client/runtime.zig) ----------------------
 
 pub const registerI32 = runtime.registerI32;

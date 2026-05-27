@@ -444,6 +444,16 @@ test "registerStr allocates a string Signal" {
     try testing.expect(signalI32("title") == null);
 }
 
+/// Resolve a server-rendered `NodeRef` to a JS-owned element handle.
+/// Returns null when the bridge can't find a matching `[data-ref="<id>"]`.
+/// Accepts any value that exposes `.id: []const u8` — typically a
+/// `verve.NodeRef(.tag)` instance.
+pub fn queryRef(ref: anytype) ?i32 {
+    const id = ref.id;
+    const handle = dom.query_ref(id.ptr, id.len);
+    return if (handle <= 0) null else handle;
+}
+
 /// Reconcile a keyed parent against a new key/html pairing. Calls
 /// `reconciler.plan` to compute the minimum (insert | move | remove)
 /// op sequence then dispatches each op through the matching DOM

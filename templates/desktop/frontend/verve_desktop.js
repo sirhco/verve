@@ -8,6 +8,9 @@
   const readStr = (ptr, len) =>
     new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
 
+  // NodeRef handles. Index 0 = sentinel for "not found".
+  const refHandles = [null];
+
   const setTextByBind = (bind, text) => {
     document
       .querySelectorAll(`[z-bind="${CSS.escape(bind)}"]`)
@@ -151,9 +154,27 @@
         }
       },
 
+      // ---- NodeRef resolution -----------------------------------------
+      // Same shape as the web bridge: map `data-ref="<id>"` to a JS-
+      // owned Element handle (index 0 = not found).
+      query_ref: (ip, il) => {
+        const id = readStr(ip, il);
+        const el = document.querySelector(
+          `[data-ref="${CSS.escape(id)}"]`,
+        );
+        if (!el) return 0;
+        refHandles.push(el);
+        return refHandles.length - 1;
+      },
+
       console_log_i32: (v) => console.log("verve:", v | 0),
     },
   };
+
+  // Exposed for hand-written JS that wants to round-trip a NodeRef.id
+  // without going through wasm.
+  window.verveQueryRef = (id) =>
+    document.querySelector(`[data-ref="${CSS.escape(String(id))}"]`);
 
   // WKWebView under a custom scheme can be picky about
   // WebAssembly.instantiateStreaming. Fall back to a buffered instantiate

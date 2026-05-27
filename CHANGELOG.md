@@ -4,6 +4,25 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.15] - 2026-05-27
+
+### Added
+
+- NodeRef resolution end-to-end (Bundle 3 of the verve_client
+  gap-close plan). `src/client/dom.zig` gains a `query_ref(id_ptr,
+  id_len) i32` extern + native stub. `src/client/runtime.zig` gains
+  a `queryRef(ref)` wrapper that accepts any `verve.NodeRef(.tag)`
+  instance and returns the JS-owned handle (>=1) or null when the
+  bridge can't find a matching `[data-ref="<id>"]`. The wasm-client
+  façade re-exports `NodeRef`, `NodeRefTag`, `queryRef`. Both
+  bridges (`src/bridge/verve.js`, `templates/desktop/frontend/
+  verve_desktop.js`) gain the `query_ref` extern handler — backed
+  by a module-scoped `refHandles[]` array with index 0 reserved for
+  "not found" — plus a `window.verveQueryRef(id)` helper for
+  hand-written JS that wants the lookup without going through wasm.
+  Per-handle mutation externs (set text, focus, etc.) deferred to a
+  future bundle; this commit ships resolution only.
+
 ## [0.1.14] - 2026-05-27
 
 ### Added
