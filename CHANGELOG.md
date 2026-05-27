@@ -8,6 +8,17 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `verve_client` public module — re-exports the reactive primitives
+  (`Signal`, `Effect`, `Owner`, `createEffect`, `batch`, `untrack`) and
+  the DOM-wired adapter (`registerI32` / `registerStr` / `registerBool`
+  / `registerF32`, `registerForEach`, `bindForEach`, `applyReconcile`)
+  for downstream wasm clients. The desktop template scaffold now
+  imports it as `@import("verve")` from `src/client/main.zig` and
+  drives DOM mutations through `Signal.set` → `on_set` instead of the
+  prior direct `set_text_by_bind_i32` externs. The desktop bridge JS
+  (`templates/desktop/frontend/verve_desktop.js`) gains the keyed-list
+  reconciler primitives (`create_keyed_child`, `move_keyed_child`,
+  `remove_keyed_child`) ported verbatim from `src/bridge/verve.js`.
 - `Window.printWithOptions` Linux: full `GtkPrintSettings`
   integration (Bundle 8 of the Win/Linux backfill plan). `copies`,
   `pages` (translated 1-indexed PageRange → 0-indexed GtkPageRange),

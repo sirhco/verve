@@ -19,6 +19,19 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/verve.zig"),
     });
 
+    // Public façade for downstream wasm clients (desktop template,
+    // browser-only apps). Re-exports reactive primitives from `verve`
+    // plus the DOM-wired adapter from `src/client/runtime.zig`. Target-
+    // agnostic so the same module satisfies both host-target tests and
+    // wasm32-freestanding consumers.
+    const verve_client_mod = b.addModule("verve_client", .{
+        .root_source_file = b.path("src/client/verve_client.zig"),
+        .imports = &.{
+            .{ .name = "verve", .module = verve_mod },
+        },
+    });
+    _ = verve_client_mod;
+
     const client_mod = b.createModule(.{
         .root_source_file = b.path("src/client/main.zig"),
         .target = wasm_target,

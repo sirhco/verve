@@ -16,6 +16,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const verve_mod = verve_dep.module("verve");
+    // Public wasm-client façade: reactive primitives + DOM-wired adapter.
+    // The client.wasm target imports this so signals registered in the
+    // scaffold drive DOM mutations through the runtime's `on_set` hook.
+    const verve_client_mod = verve_dep.module("verve_client");
 
     // Build-time SSR. A tiny host-target program imports `verve` +
     // `components` and prints the rendered HTML to stdout; the captured
@@ -65,6 +69,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/client/main.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSmall,
+        .imports = &.{
+            .{ .name = "verve", .module = verve_client_mod },
+        },
     });
     const client_wasm = b.addExecutable(.{
         .name = "client",

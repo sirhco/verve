@@ -10,6 +10,7 @@ a parallel write path.
 
 | Module | Purpose |
 |---|---|
+| `src/client/verve_client.zig` | Public façade for downstream wasm clients — re-exports `Signal` / `Effect` / `Owner` + `registerI32` / `registerStr` / `registerBool` / `registerF32` + `bindForEach` |
 | `src/client/main.zig`      | Exported wasm symbols + per-bind Signal wiring |
 | `src/client/runtime.zig`   | `registerI32` / `registerStr` / `registerBool` / `registerF32` + `ForEachHandle` + `bindForEach` |
 | `src/client/reconciler.zig`| LIS-based keyed-list planner. See [17 — Reconciler](17-reconciler.md). |
@@ -51,6 +52,53 @@ Available registrars:
 | `runtime.registerF32(name, initial)` | `Signal(f32)` | Replaces text content via `set_text_by_bind_f32` |
 | `runtime.registerForEach(parent, initial_keys)` | `*ForEachHandle` | Reconciler-driven keyed children — see [17 — Reconciler](17-reconciler.md) |
 | `runtime.bindForEach(handle, ctx, render_fn)` | `*verve.Effect` | Re-runs `render_fn` and calls `handle.update` on any tracked Signal change |
+
+## Consuming from a downstream app
+
+Downstream wasm clients (the desktop template, future browser-only
+apps) pull the same reactive surface via the public `verve_client`
+module. The module re-exports the primitives from `verve` plus the
+DOM-wired adapter from `src/client/runtime.zig` — same shape the
+framework's own `client.wasm` uses internally.
+
+```zig
+// templates/desktop/build.zig
+const verve_dep = b.dependency("verve", .{ ... });
+const verve_client_mod = verve_dep.module("verve_client");
+
+const client_mod = b.createModule(.{
+    .root_source_file = b.path("src/client/main.zig"),
+    .target = wasm_target,
+    .optimize = .ReleaseSmall,
+    .imports = &.{
+        .{ .name = "verve", .module = verve_client_mod },
+    },
+});
+```
+
+```zig
+// src/client/main.zig (downstream)
+const verve = @import("verve");
+
+var count_sig: ?*verve.Signal(i32) = null;
+var initial_count: i32 = 0;
+
+export fn verve_init_count(v: i32) void { initial_count = v; }
+
+export fn verve_hydrate() void {
+    count_sig = verve.registerI32("count", initial_count);
+}
+
+export fn increment_counter() void {
+    if (count_sig) |c| c.increment();   // → on_set → DOM
+}
+```
+
+The bridge JS must provide the DOM externs the adapter calls
+(`set_text_by_bind_i32`, `set_class_present_by_bind`, the keyed-list
+primitives, …). `templates/desktop/frontend/verve_desktop.js` is the
+reference port; `src/bridge/verve.js` is the framework's own full
+implementation.
 
 ## Exports
 

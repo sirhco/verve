@@ -89,16 +89,23 @@ To add a new reactive piece:
 1. Mark the element in `components.zig` with `.bind("name")` and an
    initial value via `.textInt(0)` or `.text("...")`.
 2. Add a `verve_init_name(value: i32)` export in
-   `src/client/main.zig` to receive the seed.
-3. Update state inside an `export fn handler() void` and call the
-   `set_text_by_bind_*` extern to re-render the bound element.
-4. Wire any UI control with `.onClick("handler")` to dispatch the
+   `src/client/main.zig` that stashes the seed in a module-level
+   `var initial_name: i32 = 0;`.
+3. In `verve_hydrate`, allocate the Signal via
+   `name_sig = verve.registerI32("name", initial_name);` — the
+   runtime wires its `on_set` hook to the matching DOM element.
+4. In click / IPC handlers, mutate via `name_sig.?.set(value)` (or
+   `.increment()` / `.decrement()` for numeric types). DOM updates
+   fall out of the reactive graph — never call `set_text_by_bind_*`
+   directly.
+5. Wire any UI control with `.onClick("handler")` to dispatch the
    handler.
 
-The wasm currently uses direct DOM externs (no reactive graph yet).
-Once `verve.Signal` is exposed for `wasm32-freestanding`, the
-`verve_hydrate` body becomes the place to register signals + on_set
-hooks for fine-grained updates.
+The wasm client imports the framework's reactive runtime via the
+public `verve_client` module — `const verve = @import("verve");`
+inside `src/client/main.zig` resolves to the wasm façade that
+re-exports `Signal` / `registerI32` / `bindForEach` / etc. See
+`docs/12-wasm-client.md` for the full surface.
 
 ## IPC — typed Router (recommended)
 

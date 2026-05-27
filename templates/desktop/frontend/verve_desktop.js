@@ -62,6 +62,53 @@
         }),
       remove_by_bind: (bp, bl) =>
         eachBind(readStr(bp, bl), (el) => el.remove()),
+
+      // ---- Keyed-list reconciler primitives (ported from src/bridge/verve.js) ----
+      create_keyed_child: (pp, pl, kp, kl, hp, hl, ap, al) => {
+        const parentName = readStr(pp, pl);
+        const key = readStr(kp, kl);
+        const html = readStr(hp, hl);
+        const anchorKey = al ? readStr(ap, al) : null;
+        const tpl = document.createElement("template");
+        tpl.innerHTML = html;
+        const node = tpl.content.firstElementChild;
+        if (!node) return;
+        node.setAttribute("data-vkey", key);
+        eachBind(parentName, (parent) => {
+          const anchor = anchorKey
+            ? parent.querySelector(`[data-vkey="${CSS.escape(anchorKey)}"]`)
+            : null;
+          // Re-clone for each matching parent so multiple bound parents
+          // don't share the same node reference.
+          parent.insertBefore(node.cloneNode(true), anchor);
+        });
+      },
+      move_keyed_child: (pp, pl, kp, kl, ap, al) => {
+        const parentName = readStr(pp, pl);
+        const key = readStr(kp, kl);
+        const anchorKey = al ? readStr(ap, al) : null;
+        eachBind(parentName, (parent) => {
+          const node = parent.querySelector(
+            `[data-vkey="${CSS.escape(key)}"]`,
+          );
+          if (!node) return;
+          const anchor = anchorKey
+            ? parent.querySelector(`[data-vkey="${CSS.escape(anchorKey)}"]`)
+            : null;
+          parent.insertBefore(node, anchor);
+        });
+      },
+      remove_keyed_child: (pp, pl, kp, kl) => {
+        const parentName = readStr(pp, pl);
+        const key = readStr(kp, kl);
+        eachBind(parentName, (parent) => {
+          const node = parent.querySelector(
+            `[data-vkey="${CSS.escape(key)}"]`,
+          );
+          if (node) node.remove();
+        });
+      },
+
       console_log_i32: (v) => console.log("verve:", v | 0),
     },
   };

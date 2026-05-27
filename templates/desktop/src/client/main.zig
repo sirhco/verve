@@ -5,45 +5,51 @@
 //! text content. Click handlers stamped with `z-on-click="<name>"`
 //! dispatch through the matching wasm export.
 //!
-//! Starts deliberately small — direct DOM externs, no reactive graph.
-//! Replace with verve.Signal + on_set hook once the runtime is exposed
-//! through the public `verve` module.
+//! Reactive flow: `verve_init_<bind>` captures the server-rendered
+//! initial value, `verve_hydrate` allocates one `verve.Signal(i32)` per
+//! binding via `verve.registerI32`, and the runtime wires each Signal's
+//! `on_set` hook to a DOM update extern. Click handlers call `.set(...)`
+//! — DOM mutations are a side effect of `Signal.set`, never written
+//! directly.
+
+const verve = @import("verve");
 
 const COUNT_BIND: []const u8 = "count";
 const CLICKS_BIND: []const u8 = "clicks";
 
-var count: i32 = 0;
-var clicks: i32 = 0;
+// Seeds captured before `verve_hydrate` allocates Signals. The bridge
+// invokes `verve_init_<bind>(value)` once per binding to sync the WASM
+// side with the server-rendered text content; Signal construction is
+// deferred to `verve_hydrate` so the initial value is correct rather
+// than mutated post-allocation.
+var initial_count: i32 = 0;
+var initial_clicks: i32 = 0;
 
-extern "verve" fn set_text_by_bind_i32(bind_ptr: [*]const u8, bind_len: u32, value: i32) void;
-extern "verve" fn console_log_i32(value: i32) void;
+var count_sig: ?*verve.Signal(i32) = null;
+var clicks_sig: ?*verve.Signal(i32) = null;
 
-/// Bridge calls this once per `verve_init_<bind>` export after wasm
-/// instantiation. Seeds the in-memory counter from the server-rendered
-/// text content.
 export fn verve_init_count(value: i32) void {
-    count = value;
+    initial_count = value;
 }
 
 export fn verve_init_clicks(value: i32) void {
-    clicks = value;
+    initial_clicks = value;
 }
 
-/// Bridge calls this after seeding completes. Final wiring hook —
-/// noop today, reserved for signal/effect setup.
-export fn verve_hydrate() void {}
+/// Bridge calls this after seeding completes. Allocates one Signal per
+/// binding under the runtime's root Owner and wires its `on_set` hook
+/// to the matching `[z-bind="<name>"]` element via the JS bridge.
+export fn verve_hydrate() void {
+    count_sig = verve.registerI32(COUNT_BIND, initial_count);
+    clicks_sig = verve.registerI32(CLICKS_BIND, initial_clicks);
+}
 
 export fn increment_counter() void {
-    count += 1;
-    clicks += 1;
-    set_text_by_bind_i32(COUNT_BIND.ptr, @intCast(COUNT_BIND.len), count);
-    set_text_by_bind_i32(CLICKS_BIND.ptr, @intCast(CLICKS_BIND.len), clicks);
-    console_log_i32(count);
+    if (count_sig) |c| c.increment();
+    if (clicks_sig) |c| c.increment();
 }
 
 export fn decrement_counter() void {
-    count -= 1;
-    clicks += 1;
-    set_text_by_bind_i32(COUNT_BIND.ptr, @intCast(COUNT_BIND.len), count);
-    set_text_by_bind_i32(CLICKS_BIND.ptr, @intCast(CLICKS_BIND.len), clicks);
+    if (count_sig) |c| c.decrement();
+    if (clicks_sig) |c| c.increment();
 }

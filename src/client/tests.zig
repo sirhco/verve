@@ -10,4 +10,5 @@ test {
     _ = @import("runtime.zig");
     _ = @import("island.zig");
     _ = @import("reconciler.zig");
+    _ = @import("verve_client.zig");
 }
