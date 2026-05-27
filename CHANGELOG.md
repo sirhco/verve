@@ -4,6 +4,36 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.25] - 2026-05-27
+
+### Added
+
+- Slot-table introspection. Read-only views over the live signal +
+  event slot tables — useful for in-page debug overlays, hydration
+  log lines pinning down which bindings registered, and capacity-watch
+  dashboards.
+
+  - `slotCount` / `slotCapacity` — signal slot usage + ceiling
+  - `eventSlotCount` / `eventSlotCapacity` — event handler slot usage
+  - `slotName(idx, buf)` — copy the bind-name at `idx` into `buf`
+  - `slotKind(idx)` — `TypeTag` (i32/str/bool/f32) of the slot at `idx`
+
+  Re-exported through `verve_client` (`TypeTag` now `pub`); also
+  exposed as `verve_*` exports for chunks via `runtime_exports.zig`
+  (slot kind comes back as `0..3` with `0xFFFFFFFF` for out-of-range)
+  and re-wrapped in `island_runtime.zig` for Zig-friendly chunk
+  callers. Bridge JS adds the six new entries to its `verveRuntime`
+  import object so chunks can call them.
+
+### Changed
+
+- **Slot capacity bumps**. `MAX_SLOTS` raised from 64 → 256;
+  `MAX_EVENT_SLOTS` raised from 256 → 1024. Both were tighter than
+  real-app usage would tolerate (one binding per visually-distinct
+  reactive span + one event handler per visually-distinct click
+  target). Bumps are static-array size only — no per-slot overhead
+  beyond what's already paid.
+
 ## [0.1.24] - 2026-05-27
 
 ### Added

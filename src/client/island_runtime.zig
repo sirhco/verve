@@ -54,6 +54,13 @@ extern "verve_runtime" fn verve_ref_get_value_f32(handle: i32) f32;
 extern "verve_runtime" fn verve_register_event(handler_idx: u32) u32;
 extern "verve_runtime" fn verve_dispatch_event(id: u32) void;
 
+extern "verve_runtime" fn verve_slot_count() u32;
+extern "verve_runtime" fn verve_slot_capacity() u32;
+extern "verve_runtime" fn verve_event_slot_count() u32;
+extern "verve_runtime" fn verve_event_slot_capacity() u32;
+extern "verve_runtime" fn verve_slot_name(idx: u32, buf_ptr: [*]u8, buf_cap: u32) u32;
+extern "verve_runtime" fn verve_slot_kind(idx: u32) u32;
+
 // ---- Friendly Zig wrappers ----------------------------------------------
 
 pub fn registerI32(name: []const u8, initial: i32) void {
@@ -190,4 +197,37 @@ pub fn registerEvent(handler: *const fn () void) u32 {
 
 pub fn dispatchEvent(id: u32) void {
     verve_dispatch_event(id);
+}
+
+/// Slot-table introspection from a chunk. Useful for in-chunk
+/// hydration sanity checks ("did the main client register the slot
+/// I expected before I tried to mutate it?").
+pub fn slotCount() u32 {
+    return verve_slot_count();
+}
+
+pub fn slotCapacity() u32 {
+    return verve_slot_capacity();
+}
+
+pub fn eventSlotCount() u32 {
+    return verve_event_slot_count();
+}
+
+pub fn eventSlotCapacity() u32 {
+    return verve_event_slot_capacity();
+}
+
+pub fn slotName(idx: u32, buf: []u8) []const u8 {
+    const wrote = verve_slot_name(idx, buf.ptr, @intCast(buf.len));
+    return buf[0..wrote];
+}
+
+/// Kind tag of the signal at `idx`. 0=i32, 1=str, 2=bool, 3=f32,
+/// null when out of range.
+pub const SlotKind = enum(u32) { i32 = 0, str = 1, bool = 2, f32 = 3 };
+pub fn slotKind(idx: u32) ?SlotKind {
+    const raw = verve_slot_kind(idx);
+    if (raw == 0xFFFFFFFF) return null;
+    return @enumFromInt(raw);
 }

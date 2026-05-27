@@ -214,6 +214,40 @@ export fn verve_dispatch_event(id: u32) void {
     runtime.dispatchEvent(id);
 }
 
+// ---- Slot-table introspection (chunk-callable) --------------------------
+
+export fn verve_slot_count() u32 {
+    return runtime.slotCount();
+}
+
+export fn verve_slot_capacity() u32 {
+    return runtime.slotCapacity();
+}
+
+export fn verve_event_slot_count() u32 {
+    return runtime.eventSlotCount();
+}
+
+export fn verve_event_slot_capacity() u32 {
+    return runtime.eventSlotCapacity();
+}
+
+export fn verve_slot_name(idx: u32, buf_ptr: [*]u8, buf_cap: u32) u32 {
+    const filled = runtime.slotName(idx, buf_ptr[0..buf_cap]);
+    return @intCast(filled.len);
+}
+
+/// Returns 0 = i32, 1 = str, 2 = bool, 3 = f32, 0xFFFFFFFF = out of range.
+export fn verve_slot_kind(idx: u32) u32 {
+    const kind = runtime.slotKind(idx) orelse return 0xFFFFFFFF;
+    return switch (kind) {
+        .i32 => 0,
+        .str => 1,
+        .bool => 2,
+        .f32 => 3,
+    };
+}
+
 // ---- Tests ---------------------------------------------------------------
 
 const std = @import("std");

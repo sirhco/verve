@@ -115,6 +115,20 @@ pub const autoHydrate = runtime.autoHydrate;
 pub const registerEvent = runtime.registerEvent;
 pub const dispatchEvent = runtime.dispatchEvent;
 
+// ---- Slot-table introspection -------------------------------------------
+//
+// Read-only views over the live signal + event slot tables. Useful
+// for in-page debug overlays, hydration log lines, and capacity-watch
+// dashboards.
+
+pub const TypeTag = runtime.TypeTag;
+pub const slotCount = runtime.slotCount;
+pub const slotCapacity = runtime.slotCapacity;
+pub const slotName = runtime.slotName;
+pub const slotKind = runtime.slotKind;
+pub const eventSlotCount = runtime.eventSlotCount;
+pub const eventSlotCapacity = runtime.eventSlotCapacity;
+
 // ---- Suspense / transition ----------------------------------------------
 //
 // Async boundary primitives. `suspense(...)` wraps a subtree whose

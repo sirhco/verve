@@ -503,6 +503,12 @@
     verve_ref_get_value_f32: exp.verve_ref_get_value_f32,
     verve_register_event: exp.verve_register_event,
     verve_dispatch_event: exp.verve_dispatch_event,
+    verve_slot_count: exp.verve_slot_count,
+    verve_slot_capacity: exp.verve_slot_capacity,
+    verve_event_slot_count: exp.verve_event_slot_count,
+    verve_event_slot_capacity: exp.verve_event_slot_capacity,
+    verve_slot_name: exp.verve_slot_name,
+    verve_slot_kind: exp.verve_slot_kind,
   };
 
   // Per-page instance counter. Each `<verve-island>` gets a unique id

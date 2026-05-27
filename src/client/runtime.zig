@@ -20,7 +20,7 @@ const reconciler = @import("reconciler.zig");
 const client_alloc = @import("allocator.zig");
 const scratch = @import("scratch.zig");
 
-const MAX_SLOTS = 64;
+const MAX_SLOTS = 256;
 
 const Slot = struct {
     name: []const u8,
@@ -28,7 +28,7 @@ const Slot = struct {
     type_tag: TypeTag,
 };
 
-const TypeTag = enum { i32, str, bool, f32 };
+pub const TypeTag = enum { i32, str, bool, f32 };
 
 const BindBoxI32 = struct {
     name: []const u8,
@@ -443,6 +443,31 @@ test "registerF32 stores and updates a float Signal" {
     try testing.expectApproxEqAbs(@as(f32, 0.875), sig.peek(), 1e-6);
 }
 
+test "slot introspection helpers track register* calls" {
+    resetForTesting();
+
+    try testing.expectEqual(@as(u32, 0), slotCount());
+    try testing.expectEqual(@as(u32, 0), eventSlotCount());
+    try testing.expect(slotCapacity() >= 256);
+    try testing.expect(eventSlotCapacity() >= 1024);
+
+    _ = registerI32("alpha", 1);
+    _ = registerStr("beta", "x");
+    _ = registerBool("gamma", "on", false);
+    try testing.expectEqual(@as(u32, 3), slotCount());
+
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("alpha", slotName(0, &buf));
+    try testing.expectEqualStrings("beta", slotName(1, &buf));
+    try testing.expectEqualStrings("gamma", slotName(2, &buf));
+    try testing.expectEqualStrings("", slotName(99, &buf));
+
+    try testing.expectEqual(TypeTag.i32, slotKind(0).?);
+    try testing.expectEqual(TypeTag.str, slotKind(1).?);
+    try testing.expectEqual(TypeTag.bool, slotKind(2).?);
+    try testing.expectEqual(@as(?TypeTag, null), slotKind(99));
+}
+
 test "registerI32 is idempotent on the name" {
     resetForTesting();
 
@@ -538,7 +563,7 @@ test "registerStr allocates a string Signal" {
 // 256 entries enough for typical apps (one slot per visually-distinct
 // handler, not per render).
 
-const MAX_EVENT_SLOTS: u32 = 256;
+const MAX_EVENT_SLOTS: u32 = 1024;
 
 var event_slots: [MAX_EVENT_SLOTS]?*const fn () void = [_]?*const fn () void{null} ** MAX_EVENT_SLOTS;
 var event_slot_count: u32 = 0;
@@ -567,6 +592,51 @@ pub fn dispatchEvent(id: u32) void {
 
 export fn verve_event_dispatch(id: u32) void {
     dispatchEvent(id);
+}
+
+// ---- Slot-table introspection -------------------------------------------
+//
+// Read-only views over the live signal + event slot tables. Useful
+// for in-page debug overlays, log lines that pin down which bindings
+// got registered during hydration, and capacity-watch dashboards.
+
+/// Number of signal slots currently allocated (across all type tags).
+pub fn slotCount() u32 {
+    return @intCast(slot_count);
+}
+
+/// Static cap on signal slots — raises `@panic` past this. Bump
+/// `MAX_SLOTS` if a real app needs more.
+pub fn slotCapacity() u32 {
+    return MAX_SLOTS;
+}
+
+/// Number of closure-style event handlers currently registered.
+pub fn eventSlotCount() u32 {
+    return event_slot_count;
+}
+
+/// Static cap on event slots. Bump `MAX_EVENT_SLOTS` if needed.
+pub fn eventSlotCapacity() u32 {
+    return MAX_EVENT_SLOTS;
+}
+
+/// Copy the name of the signal at `idx` into `buf`. Returns the
+/// slice of `buf` actually filled — empty when `idx` is out of range
+/// or the name doesn't fit. Useful for debug dumps walking
+/// `0..slotCount()`.
+pub fn slotName(idx: u32, buf: []u8) []const u8 {
+    if (idx >= slot_count) return &[_]u8{};
+    const name = slots[idx].name;
+    const to_copy = @min(name.len, buf.len);
+    @memcpy(buf[0..to_copy], name[0..to_copy]);
+    return buf[0..to_copy];
+}
+
+/// Kind tag of the signal at `idx`. `null` when out of range.
+pub fn slotKind(idx: u32) ?TypeTag {
+    if (idx >= slot_count) return null;
+    return slots[idx].type_tag;
 }
 
 /// Initial value carried by a `Binding` — picks which `register*`
