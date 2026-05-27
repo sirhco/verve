@@ -187,6 +187,77 @@ client-side resolution is **two-step**:
 Out-of-range or stale handles short-circuit to a no-op (reads return
 0) so wasm-side code stays resilient against a hot-swapped build.
 
+## HTML composition via named templates
+
+Per-island chunks compose new DOM nodes from **server-rendered
+prototypes**. The server stamps a hidden `<template data-vt="<name>">`
+block via `ctx.template(...)`; chunks clone it at runtime, fill
+named slots, and append into a bound parent. Markup lives in
+`components.zig` next to the rest of the page — no buried wasm
+`std.fmt` strings.
+
+### Server side — declare the template
+
+```zig
+// components.zig
+ctx.template(
+    "todo-row",
+    ctx.li()
+        .class("todo")
+        .children(.{
+            ctx.span().slot("text"),
+            ctx.button("✕").slot("delete").onClick("delete_todo"),
+        }),
+)
+```
+
+`Node.slot("<name>")` stamps `data-vt-slot="<name>"`. Slot names
+must be unique within a template (nested same-name slots resolve
+to document order in the cloned fragment).
+
+### Chunk side — clone + fill + append
+
+```zig
+const std = @import("std");
+const verve = @import("verve");
+
+var next_id: u32 = 0;
+
+export fn add_todo() void {
+    const handle = verve.cloneTemplate("todo-row") orelse return;
+    next_id += 1;
+    var key_buf: [32]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "todo_{d}", .{next_id}) catch return;
+
+    verve.slotText(handle, "text", readInputValue());
+    verve.slotAttr(handle, "delete", "data-vkey", key);
+    verve.appendToBind("todo-list", handle);
+}
+```
+
+| Function | Effect |
+|---|---|
+| `cloneTemplate(name) ?i32` | Look up `[data-vt="<name>"]`, clone its content, return a handle to the cloned root (`null` on miss) |
+| `slotText(h, slot, text)` | Replace `textContent` on `[data-vt-slot="<slot>"]` inside the cloned subtree |
+| `slotAttr(h, slot, name, value)` | `setAttribute(name, value)` on the matching slot |
+| `appendToBind(parent_bind, h)` | `appendChild(clone)` on every `[z-bind="<parent_bind>"]` element. Re-clones per parent so multiple bound parents don't share the same node reference |
+
+Event handlers on cloned rows work via either dispatch flavor:
+
+- **String name** — stamp `z-on-click="<exported_name>"` on a
+  template inner node; the bridge JS click delegate already walks
+  `e.target.closest("[z-on-click]")` so appended clones pick up
+  dispatch automatically.
+- **Closure id** — the server can't know the slot id at render time
+  (it's runtime state), so use `slotAttr(handle, "row",
+  "z-on-click-id", "<id>")` to stamp the id after
+  `verve.registerEvent(...)` returns, before appending.
+
+The `refHandles[]` table grows monotonically; long-running pages
+that churn through many clones leak handles. Pair with
+`verve.cleanup(...)` for now; a future bundle adds explicit
+handle disposal once SPA-navigation Owner scoping lands.
+
 ## IPC response handlers
 
 Outbound IPC was already wired through `server_fn_post`

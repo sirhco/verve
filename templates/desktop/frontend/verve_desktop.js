@@ -212,6 +212,45 @@
         return Number.isFinite(n) ? n : 0;
       },
 
+      // ---- Named templates (Phase 16 / G2) ----------------------------
+      clone_template: (np, nl) => {
+        const name = readStr(np, nl);
+        const tpl = document.querySelector(
+          `[data-vt="${CSS.escape(name)}"]`,
+        );
+        if (!tpl || !tpl.content) return 0;
+        const frag = tpl.content.cloneNode(true);
+        const root = frag.firstElementChild;
+        if (!root) return 0;
+        refHandles.push(root);
+        return refHandles.length - 1;
+      },
+      slot_text: (h, sp, sl, tp, tl) => {
+        const root = refHandles[h];
+        if (!root) return;
+        const slot = readStr(sp, sl);
+        const el = root.querySelector(
+          `[data-vt-slot="${CSS.escape(slot)}"]`,
+        );
+        if (el) el.textContent = readStr(tp, tl);
+      },
+      slot_attr: (h, sp, sl, np, nl, vp, vl) => {
+        const root = refHandles[h];
+        if (!root) return;
+        const slot = readStr(sp, sl);
+        const el = root.querySelector(
+          `[data-vt-slot="${CSS.escape(slot)}"]`,
+        );
+        if (el) el.setAttribute(readStr(np, nl), readStr(vp, vl));
+      },
+      append_to_bind: (pp, pl, h) => {
+        const root = refHandles[h];
+        if (!root) return;
+        eachBind(readStr(pp, pl), (parent) => {
+          parent.appendChild(root.cloneNode(true));
+        });
+      },
+
       console_log_i32: (v) => console.log("verve:", v | 0),
     },
   };

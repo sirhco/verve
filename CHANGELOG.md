@@ -4,6 +4,70 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.29] - 2026-05-27
+
+### Added
+
+- **HTML composition via named templates** (G2). Per-island wasm
+  chunks compose new DOM nodes from server-rendered prototypes
+  instead of formatting markup with `std.fmt` strings. Row HTML
+  lives in `components.zig` next to the rest of the page; chunks
+  just clone, fill, append.
+
+  Server side:
+  - `Context.template(name, inner) *Node` — wraps `inner` in
+    `<template data-vt="<name>">`. Browser parses but doesn't
+    render the inner subtree until a chunk clones it.
+  - `Node.slot(name)` — marks a fillable element inside a
+    template; renderer stamps `data-vt-slot="<name>"`.
+  - Renderer test in `src/core/renderer.zig` covers the wrapped
+    output.
+
+  Wasm side:
+  - `verve.cloneTemplate(name) ?i32` — looks up `[data-vt]`,
+    clones content, returns a `refHandles[]`-style handle.
+  - `verve.slotText(h, slot, text)` /
+    `verve.slotAttr(h, slot, name, value)` — fill named slots
+    inside the cloned subtree.
+  - `verve.appendToBind(parent_bind, h)` — graft the cloned
+    fragment into every `[z-bind="<parent>"]` element
+    (re-cloned per parent so multiple bound parents don't share
+    the same node reference).
+
+  Implementation:
+  - `src/client/dom.zig` — 4 new externs + native stubs +
+    module-level exports.
+  - `src/client/runtime.zig` — Zig wrappers.
+  - `src/client/runtime_exports.zig` — chunk-callable wrappers
+    (`verve_clone_template`, `verve_slot_text`, `verve_slot_attr`,
+    `verve_append_to_bind`).
+  - `src/client/island_runtime.zig` — chunk-side extern decls +
+    Zig wrappers.
+  - `src/client/verve_client.zig` — re-exports for downstream
+    wasm clients.
+  - `src/bridge/verve.js` + `templates/desktop/frontend/verve_desktop.js`
+    — 4 new handlers in `env.verve` (leverages existing
+    `refHandles[]` table from Bundle 3 + the `<template>` +
+    `cloneNode` precedent already in the bridge for keyed-list
+    reconciler + verveSwap). Web bridge adds the 4 new exports
+    to its `verveRuntime` chunk import object.
+
+  Event handlers on cloned rows work via either flavor: string-name
+  dispatch (`z-on-click="<exported_name>"` on a template inner
+  node fires through the existing delegate after append), or
+  closure-id dispatch (chunks stamp `z-on-click-id="<id>"` via
+  `slotAttr` after `registerEvent` returns, before appending).
+
+  `docs/12-wasm-client.md` gains a "HTML composition via named
+  templates" section with a worked todo-row example.
+
+  Deferred: handle disposal for the `refHandles[]` table (pairs
+  with the future per-route Owner scoping work that disposes on
+  SPA navigation). Renderer-to-wasm port stays the alternative
+  path captured in `~/.claude/plans/g2-html-composition-in-wasm.md`;
+  revisit only if real apps demand dynamic in-wasm composition
+  templates can't model.
+
 ## [0.1.28] - 2026-05-27
 
 ### Added
