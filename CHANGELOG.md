@@ -4,6 +4,19 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.13] - 2026-05-27
+
+### Added
+
+- `verve_client` façade expanded — re-exports `Action`, `createAction`,
+  `serverFn`, `serverFnGen` (server-function primitives + the wasm-side
+  `server_fn_post` bridge), `Resource`, `ResourceState`, `createResource`,
+  `createLocalResource` (async state), `Store`, `createStore` (field-
+  grained reactivity), `ErrorBoundary`, `createErrorBoundary`. Bundle 1
+  of the verve_client gap-close plan — pure additive re-exports; no
+  runtime changes. Downstream wasm clients can now reach the full
+  reactive surface, not just `Signal` + `Effect`.
+
 ## [0.1.12] - 2026-05-27
 
 ### Added

@@ -26,6 +26,43 @@ pub const untrack = verve.untrack;
 pub const batch = verve.batch;
 pub const setReactivePendingAllocator = verve.setReactivePendingAllocator;
 
+// ---- Server functions / actions ------------------------------------------
+//
+// Action wraps an imperative async operation in a reactive struct
+// (pending / value / input / version Signals). serverFnGen.post() on
+// wasm32 serializes args to JSON and fires the `server_fn_post` extern
+// the bridge JS exposes — see `src/bridge/verve.js`.
+
+pub const Action = verve.Action;
+pub const createAction = verve.createAction;
+pub const serverFn = verve.serverFn;
+pub const serverFnGen = verve.serverFnGen;
+
+// ---- Async resources -----------------------------------------------------
+//
+// Resource holds a `Signal(ResourceState(T))` where the union is
+// `loading | ready(T) | err(anyerror)`. `createLocalResource` is the
+// client-only variant (currently a pass-through to `createResource`).
+
+pub const Resource = verve.Resource;
+pub const ResourceState = verve.ResourceState;
+pub const createResource = verve.createResource;
+pub const createLocalResource = verve.createLocalResource;
+
+// ---- Field-grained reactivity --------------------------------------------
+//
+// Store(T) gives each field of T its own Signal so reads via `.get(.field)`
+// subscribe to that field only — finer granularity than wrapping the
+// whole struct in a single Signal.
+
+pub const Store = verve.Store;
+pub const createStore = verve.createStore;
+
+// ---- Error boundary ------------------------------------------------------
+
+pub const ErrorBoundary = verve.ErrorBoundary;
+pub const createErrorBoundary = verve.createErrorBoundary;
+
 // ---- DOM-wired adapter (from src/client/runtime.zig) ----------------------
 
 pub const registerI32 = runtime.registerI32;
