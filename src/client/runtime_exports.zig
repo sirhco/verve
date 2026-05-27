@@ -188,6 +188,32 @@ export fn verve_ref_get_value_f32(handle: i32) f32 {
     return dom.ref_get_value_f32(handle);
 }
 
+// ---- Closure event registration (Phase 13G) ------------------------------
+//
+// Chunks pass a `*const fn () void` taken via `&chunk_handler`. The
+// pointer is an index into the indirect function table — main runtime
+// shares its table with chunks via wasm-ld's `--import-table` /
+// `--export-table` flags wired in build.zig, so the index resolves to
+// the right function whether dispatch fires from main or chunk code.
+
+export fn verve_register_event(handler_idx: u32) u32 {
+    // wasm MVP function ABI doesn't carry `*const fn () void`
+    // arguments across module boundaries; chunks pass the indirect-
+    // function-table index as a plain u32 and we cast it back here.
+    // Sharing the table via build.zig's `import_table` / `export_table`
+    // flags is what makes this index meaningful on both sides.
+    const handler: *const fn () void = @ptrFromInt(@as(usize, handler_idx));
+    return runtime.registerEvent(handler);
+}
+
+/// Programmatically fire a previously-registered event slot. The bridge
+/// JS click delegate already invokes `verve_event_dispatch(id)` directly
+/// off the main runtime's exports; this wrapper exists so a chunk can
+/// trigger its own handler synchronously without going through the DOM.
+export fn verve_dispatch_event(id: u32) void {
+    runtime.dispatchEvent(id);
+}
+
 // ---- Tests ---------------------------------------------------------------
 
 const std = @import("std");

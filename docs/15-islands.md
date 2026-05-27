@@ -109,12 +109,44 @@ exports at instantiation. Surface:
 | `setRefText` / `setRefTextI32` / `setRefAttr` / `setRefValue` / `setRefClass` / `focusRef` / `removeRef` | Per-handle DOM mutation |
 | `refValueI32` / `refValueF32` | Per-handle value read (form inputs) |
 
-Closure-style event registration (passing a `*const fn () void`
-across the chunk → main-runtime boundary) is **not** wired today —
-the chunk exports a named handler (`counter_island_bump` above) and
-the SSR'd island content stamps `z-on-click="counter_island_bump"`;
-the bridge JS click delegate looks up the export on the chunk's
-own instance and invokes it.
+### Closure-style event handlers from chunks
+
+Chunks can register closure handlers in the main runtime's
+`event_slots` table just like the main client does, via
+`verve.registerEvent(handler)`:
+
+```zig
+const verve = @import("verve");
+
+var bump_id: u32 = 0;
+
+fn handleBump() void {
+    if (verve.signalSetI32("counter_island", verve.signalGetI32("counter_island") + 1)) |_| {}
+}
+
+export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
+    _ = props_ptr;
+    _ = props_len;
+    _ = root_id;
+    verve.registerI32("counter_island", 0);
+    bump_id = verve.registerEvent(&handleBump);
+}
+```
+
+The SSR'd content stamps `[z-on-click-id="<id>"]` (via
+`Node.onClickFn(id)` at render time) and the bridge JS click
+delegate routes through `verve_event_dispatch(id)` — same path the
+main client uses. The chunk's `&handleBump` is a fn pointer into
+the shared `__indirect_function_table` (build.zig wires
+`export_table = true` on the main client + `import_table = true`
+on each chunk, and the bridge passes the table through as
+`env.__indirect_function_table` at chunk instantiation). The main
+runtime stores the same index in `event_slots` and `call_indirect`
+dispatches into chunk code without further JS hops.
+
+Chunks that prefer the simpler string-name path still work — export
+a named handler and stamp `z-on-click="<exportName>"`. The bridge
+JS click delegate looks up the export on the chunk's own instance.
 
 ### Multi-instance islands
 
@@ -215,17 +247,13 @@ For type-safe calls from WASM, use the build-time generated
 
 ## Deferred work
 
-- **Closure-style event registration** — passing a
-  `*const fn () void` across the chunk → main-runtime boundary
-  (so chunks could call `verve.registerEvent(myFn)` like the
-  main client does) needs cross-module function-table sharing.
-  Chunks today export named handler functions and use the
-  string-name dispatch path; closure events stay main-runtime-only.
 - **Binary codec dispatch** — parse `props_schema` at chunk
   hydration time and decode `data-props` into typed args.
-- **Per-island Effect ownership** — `root_id` will dispatch slots
-  in a multi-instance table so two `<verve-island data-name="Counter">`
-  on the same page can keep distinct Signal subscriptions.
+- **Per-island Effect ownership** — `root_id` is plumbed to chunks
+  (see "Multi-instance islands" above) but the Owner is still
+  global. Future work scopes the Effect tree per `root_id` so
+  signals registered under one instance dispose when that instance
+  unmounts.
 
 ## Next
 

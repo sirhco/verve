@@ -4,6 +4,45 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.22] - 2026-05-27
+
+### Added
+
+- Phase 13G — closure-style event handlers from per-island chunks.
+  `src/client/island_runtime.zig` exposes `registerEvent(handler)`
+  + `dispatchEvent(id)`; chunks call them like the main client does
+  (`registerEvent(&myHandler) -> u32` slot id; stamp via
+  `Node.onClickFn(id)` at render time).
+
+  The fn pointer crosses the chunk → main-runtime boundary as a
+  table index. `build.zig` exports the main client's indirect
+  function table (`wasm.export_table = true`) and imports it into
+  each per-island chunk (`exe.import_table = true`); the bridge JS
+  passes the table through as `env.__indirect_function_table` at
+  chunk `WebAssembly.instantiateStreaming`. Result: `&handler`
+  taken inside a chunk lands at an index the main runtime's
+  `event_slots` array can also call via `call_indirect` from
+  `verve_event_dispatch` — no JS hops needed for dispatch, no
+  per-chunk handler-name registries.
+
+  Wasm MVP function ABI can't carry `*const fn () void` across
+  module boundaries directly; the runtime export
+  (`runtime_exports.zig`) takes the table index as `u32` and casts
+  back to a fn pointer via `@ptrFromInt(@as(usize, idx))`. The
+  chunk-side wrapper passes `@intFromPtr(handler)`. Idiomatic Zig
+  on both sides, no callers see the cast.
+
+  Closes the second of the two natural follow-ons from the
+  Phase 13F audit. Multi-instance + closure events together give
+  chunks the full reactive surface the main client has.
+
+  Files: `build.zig` (export/import table flags), `src/client/
+  runtime_exports.zig` (`verve_register_event` + `verve_dispatch_event`
+  exports), `src/client/island_runtime.zig` (externs + Zig wrappers),
+  `src/bridge/verve.js` (capture + pass the table; register the
+  two new entries in `verveRuntime`), `docs/15-islands.md` (worked
+  example).
+
 ## [0.1.21] - 2026-05-27
 
 ### Added

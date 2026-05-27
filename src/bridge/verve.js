@@ -399,6 +399,15 @@
   // the main runtime's island scratch buffer — JS writes them
   // there before calling the chunk's `hydrate(ptr, len, root_id)`,
   // which then reads the bytes directly from shared memory.
+  // Phase 13G — capture main runtime's exported indirect function
+  // table so per-island chunks can import it. Once both modules share
+  // the same table, a `*const fn () void` taken via `&handler` in a
+  // chunk lands at an index the main runtime's `event_slots` can also
+  // call via `verve_event_dispatch` / `call_indirect`. Without sharing
+  // the table, chunk fn pointers would refer to indices in the chunk's
+  // private table and crash when main dispatched them.
+  const indirectFunctionTable = exp.__indirect_function_table;
+
   // Phase 13F — assemble the chunk-side reactive-runtime import object
   // from the main client's matching exports. Built once after main
   // instantiation; reused for every island chunk. Missing entries pass
@@ -428,6 +437,8 @@
     verve_ref_remove: exp.verve_ref_remove,
     verve_ref_get_value_i32: exp.verve_ref_get_value_i32,
     verve_ref_get_value_f32: exp.verve_ref_get_value_f32,
+    verve_register_event: exp.verve_register_event,
+    verve_dispatch_event: exp.verve_dispatch_event,
   };
 
   // Per-page instance counter. Each `<verve-island>` gets a unique id
@@ -447,7 +458,10 @@
       islandChunks.set(
         name,
         WebAssembly.instantiateStreaming(fetch(url), {
-          env: { memory },
+          env: {
+            memory,
+            __indirect_function_table: indirectFunctionTable,
+          },
           verve_runtime: verveRuntime,
         }).catch((err) => {
           islandChunks.delete(name);

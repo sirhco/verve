@@ -46,6 +46,14 @@ extern "verve_runtime" fn verve_ref_remove(handle: i32) void;
 extern "verve_runtime" fn verve_ref_get_value_i32(handle: i32) i32;
 extern "verve_runtime" fn verve_ref_get_value_f32(handle: i32) f32;
 
+// Closure event registration. Requires the chunk's indirect function
+// table to be the same one the main runtime uses — build.zig sets
+// `import_table = true` on chunks + `export_table = true` on the main
+// client, and the bridge JS passes the table through as
+// `env.__indirect_function_table` at chunk instantiation.
+extern "verve_runtime" fn verve_register_event(handler_idx: u32) u32;
+extern "verve_runtime" fn verve_dispatch_event(id: u32) void;
+
 // ---- Friendly Zig wrappers ----------------------------------------------
 
 pub fn registerI32(name: []const u8, initial: i32) void {
@@ -167,4 +175,19 @@ pub fn refValueI32(handle: i32) i32 {
 
 pub fn refValueF32(handle: i32) f32 {
     return verve_ref_get_value_f32(handle);
+}
+
+/// Register a closure-style event handler in the main runtime's
+/// `event_slots` table. Returns the slot id to stamp on the
+/// rendered HTML via `Node.onClickFn(id)` / `onSubmitFn` / etc.
+/// Handler runs in the chunk's wasm with whatever state it captured
+/// at registration; the indirect function table is shared with the
+/// main runtime so `call_indirect` from `verve_event_dispatch` reaches
+/// chunk code without extra hops.
+pub fn registerEvent(handler: *const fn () void) u32 {
+    return verve_register_event(@intCast(@intFromPtr(handler)));
+}
+
+pub fn dispatchEvent(id: u32) void {
+    verve_dispatch_event(id);
 }

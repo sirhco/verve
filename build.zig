@@ -59,6 +59,12 @@ pub fn build(b: *std.Build) void {
     });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
+    // Phase 13G — export the indirect function table so per-island
+    // chunks can import + share it. Once both modules see the same
+    // table, a fn pointer the chunk takes via `&handler` is a valid
+    // index into the main runtime's `event_slots` and `call_indirect`
+    // dispatches into the chunk's code without further indirection.
+    wasm.export_table = true;
 
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(wasm.getEmittedBin(), "client.wasm");
@@ -118,6 +124,12 @@ pub fn build(b: *std.Build) void {
         // the chunks ship as pure-function bundles with no
         // duplicated runtime bytes.
         exe.import_memory = true;
+        // Phase 13G: chunks import the main client's exported
+        // indirect function table. Any `&handler` reference taken
+        // inside the chunk lands in this table; the main runtime's
+        // `event_slots` stores the same index and dispatches into
+        // chunk code via `call_indirect`.
+        exe.import_table = true;
         // Small stack — chunks only hold transient locals during
         // `hydrate`; the linker reserves the bottom of imported
         // memory for it, which the main runtime is responsible
