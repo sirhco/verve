@@ -429,6 +429,37 @@ test "registerF32 stores and updates a float Signal" {
     try testing.expectApproxEqAbs(@as(f32, 0.875), sig.peek(), 1e-6);
 }
 
+test "registerEvent + dispatchEvent invoke the matching slot" {
+    resetForTesting();
+
+    const State = struct {
+        var hits_a: u32 = 0;
+        var hits_b: u32 = 0;
+        fn a() void { hits_a += 1; }
+        fn b() void { hits_b += 1; }
+    };
+    State.hits_a = 0;
+    State.hits_b = 0;
+
+    const id_a = registerEvent(State.a);
+    const id_b = registerEvent(State.b);
+
+    try testing.expectEqual(@as(u32, 0), id_a);
+    try testing.expectEqual(@as(u32, 1), id_b);
+
+    dispatchEvent(id_a);
+    dispatchEvent(id_a);
+    dispatchEvent(id_b);
+    try testing.expectEqual(@as(u32, 2), State.hits_a);
+    try testing.expectEqual(@as(u32, 1), State.hits_b);
+
+    // Out-of-range id is a no-op — keeps the bridge resilient to a
+    // stale click against a hot-swapped wasm build.
+    dispatchEvent(999);
+    try testing.expectEqual(@as(u32, 2), State.hits_a);
+    try testing.expectEqual(@as(u32, 1), State.hits_b);
+}
+
 test "autoHydrate registers mixed-type bindings under the root owner" {
     resetForTesting();
 
@@ -462,6 +493,49 @@ test "registerStr allocates a string Signal" {
     try testing.expectEqual(counter, signalI32("count").?);
     try testing.expect(signalStr("count") == null);
     try testing.expect(signalI32("title") == null);
+}
+
+// ---- Closure-style event dispatch ----------------------------------------
+//
+// Apps register a `*const fn () void` handler against the runtime and
+// receive a `u32` id. The renderer stamps `z-on-click-id="<id>"` onto
+// the matching node; the bridge JS click delegate calls
+// `verve_event_dispatch(id)` which invokes the registered fn pointer.
+//
+// Modeled on the island chunk dispatch pattern at `src/client/island.zig`
+// — a flat slot table with sequential ids, no allocation per registration,
+// 256 entries enough for typical apps (one slot per visually-distinct
+// handler, not per render).
+
+const MAX_EVENT_SLOTS: u32 = 256;
+
+var event_slots: [MAX_EVENT_SLOTS]?*const fn () void = [_]?*const fn () void{null} ** MAX_EVENT_SLOTS;
+var event_slot_count: u32 = 0;
+
+/// Register a closure-style click handler. Returns the slot id the
+/// renderer should stamp on the node via `Node.onClickFn(id)`. Panics
+/// when capacity is exhausted — the cap is enforced because the slot
+/// table is statically sized; raise `MAX_EVENT_SLOTS` if a real app
+/// needs more.
+pub fn registerEvent(handler: *const fn () void) u32 {
+    if (event_slot_count >= MAX_EVENT_SLOTS) @panic("verve client: event slot capacity exceeded");
+    const id = event_slot_count;
+    event_slots[id] = handler;
+    event_slot_count += 1;
+    return id;
+}
+
+/// Invoke the registered handler at `id`. Out-of-range or unregistered
+/// ids are silently ignored — keeps the bridge resilient to a stale
+/// click against a hot-swapped wasm build. Exported as
+/// `verve_event_dispatch` so the JS bridge can reach it.
+pub fn dispatchEvent(id: u32) void {
+    if (id >= event_slot_count) return;
+    if (event_slots[id]) |fn_ptr| fn_ptr();
+}
+
+export fn verve_event_dispatch(id: u32) void {
+    dispatchEvent(id);
 }
 
 /// Initial value carried by a `Binding` — picks which `register*`
@@ -693,5 +767,7 @@ pub fn resetForTesting() void {
         root_owner = null;
     }
     slot_count = 0;
+    event_slot_count = 0;
+    @memset(event_slots[0..], null);
     client_alloc.reset();
 }

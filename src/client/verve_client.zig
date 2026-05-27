@@ -87,6 +87,18 @@ pub const Binding = runtime.Binding;
 pub const BindingInitial = runtime.BindingInitial;
 pub const autoHydrate = runtime.autoHydrate;
 
+// ---- Closure-style event handlers ----------------------------------------
+//
+// Alternative to the string-named `[z-on-click="exportName"]` dispatch:
+// `registerEvent(fn)` returns a u32 slot id; pass it to
+// `Node.onClickFn(id)` at render time. The bridge JS click delegate
+// routes `[z-on-click-id="<id>"]` through `verve_event_dispatch(id)`,
+// which invokes the registered fn pointer — handler runs in WASM with
+// whatever state it captured at registration.
+
+pub const registerEvent = runtime.registerEvent;
+pub const dispatchEvent = runtime.dispatchEvent;
+
 // ---- DOM-wired adapter (from src/client/runtime.zig) ----------------------
 
 pub const registerI32 = runtime.registerI32;

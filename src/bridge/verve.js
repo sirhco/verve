@@ -239,6 +239,20 @@
   };
 
   document.addEventListener("click", (e) => {
+    // Closure-style: `[z-on-click-id="<id>"]` → fn pointer registered
+    // via `verve.registerEvent(...)`, routed through
+    // `verve_event_dispatch(id)`. Wins over the string-name form when
+    // both attrs land on the same node.
+    const targetId = e.target.closest("[z-on-click-id]");
+    if (targetId) {
+      const id = parseInt(targetId.getAttribute("z-on-click-id"), 10);
+      if (Number.isFinite(id) && typeof exp.verve_event_dispatch === "function") {
+        e.preventDefault();
+        exp.verve_event_dispatch(id >>> 0);
+        return;
+      }
+    }
+
     const target = e.target.closest("[z-on-click]");
     if (!target) return;
     const action = target.getAttribute("z-on-click");

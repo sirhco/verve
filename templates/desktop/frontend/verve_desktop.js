@@ -227,10 +227,26 @@
     console.log("verve: deep-link", url);
   };
 
-  // Delegated click handler: any `[z-on-click="<name>"]` calls the
-  // matching wasm export by name. Falls back to a console warning when
-  // the export is absent (typo / stale build).
+  // Delegated click handler. Two flavors coexist:
+  //
+  //   [z-on-click="<name>"]   → string-name dispatch; calls `exp[name]()`.
+  //   [z-on-click-id="<id>"]  → closure dispatch; calls
+  //                             `exp.verve_event_dispatch(parseInt(id, 10))`.
+  //
+  // The id form runs the fn pointer registered via
+  // `verve.registerEvent(...)` in the wasm runtime — handler keeps the
+  // state it captured at registration. Both forms can appear on the
+  // same node; id wins if both are stamped.
   document.addEventListener("click", (e) => {
+    const targetId = e.target.closest("[z-on-click-id]");
+    if (targetId) {
+      const id = parseInt(targetId.getAttribute("z-on-click-id"), 10);
+      if (Number.isFinite(id) && typeof exp.verve_event_dispatch === "function") {
+        e.preventDefault();
+        exp.verve_event_dispatch(id >>> 0);
+        return;
+      }
+    }
     const target = e.target.closest("[z-on-click]");
     if (!target) return;
     const action = target.getAttribute("z-on-click");

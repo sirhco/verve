@@ -4,6 +4,32 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.17] - 2026-05-27
+
+### Added
+
+- Closure-style click handlers (Bundle 5 of the verve_client gap-close
+  plan — closes the last gap). Register a `*const fn () void` via
+  `verve.registerEvent(handler)` → returns a `u32` slot id; pass it
+  to `Node.onClickFn(id)` at render time. The renderer stamps
+  `z-on-click-id="<id>"`; the bridge JS click delegate routes it
+  through `verve_event_dispatch(id)` which invokes the registered
+  fn pointer. Handler keeps whatever state it captured at
+  registration — no flat-namespace export name required. 256 slots
+  in the runtime's `event_slots` table; out-of-range / unregistered
+  ids dispatch as no-ops. Both `[z-on-click]` (string-name) and
+  `[z-on-click-id]` (closure) flavors coexist on the same node;
+  id-style wins when both are stamped. Test added in
+  `src/client/runtime.zig`.
+
+  Files: `src/core/node.zig` (new `z_on_click_id` field +
+  `onClickFn` method), `src/core/renderer.zig` (stamps the new
+  attribute), `src/client/runtime.zig` (slot table + dispatcher
+  + export), `src/client/verve_client.zig` (re-exports),
+  `src/bridge/verve.js` + `templates/desktop/frontend/verve_desktop.js`
+  (delegate routes id-style first, falls through to name-style),
+  `docs/12-wasm-client.md` (usage example).
+
 ## [0.1.16] - 2026-05-27
 
 ### Added

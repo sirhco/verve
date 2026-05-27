@@ -30,6 +30,13 @@ pub const Node = struct {
     content_type_override: ?[]const u8 = null,
     z_bind_name: ?[]const u8 = null,
     z_on_click_action: ?[]const u8 = null,
+    /// Closure-style click handler: index into the wasm runtime's
+    /// `event_slots` table populated by `verve.registerEvent`. Stamped
+    /// onto the rendered HTML as `z-on-click-id="<n>"`; the JS bridge's
+    /// click delegate dispatches it through `verve_event_dispatch(n)`.
+    /// Mutually compatible with `z_on_click_action` — both can coexist
+    /// on one node, though apps typically pick a single style.
+    z_on_click_id: ?u32 = null,
     /// When set, the server short-circuits rendering and sends a
     /// redirect response (302/303) instead of HTML. Populated via
     /// `ctx.redirect("/login")`.
@@ -156,6 +163,17 @@ pub const Node = struct {
     pub fn onClick(self: *Node, action: []const u8) *Node {
         if (self.err != null) return self;
         self.z_on_click_action = action;
+        return self;
+    }
+
+    /// Closure-style click binding. `id` is the index returned by
+    /// `verve.registerEvent(handler)` in the wasm runtime. The
+    /// renderer stamps `z-on-click-id="<id>"` and the JS bridge
+    /// dispatches it through `verve_event_dispatch(id)` — handler
+    /// runs in WASM with whatever state it captured at registration.
+    pub fn onClickFn(self: *Node, slot_id: u32) *Node {
+        if (self.err != null) return self;
+        self.z_on_click_id = slot_id;
         return self;
     }
 

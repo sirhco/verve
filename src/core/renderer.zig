@@ -123,6 +123,9 @@ pub const Renderer = struct {
             try escapeAttr(w, action);
             try w.writeAll("\"");
         }
+        if (node.z_on_click_id) |id| {
+            try w.print(" z-on-click-id=\"{d}\"", .{id});
+        }
 
         if (node_mod.isVoidTag(node.tag)) {
             try w.writeAll(">");

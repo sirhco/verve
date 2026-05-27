@@ -77,6 +77,45 @@ Initial values come from caller-controlled state — the
 `verve_init_<name>(value)` walker remains the recommended way to
 source them from the server-rendered DOM.
 
+## Closure-style event handlers
+
+Alternative to the string-named `[z-on-click="exportName"]` dispatch.
+Register a `*const fn () void` against the runtime, receive a `u32`
+slot id, stamp it on the node with `.onClickFn(id)`:
+
+```zig
+const verve = @import("verve");
+
+const Handlers = struct {
+    fn bump() void {
+        if (verve.signalI32("count")) |c| c.increment();
+    }
+};
+
+var bump_id: u32 = 0;
+
+export fn verve_hydrate() void {
+    verve.autoHydrate(&.{ .{ .name = "count", .initial = .{ .i32 = 0 } } });
+    bump_id = verve.registerEvent(Handlers.bump);
+}
+```
+
+```zig
+// components.zig — render-time
+ctx.button().onClickFn(bump_id).text("+").build()
+```
+
+The renderer stamps `z-on-click-id="<id>"`; the bridge JS click
+delegate dispatches it through the exported `verve_event_dispatch(id)`
+function which invokes the registered fn pointer. Closure handlers
+keep whatever state they captured at registration — no flat-namespace
+export name required.
+
+Both flavors coexist: `[z-on-click]` and `[z-on-click-id]` can land on
+the same node, with id-style winning. The id table holds up to 256
+entries (raise `MAX_EVENT_SLOTS` in `runtime.zig` if a real app
+needs more).
+
 ## Consuming from a downstream app
 
 Downstream wasm clients (the desktop template, future browser-only
