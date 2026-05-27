@@ -6,16 +6,14 @@
 //! dispatch through the matching wasm export.
 //!
 //! Reactive flow: `verve_init_<bind>` captures the server-rendered
-//! initial value, `verve_hydrate` allocates one `verve.Signal(i32)` per
-//! binding via `verve.registerI32`, and the runtime wires each Signal's
-//! `on_set` hook to a DOM update extern. Click handlers call `.set(...)`
-//! — DOM mutations are a side effect of `Signal.set`, never written
-//! directly.
+//! initial value, `verve_hydrate` declares the bindings list and the
+//! runtime allocates one `verve.Signal(T)` per entry via
+//! `verve.autoHydrate`. Each Signal's `on_set` hook is wired to a DOM
+//! update extern. Click handlers look the Signal up by name and call
+//! `.set(...)` — DOM mutations are a side effect of `Signal.set`,
+//! never written directly.
 
 const verve = @import("verve");
-
-const COUNT_BIND: []const u8 = "count";
-const CLICKS_BIND: []const u8 = "clicks";
 
 // Seeds captured before `verve_hydrate` allocates Signals. The bridge
 // invokes `verve_init_<bind>(value)` once per binding to sync the WASM
@@ -25,9 +23,6 @@ const CLICKS_BIND: []const u8 = "clicks";
 var initial_count: i32 = 0;
 var initial_clicks: i32 = 0;
 
-var count_sig: ?*verve.Signal(i32) = null;
-var clicks_sig: ?*verve.Signal(i32) = null;
-
 export fn verve_init_count(value: i32) void {
     initial_count = value;
 }
@@ -36,20 +31,22 @@ export fn verve_init_clicks(value: i32) void {
     initial_clicks = value;
 }
 
-/// Bridge calls this after seeding completes. Allocates one Signal per
-/// binding under the runtime's root Owner and wires its `on_set` hook
-/// to the matching `[z-bind="<name>"]` element via the JS bridge.
+/// Bridge calls this after seeding completes. Declares the bindings
+/// list once; `autoHydrate` dispatches to the right `register*` per
+/// entry based on the union tag.
 export fn verve_hydrate() void {
-    count_sig = verve.registerI32(COUNT_BIND, initial_count);
-    clicks_sig = verve.registerI32(CLICKS_BIND, initial_clicks);
+    verve.autoHydrate(&.{
+        .{ .name = "count", .initial = .{ .i32 = initial_count } },
+        .{ .name = "clicks", .initial = .{ .i32 = initial_clicks } },
+    });
 }
 
 export fn increment_counter() void {
-    if (count_sig) |c| c.increment();
-    if (clicks_sig) |c| c.increment();
+    if (verve.signalI32("count")) |c| c.increment();
+    if (verve.signalI32("clicks")) |c| c.increment();
 }
 
 export fn decrement_counter() void {
-    if (count_sig) |c| c.decrement();
-    if (clicks_sig) |c| c.increment();
+    if (verve.signalI32("count")) |c| c.decrement();
+    if (verve.signalI32("clicks")) |c| c.increment();
 }

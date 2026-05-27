@@ -52,6 +52,30 @@ Available registrars:
 | `runtime.registerF32(name, initial)` | `Signal(f32)` | Replaces text content via `set_text_by_bind_f32` |
 | `runtime.registerForEach(parent, initial_keys)` | `*ForEachHandle` | Reconciler-driven keyed children — see [17 — Reconciler](17-reconciler.md) |
 | `runtime.bindForEach(handle, ctx, render_fn)` | `*verve.Effect` | Re-runs `render_fn` and calls `handle.update` on any tracked Signal change |
+| `runtime.autoHydrate(bindings)` | — | Batch-register a declarative slice of `Binding { name, initial }` entries. Mixes i32 / str / bool / f32 freely. |
+
+`autoHydrate` is the recommended entry point for apps with more than
+a handful of bindings — collapses the per-bind `register*` calls into
+one declarative slice:
+
+```zig
+export fn verve_hydrate() void {
+    verve.autoHydrate(&.{
+        .{ .name = "count", .initial = .{ .i32 = initial_count } },
+        .{ .name = "label", .initial = .{ .str = initial_label } },
+        .{ .name = "open",  .initial = .{ .bool = .{ .class = "is-open", .value = false } } },
+        .{ .name = "ratio", .initial = .{ .f32 = 0.0 } },
+    });
+}
+
+export fn click_handler() void {
+    if (verve.signalI32("count")) |c| c.increment();
+}
+```
+
+Initial values come from caller-controlled state — the
+`verve_init_<name>(value)` walker remains the recommended way to
+source them from the server-rendered DOM.
 
 ## Consuming from a downstream app
 

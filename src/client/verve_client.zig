@@ -74,6 +74,19 @@ pub const NodeRef = verve.NodeRef;
 pub const NodeRefTag = verve.NodeRefTag;
 pub const queryRef = runtime.queryRef;
 
+// ---- Declarative hydration -----------------------------------------------
+//
+// `autoHydrate(bindings)` batches register* calls behind a single
+// declarative slice. Mixes i32 / str / bool / f32 entries freely; the
+// union tag on `Binding.initial` picks the right registrar. Initial
+// values still come from the caller — the bridge's existing
+// `verve_init_<name>(value)` walker captures DOM-seeded values into
+// module-level vars that get fed in here.
+
+pub const Binding = runtime.Binding;
+pub const BindingInitial = runtime.BindingInitial;
+pub const autoHydrate = runtime.autoHydrate;
+
 // ---- DOM-wired adapter (from src/client/runtime.zig) ----------------------
 
 pub const registerI32 = runtime.registerI32;

@@ -4,6 +4,25 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.16] - 2026-05-27
+
+### Added
+
+- `autoHydrate(bindings)` declarative hydration helper (Bundle 4 of
+  the verve_client gap-close plan). Takes a slice of
+  `Binding { name, initial }` and dispatches to the matching
+  `registerI32` / `registerStr` / `registerBool` / `registerF32` per
+  entry — the `BindingInitial` union tag picks the variant. Lets
+  downstream wasm clients declare all their bindings in one block
+  instead of scattering `register*` calls across `verve_hydrate`.
+  Initial values still come from the caller; the bridge's existing
+  `verve_init_<name>(value)` walker remains the recommended source.
+  Desktop template scaffold migrated to demonstrate. Re-exported
+  through `verve_client` along with the `Binding` + `BindingInitial`
+  types. Full auto-walker (renderer-stamped type info + generic
+  `verve_register` extern) deferred — captured as future work in
+  the gap-close plan.
+
 ## [0.1.15] - 2026-05-27
 
 ### Added

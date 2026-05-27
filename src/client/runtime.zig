@@ -429,6 +429,26 @@ test "registerF32 stores and updates a float Signal" {
     try testing.expectApproxEqAbs(@as(f32, 0.875), sig.peek(), 1e-6);
 }
 
+test "autoHydrate registers mixed-type bindings under the root owner" {
+    resetForTesting();
+
+    autoHydrate(&.{
+        .{ .name = "score", .initial = .{ .i32 = 42 } },
+        .{ .name = "label", .initial = .{ .str = "hello" } },
+        .{ .name = "open", .initial = .{ .bool = .{ .class = "is-open", .value = true } } },
+        .{ .name = "ratio", .initial = .{ .f32 = 0.5 } },
+    });
+
+    try testing.expectEqual(@as(i32, 42), signalI32("score").?.peek());
+    try testing.expectEqualStrings("hello", signalStr("label").?.peek());
+    try testing.expect(signalBool("open").?.peek());
+    try testing.expectApproxEqAbs(@as(f32, 0.5), signalF32("ratio").?.peek(), 1e-6);
+
+    // type-tag separation: looking up a name under the wrong type returns null
+    try testing.expect(signalI32("label") == null);
+    try testing.expect(signalStr("score") == null);
+}
+
 test "registerStr allocates a string Signal" {
     resetForTesting();
 
@@ -442,6 +462,44 @@ test "registerStr allocates a string Signal" {
     try testing.expectEqual(counter, signalI32("count").?);
     try testing.expect(signalStr("count") == null);
     try testing.expect(signalI32("title") == null);
+}
+
+/// Initial value carried by a `Binding` — picks which `register*`
+/// variant the runtime should dispatch to.
+pub const BindingInitial = union(enum) {
+    i32: i32,
+    str: []const u8,
+    bool: struct { class: []const u8, value: bool },
+    f32: f32,
+};
+
+/// Single entry in the `autoHydrate` declarative bindings list.
+pub const Binding = struct {
+    name: []const u8,
+    initial: BindingInitial,
+};
+
+/// Register every binding in `bindings` against the runtime's root
+/// Owner. Dispatches to the matching `register*` based on the union
+/// tag — `bindings` can mix i32 / str / bool / f32 entries freely.
+/// Return values discarded; the caller can still look slots up by
+/// name via `signalI32` / `signalStr` / `signalBool` / `signalF32`.
+///
+/// Initial values are caller-supplied. The bridge's
+/// `verve_init_<name>(value)` walker stays the recommended way to
+/// source those from the server-rendered DOM — capture each value
+/// into a module-level `var initial_<name>: T` and pass it through
+/// here from `verve_hydrate`. Hard-coded initials work too when the
+/// app's starting state is fully known at compile time.
+pub fn autoHydrate(bindings: []const Binding) void {
+    for (bindings) |b| {
+        switch (b.initial) {
+            .i32 => |v| _ = registerI32(b.name, v),
+            .str => |v| _ = registerStr(b.name, v),
+            .bool => |s| _ = registerBool(b.name, s.class, s.value),
+            .f32 => |v| _ = registerF32(b.name, v),
+        }
+    }
 }
 
 /// Resolve a server-rendered `NodeRef` to a JS-owned element handle.
