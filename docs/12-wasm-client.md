@@ -187,6 +187,56 @@ client-side resolution is **two-step**:
 Out-of-range or stale handles short-circuit to a no-op (reads return
 0) so wasm-side code stays resilient against a hot-swapped build.
 
+## IPC response handlers
+
+Outbound IPC was already wired through `server_fn_post`
+(web → `/api/<name>` fetch) and `post_json_i32`
+(desktop → `window.verve.send`). Replies used to land in JS only —
+wasm couldn't observe them. As of v0.1.28, the reply path closes:
+
+```zig
+const verve = @import("verve");
+
+fn handlePingReply(body_ptr: [*]const u8, body_len: u32) void {
+    const body = body_ptr[0..body_len];
+    // body is the JSON reply bytes; parse / process here.
+    // Pointer is only valid for the duration of this call —
+    // copy into caller storage before returning if needed.
+    _ = body;
+}
+
+export fn install_ping_handler() void {
+    verve.registerResponseHandler("ping", &handlePingReply);
+}
+
+export fn click_ping() void {
+    const payload = "{\"sent_at\":42}";
+    // server_fn_post fires the outbound IPC; the reply lands in
+    // `handlePingReply` when the Zig route responds.
+    dom.server_fn_post("ping".ptr, 4, payload.ptr, payload.len);
+}
+```
+
+Bridge JS plumbing:
+
+- **Desktop** (`templates/desktop/frontend/verve_desktop.js`):
+  subscribes to `window.verve.onMessage(...)` and forwards every
+  inbound message to `verve_dispatch_response(type, body_json)`.
+  `__verve_id`-correlated replies (from `window.verve.request(...)`)
+  resolve their Promise first and never reach wasm handlers, so
+  wasm-initiated request/response uses `server_fn_post` (which goes
+  through `send`, no correlation).
+- **Web** (`src/bridge/verve.js`): the `server_fn_post` extern now
+  awaits the fetch response and dispatches the body to
+  `verve_dispatch_response` after the POST completes.
+
+Multiple handlers per route are allowed — they fire in registration
+order. Slot cap: 256 (raise `MAX_RESPONSE_SLOTS` in
+`runtime.zig` if needed). Replies larger than the runtime's island
+scratch buffer (8 KB by default) drop with a console warning rather
+than truncate; bump the scratch size in `src/client/main.zig` if
+you need to handle bigger payloads.
+
 ## Reactive lists
 
 Client-side Signals are intentionally scalar-only (`i32` / `str` /

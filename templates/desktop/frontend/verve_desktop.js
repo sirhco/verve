@@ -323,6 +323,57 @@
     });
   }
 
+  // Phase 15 — IPC response dispatch to wasm. Subscribes to every
+  // inbound `window.verve._dispatch` message via the shim's
+  // `onMessage` listener and forwards each one to
+  // `verve_dispatch_response(type, body_json)` on the main wasm
+  // instance. Wasm-side handlers register via
+  // `verve.registerResponseHandler(route, &handler)`.
+  //
+  // Body is JSON-encoded into shared linear memory through the
+  // runtime's island scratch buffer; the route name is staged just
+  // before it. Replies bigger than the scratch capacity are dropped
+  // with a console warning rather than truncated.
+  //
+  // Correlation note: `window.verve.request(...)` consumes
+  // `__verve_id`-tagged replies into its Promise chain before this
+  // listener fires, so wasm handlers only see broadcast / fire-and-
+  // forget replies. For wasm-initiated request → response, use
+  // `window.verve.send({type: "<route>", ...})` from wasm (via
+  // `server_fn_post`) and let the Zig handler reply with a fresh
+  // typed message that lands here.
+  if (
+    typeof exp.verve_dispatch_response === "function" &&
+    typeof exp.verve_island_scratch_ptr === "function" &&
+    typeof exp.verve_island_scratch_capacity === "function" &&
+    typeof window.verve === "object" &&
+    typeof window.verve.onMessage === "function"
+  ) {
+    const respScratchPtr = exp.verve_island_scratch_ptr();
+    const respScratchCap = exp.verve_island_scratch_capacity();
+    const respEnc = new TextEncoder();
+    window.verve.onMessage((data) => {
+      if (!data || typeof data.type !== "string") return;
+      const route = data.type;
+      const body = JSON.stringify(data);
+      const routeBytes = respEnc.encode(route);
+      const bodyBytes = respEnc.encode(body);
+      if (routeBytes.length + bodyBytes.length > respScratchCap) {
+        console.warn("verve response: payload exceeds scratch", route);
+        return;
+      }
+      const view = new Uint8Array(memory.buffer, respScratchPtr, respScratchCap);
+      view.set(routeBytes, 0);
+      view.set(bodyBytes, routeBytes.length);
+      exp.verve_dispatch_response(
+        respScratchPtr,
+        routeBytes.length,
+        respScratchPtr + routeBytes.length,
+        bodyBytes.length,
+      );
+    });
+  }
+
   // Deep-link receiver. The native side calls `window.verve.handleDeepLink(url)`
   // via evalJs when a verve://... URL arrives — either through the
   // macOS AppleEventManager handler (warm + cold) or the Win/Linux

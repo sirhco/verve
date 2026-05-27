@@ -226,6 +226,35 @@ export fn verve_cleanup(handler_idx: u32) void {
     runtime.cleanup(handler) catch return;
 }
 
+// ---- IPC response handlers (G3, chunk-callable) -------------------------
+//
+// `verve_register_response_handler(route, handler_idx)` records the
+// chunk's fn pointer against `route`. When the bridge JS observes
+// a reply with `type == <route>`, it stages the body bytes into
+// shared memory and calls `verve_dispatch_response(route, body_ptr,
+// body_len)` — the runtime walks the slot table and fires every
+// matching handler. Pairs with `server_fn_post` / `post_json_i32`
+// for outbound calls.
+
+export fn verve_register_response_handler(
+    route_ptr: [*]const u8,
+    route_len: u32,
+    handler_idx: u32,
+) void {
+    const route = route_ptr[0..route_len];
+    const handler: *const fn ([*]const u8, u32) void = @ptrFromInt(@as(usize, handler_idx));
+    runtime.registerResponseHandler(route, handler);
+}
+
+export fn verve_dispatch_response(
+    route_ptr: [*]const u8,
+    route_len: u32,
+    body_ptr: [*]const u8,
+    body_len: u32,
+) void {
+    runtime.dispatchResponse(route_ptr[0..route_len], body_ptr[0..body_len]);
+}
+
 // ---- Keyed-list reconciler (chunk-callable) ------------------------------
 //
 // Wasm-MVP-callable wrapper around `runtime.applyReconcile`. Each

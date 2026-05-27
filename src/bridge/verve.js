@@ -131,6 +131,11 @@
         }),
 
       // ---- Phase 11B: fire-and-forget typed server-fn POST -------------
+      //
+      // Reply dispatch: when the wasm side has registered a response
+      // handler via `verve.registerResponseHandler("<name>", &fn)`,
+      // the reply body lands in shared scratch and the handler fires.
+      // Replies bigger than scratch capacity drop with a warning.
       server_fn_post: (np, nl, bp, bl) => {
         const name = readStr(np, nl);
         const body = readStr(bp, bl);
@@ -138,7 +143,31 @@
           method: "POST",
           headers: { "content-type": "application/json" },
           body,
-        }).catch((err) => console.error("verve server_fn_post failed:", err));
+        })
+          .then(async (resp) => {
+            if (typeof exp.verve_dispatch_response !== "function") return;
+            if (typeof exp.verve_island_scratch_ptr !== "function") return;
+            const text = await resp.text();
+            const scratchPtr = exp.verve_island_scratch_ptr();
+            const scratchCap = exp.verve_island_scratch_capacity();
+            const enc = new TextEncoder();
+            const routeBytes = enc.encode(name);
+            const bodyBytes = enc.encode(text);
+            if (routeBytes.length + bodyBytes.length > scratchCap) {
+              console.warn("verve server_fn_post: reply exceeds scratch", name);
+              return;
+            }
+            const view = new Uint8Array(memory.buffer, scratchPtr, scratchCap);
+            view.set(routeBytes, 0);
+            view.set(bodyBytes, routeBytes.length);
+            exp.verve_dispatch_response(
+              scratchPtr,
+              routeBytes.length,
+              scratchPtr + routeBytes.length,
+              bodyBytes.length,
+            );
+          })
+          .catch((err) => console.error("verve server_fn_post failed:", err));
       },
 
       // ---- NodeRef resolution -----------------------------------------
@@ -505,6 +534,8 @@
     verve_dispatch_event: exp.verve_dispatch_event,
     verve_cleanup: exp.verve_cleanup,
     verve_list_diff: exp.verve_list_diff,
+    verve_register_response_handler: exp.verve_register_response_handler,
+    verve_dispatch_response: exp.verve_dispatch_response,
     verve_slot_count: exp.verve_slot_count,
     verve_slot_capacity: exp.verve_slot_capacity,
     verve_event_slot_count: exp.verve_event_slot_count,

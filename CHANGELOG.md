@@ -4,6 +4,56 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.28] - 2026-05-27
+
+### Added
+
+- **IPC response handlers** (G3 — closes the upstream-flagged gap
+  in `src/client/dom.zig:142` "async response delivery lands with
+  the streaming runtime in a later phase"). Outbound IPC was
+  already wired through `server_fn_post` (web → `/api/<name>`
+  fetch) and `post_json_i32` (desktop → `window.verve.send`);
+  replies used to land in JS only — wasm couldn't observe them.
+
+  Per-route subscription model:
+
+  - `verve.registerResponseHandler(route, *const fn ([*]const u8, u32) void)`
+    records a handler against `route`. Multiple handlers per route
+    are allowed; they fire in registration order. Slot cap: 256
+    (raise `MAX_RESPONSE_SLOTS` in `runtime.zig` if needed).
+  - `verve_dispatch_response(route_ptr, route_len, body_ptr, body_len)`
+    is the export the bridge JS calls once it has staged the reply
+    body bytes into shared memory.
+
+  Bridge JS wiring:
+
+  - **Desktop** (`templates/desktop/frontend/verve_desktop.js`):
+    subscribes to `window.verve.onMessage(...)` and forwards every
+    inbound message (whose `type` is a string) to
+    `verve_dispatch_response`. `__verve_id`-correlated replies
+    (consumed by `window.verve.request(...)`'s Promise chain)
+    don't reach wasm handlers, so wasm-initiated request/response
+    uses `server_fn_post` (which goes through `send`).
+  - **Web** (`src/bridge/verve.js`): the `server_fn_post` extern
+    now awaits the fetch response and dispatches the body to
+    `verve_dispatch_response` after the POST completes.
+
+  Body bytes are staged through the runtime's island scratch
+  buffer (default 8 KB); replies that overflow drop with a console
+  warning rather than truncate. Re-exported through `verve_client`
+  + chunk-side `island_runtime.zig`. Bridge JS adds the two new
+  entries to its `verveRuntime` chunk import object.
+
+  Test in `src/client/runtime.zig` covers the slot-table
+  registration + per-route dispatch + multi-handler fan-out +
+  unknown-route silent-drop semantics.
+
+### Docs
+
+- `docs/12-wasm-client.md` — new "IPC response handlers" section
+  with a worked end-to-end example covering chunk-side
+  registration + outbound call + bridge-mediated reply.
+
 ## [0.1.27] - 2026-05-27
 
 ### Added

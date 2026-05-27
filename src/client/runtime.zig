@@ -443,6 +443,46 @@ test "registerF32 stores and updates a float Signal" {
     try testing.expectApproxEqAbs(@as(f32, 0.875), sig.peek(), 1e-6);
 }
 
+test "registerResponseHandler + dispatchResponse fan replies by route" {
+    resetForTesting();
+
+    const State = struct {
+        var ping_hits: u32 = 0;
+        var ping_last_len: u32 = 0;
+        var other_hits: u32 = 0;
+        fn ping(_: [*]const u8, len: u32) void {
+            ping_hits += 1;
+            ping_last_len = len;
+        }
+        fn other(_: [*]const u8, _: u32) void {
+            other_hits += 1;
+        }
+    };
+    State.ping_hits = 0;
+    State.ping_last_len = 0;
+    State.other_hits = 0;
+
+    registerResponseHandler("ping", State.ping);
+    registerResponseHandler("other", State.other);
+    try testing.expectEqual(@as(u32, 2), responseSlotCount());
+
+    const body = "{\"ok\":true}";
+    dispatchResponse("ping", body);
+    try testing.expectEqual(@as(u32, 1), State.ping_hits);
+    try testing.expectEqual(@as(u32, body.len), State.ping_last_len);
+    try testing.expectEqual(@as(u32, 0), State.other_hits);
+
+    // Unknown route drops silently.
+    dispatchResponse("never_registered", "");
+    try testing.expectEqual(@as(u32, 1), State.ping_hits);
+
+    // Multiple handlers per route fan out in registration order.
+    registerResponseHandler("ping", State.other);
+    dispatchResponse("ping", body);
+    try testing.expectEqual(@as(u32, 2), State.ping_hits);
+    try testing.expectEqual(@as(u32, 1), State.other_hits);
+}
+
 test "cleanup runs registered handlers on owner dispose" {
     resetForTesting();
 
@@ -661,6 +701,52 @@ pub fn slotName(idx: u32, buf: []u8) []const u8 {
 pub fn slotKind(idx: u32) ?TypeTag {
     if (idx >= slot_count) return null;
     return slots[idx].type_tag;
+}
+
+// ---- IPC response handlers (G3) -----------------------------------------
+//
+// Per-route subscription model: chunks (and main client code) register
+// a `*const fn ([*]const u8, u32) void` against a route name. When the
+// bridge JS observes an inbound reply with `type == <route>`, it
+// stages the reply body bytes into the runtime's island scratch
+// buffer and calls `verve_dispatch_response(route, body_ptr, body_len)`
+// which walks the slot table and fires every matching handler. Pairs
+// with the existing `server_fn_post` / `post_json_i32` outbound
+// externs to close the request → reply loop.
+
+const ResponseSlot = struct {
+    route: []const u8,
+    fn_ptr: *const fn ([*]const u8, u32) void,
+};
+
+const MAX_RESPONSE_SLOTS: u32 = 256;
+var response_slots: [MAX_RESPONSE_SLOTS]?ResponseSlot = [_]?ResponseSlot{null} ** MAX_RESPONSE_SLOTS;
+var response_slot_count: u32 = 0;
+
+/// Register a per-route reply handler. Multiple handlers per route
+/// are allowed — they fire in registration order. Names live for the
+/// lifetime of the slot table (typically the page lifetime); chunks
+/// should pass static string literals.
+pub fn registerResponseHandler(route: []const u8, handler: *const fn ([*]const u8, u32) void) void {
+    if (response_slot_count >= MAX_RESPONSE_SLOTS) @panic("verve client: response slot capacity exceeded");
+    response_slots[response_slot_count] = .{ .route = route, .fn_ptr = handler };
+    response_slot_count += 1;
+}
+
+/// Fire every handler registered against `route`. Called from the
+/// bridge JS once it has staged the body bytes into shared memory.
+/// Out-of-table or zero-handler routes are silently dropped.
+pub fn dispatchResponse(route: []const u8, body: []const u8) void {
+    for (response_slots[0..response_slot_count]) |maybe_slot| {
+        const slot = maybe_slot orelse continue;
+        if (std.mem.eql(u8, slot.route, route)) {
+            slot.fn_ptr(body.ptr, @intCast(body.len));
+        }
+    }
+}
+
+pub fn responseSlotCount() u32 {
+    return response_slot_count;
 }
 
 // ---- Cleanup hooks -------------------------------------------------------
@@ -956,5 +1042,7 @@ pub fn resetForTesting() void {
     slot_count = 0;
     event_slot_count = 0;
     @memset(event_slots[0..], null);
+    response_slot_count = 0;
+    @memset(response_slots[0..], null);
     client_alloc.reset();
 }

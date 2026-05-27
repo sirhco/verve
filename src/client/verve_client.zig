@@ -145,6 +145,18 @@ pub const cleanup = runtime.cleanup;
 
 pub const listDiff = runtime.applyReconcile;
 
+// ---- IPC response handlers ----------------------------------------------
+//
+// Per-route subscription. `registerResponseHandler(route, fn)`
+// records a handler; the bridge JS fires it whenever an inbound
+// message arrives with `type == route`. Body bytes are staged
+// through the runtime's shared scratch buffer — the pointer is
+// only valid for the duration of the handler call.
+
+pub const registerResponseHandler = runtime.registerResponseHandler;
+pub const dispatchResponse = runtime.dispatchResponse;
+pub const responseSlotCount = runtime.responseSlotCount;
+
 pub const TypeTag = runtime.TypeTag;
 pub const slotCount = runtime.slotCount;
 pub const slotCapacity = runtime.slotCapacity;

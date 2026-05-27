@@ -55,6 +55,12 @@ extern "verve_runtime" fn verve_register_event(handler_idx: u32) u32;
 extern "verve_runtime" fn verve_dispatch_event(id: u32) void;
 extern "verve_runtime" fn verve_cleanup(handler_idx: u32) void;
 
+extern "verve_runtime" fn verve_register_response_handler(
+    route_ptr: [*]const u8,
+    route_len: u32,
+    handler_idx: u32,
+) void;
+
 extern "verve_runtime" fn verve_list_diff(
     parent_ptr: [*]const u8,
     parent_len: u32,
@@ -218,6 +224,28 @@ pub fn dispatchEvent(id: u32) void {
 /// function table wired in Phase 13G.
 pub fn cleanup(handler: *const fn () void) void {
     verve_cleanup(@intCast(@intFromPtr(handler)));
+}
+
+/// Register a per-route IPC reply handler. When the bridge JS
+/// observes an inbound message whose `type` matches `route`, the
+/// runtime fires `handler` with a pointer + length into shared
+/// memory pointing at the reply body bytes (typically JSON). The
+/// pointer is only valid for the duration of the call — copy into
+/// caller storage before returning if longer life is needed.
+///
+/// Pairs with the outbound `server_fn_post` extern so chunks can
+/// implement full request → response loops over the desktop IPC
+/// channel (or the web `/api/<name>` POST) without going through
+/// JS Promise correlation.
+pub fn registerResponseHandler(
+    route: []const u8,
+    handler: *const fn ([*]const u8, u32) void,
+) void {
+    verve_register_response_handler(
+        route.ptr,
+        @intCast(route.len),
+        @intCast(@intFromPtr(handler)),
+    );
 }
 
 /// Reconcile a keyed list against the live DOM. `parent_bind` names

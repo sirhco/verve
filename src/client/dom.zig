@@ -134,10 +134,12 @@ const WasmBridge = struct {
     ) void;
 
     // ---- Phase 11B: typed server-fn JSON POST -------------------------------
-    // Fire-and-forget. `name` is the Action's bare identifier; the JS
-    // bridge prepends `/api/`. Value returns are intentionally not
-    // plumbed back yet — async response delivery lands with the
-    // streaming runtime in a later phase.
+    // `name` is the Action's bare identifier; the JS bridge prepends
+    // `/api/`. As of v0.1.28 (Phase 15), replies fan back to wasm via
+    // `verve.registerResponseHandler(route, &handler)` + the bridge's
+    // `verve_dispatch_response` extern — caller registers a handler
+    // before the POST and the body lands in shared memory when the
+    // server responds. Calls without a handler stay fire-and-forget.
 
     pub extern "verve" fn server_fn_post(
         name_ptr: [*]const u8,
