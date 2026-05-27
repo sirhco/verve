@@ -115,6 +115,41 @@ pub const autoHydrate = runtime.autoHydrate;
 pub const registerEvent = runtime.registerEvent;
 pub const dispatchEvent = runtime.dispatchEvent;
 
+// ---- Suspense / transition ----------------------------------------------
+//
+// Async boundary primitives. `suspense(...)` wraps a subtree whose
+// fallback renders while a `Resource` resolves; `markSuspended` flags
+// the current render so the outer boundary catches it.
+
+pub const suspense = verve.suspense;
+pub const transition = verve.transition;
+pub const markSuspended = verve.markSuspended;
+
+// ---- Control-flow helpers -----------------------------------------------
+//
+// SolidJS / Leptos-style declarative helpers. `show(cond, then, else_)`
+// for conditional rendering, `forEach` for keyed lists, `portal` for
+// rendering into a different parent element.
+
+pub const show = verve.show;
+pub const forEach = verve.forEach;
+pub const portal = verve.portal;
+
+// ---- SPA-style navigation -----------------------------------------------
+//
+// `link(...)` renders an `<a>` that hijacks navigation through the
+// client-side router (bypasses full-page reload). Required for the
+// browser-only template.
+
+pub const link = verve.link;
+pub const LinkOpts = verve.LinkOpts;
+
+// ---- i18n ----------------------------------------------------------------
+
+pub const I18nCatalog = verve.I18nCatalog;
+pub const I18nEntry = verve.I18nEntry;
+pub const resolveLocale = verve.resolveLocale;
+
 // ---- DOM-wired adapter (from src/client/runtime.zig) ----------------------
 
 pub const registerI32 = runtime.registerI32;

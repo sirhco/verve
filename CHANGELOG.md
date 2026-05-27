@@ -4,6 +4,26 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.24] - 2026-05-27
+
+### Added
+
+- Suspense / control-flow / SPA-nav / i18n façade exposure. Pure
+  additive re-exports of symbols already public on the `verve`
+  module — every one of them was already wasm-compat (no host-only
+  deps in their core files), the gap was just that downstream
+  clients couldn't reach them through `verve_client`.
+
+  Added to `src/client/verve_client.zig`:
+  - **Suspense**: `suspense`, `transition`, `markSuspended`
+  - **Control flow**: `show`, `forEach`, `portal`
+  - **SPA navigation**: `link`, `LinkOpts` — required for the
+    browser-only template that lands next
+  - **i18n**: `I18nCatalog`, `I18nEntry`, `resolveLocale`
+
+  Tests + build + desktop smoke all green; no behavior change to
+  any existing surface.
+
 ## [0.1.23] - 2026-05-27
 
 ### Added
