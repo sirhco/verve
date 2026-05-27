@@ -327,6 +327,19 @@ pub const Context = struct {
         return node_mod.create(ctx.allocator, tag);
     }
 
+    /// Phase 16 — declare a named template. Renders as
+    /// `<template data-vt="<name>"><inner></template>`; browser
+    /// semantics keep the inner subtree parsed but not rendered.
+    /// Wasm chunks instantiate clones at runtime via
+    /// `verve.cloneTemplate(name)` + fill named slots via
+    /// `verve.slotText` / `verve.slotAttr` (slots are marked with
+    /// `.slot("<name>")` on inner nodes).
+    pub fn template(ctx: *const Context, name: []const u8, inner: *Node) *Node {
+        const n = node_mod.create(ctx.allocator, "template");
+        n.template_name = name;
+        return n.children(.{inner});
+    }
+
     /// Fragment node — no tag wrapper, emits the given bytes verbatim.
     /// Use for non-HTML page responses (sitemap.xml, feed.xml, OG SVG).
     /// Pair with `.contentType("application/xml")` on the same node so the

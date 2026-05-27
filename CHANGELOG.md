@@ -86,6 +86,21 @@ versions follow [Semantic Versioning](https://semver.org/).
   `bindForEach(handle, ctx, render_fn)` path stays the
   effect-driven option that re-runs on Signal change and caches
   the previous key order.
+- **README + topic guides swept for v0.1.12..v0.1.26 features.**
+  README's Reactivity + Islands sections rewritten to cover typed
+  bindings + auto-walker, declarative `autoHydrate`, idempotent
+  `register*`, closure-style event handlers (`registerEvent` +
+  `onClickFn` + 4 other event kinds), slot-table introspection,
+  NodeRef ops (`queryRef` + `setRef*` + `refValueI32`/`F32`),
+  `verve.cleanup`, chunk-side reactive runtime (Phase 13F),
+  cross-module closure events (Phase 13G), multi-instance islands,
+  and a new "Downstream wasm clients (`verve_client` module)"
+  subsection. "Use as a Zig package" gains a worked
+  `verve_client` example. `docs/12-wasm-client.md` surface table
+  refreshed; new sections for NodeRef ops, cleanup hooks,
+  slot-table introspection, extended closure-event coverage.
+  Topic index + glossary, desktop guide, and desktop scaffold
+  README all updated. Pure doc — no behavior change.
 
 ## [0.1.26] - 2026-05-27
 

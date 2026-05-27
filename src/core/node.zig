@@ -62,6 +62,16 @@ pub const Node = struct {
     /// `z_bind_kind == .bool` — paired with `z_bind_initial_bool` for
     /// the initial-state attribute on render.
     z_bind_class: ?[]const u8 = null,
+    /// Phase 16 named-template metadata. `template_name` flips the
+    /// renderer to wrap this node in `<template data-vt="<name>">`
+    /// instead of emitting it as a live element — the inner subtree
+    /// stays parsed but not rendered until a chunk clones it via
+    /// `verve.cloneTemplate`. `slot_name` marks fillable children
+    /// inside a template with `data-vt-slot="<name>"` so chunks can
+    /// reach them via `verve.slotText` / `verve.slotAttr` without
+    /// polluting the document's `data-ref` namespace.
+    template_name: ?[]const u8 = null,
+    slot_name: ?[]const u8 = null,
     z_on_click_action: ?[]const u8 = null,
     /// Closure-style event slot ids. Each corresponds to a `*const fn
     /// () void` registered via `verve.registerEvent(...)` in the wasm
@@ -196,6 +206,20 @@ pub const Node = struct {
     pub fn bind(self: *Node, signal_name: []const u8) *Node {
         if (self.err != null) return self;
         self.z_bind_name = signal_name;
+        return self;
+    }
+
+    /// Phase 16 — mark this node as a fillable slot inside a
+    /// `ctx.template(...)` subtree. Renderer stamps
+    /// `data-vt-slot="<name>"`; wasm chunks reach it after cloning
+    /// via `verve.slotText(handle, "<name>", text)` /
+    /// `verve.slotAttr(handle, "<name>", attr, val)`. Slot names
+    /// must be unique within a template; nested-template re-use of
+    /// the same slot name resolves to the first match in
+    /// document order on the cloned fragment.
+    pub fn slot(self: *Node, slot_name: []const u8) *Node {
+        if (self.err != null) return self;
+        self.slot_name = slot_name;
         return self;
     }
 

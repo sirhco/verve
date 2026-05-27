@@ -148,6 +148,21 @@ pub const Renderer = struct {
                 }
             }
         }
+        if (node.template_name) |tname| {
+            // Phase 16 — named template. The wrapping `<template>` tag
+            // is already this node's tag (set by `ctx.template(...)`);
+            // we just stamp the discovery attribute the bridge JS uses
+            // to find the prototype.
+            try w.writeAll(" data-vt=\"");
+            try escapeAttr(w, tname);
+            try w.writeAll("\"");
+        }
+        if (node.slot_name) |sname| {
+            // Phase 16 — slot marker inside a named template.
+            try w.writeAll(" data-vt-slot=\"");
+            try escapeAttr(w, sname);
+            try w.writeAll("\"");
+        }
         if (node.z_on_click_action) |action| {
             try w.writeAll(" z-on-click=\"");
             try escapeAttr(w, action);
@@ -259,6 +274,27 @@ test "renders nested element with attrs and z-bind" {
     try std.testing.expectEqualStrings(
         \\<div class="card"><span z-bind="count" data-vh="count">0</span><button z-on-click="increment">+</button></div>
     , w.buffered());
+}
+
+test "ctx.template wraps inner subtree with data-vt + slot stamps data-vt-slot" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    var buf: [512]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    const tree = try ctx.template(
+        "todo-row",
+        try ctx.el("li").class("todo").children(.{
+            ctx.span().slot("text"),
+            ctx.button("✕").slot("delete").onClick("delete_todo"),
+        }).build(),
+    ).build();
+    try Renderer.render(&w, tree);
+    try std.testing.expectEqualStrings(
+        "<template data-vt=\"todo-row\"><li class=\"todo\"><span data-vt-slot=\"text\"></span><button data-vt-slot=\"delete\" z-on-click=\"delete_todo\">✕</button></li></template>",
+        w.buffered(),
+    );
 }
 
 test "streamRender emits placeholder + template + verveSwap for a suspended boundary" {
