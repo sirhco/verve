@@ -124,8 +124,14 @@ Wasm-side primitives so app logic lives in Zig instead of an inline `<script>` b
 - **Events with data** — handlers read `eventMods()`, `eventKey(buf)`, `eventTargetAttr(name, buf)` (the element's `data-*`), `eventCoordX/Y()`, and call `eventPreventDefault()` / `eventStopPropagation()`.
 - **Timers / storage / clipboard** — `setTimeout` / `setInterval` / `requestAnimationFrame` / `queueMicrotask` / `clearTimer`, `storage.{get,set,remove,len}` over `localStorage`, `clipboardWrite`.
 - **Forms + DOM measurement** — `refValueStr`, `refRequestSubmit`, `refSelect`, `refBlur`, `refScrollIntoView`, `refRect()`, `viewport()`, `matchMedia(query)`, `formCollect(bind, buf)` → JSON for `readStruct`.
-- **Generic JS interop** — `host(name, args, out)` (sync) + `hostAsync(name, args, route)` (replies via the response-handler path). Apps register functions in `window.verveHost` — the supported hook for Intl, markdown, syntax highlight, canvas.
+- **Generic JS interop** — `host(name, args, out)` (sync) + `hostAsync(name, args, route)` (replies via the response-handler path). Apps register functions in `window.verveHost` — the supported hook for browser APIs Verve doesn't own (Intl, canvas).
 - **Chunk-local arena** — `chunkArena()` is a real `std.mem.Allocator` over a main-client bump region; `chunkArenaMark` / `chunkArenaReset` recycle per dispatch instead of pre-sizing static buffers. `registerDrop(bind, handler)` + `currentDrop(buf)` deliver dropped-file bytes to wasm.
+
+### Markdown & syntax highlighting
+Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed at SSR time into the `Node` tree; no client wasm, no JavaScript. Guide: [`docs/21-markdown-and-highlighting.md`](docs/21-markdown-and-highlighting.md). Demo: [`examples/markdown/`](examples/markdown/README.md).
+- **`ctx.markdown(src)`** — GFM: CommonMark core + tables, task lists, strikethrough, autolinks, reference links. Returns a real `Node` subtree, so text is escaped by the one renderer escaper.
+- **`ctx.codeBlock(src, lang)`** — hand-written tokenizers for Zig, JS/TS, JSON, HTML/CSS, Bash, Markdown + generic fallback; stable `tok-*` classes themed by `verve.highlightThemeCss` (light/dark). Markdown fenced code auto-highlights.
+- **Safe by default** — link/image URLs filtered by `verve.sanitizeUrl` (rejects `javascript:`, `data:`, control-char bypasses); raw HTML in source is stripped.
 
 ### Dev + ops
 - **`--dev`** auto-reload: injects a WS-disconnect-reconnect script. Pair with `zig build --watch run -- --dev`.

@@ -1,6 +1,6 @@
 # Verve examples
 
-Eight self-contained sample apps. Each is a regular Zig project — a
+Nine self-contained sample apps. Each is a regular Zig project — a
 `build.zig`, a `build.zig.zon`, and a `src/app/` tree with the
 `Actions` / `routes` / `components` triple the framework expects.
 
@@ -26,6 +26,7 @@ generate a scaffolded variant.
 | [`poll/`](poll/README.md)           | Atomic counter array + SSE reload    | Yes via SSE      | Yes |
 | [`bookmarks/`](bookmarks/README.md) | Multi-route + validation + app stats | No (static pages)| Yes |
 | [`dashboard/`](dashboard/README.md) | Multi-page admin layout              | Background fetcher | Yes |
+| [`markdown/`](markdown/README.md)   | `ctx.markdown` GFM + syntax highlighting (pure-Zig, replaces marked + highlight.js) | No (static page) | Yes |
 
 ### Wasm-driven examples
 

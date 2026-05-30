@@ -4,6 +4,43 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.31] - 2026-05-29
+
+### Added
+
+Built-in **GFM markdown rendering** and **syntax highlighting** — pure-Zig,
+server-side, safe-by-default. These replace third-party JS dependencies
+(`marked` / `markdown-it`, `highlight.js` / `prism`): markdown is parsed in
+`src/core/` at SSR time and emitted into the `Node` tree, so there is no
+client wasm cost and no JavaScript. New guide:
+`docs/21-markdown-and-highlighting.md`; new demo: `examples/markdown/`.
+
+- **`ctx.markdown(src)` / `ctx.markdownOpts(src, opts)`** (`verve.markdown`,
+  `verve.MarkdownOptions`). GFM = CommonMark core (headings, lists,
+  emphasis/strong, links, images, blockquotes, fenced + indented code,
+  autolinks, reference links, backslash escapes) plus GFM tables with
+  per-column alignment, task lists, and strikethrough. Returns a real `Node`
+  subtree (fragment), so every text leaf flows through the framework's single
+  `escapeHtml` — no second escaper to get wrong.
+
+- **`ctx.codeBlock(src, lang)`** (`verve.highlight`, `verve.HighlightLang`,
+  `verve.detectLang`). Hand-written tokenizers for Zig, JavaScript/TypeScript,
+  JSON, HTML/XML, CSS, Bash, and Markdown, plus a generic fallback. Emits
+  `<span class="tok-…">` tokens using a stable class contract themed by
+  `verve.highlightThemeCss` (bundled light/dark). Markdown fenced code blocks
+  auto-highlight via the same engine. Distinct from the existing inline
+  `ctx.code(text)`.
+
+- **Safe-by-default sanitization.** Link/image/autolink URLs pass through the
+  new `verve.sanitizeUrl` (exported standalone): only `http`, `https`,
+  `mailto`, `tel`, and scheme-less URLs are allowed; `javascript:`,
+  `vbscript:`, `data:`, `file:`, and control-character scheme bypasses are
+  rejected. Raw HTML embedded in markdown source is stripped (no allowlist).
+
+- **`ctx.textNode(text)`** — a bare escaped character-data node (renders via
+  `escapeHtml` with no wrapping element), the building block for interleaving
+  plain text with inline elements and highlight spans.
+
 ## [0.1.30] - 2026-05-29
 
 ### Added

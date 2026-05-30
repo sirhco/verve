@@ -102,6 +102,24 @@ pub const AssetResolver = context_mod.AssetResolver;
 pub const Renderer = renderer_mod.Renderer;
 pub const escapeHtml = renderer_mod.escapeHtml;
 
+/// Reject unsafe URL schemes (javascript:, data:, …) before placing a
+/// user-supplied URL into an href/src. Returns the URL when safe, null
+/// otherwise. The markdown renderer applies this automatically.
+pub const sanitizeUrl = @import("core/sanitize.zig").safeUrl;
+
+/// Default light/dark CSS theme for `ctx.markdown` / `ctx.codeBlock`
+/// highlighted code. Include via `ctx.style(verve.highlightThemeCss)`.
+pub const highlightThemeCss = @import("core/highlight_theme.zig").css;
+
+/// Build a syntax-highlighted `<pre><code>` block (also `ctx.codeBlock`).
+pub const highlight = @import("core/highlight.zig").block;
+pub const HighlightLang = @import("core/highlight.zig").Lang;
+pub const detectLang = @import("core/highlight.zig").detectLang;
+
+/// Render GFM markdown into a safe `Node` subtree (also `ctx.markdown`).
+pub const markdown = @import("core/markdown.zig").render;
+pub const MarkdownOptions = @import("core/markdown.zig").Options;
+
 /// Set the per-request CSP nonce the renderer will stamp onto every
 /// `<script>` / `<style>` tag missing one. Empty string disables.
 pub fn setRendererNonce(nonce: []const u8) void {
@@ -147,4 +165,9 @@ test {
     _ = @import("core/server_fn.zig");
     _ = @import("core/server_fn_gen.zig");
     _ = @import("core/island.zig");
+    _ = @import("core/sanitize.zig");
+    _ = @import("core/highlight_theme.zig");
+    _ = @import("core/highlight.zig");
+    _ = @import("core/markdown.zig");
+    _ = @import("core/markdown_inline.zig");
 }

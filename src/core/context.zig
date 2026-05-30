@@ -349,6 +349,14 @@ pub const Context = struct {
         return n.raw(bytes);
     }
 
+    /// Bare escaped text node — character data with no wrapping element.
+    /// Interleave plain text with inline elements (markdown) or highlight
+    /// spans without emitting noise `<span>`s around plain runs. Goes
+    /// through the renderer's `escapeHtml`, so it is safe by default.
+    pub fn textNode(ctx: *const Context, t: []const u8) *Node {
+        return ctx.el("__text__").text(t);
+    }
+
     pub fn div(ctx: *const Context) *Node {
         return ctx.el("div");
     }
@@ -431,6 +439,32 @@ pub const Context = struct {
 
     pub fn pre(ctx: *const Context) *Node {
         return ctx.el("pre");
+    }
+
+    /// Syntax-highlighted code block. Builds
+    /// `<pre><code class="language-<lang>">…token spans…</code></pre>`
+    /// with text escaped and tokens classified into the stable `tok-*`
+    /// classes (pair with `verve.highlightThemeCss`). `lang` is the
+    /// language hint ("zig", "ts", "json", …); an empty or unknown hint
+    /// falls back to a generic tokenizer, and `""` renders plain (no
+    /// highlighting). Note: this is distinct from `ctx.code(t)`, which is
+    /// an inline `<code>` element.
+    pub fn codeBlock(ctx: *const Context, source: []const u8, lang: []const u8) !*Node {
+        return @import("highlight.zig").block(ctx, source, lang);
+    }
+
+    /// Render GFM markdown `src` into a safe `Node` subtree (a fragment of
+    /// block elements). Text is escaped, link/image URLs are sanitized, raw
+    /// HTML is stripped, and fenced code is syntax-highlighted. Drop it into
+    /// a tree with `.children(.{ try ctx.markdown(src) })`. Pair highlighted
+    /// code with `verve.highlightThemeCss`.
+    pub fn markdown(ctx: *const Context, src: []const u8) !*Node {
+        return @import("markdown.zig").render(ctx.allocator, ctx, src, .{});
+    }
+
+    /// `markdown` with explicit options (GFM toggle, highlight toggle, base URL).
+    pub fn markdownOpts(ctx: *const Context, src: []const u8, opts: @import("markdown.zig").Options) !*Node {
+        return @import("markdown.zig").render(ctx.allocator, ctx, src, opts);
     }
 
     pub fn nav(ctx: *const Context) *Node {

@@ -1,0 +1,12 @@
+.{
+    .name = .verve_markdown_example,
+    .version = "0.0.0",
+    .fingerprint = 0x8e7109468c48906d,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

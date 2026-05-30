@@ -76,6 +76,16 @@ pub const Renderer = struct {
         // fallback: skip silently.
         if (std.mem.eql(u8, node.tag, "__redirect__")) return;
 
+        // Text node — escaped character data with no wrapping element. The
+        // building block for highlighted token streams (core/highlight.zig)
+        // and inline markdown runs (core/markdown.zig) that interleave bare
+        // text with element children. Goes through the same escaper as
+        // `text_content`, so it is safe by default.
+        if (std.mem.eql(u8, node.tag, "__text__")) {
+            if (node.text_content) |t| try escapeHtml(w, t);
+            return;
+        }
+
         // Empty tag → fragment. Emit only raw_inner (if set) or children;
         // attrs/bindings/text on a fragment are silently ignored.
         if (node.tag.len == 0) {
