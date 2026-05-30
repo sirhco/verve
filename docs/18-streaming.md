@@ -48,10 +48,11 @@ defer reg.deinit();
 // `reg` instead of emitting fallback inline.
 const root = try verve.withStreamRegistry(&reg, ctx, buildPage);
 
-// Walk + drain. `streamRender` flushes the shell first then
-// emits each `<template>` + `verveSwap()` chunk in registration
-// order.
-try verve.Renderer.streamRender(writer, root, &reg);
+// Walk + drain. `streamRender` flushes the shell first, then
+// awaits every parked boundary's in-flight Resource future
+// concurrently and emits each `<template>` + `verveSwap()` chunk
+// in COMPLETION order. Needs an `Io` to drive the concurrency.
+try verve.Renderer.streamRender(writer, io, root, &reg);
 ```
 
 `withStreamRegistry(reg, ctx_ptr, f)` is the safe activator: it
@@ -74,24 +75,33 @@ return try verve.suspense(ctx, .{ .fallback = fallback }, &state, render_child);
   reserves a slot id, and emits
   `<div data-vs="<id>">{fallback}</div>` in place of the child.
 
-After the main render, `streamRender` calls each parked slot's
-continuation a second time — by that point the upstream that
-triggered `markSuspended` is meant to have resolved (async
-Resource integration arrives with Phase 14C).
+During the first render, each suspended boundary captures the
+Resource futures its child depends on (a `Resolver` per future).
+After the shell flushes, `streamRender` awaits those futures
+**concurrently across boundaries** and re-renders each parked
+continuation as its upstream resolves.
 
-## Async caveat
+## Async delivery
 
-Today's Resource fetcher is synchronous. The streaming wire
-format works end-to-end but a parked boundary's continuation
-runs synchronously in the drain loop — the practical benefit
-right now is **shell-first delivery** (faster TTFB / FCP for
-pages that have above-the-fold content + below-the-fold blocks
-that take a few extra ms to compute).
+Resource fetchers run asynchronously via `std.Io.async`
+(`resource.create` launches the fetcher and stashes a
+`Future`; the boundary stays `loading` until the drain awaits
+it). The drain is genuinely out-of-order: chunk N can race
+chunk N+1 on the wire, so a fast boundary's `<template>`
+appears before a slow boundary's even if the slow one
+registered first.
 
-Truly out-of-order delivery, where chunk N can race chunk N+1
-on the wire, lands when `ctx.fetch` migrates to `std.Io.async`.
-The wire format won't change — the wiring inside
-`StreamRegistry.pending()` will.
+Mechanics: `streamRender` spawns one worker per parked slot via
+`std.Io.Select`. **Workers only block on futures** — they stage
+each result inside its Resource and touch nothing else. All
+Signal mutation, node rendering, and writer emission happen on
+the main thread in completion order, so the (non-threadsafe)
+arena and reactive graph are never touched off-thread. If the
+select buffer can't be allocated, the drain falls back to a
+sequential await/emit that is correct but loses the
+out-of-order property. The wire format is unchanged from the
+shell-first era — only the drain ordering and concurrency
+improved.
 
 ## CSP nonces
 
@@ -128,7 +138,7 @@ fn streamingHandler(io: std.Io, request: *http.Server.Request, ctx: *verve.Conte
     defer reg.deinit();
 
     const root = try verve.withStreamRegistry(&reg, ctx, renderPage);
-    try verve.Renderer.streamRender(&resp.writer, root, &reg);
+    try verve.Renderer.streamRender(&resp.writer, io, root, &reg);
     try resp.end();
 }
 ```
@@ -150,7 +160,9 @@ would.
 - `streamRender` produces the placeholder, a matching
   `<template id="verve-vs-0">{real content}</template>`, and a
   `verveSwap(0)` script tag.
-- Drain order matches registration order.
+- A slow boundary that registers first still emits **after** a
+  fast boundary that registers second — drain order is
+  completion order, not registration order.
 
 ## Next
 
