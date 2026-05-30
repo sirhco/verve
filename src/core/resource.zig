@@ -1,18 +1,17 @@
-//! Reactive async data wrapper. Server-side, the fetcher is invoked
-//! synchronously during render — the result is stuffed into a
-//! `Signal(ResourceState(T))` that components can read with normal
-//! reactive tracking. The state union mirrors Leptos:
+//! Reactive async data wrapper. The fetcher is launched asynchronously via
+//! `std.Io` at creation time. The resource starts in `.loading` state until
+//! `resolve(io)` is called, which awaits the `Future` and transitions the
+//! Signal to `.ready` or `.err`.
 //!
-//!   - `loading` — fetcher hasn't returned (only seen client-side after
-//!     phase-4 hydration; SSR never serializes a loading state).
+//!   - `loading` — fetcher hasn't resolved yet.
 //!   - `ready(T)` — fetcher returned successfully.
 //!   - `err(anyerror)` — fetcher errored; the boundary's UI can render
 //!     a fallback.
 //!
-//! Phase 3 ships the SSR side only. Phase 4 layers `<Suspense>` on top
-//! and the streaming pipeline that lets `loading` resources emit a
-//! placeholder + swap-in chunk. Phase 8's islands serialize the ready
-//! value into the hydration payload so the client doesn't re-fetch.
+//! Phase 3 ships the SSR side. Phase 4 layers `<Suspense>` on top and the
+//! streaming drain loop that drives `resolve` for pending boundaries. Phase 8's
+//! islands serialize the ready value into the hydration payload so the client
+//! doesn't re-fetch.
 
 const std = @import("std");
 const Owner = @import("owner.zig").Owner;
@@ -31,6 +30,9 @@ pub fn Resource(comptime T: type) type {
     return struct {
         state: signal_mod.Signal(ResourceState(T)),
         owner: *Owner,
+        /// The in-flight async future. Non-null from `create` until the first
+        /// call to `resolve`. Set to null afterwards (idempotent).
+        future: ?std.Io.Future(anyerror!T) = null,
 
         const Self = @This();
 
@@ -85,15 +87,29 @@ pub fn Resource(comptime T: type) type {
                 else => false,
             };
         }
+
+        /// Await the in-flight future (if any) and settle the resource state.
+        /// Idempotent: calling resolve a second time is a no-op because the
+        /// future is cleared on first await.
+        pub fn resolve(self: *Self, io: std.Io) void {
+            const f = &(self.future orelse return);
+            const result: anyerror!T = f.await(io);
+            self.future = null;
+            if (result) |value| {
+                self.state.set(.{ .ready = value });
+            } else |err| {
+                self.state.set(.{ .err = err });
+            }
+        }
     };
 }
 
-/// Allocate a Resource under `owner` and immediately invoke `fetcher`
-/// synchronously. Server-side render only — the result lands in the
-/// initial Signal value so the first read is already `.ready` or
-/// `.err`. Phase 4/8 will layer async fetch + hydration on top.
+/// Allocate a Resource under `owner` and launch `fetcher` asynchronously via
+/// `io`. The resource starts in `.loading` state. Call `res.resolve(io)` to
+/// await the future and settle the state to `.ready` or `.err`.
 pub fn create(
     comptime T: type,
+    io: std.Io,
     owner: *Owner,
     ctx_ptr: anytype,
     comptime fetcher: fn (@TypeOf(ctx_ptr)) anyerror!T,
@@ -102,13 +118,8 @@ pub fn create(
     res.* = .{
         .state = signal_mod.Signal(ResourceState(T)).init(.loading, owner.allocator()),
         .owner = owner,
+        .future = io.async(fetcher, .{ctx_ptr}),
     };
-
-    if (fetcher(ctx_ptr)) |value| {
-        res.state.set(.{ .ready = value });
-    } else |err| {
-        res.state.set(.{ .err = err });
-    }
     return res;
 }
 
@@ -118,11 +129,12 @@ pub fn create(
 /// into the hydration payload — the client runs the fetcher itself).
 pub fn createLocal(
     comptime T: type,
+    io: std.Io,
     owner: *Owner,
     ctx_ptr: anytype,
     comptime fetcher: fn (@TypeOf(ctx_ptr)) anyerror!T,
 ) !*Resource(T) {
-    return create(T, owner, ctx_ptr, fetcher);
+    return create(T, io, owner, ctx_ptr, fetcher);
 }
 
 // ---- tests ------------------------------------------------------------
@@ -130,7 +142,15 @@ pub fn createLocal(
 const testing = std.testing;
 const effect_mod = @import("effect.zig");
 
-test "Resource runs fetcher synchronously and lands ready" {
+fn makeTestIo(allocator: std.mem.Allocator) std.Io.Threaded {
+    return std.Io.Threaded.init(allocator, .{});
+}
+
+test "Resource runs fetcher asynchronously and lands ready after resolve" {
+    var threaded = makeTestIo(testing.allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var owner = Owner.init(testing.allocator);
     effect_mod.setPendingAllocator(owner.allocator());
     defer owner.dispose();
@@ -143,12 +163,18 @@ test "Resource runs fetcher synchronously and lands ready" {
     };
     var f: Fetcher = .{ .n = 21 };
 
-    const res = try create(u32, &owner, &f, Fetcher.run);
+    const res = try create(u32, io, &owner, &f, Fetcher.run);
+    // Before resolve: still loading (future in flight).
+    res.resolve(io);
     try testing.expect(res.isReady());
     try testing.expectEqual(@as(u32, 42), res.get().?);
 }
 
-test "Resource captures fetcher error" {
+test "Resource captures fetcher error after resolve" {
+    var threaded = makeTestIo(testing.allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var owner = Owner.init(testing.allocator);
     effect_mod.setPendingAllocator(owner.allocator());
     defer owner.dispose();
@@ -160,11 +186,16 @@ test "Resource captures fetcher error" {
     };
     var f: Fetcher = .{};
 
-    const res = try create(u32, &owner, &f, Fetcher.run);
+    const res = try create(u32, io, &owner, &f, Fetcher.run);
+    res.resolve(io);
     try testing.expect(res.isErr());
 }
 
 test "Resource notifies effects when set/fail" {
+    var threaded = makeTestIo(testing.allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var owner = Owner.init(testing.allocator);
     effect_mod.setPendingAllocator(owner.allocator());
     defer owner.dispose();
@@ -175,7 +206,9 @@ test "Resource notifies effects when set/fail" {
         }
     };
     var f: Fetcher = .{};
-    const res = try create(u32, &owner, &f, Fetcher.run);
+    const res = try create(u32, io, &owner, &f, Fetcher.run);
+    // Resolve so the resource is ready before the effect subscribes.
+    res.resolve(io);
 
     const Tracker = struct {
         var hits: u32 = 0;
@@ -197,4 +230,28 @@ test "Resource notifies effects when set/fail" {
     res.set(42);
     try testing.expectEqual(@as(u32, 2), Tracker.hits);
     try testing.expectEqual(@as(?u32, 42), Tracker.last);
+}
+
+test "resolve is idempotent" {
+    var threaded = makeTestIo(testing.allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var owner = Owner.init(testing.allocator);
+    effect_mod.setPendingAllocator(owner.allocator());
+    defer owner.dispose();
+
+    const Fetcher = struct {
+        n: u32,
+        fn run(self: *@This()) anyerror!u32 {
+            return self.n * 3;
+        }
+    };
+    var f: Fetcher = .{ .n = 7 };
+
+    const res = try create(u32, io, &owner, &f, Fetcher.run);
+    res.resolve(io); // first resolve — awaits future
+    res.resolve(io); // second resolve — must be a no-op
+    try testing.expect(res.isReady());
+    try testing.expectEqual(@as(u32, 21), res.get().?);
 }
