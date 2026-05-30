@@ -41,6 +41,12 @@ client wasm cost and no JavaScript. New guide:
   `escapeHtml` with no wrapping element), the building block for interleaving
   plain text with inline elements and highlight spans.
 
+- **`examples/client-runtime/`** — runnable demo for the v0.1.30 client-runtime
+  primitives (previously docs-only). Mounts the `JsonProbe` island and
+  exercises all six phases — typed IPC, events-with-data, timers/storage/
+  clipboard, forms/measurement, JS interop, chunk arena + drag-drop — from one
+  page. Linked from `docs/20-client-runtime.md`.
+
 ## [0.1.30] - 2026-05-29
 
 ### Added

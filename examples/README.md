@@ -1,6 +1,6 @@
 # Verve examples
 
-Nine self-contained sample apps. Each is a regular Zig project — a
+Ten self-contained sample apps. Each is a regular Zig project — a
 `build.zig`, a `build.zig.zon`, and a `src/app/` tree with the
 `Actions` / `routes` / `components` triple the framework expects.
 
@@ -35,6 +35,7 @@ generate a scaffolded variant.
 | [`stopwatch/`](stopwatch/README.md)   | JS-driven tick into wasm, FBA-formatted display, z-on-click → exports | ~3 KB |
 | [`calculator/`](calculator/README.md) | Many small exports, f64 math, keyboard ↔ click parity                | ~7 KB |
 | [`keystrokes/`](keystrokes/README.md) | JS → wasm string passing via shared memory                            | ~440 B |
+| [`client-runtime/`](client-runtime/README.md) | All v0.1.30 primitives in one island — typed IPC, events-with-data, timers/storage/clipboard, forms/measurement, JS interop, chunk arena + drag-drop | ~3.6 KB |
 
 The wasm-driven examples each ship their own `src/client/main.zig`
 overriding the framework's default client. The framework's server,

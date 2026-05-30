@@ -231,6 +231,13 @@ fn onDrop() void {
 }
 ```
 
+## Runnable demo
+
+`examples/client-runtime/` mounts the `JsonProbe` island and exercises every
+phase above from a single page — typed IPC (visible count round-trip),
+events-with-data, timers/storage/clipboard, forms/measurement, JS interop, and
+the chunk arena + drag-drop. `cd examples/client-runtime && zig build run`.
+
 ## Next
 
 - [12 — WASM client](12-wasm-client.md) — main runtime architecture.
