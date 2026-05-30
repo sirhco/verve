@@ -284,6 +284,15 @@
   window.verveQueryRef = (id) =>
     document.querySelector(`[data-ref="${CSS.escape(String(id))}"]`);
 
+  // Phase 21 — generic JS-interop registry. Apps register host
+  // functions here for wasm to call by name (Intl date/number
+  // formatting, markdown, syntax highlight, canvas draw — the
+  // unbounded long tail verve does not type natively):
+  //   window.verveHost.fmtDate = (args) => new Date(args.ms).toLocaleString();
+  // Each receives the JSON-parsed args object and returns a
+  // JSON-serializable result (sync) or a Promise of one (async).
+  window.verveHost = window.verveHost || {};
+
   const resp = await fetch("/client.wasm");
   const wasm = await WebAssembly.instantiateStreaming(resp, env);
   memory = wasm.instance.exports.memory;
@@ -427,14 +436,68 @@
   // `verve_event_dispatch(id)`. Returns true when a handler ran so
   // the caller can decide whether to also fall through to other
   // dispatch paths.
+  // Phase 18 — stage the dispatching event's data (modifiers, key,
+  // pointer coords, the handler element's `dataset`) into the main
+  // runtime before invoking the wasm handler, so handlers can read it
+  // via the `verve_event_*` accessors. Bytes (key + dataset JSON) stage
+  // through the island scratch buffer.
+  const stageEvent = (e, node) => {
+    if (typeof exp.verve_event_begin !== "function") return;
+    exp.verve_event_begin();
+    let mods = 0;
+    if (e.metaKey) mods |= 1;
+    if (e.ctrlKey) mods |= 2;
+    if (e.shiftKey) mods |= 4;
+    if (e.altKey) mods |= 8;
+    exp.verve_event_set_mods(mods >>> 0);
+    if (typeof e.clientX === "number") {
+      exp.verve_event_set_coords(e.clientX, e.clientY);
+    }
+    const scratchPtr =
+      typeof exp.verve_island_scratch_ptr === "function"
+        ? exp.verve_island_scratch_ptr()
+        : 0;
+    const scratchCap = scratchPtr ? exp.verve_island_scratch_capacity() : 0;
+    const enc = new TextEncoder();
+    const stage = (s) => {
+      if (!scratchPtr) return null;
+      const b = enc.encode(s);
+      if (b.length > scratchCap) return null;
+      new Uint8Array(memory.buffer, scratchPtr, scratchCap).set(b, 0);
+      return { ptr: scratchPtr, len: b.length };
+    };
+    if (e.key) {
+      const r = stage(e.key);
+      if (r) exp.verve_event_set_key(r.ptr, r.len);
+    }
+    if (node && node.dataset) {
+      const ds = {};
+      for (const k in node.dataset) ds[k] = node.dataset[k];
+      const r = stage(JSON.stringify(ds));
+      if (r) exp.verve_event_set_dataset(r.ptr, r.len);
+    }
+  };
+
+  // Honor preventDefault / stopPropagation the wasm handler requested,
+  // then release the staged dataset doc.
+  const applyEventFlags = (e) => {
+    if (typeof exp.verve_event_flags !== "function") return;
+    const f = exp.verve_event_flags();
+    if (f & 1) e.preventDefault();
+    if (f & 2) e.stopPropagation();
+    if (typeof exp.verve_event_end === "function") exp.verve_event_end();
+  };
+
   const dispatchEventId = (e, attr, prevent) => {
     const node = e.target.closest(`[${attr}]`);
     if (!node) return false;
     const id = parseInt(node.getAttribute(attr), 10);
     if (!Number.isFinite(id)) return false;
     if (typeof exp.verve_event_dispatch !== "function") return false;
+    stageEvent(e, node);
     if (prevent) e.preventDefault();
     exp.verve_event_dispatch(id >>> 0);
+    applyEventFlags(e);
     return true;
   };
 
@@ -546,6 +609,24 @@
   // private table and crash when main dispatched them.
   const indirectFunctionTable = exp.__indirect_function_table;
 
+  // Phase 19 — timer / storage / clipboard registry for chunk handlers.
+  // Handlers cross as indirect-function-table indices (same convention
+  // as `registerEvent`); `indirectFunctionTable.get(idx)` resolves the
+  // funcref so JS can invoke it when the timer fires. Our own monotonic
+  // ids decouple callers from the host's setTimeout/rAF handle types.
+  let verveTimerSeq = 1;
+  const verveTimers = new Map();
+  const verveCallSlot = (idx) => {
+    const fn = indirectFunctionTable.get(idx >>> 0);
+    if (typeof fn === "function") {
+      try {
+        fn();
+      } catch (err) {
+        console.error("verve timer handler failed:", err);
+      }
+    }
+  };
+
   // Phase 13F — assemble the chunk-side reactive-runtime import object
   // from the main client's matching exports. Built once after main
   // instantiation; reused for every island chunk. Missing entries pass
@@ -578,9 +659,313 @@
     verve_register_event: exp.verve_register_event,
     verve_dispatch_event: exp.verve_dispatch_event,
     verve_cleanup: exp.verve_cleanup,
+    // Phase 18 — current-event accessors for chunk handlers.
+    verve_event_mods: exp.verve_event_mods,
+    verve_event_coord_x: exp.verve_event_coord_x,
+    verve_event_coord_y: exp.verve_event_coord_y,
+    verve_event_key: exp.verve_event_key,
+    verve_event_target_attr: exp.verve_event_target_attr,
+    verve_event_prevent_default: exp.verve_event_prevent_default,
+    verve_event_stop_propagation: exp.verve_event_stop_propagation,
+    // Phase 19 — timers (handler crosses as a function-table index).
+    verve_set_timeout: (ms, idx) => {
+      const myId = verveTimerSeq++;
+      const h = setTimeout(() => {
+        verveTimers.delete(myId);
+        verveCallSlot(idx);
+      }, ms >>> 0);
+      verveTimers.set(myId, { kind: "t", h });
+      return myId >>> 0;
+    },
+    verve_set_interval: (ms, idx) => {
+      const myId = verveTimerSeq++;
+      const h = setInterval(() => verveCallSlot(idx), ms >>> 0);
+      verveTimers.set(myId, { kind: "i", h });
+      return myId >>> 0;
+    },
+    verve_request_animation_frame: (idx) => {
+      const myId = verveTimerSeq++;
+      const raf =
+        typeof requestAnimationFrame === "function"
+          ? requestAnimationFrame
+          : (cb) => setTimeout(cb, 16);
+      const h = raf(() => {
+        verveTimers.delete(myId);
+        verveCallSlot(idx);
+      });
+      verveTimers.set(myId, { kind: "r", h });
+      return myId >>> 0;
+    },
+    verve_queue_microtask: (idx) => {
+      queueMicrotask(() => verveCallSlot(idx));
+    },
+    verve_clear_timer: (id) => {
+      const t = verveTimers.get(id >>> 0);
+      if (!t) return;
+      verveTimers.delete(id >>> 0);
+      if (t.kind === "t") clearTimeout(t.h);
+      else if (t.kind === "i") clearInterval(t.h);
+      else if (t.kind === "r" && typeof cancelAnimationFrame === "function")
+        cancelAnimationFrame(t.h);
+    },
+    // Phase 19 — localStorage (string values; len-probe then copy).
+    verve_storage_len: (kp, kl) => {
+      try {
+        const v = localStorage.getItem(readStr(kp, kl));
+        return v == null ? 0 : new TextEncoder().encode(v).length;
+      } catch {
+        return 0;
+      }
+    },
+    verve_storage_get: (kp, kl, bp, bc) => {
+      try {
+        const v = localStorage.getItem(readStr(kp, kl));
+        if (v == null) return 0;
+        const b = new TextEncoder().encode(v);
+        const n = Math.min(b.length, bc >>> 0);
+        new Uint8Array(memory.buffer, bp, n).set(b.subarray(0, n));
+        return n;
+      } catch {
+        return 0;
+      }
+    },
+    verve_storage_set: (kp, kl, vp, vl) => {
+      try {
+        localStorage.setItem(readStr(kp, kl), readStr(vp, vl));
+      } catch (err) {
+        console.warn("verve storage set failed:", err);
+      }
+    },
+    verve_storage_remove: (kp, kl) => {
+      try {
+        localStorage.removeItem(readStr(kp, kl));
+      } catch {}
+    },
+    // Phase 20 — forms + DOM measurement (operate on `refHandles[h]`).
+    verve_ref_get_value_str: (h, bp, bc) => {
+      const el = refHandles[h];
+      if (!el) return 0;
+      const b = new TextEncoder().encode(String(el.value ?? ""));
+      const n = Math.min(b.length, bc >>> 0);
+      new Uint8Array(memory.buffer, bp, n).set(b.subarray(0, n));
+      return n;
+    },
+    verve_ref_request_submit: (h) => {
+      const el = refHandles[h];
+      if (el && el.form && typeof el.form.requestSubmit === "function") {
+        el.form.requestSubmit();
+      } else if (el && typeof el.requestSubmit === "function") {
+        el.requestSubmit();
+      }
+    },
+    verve_ref_select: (h) => {
+      const el = refHandles[h];
+      if (el && typeof el.select === "function") el.select();
+    },
+    verve_ref_blur: (h) => {
+      const el = refHandles[h];
+      if (el && typeof el.blur === "function") el.blur();
+    },
+    verve_ref_rect: (h, out) => {
+      const dv = new Float64Array(memory.buffer, out, 4);
+      const el = refHandles[h];
+      if (!el || typeof el.getBoundingClientRect !== "function") {
+        dv[0] = dv[1] = dv[2] = dv[3] = 0;
+        return;
+      }
+      const r = el.getBoundingClientRect();
+      dv[0] = r.x;
+      dv[1] = r.y;
+      dv[2] = r.width;
+      dv[3] = r.height;
+    },
+    verve_ref_scroll_into_view: (h) => {
+      const el = refHandles[h];
+      if (el && typeof el.scrollIntoView === "function") {
+        el.scrollIntoView({ block: "nearest" });
+      }
+    },
+    verve_viewport: (out) => {
+      const dv = new Float64Array(memory.buffer, out, 2);
+      dv[0] = window.innerWidth || 0;
+      dv[1] = window.innerHeight || 0;
+    },
+    verve_match_media: (qp, ql) => {
+      try {
+        return window.matchMedia(readStr(qp, ql)).matches ? 1 : 0;
+      } catch {
+        return 0;
+      }
+    },
+    verve_form_collect: (bp, bl, bufp, bufc) => {
+      const bind = readStr(bp, bl);
+      let form =
+        document.querySelector(`[z-bind="${CSS.escape(bind)}"]`) ||
+        document.querySelector(`[data-vh="${CSS.escape(bind)}"]`);
+      if (form && form.tagName !== "FORM") {
+        form = form.closest("form") || form.querySelector("form") || form;
+      }
+      const out = {};
+      if (form && form.elements) {
+        for (const el of form.elements) {
+          if (!el.name) continue;
+          if (el.type === "checkbox") out[el.name] = el.checked;
+          else if (el.type === "radio") {
+            if (el.checked) out[el.name] = el.value;
+          } else out[el.name] = el.value;
+        }
+      }
+      const b = new TextEncoder().encode(JSON.stringify(out));
+      const n = Math.min(b.length, bufc >>> 0);
+      new Uint8Array(memory.buffer, bufp, n).set(b.subarray(0, n));
+      return n;
+    },
+    // Phase 21 — generic JS interop. `verve_host_call` is synchronous
+    // (host fn must return a JSON-serializable value, not a Promise);
+    // `verve_host_call_async` fans the resolved result back through the
+    // response-handler path so it reads like a server-fn reply.
+    verve_host_call: (np, nl, ap, al, op, oc) => {
+      const fn = window.verveHost[readStr(np, nl)];
+      if (typeof fn !== "function") return 0;
+      let args;
+      try {
+        args = al ? JSON.parse(readStr(ap, al)) : undefined;
+      } catch {
+        return 0;
+      }
+      let out;
+      try {
+        const result = fn(args);
+        out = JSON.stringify(result === undefined ? null : result);
+      } catch (err) {
+        console.error("verve host call failed:", err);
+        return 0;
+      }
+      const b = new TextEncoder().encode(out);
+      const n = Math.min(b.length, oc >>> 0);
+      new Uint8Array(memory.buffer, op, n).set(b.subarray(0, n));
+      return n;
+    },
+    verve_host_call_async: (np, nl, ap, al, rp, rl) => {
+      const name = readStr(np, nl);
+      const route = readStr(rp, rl);
+      const fn = window.verveHost[name];
+      if (typeof fn !== "function") return;
+      let args;
+      try {
+        args = al ? JSON.parse(readStr(ap, al)) : undefined;
+      } catch {
+        return;
+      }
+      Promise.resolve()
+        .then(() => fn(args))
+        .then((result) => {
+          if (
+            typeof exp.verve_dispatch_response !== "function" ||
+            typeof exp.verve_island_scratch_ptr !== "function"
+          )
+            return;
+          const text = JSON.stringify(result === undefined ? null : result);
+          const scratchPtr = exp.verve_island_scratch_ptr();
+          const scratchCap = exp.verve_island_scratch_capacity();
+          const enc = new TextEncoder();
+          const routeBytes = enc.encode(route);
+          const bodyBytes = enc.encode(text);
+          if (routeBytes.length + bodyBytes.length > scratchCap) {
+            console.warn("verve host async reply exceeds scratch", name);
+            return;
+          }
+          const view = new Uint8Array(memory.buffer, scratchPtr, scratchCap);
+          view.set(routeBytes, 0);
+          view.set(bodyBytes, routeBytes.length);
+          exp.verve_dispatch_response(
+            scratchPtr,
+            routeBytes.length,
+            scratchPtr + routeBytes.length,
+            bodyBytes.length,
+          );
+        })
+        .catch((err) => console.error("verve host async failed:", name, err));
+    },
+    // Phase 19 — clipboard (async API, execCommand fallback for WKWebView).
+    verve_clipboard_write: (tp, tl) => {
+      const text = readStr(tp, tl);
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).catch(() => {});
+          return;
+        }
+      } catch {}
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      } catch (err) {
+        console.warn("verve clipboard write failed:", err);
+      }
+    },
     verve_list_diff: exp.verve_list_diff,
     verve_register_response_handler: exp.verve_register_response_handler,
     verve_dispatch_response: exp.verve_dispatch_response,
+    // Phase 17 — outbound typed POST + shared JSON value service.
+    verve_server_fn_post: exp.verve_server_fn_post,
+    verve_json_parse: exp.verve_json_parse,
+    verve_json_free: exp.verve_json_free,
+    verve_json_get: exp.verve_json_get,
+    verve_json_at: exp.verve_json_at,
+    verve_json_len: exp.verve_json_len,
+    verve_json_kind: exp.verve_json_kind,
+    verve_json_i64: exp.verve_json_i64,
+    verve_json_f64: exp.verve_json_f64,
+    verve_json_bool: exp.verve_json_bool,
+    verve_json_str_len: exp.verve_json_str_len,
+    verve_json_str: exp.verve_json_str,
+    // Phase 22 — chunk arena + drag-drop.
+    verve_chunk_alloc: exp.verve_chunk_alloc,
+    verve_chunk_arena_mark: exp.verve_chunk_arena_mark,
+    verve_chunk_arena_reset: exp.verve_chunk_arena_reset,
+    verve_drop_name: exp.verve_drop_name,
+    verve_drop_name_len: exp.verve_drop_name_len,
+    verve_drop_ptr: exp.verve_drop_ptr,
+    verve_drop_len: exp.verve_drop_len,
+    verve_register_drop: (bp, bl, idx) => {
+      const bind = readStr(bp, bl);
+      const target =
+        document.querySelector(`[z-bind="${CSS.escape(bind)}"]`) ||
+        document.querySelector(`[data-vh="${CSS.escape(bind)}"]`);
+      if (!target) return;
+      target.addEventListener("dragover", (e) => e.preventDefault());
+      target.addEventListener("drop", async (e) => {
+        e.preventDefault();
+        const file =
+          e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+        if (!file || typeof exp.verve_chunk_alloc !== "function") return;
+        let bytes;
+        try {
+          bytes = new Uint8Array(await file.arrayBuffer());
+        } catch {
+          return;
+        }
+        const dataPtr = exp.verve_chunk_alloc(bytes.length >>> 0, 1);
+        if (!dataPtr) {
+          console.warn("verve drop: arena full", file.name);
+          return;
+        }
+        new Uint8Array(memory.buffer, dataPtr, bytes.length).set(bytes);
+        const nameBytes = new TextEncoder().encode(file.name);
+        const scratchPtr = exp.verve_island_scratch_ptr();
+        const scratchCap = exp.verve_island_scratch_capacity();
+        const nlen = Math.min(nameBytes.length, scratchCap);
+        new Uint8Array(memory.buffer, scratchPtr, scratchCap).set(
+          nameBytes.subarray(0, nlen),
+        );
+        exp.verve_drop_set(scratchPtr, nlen, dataPtr, bytes.length >>> 0);
+        verveCallSlot(idx);
+      });
+    },
     verve_clone_template: exp.verve_clone_template,
     verve_slot_text: exp.verve_slot_text,
     verve_slot_attr: exp.verve_slot_attr,

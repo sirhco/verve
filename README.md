@@ -118,6 +118,15 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - **Drop-in for downstream apps** — the desktop template imports it as `@import("verve")` from its wasm client; downstream apps written against the same `verve_client` surface compile against both web and desktop targets unchanged.
 - **Bundled with the desktop scaffold** by default. `templates/desktop/src/client/main.zig` ships only the click handlers — every binding is registered automatically by the Phase-14 auto-walker.
 
+### Client runtime (wasm app primitives)
+Wasm-side primitives so app logic lives in Zig instead of an inline `<script>` blob. All chunk-callable; one shared `std.json` parser in the main client keeps chunks tiny. Guide: [`docs/20-client-runtime.md`](docs/20-client-runtime.md).
+- **Typed IPC replies** — `verve.serverFnPost(route, body)` + `verve.parseJson` / `verve.readStruct(Reply, doc, alloc)`. One parser in the main client (`verve_json_*`); chunks read typed replies without a per-chunk JSON scanner. Server-side `app_client.<name>_call(arena, args, on_reply)` mirrors the shape.
+- **Events with data** — handlers read `eventMods()`, `eventKey(buf)`, `eventTargetAttr(name, buf)` (the element's `data-*`), `eventCoordX/Y()`, and call `eventPreventDefault()` / `eventStopPropagation()`.
+- **Timers / storage / clipboard** — `setTimeout` / `setInterval` / `requestAnimationFrame` / `queueMicrotask` / `clearTimer`, `storage.{get,set,remove,len}` over `localStorage`, `clipboardWrite`.
+- **Forms + DOM measurement** — `refValueStr`, `refRequestSubmit`, `refSelect`, `refBlur`, `refScrollIntoView`, `refRect()`, `viewport()`, `matchMedia(query)`, `formCollect(bind, buf)` → JSON for `readStruct`.
+- **Generic JS interop** — `host(name, args, out)` (sync) + `hostAsync(name, args, route)` (replies via the response-handler path). Apps register functions in `window.verveHost` — the supported hook for Intl, markdown, syntax highlight, canvas.
+- **Chunk-local arena** — `chunkArena()` is a real `std.mem.Allocator` over a main-client bump region; `chunkArenaMark` / `chunkArenaReset` recycle per dispatch instead of pre-sizing static buffers. `registerDrop(bind, handler)` + `currentDrop(buf)` deliver dropped-file bytes to wasm.
+
 ### Dev + ops
 - **`--dev`** auto-reload: injects a WS-disconnect-reconnect script. Pair with `zig build --watch run -- --dev`.
 - **`--csrf=enforce|disable`** flag (default enforce).
@@ -166,7 +175,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.1.29
+VERSION=0.1.30
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256
@@ -187,7 +196,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.1.29
+zig fetch --save git+https://github.com/sirhco/verve#v0.1.30
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -247,7 +256,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.1.29 \
+verve-cli new ~/my-app --release v0.1.30 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 

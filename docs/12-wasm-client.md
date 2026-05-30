@@ -681,5 +681,7 @@ covered by Playwright-style tests in apps that consume the framework.
 
 ## Next
 
+- [Client runtime](20-client-runtime.md) — typed IPC replies + shared
+  JSON service, and the events/timers/storage/forms/interop roadmap.
 - [Index](README.md) — full doc tree.
 - [Examples](../examples/README.md) — three running apps.

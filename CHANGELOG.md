@@ -4,6 +4,63 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.30] - 2026-05-29
+
+### Added
+
+Client-runtime feature track — wasm-side primitives so frontend/desktop
+apps write application logic in Zig instead of a hand-maintained inline
+`<script>` blob. New guide: `docs/20-client-runtime.md`. All capabilities
+are chunk-callable through the `verve_runtime` import; the design keeps a
+single `std.json` parser in the main client so per-island chunks stay
+small (the `JsonProbe` demo island exercising every feature is ~3.4 KB).
+
+- **Typed IPC replies + shared JSON service** (Phase 1). One `std.json`
+  parser lives in the main client (`src/client/json_service.zig`),
+  exposed via `verve_json_*` accessor exports. Chunks read replies
+  through `verve.JsonDoc` accessors or the typed `verve.readStruct(Reply,
+  doc, allocator)` — no per-chunk JSON scanner. `verve.serverFnPost`
+  re-exports the outbound POST through `verve_runtime`. Server-side gains
+  a callback-style `serverFnGen.call` + codegen'd `app_client.<name>_call`.
+
+- **Events with data** (Phase 2). Closure event handlers can now read the
+  dispatching event: `verve.eventMods()`, `eventKey(buf)`,
+  `eventTargetAttr(name, buf)` (the handler element's `data-*`),
+  `eventCoordX/Y()`, and `eventPreventDefault()` / `eventStopPropagation()`.
+  The bridge stages the event before dispatch and honors the flags after;
+  the target dataset is parsed through the shared JSON service.
+  (`src/client/event_state.zig`.)
+
+- **Timers, storage, clipboard** (Phase 3). `verve.setTimeout` /
+  `setInterval` / `requestAnimationFrame` / `queueMicrotask` /
+  `clearTimer` (handlers cross as function-table indices),
+  `verve.storage.{get,set,remove,len}` over `localStorage`, and
+  `verve.clipboardWrite` (async API with an `execCommand` fallback).
+
+- **Forms & DOM measurement** (Phase 4). `verve.refValueStr`,
+  `refRequestSubmit`, `refSelect`, `refBlur`, `refScrollIntoView`,
+  `refRect()`, `viewport()`, `matchMedia(query)`, and `formCollect(bind,
+  buf)` (serializes a form's named fields to JSON for `readStruct`).
+
+- **Generic JS interop escape hatch** (Phase 5). `verve.host(name,
+  args_json, out)` (sync) and `verve.hostAsync(name, args_json, route)`
+  (result fans back through the response-handler path). Apps register
+  functions in `window.verveHost` — the supported path for Intl
+  date/number formatting, markdown, syntax highlight, and canvas without
+  verve owning those APIs.
+
+- **Chunk-local arena + drag-drop** (Phase 6). `verve.chunkArena()` is a
+  real `std.mem.Allocator` over a bump region in the main client
+  (`src/client/chunk_arena.zig`) with `chunkArenaMark` / `chunkArenaReset`
+  for per-dispatch recycling — replaces worst-case static buffers.
+  `verve.registerDrop(bind, handler)` + `verve.currentDrop(buf)` deliver
+  dropped-file bytes (written straight into the arena) to wasm.
+
+Implementation touched `src/client/{json_service,event_state,chunk_arena}.zig`
+(new), `runtime_exports.zig`, `island_runtime.zig`, `src/core/server_fn_gen.zig`,
+`tools/server_fn_codegen.zig`, and `src/bridge/verve.js`. `src/verve.zig`
+unchanged.
+
 ## [0.1.29] - 2026-05-27
 
 ### Added

@@ -24,6 +24,9 @@ const std = @import("std");
 const runtime = @import("runtime.zig");
 const dom = @import("dom.zig");
 const client_alloc = @import("allocator.zig");
+const json_service = @import("json_service.zig");
+const event_state = @import("event_state.zig");
+const chunk_arena = @import("chunk_arena.zig");
 
 // ---- Signal registration (register-and-forget) ---------------------------
 
@@ -216,6 +219,94 @@ export fn verve_dispatch_event(id: u32) void {
     runtime.dispatchEvent(id);
 }
 
+// ---- Current-event accessors (Phase 18, chunk-callable) -----------------
+//
+// JS stages the dispatching event's data via the `verve_event_set_*`
+// exports immediately before `verve_event_dispatch(id)`; the handler
+// reads it through these accessors; JS reads `verve_event_flags()` after
+// dispatch to honor preventDefault / stopPropagation, then calls
+// `verve_event_end()`. See `event_state.zig`.
+
+export fn verve_event_begin() void {
+    event_state.begin();
+}
+export fn verve_event_set_mods(m: u32) void {
+    event_state.setMods(m);
+}
+export fn verve_event_set_coords(x: f64, y: f64) void {
+    event_state.setCoords(x, y);
+}
+export fn verve_event_set_key(ptr: [*]const u8, len: u32) void {
+    event_state.setKey(ptr[0..len]);
+}
+export fn verve_event_set_dataset(ptr: [*]const u8, len: u32) void {
+    event_state.setDataset(ptr[0..len]);
+}
+export fn verve_event_mods() u32 {
+    return event_state.getMods();
+}
+export fn verve_event_coord_x() f64 {
+    return event_state.coordX();
+}
+export fn verve_event_coord_y() f64 {
+    return event_state.coordY();
+}
+export fn verve_event_key(buf_ptr: [*]u8, buf_cap: u32) u32 {
+    const s = event_state.keySlice();
+    const n: u32 = @min(@as(u32, @intCast(s.len)), buf_cap);
+    @memcpy(buf_ptr[0..n], s[0..n]);
+    return n;
+}
+export fn verve_event_target_attr(
+    name_ptr: [*]const u8,
+    name_len: u32,
+    buf_ptr: [*]u8,
+    buf_cap: u32,
+) u32 {
+    return event_state.targetAttr(name_ptr[0..name_len], buf_ptr, buf_cap);
+}
+export fn verve_event_prevent_default() void {
+    event_state.setPrevent();
+}
+export fn verve_event_stop_propagation() void {
+    event_state.setStop();
+}
+export fn verve_event_flags() u32 {
+    return event_state.getFlags();
+}
+export fn verve_event_end() void {
+    event_state.end();
+}
+
+// ---- Chunk arena + drag-drop (Phase 22, chunk-callable) -----------------
+
+export fn verve_chunk_alloc(len: u32, alignment: u32) u32 {
+    return @intCast(chunk_arena.alloc(len, alignment));
+}
+export fn verve_chunk_arena_mark() u32 {
+    return @intCast(chunk_arena.mark());
+}
+export fn verve_chunk_arena_reset(m: u32) void {
+    chunk_arena.reset(m);
+}
+/// Called by the bridge after writing a dropped file's bytes into the
+/// arena: stages the file name + the (ptr,len) of its bytes.
+export fn verve_drop_set(name_ptr: [*]const u8, name_len: u32, ptr: u32, len: u32) void {
+    chunk_arena.setDrop(name_ptr[0..name_len], ptr, len);
+}
+export fn verve_drop_name(buf_ptr: [*]u8, buf_cap: u32) u32 {
+    return chunk_arena.dropName(buf_ptr, buf_cap);
+}
+export fn verve_drop_name_len() u32 {
+    return chunk_arena.dropNameLen();
+}
+export fn verve_drop_ptr() u32 {
+    return chunk_arena.dropPtr();
+}
+export fn verve_drop_len() u32 {
+    return chunk_arena.dropLen();
+}
+
 /// Register a cleanup handler on the runtime's root Owner. Same
 /// fn-pointer-as-u32 ABI as `verve_register_event`. Handler runs in
 /// LIFO order when the Owner disposes; silently dropped if the
@@ -297,6 +388,75 @@ export fn verve_dispatch_response(
     body_len: u32,
 ) void {
     runtime.dispatchResponse(route_ptr[0..route_len], body_ptr[0..body_len]);
+}
+
+// ---- Outbound typed POST (Phase 17, chunk-callable) ---------------------
+//
+// Chunks can't declare `extern "verve" fn server_fn_post` — they only
+// receive the `verve_runtime` import namespace (main-client exports),
+// not the JS-bridge `verve` namespace. Re-export the bridge call here so
+// the chunk façade reaches it via `verve_runtime`. The body bytes live
+// in shared memory (typically the chunk's scratch); the bridge POSTs to
+// `/api/<name>` and fans the reply back through `verve_dispatch_response`
+// to whatever handler the chunk registered for `name`.
+
+export fn verve_server_fn_post(
+    name_ptr: [*]const u8,
+    name_len: u32,
+    body_ptr: [*]const u8,
+    body_len: u32,
+) void {
+    dom.server_fn_post(name_ptr, @as(usize, name_len), body_ptr, @as(usize, body_len));
+}
+
+// ---- Shared JSON value service (Phase 17, chunk-callable) ---------------
+//
+// One std.json parser lives here in the main client; chunks call these
+// accessors against a numeric handle instead of duplicating a parser
+// per chunk. See `json_service.zig` for the handle/lifetime contract.
+
+export fn verve_json_parse(ptr: [*]const u8, len: u32) u32 {
+    return json_service.parse(ptr[0..len]);
+}
+
+export fn verve_json_free(handle: u32) void {
+    json_service.free(handle);
+}
+
+export fn verve_json_get(handle: u32, key_ptr: [*]const u8, key_len: u32) u32 {
+    return json_service.objGet(handle, key_ptr[0..key_len]);
+}
+
+export fn verve_json_at(handle: u32, index: u32) u32 {
+    return json_service.at(handle, index);
+}
+
+export fn verve_json_len(handle: u32) i32 {
+    return json_service.len(handle);
+}
+
+export fn verve_json_kind(handle: u32) u32 {
+    return json_service.kind(handle);
+}
+
+export fn verve_json_i64(handle: u32) i64 {
+    return json_service.asI64(handle);
+}
+
+export fn verve_json_f64(handle: u32) f64 {
+    return json_service.asF64(handle);
+}
+
+export fn verve_json_bool(handle: u32) u32 {
+    return if (json_service.asBool(handle)) 1 else 0;
+}
+
+export fn verve_json_str_len(handle: u32) u32 {
+    return json_service.asStrLen(handle);
+}
+
+export fn verve_json_str(handle: u32, buf_ptr: [*]u8, buf_cap: u32) u32 {
+    return json_service.asStr(handle, buf_ptr, buf_cap);
 }
 
 // ---- Keyed-list reconciler (chunk-callable) ------------------------------

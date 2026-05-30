@@ -57,6 +57,14 @@ pub fn main(init: std.process.Init) !void {
             \\    verve.serverFnGen.post(app.Actions.{[n]s}, arena, args, "{[n]s}");
             \\}}
             \\
+            \\pub fn {[n]s}_call(
+            \\    arena: std.mem.Allocator,
+            \\    args: @typeInfo(@TypeOf(app.Actions.{[n]s})).@"fn".params[0].type.?,
+            \\    comptime on_reply: anytype,
+            \\) void {{
+            \\    verve.serverFnGen.call(app.Actions.{[n]s}, arena, args, "{[n]s}", on_reply);
+            \\}}
+            \\
             \\
         , .{ .n = decl.name });
     }

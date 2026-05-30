@@ -72,6 +72,30 @@ pub fn post(
     }
 }
 
+/// Typed call with a result callback. Invokes the action and hands the
+/// unwrapped success value to `on_reply`; errors are swallowed (the
+/// callback simply doesn't fire). On native this runs synchronously —
+/// the callback has returned by the time `call` returns. The shape
+/// mirrors the chunk-side `request → typed reply` loop so server and
+/// (future) wasm-app call sites read the same way; the arena is kept for
+/// forward-compatibility with an async wasm path.
+pub fn call(
+    comptime f: anytype,
+    arena: std.mem.Allocator,
+    args: @typeInfo(@TypeOf(f)).@"fn".params[0].type.?,
+    comptime name: []const u8,
+    comptime on_reply: anytype,
+) void {
+    const RetT = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+    const ret = invoke(f, arena, args, name);
+    if (@typeInfo(RetT) == .error_union) {
+        const v = ret catch return;
+        on_reply(v);
+    } else {
+        on_reply(ret);
+    }
+}
+
 const testing = std.testing;
 
 test "invoke calls action directly" {
@@ -113,4 +137,46 @@ test "invoke handles void return" {
     State.hit = false;
     invoke(Actions.ping, testing.allocator, .{}, "ping");
     try testing.expect(State.hit);
+}
+
+test "call delivers the unwrapped result to on_reply" {
+    const Actions = struct {
+        pub fn double(args: struct { n: i32 }) i32 {
+            return args.n * 2;
+        }
+    };
+    const Sink = struct {
+        var got: i32 = 0;
+        fn onReply(v: i32) void {
+            got = v;
+        }
+    };
+    Sink.got = 0;
+    call(Actions.double, testing.allocator, .{ .n = 9 }, "double", Sink.onReply);
+    try testing.expectEqual(@as(i32, 18), Sink.got);
+}
+
+test "call skips on_reply on error" {
+    const Actions = struct {
+        pub fn maybeFail(args: struct { ok: bool }) !i32 {
+            if (!args.ok) return error.Boom;
+            return 7;
+        }
+    };
+    const Sink = struct {
+        var fired: bool = false;
+        var got: i32 = -1;
+        fn onReply(v: i32) void {
+            fired = true;
+            got = v;
+        }
+    };
+    Sink.fired = false;
+    Sink.got = -1;
+    call(Actions.maybeFail, testing.allocator, .{ .ok = false }, "maybeFail", Sink.onReply);
+    try testing.expect(!Sink.fired);
+
+    call(Actions.maybeFail, testing.allocator, .{ .ok = true }, "maybeFail", Sink.onReply);
+    try testing.expect(Sink.fired);
+    try testing.expectEqual(@as(i32, 7), Sink.got);
 }

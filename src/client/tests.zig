@@ -12,4 +12,7 @@ test {
     _ = @import("reconciler.zig");
     _ = @import("verve_client.zig");
     _ = @import("runtime_exports.zig");
+    _ = @import("json_service.zig");
+    _ = @import("event_state.zig");
+    _ = @import("chunk_arena.zig");
 }

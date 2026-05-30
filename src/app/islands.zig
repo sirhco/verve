@@ -19,3 +19,10 @@ pub const Counter = struct {
 pub const Greeting = struct {
     pub const props_schema: []const u8 = "{\"name\":\"string\"}";
 };
+
+/// Phase 17 — typed-IPC demo. Fires a server-fn POST and reads the reply
+/// through the shared JSON service (no per-chunk parser). Source:
+/// `src/client/islands/JsonProbe.zig`.
+pub const JsonProbe = struct {
+    pub const props_schema: []const u8 = "{}";
+};

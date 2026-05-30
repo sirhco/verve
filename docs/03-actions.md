@@ -47,6 +47,12 @@ The same action surfaces four ways:
    build invokes the action directly + drops the result, so the
    same symbol compiles in both targets. Untyped escape hatch
    remains `window.verveServerFn("foo", args)` for hand-written JS.
+5. **`app_client.<name>_call(arena, args, on_reply)`** — generated
+   callback-style typed call. Invokes the action and hands the
+   unwrapped success value to `on_reply` (errors skip the callback).
+   Synchronous on native; the shape mirrors the chunk-side
+   request → typed-reply loop in
+   [20 — Client runtime](20-client-runtime.md).
 
 ## Generated client stubs
 

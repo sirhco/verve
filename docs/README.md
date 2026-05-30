@@ -24,6 +24,7 @@ you know what you need.
 17. [Reconciler](17-reconciler.md) — keyed-list planner, `ForEachHandle`, reactive `bindForEach`
 18. [Streaming SSR](18-streaming.md) — `Suspense`, `withStreamRegistry`, `streamRender`, `verveSwap`
 19. [Desktop apps](19-desktop.md) — native window + system webview, SSR + WASM hydration under `verve://`, typed IPC, cookies, multi-window, `.app` bundle, dev loop, Level-3 smoke
+20. [Client runtime](20-client-runtime.md) — wasm-side app primitives: typed IPC replies + shared JSON service (shipped), then events-with-data, timers, storage, forms, JS interop
 
 ## Reference
 

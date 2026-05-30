@@ -263,3 +263,6 @@ For type-safe calls from WASM, use the build-time generated
   with islands because the head-merge + body-swap keeps already-
   hydrated islands alive across navigations.
 - [12 — WASM client](12-wasm-client.md) — main runtime architecture.
+- [20 — Client runtime](20-client-runtime.md) — chunk-callable app
+  primitives: typed IPC replies + shared JSON service, events with data,
+  timers/storage/clipboard, forms/measurement, JS interop, chunk arena.
