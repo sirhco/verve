@@ -17,6 +17,7 @@ const std = @import("std");
 const Owner = @import("owner.zig").Owner;
 const signal_mod = @import("signal.zig");
 const suspense_mod = @import("suspense.zig");
+const stream_context = @import("stream_context.zig");
 
 pub fn ResourceState(comptime T: type) type {
     return union(enum) {
@@ -31,8 +32,13 @@ pub fn Resource(comptime T: type) type {
         state: signal_mod.Signal(ResourceState(T)),
         owner: *Owner,
         /// The in-flight async future. Non-null from `create` until the first
-        /// call to `resolve`. Set to null afterwards (idempotent).
+        /// call to `resolve`/`awaitFuture`. Set to null afterwards (idempotent).
         future: ?std.Io.Future(anyerror!T) = null,
+        /// Staging slot written by `awaitFuture` on a worker thread and read
+        /// by `applyStaged` on the main thread. Splitting await from apply lets
+        /// the concurrent streaming drain block on the future off-thread while
+        /// keeping all Signal mutation on the main thread.
+        staged: ?(anyerror!T) = null,
 
         const Self = @This();
 
@@ -55,6 +61,25 @@ pub fn Resource(comptime T: type) type {
             return switch (self.state.get()) {
                 .ready => |v| v,
                 .loading => blk: {
+                    // Register an await/apply resolver into the active capture
+                    // (if any) so the enclosing suspense boundary learns which
+                    // resources its drain must await. No-op when no capture is
+                    // active (non-streaming renders). Done BEFORE markSuspended.
+                    stream_context.captureResolver(.{
+                        .ctx = self,
+                        .awaitFn = struct {
+                            fn f(p: *anyopaque, io: std.Io) void {
+                                const r: *Self = @ptrCast(@alignCast(p));
+                                r.awaitFuture(io);
+                            }
+                        }.f,
+                        .applyFn = struct {
+                            fn f(p: *anyopaque) void {
+                                const r: *Self = @ptrCast(@alignCast(p));
+                                r.applyStaged();
+                            }
+                        }.f,
+                    });
                     suspense_mod.markSuspended();
                     break :blk null;
                 },
@@ -88,18 +113,37 @@ pub fn Resource(comptime T: type) type {
             };
         }
 
-        /// Await the in-flight future (if any) and settle the resource state.
-        /// Idempotent: calling resolve a second time is a no-op because the
-        /// future is cleared on first await.
-        pub fn resolve(self: *Self, io: std.Io) void {
+        /// WORKER-SAFE. Block on the in-flight future (if any) and stash the
+        /// result into `staged`. Touches ONLY `self.staged` and `self.future` —
+        /// no Signal mutation, no arena allocation — so it is safe to call on a
+        /// concurrent worker thread. No-op when the future is already cleared.
+        pub fn awaitFuture(self: *Self, io: std.Io) void {
             const f = &(self.future orelse return);
-            const result: anyerror!T = f.await(io);
+            self.staged = f.await(io);
             self.future = null;
+        }
+
+        /// MAIN THREAD. Settle the resource Signal from a previously staged
+        /// result. Must run on the thread that owns the reactive system. No-op
+        /// when nothing has been staged.
+        pub fn applyStaged(self: *Self) void {
+            const result = self.staged orelse return;
+            self.staged = null;
             if (result) |value| {
                 self.state.set(.{ .ready = value });
             } else |err| {
                 self.state.set(.{ .err = err });
             }
+        }
+
+        /// Await the in-flight future (if any) and settle the resource state.
+        /// Idempotent: calling resolve a second time is a no-op because the
+        /// future is cleared on first await. Equivalent to `awaitFuture`
+        /// followed by `applyStaged` — kept for the synchronous (non-streaming)
+        /// drain path.
+        pub fn resolve(self: *Self, io: std.Io) void {
+            self.awaitFuture(io);
+            self.applyStaged();
         }
     };
 }

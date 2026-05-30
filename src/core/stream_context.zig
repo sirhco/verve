@@ -22,13 +22,43 @@ const Node = @import("node.zig").Node;
 /// `Renderer.streamRender` for the lifetime of a chunked response.
 pub threadlocal var current: ?*Registry = null;
 
+/// A single resource the drain must await before re-rendering a boundary.
+/// `awaitFn` runs WORKER-SIDE (it only blocks on a Future and stages the
+/// result); `applyFn` runs MAIN-THREAD (it settles the reactive Signal from
+/// the staged result). The split keeps Signal mutation off worker threads.
+pub const Resolver = struct {
+    ctx: *anyopaque,
+    awaitFn: *const fn (*anyopaque, std.Io) void,
+    applyFn: *const fn (*anyopaque) void,
+};
+
+/// Thread-local resolver-capture installed by `suspense()` around a child
+/// render. While active, suspendable primitives (e.g. `Resource.get`) append
+/// the resolver they depend on so the boundary can drive their futures.
+pub const Capture = struct {
+    list: *std.ArrayListUnmanaged(Resolver),
+    allocator: std.mem.Allocator,
+};
+pub threadlocal var capture: ?Capture = null;
+
+/// Append `r` to the active capture, if any. No-op when no capture is
+/// installed (non-streaming renders). Allocation failures are swallowed —
+/// a dropped resolver only means that boundary's drain won't await that
+/// particular future, which degrades to the legacy re-render behavior.
+pub fn captureResolver(r: Resolver) void {
+    if (capture) |c| c.list.append(c.allocator, r) catch {};
+}
+
 /// One parked boundary. `id` matches the `data-vs` attribute on the
 /// fallback placeholder; `render_real` is invoked by the drain pump
-/// after the boundary's upstream finishes.
+/// after the boundary's upstream finishes. `resolvers` are the resource
+/// futures the drain awaits (concurrently across boundaries) before the
+/// main thread applies their staged results and re-renders.
 pub const Slot = struct {
     id: u32,
     render_real: *const fn (*anyopaque) anyerror!*Node,
     ctx: *anyopaque,
+    resolvers: []const Resolver = &.{},
 };
 
 pub const Registry = struct {
@@ -50,6 +80,7 @@ pub const Registry = struct {
         self: *Registry,
         ctx_ptr: anytype,
         comptime render_real: fn (@TypeOf(ctx_ptr)) anyerror!*Node,
+        resolvers: []const Resolver,
     ) !u32 {
         const CtxT = @TypeOf(ctx_ptr);
         comptime std.debug.assert(@typeInfo(CtxT) == .pointer);
@@ -67,6 +98,7 @@ pub const Registry = struct {
             .id = id,
             .render_real = Adapter.invoke,
             .ctx = @ptrCast(@constCast(ctx_ptr)),
+            .resolvers = resolvers,
         });
         return id;
     }
@@ -99,8 +131,8 @@ test "register assigns sequential ids and exposes the slot" {
         }
     };
 
-    const id_a = try reg.registerSuspended(&ctx_val, Real.run);
-    const id_b = try reg.registerSuspended(&ctx_val, Real.run);
+    const id_a = try reg.registerSuspended(&ctx_val, Real.run, &.{});
+    const id_b = try reg.registerSuspended(&ctx_val, Real.run, &.{});
     try testing.expectEqual(@as(u32, 0), id_a);
     try testing.expectEqual(@as(u32, 1), id_b);
     try testing.expectEqual(@as(usize, 2), reg.pending().len);
@@ -123,7 +155,7 @@ test "registered continuation invokes its callback" {
     Counter.hits = 0;
 
     var ctx_val: Counter = .{};
-    _ = try reg.registerSuspended(&ctx_val, Counter.run);
+    _ = try reg.registerSuspended(&ctx_val, Counter.run, &.{});
     const slot = reg.pending()[0];
     try testing.expectError(error.IntentionalStop, slot.render_real(slot.ctx));
     try testing.expectEqual(@as(u32, 1), Counter.hits);

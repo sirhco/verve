@@ -61,21 +61,34 @@ pub fn suspense(
     suspended = false;
     defer suspended = prev;
 
+    // When a stream registry is active, capture the resolvers (resource
+    // futures) the child depends on during its render. The drain awaits
+    // those futures concurrently across boundaries and applies their
+    // staged results on the main thread before re-rendering.
+    var resolvers: std.ArrayListUnmanaged(stream_context.Resolver) = .empty;
+    const prev_capture = stream_context.capture;
+    if (stream_context.current) |reg| {
+        stream_context.capture = .{ .list = &resolvers, .allocator = reg.allocator };
+    }
+
     const child = render_child(ctx_ptr) catch {
         // Render error short-circuits to the fallback the same way an
         // error boundary would. Phase 4-future: distinguish "suspend"
         // from "fail" via a richer state.
+        stream_context.capture = prev_capture;
         return opts.fallback;
     };
+    stream_context.capture = prev_capture;
 
     if (suspended) {
         // Phase 14B: when a stream registry is active, register the
-        // child render fn as a continuation + emit a placeholder
-        // `<div data-vs="{id}">{fallback}</div>` the client swaps
-        // once the real content arrives. Non-streaming renders fall
-        // through to the legacy inline-fallback shape.
+        // child render fn as a continuation (with its captured
+        // resolvers) + emit a placeholder `<div data-vs="{id}">{fallback}
+        // </div>` the client swaps once the real content arrives.
+        // Non-streaming renders fall through to the legacy inline-
+        // fallback shape.
         if (stream_context.current) |reg| {
-            const id = reg.registerSuspended(ctx_ptr, render_child) catch return opts.fallback;
+            const id = reg.registerSuspended(ctx_ptr, render_child, resolvers.items) catch return opts.fallback;
             return ctx.el("div").attrFmt("data-vs", "{d}", .{id}).children(.{opts.fallback});
         }
         return opts.fallback;

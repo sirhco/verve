@@ -6,6 +6,8 @@ const node_mod = @import("node.zig");
 const Context = @import("context.zig").Context;
 const Node = node_mod.Node;
 const stream_context = @import("stream_context.zig");
+const Registry = stream_context.Registry;
+const Slot = stream_context.Slot;
 
 /// Per-render CSP nonce. The server sets this before serialization
 /// so the renderer can stamp `nonce="…"` on every emitted `<script>`
@@ -33,8 +35,9 @@ pub const Renderer = struct {
     /// way every other emitted script does.
     pub fn streamRender(
         w: *Writer,
+        io: std.Io,
         node: *const Node,
-        reg: *@import("stream_context.zig").Registry,
+        reg: *Registry,
     ) Writer.Error!void {
         const prev = stream_context.current;
         stream_context.current = reg;
@@ -42,24 +45,35 @@ pub const Renderer = struct {
 
         try render(w, node);
 
-        // Drain continuations in registration order. Each parked
-        // boundary's `render_real` runs again now that the underlying
-        // upstream is meant to have resolved — today that just means
-        // a second sync call into the same child, since Resource is
-        // still synchronous. Once the async runtime lands, the slot
-        // can hold off until its future fires.
-        for (reg.pending()) |slot| {
-            const real = slot.render_real(slot.ctx) catch continue;
-            try w.print("<template id=\"verve-vs-{d}\">", .{slot.id});
-            try render(w, real);
-            try w.writeAll("</template>");
-            if (current_nonce.len > 0) {
-                try w.writeAll("<script nonce=\"");
-                try escapeAttr(w, current_nonce);
-                try w.print("\">verveSwap({d})</script>", .{slot.id});
-            } else {
-                try w.print("<script>verveSwap({d})</script>", .{slot.id});
-            }
+        const slots = reg.pending();
+        if (slots.len == 0) return;
+
+        // Tag carried back from a worker: the id of the slot whose
+        // resources finished awaiting. Workers only block on futures
+        // (via Resolver.awaitFn → Resource.awaitFuture), staging the
+        // result; NO Signal mutation / arena alloc / node render runs
+        // off-thread. The main thread (below) applies the staged
+        // results and re-renders in COMPLETION order.
+        const U = union(enum) { done: u32 };
+
+        // Allocate the select queue buffer. On OOM, fall back to a
+        // sequential drain so correctness never depends on the
+        // concurrent path being available.
+        const buf = reg.allocator.alloc(U, slots.len) catch
+            return drainSequential(w, io, slots);
+
+        var select = std.Io.Select(U).init(io, buf);
+        for (slots) |slot| {
+            select.async(.done, resolveSlot, .{ io, slot });
+        }
+
+        // Emit one boundary per completed await, in completion order.
+        var i: usize = 0;
+        while (i < slots.len) : (i += 1) {
+            const u = select.await() catch break;
+            const id = u.done;
+            const slot = findSlot(slots, id) orelse continue;
+            try emitSlot(w, slot);
         }
     }
 
@@ -216,6 +230,51 @@ pub const Renderer = struct {
     }
 };
 
+/// WORKER-SAFE drain task. Blocks on every resolver future the boundary
+/// depends on (staging each result inside its Resource) and returns the
+/// slot id. Touches ONLY future/staged fields — no Signal mutation, no
+/// arena allocation, no node rendering happens here.
+fn resolveSlot(io: std.Io, slot: Slot) u32 {
+    for (slot.resolvers) |r| r.awaitFn(r.ctx, io);
+    return slot.id;
+}
+
+fn findSlot(slots: []const Slot, id: u32) ?Slot {
+    for (slots) |slot| if (slot.id == id) return slot;
+    return null;
+}
+
+/// MAIN-THREAD emission for one drained boundary: apply staged resolver
+/// results to settle the reactive Signals, re-render the real subtree,
+/// and write the `<template>` + verveSwap script. Nonce handling matches
+/// the rest of the renderer.
+fn emitSlot(w: *Writer, slot: Slot) Writer.Error!void {
+    // Apply staged results on the main thread → state.ready/.err.
+    for (slot.resolvers) |r| r.applyFn(r.ctx);
+    const real = slot.render_real(slot.ctx) catch return;
+    try w.print("<template id=\"verve-vs-{d}\">", .{slot.id});
+    try Renderer.render(w, real);
+    try w.writeAll("</template>");
+    if (current_nonce.len > 0) {
+        try w.writeAll("<script nonce=\"");
+        try escapeAttr(w, current_nonce);
+        try w.print("\">verveSwap({d})</script>", .{slot.id});
+    } else {
+        try w.print("<script>verveSwap({d})</script>", .{slot.id});
+    }
+}
+
+/// Fallback drain used when the concurrent select buffer can't be
+/// allocated. Awaits + emits each boundary sequentially in registration
+/// order. Correctness-equivalent to the concurrent path, minus the
+/// out-of-order completion ordering.
+fn drainSequential(w: *Writer, io: std.Io, slots: []const Slot) Writer.Error!void {
+    for (slots) |slot| {
+        for (slot.resolvers) |r| r.awaitFn(r.ctx, io);
+        try emitSlot(w, slot);
+    }
+}
+
 /// Escape user text appearing inside an element body.
 pub fn escapeHtml(w: *Writer, text: []const u8) Writer.Error!void {
     var start: usize = 0;
@@ -337,9 +396,13 @@ test "streamRender emits placeholder + template + verveSwap for a suspended boun
     const root = try @import("suspense.zig").suspense(&ctx, .{ .fallback = fallback }, &ctx, Inner.render);
     stream_context.current = null;
 
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var buf: [1024]u8 = undefined;
     var w: Writer = .fixed(&buf);
-    try Renderer.streamRender(&w, root, &reg);
+    try Renderer.streamRender(&w, io, root, &reg);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "data-vs=\"0\"") != null);
@@ -347,6 +410,104 @@ test "streamRender emits placeholder + template + verveSwap for a suspended boun
     try std.testing.expect(std.mem.indexOf(u8, out, "<template id=\"verve-vs-0\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "real-content") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "verveSwap(0)") != null);
+}
+
+test "streamRender drains suspended boundaries in completion order, not registration order" {
+    const resource_mod = @import("resource.zig");
+    const Owner = @import("owner.zig").Owner;
+    const effect_mod = @import("effect.zig");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    var owner = Owner.init(std.testing.allocator);
+    effect_mod.setPendingAllocator(owner.allocator());
+    defer owner.dispose();
+
+    // Real threaded Io so the fetcher sleeps run concurrently across the
+    // two boundaries' drain tasks.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Fetcher that sleeps a configured duration, then returns a value.
+    const SleepFetcher = struct {
+        io: std.Io,
+        ms: i64,
+        value: u32,
+        fn run(self: *@This()) anyerror!u32 {
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(self.ms), .awake) catch {};
+            return self.value;
+        }
+    };
+    // SLOW boundary registers FIRST (id 0); FAST boundary second (id 1).
+    var slow_fetcher: SleepFetcher = .{ .io = io, .ms = 60, .value = 100 };
+    var fast_fetcher: SleepFetcher = .{ .io = io, .ms = 1, .value = 200 };
+
+    const slow_res = try resource_mod.create(u32, io, &owner, &slow_fetcher, SleepFetcher.run);
+    const fast_res = try resource_mod.create(u32, io, &owner, &fast_fetcher, SleepFetcher.run);
+
+    // Build the two boundaries with the registry active so resolvers
+    // get captured during the child render. Each boundary's child reads
+    // its resource (suspends + captures the resolver) and renders a
+    // uniquely-classed div once ready.
+    var reg = stream_context.Registry.init(arena.allocator());
+    defer reg.deinit();
+
+    const SlowCtx = struct {
+        c: *const Context,
+        r: *resource_mod.Resource(u32),
+        fn render(self: *@This()) anyerror!*Node {
+            if (self.r.get()) |v| {
+                return self.c.div().class("slow-real").attrFmt("data-v", "{d}", .{v}).build();
+            }
+            return self.c.div().class("slow-pending").build();
+        }
+    };
+    const FastCtx = struct {
+        c: *const Context,
+        r: *resource_mod.Resource(u32),
+        fn render(self: *@This()) anyerror!*Node {
+            if (self.r.get()) |v| {
+                return self.c.div().class("fast-real").attrFmt("data-v", "{d}", .{v}).build();
+            }
+            return self.c.div().class("fast-pending").build();
+        }
+    };
+    var slow_ctx: SlowCtx = .{ .c = &ctx, .r = slow_res };
+    var fast_ctx: FastCtx = .{ .c = &ctx, .r = fast_res };
+
+    stream_context.current = &reg;
+    const slow_fallback = ctx.div().class("slow-fallback");
+    const fast_fallback = ctx.div().class("fast-fallback");
+    const slow_node = try @import("suspense.zig").suspense(&ctx, .{ .fallback = slow_fallback }, &slow_ctx, SlowCtx.render);
+    const fast_node = try @import("suspense.zig").suspense(&ctx, .{ .fallback = fast_fallback }, &fast_ctx, FastCtx.render);
+    stream_context.current = null;
+
+    const root = try ctx.div().children(.{ slow_node, fast_node }).build();
+
+    // Sanity: slow registered first (id 0), fast second (id 1).
+    try std.testing.expectEqual(@as(usize, 2), reg.pending().len);
+    try std.testing.expectEqual(@as(u32, 0), reg.pending()[0].id);
+    try std.testing.expectEqual(@as(u32, 1), reg.pending()[1].id);
+
+    var buf: [2048]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    try Renderer.streamRender(&w, io, root, &reg);
+    const out = w.buffered();
+
+    // Both templates present.
+    const fast_tmpl = std.mem.indexOf(u8, out, "verve-vs-1");
+    const slow_tmpl = std.mem.indexOf(u8, out, "verve-vs-0");
+    try std.testing.expect(fast_tmpl != null);
+    try std.testing.expect(slow_tmpl != null);
+    // FAST (id 1, registered second) completes first → its template
+    // appears BEFORE the SLOW (id 0) template on the wire. Completion
+    // order, not registration order.
+    try std.testing.expect(fast_tmpl.? < slow_tmpl.?);
+    try std.testing.expect(std.mem.indexOf(u8, out, "fast-real") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "slow-real") != null);
 }
 
 test "escapes HTML entities in text" {
