@@ -262,10 +262,20 @@ Every `<verve-island>` carries a server-assigned, render-unique
 
 In wasm, each `vid` gets its own `Owner` (a child of the route owner),
 and the signal/event/response slot tables are keyed by `(vid, name)` —
-so two instances of the same component hold independent state. The
+so two instances of the same component hold independent state. Event and
+response handlers run with their island's `vid` restored, so name-based
+signal lookups inside a handler resolve that island's signals. The
 route-level `verve_unmount_route()` (see
 [16 — SPA router](16-spa-router.md)) disposes the root owner, which
 cascades to every island owner at once.
+
+**Limitations.** Up to `MAX_ISLAND_OWNERS` (64) islands may be live
+simultaneously. `verve_unmount_island` frees an island's signal arena and
+handlers, but its (small) `Owner` record stays on the route arena until
+the next `verve_unmount_route()` re-arms it — so repeatedly mounting and
+unmounting islands *without navigating* accumulates a slow residual.
+Navigation reclaims it. The common case (islands disposed on route
+change) has no residual.
 
 ## Deferred work
 
