@@ -562,30 +562,8 @@
     );
   }
 
-  const dispatchIslands = () => {
-    if (typeof exp.verve_island_dispatch !== "function") return;
-    const scratchPtr = exp.verve_island_scratch_ptr();
-    const scratchCap = exp.verve_island_scratch_capacity();
-    if (!scratchPtr || !scratchCap) return;
-    const enc = new TextEncoder();
-    document.querySelectorAll("verve-island").forEach((el) => {
-      const name = el.getAttribute("data-name") || "";
-      const props = el.getAttribute("data-props") || "";
-      const nameBytes = enc.encode(name);
-      const propsBytes = enc.encode(props);
-      if (nameBytes.length + propsBytes.length > scratchCap) {
-        console.warn("verve: island payload exceeds scratch buffer", name);
-        return;
-      }
-      const view = new Uint8Array(memory.buffer, scratchPtr, scratchCap);
-      view.set(nameBytes, 0);
-      view.set(propsBytes, nameBytes.length);
-      exp.verve_island_dispatch(nameBytes.length, propsBytes.length);
-    });
-  };
-  // Run once after the initial hydrate. Components register their
-  // hydrate fn during `verve_hydrate`, so this pass picks them up.
-  dispatchIslands();
+  // Island hydrate/dispose lifecycle (initial pass + MutationObserver) is
+  // set up below, after `loadIslandChunk` is defined.
 
   // ---- Phase 13C: per-island WASM chunk loader -------------------------
   // For every `<verve-island>` marker on the page, fetch the matching
@@ -978,14 +956,10 @@
     verve_slot_kind: exp.verve_slot_kind,
   };
 
-  // Per-page instance counter. Each `<verve-island>` gets a unique id
-  // passed to its chunk's `hydrate(props_ptr, props_len, root_id)` so
-  // multi-instance chunks can namespace their bind-names (e.g.
-  // `"counter_island_{root_id}"`). Document-order assignment matches
-  // the SSR'd HTML's order so id 0 is always the first marker on the
-  // page regardless of when the chunk happens to instantiate.
-  let nextIslandInstance = 0;
-
+  // Each `<verve-island>` carries a server-assigned `data-vid` — the
+  // single per-instance id, passed to its chunk's
+  // `hydrate(props_ptr, props_len, vid)` and used as the wasm per-island
+  // owner-scope key.
   const islandChunks = new Map();
   const loadIslandChunk = async (el, instanceId) => {
     const name = el.getAttribute("data-name") || "";
@@ -1029,11 +1003,61 @@
       cexp.hydrate(0, 0, instanceId);
     }
   };
-  document.querySelectorAll("verve-island").forEach((el) => {
-    const instanceId = nextIslandInstance++;
-    el.setAttribute("data-instance", String(instanceId));
-    loadIslandChunk(el, instanceId).catch(() => {});
-  });
+  // ---- Per-island hydrate/dispose lifecycle ---------------------------
+  // A MutationObserver hydrates each `<verve-island>` on insertion (initial
+  // load, mid-page conditional mounts, and post-SPA-nav body swaps) and
+  // disposes its wasm scope on removal, keyed by the server's `data-vid`.
+  const hydratedIslands = new WeakSet();
+
+  const hydrateIslandEl = (el) => {
+    if (hydratedIslands.has(el)) return;
+    hydratedIslands.add(el);
+    const vid = parseInt(el.getAttribute("data-vid"), 10) || 0;
+    const name = el.getAttribute("data-name") || "";
+    const props = el.getAttribute("data-props") || "";
+    if (typeof exp.verve_island_dispatch_v === "function") {
+      const scratchPtr = exp.verve_island_scratch_ptr();
+      const scratchCap = exp.verve_island_scratch_capacity();
+      if (scratchPtr && scratchCap) {
+        const enc = new TextEncoder();
+        const nameBytes = enc.encode(name);
+        const propsBytes = enc.encode(props);
+        if (nameBytes.length + propsBytes.length <= scratchCap) {
+          const view = new Uint8Array(memory.buffer, scratchPtr, scratchCap);
+          view.set(nameBytes, 0);
+          view.set(propsBytes, nameBytes.length);
+          exp.verve_island_dispatch_v(nameBytes.length, propsBytes.length, vid);
+        } else {
+          console.warn("verve: island payload exceeds scratch buffer", name);
+        }
+      }
+    }
+    loadIslandChunk(el, vid).catch(() => {});
+  };
+
+  const unmountIslandEl = (el) => {
+    if (!hydratedIslands.has(el)) return;
+    hydratedIslands.delete(el);
+    const vid = parseInt(el.getAttribute("data-vid"), 10) || 0;
+    if (vid && typeof exp.verve_unmount_island === "function") {
+      exp.verve_unmount_island(vid);
+    }
+  };
+
+  const eachIslandIn = (node, fn) => {
+    if (!(node instanceof Element)) return;
+    if (node.tagName === "VERVE-ISLAND") fn(node);
+    if (node.querySelectorAll) node.querySelectorAll("verve-island").forEach(fn);
+  };
+
+  document.querySelectorAll("verve-island").forEach(hydrateIslandEl);
+
+  new MutationObserver((records) => {
+    for (const rec of records) {
+      rec.removedNodes.forEach((n) => eachIslandIn(n, unmountIslandEl));
+      rec.addedNodes.forEach((n) => eachIslandIn(n, hydrateIslandEl));
+    }
+  }).observe(document.body, { childList: true, subtree: true });
 
   // ---- Phase 14: out-of-order Suspense swap ---------------------------
   // Each parked Suspense boundary renders as
