@@ -1132,6 +1132,42 @@ pub fn bindForEach(
     return try verve.createEffect(owner, wrap, Wrapper.run);
 }
 
+/// Remove all slot-table entries tagged with `vid`, compacting in place.
+fn dropSlotsForVid(vid: u32) void {
+    var w: usize = 0;
+    for (slots[0..slot_count]) |s| {
+        if (s.vid != vid) {
+            slots[w] = s;
+            w += 1;
+        }
+    }
+    slot_count = w;
+}
+
+/// Dispose a single island instance's reactive scope: run its cleanups (LIFO),
+/// free its owner arena, drop its `(vid, *)` slots, and reset the reactive
+/// pending queue so a stale `*Effect` from the freed arena can't be reused.
+/// Idempotent for unknown vids. `vid == 0` is the route scope — use unmountRoute.
+pub fn unmountIsland(vid: u32) void {
+    if (vid == 0) return;
+    var i: usize = 0;
+    while (i < island_owner_count) : (i += 1) {
+        if (island_owner_ids[i] == vid) {
+            island_owner_ptrs[i].dispose();
+            island_owner_count -= 1;
+            island_owner_ids[i] = island_owner_ids[island_owner_count];
+            island_owner_ptrs[i] = island_owner_ptrs[island_owner_count];
+            break;
+        }
+    }
+    dropSlotsForVid(vid);
+    verve.setReactivePendingAllocator(client_alloc.allocator());
+}
+
+export fn verve_unmount_island(vid: u32) void {
+    unmountIsland(vid);
+}
+
 /// Wipe runtime state. ONLY for use from unit tests on the native build.
 pub fn resetForTesting() void {
     if (root_owner) |o| {
@@ -1224,4 +1260,64 @@ test "vid 0 routes registrations to the route owner" {
     island.current_island_id = 0;
     const sig = registerI32("page", 1);
     try testing.expectEqual(sig, signalI32("page").?);
+}
+
+test "unmountIsland disposes only its own vid scope" {
+    resetForTesting();
+    const island = @import("island.zig");
+
+    const Cleanups = struct {
+        var ran7: u32 = 0;
+        fn c7() void {
+            ran7 += 1;
+        }
+    };
+    Cleanups.ran7 = 0;
+
+    island.current_island_id = 7;
+    _ = registerI32("count", 70);
+    try cleanup(Cleanups.c7);
+    island.current_island_id = 3;
+    const keep = registerI32("count", 30);
+    island.current_island_id = 0;
+
+    unmountIsland(7);
+
+    try testing.expectEqual(@as(u32, 1), Cleanups.ran7);
+    island.current_island_id = 3;
+    try testing.expectEqual(keep, signalI32("count").?);
+    try testing.expectEqual(@as(i32, 30), keep.peek());
+    island.current_island_id = 7;
+    try testing.expect(signalI32("count") == null);
+    island.current_island_id = 0;
+
+    island.current_island_id = 7;
+    const fresh = registerI32("count", 71);
+    try testing.expectEqual(@as(i32, 71), fresh.peek());
+    island.current_island_id = 0;
+}
+
+test "unmountIsland is a no-op for unknown vid" {
+    resetForTesting();
+    unmountIsland(999);
+    const island = @import("island.zig");
+    island.current_island_id = 0;
+    const sig = registerI32("a", 1);
+    try testing.expectEqual(@as(i32, 1), sig.peek());
+}
+
+test "unmountRoute clears island owners so vids start fresh" {
+    resetForTesting();
+    const island = @import("island.zig");
+
+    island.current_island_id = 5;
+    _ = registerI32("x", 1);
+    island.current_island_id = 0;
+
+    unmountRoute();
+
+    island.current_island_id = 5;
+    const sig = registerI32("x", 2);
+    try testing.expectEqual(@as(i32, 2), sig.peek());
+    island.current_island_id = 0;
 }
