@@ -20,7 +20,11 @@ pub fn resourceFromState(comptime T: type, owner: *verve.Owner, key: []const u8)
         i32 => if (v == .i32) v.i32 else return null,
         bool => if (v == .bool) v.bool else return null,
         f32 => if (v == .f32) v.f32 else return null,
-        []const u8 => if (v == .str) v.str else return null,
+        // Dupe the string into the island's owner arena. `current_blob` aliases
+        // a shared scratch buffer the NEXT island's hydrate overwrites, so a
+        // borrowed slice would dangle once another island mounts; the arena
+        // copy lives as long as the island (freed on its unmount).
+        []const u8 => if (v == .str) try owner.allocator().dupe(u8, v.str) else return null,
         else => @compileError("resourceFromState: unsupported T " ++ @typeName(T)),
     };
     return try verve.resourceReady(T, owner, value);
@@ -50,4 +54,12 @@ test "resourceFromState decodes a ready primitive without fetching" {
     try testing.expectEqualStrings("hi", r_label.get().?);
 
     try testing.expect((try resourceFromState(i32, &owner, "nope")) == null);
+
+    // The string value is duped into the owner arena, so it survives the next
+    // island's blob overwriting the shared scratch buffer.
+    var other: std.ArrayListUnmanaged(u8) = .empty;
+    defer other.deinit(testing.allocator);
+    try verve.islandStateEncodeEntry(testing.allocator, &other, "x", .{ .str = "ZZZZ" });
+    setCurrentBlob(other.items);
+    try testing.expectEqualStrings("hi", r_label.get().?);
 }
