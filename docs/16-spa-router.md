@@ -91,10 +91,16 @@ body content is replaced).
 
 ## Composing with islands
 
-When the router swaps body content, hydrated islands inside the
-outgoing body are dropped (the WASM exports may stay loaded but their
-DOM references are gone). The incoming body's islands re-hydrate
-automatically as the markers appear in the DOM (Phase 8 loader).
+When the router swaps body content it first calls
+`verve_unmount_route()`, which disposes the outgoing route's reactive
+scope — every signal, effect, `ForEachHandle`, event handler, and
+registered cleanup is torn down (cleanups run LIFO while the old DOM is
+still present, so DOM-touching teardown sees live nodes). The incoming
+body's islands then re-hydrate into a fresh scope as their markers
+appear in the DOM. Disposal is route-granular today; per-instance
+(single island) disposal is a planned follow-on — the server already
+stamps a `data-vid` on each `<verve-island>` and the client dispatch
+records it, dormant, for that future work.
 
 This means SPA navigation between two heavy-island pages still
 costs a WASM hydration on arrival — same as a hard reload, just
