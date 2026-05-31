@@ -128,6 +128,12 @@ pub const detectLang = @import("core/highlight.zig").detectLang;
 pub const markdown = @import("core/markdown.zig").render;
 pub const MarkdownOptions = @import("core/markdown.zig").Options;
 
+/// Typed island props codec (base64 ↔ serialize.zig).
+pub const encodeProps = @import("core/props.zig").encodeProps;
+pub const decodeProps = @import("core/props.zig").decodeProps;
+pub const serializeDecode = @import("core/serialize.zig").decode;
+pub const serializeEncodeToBytes = @import("core/serialize.zig").encodeToBytes;
+
 /// Set the per-request CSP nonce the renderer will stamp onto every
 /// `<script>` / `<style>` tag missing one. Empty string disables.
 pub fn setRendererNonce(nonce: []const u8) void {
@@ -179,4 +185,5 @@ test {
     _ = @import("core/markdown.zig");
     _ = @import("core/markdown_inline.zig");
     _ = @import("core/island_state.zig");
+    _ = @import("core/props.zig");
 }
