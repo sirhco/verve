@@ -14,13 +14,17 @@ const std = @import("std");
 const Context = @import("context.zig").Context;
 const Node = @import("node.zig").Node;
 
-/// Per-render island id sequence. The server resets it to 0 at the top of each
+/// Per-render island id sequence. The server resets it to 1 at the top of each
 /// request (mirrors `renderer.current_nonce`). Each `island()` without an
 /// explicit `IslandOpts.id` consumes the next value as its `data-vid`.
-pub threadlocal var vid_seq: u32 = 0;
+///
+/// vid 0 is reserved for the route/app scope sentinel (see the client
+/// `unmountIsland`/`ensureOwner` handling) — auto-assigned island vids start
+/// at 1 so the first island per render is never mis-scoped into the route owner.
+pub threadlocal var vid_seq: u32 = 1;
 
 pub fn resetRenderVidSeq() void {
-    vid_seq = 0;
+    vid_seq = 1;
 }
 
 pub const IslandOpts = struct {
@@ -122,8 +126,8 @@ test "island auto-assigns sequential data-vid per render" {
     const a = island(&ctx, .{ .name = "Counter" }, ctx.div());
     const b = island(&ctx, .{ .name = "Counter" }, ctx.div());
 
-    try testing.expectEqualStrings("0", attrValue(a, "data-vid").?);
-    try testing.expectEqualStrings("1", attrValue(b, "data-vid").?);
+    try testing.expectEqualStrings("1", attrValue(a, "data-vid").?);
+    try testing.expectEqualStrings("2", attrValue(b, "data-vid").?);
 }
 
 test "explicit id overrides the auto sequence" {

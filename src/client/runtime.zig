@@ -609,6 +609,50 @@ test "registerEvent + dispatchEvent invoke the matching slot" {
     try testing.expectEqual(@as(u32, 1), State.hits_b);
 }
 
+test "event handler runs under its island vid so name lookups resolve" {
+    resetForTesting();
+    const island = @import("island.zig");
+
+    const H = struct {
+        fn bump() void {
+            // Looks up by NAME during dispatch — must resolve the vid-5 signal.
+            if (signalI32("n")) |s| s.set(s.peek() + 1);
+        }
+    };
+
+    island.current_island_id = 5;
+    const sig = registerI32("n", 0);
+    const id = registerEvent(H.bump);
+    island.current_island_id = 0; // dispatch happens outside any hydrate
+
+    dispatchEvent(id);
+    try testing.expectEqual(@as(i32, 1), sig.peek());
+}
+
+test "unmountIsland drops the island's event handler" {
+    resetForTesting();
+    const island = @import("island.zig");
+
+    const H = struct {
+        var hits: u32 = 0;
+        fn run() void {
+            hits += 1;
+        }
+    };
+    H.hits = 0;
+
+    island.current_island_id = 6;
+    const id = registerEvent(H.run);
+    island.current_island_id = 0;
+
+    dispatchEvent(id);
+    try testing.expectEqual(@as(u32, 1), H.hits);
+
+    unmountIsland(6);
+    dispatchEvent(id); // slot nulled → no-op
+    try testing.expectEqual(@as(u32, 1), H.hits);
+}
+
 test "autoHydrate registers mixed-type bindings under the root owner" {
     resetForTesting();
 
@@ -659,6 +703,11 @@ test "registerStr allocates a string Signal" {
 const MAX_EVENT_SLOTS: u32 = 1024;
 
 var event_slots: [MAX_EVENT_SLOTS]?*const fn () void = [_]?*const fn () void{null} ** MAX_EVENT_SLOTS;
+/// Per-slot owning island vid, parallel to `event_slots` (preserves the
+/// id-as-index contract). Set at register time from `current_island_id`;
+/// restored around each dispatch so name-based signal lookups resolve the
+/// island's vid-scoped signals. Values for null slots are ignored.
+var event_slot_vids: [MAX_EVENT_SLOTS]u32 = [_]u32{0} ** MAX_EVENT_SLOTS;
 var event_slot_count: u32 = 0;
 
 /// Register a closure-style click handler. Returns the slot id the
@@ -670,6 +719,7 @@ pub fn registerEvent(handler: *const fn () void) u32 {
     if (event_slot_count >= MAX_EVENT_SLOTS) @panic("verve client: event slot capacity exceeded");
     const id = event_slot_count;
     event_slots[id] = handler;
+    event_slot_vids[id] = @import("island.zig").current_island_id;
     event_slot_count += 1;
     return id;
 }
@@ -680,7 +730,13 @@ pub fn registerEvent(handler: *const fn () void) u32 {
 /// `verve_event_dispatch` so the JS bridge can reach it.
 pub fn dispatchEvent(id: u32) void {
     if (id >= event_slot_count) return;
-    if (event_slots[id]) |fn_ptr| fn_ptr();
+    if (event_slots[id]) |fn_ptr| {
+        const island = @import("island.zig");
+        const prev = island.current_island_id;
+        island.current_island_id = event_slot_vids[id];
+        defer island.current_island_id = prev;
+        fn_ptr();
+    }
 }
 
 export fn verve_event_dispatch(id: u32) void {
@@ -781,6 +837,9 @@ pub fn slotKind(idx: u32) ?TypeTag {
 const ResponseSlot = struct {
     route: []const u8,
     fn_ptr: *const fn ([*]const u8, u32) void,
+    /// Owning island vid; restored around dispatch so name-based signal
+    /// lookups inside the handler resolve the island's vid-scoped signals.
+    vid: u32,
 };
 
 const MAX_RESPONSE_SLOTS: u32 = 256;
@@ -793,7 +852,7 @@ var response_slot_count: u32 = 0;
 /// should pass static string literals.
 pub fn registerResponseHandler(route: []const u8, handler: *const fn ([*]const u8, u32) void) void {
     if (response_slot_count >= MAX_RESPONSE_SLOTS) @panic("verve client: response slot capacity exceeded");
-    response_slots[response_slot_count] = .{ .route = route, .fn_ptr = handler };
+    response_slots[response_slot_count] = .{ .route = route, .fn_ptr = handler, .vid = @import("island.zig").current_island_id };
     response_slot_count += 1;
 }
 
@@ -804,6 +863,10 @@ pub fn dispatchResponse(route: []const u8, body: []const u8) void {
     for (response_slots[0..response_slot_count]) |maybe_slot| {
         const slot = maybe_slot orelse continue;
         if (std.mem.eql(u8, slot.route, route)) {
+            const island = @import("island.zig");
+            const prev = island.current_island_id;
+            island.current_island_id = slot.vid;
+            defer island.current_island_id = prev;
             slot.fn_ptr(body.ptr, @intCast(body.len));
         }
     }
@@ -1161,6 +1224,29 @@ pub fn unmountIsland(vid: u32) void {
         }
     }
     dropSlotsForVid(vid);
+
+    // Drop this island's event handlers in place — null the slot but keep
+    // event_slot_count unchanged so ids stay stable as indices. dispatchEvent
+    // already skips null slots. Prevents dangling fn pointers into the freed
+    // island arena (use-after-free) plus the slot leak.
+    {
+        var ei: u32 = 0;
+        while (ei < event_slot_count) : (ei += 1) {
+            if (event_slot_vids[ei] == vid) event_slots[ei] = null;
+        }
+    }
+
+    // Drop this island's response handlers. dispatchResponse already skips
+    // null entries; nulling in place keeps registration order for survivors.
+    {
+        var ri: u32 = 0;
+        while (ri < response_slot_count) : (ri += 1) {
+            if (response_slots[ri]) |slot| {
+                if (slot.vid == vid) response_slots[ri] = null;
+            }
+        }
+    }
+
     verve.setReactivePendingAllocator(client_alloc.allocator());
 }
 
