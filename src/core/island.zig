@@ -29,6 +29,10 @@ pub const IslandOpts = struct {
     /// (effectively turns the island into a plain SSR subtree). Used
     /// for build-time A/B between island vs static.
     hydrate: bool = true,
+    /// Optional stable per-instance id, stamped as `data-vid` on the
+    /// marker. Reserved for future per-island disposal — recorded by the
+    /// client dispatch but not yet wired to a per-instance owner.
+    id: ?u32 = null,
 };
 
 /// Wrap `inner` in an island marker. Server emits both the marker AND
@@ -41,6 +45,7 @@ pub fn island(ctx: *const Context, opts: IslandOpts, inner: *Node) *Node {
         .attr("data-name", opts.name)
         .attr("data-props", opts.props);
     if (opts.state_id) |s| node = node.attr("data-state", s);
+    if (opts.id) |vid| node = node.attrFmt("data-vid", "{d}", .{vid});
     return node.children(.{inner});
 }
 
@@ -76,4 +81,32 @@ test "island hydrate=false returns inner unchanged" {
     const inner = ctx.div().class("static");
     const wrapped = island(&ctx, .{ .name = "x", .hydrate = false }, inner);
     try testing.expect(wrapped == inner);
+}
+
+test "island stamps data-vid when an id is provided" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const inner = ctx.div().class("counter").text("0");
+    const wrapped = island(&ctx, .{ .name = "Counter", .props = "{}", .id = 7 }, inner);
+
+    var has_vid = false;
+    for (wrapped.attrs.items) |a| {
+        if (std.mem.eql(u8, a.key, "data-vid") and std.mem.eql(u8, a.value, "7")) has_vid = true;
+    }
+    try testing.expect(has_vid);
+}
+
+test "island omits data-vid when no id is provided" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const inner = ctx.div();
+    const wrapped = island(&ctx, .{ .name = "Counter" }, inner);
+
+    for (wrapped.attrs.items) |a| {
+        try testing.expect(!std.mem.eql(u8, a.key, "data-vid"));
+    }
 }
