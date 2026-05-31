@@ -675,6 +675,11 @@ pub fn unmountRoute() void {
     if (root_owner) |o| {
         o.dispose();
         o.* = verve.Owner.init(client_alloc.allocator());
+        // Drop any *Effect still queued in the reactive pending list —
+        // those structs lived in the now-freed arena. setPendingAllocator
+        // resets the queue's slice (see effect.zig) so a stale items.ptr
+        // can't be reused, and re-points it at the stable bump allocator.
+        verve.setReactivePendingAllocator(client_alloc.allocator());
     }
     slot_count = 0;
     event_slot_count = 0;
