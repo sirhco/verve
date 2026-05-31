@@ -479,6 +479,13 @@ fn renderPage(req: RenderRequest) !void {
     // Reset per-island vid sequence so every island in this render gets
     // a unique, stable data-vid starting from 0.
     verve.islandResetVidSeq();
+    // Per-request island resource-state registry. Components record a
+    // serialized Resource value under their island's vid via
+    // `IslandOpts.state`; emitted as an application/verve-state script below.
+    var island_state_reg = verve.IslandStateRegistry.init(req.gpa);
+    defer island_state_reg.deinit();
+    verve.islandStateSetCurrent(&island_state_reg);
+    defer verve.islandStateSetCurrent(null);
 
     const node: *verve.Node = blk: {
         if (req.route_chain.len > 0) {
@@ -559,6 +566,31 @@ fn renderPage(req: RenderRequest) !void {
             @memcpy(out[0..pos], final_body[0..pos]);
             @memcpy(out[pos .. pos + snippet.len], snippet);
             @memcpy(out[pos + snippet.len ..], final_body[pos..]);
+            injected_buf = out;
+            final_body = out;
+        }
+    }
+
+    // Inject the island resource-state script before `</body>` whenever a
+    // component recorded state this render. The JSON body is base64 + digits
+    // + braces/quotes only (no `<`/`>`), so it is safe inside the script
+    // element without HTML-escaping.
+    if (!is_fragment and island_state_reg.entries.items.len > 0) {
+        if (std.mem.lastIndexOf(u8, final_body, "</body>")) |pos| {
+            var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer body_buf.deinit(req.gpa);
+            try verve.buildIslandStateScript(req.gpa, &body_buf, island_state_reg.entries.items);
+            const snippet = try std.fmt.allocPrint(
+                req.gpa,
+                "<script type=\"application/verve-state\" nonce=\"{s}\">{s}</script>",
+                .{ csp_nonce, body_buf.items },
+            );
+            defer req.gpa.free(snippet);
+            const out = try req.gpa.alloc(u8, final_body.len + snippet.len);
+            @memcpy(out[0..pos], final_body[0..pos]);
+            @memcpy(out[pos .. pos + snippet.len], snippet);
+            @memcpy(out[pos + snippet.len ..], final_body[pos..]);
+            if (injected_buf) |b| req.gpa.free(b);
             injected_buf = out;
             final_body = out;
         }
