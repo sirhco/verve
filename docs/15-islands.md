@@ -277,14 +277,47 @@ unmounting islands *without navigating* accumulates a slow residual.
 Navigation reclaims it. The common case (islands disposed on route
 change) has no residual.
 
+## Resource state hydration
+
+When an island reads a `Resource` that the server already resolved, the
+component serializes its ready value so the client uses it directly —
+no re-fetch:
+
+```zig
+// server-side island component
+const user = try ctx.createResource(User, ctx.io, owner, &args, fetchUser);
+// ... render with user.get() ...
+return ctx.island(.{
+    .name = "Profile",
+    .state = try ctx.islandState(.{ .name = user.get().?.name, .age = user.get().?.age }),
+}, inner);
+```
+
+The page carries one `<script type="application/verve-state">` — a map of
+`data-vid → base64(blob)`. The bridge parses it once (and again after each
+SPA body swap) and stages each island's blob before its chunk hydrates.
+The chunk reconstructs a `.ready` Resource without touching the network:
+
+```zig
+// chunk-side hydrate
+const name = (try verve.resourceFromState([]const u8, owner, "name")).?;
+const age = (try verve.resourceFromState(i32, owner, "age")).?;
+```
+
+The codec covers primitives only — `i32` / `[]const u8` / `bool` / `f32`
+(an unsupported field type is a compile error). Struct / rich-`T`
+serialization is future work, shared with the props binary codec.
+
 ## Deferred work
 
 - **Binary codec dispatch** — parse `props_schema` at chunk
-  hydration time and decode `data-props` into typed args.
-- **Client async-resource rehydration** — a `loading` Resource
-  serialized from SSR, keyed by `data-vid`, awaited client-side on
-  hydrate (builds on the streaming async work in
-  [18 — Streaming](18-streaming.md)).
+  hydration time and decode `data-props` into typed args (also unlocks
+  struct values in `islandState`).
+- **Client-side fetch of pending / local resources** — a `loading` or
+  `LocalResource` resolved client-side via the server-function reply
+  loop (`server_fn_post` → `dispatchResponse`), keyed by `data-vid` and
+  scoped to the island's owner. Designed; the resolved-at-SSR common
+  case above already avoids the round-trip.
 
 ## Next
 

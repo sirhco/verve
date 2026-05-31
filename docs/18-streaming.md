@@ -103,6 +103,12 @@ out-of-order property. The wire format is unchanged from the
 shell-first era — only the drain ordering and concurrency
 improved.
 
+For **islands** specifically, a Resource resolved before the island's
+markup flushes can be serialized into the page state script and rehydrated
+client-side with no re-fetch — see
+[15 — Islands › Resource state hydration](15-islands.md#resource-state-hydration).
+The streamed `verveSwap` path here covers boundaries still pending at flush.
+
 ## CSP nonces
 
 `streamRender` reads `renderer.current_nonce` and stamps it on
