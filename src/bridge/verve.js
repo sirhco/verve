@@ -1134,6 +1134,13 @@
       // Fallback: append as-is (json-ld scripts, etc).
       document.head.appendChild(node.cloneNode(true));
     }
+    // Dispose the outgoing route's reactive scope BEFORE its DOM is
+    // dropped, so per-route signals/effects/refHandles are reclaimed and
+    // DOM-touching cleanups still see live nodes. Guarded so older wasm
+    // builds (no export) degrade gracefully.
+    if (exp && typeof exp.verve_unmount_route === "function") {
+      exp.verve_unmount_route();
+    }
     // Body content swap (preserves outer <body> so scripts don't re-run).
     document.body.innerHTML = doc.body.innerHTML;
   };
