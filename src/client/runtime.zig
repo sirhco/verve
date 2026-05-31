@@ -23,6 +23,7 @@ const scratch = @import("scratch.zig");
 const MAX_SLOTS = 256;
 
 const Slot = struct {
+    vid: u32,
     name: []const u8,
     sig_ptr: *anyopaque,
     type_tag: TypeTag,
@@ -49,12 +50,15 @@ const BindBoxF32 = struct {
 
 var slots: [MAX_SLOTS]Slot = undefined;
 var slot_count: usize = 0;
-var root_owner: ?*verve.Owner = null;
 
-/// Lazily build a root Owner backed by the client's bump allocator and
-/// hook it up as the pending-effects sink. Subsequent calls return the
-/// same Owner.
-pub fn ensureOwner() *verve.Owner {
+const MAX_ISLAND_OWNERS = 64;
+
+var root_owner: ?*verve.Owner = null;
+var island_owner_ids: [MAX_ISLAND_OWNERS]u32 = undefined;
+var island_owner_ptrs: [MAX_ISLAND_OWNERS]*verve.Owner = undefined;
+var island_owner_count: usize = 0;
+
+fn ensureRoot() *verve.Owner {
     if (root_owner) |o| return o;
     const gpa = client_alloc.allocator();
     verve.setReactivePendingAllocator(gpa);
@@ -62,6 +66,23 @@ pub fn ensureOwner() *verve.Owner {
     owner.* = verve.Owner.init(gpa);
     root_owner = owner;
     return owner;
+}
+
+pub fn ensureOwner() *verve.Owner {
+    const root = ensureRoot();
+    const vid = @import("island.zig").current_island_id;
+    if (vid == 0) return root;
+
+    var i: usize = 0;
+    while (i < island_owner_count) : (i += 1) {
+        if (island_owner_ids[i] == vid) return island_owner_ptrs[i];
+    }
+    if (island_owner_count >= MAX_ISLAND_OWNERS) @panic("verve client: island owner capacity exceeded");
+    const child = root.createChild() catch @panic("verve client: OOM allocating island Owner");
+    island_owner_ids[island_owner_count] = vid;
+    island_owner_ptrs[island_owner_count] = child;
+    island_owner_count += 1;
+    return child;
 }
 
 /// Register a reactive `i32` keyed by its DOM bind-name. Allocates a
@@ -89,7 +110,7 @@ pub fn registerI32(name: []const u8, initial: i32) *verve.Signal(i32) {
     sig.on_set = onSetI32;
     sig.on_set_ctx = box;
 
-    slots[slot_count] = .{ .name = name, .sig_ptr = sig, .type_tag = .i32 };
+    slots[slot_count] = .{ .vid = @import("island.zig").current_island_id, .name = name, .sig_ptr = sig, .type_tag = .i32 };
     slot_count += 1;
 
     return sig;
@@ -98,8 +119,10 @@ pub fn registerI32(name: []const u8, initial: i32) *verve.Signal(i32) {
 /// Look up a previously registered i32 signal by its bind-name. Returns
 /// null when no slot matches.
 pub fn signalI32(name: []const u8) ?*verve.Signal(i32) {
+    const vid = @import("island.zig").current_island_id;
     for (slots[0..slot_count]) |s| {
         if (s.type_tag != .i32) continue;
+        if (s.vid != vid) continue;
         if (std.mem.eql(u8, s.name, name)) {
             return @ptrCast(@alignCast(s.sig_ptr));
         }
@@ -131,15 +154,17 @@ pub fn registerStr(name: []const u8, initial: []const u8) *verve.Signal([]const 
     sig.on_set = onSetStr;
     sig.on_set_ctx = box;
 
-    slots[slot_count] = .{ .name = name, .sig_ptr = sig, .type_tag = .str };
+    slots[slot_count] = .{ .vid = @import("island.zig").current_island_id, .name = name, .sig_ptr = sig, .type_tag = .str };
     slot_count += 1;
 
     return sig;
 }
 
 pub fn signalStr(name: []const u8) ?*verve.Signal([]const u8) {
+    const vid = @import("island.zig").current_island_id;
     for (slots[0..slot_count]) |s| {
         if (s.type_tag != .str) continue;
+        if (s.vid != vid) continue;
         if (std.mem.eql(u8, s.name, name)) {
             return @ptrCast(@alignCast(s.sig_ptr));
         }
@@ -171,15 +196,17 @@ pub fn registerBool(name: []const u8, class_name: []const u8, initial: bool) *ve
     sig.on_set = onSetBool;
     sig.on_set_ctx = box;
 
-    slots[slot_count] = .{ .name = name, .sig_ptr = sig, .type_tag = .bool };
+    slots[slot_count] = .{ .vid = @import("island.zig").current_island_id, .name = name, .sig_ptr = sig, .type_tag = .bool };
     slot_count += 1;
 
     return sig;
 }
 
 pub fn signalBool(name: []const u8) ?*verve.Signal(bool) {
+    const vid = @import("island.zig").current_island_id;
     for (slots[0..slot_count]) |s| {
         if (s.type_tag != .bool) continue;
+        if (s.vid != vid) continue;
         if (std.mem.eql(u8, s.name, name)) {
             return @ptrCast(@alignCast(s.sig_ptr));
         }
@@ -217,15 +244,17 @@ pub fn registerF32(name: []const u8, initial: f32) *verve.Signal(f32) {
     sig.on_set = onSetF32;
     sig.on_set_ctx = box;
 
-    slots[slot_count] = .{ .name = name, .sig_ptr = sig, .type_tag = .f32 };
+    slots[slot_count] = .{ .vid = @import("island.zig").current_island_id, .name = name, .sig_ptr = sig, .type_tag = .f32 };
     slot_count += 1;
 
     return sig;
 }
 
 pub fn signalF32(name: []const u8) ?*verve.Signal(f32) {
+    const vid = @import("island.zig").current_island_id;
     for (slots[0..slot_count]) |s| {
         if (s.type_tag != .f32) continue;
+        if (s.vid != vid) continue;
         if (std.mem.eql(u8, s.name, name)) {
             return @ptrCast(@alignCast(s.sig_ptr));
         }
@@ -681,6 +710,7 @@ pub fn unmountRoute() void {
         // can't be reused, and re-points it at the stable bump allocator.
         verve.setReactivePendingAllocator(client_alloc.allocator());
     }
+    island_owner_count = 0;
     slot_count = 0;
     event_slot_count = 0;
     @memset(event_slots[0..], null);
@@ -1108,6 +1138,7 @@ pub fn resetForTesting() void {
         o.dispose();
         root_owner = null;
     }
+    island_owner_count = 0;
     slot_count = 0;
     event_slot_count = 0;
     @memset(event_slots[0..], null);
@@ -1158,4 +1189,39 @@ test "unmountRoute is idempotent and safe with no route owner" {
 
     const sig = registerI32("a", 2);
     try testing.expectEqual(@as(i32, 2), sig.peek());
+}
+
+test "same signal name under different vids are independent" {
+    resetForTesting();
+    const island = @import("island.zig");
+
+    island.current_island_id = 1;
+    const a = registerI32("count", 10);
+    island.current_island_id = 0;
+
+    island.current_island_id = 2;
+    const b = registerI32("count", 20);
+    island.current_island_id = 0;
+
+    try testing.expect(a != b);
+    try testing.expectEqual(@as(i32, 10), a.peek());
+    try testing.expectEqual(@as(i32, 20), b.peek());
+
+    a.set(99);
+    try testing.expectEqual(@as(i32, 99), a.peek());
+    try testing.expectEqual(@as(i32, 20), b.peek());
+
+    island.current_island_id = 1;
+    try testing.expectEqual(a, signalI32("count").?);
+    island.current_island_id = 2;
+    try testing.expectEqual(b, signalI32("count").?);
+    island.current_island_id = 0;
+}
+
+test "vid 0 routes registrations to the route owner" {
+    resetForTesting();
+    const island = @import("island.zig");
+    island.current_island_id = 0;
+    const sig = registerI32("page", 1);
+    try testing.expectEqual(sig, signalI32("page").?);
 }
