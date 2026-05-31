@@ -167,6 +167,17 @@ pub fn create(
     return res;
 }
 
+/// Build a Resource already in `.ready(value)` WITHOUT launching a fetcher.
+/// Used client-side to hydrate from serialized SSR state.
+pub fn ready(comptime T: type, owner: *Owner, value: T) !*Resource(T) {
+    const res = try owner.allocator().create(Resource(T));
+    res.* = .{
+        .state = signal_mod.Signal(ResourceState(T)).init(.{ .ready = value }, owner.allocator()),
+        .owner = owner,
+    };
+    return res;
+}
+
 /// Local resource — declared for API parity with Leptos. On Phase 3
 /// server-side, `local` is identical to `create`. Phase 8's island
 /// runtime will distinguish them (LocalResource is never serialized
@@ -298,4 +309,13 @@ test "resolve is idempotent" {
     res.resolve(io); // second resolve — must be a no-op
     try testing.expect(res.isReady());
     try testing.expectEqual(@as(u32, 21), res.get().?);
+}
+
+test "ready builds a ready resource without a fetcher" {
+    var owner = Owner.init(testing.allocator);
+    effect_mod.setPendingAllocator(owner.allocator());
+    defer owner.dispose();
+    const res = try ready(i32, &owner, 42);
+    try testing.expect(res.isReady());
+    try testing.expectEqual(@as(i32, 42), res.get().?);
 }
