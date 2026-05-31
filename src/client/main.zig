@@ -42,15 +42,15 @@ export fn verve_island_scratch_capacity() u32 {
 }
 
 export fn verve_island_dispatch(name_len: u32, props_len: u32) i32 {
+    return verve_island_dispatch_v(name_len, props_len, 0);
+}
+
+export fn verve_island_dispatch_v(name_len: u32, props_len: u32, vid: u32) i32 {
     const total = @as(usize, name_len) + @as(usize, props_len);
     if (total > island_scratch.len) return 0;
     const name = island_scratch[0..name_len];
     const props = island_scratch[name_len .. name_len + props_len];
-    if (island.lookup(name)) |hydrate_fn| {
-        hydrate_fn(props);
-        return 1;
-    }
-    return 0;
+    return island.dispatch(name, props, vid);
 }
 
 const API_PATH: []const u8 = "/api/updateDatabase";
