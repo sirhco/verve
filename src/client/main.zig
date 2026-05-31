@@ -41,6 +41,19 @@ export fn verve_island_scratch_capacity() u32 {
     return island_scratch.len;
 }
 
+// Persistent copy of the hydrating island's serialized resource-state blob.
+// The bridge stages the blob bytes into `island_scratch` then calls
+// `verve_set_island_state(len)`; we copy them OUT here so the subsequent
+// name/props staging into the same scratch can't corrupt the blob the chunk
+// reads via `verve.resourceFromState`.
+var island_state_buf: [island_scratch.len]u8 = undefined;
+
+export fn verve_set_island_state(len: u32) void {
+    const n = @min(@as(usize, len), island_state_buf.len);
+    @memcpy(island_state_buf[0..n], island_scratch[0..n]);
+    @import("island_state_client.zig").setCurrentBlob(island_state_buf[0..n]);
+}
+
 export fn verve_island_dispatch(name_len: u32, props_len: u32) i32 {
     return verve_island_dispatch_v(name_len, props_len, 0);
 }

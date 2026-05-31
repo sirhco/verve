@@ -1009,12 +1009,57 @@
   // disposes its wasm scope on removal, keyed by the server's `data-vid`.
   const hydratedIslands = new WeakSet();
 
+  // Per-page island resource-state map: vid -> Uint8Array(blob). Parsed from
+  // the `<script type="application/verve-state">` the server emits, re-parsed
+  // after each SPA body swap (the new document carries its own state script).
+  let islandState = {};
+  const parseIslandState = () => {
+    islandState = {};
+    const tag = document.querySelector('script[type="application/verve-state"]');
+    if (!tag || !tag.textContent.trim()) return;
+    let map;
+    try {
+      map = JSON.parse(tag.textContent);
+    } catch {
+      return;
+    }
+    for (const k of Object.keys(map)) {
+      try {
+        const bin = atob(map[k]);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        islandState[k] = bytes;
+      } catch {}
+    }
+  };
+
+  // Copy the island's serialized state blob into the wasm side BEFORE staging
+  // name/props (both use the same scratch buffer; the wasm copies the blob out
+  // on `verve_set_island_state`, so a later props write can't corrupt it).
+  const stageIslandState = (vid) => {
+    if (typeof exp.verve_set_island_state !== "function") return;
+    const bytes = islandState[String(vid)];
+    if (!bytes) {
+      exp.verve_set_island_state(0); // clear any stale blob
+      return;
+    }
+    const sp = exp.verve_island_scratch_ptr();
+    const cap = exp.verve_island_scratch_capacity();
+    if (sp && bytes.length <= cap) {
+      new Uint8Array(memory.buffer, sp, cap).set(bytes, 0);
+      exp.verve_set_island_state(bytes.length);
+    } else {
+      exp.verve_set_island_state(0);
+    }
+  };
+
   const hydrateIslandEl = (el) => {
     if (hydratedIslands.has(el)) return;
     hydratedIslands.add(el);
     const vid = parseInt(el.getAttribute("data-vid"), 10) || 0;
     const name = el.getAttribute("data-name") || "";
     const props = el.getAttribute("data-props") || "";
+    stageIslandState(vid);
     if (typeof exp.verve_island_dispatch_v === "function") {
       const scratchPtr = exp.verve_island_scratch_ptr();
       const scratchCap = exp.verve_island_scratch_capacity();
@@ -1050,6 +1095,7 @@
     if (node.querySelectorAll) node.querySelectorAll("verve-island").forEach(fn);
   };
 
+  parseIslandState();
   document.querySelectorAll("verve-island").forEach(hydrateIslandEl);
 
   new MutationObserver((records) => {
@@ -1167,6 +1213,9 @@
     }
     // Body content swap (preserves outer <body> so scripts don't re-run).
     document.body.innerHTML = doc.body.innerHTML;
+    // Re-parse the new document's island state script synchronously, before
+    // the MutationObserver's async callback hydrates the swapped-in islands.
+    parseIslandState();
   };
 
   const navigate = async (href, opts) => {
