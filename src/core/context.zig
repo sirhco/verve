@@ -549,6 +549,26 @@ pub const Context = struct {
         if (ctx.csp_nonce.len > 0) _ = n.attr("nonce", ctx.csp_nonce);
         return n;
     }
+
+    /// Encode a set of named primitive values into an island state blob for
+    /// `IslandOpts.state`. Field types supported: i32, []const u8, bool, f32 —
+    /// any other type is a compile error. Blob lives on the render arena.
+    pub fn islandState(ctx: *const Context, fields: anytype) ![]const u8 {
+        const island_state = @import("island_state.zig");
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        inline for (@typeInfo(@TypeOf(fields)).@"struct".fields) |f| {
+            const v = @field(fields, f.name);
+            const entry: island_state.Value = switch (@TypeOf(v)) {
+                i32, comptime_int => .{ .i32 = v },
+                f32, comptime_float => .{ .f32 = v },
+                bool => .{ .bool = v },
+                []const u8 => .{ .str = v },
+                else => @compileError("islandState: unsupported field type " ++ @typeName(@TypeOf(v)) ++ " (only i32/[]const u8/bool/f32)"),
+            };
+            try island_state.encodeEntry(ctx.allocator, &buf, f.name, entry);
+        }
+        return buf.items;
+    }
 };
 
 test "Context allocates signals in arena" {

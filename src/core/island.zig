@@ -35,9 +35,10 @@ pub const IslandOpts = struct {
     /// island's render fn during hydration. Caller is responsible for
     /// encoding it.
     props: []const u8 = "",
-    /// Optional initial state ID — useful when the island reads from
-    /// a Resource that was pre-resolved server-side.
-    state_id: ?[]const u8 = null,
+    /// Serialized resource-state blob (from `ctx.islandState(...)`). Recorded
+    /// under this island's `vid` and emitted in the page state script so the
+    /// client hydrates the resource without re-fetching.
+    state: ?[]const u8 = null,
     /// When false, the inline HTML is emitted but no marker is set
     /// (effectively turns the island into a plain SSR subtree). Used
     /// for build-time A/B between island vs static.
@@ -60,10 +61,15 @@ pub fn island(ctx: *const Context, opts: IslandOpts, inner: *Node) *Node {
         break :blk v;
     };
 
+    if (opts.state) |blob| {
+        if (@import("island_state.zig").current) |reg| {
+            reg.record(vid, blob) catch {};
+        }
+    }
+
     var node = ctx.el("verve-island")
         .attr("data-name", opts.name)
         .attr("data-props", opts.props);
-    if (opts.state_id) |s| node = node.attr("data-state", s);
     node = node.attrFmt("data-vid", "{d}", .{vid});
     return node.children(.{inner});
 }
@@ -145,4 +151,25 @@ fn attrValue(node: *Node, key: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, a.key, key)) return a.value;
     }
     return null;
+}
+
+test "island records its state blob under the assigned vid" {
+    const island_state = @import("island_state.zig");
+    var reg = island_state.Registry.init(testing.allocator);
+    defer reg.deinit();
+    island_state.current = &reg;
+    defer island_state.current = null;
+    resetRenderVidSeq();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const blob = try ctx.islandState(.{ .n = @as(i32, 7), .label = @as([]const u8, "hi") });
+    _ = island(&ctx, .{ .name = "Counter", .state = blob }, ctx.div());
+
+    try testing.expectEqual(@as(usize, 1), reg.entries.items.len);
+    try testing.expectEqual(@as(u32, 1), reg.entries.items[0].vid);
+    try testing.expectEqual(@as(i32, 7), (try island_state.lookup(reg.entries.items[0].blob, "n")).?.i32);
+    try testing.expectEqualStrings("hi", (try island_state.lookup(reg.entries.items[0].blob, "label")).?.str);
 }
