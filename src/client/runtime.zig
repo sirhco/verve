@@ -658,6 +658,35 @@ export fn verve_event_dispatch(id: u32) void {
     dispatchEvent(id);
 }
 
+// ---- Route lifecycle -----------------------------------------------------
+
+/// Dispose the current route's reactive scope. Runs every cleanup
+/// registered this route (LIFO), frees the route owner's arena
+/// (signals/effects/bind boxes/ForEachHandles), and clears the
+/// per-route slot tables. The owner is re-armed in place so the next
+/// `register*` finds a fresh, empty scope under the same pointer.
+/// Idempotent; safe before any owner is allocated.
+///
+/// The JS bridge calls the matching `verve_unmount_route` export
+/// immediately before it swaps `document.body.innerHTML` on SPA
+/// navigation, so the outgoing route's state is reclaimed while its
+/// DOM is still present (DOM-touching cleanups see live nodes).
+pub fn unmountRoute() void {
+    if (root_owner) |o| {
+        o.dispose();
+        o.* = verve.Owner.init(client_alloc.allocator());
+    }
+    slot_count = 0;
+    event_slot_count = 0;
+    @memset(event_slots[0..], null);
+    response_slot_count = 0;
+    @memset(response_slots[0..], null);
+}
+
+export fn verve_unmount_route() void {
+    unmountRoute();
+}
+
 // ---- Slot-table introspection -------------------------------------------
 //
 // Read-only views over the live signal + event slot tables. Useful
@@ -1080,4 +1109,48 @@ pub fn resetForTesting() void {
     response_slot_count = 0;
     @memset(response_slots[0..], null);
     client_alloc.reset();
+}
+
+test "unmountRoute disposes the route scope and clears slot tables" {
+    resetForTesting();
+
+    const State = struct {
+        var ran: u32 = 0;
+        fn onCleanup() void {
+            ran += 1;
+        }
+    };
+    State.ran = 0;
+
+    const sig = registerI32("count", 5);
+    try testing.expectEqual(@as(i32, 5), sig.peek());
+    _ = registerStr("label", "hi");
+    _ = registerEvent(State.onCleanup);
+    try cleanup(State.onCleanup);
+    try testing.expect(slotCount() >= 2);
+    try testing.expect(eventSlotCount() >= 1);
+
+    unmountRoute();
+
+    try testing.expectEqual(@as(u32, 1), State.ran);
+    try testing.expectEqual(@as(u32, 0), slotCount());
+    try testing.expectEqual(@as(u32, 0), eventSlotCount());
+
+    const sig2 = registerI32("count", 9);
+    try testing.expectEqual(@as(i32, 9), sig2.peek());
+}
+
+test "unmountRoute is idempotent and safe with no route owner" {
+    resetForTesting();
+
+    unmountRoute();
+    try testing.expectEqual(@as(u32, 0), slotCount());
+
+    _ = registerI32("a", 1);
+    unmountRoute();
+    unmountRoute();
+    try testing.expectEqual(@as(u32, 0), slotCount());
+
+    const sig = registerI32("a", 2);
+    try testing.expectEqual(@as(i32, 2), sig.peek());
 }
