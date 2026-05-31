@@ -245,15 +245,36 @@ For type-safe calls from WASM, use the build-time generated
 `app_client.<name>_post` variant — see
 [03 — Actions](03-actions.md).
 
+## Lifecycle
+
+Every `<verve-island>` carries a server-assigned, render-unique
+`data-vid`. The JS bridge runs a `MutationObserver` over the body:
+
+- **On insertion** (initial load, a mid-page conditional mount, or a
+  post-SPA-nav body swap) it hydrates the island —
+  `verve_island_dispatch_v(name, props, vid)` plus the per-island chunk
+  load. Islands therefore hydrate whenever they appear, not only at
+  first paint.
+- **On removal** it calls `verve_unmount_island(vid)`, which disposes
+  that island's reactive scope: its signals, effects, and registered
+  cleanups (LIFO) are torn down and its slot-table entries freed, while
+  sibling islands and the route scope are untouched.
+
+In wasm, each `vid` gets its own `Owner` (a child of the route owner),
+and the signal/event/response slot tables are keyed by `(vid, name)` —
+so two instances of the same component hold independent state. The
+route-level `verve_unmount_route()` (see
+[16 — SPA router](16-spa-router.md)) disposes the root owner, which
+cascades to every island owner at once.
+
 ## Deferred work
 
 - **Binary codec dispatch** — parse `props_schema` at chunk
   hydration time and decode `data-props` into typed args.
-- **Per-island Effect ownership** — `root_id` is plumbed to chunks
-  (see "Multi-instance islands" above) but the Owner is still
-  global. Future work scopes the Effect tree per `root_id` so
-  signals registered under one instance dispose when that instance
-  unmounts.
+- **Client async-resource rehydration** — a `loading` Resource
+  serialized from SSR, keyed by `data-vid`, awaited client-side on
+  hydrate (builds on the streaming async work in
+  [18 — Streaming](18-streaming.md)).
 
 ## Next
 

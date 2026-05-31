@@ -97,10 +97,12 @@ scope — every signal, effect, `ForEachHandle`, event handler, and
 registered cleanup is torn down (cleanups run LIFO while the old DOM is
 still present, so DOM-touching teardown sees live nodes). The incoming
 body's islands then re-hydrate into a fresh scope as their markers
-appear in the DOM. Disposal is route-granular today; per-instance
-(single island) disposal is a planned follow-on — the server already
-stamps a `data-vid` on each `<verve-island>` and the client dispatch
-records it, dormant, for that future work.
+appear in the DOM — a `MutationObserver` hydrates each new
+`<verve-island>` on insertion, so islands brought in by the swap come
+alive automatically. Disposal is both route-granular (the whole scope on
+navigation) and per-island: removing a single `<verve-island>` mid-page
+fires `verve_unmount_island(vid)`, disposing just that instance's scope.
+See [15 — Islands](15-islands.md#lifecycle).
 
 This means SPA navigation between two heavy-island pages still
 costs a WASM hydration on arrival — same as a hard reload, just
