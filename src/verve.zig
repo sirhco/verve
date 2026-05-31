@@ -86,6 +86,7 @@ pub const serverFn = @import("core/server_fn.zig").call;
 pub const serverFnGen = @import("core/server_fn_gen.zig");
 pub const island = @import("core/island.zig").island;
 pub const IslandOpts = @import("core/island.zig").IslandOpts;
+pub const islandResetVidSeq = @import("core/island.zig").resetRenderVidSeq;
 pub const Store = store_mod.Store;
 pub const createStore = store_mod.create;
 pub const I18nCatalog = i18n_mod.Catalog;

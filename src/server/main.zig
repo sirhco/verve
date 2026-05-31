@@ -476,6 +476,9 @@ fn renderPage(req: RenderRequest) !void {
     // out so a later request without a nonce doesn't reuse this one.
     verve.setRendererNonce(csp_nonce);
     defer verve.setRendererNonce("");
+    // Reset per-island vid sequence so every island in this render gets
+    // a unique, stable data-vid starting from 0.
+    verve.islandResetVidSeq();
 
     const node: *verve.Node = blk: {
         if (req.route_chain.len > 0) {

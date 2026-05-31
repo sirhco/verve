@@ -14,6 +14,15 @@ const std = @import("std");
 const Context = @import("context.zig").Context;
 const Node = @import("node.zig").Node;
 
+/// Per-render island id sequence. The server resets it to 0 at the top of each
+/// request (mirrors `renderer.current_nonce`). Each `island()` without an
+/// explicit `IslandOpts.id` consumes the next value as its `data-vid`.
+pub threadlocal var vid_seq: u32 = 0;
+
+pub fn resetRenderVidSeq() void {
+    vid_seq = 0;
+}
+
 pub const IslandOpts = struct {
     /// Component identifier (typically `@typeName(Component)`). Phase
     /// 8 uses this to look up the WASM chunk that owns this island.
@@ -41,11 +50,17 @@ pub const IslandOpts = struct {
 pub fn island(ctx: *const Context, opts: IslandOpts, inner: *Node) *Node {
     if (!opts.hydrate) return inner;
 
+    const vid = opts.id orelse blk: {
+        const v = vid_seq;
+        vid_seq += 1;
+        break :blk v;
+    };
+
     var node = ctx.el("verve-island")
         .attr("data-name", opts.name)
         .attr("data-props", opts.props);
     if (opts.state_id) |s| node = node.attr("data-state", s);
-    if (opts.id) |vid| node = node.attrFmt("data-vid", "{d}", .{vid});
+    node = node.attrFmt("data-vid", "{d}", .{vid});
     return node.children(.{inner});
 }
 
@@ -98,15 +113,32 @@ test "island stamps data-vid when an id is provided" {
     try testing.expect(has_vid);
 }
 
-test "island omits data-vid when no id is provided" {
+test "island auto-assigns sequential data-vid per render" {
+    resetRenderVidSeq();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ctx = Context.init(&arena);
 
-    const inner = ctx.div();
-    const wrapped = island(&ctx, .{ .name = "Counter" }, inner);
+    const a = island(&ctx, .{ .name = "Counter" }, ctx.div());
+    const b = island(&ctx, .{ .name = "Counter" }, ctx.div());
 
-    for (wrapped.attrs.items) |a| {
-        try testing.expect(!std.mem.eql(u8, a.key, "data-vid"));
+    try testing.expectEqualStrings("0", attrValue(a, "data-vid").?);
+    try testing.expectEqualStrings("1", attrValue(b, "data-vid").?);
+}
+
+test "explicit id overrides the auto sequence" {
+    resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const a = island(&ctx, .{ .name = "X", .id = 42 }, ctx.div());
+    try testing.expectEqualStrings("42", attrValue(a, "data-vid").?);
+}
+
+fn attrValue(node: *Node, key: []const u8) ?[]const u8 {
+    for (node.attrs.items) |a| {
+        if (std.mem.eql(u8, a.key, key)) return a.value;
     }
+    return null;
 }
