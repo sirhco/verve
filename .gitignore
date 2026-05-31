@@ -2,3 +2,6 @@
 zig-out/
 *.o
 .DS_Store
+
+# Local-dev superpowers artifacts (specs/plans) — never committed
+docs/superpowers/
