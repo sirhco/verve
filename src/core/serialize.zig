@@ -153,6 +153,179 @@ fn writeLen(len: usize, out: *std.ArrayList(u8), alloc: std.mem.Allocator) !void
     }
 }
 
+// ---- decoder ----------------------------------------------------------
+
+pub const DecodeError = std.mem.Allocator.Error || error{
+    Corrupt,
+    TypeMismatch,
+    EndOfStream,
+};
+
+/// Bounds-checked reader over a borrowed byte slice. Every read validates
+/// `pos`/`len` before indexing so arbitrary client-controlled input can
+/// never trigger an out-of-bounds panic. Invariant: `pos <= buf.len`.
+const Cursor = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn byte(c: *Cursor) DecodeError!u8 {
+        if (c.pos >= c.buf.len) return error.EndOfStream;
+        const b = c.buf[c.pos];
+        c.pos += 1;
+        return b;
+    }
+
+    /// Returns a sub-slice of `n` bytes, advancing the cursor. Checks the
+    /// length against the *remaining* buffer using subtraction that cannot
+    /// underflow (pos <= len invariant), so a bogus huge `n` errors out
+    /// before any allocation rather than reading OOB.
+    fn take(c: *Cursor, n: usize) DecodeError![]const u8 {
+        if (n > c.buf.len - c.pos) return error.EndOfStream;
+        const out = c.buf[c.pos .. c.pos + n];
+        c.pos += n;
+        return out;
+    }
+
+    /// uleb128 length reader, guarded against shift overflow: a malicious
+    /// varint with the continuation bit set forever is rejected once the
+    /// shift would exceed the width of `usize`, so it cannot loop or wrap.
+    fn uleb(c: *Cursor) DecodeError!usize {
+        var result: usize = 0;
+        var shift: usize = 0;
+        while (true) {
+            const b = try c.byte();
+            if (shift >= @bitSizeOf(usize)) return error.Corrupt;
+            result |= (@as(usize, b & 0x7f) << @intCast(shift));
+            if (b & 0x80 == 0) break;
+            shift += 7;
+        }
+        return result;
+    }
+
+    fn expect(c: *Cursor, tag: Tag) DecodeError!void {
+        const b = try c.byte();
+        if (b != @intFromEnum(tag)) return error.TypeMismatch;
+    }
+};
+
+/// Comptime mapping from an int type's info to its wire tag. Mirrors
+/// `writeIntTag` and `@compileError`s on widths the encoder cannot emit,
+/// so the decoder can never be asked to read an int it didn't write.
+fn intTag(comptime info: std.builtin.Type.Int) Tag {
+    return switch (info.signedness) {
+        .signed => switch (info.bits) {
+            8 => .i8_t,
+            16 => .i16_t,
+            32 => .i32_t,
+            64 => .i64_t,
+            else => @compileError("unsupported signed int width"),
+        },
+        .unsigned => switch (info.bits) {
+            8 => .u8_t,
+            16 => .u16_t,
+            32 => .u32_t,
+            64 => .u64_t,
+            else => @compileError("unsupported unsigned int width"),
+        },
+    };
+}
+
+/// Decode a `T` from `bytes`, allocating owned storage (slices/strings)
+/// from `alloc`. Trailing bytes after the value are ignored. Panic-free
+/// on arbitrary input: every read is bounds-checked, lengths are validated
+/// before allocation, and the uleb reader is shift-guarded.
+pub fn decode(comptime T: type, bytes: []const u8, alloc: std.mem.Allocator) DecodeError!T {
+    var c = Cursor{ .buf = bytes };
+    return decodeTyped(T, &c, alloc);
+}
+
+fn decodeTyped(comptime T: type, c: *Cursor, alloc: std.mem.Allocator) DecodeError!T {
+    switch (@typeInfo(T)) {
+        .bool => {
+            try c.expect(.bool_t);
+            return (try c.byte()) != 0;
+        },
+        .int => |info| {
+            try c.expect(intTag(info));
+            const raw = try c.take(@sizeOf(T));
+            var tmp: [@sizeOf(T)]u8 = undefined;
+            @memcpy(&tmp, raw);
+            return std.mem.readInt(T, &tmp, .little);
+        },
+        .float => |info| {
+            switch (info.bits) {
+                32 => {
+                    try c.expect(.f32_t);
+                    const raw = try c.take(4);
+                    var tmp: [4]u8 = undefined;
+                    @memcpy(&tmp, raw);
+                    return @bitCast(std.mem.readInt(u32, &tmp, .little));
+                },
+                64 => {
+                    try c.expect(.f64_t);
+                    const raw = try c.take(8);
+                    var tmp: [8]u8 = undefined;
+                    @memcpy(&tmp, raw);
+                    return @bitCast(std.mem.readInt(u64, &tmp, .little));
+                },
+                else => @compileError("unsupported float width"),
+            }
+        },
+        .pointer => |p| {
+            if (p.size != .slice) @compileError("only slice pointers are supported");
+            if (p.child == u8) {
+                try c.expect(.bytes_t);
+                const n = try c.uleb();
+                const src = try c.take(n);
+                return try alloc.dupe(u8, src);
+            } else {
+                try c.expect(.slice_t);
+                const n = try c.uleb();
+                const out = try alloc.alloc(p.child, n);
+                errdefer alloc.free(out);
+                for (out) |*elem| {
+                    elem.* = try decodeTyped(p.child, c, alloc);
+                }
+                return out;
+            }
+        },
+        .optional => |opt| {
+            try c.expect(.optional_t);
+            const present = try c.byte();
+            if (present != 0) {
+                return try decodeTyped(opt.child, c, alloc);
+            }
+            return null;
+        },
+        .@"struct" => |s| {
+            try c.expect(.struct_t);
+            const count = try c.uleb();
+            if (count != s.fields.len) return error.TypeMismatch;
+            var result: T = undefined;
+            inline for (s.fields) |f| {
+                @field(result, f.name) = try decodeTyped(f.type, c, alloc);
+            }
+            return result;
+        },
+        .@"enum" => |e| {
+            try c.expect(.enum_t);
+            const raw = try decodeTyped(e.tag_type, c, alloc);
+            return std.enums.fromInt(T, raw) orelse return error.Corrupt;
+        },
+        else => @compileError("unsupported type for decode: " ++ @typeName(T)),
+    }
+}
+
+/// Convenience wrapper that encodes `value` into a freshly allocated owned
+/// slice. Mirrors how the rest of the repo turns an ArrayList into an owned
+/// buffer via `toOwnedSlice(alloc)`.
+pub fn encodeToBytes(value: anytype, alloc: std.mem.Allocator) EncodeError![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try encode(value, &out, alloc);
+    return out.toOwnedSlice(alloc);
+}
+
 // ---- tests ------------------------------------------------------------
 
 const testing = std.testing;
@@ -231,4 +404,74 @@ test "encode slice of u32" {
     try testing.expectEqual(@as(u8, 3), buf.items[1]);
     try testing.expectEqual(@intFromEnum(Tag.u32_t), buf.items[2]);
     try testing.expectEqual(@as(u8, 10), buf.items[3]);
+}
+
+test "decode round-trips every supported type" {
+    const E = enum(u8) { a, b, c };
+    const Inner = struct { x: i64, y: ?bool };
+    const T = struct {
+        flag: bool, n8: i8, n16: u16, n32: i32, n64: u64,
+        fl: f32, dl: f64, name: []const u8,
+        opt_present: ?u32, opt_absent: ?u32,
+        nums: []const u32, strs: []const []const u8,
+        inner: Inner, kind: E,
+    };
+    const value = T{
+        .flag = true, .n8 = -5, .n16 = 600, .n32 = -123456, .n64 = 9_000_000_000,
+        .fl = 1.5, .dl = 2.25, .name = "hello",
+        .opt_present = 77, .opt_absent = null,
+        .nums = &.{ 1, 2, 3 }, .strs = &.{ "a", "bb" },
+        .inner = .{ .x = -1, .y = true }, .kind = .c,
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try encode(value, &buf, testing.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const got = try decode(T, buf.items, arena.allocator());
+
+    try testing.expectEqual(value.flag, got.flag);
+    try testing.expectEqual(value.n8, got.n8);
+    try testing.expectEqual(value.n16, got.n16);
+    try testing.expectEqual(value.n32, got.n32);
+    try testing.expectEqual(value.n64, got.n64);
+    try testing.expectEqual(value.fl, got.fl);
+    try testing.expectEqual(value.dl, got.dl);
+    try testing.expectEqualStrings(value.name, got.name);
+    try testing.expectEqual(@as(?u32, 77), got.opt_present);
+    try testing.expectEqual(@as(?u32, null), got.opt_absent);
+    try testing.expectEqualSlices(u32, value.nums, got.nums);
+    try testing.expectEqual(@as(usize, 2), got.strs.len);
+    try testing.expectEqualStrings("a", got.strs[0]);
+    try testing.expectEqualStrings("bb", got.strs[1]);
+    try testing.expectEqual(@as(i64, -1), got.inner.x);
+    try testing.expectEqual(@as(?bool, true), got.inner.y);
+    try testing.expectEqual(E.c, got.kind);
+}
+
+test "decode rejects wrong leading tag" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try encode(@as(bool, true), &buf, testing.allocator);
+    try testing.expectError(error.TypeMismatch, decode(u32, buf.items, arena.allocator()));
+}
+
+test "decode never panics or OOB-reads on truncated input" {
+    const T = struct { a: u32, b: []const u8, c: ?[]const u32 };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try encode(T{ .a = 9, .b = "xyz", .c = &.{ 1, 2 } }, &buf, testing.allocator);
+    var n: usize = 0;
+    while (n < buf.items.len) : (n += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        _ = decode(T, buf.items[0..n], arena.allocator()) catch {};
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const bogus = [_]u8{ @intFromEnum(Tag.bytes_t), 0xff, 0xff, 0xff, 0xff, 0x0f };
+    _ = decode([]const u8, &bogus, arena.allocator()) catch {};
 }
