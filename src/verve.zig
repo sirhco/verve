@@ -171,4 +171,5 @@ test {
     _ = @import("core/highlight.zig");
     _ = @import("core/markdown.zig");
     _ = @import("core/markdown_inline.zig");
+    _ = @import("core/island_state.zig");
 }
