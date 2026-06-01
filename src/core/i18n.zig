@@ -93,6 +93,26 @@ fn languagePrefix(tag: []const u8) []const u8 {
     return tag;
 }
 
+// ---- RTL helpers -------------------------------------------------------
+
+fn langOf(locale: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < locale.len and locale[end] != '-' and locale[end] != '_') : (end += 1) {}
+    return locale[0..end];
+}
+
+const rtl_langs = [_][]const u8{ "ar", "he", "fa", "ur", "ps", "sd", "ug", "yi", "dv", "ckb" };
+
+pub fn isRtl(locale: []const u8) bool {
+    const lang = langOf(locale);
+    for (rtl_langs) |r| if (std.ascii.eqlIgnoreCase(lang, r)) return true;
+    return false;
+}
+
+pub fn dir(locale: []const u8) []const u8 {
+    return if (isRtl(locale)) "rtl" else "ltr";
+}
+
 // ---- tests ------------------------------------------------------------
 
 const testing = std.testing;
@@ -143,6 +163,20 @@ test "resolveLocale prefers cookie over query over header" {
     // Nothing → default.
     const meta_empty: RequestMeta = .{};
     try testing.expectEqualStrings("en", try resolveLocale(catalog, &meta_empty, &loc_no_query, arena.allocator()));
+}
+
+test "isRtl + dir by language prefix" {
+    try testing.expect(isRtl("ar"));
+    try testing.expect(isRtl("ar-EG"));
+    try testing.expect(isRtl("fa_IR"));
+    try testing.expect(isRtl("he"));
+    try testing.expect(isRtl("ckb"));
+    try testing.expect(isRtl("UR"));
+    try testing.expect(!isRtl("en"));
+    try testing.expect(!isRtl("es-MX"));
+    try testing.expect(!isRtl(""));
+    try testing.expectEqualStrings("rtl", dir("ar"));
+    try testing.expectEqualStrings("ltr", dir("en"));
 }
 
 test "resolveLocale language-prefix fallback" {
