@@ -104,6 +104,7 @@ pub const i18nIsRtl = i18n_mod.isRtl;
 pub const i18nDir = i18n_mod.dir;
 pub const PluralCategory = i18n_mod.PluralCategory;
 pub const pluralCategory = i18n_mod.pluralCategory;
+pub const tPlural = i18n_mod.tPlural;
 pub const ErrorBoundary = error_boundary_mod.ErrorBoundary;
 pub const createErrorBoundary = error_boundary_mod.create;
 pub const untrack = signal_mod.untrack;

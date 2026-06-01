@@ -172,6 +172,53 @@ pub fn pluralCategory(locale: []const u8, n: u64) PluralCategory {
     };
 }
 
+// ---- tPlural -----------------------------------------------------------
+
+pub fn tPlural(
+    catalog: Catalog,
+    locale: []const u8,
+    key_base: []const u8,
+    n: u64,
+    arena: std.mem.Allocator,
+) ![]const u8 {
+    const cat = pluralCategory(locale, n);
+    const chosen = try selectPluralValue(catalog, locale, key_base, cat);
+    return interpolateN(chosen, n, arena);
+}
+
+fn lookupExact(catalog: Catalog, locale: []const u8, key: []const u8) ?[]const u8 {
+    const v = catalog.lookup(locale, key);
+    return if (std.mem.eql(u8, v, key)) null else v;
+}
+
+fn selectPluralValue(catalog: Catalog, locale: []const u8, key_base: []const u8, cat: PluralCategory) ![]const u8 {
+    var buf: [256]u8 = undefined;
+    const cat_key = try std.fmt.bufPrint(&buf, "{s}.{s}", .{ key_base, @tagName(cat) });
+    if (lookupExact(catalog, locale, cat_key)) |v| return v;
+    const other_key = try std.fmt.bufPrint(&buf, "{s}.other", .{key_base});
+    if (lookupExact(catalog, locale, other_key)) |v| return v;
+    if (lookupExact(catalog, locale, key_base)) |v| return v;
+    return key_base;
+}
+
+fn interpolateN(value: []const u8, n: u64, arena: std.mem.Allocator) ![]const u8 {
+    if (std.mem.indexOf(u8, value, "{n}") == null) return value;
+    var num_buf: [20]u8 = undefined;
+    const num = try std.fmt.bufPrint(&num_buf, "{d}", .{n});
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < value.len) {
+        if (i + 3 <= value.len and std.mem.eql(u8, value[i .. i + 3], "{n}")) {
+            try out.appendSlice(arena, num);
+            i += 3;
+        } else {
+            try out.append(arena, value[i]);
+            i += 1;
+        }
+    }
+    return out.items;
+}
+
 // ---- tests ------------------------------------------------------------
 
 const testing = std.testing;
@@ -228,6 +275,30 @@ test "pluralCategory CLDR cardinal rules per family" {
     try testing.expectEqual(PluralCategory.other, pluralCategory("zh", 5));
     try testing.expectEqual(PluralCategory.one, pluralCategory("xx", 1));
     try testing.expectEqual(PluralCategory.other, pluralCategory("xx", 2));
+}
+
+test "tPlural selects the category key + substitutes {n}" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const catalog: Catalog = .{
+        .entries = &.{
+            .{ .locale = "en", .key = "items.one", .value = "{n} item" },
+            .{ .locale = "en", .key = "items.other", .value = "{n} items" },
+            .{ .locale = "ru", .key = "items.one", .value = "{n} штука" },
+            .{ .locale = "ru", .key = "items.few", .value = "{n} штуки" },
+            .{ .locale = "ru", .key = "items.many", .value = "{n} штук" },
+            .{ .locale = "en", .key = "twice", .value = "{n} and {n}" },
+        },
+        .default_locale = "en",
+        .supported = &.{ "en", "ru" },
+    };
+    try testing.expectEqualStrings("1 item", try tPlural(catalog, "en", "items", 1, a));
+    try testing.expectEqualStrings("3 items", try tPlural(catalog, "en", "items", 3, a));
+    try testing.expectEqualStrings("2 штуки", try tPlural(catalog, "ru", "items", 2, a));
+    try testing.expectEqualStrings("5 штук", try tPlural(catalog, "ru", "items", 5, a));
+    try testing.expectEqualStrings("4 and 4", try tPlural(catalog, "en", "twice", 4, a));
+    try testing.expectEqualStrings("nope", try tPlural(catalog, "en", "nope", 1, a));
 }
 
 test "resolveLocale prefers cookie over query over header" {
