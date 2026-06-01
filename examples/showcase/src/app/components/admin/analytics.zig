@@ -31,8 +31,8 @@ pub fn analyticsPage(ctx: *verve.Context) !*verve.Node {
     var fc1: FetchCtx = .{ .ctx = ctx };
     var fc2: FetchCtx = .{ .ctx = ctx };
 
-    const r1 = try verve.createResource(HealthPayload, owner, &fc1, FetchCtx.run);
-    const r2 = try verve.createResource(HealthPayload, owner, &fc2, FetchCtx.run);
+    const r1 = try verve.createResource(HealthPayload, ctx.io.?, owner, &fc1, FetchCtx.run);
+    const r2 = try verve.createResource(HealthPayload, ctx.io.?, owner, &fc2, FetchCtx.run);
 
     const body = ctx.div().children(.{
         ctx.div().class("hero").children(.{

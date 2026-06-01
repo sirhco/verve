@@ -37,7 +37,7 @@ pub fn issueDetail(ctx: *verve.Context) !*verve.Node {
         }
     };
     var cf: CommentsFetcher = .{ .issue_id = issue.id, .arena = ctx.alloc() };
-    const comments_res = try verve.createResource([]const api.Comment, owner, &cf, CommentsFetcher.run);
+    const comments_res = try verve.createResource([]const api.Comment, ctx.io.?, owner, &cf, CommentsFetcher.run);
 
     const ActivityFetcher = struct {
         arena: std.mem.Allocator,
@@ -46,7 +46,7 @@ pub fn issueDetail(ctx: *verve.Context) !*verve.Node {
         }
     };
     var af: ActivityFetcher = .{ .arena = ctx.alloc() };
-    const activity_res = try verve.createResource([]const api.Activity, owner, &af, ActivityFetcher.run);
+    const activity_res = try verve.createResource([]const api.Activity, ctx.io.?, owner, &af, ActivityFetcher.run);
 
     // ErrorBoundary demo: capture an error from a synthetic widget; a
     // real app would call eb.reset() from a "Try again" button.
