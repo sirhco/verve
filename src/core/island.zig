@@ -173,3 +173,26 @@ test "island records its state blob under the assigned vid" {
     try testing.expectEqual(@as(i32, 7), (try island_state.lookup(reg.entries.items[0].blob, "n")).?.i32);
     try testing.expectEqualStrings("hi", (try island_state.lookup(reg.entries.items[0].blob, "label")).?.str);
 }
+
+test "islandStateStruct records a serialized struct under the vid" {
+    const island_state = @import("island_state.zig");
+    var reg = island_state.Registry.init(testing.allocator);
+    defer reg.deinit();
+    island_state.current = &reg;
+    defer island_state.current = null;
+    resetRenderVidSeq();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const Cfg = struct { w: u32, name: []const u8 };
+    const sblob = try ctx.islandStateStruct("cfg", Cfg{ .w = 4, .name = "grid" });
+    _ = island(&ctx, .{ .name = "Board", .state = sblob }, ctx.div());
+
+    try testing.expectEqual(@as(usize, 1), reg.entries.items.len);
+    const v = (try island_state.lookup(reg.entries.items[0].blob, "cfg")).?;
+    const got = try @import("serialize.zig").decode(Cfg, v.str, arena.allocator());
+    try testing.expectEqual(@as(u32, 4), got.w);
+    try testing.expectEqualStrings("grid", got.name);
+}

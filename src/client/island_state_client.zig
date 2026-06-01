@@ -11,6 +11,16 @@ pub fn setCurrentBlob(blob: []const u8) void {
     current_blob = blob;
 }
 
+/// Decode a struct-valued state entry into a `.ready` Resource(T). The struct
+/// (and its strings/slices) are allocated from `owner.allocator()`, so they
+/// outlive the shared scratch buffer. Returns null when the key is absent.
+pub fn resourceStructFromState(comptime T: type, owner: *verve.Owner, key: []const u8) !?*verve.Resource(T) {
+    const v = (verve.islandStateLookup(current_blob, key) catch return null) orelse return null;
+    if (v != .str) return null;
+    const value = verve.serializeDecode(T, v.str, owner.allocator()) catch return null;
+    return try verve.resourceReady(T, owner, value);
+}
+
 /// Reconstruct a `.ready` Resource(T) from the current island's serialized
 /// state entry `key`. Returns null when absent / wrong type. T ∈ { i32,
 /// []const u8, bool, f32 }.
@@ -62,4 +72,24 @@ test "resourceFromState decodes a ready primitive without fetching" {
     try verve.islandStateEncodeEntry(testing.allocator, &other, "x", .{ .str = "ZZZZ" });
     setCurrentBlob(other.items);
     try testing.expectEqualStrings("hi", r_label.get().?);
+}
+
+test "resourceStructFromState decodes a struct value" {
+    var owner = verve.Owner.init(testing.allocator);
+    verve.setReactivePendingAllocator(owner.allocator());
+    defer owner.dispose();
+
+    const Cfg = struct { w: u32, name: []const u8 };
+    const sbytes = try verve.serializeEncodeToBytes(Cfg{ .w = 9, .name = "hi" }, testing.allocator);
+    defer testing.allocator.free(sbytes);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try verve.islandStateEncodeEntry(testing.allocator, &buf, "cfg", .{ .str = sbytes });
+    setCurrentBlob(buf.items);
+    defer setCurrentBlob(&.{});
+
+    const r = (try resourceStructFromState(Cfg, &owner, "cfg")).?;
+    try testing.expectEqual(@as(u32, 9), r.get().?.w);
+    try testing.expectEqualStrings("hi", r.get().?.name);
 }

@@ -49,6 +49,7 @@ pub const ResourceState = verve.ResourceState;
 pub const createResource = verve.createResource;
 pub const createLocalResource = verve.createLocalResource;
 pub const resourceFromState = @import("island_state_client.zig").resourceFromState;
+pub const resourceStructFromState = @import("island_state_client.zig").resourceStructFromState;
 pub const setIslandStateBlob = @import("island_state_client.zig").setCurrentBlob;
 
 // ---- Field-grained reactivity --------------------------------------------

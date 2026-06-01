@@ -569,6 +569,20 @@ pub const Context = struct {
         }
         return buf.items;
     }
+
+    /// Like `islandState`, but for a single struct value: `key → serialize(value)`.
+    /// Stored as a `str`-tagged entry whose payload is the binary-encoded struct,
+    /// so it shares the island state blob envelope. Lives on the render arena.
+    /// (One blob per `IslandOpts.state`; for now an island uses either the
+    /// primitive `islandState` or one `islandStateStruct`, not both at once.)
+    pub fn islandStateStruct(ctx: *const Context, key: []const u8, value: anytype) ![]const u8 {
+        const island_state = @import("island_state.zig");
+        const serialize = @import("serialize.zig");
+        const payload = try serialize.encodeToBytes(value, ctx.allocator);
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        try island_state.encodeEntry(ctx.allocator, &buf, key, .{ .str = payload });
+        return buf.items;
+    }
 };
 
 test "Context allocates signals in arena" {
