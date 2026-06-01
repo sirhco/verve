@@ -49,6 +49,22 @@ pub const IslandOpts = struct {
     id: ?u32 = null,
 };
 
+fn rewriteBindings(node: *Node, vid: u32, alloc: std.mem.Allocator) void {
+    if (node.z_bind_name) |bn| {
+        var buf: [256]u8 = undefined;
+        const suffixed = vidBindName(bn, vid, &buf);
+        if (suffixed.ptr != bn.ptr) node.z_bind_name = alloc.dupe(u8, suffixed) catch bn;
+    }
+    for (node.attrs.items) |*a| {
+        if (std.mem.eql(u8, a.key, "data-ref")) {
+            var buf: [256]u8 = undefined;
+            const suffixed = vidBindName(a.value, vid, &buf);
+            if (suffixed.ptr != a.value.ptr) a.value = alloc.dupe(u8, suffixed) catch a.value;
+        }
+    }
+    for (node.children_list.items) |child| rewriteBindings(child, vid, alloc);
+}
+
 /// Wrap `inner` in an island marker. Server emits both the marker AND
 /// the inner HTML inline; Phase 8 hydration upgrades the marker to a
 /// reactive component.
@@ -60,6 +76,8 @@ pub fn island(ctx: *const Context, opts: IslandOpts, inner: *Node) *Node {
         vid_seq += 1;
         break :blk v;
     };
+
+    rewriteBindings(inner, vid, ctx.allocator);
 
     if (opts.state) |blob| {
         if (@import("island_state.zig").current) |reg| {
@@ -190,6 +208,43 @@ test "island records its state blob under the assigned vid" {
     try testing.expectEqual(@as(u32, 1), reg.entries.items[0].vid);
     try testing.expectEqual(@as(i32, 7), (try island_state.lookup(reg.entries.items[0].blob, "n")).?.i32);
     try testing.expectEqualStrings("hi", (try island_state.lookup(reg.entries.items[0].blob, "label")).?.str);
+}
+
+test "island suffixes inner z-bind and data-ref by vid" {
+    resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const inner1 = ctx.div().children(.{
+        ctx.span().bind("counter"),
+        ctx.span().attr("data-ref", "lbl"),
+        ctx.el("button").attr("z-on-click", "bump"),
+    });
+    _ = island(&ctx, .{ .name = "Counter" }, inner1); // vid 1
+
+    const inner2 = ctx.div().children(.{ ctx.span().bind("counter") });
+    _ = island(&ctx, .{ .name = "Counter" }, inner2); // vid 2
+
+    try testing.expectEqualStrings("counter__v1", inner1.children_list.items[0].z_bind_name.?);
+    try testing.expectEqualStrings("lbl__v1", attrVal(inner1.children_list.items[1], "data-ref").?);
+    try testing.expectEqualStrings("bump", attrVal(inner1.children_list.items[2], "z-on-click").?);
+    try testing.expectEqualStrings("counter__v2", inner2.children_list.items[0].z_bind_name.?);
+}
+
+test "island hydrate=false leaves inner unchanged" {
+    resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const inner = ctx.span().bind("counter");
+    _ = island(&ctx, .{ .name = "X", .hydrate = false }, inner);
+    try testing.expectEqualStrings("counter", inner.z_bind_name.?);
+}
+
+fn attrVal(node: *Node, key: []const u8) ?[]const u8 {
+    for (node.attrs.items) |a| if (std.mem.eql(u8, a.key, key)) return a.value;
+    return null;
 }
 
 test "islandStateStruct records a serialized struct under the vid" {
