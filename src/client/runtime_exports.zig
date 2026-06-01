@@ -435,7 +435,8 @@ export fn verve_server_fn_post(
     body_ptr: [*]const u8,
     body_len: u32,
 ) void {
-    dom.server_fn_post(name_ptr, @as(usize, name_len), body_ptr, @as(usize, body_len));
+    // Chunk-facing fire-and-forget post: no correlation id (rid 0).
+    dom.server_fn_post(name_ptr, @as(usize, name_len), body_ptr, @as(usize, body_len), 0);
 }
 
 // ---- Shared JSON value service (Phase 17, chunk-callable) ---------------

@@ -146,6 +146,7 @@ const WasmBridge = struct {
         name_len: usize,
         body_ptr: [*]const u8,
         body_len: usize,
+        rid: u32,
     ) void;
 
     // ---- NodeRef resolution -------------------------------------------------
@@ -263,7 +264,7 @@ const NativeStub = struct {
     pub fn remove_keyed_child(_: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
     pub fn set_class_present_by_bind(_: [*]const u8, _: usize, _: [*]const u8, _: usize, _: u32) void {}
     pub fn set_text_by_bind_f32(_: [*]const u8, _: usize, _: f32) void {}
-    pub fn server_fn_post(_: [*]const u8, _: usize, _: [*]const u8, _: usize) void {}
+    pub fn server_fn_post(_: [*]const u8, _: usize, _: [*]const u8, _: usize, _: u32) void {}
     pub fn query_ref(_: [*]const u8, _: usize) i32 {
         return 0;
     }

@@ -136,12 +136,17 @@
       // handler via `verve.registerResponseHandler("<name>", &fn)`,
       // the reply body lands in shared scratch and the handler fires.
       // Replies bigger than scratch capacity drop with a warning.
-      server_fn_post: (np, nl, bp, bl) => {
+      server_fn_post: (np, nl, bp, bl, rid) => {
         const name = readStr(np, nl);
         const body = readStr(bp, bl);
+        const headers = { "content-type": "application/json" };
+        // Correlation id for `_call` (the server echoes it in the reply so the
+        // client routes the reply to the right one-shot handler). `_post` sends
+        // rid 0 → no header.
+        if (rid) headers["x-verve-rid"] = String(rid >>> 0);
         fetch(`/api/${name}`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers,
           body,
         })
           .then(async (resp) => {

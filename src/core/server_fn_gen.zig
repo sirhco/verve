@@ -54,9 +54,11 @@ pub fn post(
                 name_len: usize,
                 body_ptr: [*]const u8,
                 body_len: usize,
+                rid: u32,
             ) void;
         };
-        wasm_bridge.server_fn_post(name.ptr, name.len, json.ptr, json.len);
+        // `_post` is fire-and-forget — no correlation (rid 0).
+        wasm_bridge.server_fn_post(name.ptr, name.len, json.ptr, json.len, 0);
     } else {
         // Native path: invoke directly, discard the result. Matches
         // the contract that `_post` is best-effort. `arena` + `name`
