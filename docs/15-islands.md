@@ -277,6 +277,46 @@ unmounting islands *without navigating* accumulates a slow residual.
 Navigation reclaims it. The common case (islands disposed on route
 change) has no residual.
 
+## Typed props
+
+`data-props` is decoded into a typed value at hydration via a binary codec
+(`src/core/serialize.zig` — bool, ints, floats, `[]const u8`, optionals,
+slices, nested structs, enums). The component declares a `Props` type and
+encodes it server-side; the chunk decodes it:
+
+```zig
+// island component
+pub const Props = struct { initial: i32, label: []const u8 };
+
+// server-side render
+return ctx.island(.{
+    .name = "Counter",
+    .props = try verve.encodeProps(&ctx, Props{ .initial = 0, .label = "Clicks" }),
+}, inner);
+```
+
+```zig
+// chunk-side hydrate
+export fn hydrate(props_ptr: u32, props_len: u32, vid: u32) void {
+    const bytes = @as([*]const u8, @ptrFromInt(props_ptr))[0..props_len];
+    const p = verve.decodeProps(Props, bytes, alloc) catch return;
+    // use p.initial / p.label ...
+}
+```
+
+`encodeProps` serializes then base64-encodes into `data-props`; the JS bridge
+base64-decodes and stages the raw bytes for the chunk. The decoder is
+panic-free on arbitrary bytes (it parses client-controllable markup), erroring
+rather than faulting on malformed input.
+
+`props_schema` (the JSON string on island component types) is now optional
+documentation — the comptime `Props` type is the real contract; `decodeProps`
+validates the bytes against it.
+
+For server-resolved **resource** state (not props), see
+[Resource state hydration](#resource-state-hydration) below; `islandStateStruct`
++ `resourceStructFromState` carry struct values through the same codec.
+
 ## Resource state hydration
 
 When an island reads a `Resource` that the server already resolved, the
