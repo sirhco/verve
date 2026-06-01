@@ -113,6 +113,65 @@ pub fn dir(locale: []const u8) []const u8 {
     return if (isRtl(locale)) "rtl" else "ltr";
 }
 
+// ---- Plural rules -------------------------------------------------------
+
+pub const PluralCategory = enum { zero, one, two, few, many, other };
+
+const PluralFamily = enum { other_only, english, french, east_slavic, polish, czech, arabic };
+
+fn pluralFamily(lang: []const u8) PluralFamily {
+    const eq = struct {
+        fn f(a: []const u8, b: []const u8) bool {
+            return std.ascii.eqlIgnoreCase(a, b);
+        }
+    }.f;
+    const other_only = [_][]const u8{ "ja", "zh", "ko", "th", "vi", "id", "ms", "lo", "my", "km" };
+    for (other_only) |l| if (eq(lang, l)) return .other_only;
+    if (eq(lang, "fr")) return .french;
+    if (eq(lang, "ru") or eq(lang, "uk")) return .east_slavic;
+    if (eq(lang, "pl")) return .polish;
+    if (eq(lang, "cs") or eq(lang, "sk")) return .czech;
+    if (eq(lang, "ar")) return .arabic;
+    return .english;
+}
+
+pub fn pluralCategory(locale: []const u8, n: u64) PluralCategory {
+    const lang = langOf(locale);
+    return switch (pluralFamily(lang)) {
+        .other_only => .other,
+        .english => if (n == 1) .one else .other,
+        .french => if (n == 0 or n == 1) .one else .other,
+        .east_slavic => blk: {
+            const m10 = n % 10;
+            const m100 = n % 100;
+            if (m10 == 1 and m100 != 11) break :blk .one;
+            if (m10 >= 2 and m10 <= 4 and !(m100 >= 12 and m100 <= 14)) break :blk .few;
+            break :blk .many;
+        },
+        .polish => blk: {
+            const m10 = n % 10;
+            const m100 = n % 100;
+            if (n == 1) break :blk .one;
+            if (m10 >= 2 and m10 <= 4 and !(m100 >= 12 and m100 <= 14)) break :blk .few;
+            break :blk .many;
+        },
+        .czech => blk: {
+            if (n == 1) break :blk .one;
+            if (n >= 2 and n <= 4) break :blk .few;
+            break :blk .other;
+        },
+        .arabic => blk: {
+            const m100 = n % 100;
+            if (n == 0) break :blk .zero;
+            if (n == 1) break :blk .one;
+            if (n == 2) break :blk .two;
+            if (m100 >= 3 and m100 <= 10) break :blk .few;
+            if (m100 >= 11 and m100 <= 99) break :blk .many;
+            break :blk .other;
+        },
+    };
+}
+
 // ---- tests ------------------------------------------------------------
 
 const testing = std.testing;
@@ -134,6 +193,41 @@ test "Catalog.lookup falls back to default then key" {
     try testing.expectEqualStrings("Goodbye", catalog.lookup("es", "bye"));
     // missing-everywhere → returns the key itself
     try testing.expectEqualStrings("missing.key", catalog.lookup("en", "missing.key"));
+}
+
+test "pluralCategory CLDR cardinal rules per family" {
+    try testing.expectEqual(PluralCategory.other, pluralCategory("en", 0));
+    try testing.expectEqual(PluralCategory.one, pluralCategory("en", 1));
+    try testing.expectEqual(PluralCategory.other, pluralCategory("en", 2));
+    try testing.expectEqual(PluralCategory.one, pluralCategory("de", 1));
+    try testing.expectEqual(PluralCategory.one, pluralCategory("fr", 0));
+    try testing.expectEqual(PluralCategory.one, pluralCategory("fr", 1));
+    try testing.expectEqual(PluralCategory.other, pluralCategory("fr", 2));
+    try testing.expectEqual(PluralCategory.one, pluralCategory("ru", 1));
+    try testing.expectEqual(PluralCategory.few, pluralCategory("ru", 2));
+    try testing.expectEqual(PluralCategory.many, pluralCategory("ru", 5));
+    try testing.expectEqual(PluralCategory.many, pluralCategory("ru", 11));
+    try testing.expectEqual(PluralCategory.one, pluralCategory("ru", 21));
+    try testing.expectEqual(PluralCategory.few, pluralCategory("ru", 22));
+    try testing.expectEqual(PluralCategory.many, pluralCategory("ru-RU", 25));
+    try testing.expectEqual(PluralCategory.one, pluralCategory("pl", 1));
+    try testing.expectEqual(PluralCategory.few, pluralCategory("pl", 2));
+    try testing.expectEqual(PluralCategory.many, pluralCategory("pl", 5));
+    try testing.expectEqual(PluralCategory.few, pluralCategory("pl", 22));
+    try testing.expectEqual(PluralCategory.many, pluralCategory("pl", 25));
+    try testing.expectEqual(PluralCategory.one, pluralCategory("cs", 1));
+    try testing.expectEqual(PluralCategory.few, pluralCategory("cs", 3));
+    try testing.expectEqual(PluralCategory.other, pluralCategory("cs", 5));
+    try testing.expectEqual(PluralCategory.zero, pluralCategory("ar", 0));
+    try testing.expectEqual(PluralCategory.one, pluralCategory("ar", 1));
+    try testing.expectEqual(PluralCategory.two, pluralCategory("ar", 2));
+    try testing.expectEqual(PluralCategory.few, pluralCategory("ar", 3));
+    try testing.expectEqual(PluralCategory.many, pluralCategory("ar", 11));
+    try testing.expectEqual(PluralCategory.other, pluralCategory("ar", 100));
+    try testing.expectEqual(PluralCategory.other, pluralCategory("ja", 1));
+    try testing.expectEqual(PluralCategory.other, pluralCategory("zh", 5));
+    try testing.expectEqual(PluralCategory.one, pluralCategory("xx", 1));
+    try testing.expectEqual(PluralCategory.other, pluralCategory("xx", 2));
 }
 
 test "resolveLocale prefers cookie over query over header" {
