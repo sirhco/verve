@@ -20,6 +20,13 @@
 // to throw `LinkError` when the chunk loads.
 
 const std = @import("std");
+const serialize = @import("serialize");
+const island_state = @import("island_state");
+
+// Shared-memory access to the island state blob the main client staged before
+// this chunk's hydrate (see `verve_current_state_ptr`/`_len` in runtime_exports).
+extern "verve_runtime" fn verve_current_state_ptr() u32;
+extern "verve_runtime" fn verve_current_state_len() u32;
 
 extern "verve_runtime" fn verve_register_i32(name_ptr: [*]const u8, name_len: u32, initial: i32) void;
 extern "verve_runtime" fn verve_register_str(name_ptr: [*]const u8, name_len: u32, initial_ptr: [*]const u8, initial_len: u32) void;
@@ -349,6 +356,28 @@ pub fn registerEvent(handler: *const fn () void) u32 {
 
 pub fn dispatchEvent(id: u32) void {
     verve_dispatch_event(id);
+}
+
+// ---- Typed props + island state (P3 / P1.5) ------------------------------
+
+/// Decode this island's typed props from the `props_ptr` bytes the bridge
+/// staged (base64-decoded `data-props`, in shared memory). Allocations live on
+/// `alloc`. Panic-free on arbitrary bytes (see `serialize.decode`).
+pub fn decodeProps(comptime T: type, bytes: []const u8, alloc: std.mem.Allocator) !T {
+    return serialize.decode(T, bytes, alloc);
+}
+
+/// Read a primitive value (`i32`/`[]const u8`/`bool`/`f32`) from this island's
+/// server-staged state blob, keyed by `key`. Returns null when absent or the
+/// stored tag doesn't match `T`. String results are slices into the shared
+/// state buffer — valid only during `hydrate`; copy (e.g. seed a `registerStr`)
+/// to keep them past this call.
+pub fn islandStateValue(comptime T: type, key: []const u8) ?T {
+    const len = verve_current_state_len();
+    if (len == 0) return null;
+    const ptr = verve_current_state_ptr();
+    const blob = @as([*]const u8, @ptrFromInt(ptr))[0..len];
+    return island_state.valueAs(T, blob, key) catch null;
 }
 
 /// Register a cleanup handler on the runtime's root Owner from a

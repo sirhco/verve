@@ -38,8 +38,21 @@ pub fn build(b: *std.Build) void {
     // exports at instantiation time. Wasm-only by construction (its
     // externs don't exist on the native target) so per-island chunks
     // are the only consumers.
+    // Core codec modules the chunk runtime needs for typed props + island
+    // state (chunks can't reach ../core via relative import — module path is
+    // src/client). Exposed by name so `island_runtime.zig` can @import them.
+    const serialize_island_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/serialize.zig"),
+    });
+    const island_state_island_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/island_state.zig"),
+    });
     const verve_island_mod = b.addModule("verve_island", .{
         .root_source_file = b.path("src/client/island_runtime.zig"),
+        .imports = &.{
+            .{ .name = "serialize", .module = serialize_island_mod },
+            .{ .name = "island_state", .module = island_state_island_mod },
+        },
     });
 
     const client_mod = b.createModule(.{
