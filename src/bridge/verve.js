@@ -637,6 +637,10 @@
     verve_register_event: exp.verve_register_event,
     verve_dispatch_event: exp.verve_dispatch_event,
     verve_cleanup: exp.verve_cleanup,
+    // Island resource-state blob access (chunk islandStateValue reads the
+    // main client's staged blob from shared memory via these).
+    verve_current_state_ptr: exp.verve_current_state_ptr,
+    verve_current_state_len: exp.verve_current_state_len,
     // Phase 18 — current-event accessors for chunk handlers.
     verve_event_mods: exp.verve_event_mods,
     verve_event_coord_x: exp.verve_event_coord_x,
