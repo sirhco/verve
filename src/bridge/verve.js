@@ -517,10 +517,24 @@
       return;
     }
 
-    const fn = exp[action];
+    // Resolve the handler against the main client first, then any island
+    // chunk's exports. Chunk handlers are exported fns called directly here
+    // (no cross-module function table); they call back into the main runtime
+    // via their `verve_runtime` imports. Scope the call to the enclosing
+    // island's vid so name-keyed signal lookups resolve that island's signals.
+    const fn =
+      typeof exp[action] === "function" ? exp[action] : chunkExports[action];
     if (typeof fn === "function") {
       e.preventDefault();
-      fn();
+      const islandEl = target.closest("verve-island");
+      const vid = islandEl ? parseInt(islandEl.getAttribute("data-vid"), 10) || 0 : 0;
+      const scope = vid && typeof exp.verve_enter_island === "function";
+      if (scope) exp.verve_enter_island(vid);
+      try {
+        fn();
+      } finally {
+        if (scope && typeof exp.verve_exit_island === "function") exp.verve_exit_island();
+      }
     } else {
       console.warn("verve: no wasm export for action", action);
     }
@@ -981,6 +995,10 @@
   };
 
   const islandChunks = new Map();
+  // Exported handler fns from loaded island chunks, keyed by export name, so
+  // `z-on-click="<name>"` on an island's markup can reach a chunk handler.
+  // (Last-writer-wins across chunks; name your chunk handlers distinctly.)
+  const chunkExports = {};
   const loadIslandChunk = async (el, instanceId) => {
     const name = el.getAttribute("data-name") || "";
     if (!name) return;
@@ -1005,6 +1023,11 @@
     if (!chunk) return;
     const cexp = chunk.instance.exports;
     if (typeof cexp.hydrate !== "function") return;
+    // Register this chunk's exported handlers (everything callable except the
+    // hydrate entry) so `z-on-click="<name>"` can dispatch to them.
+    for (const k of Object.keys(cexp)) {
+      if (k !== "hydrate" && typeof cexp[k] === "function") chunkExports[k] = cexp[k];
+    }
     const props = el.getAttribute("data-props") || "";
     // Re-stage THIS island's resource-state blob now: chunk load is async, so
     // another island's hydrate may have overwritten the shared current blob

@@ -3,18 +3,14 @@
 //!   - island resource-state → `islandStateValue(i32, "seed")`
 //!   - a reactive signal     → `registerI32` (SSR value span binds to it)
 //!   - a DOM ref             → `queryRef` + `setRefText` (typed label)
+//!   - an interactive handler → exported `counter_bump`, dispatched by the
+//!     bridge for `z-on-click="counter_bump"` (called directly + scoped to
+//!     this island's vid, so its signal lookup resolves; no cross-module
+//!     function table needed).
 //!
 //! Built to `island_Counter.wasm` and served at `/islands/Counter.wasm`.
 //! `@import("verve")` resolves to `src/client/island_runtime.zig` (the
 //! chunk runtime) via the per-island build module.
-//!
-//! NOTE: chunk-side CLOSURE event handlers (`registerEvent`) are NOT wired
-//! yet — passing a `*const fn()` across the chunk↔main boundary needs the
-//! shared indirect function table fully connected (`runtime_exports.zig`
-//! flags this as deferred). A chunk that registered a closure handler traps
-//! with "function signature mismatch" on dispatch. So this demo verifies the
-//! props/state/signal hydration path; interactive chunk handlers are a
-//! separate follow-up.
 
 const std = @import("std");
 const verve = @import("verve");
@@ -39,4 +35,11 @@ export fn hydrate(props_ptr: u32, props_len: u32, vid: u32) void {
 
     // Fill the label from typed props.
     if (verve.queryRef(.{ .id = "counter-label" })) |h| verve.setRefText(h, p.label);
+}
+
+/// Click handler for `z-on-click="counter_bump"`. The bridge calls this chunk
+/// export directly, wrapped in this island's vid scope, so `signalGet/SetI32`
+/// resolve the island's own `counter` signal.
+export fn counter_bump() void {
+    verve.signalSetI32("counter", verve.signalGetI32("counter") + 1);
 }

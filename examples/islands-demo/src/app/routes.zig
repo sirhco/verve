@@ -20,10 +20,12 @@ fn renderHome(ctx: *verve.Context) !*verve.Node {
     // The SSR subtree the chunk hydrates in place. The label span carries a
     // `data-ref` the chunk resolves via `queryRef` + `setRefText` (typed
     // prop); the value span binds to the "counter" signal the chunk seeds
-    // from props + island state.
+    // from props + island state; the button's `z-on-click` dispatches to the
+    // chunk's exported `counter_bump` (the bridge scopes it to this island).
     const inner = ctx.div().class("counter").children(.{
         ctx.span().attr("data-ref", "counter-label").text("…"),
         ctx.span().bind("counter").textInt(0),
+        ctx.el("button").attr("z-on-click", "counter_bump").text("+"),
     });
 
     const widget = verve.island(ctx, .{
