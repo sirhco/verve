@@ -11,6 +11,13 @@ pub fn setCurrentBlob(blob: []const u8) void {
     current_blob = blob;
 }
 
+/// The blob staged for the island currently hydrating (set by
+/// `verve_set_island_state`). Slices into the shared state buffer. Chunks
+/// read it through the `verve_current_state_ptr`/`_len` exports.
+pub fn currentBlob() []const u8 {
+    return current_blob;
+}
+
 /// Decode a struct-valued state entry into a `.ready` Resource(T). The struct
 /// (and its strings/slices) are allocated from `owner.allocator()`, so they
 /// outlive the shared scratch buffer. Returns null when the key is absent.

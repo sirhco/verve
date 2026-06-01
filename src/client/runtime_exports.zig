@@ -27,6 +27,32 @@ const client_alloc = @import("allocator.zig");
 const json_service = @import("json_service.zig");
 const event_state = @import("event_state.zig");
 const chunk_arena = @import("chunk_arena.zig");
+const island = @import("island.zig");
+const island_state_client = @import("island_state_client.zig");
+
+// ---- Island scope + state for chunk hydration ----------------------------
+// A chunk's `register*`/`registerEvent` calls route into this main runtime,
+// which scopes them by `island.current_island_id`. The bridge wraps each
+// chunk `hydrate` in enter/exit so chunk signals land under the island's vid
+// owner (and dispose with it). `verve_current_state_ptr`/`_len` expose the
+// already-staged resource-state blob so chunks read it from shared memory.
+
+export fn verve_enter_island(vid: u32) void {
+    island.current_island_id = vid;
+}
+
+export fn verve_exit_island() void {
+    island.current_island_id = 0;
+}
+
+export fn verve_current_state_ptr() u32 {
+    // usize on the native test target is 64-bit; truncate to the wasm32 u32 ABI.
+    return @intCast(@intFromPtr(island_state_client.currentBlob().ptr));
+}
+
+export fn verve_current_state_len() u32 {
+    return @intCast(island_state_client.currentBlob().len);
+}
 
 // ---- Signal registration (register-and-forget) ---------------------------
 
