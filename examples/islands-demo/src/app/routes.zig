@@ -17,30 +17,38 @@ pub const routes: []const verve.Route = &.{
 fn renderHome(ctx: *verve.Context) !*verve.Node {
     try ctx.setTitle("Verve Islands Demo");
 
-    // The SSR subtree the chunk hydrates in place. The label span carries a
-    // `data-ref` the chunk resolves via `queryRef` + `setRefText` (typed
-    // prop); the value span binds to the "counter" signal the chunk seeds
-    // from props + island state; the button's `z-on-click` dispatches to the
-    // chunk's exported `counter_bump` (the bridge scopes it to this island).
+    // Two instances of the SAME island component. Each inner subtree uses the
+    // PLAIN bind-name "counter", data-ref "counter-label", and handler name
+    // "counter_bump" — the framework namespaces them per-island by vid
+    // (`counter__v1` / `counter__v2`, etc.), so the two counters render and
+    // increment independently with no author burden.
+    const a = try counterIsland(ctx, 3, "Clicks", 100); // → 103
+    const b = try counterIsland(ctx, 50, "Taps", 0); //    → 50
+
+    const body = ctx.div().children(.{
+        ctx.h1("Islands demo"),
+        ctx.p().text("Two hydrated Counter islands of the same component. Each gets typed props (base64 data-props) + island state (verve-state script). They share bind-name \"counter\" in source; the framework suffixes per-vid so they stay independent — click one and only it increments."),
+        ctx.section().class("card").children(.{a}),
+        ctx.section().class("card").children(.{b}),
+        ctx.p().children(.{ verve.link(ctx, "/plain", "Plain page", .{}) }),
+    });
+    return components.shell.page(ctx, body);
+}
+
+/// One Counter island instance. The inner subtree uses plain binding names;
+/// `verve.island` stamps a unique vid and the framework namespaces the SSR
+/// `z-bind`/`data-ref` by it.
+fn counterIsland(ctx: *verve.Context, initial: i32, label: []const u8, seed: i32) !*verve.Node {
     const inner = ctx.div().class("counter").children(.{
         ctx.span().attr("data-ref", "counter-label").text("…"),
         ctx.span().bind("counter").textInt(0),
         ctx.el("button").attr("z-on-click", "counter_bump").text("+"),
     });
-
-    const widget = verve.island(ctx, .{
+    return verve.island(ctx, .{
         .name = "Counter",
-        .props = try verve.encodeProps(ctx, islands.Counter.Props{ .initial = 3, .label = "Clicks" }),
-        .state = try ctx.islandState(.{ .seed = @as(i32, 100) }),
+        .props = try verve.encodeProps(ctx, islands.Counter.Props{ .initial = initial, .label = label }),
+        .state = try ctx.islandState(.{ .seed = seed }),
     }, inner);
-
-    const body = ctx.div().children(.{
-        ctx.h1("Islands demo"),
-        ctx.p().text("The counter below is a hydrated island: typed props (initial=3, label=\"Clicks\") decoded from base64 data-props + island state (seed=100) from the verve-state script. The chunk seeds the signal to initial+seed=103 and sets the label from the typed prop."),
-        ctx.section().class("card").children(.{widget}),
-        ctx.p().children(.{ verve.link(ctx, "/plain", "Plain page", .{}) }),
-    });
-    return components.shell.page(ctx, body);
 }
 
 fn renderPlain(ctx: *verve.Context) !*verve.Node {

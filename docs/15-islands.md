@@ -341,6 +341,21 @@ navigation. `islandStateValue` string results are slices into shared memory,
 valid only during `hydrate`; copy (e.g. seed a `registerStr`) to keep them.
 A runnable end-to-end demo lives in `examples/islands-demo`.
 
+### Multiple instances of one component
+
+Two `<verve-island>` of the same component on one page work independently with
+no author burden. The chunk writes plain binding names (`registerI32("counter")`,
+`queryRef(.{ .id = "counter-label" })`) and the SSR template uses plain
+`bind("counter")` / `data-ref="counter-label"`; the framework suffixes each
+instance's binding by its `vid` on both sides — `island()` rewrites the inner
+tree's `z-bind`/`data-ref`/`data-vh` to `counter__v1`, `counter__v2`, … and the
+client drives the DOM (and resolves `queryRef`) with the matching suffixed name.
+So instance 1's signal updates only its own span. The `__v{vid}` separator is
+reserved. (Signals themselves are already `(vid, name)`-scoped; this closes the
+DOM-side of multi-instance.) Route-scope binds (`vid` 0, outside any island) are
+never suffixed. Keyed-list parent binds (`bindForEach`) are not yet auto-namespaced
+— a multi-instance keyed list needs a manually distinct parent bind for now.
+
 ## Resource state hydration
 
 When an island reads a `Resource` that the server already resolved, the
