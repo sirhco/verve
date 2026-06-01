@@ -960,6 +960,22 @@
   // single per-instance id, passed to its chunk's
   // `hydrate(props_ptr, props_len, vid)` and used as the wasm per-island
   // owner-scope key.
+
+  // `data-props` carries base64 of the binary props codec (serialize.zig).
+  // Decode to raw bytes before staging into the wasm scratch; empty/invalid
+  // props stage to zero bytes.
+  const b64ToBytes = (s) => {
+    if (!s) return new Uint8Array(0);
+    try {
+      const bin = atob(s);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    } catch {
+      return new Uint8Array(0);
+    }
+  };
+
   const islandChunks = new Map();
   const loadIslandChunk = async (el, instanceId) => {
     const name = el.getAttribute("data-name") || "";
@@ -992,7 +1008,7 @@
     ) {
       const ptr = exp.verve_island_scratch_ptr();
       const cap = exp.verve_island_scratch_capacity();
-      const propsBytes = new TextEncoder().encode(props);
+      const propsBytes = b64ToBytes(props);
       if (propsBytes.length > cap) {
         console.warn("verve: island props exceed shared scratch", name);
         return;
@@ -1066,7 +1082,7 @@
       if (scratchPtr && scratchCap) {
         const enc = new TextEncoder();
         const nameBytes = enc.encode(name);
-        const propsBytes = enc.encode(props);
+        const propsBytes = b64ToBytes(props);
         if (nameBytes.length + propsBytes.length <= scratchCap) {
           const view = new Uint8Array(memory.buffer, scratchPtr, scratchCap);
           view.set(nameBytes, 0);
