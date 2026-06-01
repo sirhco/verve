@@ -105,12 +105,17 @@ pub fn registerI32(name: []const u8, initial: i32) *verve.Signal(i32) {
     const sig = gpa.create(verve.Signal(i32)) catch @panic("verve client: OOM allocating Signal");
     sig.* = verve.Signal(i32).init(initial, gpa);
 
+    const vid = @import("island.zig").current_island_id;
+    var nbuf: [256]u8 = undefined;
+    const dom_name_tmp = verve.vidBindName(name, vid, &nbuf);
+    const dom_name = if (dom_name_tmp.ptr == name.ptr) name else gpa.dupe(u8, dom_name_tmp) catch name;
+
     const box = gpa.create(BindBoxI32) catch @panic("verve client: OOM allocating bind box");
-    box.* = .{ .name = name };
+    box.* = .{ .name = dom_name };
     sig.on_set = onSetI32;
     sig.on_set_ctx = box;
 
-    slots[slot_count] = .{ .vid = @import("island.zig").current_island_id, .name = name, .sig_ptr = sig, .type_tag = .i32 };
+    slots[slot_count] = .{ .vid = vid, .name = name, .sig_ptr = sig, .type_tag = .i32 };
     slot_count += 1;
 
     return sig;
@@ -149,12 +154,17 @@ pub fn registerStr(name: []const u8, initial: []const u8) *verve.Signal([]const 
     const sig = gpa.create(verve.Signal([]const u8)) catch @panic("verve client: OOM allocating Signal");
     sig.* = verve.Signal([]const u8).init(initial, gpa);
 
+    const vid = @import("island.zig").current_island_id;
+    var nbuf: [256]u8 = undefined;
+    const dom_name_tmp = verve.vidBindName(name, vid, &nbuf);
+    const dom_name = if (dom_name_tmp.ptr == name.ptr) name else gpa.dupe(u8, dom_name_tmp) catch name;
+
     const box = gpa.create(BindBoxStr) catch @panic("verve client: OOM allocating bind box");
-    box.* = .{ .name = name };
+    box.* = .{ .name = dom_name };
     sig.on_set = onSetStr;
     sig.on_set_ctx = box;
 
-    slots[slot_count] = .{ .vid = @import("island.zig").current_island_id, .name = name, .sig_ptr = sig, .type_tag = .str };
+    slots[slot_count] = .{ .vid = vid, .name = name, .sig_ptr = sig, .type_tag = .str };
     slot_count += 1;
 
     return sig;
@@ -191,12 +201,17 @@ pub fn registerBool(name: []const u8, class_name: []const u8, initial: bool) *ve
     const sig = gpa.create(verve.Signal(bool)) catch @panic("verve client: OOM allocating Signal");
     sig.* = verve.Signal(bool).init(initial, gpa);
 
+    const vid = @import("island.zig").current_island_id;
+    var nbuf: [256]u8 = undefined;
+    const dom_name_tmp = verve.vidBindName(name, vid, &nbuf);
+    const dom_name = if (dom_name_tmp.ptr == name.ptr) name else gpa.dupe(u8, dom_name_tmp) catch name;
+
     const box = gpa.create(BindBoxBool) catch @panic("verve client: OOM allocating bind box");
-    box.* = .{ .name = name, .class_name = class_name };
+    box.* = .{ .name = dom_name, .class_name = class_name };
     sig.on_set = onSetBool;
     sig.on_set_ctx = box;
 
-    slots[slot_count] = .{ .vid = @import("island.zig").current_island_id, .name = name, .sig_ptr = sig, .type_tag = .bool };
+    slots[slot_count] = .{ .vid = vid, .name = name, .sig_ptr = sig, .type_tag = .bool };
     slot_count += 1;
 
     return sig;
@@ -239,12 +254,17 @@ pub fn registerF32(name: []const u8, initial: f32) *verve.Signal(f32) {
     const sig = gpa.create(verve.Signal(f32)) catch @panic("verve client: OOM allocating Signal");
     sig.* = verve.Signal(f32).init(initial, gpa);
 
+    const vid = @import("island.zig").current_island_id;
+    var nbuf: [256]u8 = undefined;
+    const dom_name_tmp = verve.vidBindName(name, vid, &nbuf);
+    const dom_name = if (dom_name_tmp.ptr == name.ptr) name else gpa.dupe(u8, dom_name_tmp) catch name;
+
     const box = gpa.create(BindBoxF32) catch @panic("verve client: OOM allocating bind box");
-    box.* = .{ .name = name };
+    box.* = .{ .name = dom_name };
     sig.on_set = onSetF32;
     sig.on_set_ctx = box;
 
-    slots[slot_count] = .{ .vid = @import("island.zig").current_island_id, .name = name, .sig_ptr = sig, .type_tag = .f32 };
+    slots[slot_count] = .{ .vid = vid, .name = name, .sig_ptr = sig, .type_tag = .f32 };
     slot_count += 1;
 
     return sig;
@@ -940,7 +960,9 @@ pub fn autoHydrate(bindings: []const Binding) void {
 /// `verve.NodeRef(.tag)` instance.
 pub fn queryRef(ref: anytype) ?i32 {
     const id = ref.id;
-    const handle = dom.query_ref(id.ptr, id.len);
+    var nbuf: [256]u8 = undefined;
+    const scoped = verve.vidBindName(id, @import("island.zig").current_island_id, &nbuf);
+    const handle = dom.query_ref(scoped.ptr, scoped.len);
     return if (handle <= 0) null else handle;
 }
 
@@ -1390,6 +1412,37 @@ test "unmountIsland is a no-op for unknown vid" {
     island.current_island_id = 0;
     const sig = registerI32("a", 1);
     try testing.expectEqual(@as(i32, 1), sig.peek());
+}
+
+/// Test-only: return the DOM bind name stored on the BindBoxI32 for a
+/// given i32 Signal pointer (walks slots, casts on_set_ctx). Returns null
+/// when not found or when the slot isn't i32.
+pub fn debugBoxName(sig: *verve.Signal(i32)) ?[]const u8 {
+    for (slots[0..slot_count]) |s| {
+        if (s.type_tag != .i32) continue;
+        if (s.sig_ptr != @as(*anyopaque, sig)) continue;
+        const box: *BindBoxI32 = @ptrCast(@alignCast(sig.on_set_ctx));
+        return box.name;
+    }
+    return null;
+}
+
+test "register stores vid-suffixed DOM bind name, slot lookup stays plain" {
+    resetForTesting();
+    const island = @import("island.zig");
+
+    island.current_island_id = 1;
+    const sig = registerI32("counter", 5);
+    island.current_island_id = 0;
+
+    island.current_island_id = 1;
+    try testing.expectEqual(sig, signalI32("counter").?); // plain lookup still works
+    island.current_island_id = 0;
+
+    try testing.expectEqualStrings("counter__v1", debugBoxName(sig).?);
+
+    const app = registerI32("score", 1); // vid 0
+    try testing.expectEqualStrings("score", debugBoxName(app).?);
 }
 
 test "unmountRoute clears island owners so vids start fresh" {

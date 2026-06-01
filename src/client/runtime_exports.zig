@@ -169,7 +169,10 @@ export fn verve_signal_get_str(
 // ---- NodeRef ops (thin wrappers around dom.* externs) --------------------
 
 export fn verve_query_ref(id_ptr: [*]const u8, id_len: u32) i32 {
-    return dom.query_ref(id_ptr, @as(usize, id_len));
+    const id = id_ptr[0..id_len];
+    var nbuf: [256]u8 = undefined;
+    const scoped = @import("verve").vidBindName(id, island.current_island_id, &nbuf);
+    return dom.query_ref(scoped.ptr, scoped.len);
 }
 
 export fn verve_ref_set_text(handle: i32, ptr: [*]const u8, len: u32) void {
