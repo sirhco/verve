@@ -860,11 +860,16 @@ const ResponseSlot = struct {
     /// Owning island vid; restored around dispatch so name-based signal
     /// lookups inside the handler resolve the island's vid-scoped signals.
     vid: u32,
+    /// Non-zero only for one-shot handlers registered via `registerResponseHandlerOnce`.
+    rid: u32 = 0,
+    /// When true the slot fires at most once (for its `rid`) then is removed.
+    once: bool = false,
 };
 
 const MAX_RESPONSE_SLOTS: u32 = 256;
 var response_slots: [MAX_RESPONSE_SLOTS]?ResponseSlot = [_]?ResponseSlot{null} ** MAX_RESPONSE_SLOTS;
 var response_slot_count: u32 = 0;
+var server_fn_req_seq: u32 = 0;
 
 /// Register a per-route reply handler. Multiple handlers per route
 /// are allowed — they fire in registration order. Names live for the
@@ -876,19 +881,72 @@ pub fn registerResponseHandler(route: []const u8, handler: *const fn ([*]const u
     response_slot_count += 1;
 }
 
-/// Fire every handler registered against `route`. Called from the
+/// Register a one-shot reply handler correlated by request-id `rid`.
+/// Fires exactly once when a reply arrives whose `"rid"` field matches,
+/// then is removed from the slot table. Use `nextReqId()` to allocate
+/// a fresh correlation id before issuing the outbound call.
+pub fn registerResponseHandlerOnce(route: []const u8, rid: u32, handler: *const fn ([*]const u8, u32) void) void {
+    if (response_slot_count >= MAX_RESPONSE_SLOTS) @panic("verve client: response slot capacity exceeded");
+    response_slots[response_slot_count] = .{
+        .route = route,
+        .fn_ptr = handler,
+        .vid = @import("island.zig").current_island_id,
+        .rid = rid,
+        .once = true,
+    };
+    response_slot_count += 1;
+}
+
+/// Allocate a monotonically increasing, non-zero request correlation id.
+/// Pass to `registerResponseHandlerOnce` before each outbound server-fn call.
+pub fn nextReqId() u32 {
+    server_fn_req_seq += 1;
+    return server_fn_req_seq;
+}
+
+/// Parse the top-level `"rid"` integer from a server reply body, or 0 when absent.
+/// Performs a minimal scan for `"rid":<digits>` — the server controls this exact shape.
+fn parseReplyRid(body: []const u8) u32 {
+    const key = "\"rid\":";
+    const idx = std.mem.indexOf(u8, body, key) orelse return 0;
+    var i = idx + key.len;
+    while (i < body.len and body[i] == ' ') i += 1;
+    var n: u32 = 0;
+    var any = false;
+    while (i < body.len and body[i] >= '0' and body[i] <= '9') : (i += 1) {
+        n = n * 10 + (body[i] - '0');
+        any = true;
+    }
+    return if (any) n else 0;
+}
+
+/// Fire every handler registered against `route`. One-shot handlers
+/// (registered via `registerResponseHandlerOnce`) fire only when the
+/// reply's `"rid"` matches their correlation id, then are removed.
+/// Persistent handlers (registered via `registerResponseHandler`) fire
+/// for every matching route reply regardless of rid. Called from the
 /// bridge JS once it has staged the body bytes into shared memory.
 /// Out-of-table or zero-handler routes are silently dropped.
 pub fn dispatchResponse(route: []const u8, body: []const u8) void {
-    for (response_slots[0..response_slot_count]) |maybe_slot| {
-        const slot = maybe_slot orelse continue;
-        if (std.mem.eql(u8, slot.route, route)) {
-            const island = @import("island.zig");
+    const reply_rid = parseReplyRid(body);
+    const island = @import("island.zig");
+    var i: u32 = 0;
+    while (i < response_slot_count) {
+        const slot = response_slots[i] orelse { i += 1; continue; };
+        const fires = std.mem.eql(u8, slot.route, route) and (!slot.once or slot.rid == reply_rid);
+        if (fires) {
             const prev = island.current_island_id;
             island.current_island_id = slot.vid;
-            defer island.current_island_id = prev;
             slot.fn_ptr(body.ptr, @intCast(body.len));
+            island.current_island_id = prev;
+            if (slot.once) {
+                response_slot_count -= 1;
+                response_slots[i] = response_slots[response_slot_count];
+                response_slots[response_slot_count] = null;
+                continue; // re-check swapped-in slot at same index i
+            }
         }
+        i += 1;
     }
 }
 
@@ -1288,6 +1346,7 @@ pub fn resetForTesting() void {
     @memset(event_slots[0..], null);
     response_slot_count = 0;
     @memset(response_slots[0..], null);
+    server_fn_req_seq = 0;
     client_alloc.reset();
 }
 
@@ -1459,4 +1518,54 @@ test "unmountRoute clears island owners so vids start fresh" {
     const sig = registerI32("x", 2);
     try testing.expectEqual(@as(i32, 2), sig.peek());
     island.current_island_id = 0;
+}
+
+test "registerResponseHandlerOnce fires once for its rid, then is removed" {
+    resetForTesting();
+    const State = struct {
+        var hits: u32 = 0;
+        fn h(_: [*]const u8, _: u32) void { hits += 1; }
+    };
+    State.hits = 0;
+
+    registerResponseHandlerOnce("calc", 7, State.h);
+    try testing.expectEqual(@as(u32, 1), responseSlotCount());
+
+    dispatchResponse("calc", "{\"rid\":3,\"value\":1}"); // wrong rid
+    try testing.expectEqual(@as(u32, 0), State.hits);
+    try testing.expectEqual(@as(u32, 1), responseSlotCount());
+
+    dispatchResponse("calc", "{\"rid\":7,\"value\":42}"); // match → fire + remove
+    try testing.expectEqual(@as(u32, 1), State.hits);
+    try testing.expectEqual(@as(u32, 0), responseSlotCount());
+
+    dispatchResponse("calc", "{\"rid\":7,\"value\":42}"); // already removed
+    try testing.expectEqual(@as(u32, 1), State.hits);
+}
+
+test "one-shots correlate by rid; persistent handlers still fan out" {
+    resetForTesting();
+    const S = struct {
+        var a: u32 = 0; var b: u32 = 0; var p: u32 = 0;
+        fn ha(_: [*]const u8, _: u32) void { a += 1; }
+        fn hb(_: [*]const u8, _: u32) void { b += 1; }
+        fn hp(_: [*]const u8, _: u32) void { p += 1; }
+    };
+    S.a = 0; S.b = 0; S.p = 0;
+
+    registerResponseHandler("calc", S.hp);     // persistent
+    registerResponseHandlerOnce("calc", 1, S.ha);
+    registerResponseHandlerOnce("calc", 2, S.hb);
+
+    dispatchResponse("calc", "{\"rid\":2,\"value\":0}");
+    try testing.expectEqual(@as(u32, 0), S.a);
+    try testing.expectEqual(@as(u32, 1), S.b);
+    try testing.expectEqual(@as(u32, 1), S.p);
+}
+
+test "nextReqId is monotonic and non-zero" {
+    resetForTesting();
+    const a = nextReqId();
+    const b = nextReqId();
+    try testing.expect(a != 0 and b != 0 and b != a);
 }
