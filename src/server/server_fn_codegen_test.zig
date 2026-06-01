@@ -18,6 +18,25 @@ test "generated stub: getCount mirrors app.Actions counter" {
     try testing.expectEqual(@as(i32, 7), observed);
 }
 
+test "generated stub: _call delivers the typed result to on_reply (native)" {
+    app.last_count.store(7, .monotonic);
+    defer app.last_count.store(0, .monotonic);
+
+    const Sink = struct {
+        var got: i32 = -1;
+        fn onReply(v: i32) void {
+            got = v;
+        }
+    };
+    Sink.got = -1;
+    // Native path: runs synchronously, unwraps the `!i32`, fires the callback.
+    // (The wasm `_call` round-trip — POST + correlated reply — needs the
+    // generated stubs compiled into the wasm client; today app_client is
+    // native-only, so that path is exercised in the browser, not here.)
+    app_client.getCount_call(testing.allocator, .{}, Sink.onReply);
+    try testing.expectEqual(@as(i32, 7), Sink.got);
+}
+
 test "generated stub: updateDatabase + getCount roundtrip" {
     defer app.last_count.store(0, .monotonic);
 
