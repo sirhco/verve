@@ -62,12 +62,19 @@ pub fn dispatch(
 
     const redirect_target = if (meta.is_form) meta.referer orelse "/" else "";
 
+    // Read x-verve-rid for request-id correlation. Parse to ?u32;
+    // absent or non-numeric header → null (fire-and-forget back-compat).
+    const rid: ?u32 = if (meta.rid_raw) |raw|
+        std.fmt.parseInt(u32, raw, 10) catch null
+    else
+        null;
+
     const Actions = app.Actions;
     const decls = comptime std.meta.declarations(Actions);
 
     inline for (decls) |decl| {
         if (std.mem.eql(u8, decl.name, fn_name)) {
-            try invoke(gpa, request, @field(Actions, decl.name), body, meta.is_form, redirect_target);
+            try invoke(gpa, request, @field(Actions, decl.name), body, meta.is_form, redirect_target, rid);
             return;
         }
     }
@@ -82,6 +89,7 @@ fn invoke(
     body: []const u8,
     is_form: bool,
     redirect_target: []const u8,
+    rid: ?u32,
 ) !void {
     const fn_info = @typeInfo(@TypeOf(func)).@"fn";
     if (fn_info.params.len != 1) {
@@ -128,24 +136,24 @@ fn invoke(
         if (is_form) {
             try respondRedirect(request, redirect_target);
         } else {
-            try respondValue(gpa, request, value);
+            try respondValue(gpa, request, rid, value);
         }
     } else if (returns_error and !returns_value) {
         func(args) catch {
             try request.respond("internal error", .{ .status = .internal_server_error });
             return;
         };
-        if (is_form) try respondRedirect(request, redirect_target) else try respondOk(request);
+        if (is_form) try respondRedirect(request, redirect_target) else try respondOk(request, rid);
     } else if (!returns_error and returns_value) {
         const value = func(args);
         if (is_form) {
             try respondRedirect(request, redirect_target);
         } else {
-            try respondValue(gpa, request, value);
+            try respondValue(gpa, request, rid, value);
         }
     } else {
         func(args);
-        if (is_form) try respondRedirect(request, redirect_target) else try respondOk(request);
+        if (is_form) try respondRedirect(request, redirect_target) else try respondOk(request, rid);
     }
 }
 
@@ -244,8 +252,35 @@ fn respondRedirect(request: *http.Server.Request, target: []const u8) !void {
     });
 }
 
-fn respondOk(request: *http.Server.Request) !void {
-    try request.respond("{\"ok\":true}", .{
+/// Reply payload for `replyBody`.
+const ReplyPayload = union(enum) {
+    ok,
+    value_json: []const u8,
+};
+
+/// Build a server-fn reply body. `rid` echoes the correlation id when present.
+/// Writes into `buf` and returns the populated slice.
+fn replyBody(buf: []u8, rid: ?u32, payload: ReplyPayload) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeByte('{');
+    if (rid) |r| {
+        try w.print("\"rid\":{d},", .{r});
+    }
+    switch (payload) {
+        .ok => try w.writeAll("\"ok\":true"),
+        .value_json => |v| {
+            try w.writeAll("\"value\":");
+            try w.writeAll(v);
+        },
+    }
+    try w.writeByte('}');
+    return w.buffered();
+}
+
+fn respondOk(request: *http.Server.Request, rid: ?u32) !void {
+    var buf: [64]u8 = undefined;
+    const body = try replyBody(&buf, rid, .ok);
+    try request.respond(body, .{
         .status = .ok,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
@@ -256,14 +291,25 @@ fn respondOk(request: *http.Server.Request) !void {
 fn respondValue(
     gpa: std.mem.Allocator,
     request: *http.Server.Request,
+    rid: ?u32,
     value: anytype,
 ) !void {
-    var aw: Writer.Allocating = .init(gpa);
-    defer aw.deinit();
-    try aw.writer.writeAll("{\"value\":");
-    try std.json.Stringify.value(value, .{}, &aw.writer);
-    try aw.writer.writeAll("}");
-    try request.respond(aw.written(), .{
+    // Serialize the value first, then wrap with optional rid prefix.
+    var val_aw: Writer.Allocating = .init(gpa);
+    defer val_aw.deinit();
+    try std.json.Stringify.value(value, .{}, &val_aw.writer);
+    const value_json = val_aw.written();
+
+    var wrap_aw: Writer.Allocating = .init(gpa);
+    defer wrap_aw.deinit();
+    const wrap_w = &wrap_aw.writer;
+    try wrap_w.writeByte('{');
+    if (rid) |r| try wrap_w.print("\"rid\":{d},", .{r});
+    try wrap_w.writeAll("\"value\":");
+    try wrap_w.writeAll(value_json);
+    try wrap_w.writeByte('}');
+
+    try request.respond(wrap_aw.written(), .{
         .status = .ok,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
@@ -317,4 +363,13 @@ test "Stringify produces JSON for primitives" {
     defer aw.deinit();
     try std.json.Stringify.value(@as(i32, 42), .{}, &aw.writer);
     try std.testing.expectEqualStrings("42", aw.written());
+}
+
+test "replyBody echoes rid when present, omits when absent" {
+    const testing = std.testing;
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("{\"ok\":true}", try replyBody(&buf, null, .ok));
+    try testing.expectEqualStrings("{\"rid\":5,\"ok\":true}", try replyBody(&buf, 5, .ok));
+    try testing.expectEqualStrings("{\"value\":42}", try replyBody(&buf, null, .{ .value_json = "42" }));
+    try testing.expectEqualStrings("{\"rid\":7,\"value\":42}", try replyBody(&buf, 7, .{ .value_json = "42" }));
 }

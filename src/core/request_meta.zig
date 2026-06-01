@@ -61,6 +61,8 @@ pub const RequestMeta = struct {
     host: ?[]const u8 = null,
     /// Raw Cookie header — split into name/value pairs by `parseCookies`.
     cookie_header: ?[]const u8 = null,
+    /// Raw value of `x-verve-rid` when present; null otherwise.
+    rid_raw: ?[]const u8 = null,
 
     /// Look up a cookie by name. Returns null when the cookie is absent or
     /// the Cookie header was not present on the request.
@@ -116,6 +118,8 @@ pub const RequestMeta = struct {
                 result.host = h.value;
             } else if (std.ascii.eqlIgnoreCase(h.name, "cookie")) {
                 result.cookie_header = h.value;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "x-verve-rid")) {
+                result.rid_raw = h.value;
             }
         }
         return result;
