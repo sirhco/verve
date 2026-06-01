@@ -1346,8 +1346,15 @@ Third entry in the Win/Linux backfill plan. Closes the macOS-only
   through gtk+-3.0 + libgtk-3 — already in the link line.
 - New extern in `src/desktop/windows.zig`:
   `RegisterClipboardFormatW` from user32 (auto-linked).
-- Image clipboard formats (TIFF / DIB / image/png) still pending
-  all 3 backends. Future bundle.
+- Image clipboard (PNG): **macOS done (2026-06-01)** —
+  `Clipboard.writeImage(png)` / `readImage(alloc)` via `NSData` +
+  `setData:forType:` / `dataForType:` with the `public.png` UTI
+  (verified by a host round-trip: write a 1×1 PNG → read back
+  identical; the system pasteboard reports `«class PNGf»`). The API
+  format is raw PNG bytes. **Windows (`CF_DIB`) + Linux (`image/png`
+  GtkClipboard target) still pending** — both backends return
+  `error.Unsupported` for now. (TIFF on macOS is a possible later add;
+  PNG pastes into modern apps.)
 
 Verified: framework `zig build test` (205 pass); 3-backend
 cross-compile clean for `windows.zig` + `linux.zig`;
@@ -1590,7 +1597,7 @@ signing infra.
 
 | Gap | What | Estimated scope |
 |---|---|---|
-| ~~**Clipboard HTML (Win + Linux)**~~ | **Closed 2026-05-30 (Bundle 3).** Win CF_HTML format with the Microsoft-spec Version / Start/End HTML / Start/End Fragment header offsets. Linux GtkClipboard `text/html` target via `gtk_clipboard_set_with_data` + a get-callback that reads a process-global cached payload. Image clipboard (`NSPasteboardTypeTIFF` / `CF_DIB` / `image/png` target) still pending all 3. | — |
+| ~~**Clipboard HTML (Win + Linux)**~~ | **Closed 2026-05-30 (Bundle 3).** Win CF_HTML format with the Microsoft-spec Version / Start/End HTML / Start/End Fragment header offsets. Linux GtkClipboard `text/html` target via `gtk_clipboard_set_with_data` + a get-callback that reads a process-global cached payload. Image clipboard (PNG): macOS done 2026-06-01 (`public.png` via NSData; `Clipboard.writeImage`/`readImage`); `CF_DIB` (Win) + `image/png` GtkClipboard target (Linux) still pending. | — |
 | ~~**File-watch (Win + Linux)**~~ | **Closed 2026-05-30 (Bundles 4 + 5).** Win: `ReadDirectoryChangesW` + overlapped IO on a dedicated worker thread + `GetOverlappedResult` pump + `CancelIoEx`-driven shutdown (callback fires from worker thread). Linux: `inotify_init1 + inotify_add_watch` + `GIOChannel` wrap + `g_io_add_watch(G_IO_IN)` so events dispatch on the GTK main loop (callback fires on main thread, matching macOS). v1 Linux is **non-recursive** — single-inode watch only; callers walk subtrees themselves. | — |
 | ~~**Global hotkeys (Win + Linux)**~~ | **Closed 2026-05-30 (Bundles 6 + 7).** macOS Carbon `RegisterEventHotKey` shipped 2026-05-28. Win: `RegisterHotKey` against a hidden HWND_MESSAGE message-only window owned by the manager; existing app message loop delivers `WM_HOTKEY` to a small custom wndProc. Linux X11: libX11 loaded via `dlopen("libX11.so.6")` + `XGrabKey` on the root window for all 4 NumLock/CapsLock modifier variants; dedicated worker thread does `XNextEvent`. Wayland deferred (needs GlobalShortcuts xdg portal). | — |
 | ~~**Custom URL scheme runtime registration (Win + Linux)**~~ | **Closed 2026-05-30 (Bundle 2).** Win writes `HKCU\Software\Classes\<scheme>` registry tree (default value + `URL Protocol` marker + `shell\open\command`); Linux writes `~/.local/share/applications/<bundle_id>.desktop` with `MimeType=x-scheme-handler/<scheme>`. macOS `LSSetDefaultHandlerForURLScheme` shipped 2026-05-28. | — |
