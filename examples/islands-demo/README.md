@@ -1,0 +1,3 @@
+# islands-demo
+
+A minimal Verve example that exercises the island stack so it can be verified in a browser: the `/` route places one `Counter` island whose per-island WASM chunk decodes **typed props** (`initial=3`, `label="Clicks"`), reads **island resource-state** (`seed=100`), seeds a reactive `counter` signal to `initial+seed` (103), fills a `data-ref` label from props, and registers a **chunk-side closure event handler** wired to the `+` button (via `registerEvent` → `z-on-click-id`) that bumps the signal. `/plain` is a plain SSR page with no island. Run it with `zig build run` (serves on the default port; open `/`).
