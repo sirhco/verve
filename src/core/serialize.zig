@@ -281,6 +281,13 @@ fn decodeTyped(comptime T: type, c: *Cursor, alloc: std.mem.Allocator) DecodeErr
             } else {
                 try c.expect(.slice_t);
                 const n = try c.uleb();
+                // Cap the element count against the remaining buffer BEFORE
+                // allocating — every encoded element is at least one tag byte,
+                // so a valid `n` can never exceed the bytes left. This stops an
+                // attacker-controlled length from allocation-bombing (OOM-DoS)
+                // before the per-element decode hits EndOfStream. (pos <= len
+                // invariant holds, so the subtraction can't underflow.)
+                if (n > c.buf.len - c.pos) return error.EndOfStream;
                 const out = try alloc.alloc(p.child, n);
                 errdefer alloc.free(out);
                 for (out) |*elem| {
@@ -448,6 +455,13 @@ test "decode round-trips every supported type" {
     try testing.expectEqual(@as(i64, -1), got.inner.x);
     try testing.expectEqual(@as(?bool, true), got.inner.y);
     try testing.expectEqual(E.c, got.kind);
+}
+
+test "decode caps slice length against buffer (no allocation bomb)" {
+    // slice_t + a huge uleb length (~268M) + no element bytes. The length cap
+    // must reject this with EndOfStream BEFORE allocating ~268M elements.
+    const bytes = [_]u8{ @intFromEnum(Tag.slice_t), 0xff, 0xff, 0xff, 0x7f };
+    try testing.expectError(error.EndOfStream, decode([]const u32, &bytes, testing.allocator));
 }
 
 test "decode rejects wrong leading tag" {
