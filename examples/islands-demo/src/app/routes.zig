@@ -18,17 +18,12 @@ fn renderHome(ctx: *verve.Context) !*verve.Node {
     try ctx.setTitle("Verve Islands Demo");
 
     // The SSR subtree the chunk hydrates in place. The label span carries a
-    // `data-ref` the chunk resolves via `queryRef`; the value span binds to
-    // the "counter" signal the chunk registers. The button carries a
-    // `data-ref` too: a chunk-side closure handler is registered via
-    // `registerEvent` at hydrate time, and its slot id is stamped onto the
-    // button as `z-on-click-id` (the bridge's closure-dispatch path —
-    // string `z-on-click` resolves against the MAIN client exports, not the
-    // chunk, so chunk handlers must use the id form).
+    // `data-ref` the chunk resolves via `queryRef` + `setRefText` (typed
+    // prop); the value span binds to the "counter" signal the chunk seeds
+    // from props + island state.
     const inner = ctx.div().class("counter").children(.{
         ctx.span().attr("data-ref", "counter-label").text("…"),
         ctx.span().bind("counter").textInt(0),
-        ctx.el("button").attr("data-ref", "counter-btn").text("+"),
     });
 
     const widget = verve.island(ctx, .{
@@ -39,7 +34,7 @@ fn renderHome(ctx: *verve.Context) !*verve.Node {
 
     const body = ctx.div().children(.{
         ctx.h1("Islands demo"),
-        ctx.p().text("The counter below is a hydrated island: typed props (initial=3, label=\"Clicks\") + island state (seed=100). The chunk seeds the signal to initial+seed=103 and the + button runs chunk code."),
+        ctx.p().text("The counter below is a hydrated island: typed props (initial=3, label=\"Clicks\") decoded from base64 data-props + island state (seed=100) from the verve-state script. The chunk seeds the signal to initial+seed=103 and sets the label from the typed prop."),
         ctx.section().class("card").children(.{widget}),
         ctx.p().children(.{ verve.link(ctx, "/plain", "Plain page", .{}) }),
     });

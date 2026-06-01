@@ -1,13 +1,20 @@
 //! Counter island chunk. Exercises the island stack end to end:
 //!   - typed props          → `decodeProps` over the bridge-staged bytes
 //!   - island resource-state → `islandStateValue(i32, "seed")`
-//!   - a reactive signal     → `registerI32` / `signalGet*`/`signalSet*`
-//!   - a DOM ref             → `queryRef` + `setRefText`
-//!   - a closure event       → `registerEvent` + stamping `z-on-click-id`
+//!   - a reactive signal     → `registerI32` (SSR value span binds to it)
+//!   - a DOM ref             → `queryRef` + `setRefText` (typed label)
 //!
 //! Built to `island_Counter.wasm` and served at `/islands/Counter.wasm`.
 //! `@import("verve")` resolves to `src/client/island_runtime.zig` (the
 //! chunk runtime) via the per-island build module.
+//!
+//! NOTE: chunk-side CLOSURE event handlers (`registerEvent`) are NOT wired
+//! yet — passing a `*const fn()` across the chunk↔main boundary needs the
+//! shared indirect function table fully connected (`runtime_exports.zig`
+//! flags this as deferred). A chunk that registered a closure handler traps
+//! with "function signature mismatch" on dispatch. So this demo verifies the
+//! props/state/signal hydration path; interactive chunk handlers are a
+//! separate follow-up.
 
 const std = @import("std");
 const verve = @import("verve");
@@ -26,23 +33,10 @@ export fn hydrate(props_ptr: u32, props_len: u32, vid: u32) void {
     // Server-staged island state (`ctx.islandState(.{ .seed = ... })`).
     const seed = verve.islandStateValue(i32, "seed") orelse 0;
 
-    // Seed the reactive signal the SSR value span binds to.
+    // Seed the reactive signal the SSR value span binds to: shows
+    // `initial + seed` = 3 + 100 = 103, proving props + state both hydrated.
     verve.registerI32("counter", p.initial + seed);
 
     // Fill the label from typed props.
     if (verve.queryRef(.{ .id = "counter-label" })) |h| verve.setRefText(h, p.label);
-
-    // Register the chunk-side click handler and wire it to the button.
-    // `registerEvent` returns the runtime slot id; stamp it as
-    // `z-on-click-id` so the bridge's closure-dispatch path reaches us.
-    const slot = verve.registerEvent(counter_bump);
-    if (verve.queryRef(.{ .id = "counter-btn" })) |h| {
-        var idbuf: [16]u8 = undefined;
-        const s = std.fmt.bufPrint(&idbuf, "{d}", .{slot}) catch return;
-        verve.setRefAttr(h, "z-on-click-id", s);
-    }
-}
-
-fn counter_bump() void {
-    verve.signalSetI32("counter", verve.signalGetI32("counter") + 1);
 }
