@@ -48,11 +48,17 @@ The same action surfaces four ways:
    same symbol compiles in both targets. Untyped escape hatch
    remains `window.verveServerFn("foo", args)` for hand-written JS.
 5. **`app_client.<name>_call(arena, args, on_reply)`** — generated
-   callback-style typed call. Invokes the action and hands the
-   unwrapped success value to `on_reply` (errors skip the callback).
-   Synchronous on native; the shape mirrors the chunk-side
-   request → typed-reply loop in
-   [20 — Client runtime](20-client-runtime.md).
+   callback-style typed call. Hands the unwrapped success value to
+   `on_reply` (errors skip the callback). **Native:** runs the action
+   synchronously — the callback has fired by the time `_call` returns.
+   **WASM (planned wiring):** posts `args` to `/api/<name>` with a
+   per-call correlation id (`x-verve-rid` header); the server echoes
+   `"rid":N` in the reply; the client routes that reply to a one-shot
+   `(name, rid)` handler that decodes the typed value and fires
+   `on_reply` — so two concurrent calls never cross. The correlation
+   plumbing (`registerResponseHandlerOnce` + rid echo) is in place; the
+   wasm round-trip is enabled once the generated stubs are compiled into
+   the wasm client (today `app_client` is server-side only).
 
 ## Generated client stubs
 
@@ -71,9 +77,10 @@ try testing.expectEqual(@as(i32, 1), after);
 app_client.addTodo_post(scratch, .{ .text = "milk" });
 ```
 
-Native value-returning calls are typed end-to-end. WASM-side
-typed *value returns* still wait on the streaming async runtime
-(Phase 14C) — use the `_post` variant for now.
+Native value-returning calls are typed end-to-end. The `_call`
+callback variant is typed + correlated (see call path 5); its wasm
+round-trip lands once `app_client` is compiled into the wasm client.
+For pure fire-and-forget, use `_post`.
 
 ## Return types
 
