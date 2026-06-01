@@ -317,6 +317,30 @@ For server-resolved **resource** state (not props), see
 [Resource state hydration](#resource-state-hydration) below; `islandStateStruct`
 + `resourceStructFromState` carry struct values through the same codec.
 
+### In a chunk
+
+App island logic lives in a per-island chunk (`src/client/islands/<Name>.zig`,
+compiled to a separate `.wasm` sharing the main client's memory). The chunk's
+`verve` is `island_runtime.zig`, which exposes the codec for chunks:
+
+```zig
+const verve = @import("verve"); // island_runtime
+export fn hydrate(props_ptr: u32, props_len: u32, vid: u32) void {
+    const bytes = @as([*]const u8, @ptrFromInt(props_ptr))[0..props_len];
+    const p = verve.decodeProps(MyProps, bytes, alloc) catch return;
+    const seed = verve.islandStateValue(i32, "seed") orelse 0; // server state
+    verve.registerI32("count", p.initial + seed);
+    _ = verve.registerEvent(bump); // stamps z-on-click-id on the bound node
+}
+```
+
+The bridge wraps the chunk's `hydrate` in `verve_enter_island(vid)` /
+`verve_exit_island()`, so signals/effects/cleanups the chunk registers scope to
+the island's `vid` owner — they dispose on per-island unmount and on route
+navigation. `islandStateValue` string results are slices into shared memory,
+valid only during `hydrate`; copy (e.g. seed a `registerStr`) to keep them.
+A runnable end-to-end demo lives in `examples/islands-demo`.
+
 ## Resource state hydration
 
 When an island reads a `Resource` that the server already resolved, the
