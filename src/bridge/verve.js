@@ -1002,21 +1002,34 @@
     const cexp = chunk.instance.exports;
     if (typeof cexp.hydrate !== "function") return;
     const props = el.getAttribute("data-props") || "";
-    if (
-      typeof exp.verve_island_scratch_ptr === "function" &&
-      typeof exp.verve_island_scratch_capacity === "function"
-    ) {
-      const ptr = exp.verve_island_scratch_ptr();
-      const cap = exp.verve_island_scratch_capacity();
-      const propsBytes = b64ToBytes(props);
-      if (propsBytes.length > cap) {
-        console.warn("verve: island props exceed shared scratch", name);
-        return;
+    // Re-stage THIS island's resource-state blob now: chunk load is async, so
+    // another island's hydrate may have overwritten the shared current blob
+    // since hydrateIslandEl ran. `verve_current_state_ptr/_len` (read by the
+    // chunk's islandStateValue) must reflect this island.
+    stageIslandState(instanceId);
+    // Scope the chunk's register*/registerEvent/cleanup under this island's vid
+    // owner so per-island unmount disposes them.
+    const scope = typeof exp.verve_enter_island === "function";
+    if (scope) exp.verve_enter_island(instanceId);
+    try {
+      if (
+        typeof exp.verve_island_scratch_ptr === "function" &&
+        typeof exp.verve_island_scratch_capacity === "function"
+      ) {
+        const ptr = exp.verve_island_scratch_ptr();
+        const cap = exp.verve_island_scratch_capacity();
+        const propsBytes = b64ToBytes(props);
+        if (propsBytes.length > cap) {
+          console.warn("verve: island props exceed shared scratch", name);
+          return;
+        }
+        new Uint8Array(memory.buffer, ptr, cap).set(propsBytes, 0);
+        cexp.hydrate(ptr, propsBytes.length, instanceId);
+      } else {
+        cexp.hydrate(0, 0, instanceId);
       }
-      new Uint8Array(memory.buffer, ptr, cap).set(propsBytes, 0);
-      cexp.hydrate(ptr, propsBytes.length, instanceId);
-    } else {
-      cexp.hydrate(0, 0, instanceId);
+    } finally {
+      if (scope && typeof exp.verve_exit_island === "function") exp.verve_exit_island();
     }
   };
   // ---- Per-island hydrate/dispose lifecycle ---------------------------
