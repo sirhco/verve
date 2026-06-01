@@ -18,7 +18,7 @@ you know what you need.
 11. [Deployment](11-deployment.md) — CLI flags, systemd `LISTEN_FDS`, `--dev`, `VERVE_CSRF_KEY`
 12. [WASM client](12-wasm-client.md) — wasm32-freestanding runtime, reactive graph, typed bindings + auto-walker, closure events, NodeRef ops, slot introspection, `verve_client` façade for downstream apps
 13. [Security](13-security.md) — CSRF, CSP nonce, Origin pinning, ProtectedRoute
-14. [i18n](14-i18n.md) — Catalog + locale resolution
+14. [i18n](14-i18n.md) — Catalog + locale resolution, RTL, pluralization
 15. [Islands](15-islands.md) — per-island WASM chunks, shared-runtime memory, chunk-side reactive API (Phase 13F), cross-module closure events (Phase 13G), multi-instance support, manifest codegen
 16. [SPA router](16-spa-router.md) — `verve.link`, head merge + body swap, prefetch
 17. [Reconciler](17-reconciler.md) — keyed-list planner, `ForEachHandle`, reactive `bindForEach`
@@ -65,7 +65,12 @@ you know what you need.
 - **Island** — opt-in hydration boundary marked with
   `<verve-island data-name=… data-props=…>`. Each declared island
   ships its own WASM chunk that imports linear memory from the
-  main `client.wasm` for zero runtime duplication.
+  main `client.wasm` for zero runtime duplication. Islands support
+  typed props (`verve.encodeProps` / `verve.decodeProps`), resource-state
+  hydration (`islandState` / `islandStateValue`), lifecycle disposal
+  (`verve_unmount_island` per island, `verve_unmount_route` for all),
+  and automatic multi-instance namespacing (the framework suffixes
+  `z-bind`/`data-ref` by `vid` — no author burden).
 - **island_chunks** — generated assets table the server uses to
   serve `/islands/<Name>.wasm` from the embedded chunk bytes.
 - **NodeRef** — typed handle to a DOM node that survives hydration.
@@ -113,6 +118,7 @@ you know what you need.
   closure-style event handlers (`verve.registerEvent(&fn)`) cross
   the chunk → main-runtime boundary without going through JS.
 - **Cleanup hook** — `verve.cleanup(handler)` registers a
-  `*const fn () void` against the runtime's root Owner; runs LIFO
-  on dispose. Dormant in production today (Owner only disposes on
-  test reset); poised for SPA-navigation work.
+  `*const fn () void` against the enclosing Owner; runs LIFO on
+  dispose. Fires on per-island unmount (`verve_unmount_island`) and on
+  route navigation (`verve_unmount_route`), cascading through all island
+  owners under the route.

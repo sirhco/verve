@@ -255,8 +255,10 @@ Event handlers on cloned rows work via either dispatch flavor:
 
 The `refHandles[]` table grows monotonically; long-running pages
 that churn through many clones leak handles. Pair with
-`verve.cleanup(...)` for now; a future bundle adds explicit
-handle disposal once SPA-navigation Owner scoping lands.
+`verve.cleanup(...)` to reclaim them; route/island Owner disposal
+now runs on SPA navigation (`verve_unmount_route`) and per-island
+unmount (`verve_unmount_island`), but explicit `refHandles` disposal
+is still a gap — the gating Owner-scoping work has landed.
 
 ## IPC response handlers
 
@@ -356,10 +358,10 @@ the handle.
 
 `verve.cleanup(handler)` registers a `*const fn () void` against the
 runtime's root Owner. Handlers run in LIFO order when the Owner
-disposes. Today the Owner only disposes on test reset, so the hook
-is dormant in production — the API exists so apps can declare
-resource teardown ahead of the future SPA-navigation work that will
-dispose per-route owners between pages.
+disposes. Owners now dispose on SPA route navigation
+(`verve_unmount_route`) and on per-island unmount
+(`verve_unmount_island`), so cleanup hooks fire in production on both
+paths — they are no longer dormant.
 
 ## Slot-table introspection
 
@@ -447,6 +449,15 @@ verve_island_scratch_capacity() u32   shared scratch size
 verve_island_dispatch(name_len, props_len) i32
                                       in-process island dispatch — returns 1 when a
                                       hydrator was registered for the named island, 0 otherwise
+verve_island_dispatch_v(name_len, props_len, vid) i32
+                                      vid-scoped variant; bridge uses this to hydrate a
+                                      specific island instance
+verve_unmount_island(vid) void        dispose the per-island Owner for `vid`; cleanup
+                                      hooks fire in LIFO order
+verve_unmount_route() void            dispose the per-route Owner; called by bridge on
+                                      SPA navigation before the new route renders
+verve_enter_island(vid) void          set current island scope (bridge wraps chunk hydrate)
+verve_exit_island() void              clear island scope after chunk hydrate
 ```
 
 The bridge enumerates these on boot:
@@ -589,17 +600,22 @@ For very large client-side state (megabytes), pre-grow at startup by
 making one large allocation immediately; subsequent allocations
 inside the reserved region won't trigger further grows.
 
-## NodeRef hydration (Phase 8 roadmap)
+## NodeRef hydration and island lifecycle
 
 `ctx.nodeRef(.input, "email")` emits `data-ref="email"` on the
 server-rendered HTML. The client-side runtime exposes
 `verveQueryRef("email") -> ?Element` so wasm effects can resolve a
-typed handle to the live DOM node. The Phase 8 hydration loader will
-walk `<verve-island>` markers and invoke per-island wasm bundles that
-read these refs to attach handlers + subscribe to reactive state.
+typed handle to the live DOM node.
 
-Phase 7 ships the marker emission only — the Phase 8 loader and
-per-island bundling are the next round of work on the client side.
+The bridge's `MutationObserver` watches for `<verve-island>` markers
+inserted into the DOM (initial pass + dynamic SPA swaps) and calls
+`loadIslandChunk(el, instanceId)` to fetch and instantiate the
+per-island wasm bundle on demand. Hydration is scoped via
+`verve_enter_island(vid)` / `verve_exit_island()` so each island's
+signals land under its own Owner. Chunk dispatch uses
+`verve_island_dispatch_v(name_len, props_len, vid)`. Teardown is
+`verve_unmount_island(vid)` (element removed) or
+`verve_unmount_route()` (SPA navigation).
 
 ## Escape helper
 

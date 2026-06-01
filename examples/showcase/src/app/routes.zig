@@ -66,7 +66,7 @@ fn renderIslandDemo(ctx: *verve.Context) !*verve.Node {
     const body = ctx.div().children(.{
         ctx.div().class("hero").children(.{
             ctx.h1("Islands"),
-            ctx.p().class("lead").text("Server emits a `<verve-island data-name=… data-props=…>` marker around the SSR subtree. The Phase 8 client runtime will fetch a per-island WASM chunk and hydrate this subtree in place. View source to see the wrapper."),
+            ctx.p().class("lead").text("Server emits a `<verve-island data-name=… data-props=…>` marker around the SSR subtree. The client runtime fetches the per-island WASM chunk and hydrates this subtree in place. View source to see the wrapper."),
         }),
         ctx.section().class("card").children(.{ wrapped }),
     });

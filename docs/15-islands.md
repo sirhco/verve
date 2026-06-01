@@ -11,19 +11,24 @@ doesn't multiply the runtime bytes the browser downloads.
 ```zig
 return verve.island(ctx, .{
     .name = "Counter",
-    .props = "{\"initial\":7}",
+    .props = try verve.encodeProps(&ctx, Counter.Props{ .initial = 7 }),
 }, try counterInline(ctx, 7));
 ```
 
 Server renders the inline HTML (for search engines + noscript
 clients), then wraps it in a `<verve-island>` custom element
-carrying the component name + JSON-serialized props:
+carrying the component name + base64-encoded binary props:
 
 ```html
-<verve-island data-name="Counter" data-props='{"initial":7}'>
+<verve-island data-name="Counter" data-props="<base64>">
   <div class="counter">7</div>
 </verve-island>
 ```
+
+`data-props` is always base64 of the binary codec output from
+`verve.encodeProps`. The JS bridge base64-decodes and stages the raw
+bytes for the chunk. See [Typed props](#typed-props) for the full
+encode/decode pattern.
 
 The wrapper costs ~20 bytes of HTML per island — cheap enough to add
 to every interactive subtree.
@@ -33,8 +38,8 @@ to every interactive subtree.
 | Field | Default | Notes |
 |---|---|---|
 | `name`    | required | Component identifier. Must match a `pub const <Name>` in `src/app/islands.zig` for the chunk to ship. |
-| `props`   | `""`     | Pre-encoded props blob. Caller chooses JSON, the binary codec (`verve.encode`), or something else. |
-| `state_id`| `null`   | Optional reference to a pre-resolved Resource's state slot. |
+| `props`   | `""`     | Pre-encoded props blob. Use `verve.encodeProps(&ctx, Props{...})`; the result is base64 of the binary codec, which `data-props` always carries. |
+| `state`   | `null`   | Serialized resource-state blob from `ctx.islandState(...)`. Staged under this island's `vid` for client hydration without re-fetching. |
 | `hydrate` | `true`   | When false the wrapper is skipped — pure SSR subtree, useful for build-time A/B. |
 
 ## Declaring an island
@@ -46,17 +51,20 @@ time and fans WASM chunks out across every top-level decl:
 ```zig
 // src/app/islands.zig
 pub const Counter = struct {
-    pub const props_schema: []const u8 = "{\"initial\":\"i32\"}";
+    pub const Props = struct { initial: i32 };
 };
 
 pub const Greeting = struct {
-    pub const props_schema: []const u8 = "{\"name\":\"string\"}";
+    pub const Props = struct { name: []const u8 };
 };
 ```
 
-`props_schema` is metadata only today — the Phase 13F binary codec
-will read it to type-check `data-props` decoding. The schema isn't
-required for the chunk to ship.
+The comptime `Props` type is the real contract — `verve.encodeProps`
+encodes it server-side and `verve.decodeProps` validates the bytes
+against it chunk-side. `props_schema` (a JSON string) is now
+**optional documentation only** and not required for the chunk to
+ship. See [Typed props](#typed-props) for the full encode/decode
+pattern.
 
 ## Custom per-island logic
 
@@ -70,19 +78,21 @@ needs:
 // src/client/islands/Counter.zig
 const verve = @import("verve");
 
-const BIND: []const u8 = "counter_island";
+const BIND: []const u8 = "counter";
 
-export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
+export fn hydrate(props_ptr: u32, props_len: u32, vid: u32) void {
     _ = props_ptr;
     _ = props_len;
-    _ = root_id;
+    _ = vid;
     // Register the per-island Signal in the main runtime's slot
     // table. Its `on_set` hook wires straight to the matching
-    // `[z-bind="counter_island"]` element via the JS bridge.
+    // `[z-bind="counter"]` element via the JS bridge.
+    // The framework suffixes the bind-name by vid (counter__v1,
+    // counter__v2, …) automatically for multi-instance support.
     verve.registerI32(BIND, 0);
 }
 
-export fn counter_island_bump() void {
+export fn counter_bump() void {
     verve.signalSetI32(BIND, verve.signalGetI32(BIND) + 1);
 }
 ```
@@ -121,14 +131,14 @@ const verve = @import("verve");
 var bump_id: u32 = 0;
 
 fn handleBump() void {
-    if (verve.signalSetI32("counter_island", verve.signalGetI32("counter_island") + 1)) |_| {}
+    if (verve.signalSetI32("counter", verve.signalGetI32("counter") + 1)) |_| {}
 }
 
-export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
+export fn hydrate(props_ptr: u32, props_len: u32, vid: u32) void {
     _ = props_ptr;
     _ = props_len;
-    _ = root_id;
-    verve.registerI32("counter_island", 0);
+    _ = vid;
+    verve.registerI32("counter", 0);
     bump_id = verve.registerEvent(&handleBump);
 }
 ```
@@ -150,31 +160,20 @@ JS click delegate looks up the export on the chunk's own instance.
 
 ### Multi-instance islands
 
-`<verve-island>` markers on a page get a document-order id stamped
-as `data-instance="N"` and passed to the chunk's `hydrate` as
-`root_id`. Two markers with the same `data-name` share the same
-chunk wasm but get distinct `root_id` values, so chunks can keep
-per-instance state by namespacing their bind-names:
+Two `<verve-island>` markers with the same `data-name` share the
+same chunk WASM but are kept independent **automatically** — no
+author burden. Each marker gets a unique `vid` (stamped as
+`data-vid`), and `island()` rewrites every `z-bind` / `data-ref` /
+`data-vh` in the inner tree by that vid before rendering: plain
+`"counter"` becomes `"counter__v1"` for the first instance,
+`"counter__v2"` for the second, and so on. The chunk writes plain
+binding names and the SSR template uses plain `bind("counter")` /
+`data-ref="counter-label"`; the suffixing is invisible to the author.
 
-```zig
-const std = @import("std");
-const verve = @import("verve");
-
-export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
-    _ = props_ptr;
-    _ = props_len;
-    var buf: [32]u8 = undefined;
-    const bind = std.fmt.bufPrint(&buf, "counter_island_{d}", .{root_id}) catch return;
-    verve.registerI32(bind, 0);
-}
-```
-
-The SSR'd content's `[z-bind="counter_island_{N}"]` must use the
-matching namespaced form. Chunks that don't care about
-multi-instance can ignore `root_id` entirely — `registerI32` is
-idempotent on the bind-name, so a second `<verve-island
-data-name="Counter">` marker just shares the same Signal slot
-(no duplicate allocation, no warning).
+The third argument to `hydrate` is `vid` (not `root_id`). Chunks
+that don't need the vid can ignore it. See the
+[Multiple instances](#multiple-instances-of-one-component) section
+below for the full pattern and limitations.
 
 ## Shared linear memory
 
@@ -389,9 +388,6 @@ serialization is future work, shared with the props binary codec.
 
 ## Deferred work
 
-- **Binary codec dispatch** — parse `props_schema` at chunk
-  hydration time and decode `data-props` into typed args (also unlocks
-  struct values in `islandState`).
 - **Client-side fetch of pending / local resources** — a `loading` or
   `LocalResource` resolved client-side via the server-function reply
   loop (`server_fn_post` → `dispatchResponse`), keyed by `data-vid` and

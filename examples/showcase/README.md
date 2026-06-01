@@ -164,8 +164,6 @@ src/app/
 
 ## Deferred
 
-- Per-island WASM chunk + hydration loader (Phase 8 framework work).
-  The marker emits today; the runtime upgrade lands separately.
 - Chunked HTML streaming with out-of-order Suspense `<template>` chunks
   (waits for async Resources in the WASM client).
 - `ctx.fetch` analytics panel: synthesized payload in the demo (the

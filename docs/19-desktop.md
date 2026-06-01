@@ -123,9 +123,12 @@ reference. Headline list:
   `WM_SETTINGCHANGE` with `lParam == "ImmersiveColorSet"`; Linux
   connects to `GtkSettings notify::gtk-application-prefer-dark-theme`.
 - **Clipboard** — `Window.clipboard()` returns a handle with
-  `writeText(text)` / `readText(alloc) -> ?[]u8` and
+  `writeText(text)` / `readText(alloc) -> ?[]u8`,
   `writeHtml(html)` / `readHtml(alloc) -> ?[]u8` (macOS only on
-  the HTML pair — Win + Linux return `error.Unsupported`).
+  the HTML pair — Win + Linux return `error.Unsupported`), and
+  `writeImage(png)` / `readImage(alloc) -> ?[]u8` for raw PNG
+  bytes (macOS writes `NSPasteboardTypePNG` / `public.png`; Windows
+  + Linux return `error.Unsupported`).
   Text: macOS `NSPasteboard.generalPasteboard` +
   `public.utf8-plain-text`; Windows `OpenClipboard` +
   `CF_UNICODETEXT` + an HGLOBAL payload that ownership transfers
@@ -320,6 +323,7 @@ Zig calls via nested event-loop pumps.
 | Print copies / pages / printer | ✓ | stub | stub |
 | Clipboard (text) | ✓ | ✓ | ✓ |
 | Clipboard (HTML) | ✓ | stub | stub |
+| Clipboard (image/PNG) | ✓ | pending | pending |
 | Battery / charging (`desktop.power`) | ✓ | ✓ | ✓ |
 | Disk space (`desktop.disk`) | ✓ | ✓ | ✓ |
 | System info (`desktop.system`) | ✓ | ✓ | ✓ |

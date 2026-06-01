@@ -4,6 +4,82 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.32] - 2026-06-01
+
+### Added
+
+**Interactive islands, end to end** — the island stack moves from
+marker-emission-only to a complete client lifecycle: typed props, server-resolved
+resource state, per-instance reactive ownership with disposal, and multi-instance
+independence. App islands (separate per-island `.wasm` chunks sharing the main
+client's memory) can now decode typed props, read server state, register reactive
+signals + handlers, and dispose cleanly on navigation or unmount. New runnable
+demo: `examples/islands-demo` (two independent Counter islands). Guide updates in
+`docs/15-islands.md`, `docs/18-streaming.md`, `docs/16-spa-router.md`,
+`docs/12-wasm-client.md`.
+
+- **Streaming SSR is truly async (P2).** `Resource` fetchers run via
+  `std.Io.async` (`resource.create(T, io, owner, ctx, fetcher)` launches the
+  fetcher + stores a `Future`); `Renderer.streamRender(w, io, node, reg)` awaits
+  every suspended boundary's in-flight future **concurrently** and emits each
+  `<template id="verve-vs-N">` chunk in **completion order** (out-of-order on the
+  wire — a fast boundary lands before a slow one). Worker tasks only block on
+  futures; all Signal mutation + node rendering stay on the main thread.
+
+- **Per-island + route lifecycle (P1).** `verve_unmount_route()` disposes a route's
+  reactive scope on SPA navigation (re-arming the owner; clears the slot tables),
+  fired by the bridge before the body swap. A `MutationObserver` hydrates each
+  `<verve-island>` on insertion (closing the post-nav re-hydration gap) and calls
+  `verve_unmount_island(vid)` on removal. Islands carry an auto-assigned unique
+  `data-vid`; signals/effects/cleanups register under per-`vid` child owners and
+  dispose with the island.
+
+- **Island resource-state hydration (P1.5).** `ctx.islandState(.{...})` /
+  `ctx.islandStateStruct(key, value)` serialize a server-resolved value into a
+  per-page `<script type="application/verve-state">` (keyed by `vid`); the client
+  `verve.resourceFromState` / `resourceStructFromState` / `islandStateValue`
+  reconstruct it with **no re-fetch**.
+
+- **Typed island props via a binary codec (P3).** Added a panic-free decoder to
+  `src/core/serialize.zig` (mirrors the encoder; bounds-checked, allocation-capped
+  against malicious `data-props`). `verve.encodeProps(ctx, P{...})` →
+  `verve.decodeProps(P, bytes, alloc)`; `data-props` is now base64 of the binary
+  codec. `props_schema` is demoted to optional documentation — the comptime `Props`
+  type is the contract.
+
+- **Chunk-runtime integration.** App chunks reach the new features through
+  `island_runtime.zig`: `verve.decodeProps`, `verve.islandStateValue(T, key)`
+  (reads the shared state blob via `verve_current_state_ptr/_len`). The bridge wraps
+  each chunk `hydrate` in `verve_enter_island(vid)` / `verve_exit_island()` so chunk
+  signals scope to the island's vid; `z-on-click="<name>"` dispatches to the
+  chunk's exported handler (scoped to its island).
+
+- **Multi-instance islands.** Two `<verve-island>` of one component on a page now
+  work independently with no author burden — the framework suffixes each instance's
+  `z-bind` / `data-ref` (and the client DOM updates / `queryRef`) by `vid`
+  (`name__v1`, `name__v2`). The reserved separator is `__v`.
+
+- **Server-fn `_call` correlated callback (P4).** `app_client.<name>_call(arena,
+  args, on_reply)` — typed callback variant. Native runs synchronously; the wasm
+  path threads a per-call request id (`x-verve-rid` header, echoed in the reply) and
+  a one-shot `(route, rid)` reply handler (`registerResponseHandlerOnce`) so
+  concurrent calls never cross. (The wasm round-trip is wired pending
+  `app_client`-in-wasm-client; native works today.)
+
+- **i18n: RTL + pluralization (P5).** `verve.i18nIsRtl(locale)` / `verve.i18nDir`
+  (10-language RTL set) for `<html dir="…">`. `verve.PluralCategory` +
+  `verve.pluralCategory(locale, n)` — CLDR cardinal rules for a curated set of
+  language families (English/French/East-Slavic/Polish/Czech-Slovak/Arabic/Asian
+  other-only; unknown → English; integer counts). `verve.tPlural(catalog, locale,
+  key_base, n, arena)` selects `key.<category>` (fallback to `.other`/base) and
+  substitutes `{n}`.
+
+- **Desktop image clipboard (P6).** `Clipboard.writeImage(png)` /
+  `readImage(alloc)` (raw PNG bytes). macOS implemented via `NSData` +
+  `setData:forType:` / `dataForType:` with `public.png` (verified by a host
+  round-trip). Windows (`CF_DIB`) + Linux (`image/png` GtkClipboard target) return
+  `error.Unsupported` — follow-ups.
+
 ## [0.1.31] - 2026-05-29
 
 ### Added

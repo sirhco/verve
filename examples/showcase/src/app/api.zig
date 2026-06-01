@@ -161,7 +161,7 @@ const post_hash       = "Build-time Wyhash → 8 hex chars → `/public/style-<h
 const post_nested     = "`Route.layout(pattern, render, children)` declares a layout with nested children. `ctx.outlet()` is the placeholder the child renders into.";
 const post_csrf       = "HMAC-SHA256 token signed over a timestamp. Cookie + form field round-trip. SameSite=Strict closes the cross-origin gap.";
 const post_stores     = "A Store(T) is a comptime tuple of Signal(field.type), one per declared field. Reads subscribe to ONLY the field touched. Writes notify ONLY that field's effects.";
-const post_islands    = "Islands ship as `<verve-island data-name=… data-props=…>` markers. The Phase 8 client runtime will fetch each island's WASM chunk on demand.";
+const post_islands    = "Islands ship as `<verve-island data-name=… data-props=…>` markers. The client runtime fetches each island's WASM chunk on demand.";
 
 // ---- mutable state: issues + comments + activity ----
 

@@ -117,7 +117,7 @@ redirects, OAuth callbacks). To opt out of SPA navigation on those:
 - Don't use `verve.link` to link to them — `ctx.a(href, label)`
   produces a plain anchor the router ignores.
 - Or set `<meta name="verve-spa" content="off">` (not yet
-  implemented; track in Phase 8).
+  implemented).
 
 ## Implementation summary
 

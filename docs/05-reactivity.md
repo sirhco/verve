@@ -112,7 +112,7 @@ a tuple index.
 ## Resource — async data
 
 ```zig
-const todos = try verve.createResource([]Todo, owner, &deps, fetcher);
+const todos = try ctx.createResource([]Todo, ctx.io, owner, &deps, fetcher);
 
 switch (todos.state.get()) {
     .loading      => return ctx.span().text("Loading…"),
@@ -121,11 +121,14 @@ switch (todos.state.get()) {
 }
 ```
 
-Server-side the fetcher runs synchronously during render — Phase 3
-ships SSR-resolved resources. Reads inside a `verve.suspense(...)`
-boundary that see `.loading` mark the render suspended, and the
-boundary's `fallback` is emitted instead. Phase 8's client runtime
-will resolve resources asynchronously on hydrate.
+The fetcher is launched asynchronously via `std.Io.async` at creation
+time; the resource starts in `.loading` and transitions to `.ready` or
+`.err` once `resolve(io)` awaits the `Future`. Reads inside a
+`verve.suspense(...)` boundary that see `.loading` mark the render
+suspended and emit the boundary's fallback instead. The streaming drain
+(`streamRender`) awaits all pending boundaries concurrently — resolving
+them in completion order, not registration order. See
+[18 — Streaming](18-streaming.md) for the drain loop detail.
 
 ## NodeRef — typed DOM handle
 
@@ -170,7 +173,7 @@ The previous wire (`<span z-bind="count">` + JS bridge
 without spinning up the full reactive runtime. The `/counter` example
 demonstrates it. New code should reach for `Signal` + `Effect`
 instead; the JS-bridge path will retire once the WASM client gains
-its own reactive runtime (Phase 8).
+its own reactive runtime — which has shipped.
 
 ## SSE-driven binds (no wasm required)
 
@@ -208,8 +211,8 @@ return ctx.main_().children(.{
 });
 ```
 
-Phase 8 will let those same signals participate in client-side
-hydration — same code, more behavior.
+The WASM client runtime hosts the same reactive graph in the browser
+today — those same signals participate in client-side hydration.
 
 ## Next
 

@@ -18,7 +18,7 @@ No Chromium. No Electron. No third-party dependencies.
 
 Targets **Zig 0.16.0**.
 
-📚 **[Documentation](docs/README.md)** — 20 topic guides covering every feature.
+📚 **[Documentation](docs/README.md)** — 21 topic guides covering every feature.
 🧪 **[Examples](examples/README.md)** — runnable sample apps including a full [showcase](examples/showcase/).
 
 ```sh
@@ -89,13 +89,15 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - Streaming SSR via `std.http.Server`, chunked transfer-encoding, no full-body buffering.
 - **`ctx.fetch`** wrapper around `std.http.Client`.
 - **`ctx.serverFn`** — server-side direct call into `app.Actions`.
-- **Typed server-fn client stubs** — `build.zig` codegen walks `app.Actions` at build time and emits `app_client.zig` with `<name>(arena, args)` (native, typed return) plus `<name>_post(arena, args)` (fire-and-forget JSON POST, WASM-callable).
+- **Typed server-fn client stubs** — `build.zig` codegen walks `app.Actions` at build time and emits `app_client.zig` with `<name>(arena, args)` (native, typed return), `<name>_post(arena, args)` (fire-and-forget JSON POST, WASM-callable), and `<name>_call(arena, args, on_reply)` (typed correlated-callback; native sync, wasm threads a request id for a round-trip reply).
 - **Out-of-order Suspense streaming** — `Renderer.streamRender` flushes the shell first, then drains parked boundaries as `<template id="verve-vs-N">{real}</template>` + `verveSwap(N)` chunks. `withStreamRegistry` activates the threadlocal for a build's scope.
 - **SPA navigation** via `verve.link` — delegated click intercept, head merge, body swap, prefetch-on-hover, popstate handler.
 - **Growable WASM heap** (`@wasmMemoryGrow`) + 256 KB per-frame scratch region for reconciler scratch.
 
 ### i18n
 - `verve.I18nCatalog` + `resolveLocale` — cookie → query → Accept-Language → default with language-prefix fallback.
+- **RTL direction** — `verve.i18nIsRtl(locale)` / `verve.i18nDir(locale)` return whether a locale is right-to-left and its CSS `dir` value (`"rtl"` / `"ltr"`).
+- **CLDR cardinal pluralization** — `verve.PluralCategory` (`.zero` / `.one` / `.two` / `.few` / `.many` / `.other`), `verve.pluralCategory(locale, n)`, and `verve.tPlural(catalog, locale, key_base, n, args)` for pluralized translations.
 
 ### Assets
 - Static asset routing at `/public/*` — runtime (`--public-dir`) or comptime-embedded (`-Dpublic-dir=…`).
@@ -108,10 +110,13 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - **Build-time manifest codegen** walks `app.islands` at comptime and emits `client_manifest.zig` listing every island's name, props schema, and chunk URL.
 - **Per-island WASM chunks** — `build.zig` parses `src/app/islands.zig` and builds one chunk per declared island (`src/client/islands/<Name>.zig` for custom logic, `_default.zig` as a shared stub).
 - **Shared linear memory** — chunks import their memory from the main `client.wasm` via `env.memory`, dropping per-chunk size to **~73 bytes** for stubs (~290 B for chunks that ship real logic) vs. ~180 B standalone. Total bytes-on-wire stays flat as you add more islands.
-- **Lazy dispatch** — JS bridge fetches each chunk on first encounter, caches the instantiation, copies props through shared scratch, and calls `hydrate(ptr, len, root_id)`.
+- **Lazy dispatch** — JS bridge fetches each chunk on first encounter, caches the instantiation, copies props through shared scratch, and calls `hydrate(ptr, len, vid)`.
 - **Chunk-side reactive runtime** (Phase 13F) — chunks `@import("verve")` (the chunk-side façade) and call `registerI32` / `signalSetI32` / `signalGetI32` / `queryRef` / `setRefText` / `cleanup` / etc. via a `verve_runtime` import the bridge JS resolves against the main client's exports at instantiation. Per-island Signal registration without bouncing through the main client.
 - **Closure-style events from chunks** (Phase 13G) — `verve.registerEvent(&handler)` from a chunk lands in the main runtime's event-slot table; `call_indirect` dispatches via a **shared `__indirect_function_table`** (the main client exports it; chunks import it). No JS hops, no per-chunk handler-name registries.
-- **Multi-instance islands** — bridge JS assigns a document-order id to each `<verve-island>` marker and passes it through to the chunk's `hydrate(props_ptr, props_len, root_id)`. Chunks namespace per-instance state via `root_id` (e.g. `"counter_island_{d}"`).
+- **Multi-instance islands** — the framework auto-namespaces every `z-bind` / `data-ref` inside an island as `name__v{vid}` at SSR time. Two instances of the same component are fully independent with no author burden; `hydrate(props_ptr, props_len, vid)` receives the document-order `vid` assigned by the bridge.
+- **Typed props** — `verve.encodeProps(ctx, Props{...})` serializes a typed struct to base64 (binary codec in `src/core/props.zig`) for the server; `verve.decodeProps(Props, bytes, alloc)` reconstructs it chunk-side from `data-props`. `props_schema` is optional documentation, not the wire contract.
+- **Island resource-state hydration** — `ctx.islandState(fields)` / `ctx.islandStateStruct(key, value)` server-side embed state in `<script type="application/verve-state">`; chunks read it back with `verve.resourceFromState(T, owner, key)` (returns a `.ready` Resource, no re-fetch) or `verve.islandStateValue(T, key)` (raw primitive).
+- **Per-island + route lifecycle** — `verve_unmount_route()` disposes all island state on SPA route changes; `verve_unmount_island(vid)` tears down a single island instance. The bridge wires both via MutationObserver; `data-vid` is stamped automatically.
 
 ### Downstream wasm clients (`verve_client` module)
 - **`verve_client`** is a sibling module published from `build.zig` alongside `verve` — re-exports every reactive primitive a wasm client needs (Signal / Effect / Owner / Action / Resource / Store / ErrorBoundary), the DOM-wired adapter (`registerI32` + variants, `bindForEach` / `applyReconcile`, NodeRef ops, closure events, cleanup, slot introspection), and the SPA navigation + control-flow + suspense + i18n helpers.
@@ -148,7 +153,7 @@ Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed
 - **WASM hydration** — `src/client/main.zig` compiled to `wasm32-freestanding` (ReleaseSmall, ~470 B for the demo), served at `verve://app/client.wasm`. A stripped bridge (`verve_desktop.js`) instantiates it and dispatches `[z-on-click]` to wasm exports.
 - **Typed IPC** — `desktop.Router(Ctx, Routes)` with comptime `Args` + `Reply` types; JS callers `await window.verve.request({type, ...})` and get a typed Promise back.
 - **Cookies** — per-window `CookieStore` with real implementations on all three backends (sync wrappers over the native async cookie managers via nested run-loop pumps).
-- **Clipboard** — `Window.clipboard().writeText(s)` / `.readText(alloc)` against `NSPasteboard` (macOS), `CF_UNICODETEXT` + HGLOBAL (Windows), and `GtkClipboard` on the CLIPBOARD selection (Linux).
+- **Clipboard** — `Window.clipboard().writeText(s)` / `.readText(alloc)` / `.writeHtml(html)` against `NSPasteboard` (macOS), `CF_UNICODETEXT` + HGLOBAL (Windows), and `GtkClipboard` on the CLIPBOARD selection (Linux). `.writeImage(png)` / `.readImage(alloc)` for PNG bitmaps (macOS; Unsupported on Windows + Linux).
 - **Multi-window** — `Window.openChildWindow(opts)`; last-window-quit semantics on all three platforms.
 - **Single-instance enforcement** — `desktop.single_instance.acquire(alloc, "my-app")` returns a `Lock` held for process lifetime. POSIX `flock` on macOS + Linux, `CreateMutexW` under `Local\` on Windows.
 - **Color-scheme follow** — `Window.colorScheme()` returns `.light` / `.dark` / `.unknown` from the OS preference; `Window.setColorSchemeHandler(cb, ctx)` fires live on toggle (NSDistributedNotificationCenter / WM_SETTINGCHANGE / GtkSettings notify).
@@ -181,7 +186,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.1.30
+VERSION=0.1.32
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256
@@ -202,7 +207,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.1.30
+zig fetch --save git+https://github.com/sirhco/verve#v0.1.32
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -262,7 +267,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.1.30 \
+verve-cli new ~/my-app --release v0.1.32 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 
@@ -432,11 +437,15 @@ Per-island WASM chunks ship lazily — pages that don't use a particular island 
 ```zig
 // src/app/islands.zig (build.zig discovers entries here)
 pub const Counter = struct {
-    pub const props_schema: []const u8 = "{\"initial\":\"i32\"}";
+    // props_schema is optional documentation — the wire contract is the struct.
+    pub const Props = struct { initial: i32 };
 };
 
 // src/app/components.zig
-return verve.island(ctx, .{ .name = "Counter", .props = "{}" }, inner);
+return verve.island(ctx, .{
+    .name  = "Counter",
+    .props = try verve.encodeProps(ctx, Counter.Props{ .initial = 0 }),
+}, inner);
 ```
 
 The build system fans one WASM chunk out per declared island, each importing memory from the main `client.wasm` for zero-byte runtime duplication. Custom island logic lives in `src/client/islands/<Name>.zig`; everything else picks up the shared `_default.zig` stub.
@@ -448,7 +457,7 @@ Suspense boundaries that mark themselves `markSuspended` register a continuation
 ```zig
 const reg = verve.StreamRegistry.init(ctx.alloc());
 const root = try verve.withStreamRegistry(&reg, ctx, buildPage);
-try verve.Renderer.streamRender(writer, root, &reg);
+try verve.Renderer.streamRender(writer, io, root, &reg);
 ```
 
 `streamRender` walks the tree, then drains every parked slot as `<template id="verve-vs-{id}">{real}</template>` + `verveSwap({id})` chunks. The client `verveSwap` helper unwraps the template in place of the `<div data-vs="{id}">` placeholder.
