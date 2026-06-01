@@ -88,6 +88,7 @@ pub const serverFnGen = @import("core/server_fn_gen.zig");
 pub const island = @import("core/island.zig").island;
 pub const IslandOpts = @import("core/island.zig").IslandOpts;
 pub const islandResetVidSeq = @import("core/island.zig").resetRenderVidSeq;
+pub const vidBindName = @import("core/island.zig").vidBindName;
 pub const IslandStateRegistry = @import("core/island_state.zig").Registry;
 pub const islandStateSetCurrent = @import("core/island_state.zig").setCurrent;
 pub const buildIslandStateScript = @import("core/island_state.zig").buildStateScriptBody;

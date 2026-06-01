@@ -74,6 +74,17 @@ pub fn island(ctx: *const Context, opts: IslandOpts, inner: *Node) *Node {
     return node.children(.{inner});
 }
 
+/// Per-island DOM binding name: `name` for the route scope (vid 0), or
+/// `name__v{vid}` for island vid > 0. The server stamps the suffixed form on
+/// the island's SSR `z-bind`/`data-ref`; the client drives the DOM with the
+/// same suffixed name, so two instances of one component don't cross-update.
+/// `__v` is a reserved separator. Result is written into `buf`; returns `name`
+/// directly when vid == 0 (or on overflow).
+pub fn vidBindName(name: []const u8, vid: u32, buf: []u8) []const u8 {
+    if (vid == 0) return name;
+    return std.fmt.bufPrint(buf, "{s}__v{d}", .{ name, vid }) catch name;
+}
+
 // ---- tests ------------------------------------------------------------
 
 const testing = std.testing;
@@ -151,6 +162,13 @@ fn attrValue(node: *Node, key: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, a.key, key)) return a.value;
     }
     return null;
+}
+
+test "vidBindName suffixes only for non-zero vid" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("counter", vidBindName("counter", 0, &buf));
+    try testing.expectEqualStrings("counter__v1", vidBindName("counter", 1, &buf));
+    try testing.expectEqualStrings("counter__v42", vidBindName("counter", 42, &buf));
 }
 
 test "island records its state blob under the assigned vid" {
