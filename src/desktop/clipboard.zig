@@ -63,4 +63,18 @@ pub const Clipboard = struct {
     pub fn readHtml(self: Clipboard, allocator: std.mem.Allocator) ClipboardError!?[]u8 {
         return backend.clipboardReadHtml(self.window, allocator);
     }
+
+    /// Replace the system clipboard with a PNG image (`png` = raw PNG bytes).
+    /// macOS writes `public.png` (NSPasteboardTypePNG); Windows + Linux return
+    /// `error.Unsupported` (CF_DIB / `image/png` GtkClipboard target are
+    /// follow-up bundles).
+    pub fn writeImage(self: Clipboard, png: []const u8) ClipboardError!void {
+        return backend.clipboardWriteImage(self.window, png);
+    }
+
+    /// Read a PNG image off the clipboard, or `null` when none is present.
+    /// Returned bytes are owned by `allocator`. macOS only today.
+    pub fn readImage(self: Clipboard, allocator: std.mem.Allocator) ClipboardError!?[]u8 {
+        return backend.clipboardReadImage(self.window, allocator);
+    }
 };

@@ -2007,3 +2007,39 @@ pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_
     const slice = std.mem.span(cstr);
     return allocator.dupe(u8, slice) catch return opts_mod.ClipboardError.OutOfMemory;
 }
+
+pub fn clipboardWriteImage(window: *anyopaque, png: []const u8) opts_mod.ClipboardError!void {
+    _ = window;
+    const NSData = m.getClass("NSData");
+    const dataWithBytes = m.cast(*const fn (id, SEL, [*]const u8, usize) callconv(.c) id);
+    const data = dataWithBytes(@as(id, @ptrCast(NSData)), m.sel("dataWithBytes:length:"), png.ptr, png.len);
+
+    const NSPasteboard = m.getClass("NSPasteboard");
+    const generalPasteboard = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const pb = generalPasteboard(@as(id, @ptrCast(NSPasteboard)), m.sel("generalPasteboard"));
+
+    const clearContents = m.cast(*const fn (id, SEL) callconv(.c) isize);
+    _ = clearContents(pb, m.sel("clearContents"));
+
+    const setData = m.cast(*const fn (id, SEL, id, id) callconv(.c) bool);
+    const ok = setData(pb, m.sel("setData:forType:"), data, nsString("public.png"));
+    if (!ok) return opts_mod.ClipboardError.Backend;
+}
+
+pub fn clipboardReadImage(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    _ = window;
+    const NSPasteboard = m.getClass("NSPasteboard");
+    const generalPasteboard = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const pb = generalPasteboard(@as(id, @ptrCast(NSPasteboard)), m.sel("generalPasteboard"));
+
+    const dataForType = m.cast(*const fn (id, SEL, id) callconv(.c) ?id);
+    const data = dataForType(pb, m.sel("dataForType:"), nsString("public.png")) orelse return null;
+
+    const lengthFn = m.cast(*const fn (id, SEL) callconv(.c) usize);
+    const len = lengthFn(data, m.sel("length"));
+    if (len == 0) return null;
+
+    const bytesFn = m.cast(*const fn (id, SEL) callconv(.c) ?[*]const u8);
+    const ptr = bytesFn(data, m.sel("bytes")) orelse return null;
+    return allocator.dupe(u8, ptr[0..len]) catch return opts_mod.ClipboardError.OutOfMemory;
+}

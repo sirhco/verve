@@ -2033,3 +2033,15 @@ pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_
     const data = gtk_selection_data_get_data(sd);
     return allocator.dupe(u8, data[0..len]) catch return opts_mod.ClipboardError.OutOfMemory;
 }
+
+pub fn clipboardWriteImage(window: *anyopaque, png: []const u8) opts_mod.ClipboardError!void {
+    _ = window;
+    _ = png;
+    return opts_mod.ClipboardError.Unsupported;
+}
+
+pub fn clipboardReadImage(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    _ = window;
+    _ = allocator;
+    return opts_mod.ClipboardError.Unsupported;
+}

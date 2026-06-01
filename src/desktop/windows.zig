@@ -2687,6 +2687,18 @@ pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_
     return allocator.dupe(u8, fragment) catch return opts_mod.ClipboardError.OutOfMemory;
 }
 
+pub fn clipboardWriteImage(window: *anyopaque, png: []const u8) opts_mod.ClipboardError!void {
+    _ = window;
+    _ = png;
+    return opts_mod.ClipboardError.Unsupported;
+}
+
+pub fn clipboardReadImage(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
+    _ = window;
+    _ = allocator;
+    return opts_mod.ClipboardError.Unsupported;
+}
+
 fn parseOffset(buf: []const u8, label: []const u8) ?usize {
     const idx = std.mem.indexOf(u8, buf, label) orelse return null;
     var i = idx + label.len;
