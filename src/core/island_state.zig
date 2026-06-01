@@ -223,6 +223,24 @@ pub fn buildStateScriptBody(
 }
 
 // ---------------------------------------------------------------------------
+// Typed lookup
+// ---------------------------------------------------------------------------
+
+/// Look up `key` in `blob` and coerce its primitive value to `T`
+/// (i32 / []const u8 / bool / f32). Returns null when absent or the stored
+/// tag doesn't match `T`. String results are slices into `blob`.
+pub fn valueAs(comptime T: type, blob: []const u8, key: []const u8) !?T {
+    const v = (try lookup(blob, key)) orelse return null;
+    return switch (T) {
+        i32 => if (v == .i32) v.i32 else null,
+        bool => if (v == .bool) v.bool else null,
+        f32 => if (v == .f32) v.f32 else null,
+        []const u8 => if (v == .str) v.str else null,
+        else => @compileError("valueAs: unsupported T " ++ @typeName(T)),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -264,4 +282,20 @@ test "empty registry yields empty script body" {
     defer out.deinit(testing.allocator);
     try buildStateScriptBody(testing.allocator, &out, &.{});
     try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "valueAs coerces each primitive, null on miss/wrong-type" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try encodeEntry(testing.allocator, &buf, "n", .{ .i32 = 7 });
+    try encodeEntry(testing.allocator, &buf, "s", .{ .str = "hi" });
+    try encodeEntry(testing.allocator, &buf, "b", .{ .bool = true });
+    try encodeEntry(testing.allocator, &buf, "f", .{ .f32 = 1.5 });
+
+    try testing.expectEqual(@as(?i32, 7), try valueAs(i32, buf.items, "n"));
+    try testing.expectEqualStrings("hi", (try valueAs([]const u8, buf.items, "s")).?);
+    try testing.expectEqual(@as(?bool, true), try valueAs(bool, buf.items, "b"));
+    try testing.expectEqual(@as(?f32, 1.5), try valueAs(f32, buf.items, "f"));
+    try testing.expectEqual(@as(?i32, null), try valueAs(i32, buf.items, "missing"));
+    try testing.expectEqual(@as(?i32, null), try valueAs(i32, buf.items, "s"));
 }
