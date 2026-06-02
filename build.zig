@@ -225,10 +225,14 @@ pub fn build(b: *std.Build) void {
     });
     const codegen_run = b.addRunArtifact(codegen_exe);
     const generated_app_client = codegen_run.captureStdOut(.{ .basename = "app_client.zig" });
-    _ = wf.addCopyFile(generated_app_client, "app_client.zig");
+    // Dedicated WriteFiles so the wasm client can import app_client.zig
+    // without a dependency cycle through the main `wf` step (which holds
+    // client.wasm, the output of the very client module that imports this).
+    const wf_app_client = b.addWriteFiles();
+    _ = wf_app_client.addCopyFile(generated_app_client, "app_client.zig");
 
     const app_client_mod = b.createModule(.{
-        .root_source_file = wf.getDirectory().path(b, "app_client.zig"),
+        .root_source_file = wf_app_client.getDirectory().path(b, "app_client.zig"),
         .imports = &.{
             .{ .name = "verve", .module = verve_mod },
             .{ .name = "app", .module = app_mod },
@@ -261,6 +265,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = wf_manifest.getDirectory().path(b, "client_manifest.zig"),
     });
     client_mod.addImport("client_manifest", client_manifest_mod);
+    // Compile the generated typed server-fn stubs into the wasm client so
+    // `app_client.<name>_call` reaches a real round-trip call-site.
+    client_mod.addImport("app_client", app_client_mod);
 
     const server_mod = b.createModule(.{
         .root_source_file = b.path("src/server/main.zig"),
