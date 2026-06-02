@@ -62,6 +62,12 @@ pub const Actions = struct {
         return last_count.load(.monotonic);
     }
 
+    /// Value-returning string action — backs the `fetchSignal([]const u8, ...)`
+    /// demo in `src/client/islands/JsonProbe.zig`.
+    pub fn appName(_: struct {}) []const u8 {
+        return "verve";
+    }
+
     pub fn incrementCount(_: struct {}) i32 {
         return last_count.fetchAdd(1, .monotonic) + 1;
     }

@@ -489,8 +489,14 @@ fn Settler(comptime T: type, comptime name: []const u8) type {
                 bool => signalSetBool(name, v.boolean()),
                 f32 => signalSetF32(name, @floatCast(v.float())),
                 []const u8 => {
-                    var buf: [256]u8 = undefined;
-                    signalSetStr(name, v.str(&buf));
+                    // Size the buffer from the actual value length so long
+                    // strings aren't silently truncated. `signalSetStr` copies
+                    // the bytes into the signal, so the arena scratch is freed
+                    // immediately after.
+                    const m = chunkArenaMark();
+                    defer chunkArenaReset(m);
+                    const buf = chunkArena().alloc(u8, v.strLen()) catch return;
+                    signalSetStr(name, v.str(buf));
                 },
                 else => @compileError("fetchSignal: unsupported T " ++ @typeName(T)),
             }

@@ -57,6 +57,14 @@ export fn json_probe_fetch() void {
     verve.fetchSignal(i32, "getCount", .{}, COUNT_BIND);
 }
 
+/// Phase B demo, string variant — exercises the `[]const u8` settler branch.
+/// `appName` returns `[]const u8`. The signal must be registered first; this
+/// also compile-checks `fetchSignal([]const u8, ...)`.
+export fn json_probe_fetch_name() void {
+    verve.registerStr("json_probe_name", "");
+    verve.fetchSignal([]const u8, "appName", .{}, "json_probe_name");
+}
+
 /// Closure keydown handler (registered in `hydrate`, stamped via
 /// `z-on-keydown-id`). Reads the staged event: ⌘K / Ctrl+K refreshes;
 /// the clicked row's `data-id` is read via the target dataset.
