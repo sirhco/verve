@@ -98,6 +98,70 @@ pub fn call(
     }
 }
 
+/// Installed by the wasm client at startup so the target-agnostic `call`
+/// glue can reach the client runtime's correlation + allocation surface
+/// without `core/` importing `client/`. Null on native and until install.
+pub const RegisterOnceFn =
+    *const fn (route: []const u8, rid: u32, handler: *const fn ([*]const u8, u32) void) void;
+pub const NextRidFn = *const fn () u32;
+pub const DecodeAllocFn = *const fn () std.mem.Allocator;
+
+var register_once_hook: ?RegisterOnceFn = null;
+var next_rid_hook: ?NextRidFn = null;
+var decode_alloc_hook: ?DecodeAllocFn = null;
+
+/// Wire the wasm `_call` round-trip to the client runtime. Called once
+/// from `src/client/main.zig` at hydrate.
+pub fn installWasmHooks(
+    next_rid: NextRidFn,
+    register_once: RegisterOnceFn,
+    decode_alloc: DecodeAllocFn,
+) void {
+    next_rid_hook = next_rid;
+    register_once_hook = register_once;
+    decode_alloc_hook = decode_alloc;
+}
+
+/// Comptime-monomorphic reply decoder. One distinct `handle` per
+/// `(SuccessT, on_reply)` call site. Parses the server reply shape
+/// `{"rid":N,"value":<T>}` against the installed decode allocator and
+/// fires `on_reply` with the unwrapped value. Malformed or value-less
+/// replies skip the callback. NOTE: for slice-typed `SuccessT`, the
+/// decoded value is freed when `handle` returns — `on_reply` must copy
+/// anything it keeps.
+fn Decoder(comptime SuccessT: type, comptime on_reply: anytype) type {
+    return struct {
+        fn handle(ptr: [*]const u8, len: u32) void {
+            const body = ptr[0..len];
+            const a = decode_alloc_hook orelse return;
+            const Reply = struct { rid: u32 = 0, value: SuccessT };
+            const parsed = std.json.parseFromSlice(
+                Reply,
+                a(),
+                body,
+                .{ .ignore_unknown_fields = true },
+            ) catch return;
+            defer parsed.deinit();
+            on_reply(parsed.value.value);
+        }
+    };
+}
+
+/// Allocate a correlation id and register the typed one-shot decoder for
+/// `name`'s reply. Target-agnostic (the wasm `call` branch posts after
+/// this returns). Returns the rid, or 0 when hooks aren't installed.
+fn registerCall(
+    comptime SuccessT: type,
+    comptime name: []const u8,
+    comptime on_reply: anytype,
+) u32 {
+    const next_rid = next_rid_hook orelse return 0;
+    const register_once = register_once_hook orelse return 0;
+    const rid = next_rid();
+    register_once(name, rid, &Decoder(SuccessT, on_reply).handle);
+    return rid;
+}
+
 const testing = std.testing;
 
 test "invoke calls action directly" {
@@ -181,4 +245,92 @@ test "call skips on_reply on error" {
     call(Actions.maybeFail, testing.allocator, .{ .ok = true }, "maybeFail", Sink.onReply);
     try testing.expect(Sink.fired);
     try testing.expectEqual(@as(i32, 7), Sink.got);
+}
+
+fn clearHooksForTesting() void {
+    next_rid_hook = null;
+    register_once_hook = null;
+    decode_alloc_hook = null;
+}
+
+test "registerCall allocates a rid and registers a one-shot decoder under the action name" {
+    const Fake = struct {
+        var seq: u32 = 0;
+        var route: []const u8 = "";
+        var rid: u32 = 0;
+        var handler: ?*const fn ([*]const u8, u32) void = null;
+        fn nextRid() u32 {
+            seq += 1;
+            return seq;
+        }
+        fn registerOnce(r: []const u8, id: u32, h: *const fn ([*]const u8, u32) void) void {
+            route = r;
+            rid = id;
+            handler = h;
+        }
+        fn alloc() std.mem.Allocator {
+            return testing.allocator;
+        }
+    };
+    Fake.seq = 0;
+    Fake.handler = null;
+    installWasmHooks(Fake.nextRid, Fake.registerOnce, Fake.alloc);
+    defer clearHooksForTesting();
+
+    const Sink = struct {
+        var got: i32 = 0;
+        fn onReply(v: i32) void {
+            got = v;
+        }
+    };
+    Sink.got = 0;
+
+    const rid = registerCall(i32, "incrementCount", Sink.onReply);
+    try testing.expectEqual(@as(u32, 1), rid);
+    try testing.expectEqualStrings("incrementCount", Fake.route);
+    try testing.expectEqual(@as(u32, 1), Fake.rid);
+    try testing.expect(Fake.handler != null);
+
+    const body = "{\"rid\":1,\"value\":42}";
+    Fake.handler.?(body.ptr, @intCast(body.len));
+    try testing.expectEqual(@as(i32, 42), Sink.got);
+}
+
+test "decoder skips on_reply when the reply has no value field" {
+    const Fake = struct {
+        var handler: ?*const fn ([*]const u8, u32) void = null;
+        fn nextRid() u32 {
+            return 7;
+        }
+        fn registerOnce(_: []const u8, _: u32, h: *const fn ([*]const u8, u32) void) void {
+            handler = h;
+        }
+        fn alloc() std.mem.Allocator {
+            return testing.allocator;
+        }
+    };
+    Fake.handler = null;
+    installWasmHooks(Fake.nextRid, Fake.registerOnce, Fake.alloc);
+    defer clearHooksForTesting();
+
+    const Sink = struct {
+        var fired: bool = false;
+        fn onReply(_: i32) void {
+            fired = true;
+        }
+    };
+    Sink.fired = false;
+
+    _ = registerCall(i32, "getCount", Sink.onReply);
+    const body = "{\"rid\":7,\"ok\":true}";
+    Fake.handler.?(body.ptr, @intCast(body.len));
+    try testing.expect(!Sink.fired);
+}
+
+test "registerCall returns 0 when hooks are not installed" {
+    clearHooksForTesting();
+    const Sink = struct {
+        fn onReply(_: i32) void {}
+    };
+    try testing.expectEqual(@as(u32, 0), registerCall(i32, "noop", Sink.onReply));
 }
