@@ -619,7 +619,7 @@ const LinuxManager = struct {
         // process, which would surprise an app that uses other X11
         // libs alongside us. Setting a no-op handler globally is
         // standard practice for hotkey libs.
-        _ = x.set_error_handler(@constCast(@ptrCast(&xNoopErrorHandler)));
+        _ = x.set_error_handler(@ptrCast(@constCast(&xNoopErrorHandler)));
 
         self.thread = std.Thread.spawn(.{}, x11ThreadEntry, .{self}) catch {
             _ = x.close_display(display);

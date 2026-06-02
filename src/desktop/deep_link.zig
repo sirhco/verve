@@ -475,7 +475,6 @@ const LinuxBackend = struct {
         }
     }
 
-
     /// Build the abstract-socket path bytes. Format: a leading NUL
     /// followed by `"verve-deeplink-" ++ name`. Returns the total
     /// path length including the leading NUL.

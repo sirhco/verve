@@ -166,8 +166,7 @@ pub fn init(
             // Singleton wires here so callbacks read from the heap
             // address, not the about-to-be-copied stack-return.
             g_macos_tray = heap;
-            if (opts.icon_path) |p| try heap.setIcon(p)
-            else if (opts.icon_symbol) |s| try heap.setIconSymbol(s);
+            if (opts.icon_path) |p| try heap.setIcon(p) else if (opts.icon_symbol) |s| try heap.setIconSymbol(s);
             if (opts.menu.len > 0) {
                 try heap.setMenu(opts.menu);
             } else if (opts.on_click != null) {

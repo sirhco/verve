@@ -417,18 +417,36 @@ test "decode round-trips every supported type" {
     const E = enum(u8) { a, b, c };
     const Inner = struct { x: i64, y: ?bool };
     const T = struct {
-        flag: bool, n8: i8, n16: u16, n32: i32, n64: u64,
-        fl: f32, dl: f64, name: []const u8,
-        opt_present: ?u32, opt_absent: ?u32,
-        nums: []const u32, strs: []const []const u8,
-        inner: Inner, kind: E,
+        flag: bool,
+        n8: i8,
+        n16: u16,
+        n32: i32,
+        n64: u64,
+        fl: f32,
+        dl: f64,
+        name: []const u8,
+        opt_present: ?u32,
+        opt_absent: ?u32,
+        nums: []const u32,
+        strs: []const []const u8,
+        inner: Inner,
+        kind: E,
     };
     const value = T{
-        .flag = true, .n8 = -5, .n16 = 600, .n32 = -123456, .n64 = 9_000_000_000,
-        .fl = 1.5, .dl = 2.25, .name = "hello",
-        .opt_present = 77, .opt_absent = null,
-        .nums = &.{ 1, 2, 3 }, .strs = &.{ "a", "bb" },
-        .inner = .{ .x = -1, .y = true }, .kind = .c,
+        .flag = true,
+        .n8 = -5,
+        .n16 = 600,
+        .n32 = -123456,
+        .n64 = 9_000_000_000,
+        .fl = 1.5,
+        .dl = 2.25,
+        .name = "hello",
+        .opt_present = 77,
+        .opt_absent = null,
+        .nums = &.{ 1, 2, 3 },
+        .strs = &.{ "a", "bb" },
+        .inner = .{ .x = -1, .y = true },
+        .kind = .c,
     };
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);

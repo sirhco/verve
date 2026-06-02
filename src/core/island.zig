@@ -223,7 +223,7 @@ test "island suffixes inner z-bind and data-ref by vid" {
     });
     _ = island(&ctx, .{ .name = "Counter" }, inner1); // vid 1
 
-    const inner2 = ctx.div().children(.{ ctx.span().bind("counter") });
+    const inner2 = ctx.div().children(.{ctx.span().bind("counter")});
     _ = island(&ctx, .{ .name = "Counter" }, inner2); // vid 2
 
     try testing.expectEqualStrings("counter__v1", inner1.children_list.items[0].z_bind_name.?);

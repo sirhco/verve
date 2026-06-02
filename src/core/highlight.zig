@@ -86,13 +86,25 @@ pub fn detectLang(info: []const u8) Lang {
 
     const map = .{
         .{ "zig", Lang.zig },
-        .{ "js", Lang.js },         .{ "javascript", Lang.js },  .{ "jsx", Lang.js },  .{ "mjs", Lang.js },
-        .{ "ts", Lang.ts },         .{ "typescript", Lang.ts },  .{ "tsx", Lang.ts },
-        .{ "json", Lang.json },     .{ "jsonc", Lang.json },
-        .{ "html", Lang.html },     .{ "xml", Lang.html },       .{ "svg", Lang.html },
+        .{ "js", Lang.js },
+        .{ "javascript", Lang.js },
+        .{ "jsx", Lang.js },
+        .{ "mjs", Lang.js },
+        .{ "ts", Lang.ts },
+        .{ "typescript", Lang.ts },
+        .{ "tsx", Lang.ts },
+        .{ "json", Lang.json },
+        .{ "jsonc", Lang.json },
+        .{ "html", Lang.html },
+        .{ "xml", Lang.html },
+        .{ "svg", Lang.html },
         .{ "css", Lang.css },
-        .{ "bash", Lang.bash },     .{ "sh", Lang.bash },        .{ "shell", Lang.bash }, .{ "zsh", Lang.bash },
-        .{ "md", Lang.markdown },   .{ "markdown", Lang.markdown },
+        .{ "bash", Lang.bash },
+        .{ "sh", Lang.bash },
+        .{ "shell", Lang.bash },
+        .{ "zsh", Lang.bash },
+        .{ "md", Lang.markdown },
+        .{ "markdown", Lang.markdown },
     };
     inline for (map) |pair| {
         if (std.ascii.eqlIgnoreCase(w, pair[0])) return pair[1];
@@ -582,22 +594,23 @@ fn isSpace(c: u8) bool {
 
 const zig_spec = LangSpec{
     .keywords = &.{
-        "const",      "var",         "fn",        "pub",      "return",   "if",
-        "else",       "while",       "for",       "switch",   "struct",   "enum",
-        "union",      "error",       "try",       "catch",    "defer",    "errdefer",
-        "comptime",   "inline",      "test",      "and",      "or",       "orelse",
-        "unreachable", "break",      "continue",  "async",    "await",    "suspend",
-        "resume",     "nosuspend",   "export",    "extern",   "threadlocal",
-        "usingnamespace", "asm",     "volatile",  "align",    "callconv", "noalias",
-        "opaque",     "packed",      "linksection", "allowzero",
-        "true",       "false",       "null",      "undefined",
+        "const",       "var",         "fn",        "pub",      "return",      "if",
+        "else",        "while",       "for",       "switch",   "struct",      "enum",
+        "union",       "error",       "try",       "catch",    "defer",       "errdefer",
+        "comptime",    "inline",      "test",      "and",      "or",          "orelse",
+        "unreachable", "break",       "continue",  "async",    "await",       "suspend",
+        "resume",      "nosuspend",   "export",    "extern",   "threadlocal", "usingnamespace",
+        "asm",         "volatile",    "align",     "callconv", "noalias",     "opaque",
+        "packed",      "linksection", "allowzero", "true",     "false",       "null",
+        "undefined",
     },
     .types = &.{
-        "void",  "bool",         "type",          "anytype",       "anyopaque",
-        "anyerror", "noreturn",  "comptime_int",  "comptime_float",
-        "i8",    "i16",  "i32",  "i64",  "i128",  "isize",
-        "u8",    "u16",  "u32",  "u64",  "u128",  "usize",
-        "f16",   "f32",  "f64",  "f80",  "f128",  "c_int", "c_uint",
+        "void",     "bool",     "type",         "anytype",        "anyopaque",
+        "anyerror", "noreturn", "comptime_int", "comptime_float", "i8",
+        "i16",      "i32",      "i64",          "i128",           "isize",
+        "u8",       "u16",      "u32",          "u64",            "u128",
+        "usize",    "f16",      "f32",          "f64",            "f80",
+        "f128",     "c_int",    "c_uint",
     },
     .line_comment = "//",
     .double_q = true,
@@ -608,19 +621,19 @@ const zig_spec = LangSpec{
 
 const generic_spec = LangSpec{
     .keywords = &.{
-        "if",        "else",      "elif",      "for",       "while",     "do",
-        "return",    "break",     "continue",  "function",  "fn",        "def",
-        "class",     "struct",    "enum",      "interface", "trait",     "impl",
-        "const",     "let",       "var",       "val",       "mut",       "static",
-        "public",    "private",   "protected", "internal",  "abstract",  "final",
-        "void",      "new",       "delete",    "import",    "export",    "from",
-        "package",   "namespace", "module",    "using",     "use",       "switch",
-        "case",      "default",   "match",     "when",      "where",     "try",
-        "catch",     "finally",   "throw",     "throws",    "async",     "await",
-        "yield",     "true",      "false",     "null",      "nil",       "none",
-        "this",      "self",      "super",     "extends",   "implements","type",
-        "typedef",   "then",      "end",       "begin",     "in",        "of",
-        "as",        "is",        "and",       "or",        "not",
+        "if",      "else",      "elif",      "for",       "while",      "do",
+        "return",  "break",     "continue",  "function",  "fn",         "def",
+        "class",   "struct",    "enum",      "interface", "trait",      "impl",
+        "const",   "let",       "var",       "val",       "mut",        "static",
+        "public",  "private",   "protected", "internal",  "abstract",   "final",
+        "void",    "new",       "delete",    "import",    "export",     "from",
+        "package", "namespace", "module",    "using",     "use",        "switch",
+        "case",    "default",   "match",     "when",      "where",      "try",
+        "catch",   "finally",   "throw",     "throws",    "async",      "await",
+        "yield",   "true",      "false",     "null",      "nil",        "none",
+        "this",    "self",      "super",     "extends",   "implements", "type",
+        "typedef", "then",      "end",       "begin",     "in",         "of",
+        "as",      "is",        "and",       "or",        "not",
     },
     .line_comment = "//",
     .block_open = "/*",
@@ -630,26 +643,26 @@ const generic_spec = LangSpec{
 };
 
 const js_keywords = [_][]const u8{
-    "break",     "case",      "catch",   "class",  "const",      "continue",
-    "debugger",  "default",   "delete",  "do",     "else",       "export",
-    "extends",   "finally",   "for",     "function", "if",       "import",
-    "in",        "instanceof", "new",    "return", "super",      "switch",
-    "this",      "throw",     "try",     "typeof", "var",        "void",
-    "while",     "with",      "yield",   "let",    "static",     "async",
-    "await",     "of",        "as",      "from",   "get",        "set",
-    "true",      "false",     "null",    "undefined", "NaN",     "Infinity",
+    "break",    "case",       "catch",  "class",     "const",  "continue",
+    "debugger", "default",    "delete", "do",        "else",   "export",
+    "extends",  "finally",    "for",    "function",  "if",     "import",
+    "in",       "instanceof", "new",    "return",    "super",  "switch",
+    "this",     "throw",      "try",    "typeof",    "var",    "void",
+    "while",    "with",       "yield",  "let",       "static", "async",
+    "await",    "of",         "as",     "from",      "get",    "set",
+    "true",     "false",      "null",   "undefined", "NaN",    "Infinity",
 };
 
 const js_builtins = [_][]const u8{
-    "console",  "window",  "document", "Math",    "JSON",    "Object",
-    "Array",    "Promise", "String",   "Number",  "Boolean", "Symbol",
-    "Map",      "Set",     "Date",     "RegExp",  "Error",   "globalThis",
+    "console", "window",  "document", "Math",   "JSON",    "Object",
+    "Array",   "Promise", "String",   "Number", "Boolean", "Symbol",
+    "Map",     "Set",     "Date",     "RegExp", "Error",   "globalThis",
 };
 
 const ts_extra_keywords = [_][]const u8{
-    "interface", "type",      "enum",      "namespace", "declare",   "abstract",
-    "implements", "public",   "private",   "protected", "readonly",  "keyof",
-    "infer",     "is",        "asserts",   "satisfies", "override",  "module",
+    "interface",  "type",   "enum",    "namespace", "declare",  "abstract",
+    "implements", "public", "private", "protected", "readonly", "keyof",
+    "infer",      "is",     "asserts", "satisfies", "override", "module",
 };
 
 const ts_types = [_][]const u8{
@@ -681,12 +694,12 @@ const ts_spec = LangSpec{
 
 const bash_spec = LangSpec{
     .keywords = &.{
-        "if",     "then",   "else",     "elif",     "fi",       "for",
-        "while",  "until",  "do",       "done",     "case",     "esac",
-        "function", "in",   "select",   "return",   "break",    "continue",
-        "local",  "export", "readonly", "declare",  "typeset",  "unset",
-        "shift",  "eval",   "exec",     "source",   "alias",    "set",
-        "trap",   "echo",   "printf",   "read",     "cd",       "test",
+        "if",       "then",   "else",     "elif",    "fi",      "for",
+        "while",    "until",  "do",       "done",    "case",    "esac",
+        "function", "in",     "select",   "return",  "break",   "continue",
+        "local",    "export", "readonly", "declare", "typeset", "unset",
+        "shift",    "eval",   "exec",     "source",  "alias",   "set",
+        "trap",     "echo",   "printf",   "read",    "cd",      "test",
     },
     .line_comment = "#",
     .line_comment_boundary = true,

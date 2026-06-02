@@ -538,8 +538,12 @@ test "cleanup runs registered handlers on owner dispose" {
     const State = struct {
         var ran_a: u32 = 0;
         var ran_b: u32 = 0;
-        fn a() void { ran_a += 1; }
-        fn b() void { ran_b += 1; }
+        fn a() void {
+            ran_a += 1;
+        }
+        fn b() void {
+            ran_b += 1;
+        }
     };
     State.ran_a = 0;
     State.ran_b = 0;
@@ -604,8 +608,12 @@ test "registerEvent + dispatchEvent invoke the matching slot" {
     const State = struct {
         var hits_a: u32 = 0;
         var hits_b: u32 = 0;
-        fn a() void { hits_a += 1; }
-        fn b() void { hits_b += 1; }
+        fn a() void {
+            hits_a += 1;
+        }
+        fn b() void {
+            hits_b += 1;
+        }
     };
     State.hits_a = 0;
     State.hits_b = 0;
@@ -932,7 +940,10 @@ pub fn dispatchResponse(route: []const u8, body: []const u8) void {
     const island = @import("island.zig");
     var i: u32 = 0;
     while (i < response_slot_count) {
-        const slot = response_slots[i] orelse { i += 1; continue; };
+        const slot = response_slots[i] orelse {
+            i += 1;
+            continue;
+        };
         const fires = std.mem.eql(u8, slot.route, route) and (!slot.once or slot.rid == reply_rid);
         if (fires) {
             const prev = island.current_island_id;
@@ -1553,7 +1564,9 @@ test "registerResponseHandlerOnce fires once for its rid, then is removed" {
     resetForTesting();
     const State = struct {
         var hits: u32 = 0;
-        fn h(_: [*]const u8, _: u32) void { hits += 1; }
+        fn h(_: [*]const u8, _: u32) void {
+            hits += 1;
+        }
     };
     State.hits = 0;
 
@@ -1575,14 +1588,24 @@ test "registerResponseHandlerOnce fires once for its rid, then is removed" {
 test "one-shots correlate by rid; persistent handlers still fan out" {
     resetForTesting();
     const S = struct {
-        var a: u32 = 0; var b: u32 = 0; var p: u32 = 0;
-        fn ha(_: [*]const u8, _: u32) void { a += 1; }
-        fn hb(_: [*]const u8, _: u32) void { b += 1; }
-        fn hp(_: [*]const u8, _: u32) void { p += 1; }
+        var a: u32 = 0;
+        var b: u32 = 0;
+        var p: u32 = 0;
+        fn ha(_: [*]const u8, _: u32) void {
+            a += 1;
+        }
+        fn hb(_: [*]const u8, _: u32) void {
+            b += 1;
+        }
+        fn hp(_: [*]const u8, _: u32) void {
+            p += 1;
+        }
     };
-    S.a = 0; S.b = 0; S.p = 0;
+    S.a = 0;
+    S.b = 0;
+    S.p = 0;
 
-    registerResponseHandler("calc", S.hp);     // persistent
+    registerResponseHandler("calc", S.hp); // persistent
     registerResponseHandlerOnce("calc", 1, S.ha);
     registerResponseHandlerOnce("calc", 2, S.hb);
 
