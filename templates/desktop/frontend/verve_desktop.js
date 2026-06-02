@@ -308,6 +308,16 @@
   // buffer keeps the bridge alloc-free.
   if (
     typeof exp.verve_register_i32 === "function" &&
+    (typeof exp.verve_island_scratch_ptr !== "function" ||
+      typeof exp.verve_island_scratch_capacity !== "function")
+  ) {
+    console.warn(
+      "verve: binding walker skipped — verve_island_scratch_ptr/" +
+        "_capacity not exported; [data-vh] bindings will be inert",
+    );
+  }
+  if (
+    typeof exp.verve_register_i32 === "function" &&
     typeof exp.verve_island_scratch_ptr === "function" &&
     typeof exp.verve_island_scratch_capacity === "function"
   ) {
