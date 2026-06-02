@@ -40,6 +40,22 @@ work needed to call it "fully functional." Written 2026-05-22, last
 updated 2026-05-28. Fresh sessions should be able to pick up without
 prior context.
 
+## Done in the 2026-06-02 session
+
+- [x] **Window-chrome a11y provider.** Three new `Window` methods on all
+  three backends: `setAccessibilityHelp`, `setAccessibilityRoleDescription`,
+  `setAccessibilitySubrole(AccessibilitySubrole)`. macOS: real
+  `setAccessibilityHelp:` / `setAccessibilityRoleDescription:` /
+  `setAccessibilitySubrole:` (subrole tags map to AXStandardWindow /
+  AXDialog / AXSystemDialog / AXFloatingWindow). Linux: help →
+  `atk_object_set_description`; role-desc + subrole no-op (logged).
+  Windows: all three no-op (no UIA provider). New `AccessibilitySubrole`
+  enum in `options.zig`; ABI-guarded in `surface_test.zig`. No
+  `src/verve.zig` change. Conformance enforced by the comptime list in
+  `window.zig`; macOS verified via `zig build-obj -target aarch64-macos`,
+  Win/Linux cross-compile clean. Live a11y-tree verification on
+  Win/Linux deferred — host-gated.
+
 ## v0.1.0 — first tagged release (2026-05-26)
 
 Pushed to `sirhco/verve` as `v0.1.0`. Release workflow built and

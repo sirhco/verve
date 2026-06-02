@@ -92,9 +92,12 @@ clean but behavior is unvalidated.
   AppImageUpdate (Linux). Check + macOS apply ship.
 - ⏳🔒 **GTK4 + WebKitGTK 6.0** behind `-Dgtk4` — largest item; GTK3 +
   WebKitGTK 4.1 wired today. Needs Ubuntu 24 LTS / Fedora 41 validation.
-- ⏳🍎 **Full a11y provider** — NSAccessibility / UIA / ATK roles + states
-  beyond the current `setAccessibilityLabel`. Remaining gap is
-  window-chrome semantics (web content + menus self-publish).
+- 🟡🍎 **Full a11y provider** — window-chrome NSAccessibility now covers
+  `setAccessibilityHelp` (AXHelp), `setAccessibilityRoleDescription`, and
+  `setAccessibilitySubrole` on macOS (Linux: help via
+  `atk_object_set_description`; role-desc/subrole + Windows are documented
+  no-ops pending a UIA/AtkObject provider). Web content + menus
+  self-publish.
 - ⏳🍎 **macOS `UNUserNotificationCenter` migration** — off the deprecated
   `NSUserNotification`; needs entitlements + an async permission prompt.
 - ⏳🔒 **Image clipboard Win (`CF_DIB`) + Linux (`image/png` target)** —
