@@ -1020,6 +1020,29 @@ pub const Window = struct {
         self.setTitle(label);
     }
 
+    /// No-op: without a dedicated UIA / IAccessible2 provider Windows has
+    /// no AXHelp-equivalent channel. Deferred — same scope note as
+    /// `setAccessibilityLabel`.
+    pub fn setAccessibilityHelp(self: *Window, text: []const u8) void {
+        _ = self;
+        _ = text;
+        std.log.info("verve.desktop[windows]: setAccessibilityHelp no-op (no UIA provider)", .{});
+    }
+
+    /// No-op: no role-description channel without a UIA provider.
+    pub fn setAccessibilityRoleDescription(self: *Window, text: []const u8) void {
+        _ = self;
+        _ = text;
+        std.log.info("verve.desktop[windows]: setAccessibilityRoleDescription no-op (no UIA provider)", .{});
+    }
+
+    /// No-op: no subrole channel without a UIA provider.
+    pub fn setAccessibilitySubrole(self: *Window, subrole: opts_mod.AccessibilitySubrole) void {
+        _ = self;
+        _ = subrole;
+        std.log.info("verve.desktop[windows]: setAccessibilitySubrole no-op (no UIA provider)", .{});
+    }
+
     /// Toggle topmost via `SetWindowPos(HWND_TOPMOST | HWND_NOTOPMOST)`.
     pub fn setAlwaysOnTop(self: *Window, on: bool) void {
         const HWND_TOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
