@@ -108,8 +108,13 @@ clean but behavior is unvalidated.
 - ⏳🔒 **Image clipboard Win (`CF_DIB`) + Linux (`image/png` target)** —
   macOS (PNG) ships.
 - ⏳🔒 **Live Win/Linux validation** — boot every code path on real hosts.
-- ⏳ **Notarization automation (macOS)** — manual sequence documented;
-  CI script pending.
+- ✅ **Notarization automation (macOS)** — `zig build notarize` ships in the
+  desktop scaffold (`-Dnotarize-profile=<keychain-profile>` →
+  ditto-zip → `notarytool submit --wait` → `stapler staple` → stapled ship
+  zip; hardened runtime implied). The framework has no app of its own to
+  notarize — each downstream app runs the step under its own Developer ID
+  Application cert. Live end-to-end needs that cert (the dev machine's
+  "Apple Development" cert is rejected by notarization).
 
 ---
 

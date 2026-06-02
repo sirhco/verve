@@ -385,3 +385,38 @@ entitlements).
   there is no `/api/*`, `/ws`, `/events`, or `/islands/*` route, so
   the desktop bridge (`verve_desktop.js`) is a strict subset of the
   server-side bridge (`src/bridge/verve.js`).
+
+## Notarization (macOS)
+
+To distribute a Verve desktop app outside the App Store without the
+Gatekeeper "unidentified developer" block, notarize the signed bundle.
+This requires a paid Apple Developer account and a **Developer ID
+Application** certificate in your keychain.
+
+One-time: store notary credentials as a keychain profile (so secrets never
+appear on the build command line):
+
+```sh
+xcrun notarytool store-credentials verve-notary \
+  --apple-id "you@example.com" \
+  --team-id "ABCDE12345" \
+  --password "<app-specific-password>"   # appleid.apple.com → App-Specific Passwords
+```
+
+Then build, sign, and notarize in one step:
+
+```sh
+zig build notarize \
+  -Dcodesign="Developer ID Application: Your Name (ABCDE12345)" \
+  -Dnotarize-profile=verve-notary \
+  -Dbundle-id=com.example.myapp
+```
+
+`-Dnotarize-profile` implies the hardened runtime, so you do not need
+`-Dhardened=true` as well. The step produces:
+
+- `zig-out/<name>.app` — signed, hardened, **stapled** (runs offline).
+- `zig-out/<name>.zip` — the stapled `.app`, ready to distribute.
+
+(`zig-out/<name>-submission.zip` is an intermediate pre-ticket container —
+do not distribute it.)

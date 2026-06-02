@@ -79,6 +79,14 @@ prior context.
   so every client entry exports them. Added a same-file regression-guard
   test + a "walker skipped" `console.warn` in both bridges. Pre-existing
   bug, unrelated to the notification migration.
+- [x] **Scaffold `zig build notarize` step.** `templates/desktop/build.zig`
+  gained a `notarize` step (gated on `-Dnotarize-profile` + `-Dcodesign`):
+  ditto-zips the signed bundle, `xcrun notarytool submit --wait` against a
+  keychain profile, `xcrun stapler staple`s the ticket, then re-zips the
+  stapled `.app` as `zig-out/<name>.zip`. Requesting notarize implies the
+  hardened runtime. The framework notarizes nothing itself — downstream
+  apps run it under their own Developer ID Application cert; structural
+  verification only here (no Developer ID cert on the dev box).
 
 ## v0.1.0 — first tagged release (2026-05-26)
 
