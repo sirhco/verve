@@ -55,6 +55,19 @@ prior context.
   `window.zig`; macOS verified via `zig build-obj -target aarch64-macos`,
   Win/Linux cross-compile clean. Live a11y-tree verification on
   Win/Linux deferred — host-gated.
+- [x] **macOS notifications → UNUserNotificationCenter.**
+  `notifications.show` macOS branch rewritten off the deprecated
+  `NSUserNotification`. Guards on `[[NSBundle mainBundle]
+  bundleIdentifier]` (unbundled → `error.Unsupported`); first call
+  requests authorization (`requestAuthorizationWithOptions:` alert|sound)
+  and pumps a nested `NSRunLoop` until the grant resolves, caching it
+  process-wide; denied → `error.Unsupported`. Delivers via
+  `UNMutableNotificationContent` + `UNNotificationRequest` (nil trigger).
+  Scaffold `build.zig` links `UserNotifications.framework`. Cross-platform
+  `show(allocator, opts)` surface unchanged; Linux/Windows untouched. No
+  `src/verve.zig` change. macOS semantic compile verified via
+  `zig build-obj -target aarch64-macos`; live delivery needs a signed
+  bundle (deferred to a signing-capable host).
 
 ## v0.1.0 — first tagged release (2026-05-26)
 

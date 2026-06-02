@@ -98,8 +98,13 @@ clean but behavior is unvalidated.
   `atk_object_set_description`; role-desc/subrole + Windows are documented
   no-ops pending a UIA/AtkObject provider). Web content + menus
   self-publish.
-- ⏳🍎 **macOS `UNUserNotificationCenter` migration** — off the deprecated
-  `NSUserNotification`; needs entitlements + an async permission prompt.
+- 🟡🍎 **macOS `UNUserNotificationCenter` migration** — done in code:
+  `notifications.show` now uses `UNUserNotificationCenter` with a
+  bundle-id guard + lazy synchronous authorization (nested `NSRunLoop`
+  pump). `NSUserNotification` removed; scaffold links
+  `UserNotifications.framework`. Live delivery requires a signed `.app`
+  bundle — end-to-end verification on a signing-capable host still
+  pending.
 - ⏳🔒 **Image clipboard Win (`CF_DIB`) + Linux (`image/png` target)** —
   macOS (PNG) ships.
 - ⏳🔒 **Live Win/Linux validation** — boot every code path on real hosts.
