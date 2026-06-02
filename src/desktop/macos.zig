@@ -546,6 +546,35 @@ pub const Window = struct {
         setLabel(self.window, m.sel("setAccessibilityLabel:"), nsString(label));
     }
 
+    /// `AXHelp` — the supplementary description VoiceOver reads after the
+    /// label. Distinct from the label/title; targets the a11y tree only.
+    pub fn setAccessibilityHelp(self: *Window, text: []const u8) void {
+        const set = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+        set(self.window, m.sel("setAccessibilityHelp:"), nsString(text));
+    }
+
+    /// Overrides the spoken role name (`AXRoleDescription`) VoiceOver
+    /// announces for the window chrome.
+    pub fn setAccessibilityRoleDescription(self: *Window, text: []const u8) void {
+        const set = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+        set(self.window, m.sel("setAccessibilityRoleDescription:"), nsString(text));
+    }
+
+    /// Sets the window's accessibility subrole (`AXSubrole`) so assistive
+    /// tech can distinguish dialog / floating / standard windows. The
+    /// constants are inlined as their literal AX string values, matching
+    /// how the codebase inlines other AppKit constants.
+    pub fn setAccessibilitySubrole(self: *Window, subrole: opts_mod.AccessibilitySubrole) void {
+        const ax = switch (subrole) {
+            .standard => "AXStandardWindow",
+            .dialog => "AXDialog",
+            .system_dialog => "AXSystemDialog",
+            .floating => "AXFloatingWindow",
+        };
+        const set = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+        set(self.window, m.sel("setAccessibilitySubrole:"), nsString(ax));
+    }
+
     /// Toggle whether this window floats above normal-level windows.
     /// `true` switches to `NSFloatingWindowLevel` (3); `false` back
     /// to `NSNormalWindowLevel` (0).
