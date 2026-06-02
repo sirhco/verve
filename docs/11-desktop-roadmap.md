@@ -68,6 +68,17 @@ prior context.
   `src/verve.zig` change. macOS semantic compile verified via
   `zig build-obj -target aarch64-macos`; live delivery needs a signed
   bundle (deferred to a signing-capable host).
+- [x] **Fixed dead binding-walker in island-free desktop apps.** The
+  scaffold demo's counter never updated: the JS walker that registers
+  `bindI32` signals requires `verve_island_scratch_ptr`/`_capacity`
+  exports, but those lived in the framework's `src/client/main.zig`, so
+  the desktop template's own minimal `main.zig` (no islands) didn't
+  export them → walker skipped → `signalI32("count")` null → clicks
+  no-op. Moved the scratch buffer + accessors into the shared
+  `src/client/runtime_exports.zig` (force-included via `verve_client`)
+  so every client entry exports them. Added a same-file regression-guard
+  test + a "walker skipped" `console.warn` in both bridges. Pre-existing
+  bug, unrelated to the notification migration.
 
 ## v0.1.0 — first tagged release (2026-05-26)
 

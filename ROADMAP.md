@@ -122,3 +122,10 @@ clean but behavior is unvalidated.
 - **Genuinely out of scope (not bugs):** the `_post` fire-and-forget path,
   the `verve-spa` meta opt-out (unimplemented by design), and decimal-operand
   CLDR plural forms (integer counts only) are intentional, not pending.
+- **Client binding-walker fix (2026-06-02):** the JS auto-walker that
+  registers `bindI32`/`bindStr`/… signals is gated on the wasm exporting
+  `verve_island_scratch_ptr`/`_capacity`. Those accessors moved from
+  `src/client/main.zig` to the shared `src/client/runtime_exports.zig`
+  so island-free apps (e.g. the desktop scaffold) export them and their
+  bindings register. Both bridges now `console.warn` instead of silently
+  skipping the walker.
