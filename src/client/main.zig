@@ -15,6 +15,7 @@ const dom = @import("dom.zig");
 const client_alloc = @import("allocator.zig");
 const scratch = @import("scratch.zig");
 const client_manifest = @import("client_manifest");
+const app_client = @import("app_client");
 
 pub const render = @import("render.zig");
 
@@ -79,6 +80,13 @@ var count_sig: ?*verve.Signal(i32) = null;
 var clicks_sig: ?*verve.Signal(i32) = null;
 
 export fn verve_hydrate() void {
+    // Wire the wasm `_call` round-trip to this runtime's correlation +
+    // allocation surface (see core/server_fn_gen.zig installWasmHooks).
+    verve.serverFnGen.installWasmHooks(
+        runtime.nextReqId,
+        runtime.registerResponseHandlerOnce,
+        client_alloc.allocator,
+    );
     count_sig = runtime.registerI32("count", count_initial);
     clicks_sig = runtime.registerI32("clicks", clicks_initial);
 }
@@ -115,6 +123,20 @@ export fn increment_counter() void {
 export fn decrement_counter() void {
     if (count_sig) |c| c.set(c.peek() - 1);
     if (clicks_sig) |c| c.set(c.peek() + 1);
+}
+
+/// Reply handler for the `_call` demo — the server returns the new count
+/// value, which we push through the reactive graph.
+fn onCallIncrement(value: i32) void {
+    if (count_sig) |c| c.set(value);
+    if (clicks_sig) |c| c.set(c.peek() + 1);
+}
+
+/// Demo of the typed `_call` round-trip: POST /api/incrementCount, then
+/// the correlated reply's `value` lands in `onCallIncrement`. Also the
+/// real call-site that retains `app_client` in the wasm client.
+export fn verve_call_increment() void {
+    app_client.incrementCount_call(client_alloc.allocator(), .{}, onCallIncrement);
 }
 
 export fn current_count() i32 {
