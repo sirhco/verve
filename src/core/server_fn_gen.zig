@@ -80,6 +80,12 @@ pub fn post(
 /// a correlated typed decoder via `registerCall`, and posts to the JS bridge;
 /// `on_reply` fires later when the bridge delivers the reply. Void actions
 /// on wasm post fire-and-forget (no rid, no decoder registered).
+///
+/// Precondition (wasm): the client must have called `installWasmHooks`
+/// (done at hydrate) before any value-returning `_call`. If the hooks are
+/// unset, `registerCall` returns rid 0 and the request posts fire-and-forget
+/// — `on_reply` never fires. In normal use `_call` is user-triggered after
+/// hydration, so the hooks are always installed by then.
 pub fn call(
     comptime f: anytype,
     arena: std.mem.Allocator,
