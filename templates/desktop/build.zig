@@ -226,6 +226,12 @@ pub fn build(b: *std.Build) void {
             "codesign",
             "Apple Developer signing identity. When set, the bundle is signed (use \"-\" for ad-hoc).",
         );
+        const notarize_profile = b.option(
+            []const u8,
+            "notarize-profile",
+            "notarytool keychain profile (from `xcrun notarytool store-credentials`). " ++
+                "Enables `zig build notarize`; requires -Dcodesign=<Developer ID Application> (hardened implied).",
+        );
         // Opt-in hardened runtime + entitlements. Required before
         // notarization but not before ad-hoc signing — self-built apps
         // can leave this off. When set, codesign runs with
@@ -233,11 +239,11 @@ pub fn build(b: *std.Build) void {
         // the plist enables the three keys WKWebView needs under the
         // hardened runtime (JIT, unsigned-executable-memory, library
         // validation disable for embedded WebKit dylibs).
-        const hardened = b.option(
+        const hardened = (b.option(
             bool,
             "hardened",
-            "Sign with hardened runtime + entitlements (required for future notarization).",
-        ) orelse false;
+            "Sign with hardened runtime + entitlements (required for notarization; implied by -Dnotarize-profile).",
+        ) orelse false) or (notarize_profile != null);
         // Path to a `.icns` file. Copied into Contents/Resources/ and
         // referenced from Info.plist via CFBundleIconFile. Generate one
         // from a square PNG with: `mkdir AppIcon.iconset && sips -z N N
@@ -361,6 +367,7 @@ pub fn build(b: *std.Build) void {
             bundle_step.dependOn(&inst_icon.step);
         }
 
+        var sign_step: ?*std.Build.Step = null;
         if (codesign_id) |ident| {
             const bundle_path = b.fmt("zig-out/{s}", .{bundle_root});
             const sign = b.addSystemCommand(&.{
@@ -393,8 +400,48 @@ pub fn build(b: *std.Build) void {
             }
             sign.addArg(bundle_path);
             sign.step.dependOn(bundle_step);
-            const sign_step = b.step("codesign", "Sign the macOS bundle (-Dcodesign=<identity>)");
-            sign_step.dependOn(&sign.step);
+            const s = b.step("codesign", "Sign the macOS bundle (-Dcodesign=<identity>)");
+            s.dependOn(&sign.step);
+            sign_step = s;
+        }
+
+        if (notarize_profile) |profile| {
+            if (sign_step) |signed| {
+                const app_path = b.fmt("zig-out/{s}", .{bundle_root});
+                const submit_zip = b.fmt("zig-out/{s}-submission.zip", .{exe.name});
+                const ship_zip = b.fmt("zig-out/{s}.zip", .{exe.name});
+
+                // 1. Zip the signed .app — notarytool needs a container.
+                const zip_submit = b.addSystemCommand(&.{
+                    "ditto", "-c", "-k", "--keepParent", app_path, submit_zip,
+                });
+                zip_submit.step.dependOn(signed);
+
+                // 2. Submit + wait for the notary verdict.
+                const submit = b.addSystemCommand(&.{
+                    "xcrun",              "notarytool", "submit", submit_zip,
+                    "--keychain-profile", profile,      "--wait",
+                });
+                submit.step.dependOn(&zip_submit.step);
+
+                // 3. Staple the ticket into the .app.
+                const staple = b.addSystemCommand(&.{
+                    "xcrun", "stapler", "staple", app_path,
+                });
+                staple.step.dependOn(&submit.step);
+
+                // 4. Re-zip the STAPLED .app as the distributable artifact.
+                const zip_ship = b.addSystemCommand(&.{
+                    "ditto", "-c", "-k", "--keepParent", app_path, ship_zip,
+                });
+                zip_ship.step.dependOn(&staple.step);
+
+                const notarize_step = b.step(
+                    "notarize",
+                    "Notarize + staple the signed macOS bundle (-Dnotarize-profile=<name>; requires -Dcodesign=<Developer ID Application>)",
+                );
+                notarize_step.dependOn(&zip_ship.step);
+            }
         }
     }
 
