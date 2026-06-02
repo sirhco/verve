@@ -4,6 +4,53 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.35] - 2026-06-02
+
+### Added
+
+- **Window-chrome accessibility provider (macOS).** Three new `Window`
+  methods extend the desktop accessibility surface beyond the existing
+  `setAccessibilityLabel`: `setAccessibilityHelp` (sets `AXHelp` — the
+  supplementary description VoiceOver reads after the label),
+  `setAccessibilityRoleDescription` (overrides the spoken role name), and
+  `setAccessibilitySubrole(.standard | .dialog | .system_dialog |
+  .floating)` (maps each tag to the matching `NSAccessibility*WindowSubrole`
+  constant). macOS publishes them through `objc_msgSend`; Linux maps
+  `setAccessibilityHelp` to `atk_object_set_description` and no-ops the other
+  two; Windows no-ops all three (no UIA provider). Web content + native menus
+  already self-publish their own accessibility tree, so they stay out of
+  scope. New `AccessibilitySubrole` enum on the desktop surface.
+
+### Changed
+
+- **macOS notifications migrated to `UNUserNotificationCenter`.**
+  `desktop.notifications.show` no longer uses the deprecated
+  `NSUserNotification`. The macOS path now guards on the process being a
+  bundled app (`[[NSBundle mainBundle] bundleIdentifier]`; an unbundled
+  process returns `error.Unsupported`), lazily requests authorization on the
+  first call and pumps a nested `NSRunLoop` until the grant resolves (caching
+  it process-wide; a denied grant returns `error.Unsupported`), then delivers
+  via `UNMutableNotificationContent` + `UNNotificationRequest` (nil trigger =
+  immediate). The desktop scaffold links `UserNotifications.framework`. The
+  cross-platform `show(allocator, opts)` surface is unchanged; the Linux
+  (libnotify) and Windows (tray balloon) paths are untouched.
+
+### Fixed
+
+- **Client binding-walker now runs in island-free apps.** The JS auto-walker
+  that registers `bindI32` / `bindStr` / `bindBool` / `bindF32` signals is
+  gated on the wasm exporting `verve_island_scratch_ptr` /
+  `verve_island_scratch_capacity`. Those accessors (and the backing scratch
+  buffer) lived in the framework's `src/client/main.zig`, so an app shipping
+  its own client entry without islands — e.g. a fresh desktop scaffold — never
+  exported them: the walker silently skipped, no signals registered, and every
+  reactive binding (the demo counter) was inert. The buffer + accessors moved
+  to the shared `src/client/runtime_exports.zig` (force-included via
+  `verve_client`), so every client entry now exports them. Both JS bridges
+  (`verve.js`, the desktop `verve_desktop.js`) now `console.warn` when the
+  walker is skipped instead of failing silently. A regression-guard test in
+  the client suite keeps the accessors from drifting back out.
+
 ## [0.1.34] - 2026-06-02
 
 ### Added
