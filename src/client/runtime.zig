@@ -1213,13 +1213,22 @@ pub fn registerForEach(parent_bind: []const u8, initial_keys: []const []const u8
     const owner = ensureOwner();
     const gpa = owner.allocator();
 
+    // Suffix the parent bind by the enclosing island's vid (matching the
+    // server's `rewriteBindings`, which suffixes the SSR parent's `z-bind`),
+    // so two instances of one component each reconcile only their own keyed
+    // list instead of both matching a shared `[z-bind="<name>"]` selector.
+    const vid = @import("island.zig").current_island_id;
+    var nbuf: [256]u8 = undefined;
+    const scoped_tmp = verve.vidBindName(parent_bind, vid, &nbuf);
+    const scoped = if (scoped_tmp.ptr == parent_bind.ptr) parent_bind else try gpa.dupe(u8, scoped_tmp);
+
     const handle = try gpa.create(ForEachHandle);
     const owned = try gpa.alloc([]const u8, initial_keys.len);
     for (initial_keys, 0..) |k, i| {
         owned[i] = try gpa.dupe(u8, k);
     }
     handle.* = .{
-        .parent_bind = parent_bind,
+        .parent_bind = scoped,
         .current_keys = owned,
         .allocator = gpa,
     };
@@ -1502,6 +1511,26 @@ test "register stores vid-suffixed DOM bind name, slot lookup stays plain" {
 
     const app = registerI32("score", 1); // vid 0
     try testing.expectEqualStrings("score", debugBoxName(app).?);
+}
+
+test "registerForEach suffixes parent bind by island vid, route scope stays plain" {
+    resetForTesting();
+    const island = @import("island.zig");
+    const initial = [_][]const u8{"a"};
+
+    island.current_island_id = 1;
+    const h1 = try registerForEach("items", &initial);
+    island.current_island_id = 2;
+    const h2 = try registerForEach("items", &initial);
+    island.current_island_id = 0;
+
+    // Two instances of one component reconcile against distinct selectors.
+    try testing.expectEqualStrings("items__v1", h1.parent_bind);
+    try testing.expectEqualStrings("items__v2", h2.parent_bind);
+
+    // Route scope (vid 0) is never suffixed.
+    const route = try registerForEach("items", &initial);
+    try testing.expectEqualStrings("items", route.parent_bind);
 }
 
 test "unmountRoute clears island owners so vids start fresh" {

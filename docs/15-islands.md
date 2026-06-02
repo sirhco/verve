@@ -355,8 +355,11 @@ client drives the DOM (and resolves `queryRef`) with the matching suffixed name.
 So instance 1's signal updates only its own span. The `__v{vid}` separator is
 reserved. (Signals themselves are already `(vid, name)`-scoped; this closes the
 DOM-side of multi-instance.) Route-scope binds (`vid` 0, outside any island) are
-never suffixed. Keyed-list parent binds (`bindForEach`) are not yet auto-namespaced
-— a multi-instance keyed list needs a manually distinct parent bind for now.
+never suffixed. Keyed-list parent binds (`bindForEach`) are auto-namespaced
+too: `registerForEach` suffixes its `parent_bind` by the enclosing island's
+vid (matching the server-side suffix of the parent's `z-bind`), so two
+instances of one component each reconcile only their own list — no manual
+parent-bind disambiguation needed.
 
 ## Resource state hydration
 

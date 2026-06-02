@@ -53,11 +53,12 @@ The original 6-phase roadmap is substantially complete:
 
 ### Island follow-ups
 
-- ⏳🍎 **Keyed-list (`bindForEach`) multi-instance namespacing** — single
-  instance works; two instances of one component sharing a keyed list need a
-  manually distinct parent bind today (the auto per-`vid` namespacing does
-  not yet cover `bindForEach` parent binds).
-  → [`docs/15-islands.md:355`](docs/15-islands.md)
+- ✅ **Keyed-list (`bindForEach`) multi-instance namespacing** —
+  `registerForEach` now suffixes its `parent_bind` by the enclosing island's
+  vid (matching the server-side `z-bind` suffix), so two instances of one
+  component each reconcile only their own keyed list — no manual parent-bind
+  disambiguation. Documented in `docs/15-islands.md`.
+  → `src/client/runtime.zig` (`registerForEach`)
 
 - ⏳🍎 **Client-side fetch of pending / local resources** (resource-state
   hydration phase 2) — a `loading` or `LocalResource` resolved client-side
