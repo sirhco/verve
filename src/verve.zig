@@ -181,6 +181,7 @@ test {
     _ = @import("core/link.zig");
     _ = @import("core/store.zig");
     _ = @import("core/i18n.zig");
+    _ = @import("core/i18n_lazy.zig");
     _ = @import("core/error_boundary.zig");
     _ = @import("core/server_fn.zig");
     _ = @import("core/server_fn_gen.zig");
