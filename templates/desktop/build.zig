@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/components.zig"),
         .target = host_target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "verve", .module = verve_host_mod } },
+        .imports = &.{.{ .name = "verve", .module = verve_host_mod }},
     });
 
     const render_index_mod = b.createModule(.{
@@ -125,6 +125,8 @@ pub fn build(b: *std.Build) void {
             desktop_mod.linkFramework("Cocoa", .{});
             desktop_mod.linkFramework("WebKit", .{});
             desktop_mod.linkFramework("Foundation", .{});
+            // UserNotifications: desktop.notifications UNUserNotificationCenter.
+            desktop_mod.linkFramework("UserNotifications", .{});
             // IOKit: desktop.power battery / charging readout.
             desktop_mod.linkFramework("IOKit", .{});
             // CoreFoundation: pulled in transitively by Cocoa/Foundation
