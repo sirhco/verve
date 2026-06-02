@@ -106,6 +106,8 @@ pub const RegisterOnceFn =
 pub const NextRidFn = *const fn () u32;
 pub const DecodeAllocFn = *const fn () std.mem.Allocator;
 
+// NOTE: wasm-only by design (single-threaded); not synchronized. On native
+// they stay null except in this file's own tests.
 var register_once_hook: ?RegisterOnceFn = null;
 var next_rid_hook: ?NextRidFn = null;
 var decode_alloc_hook: ?DecodeAllocFn = null;
@@ -133,8 +135,14 @@ fn Decoder(comptime SuccessT: type, comptime on_reply: anytype) type {
     return struct {
         fn handle(ptr: [*]const u8, len: u32) void {
             const body = ptr[0..len];
+            // Hooks cleared between registration and reply (e.g. test
+            // teardown) → silently drop this reply rather than crash.
             const a = decode_alloc_hook orelse return;
-            const Reply = struct { rid: u32 = 0, value: SuccessT };
+            // rid correlation already happened in the client runtime's
+            // dispatchResponse (it matches slot.rid == reply_rid before
+            // invoking this handler), so decode only the typed value; any
+            // other reply fields (rid, ok, …) are ignored.
+            const Reply = struct { value: SuccessT };
             const parsed = std.json.parseFromSlice(
                 Reply,
                 a(),
@@ -247,6 +255,7 @@ test "call skips on_reply on error" {
     try testing.expectEqual(@as(i32, 7), Sink.got);
 }
 
+// Testing only — reset hook state between tests.
 fn clearHooksForTesting() void {
     next_rid_hook = null;
     register_once_hook = null;
