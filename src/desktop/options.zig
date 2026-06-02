@@ -109,6 +109,11 @@ pub const ClipboardError = error{
 ///    `webkit_print_operation_run_dialog`.
 pub const PrintDialogKind = enum { default, browser, system };
 
+/// Window-chrome accessibility subrole. macOS maps each tag to an
+/// `NSAccessibility*WindowSubrole` constant via `setAccessibilitySubrole:`.
+/// Win/Linux have no equivalent channel — the setter is a no-op there.
+pub const AccessibilitySubrole = enum { standard, dialog, system_dialog, floating };
+
 /// Inclusive page range. `from` defaults to 1, `to` to 0 which
 /// the backends interpret as "all remaining pages".
 pub const PageRange = struct {

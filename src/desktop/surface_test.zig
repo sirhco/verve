@@ -46,6 +46,17 @@ test "PrintDialogKind enumerates default/browser/system" {
     _ = options.PrintDialogKind.system;
 }
 
+test "AccessibilitySubrole enumerates standard/dialog/system_dialog/floating" {
+    // ABI guard: macOS maps these tags to AX subrole strings; downstream
+    // apps switch on them.
+    const S = options.AccessibilitySubrole;
+    try std.testing.expectEqual(4, @typeInfo(S).@"enum".fields.len);
+    _ = S.standard;
+    _ = S.dialog;
+    _ = S.system_dialog;
+    _ = S.floating;
+}
+
 test "PrintError set is stable" {
     // ABI guard: downstream catch-prongs depend on these names.
     const e: options.PrintError = error.Unsupported;
