@@ -30,9 +30,10 @@ test "generated stub: _call delivers the typed result to on_reply (native)" {
     };
     Sink.got = -1;
     // Native path: runs synchronously, unwraps the `!i32`, fires the callback.
-    // (The wasm `_call` round-trip — POST + correlated reply — needs the
-    // generated stubs compiled into the wasm client; today app_client is
-    // native-only, so that path is exercised in the browser, not here.)
+    // (The wasm `_call` round-trip — POST + correlated reply — now ships:
+    // app_client is compiled into the wasm client and the path is exercised
+    // via the `/counter` "call +" demo button. Automated browser execution is
+    // not wired, so this test covers only the native branch.)
     app_client.getCount_call(testing.allocator, .{}, Sink.onReply);
     try testing.expectEqual(@as(i32, 7), Sink.got);
 }

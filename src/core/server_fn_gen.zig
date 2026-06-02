@@ -1,7 +1,7 @@
 //! Phase 11 + 11B — typed client stubs for `app.Actions`.
 //!
 //! `tools/server_fn_codegen.zig` walks `app.Actions` at build time and
-//! emits a pair of per-action wrappers in `app_client.zig`:
+//! emits per-action wrappers in `app_client.zig`:
 //!
 //!   - `<name>(arena, args) → Ret` — typed synchronous invocation.
 //!     Native callers reach the action directly via `invoke`. WASM
@@ -14,6 +14,12 @@
 //!     invokes the action directly and drops the result so the same
 //!     symbol stays callable across targets without a `comptime if`
 //!     at every call site.
+//!
+//!   - `<name>_call(arena, args, on_reply)` — typed callback. Native runs
+//!     the action synchronously and fires `on_reply`. WASM serializes args,
+//!     registers a correlated one-shot decoder (`registerCall`/`Decoder`),
+//!     and posts with a request id; the reply decodes the typed value and
+//!     fires `on_reply`. The client wires this up via `installWasmHooks`.
 
 const std = @import("std");
 const builtin = @import("builtin");
