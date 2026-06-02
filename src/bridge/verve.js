@@ -918,6 +918,9 @@
     verve_dispatch_response: exp.verve_dispatch_response,
     // Phase 17 — outbound typed POST + shared JSON value service.
     verve_server_fn_post: exp.verve_server_fn_post,
+    verve_server_fn_post_rid: exp.verve_server_fn_post_rid,
+    verve_next_req_id: exp.verve_next_req_id,
+    verve_register_response_handler_once: exp.verve_register_response_handler_once,
     verve_json_parse: exp.verve_json_parse,
     verve_json_free: exp.verve_json_free,
     verve_json_get: exp.verve_json_get,

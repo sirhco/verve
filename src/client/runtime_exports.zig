@@ -439,6 +439,35 @@ export fn verve_server_fn_post(
     dom.server_fn_post(name_ptr, @as(usize, name_len), body_ptr, @as(usize, body_len), 0);
 }
 
+// ---- Correlated round-trip (chunk-callable) -----------------------------
+// Mirror the main client's rid correlation into the `verve_runtime` namespace
+// so chunks can do one-shot, correlated request → typed-reply loops (e.g.
+// `fetchSignal`). The logic lives in `runtime.zig`; these only re-export it.
+
+export fn verve_next_req_id() u32 {
+    return runtime.nextReqId();
+}
+
+export fn verve_register_response_handler_once(
+    route_ptr: [*]const u8,
+    route_len: u32,
+    rid: u32,
+    handler_idx: u32,
+) void {
+    const handler: *const fn ([*]const u8, u32) void = @ptrFromInt(@as(usize, handler_idx));
+    runtime.registerResponseHandlerOnce(route_ptr[0..route_len], rid, handler);
+}
+
+export fn verve_server_fn_post_rid(
+    name_ptr: [*]const u8,
+    name_len: u32,
+    body_ptr: [*]const u8,
+    body_len: u32,
+    rid: u32,
+) void {
+    dom.server_fn_post(name_ptr, @as(usize, name_len), body_ptr, @as(usize, body_len), rid);
+}
+
 // ---- Shared JSON value service (Phase 17, chunk-callable) ---------------
 //
 // One std.json parser lives here in the main client; chunks call these

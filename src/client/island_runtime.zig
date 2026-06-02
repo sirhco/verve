@@ -79,6 +79,20 @@ extern "verve_runtime" fn verve_server_fn_post(
     body_ptr: [*]const u8,
     body_len: u32,
 ) void;
+extern "verve_runtime" fn verve_next_req_id() u32;
+extern "verve_runtime" fn verve_register_response_handler_once(
+    route_ptr: [*]const u8,
+    route_len: u32,
+    rid: u32,
+    handler_idx: u32,
+) void;
+extern "verve_runtime" fn verve_server_fn_post_rid(
+    name_ptr: [*]const u8,
+    name_len: u32,
+    body_ptr: [*]const u8,
+    body_len: u32,
+    rid: u32,
+) void;
 extern "verve_runtime" fn verve_json_parse(ptr: [*]const u8, len: u32) u32;
 extern "verve_runtime" fn verve_json_free(handle: u32) void;
 extern "verve_runtime" fn verve_json_get(handle: u32, key_ptr: [*]const u8, key_len: u32) u32;
@@ -429,6 +443,34 @@ pub fn registerResponseHandler(
 /// handler registered for `name` via `registerResponseHandler`.
 pub fn serverFnPost(name: []const u8, body: []const u8) void {
     verve_server_fn_post(name.ptr, @intCast(name.len), body.ptr, @intCast(body.len));
+}
+
+/// Allocate a monotonic, non-zero request correlation id (main-client scoped).
+pub fn nextReqId() u32 {
+    return verve_next_req_id();
+}
+
+/// Register a one-shot reply handler correlated by `rid`. Fires once when a reply
+/// arrives whose `"rid"` matches, then is removed. The handler runs with the
+/// registering island's vid restored (so name-keyed signal sets resolve that
+/// island's signals).
+pub fn registerResponseHandlerOnce(
+    route: []const u8,
+    rid: u32,
+    handler: *const fn ([*]const u8, u32) void,
+) void {
+    verve_register_response_handler_once(
+        route.ptr,
+        @intCast(route.len),
+        rid,
+        @intCast(@intFromPtr(handler)),
+    );
+}
+
+/// POST `body` to `/api/<name>` with correlation id `rid` (sent as the
+/// `x-verve-rid` header). The reply fans back through `dispatchResponse`.
+pub fn serverFnPostRid(name: []const u8, body: []const u8, rid: u32) void {
+    verve_server_fn_post_rid(name.ptr, @intCast(name.len), body.ptr, @intCast(body.len), rid);
 }
 
 /// A handle into the main client's shared JSON value table. Non-owning
