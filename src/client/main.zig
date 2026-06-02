@@ -14,6 +14,7 @@ const island = @import("island.zig");
 const dom = @import("dom.zig");
 const client_alloc = @import("allocator.zig");
 const scratch = @import("scratch.zig");
+const runtime_exports = @import("runtime_exports.zig");
 const client_manifest = @import("client_manifest");
 const app_client = @import("app_client");
 
@@ -27,31 +28,16 @@ comptime {
     _ = @import("runtime_exports.zig");
 }
 
-// ---- Phase 13: island dispatch scratch buffer ----------------------------
-// JS writes name+props as concatenated UTF-8 bytes into this buffer
-// then invokes `verve_island_dispatch(name_len, props_len)`. Sized for
-// modest payloads — large prop blobs should be staged through the
-// general-purpose allocator instead (deferred).
-var island_scratch: [8192]u8 align(@alignOf(u8)) = undefined;
-
-export fn verve_island_scratch_ptr() u32 {
-    return @intFromPtr(&island_scratch);
-}
-
-export fn verve_island_scratch_capacity() u32 {
-    return island_scratch.len;
-}
-
 // Persistent copy of the hydrating island's serialized resource-state blob.
 // The bridge stages the blob bytes into `island_scratch` then calls
 // `verve_set_island_state(len)`; we copy them OUT here so the subsequent
 // name/props staging into the same scratch can't corrupt the blob the chunk
 // reads via `verve.resourceFromState`.
-var island_state_buf: [island_scratch.len]u8 = undefined;
+var island_state_buf: [runtime_exports.island_scratch.len]u8 = undefined;
 
 export fn verve_set_island_state(len: u32) void {
     const n = @min(@as(usize, len), island_state_buf.len);
-    @memcpy(island_state_buf[0..n], island_scratch[0..n]);
+    @memcpy(island_state_buf[0..n], runtime_exports.island_scratch[0..n]);
     @import("island_state_client.zig").setCurrentBlob(island_state_buf[0..n]);
 }
 
@@ -61,9 +47,9 @@ export fn verve_island_dispatch(name_len: u32, props_len: u32) i32 {
 
 export fn verve_island_dispatch_v(name_len: u32, props_len: u32, vid: u32) i32 {
     const total = @as(usize, name_len) + @as(usize, props_len);
-    if (total > island_scratch.len) return 0;
-    const name = island_scratch[0..name_len];
-    const props = island_scratch[name_len .. name_len + props_len];
+    if (total > runtime_exports.island_scratch.len) return 0;
+    const name = runtime_exports.island_scratch[0..name_len];
+    const props = runtime_exports.island_scratch[name_len .. name_len + props_len];
     return island.dispatch(name, props, vid);
 }
 

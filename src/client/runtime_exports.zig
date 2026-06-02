@@ -30,6 +30,30 @@ const chunk_arena = @import("chunk_arena.zig");
 const island = @import("island.zig");
 const island_state_client = @import("island_state_client.zig");
 
+// ---- Binding / dispatch scratch buffer ------------------------------------
+// JS stages binding names + island dispatch payloads into this buffer
+// before calling the matching `verve_register_*` / `verve_island_dispatch`
+// export. It lives in THIS shared module — force-included by
+// `verve_client.zig`'s `comptime { _ = @import("runtime_exports.zig"); }`
+// — so every client entry (framework web + any scaffold with its own
+// `main.zig`) exports the accessors and the JS binding walker can run.
+pub var island_scratch: [8192]u8 align(@alignOf(u8)) = undefined;
+
+export fn verve_island_scratch_ptr() u32 {
+    // usize on the native test target is 64-bit; truncate to the wasm32 u32 ABI.
+    return @intCast(@intFromPtr(&island_scratch));
+}
+
+export fn verve_island_scratch_capacity() u32 {
+    return island_scratch.len;
+}
+
+test "runtime_exports keeps the walker scratch accessors exported" {
+    _ = &verve_island_scratch_ptr;
+    _ = &verve_island_scratch_capacity;
+    _ = &island_scratch;
+}
+
 // ---- Island scope + state for chunk hydration ----------------------------
 // A chunk's `register*`/`registerEvent` calls route into this main runtime,
 // which scopes them by `island.current_island_id`. The bridge wraps each
