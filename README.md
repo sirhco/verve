@@ -186,7 +186,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.1.32
+VERSION=0.1.33
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256
@@ -207,7 +207,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.1.32
+zig fetch --save git+https://github.com/sirhco/verve#v0.1.33
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -267,7 +267,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.1.32 \
+verve-cli new ~/my-app --release v0.1.33 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 

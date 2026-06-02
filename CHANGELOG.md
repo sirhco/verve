@@ -4,6 +4,43 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.33] - 2026-06-01
+
+### Added
+
+- **Server-fn `_call` wasm round-trip.** `app_client.<name>_call(arena, args,
+  on_reply)` now completes a real correlated round-trip in the browser, not just
+  on native. The wasm path serializes `args`, allocates a correlation id,
+  registers a one-shot `(name, rid)` typed decoder, and posts to `/api/<name>`
+  with the `x-verve-rid` header; the server echoes `"rid":N`, the reply routes to
+  the matching handler, decodes the typed `value`, and fires `on_reply` — two
+  concurrent calls never cross. Void-returning actions post fire-and-forget. The
+  generated `app_client` module is now compiled into the wasm client (via a
+  dedicated build `WriteFiles` to avoid a cycle through `client.wasm`); the client
+  installs the correlation + allocation surface at hydrate via
+  `verve.serverFnGen.installWasmHooks(...)`. `core/server_fn_gen.zig` reaches the
+  client runtime through dependency-inversion hooks, so the target-agnostic core
+  stays free of any `client/` import. Demo: the `/counter` page's "call +" button.
+  Guide: `docs/03-actions.md`.
+
+### Changed
+
+- **Keyed-list (`bindForEach`) multi-instance namespacing.** `registerForEach`
+  now suffixes its `parent_bind` by the enclosing island's `vid` (matching the
+  server-side `z-bind` suffix from `rewriteBindings`), so two instances of one
+  component each reconcile only their own keyed list. The previous manual
+  distinct-parent-bind workaround is no longer needed. Guide: `docs/15-islands.md`.
+
+### Fixed
+
+- **Chunk-handler cross-component name collisions.** `z-on-click` string dispatch
+  resolved chunk exports through a flat, last-writer-wins map keyed only by export
+  name, so two island components exporting the same handler name collided (the
+  second-loaded chunk shadowed the first). Chunk exports are now nested by island
+  `data-name` then export name, and dispatch resolves against the click target's
+  enclosing `<verve-island>` — same-named handlers in different components no
+  longer collide. Guide: `docs/15-islands.md`.
+
 ## [0.1.32] - 2026-06-01
 
 ### Added
