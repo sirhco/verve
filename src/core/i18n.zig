@@ -62,7 +62,7 @@ pub const Catalog = struct {
 ///   2. query `?lang=`
 ///   3. first parseable `Accept-Language` candidate that we support
 ///   4. catalog default
-pub fn resolveLocale(catalog: Catalog, meta: ?*const RequestMeta, location: ?*Location, arena: std.mem.Allocator) ![]const u8 {
+pub fn resolveLocale(catalog: anytype, meta: ?*const RequestMeta, location: ?*Location, arena: std.mem.Allocator) ![]const u8 {
     if (meta) |m| {
         if (m.cookie(COOKIE_NAME)) |c| if (catalog.isSupported(c)) return c;
     }
@@ -222,6 +222,23 @@ fn interpolateN(value: []const u8, n: u64, arena: std.mem.Allocator) ![]const u8
 // ---- tests ------------------------------------------------------------
 
 const testing = std.testing;
+
+test "resolveLocale works with a LazyCatalog (duck-typed)" {
+    const LazyCatalog = @import("i18n_lazy.zig").LazyCatalog;
+    const Locale = @import("i18n_lazy.zig").Locale;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const locales = [_]Locale{
+        .{ .tag = "en", .json = "{}" },
+        .{ .tag = "fr", .json = "{}" },
+    };
+    var cat = LazyCatalog.init(&locales, "en", arena.allocator());
+
+    // No request context → falls through to the default locale.
+    const got = try resolveLocale(&cat, null, null, arena.allocator());
+    try testing.expectEqualStrings("en", got);
+    try testing.expect(cat.isSupported("fr"));
+}
 
 test "Catalog.lookup falls back to default then key" {
     const catalog: Catalog = .{
