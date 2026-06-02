@@ -48,10 +48,13 @@ The original 6-phase roadmap is substantially complete:
   Demo: the `/counter` "call +" button.
   → `docs/03-actions.md`, `src/core/server_fn_gen.zig`, `src/client/main.zig`
 
-- ⏳ **i18n lazy/streaming catalog loading** — every catalog ships in full
-  today; per-locale split + on-demand load (build split + runtime merge, or
-  a server endpoint) for very large translation sets.
-  → [`docs/14-i18n.md:96`](docs/14-i18n.md)
+- ✅ **i18n lazy/streaming catalog loading** — opt-in `LazyCatalog` ships each
+  locale as a separate embedded JSON blob and parses + caches only the active
+  (and default-fallback) locale on demand, mutex-guarded for the worker pool.
+  Build walker (`-Di18n-dir`) turns `i18n/<locale>.json` into the embedded
+  `locales` manifest (single-binary preserved). The comptime `Catalog` stays for
+  small sets. Guide: `docs/14-i18n.md`.
+  → `src/core/i18n_lazy.zig`, `build.zig`
 
 ### Island follow-ups
 
