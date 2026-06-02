@@ -10,6 +10,9 @@ pub fn build(b: *std.Build) void {
         "Directory whose contents are baked into the binary and served at /public/*",
     );
 
+    const i18n_dir_opt = b.option([]const u8, "i18n-dir", "Directory of <locale>.json catalogs (default: i18n)") orelse "i18n";
+    const i18n_default_opt = b.option([]const u8, "i18n-default", "Default locale tag for the lazy catalog");
+
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -18,6 +21,9 @@ pub fn build(b: *std.Build) void {
     const verve_mod = b.addModule("verve", .{
         .root_source_file = b.path("src/verve.zig"),
     });
+
+    // Build-generated per-locale i18n catalog (LazyCatalog manifest).
+    const i18n_catalog_mod = buildI18nCatalog(b, i18n_dir_opt, i18n_default_opt, verve_mod);
 
     // Public façade for downstream wasm clients (desktop template,
     // browser-only apps). Re-exports reactive primitives from `verve`
@@ -280,6 +286,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_client", .module = app_client_mod },
             .{ .name = "client_manifest", .module = client_manifest_mod },
             .{ .name = "public_assets", .module = public_assets_mod },
+            .{ .name = "i18n_catalog", .module = i18n_catalog_mod },
         },
     });
     const server = b.addExecutable(.{
@@ -449,8 +456,23 @@ pub fn build(b: *std.Build) void {
         const desktop_tests = b.addTest(.{ .root_module = desktop_test_mod });
         const run_desktop_tests = b.addRunArtifact(desktop_tests);
 
+        // i18n catalog integration: load the build-generated module into a
+        // LazyCatalog and resolve fixture keys end-to-end.
+        const i18n_it_mod = b.createModule(.{
+            .root_source_file = b.path("tests/i18n_catalog_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "verve", .module = verve_mod },
+                .{ .name = "i18n_catalog", .module = i18n_catalog_mod },
+            },
+        });
+        const i18n_it_tests = b.addTest(.{ .root_module = i18n_it_mod });
+        const run_i18n_it_tests = b.addRunArtifact(i18n_it_tests);
+
         const test_step = b.step("test", "Run tests");
         test_step.dependOn(&run_tests.step);
+        test_step.dependOn(&run_i18n_it_tests.step);
         test_step.dependOn(&run_server_tests.step);
         test_step.dependOn(&run_client_tests.step);
         test_step.dependOn(&run_integration_tests.step);
@@ -560,6 +582,62 @@ fn buildPublicAssets(b: *std.Build, dir_opt: ?[]const u8) *std.Build.Module {
 
     return b.createModule(.{
         .root_source_file = wf.getDirectory().path(b, "public_assets.zig"),
+    });
+}
+
+/// Walk `dir` for `<tag>.json` locale files at configure time and generate an
+/// `i18n_catalog` module: per-locale `@embedFile` blobs + a `locales` manifest
+/// of `verve.I18nLocale`. Missing dir → empty manifest (graceful). `default`
+/// is the default locale tag (else the first tag alphabetically). Mirrors
+/// `buildPublicAssets`'s configure-time walk + embed.
+fn buildI18nCatalog(b: *std.Build, dir: []const u8, default: ?[]const u8, verve_mod: *std.Build.Module) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    var manifest: std.ArrayList(u8) = .empty;
+    manifest.appendSlice(b.allocator,
+        \\const Locale = @import("verve").I18nLocale;
+        \\
+        \\pub const locales: []const Locale = &.{
+        \\
+    ) catch @panic("OOM");
+
+    var first_tag: ?[]const u8 = null;
+    const io = b.graph.io;
+    if (b.build_root.handle.openDir(io, dir, .{ .iterate = true })) |root_const| {
+        var root = root_const;
+        defer root.close(io);
+        var walker = root.walk(b.allocator) catch @panic("OOM");
+        defer walker.deinit();
+        while (walker.next(io) catch @panic("i18n walk failed")) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".json")) continue;
+            const tag = entry.basename[0 .. entry.basename.len - ".json".len];
+            const tag_owned = b.allocator.dupe(u8, tag) catch @panic("OOM");
+            if (first_tag == null or std.mem.lessThan(u8, tag_owned, first_tag.?)) first_tag = tag_owned;
+            // Forward slashes so @embedFile resolves on Windows hosts too.
+            const path_forward = b.allocator.dupe(u8, entry.path) catch @panic("OOM");
+            for (path_forward) |*c| if (c.* == '\\') {
+                c.* = '/';
+            };
+            _ = wf.addCopyFile(b.path(b.pathJoin(&.{ dir, entry.path })), path_forward);
+            manifest.appendSlice(b.allocator, b.fmt(
+                "    .{{ .tag = \"{s}\", .json = @embedFile(\"{s}\") }},\n",
+                .{ tag_owned, path_forward },
+            )) catch @panic("OOM");
+        }
+    } else |_| {
+        // Missing dir → empty manifest. Graceful, like absent templates.
+    }
+
+    const default_tag = default orelse (first_tag orelse "");
+    manifest.appendSlice(b.allocator, b.fmt(
+        "}};\n\npub const default_locale: []const u8 = \"{s}\";\n",
+        .{default_tag},
+    )) catch @panic("OOM");
+
+    const gen = wf.add("i18n_catalog.zig", manifest.items);
+    return b.createModule(.{
+        .root_source_file = gen,
+        .imports = &.{.{ .name = "verve", .module = verve_mod }},
     });
 }
 
