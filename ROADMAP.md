@@ -62,11 +62,13 @@ The original 6-phase roadmap is substantially complete:
   disambiguation. Documented in `docs/15-islands.md`.
   → `src/client/runtime.zig` (`registerForEach`)
 
-- ⏳🍎 **Client-side fetch of pending / local resources** (resource-state
-  hydration phase 2) — a `loading` or `LocalResource` resolved client-side
-  via the `server_fn_post` → `dispatchResponse` reply loop, vid-scoped. The
-  resolved-at-SSR common case already avoids the round-trip.
-  → [`docs/15-islands.md:389`](docs/15-islands.md) ("Deferred work")
+- ✅ **Client-side fetch of pending / local resources** — chunks fetch a value
+  not resolved at SSR via `verve.fetchSignal(T, action, args, signal_name)`: a
+  correlated server-fn round-trip whose typed reply sets the island's vid-scoped
+  signal (multiple instances never cross). Built on extending Phase A's rid
+  correlation to the chunk runtime. Failure leaves the signal at its loading
+  value (error path deferred). Guide: `docs/15-islands.md`.
+  → `src/client/island_runtime.zig`, `src/client/runtime_exports.zig`
 
 - ✅ **Chunk-handler cross-component name collisions** — `z-on-click`
   dispatch now nests chunk exports by island `data-name` then export name,

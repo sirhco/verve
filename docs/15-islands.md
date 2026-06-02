@@ -392,13 +392,33 @@ The codec covers primitives only — `i32` / `[]const u8` / `bool` / `f32`
 (an unsupported field type is a compile error). Struct / rich-`T`
 serialization is future work, shared with the props binary codec.
 
-## Deferred work
+## Client-side value fetch (`fetchSignal`)
 
-- **Client-side fetch of pending / local resources** — a `loading` or
-  `LocalResource` resolved client-side via the server-function reply
-  loop (`server_fn_post` → `dispatchResponse`), keyed by `data-vid` and
-  scoped to the island's owner. Designed; the resolved-at-SSR common
-  case above already avoids the round-trip.
+When an island's value wasn't resolved at SSR (`islandStateValue` returns null —
+the resource was still loading, or it's a `LocalResource`), the chunk fetches it
+client-side and settles its signal:
+
+```zig
+export fn hydrate(props_ptr: u32, props_len: u32, vid: u32) void {
+    const sig = verve.registerI32("count", 0);              // loading default
+    if (verve.islandStateValue(i32, "count")) |v| {
+        sig.set(v);                                          // resolved at SSR
+    } else {
+        verve.fetchSignal(i32, "getCount", .{}, "count");    // pending -> fetch
+    }
+}
+```
+
+`fetchSignal(T, action_name, args, signal_name)` posts a correlated request to
+`/api/<action_name>` and registers a one-shot handler; the server echoes
+`{"rid":N,"value":…}`, and the reply sets the named, vid-scoped signal — so two
+instances of one component never cross. `T` is the signal type
+(`i32` / `[]const u8` / `bool` / `f32`); `action_name` is any `app.Actions`
+server-fn returning that value.
+
+**Failure:** on a server error or no reply, the signal keeps its loading value
+(there is no error path yet). **Lifetime:** a reply arriving after the island
+unmounts is dropped (`unmountIsland` nulls the island's response handlers).
 
 ## Next
 
