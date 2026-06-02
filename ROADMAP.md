@@ -40,11 +40,13 @@ The original 6-phase roadmap is substantially complete:
 
 ### Finishing partial phases
 
-- ⏳🍎 **Server-fn `_call` wasm round-trip** — native works; the browser
-  path needs `app_client` compiled into the wasm client + a real call-site
-  (POST → correlated reply → typed callback). Correlation plumbing
-  (`x-verve-rid`, `registerResponseHandlerOnce`) already ships.
-  → [`docs/03-actions.md:60`](docs/03-actions.md)
+- ✅ **Server-fn `_call` wasm round-trip** — the browser path now
+  serializes args, registers a correlated one-shot typed decoder, and
+  posts with `x-verve-rid`; the server's `"rid"` echo routes the reply
+  back to decode the typed value and fire `on_reply`. `app_client` is
+  compiled into the wasm client; the client installs the hooks at hydrate.
+  Demo: the `/counter` "call +" button.
+  → `docs/03-actions.md`, `src/core/server_fn_gen.zig`, `src/client/main.zig`
 
 - ⏳ **i18n lazy/streaming catalog loading** — every catalog ships in full
   today; per-locale split + on-demand load (build split + runtime merge, or
