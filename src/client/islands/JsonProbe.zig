@@ -50,6 +50,13 @@ export fn json_probe_refresh() void {
     verve.serverFnPost(ROUTE, "{}");
 }
 
+/// Phase B demo — fetch a value via a correlated `_call`-style round-trip and
+/// settle the signal. `getCount` is an existing `app.Actions` server-fn
+/// returning `i32`. Stamped via `[z-on-click="json_probe_fetch"]`.
+export fn json_probe_fetch() void {
+    verve.fetchSignal(i32, "getCount", .{}, COUNT_BIND);
+}
+
 /// Closure keydown handler (registered in `hydrate`, stamped via
 /// `z-on-keydown-id`). Reads the staged event: ⌘K / Ctrl+K refreshes;
 /// the clicked row's `data-id` is read via the target dataset.

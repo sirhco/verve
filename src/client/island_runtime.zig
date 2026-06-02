@@ -473,6 +473,54 @@ pub fn serverFnPostRid(name: []const u8, body: []const u8, rid: u32) void {
     verve_server_fn_post_rid(name.ptr, @intCast(name.len), body.ptr, @intCast(body.len), rid);
 }
 
+/// Comptime-monomorphic per (T, signal_name). Registered as the one-shot
+/// (route, rid) reply handler; fires exactly once, for this call's reply.
+/// Decodes the reply's `value` via the chunk JSON service and sets the named
+/// signal. A reply missing `value` (e.g. a server error reshaped upstream)
+/// leaves the signal at its current value.
+fn Settler(comptime T: type, comptime name: []const u8) type {
+    return struct {
+        fn handle(ptr: [*]const u8, len: u32) void {
+            const doc = parseJson(ptr[0..len]) orelse return;
+            defer doc.free();
+            const v = doc.get("value") orelse return;
+            switch (T) {
+                i32 => signalSetI32(name, @intCast(v.int())),
+                bool => signalSetBool(name, v.boolean()),
+                f32 => signalSetF32(name, @floatCast(v.float())),
+                []const u8 => {
+                    var buf: [256]u8 = undefined;
+                    signalSetStr(name, v.str(&buf));
+                },
+                else => @compileError("fetchSignal: unsupported T " ++ @typeName(T)),
+            }
+        }
+    };
+}
+
+/// Fetch `action_name(args)` from the server and set the already-registered,
+/// vid-scoped signal `signal_name` from the typed reply `value`. The signal
+/// must be registered first (e.g. `registerI32(signal_name, loading_default)`)
+/// so the DOM binds; this updates it when the reply lands.
+///
+/// `T` is the signal type: `i32` | `[]const u8` | `bool` | `f32`. On server
+/// error / no reply the signal keeps its loading value (no error path).
+pub fn fetchSignal(
+    comptime T: type,
+    comptime action_name: []const u8,
+    args: anytype,
+    comptime signal_name: []const u8,
+) void {
+    const m = chunkArenaMark();
+    defer chunkArenaReset(m);
+    // Serialize args to a JSON object for the POST body. The bridge reads the
+    // body synchronously inside `serverFnPostRid`, so the arena is still live.
+    const json = std.json.Stringify.valueAlloc(chunkArena(), args, .{}) catch return;
+    const rid = nextReqId();
+    registerResponseHandlerOnce(action_name, rid, &Settler(T, signal_name).handle);
+    serverFnPostRid(action_name, json, rid);
+}
+
 /// A handle into the main client's shared JSON value table. Non-owning
 /// child handles from `get`/`at` stay valid until the root `free`s —
 /// free the root last.
