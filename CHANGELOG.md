@@ -4,6 +4,39 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.34] - 2026-06-02
+
+### Added
+
+- **Client-side value fetch (`fetchSignal`).** An island chunk whose value
+  wasn't resolved at SSR (`islandStateValue` returns null — the resource was
+  still loading, or it's a `LocalResource`) fetches it client-side:
+  `verve.fetchSignal(T, action_name, args, signal_name)` posts a correlated
+  server-fn request (`x-verve-rid`) and registers a one-shot settler that decodes
+  the typed reply `value` via the chunk JSON service and sets the named,
+  vid-scoped signal — `dispatchResponse` restores the island vid first, so two
+  instances of one component never cross. `T` is the signal type
+  (`i32` / `[]const u8` / `bool` / `f32`). On server error / no reply the signal
+  keeps its loading value (error path deferred). This required extending Phase A's
+  rid correlation to the **chunk runtime**: `verve_next_req_id` /
+  `verve_register_response_handler_once` / `verve_server_fn_post_rid` are now
+  exported to the `verve_runtime` namespace with matching chunk-façade wrappers —
+  any chunk can do a one-shot correlated request → typed-reply loop, not just
+  value fetches. Guide: `docs/15-islands.md`.
+
+- **i18n lazy catalogs (`LazyCatalog`).** For very large multi-locale translation
+  sets, an opt-in `LazyCatalog` ships each locale as a separate embedded JSON blob
+  and parses + caches only the active (and default-fallback) locale on first
+  lookup, mutex-guarded for the server worker pool. Fallback chain is
+  locale → default → key. A build-time walker turns `i18n/<locale>.json` (flat
+  `{ "key": "value" }`) into an `@embedFile`d `locales` manifest module —
+  single-binary distribution preserved; missing dir degrades to an empty manifest.
+  Options: `-Di18n-dir` (default `i18n/`), `-Di18n-default`. `resolveLocale` is now
+  duck-typed (`catalog: anytype`) so it works with both `LazyCatalog` and the
+  existing comptime `Catalog` (which stays the zero-cost choice for small sets).
+  New public surface: `verve.I18nLazyCatalog`, `verve.I18nLocale`. Guide:
+  `docs/14-i18n.md`.
+
 ## [0.1.33] - 2026-06-01
 
 ### Added
