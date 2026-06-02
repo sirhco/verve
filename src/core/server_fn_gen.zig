@@ -74,13 +74,12 @@ pub fn post(
     }
 }
 
-/// Typed call with a result callback. Invokes the action and hands the
-/// unwrapped success value to `on_reply`; errors are swallowed (the
-/// callback simply doesn't fire). On native this runs synchronously —
-/// the callback has returned by the time `call` returns. The shape
-/// mirrors the chunk-side `request → typed reply` loop so server and
-/// (future) wasm-app call sites read the same way; the arena is kept for
-/// forward-compatibility with an async wasm path.
+/// Typed call with a result callback. On native this runs synchronously —
+/// invokes the action and hands the unwrapped success value to `on_reply`;
+/// errors skip the callback. On wasm, serializes `args` to JSON, registers
+/// a correlated typed decoder via `registerCall`, and posts to the JS bridge;
+/// `on_reply` fires later when the bridge delivers the reply. Void actions
+/// on wasm post fire-and-forget (no rid, no decoder registered).
 pub fn call(
     comptime f: anytype,
     arena: std.mem.Allocator,
@@ -89,12 +88,39 @@ pub fn call(
     comptime on_reply: anytype,
 ) void {
     const RetT = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
-    const ret = invoke(f, arena, args, name);
-    if (@typeInfo(RetT) == .error_union) {
-        const v = ret catch return;
-        on_reply(v);
+    const SuccessT = switch (@typeInfo(RetT)) {
+        .error_union => |eu| eu.payload,
+        else => RetT,
+    };
+
+    if (builtin.target.cpu.arch.isWasm()) {
+        const json = std.json.Stringify.valueAlloc(arena, args, .{}) catch return;
+        const wasm_bridge = struct {
+            extern "verve" fn server_fn_post(
+                name_ptr: [*]const u8,
+                name_len: usize,
+                body_ptr: [*]const u8,
+                body_len: usize,
+                rid: u32,
+            ) void;
+        };
+        if (SuccessT == void) {
+            // Nothing to deliver — behave like `_post` (fire-and-forget).
+            wasm_bridge.server_fn_post(name.ptr, name.len, json.ptr, json.len, 0);
+        } else {
+            const rid = registerCall(SuccessT, name, on_reply);
+            wasm_bridge.server_fn_post(name.ptr, name.len, json.ptr, json.len, rid);
+        }
     } else {
-        on_reply(ret);
+        // Native: run the action synchronously, hand the unwrapped value
+        // to on_reply. Errors skip the callback.
+        const ret = invoke(f, arena, args, name);
+        if (@typeInfo(RetT) == .error_union) {
+            const v = ret catch return;
+            on_reply(v);
+        } else {
+            on_reply(ret);
+        }
     }
 }
 
