@@ -17,6 +17,9 @@ pub fn counter(ctx: *const verve.Context, initial: i32) !*verve.Node {
         ctx.actionForm(.{ .post = "/api/decrementCount", .class = "counter-form" }).children(.{
             ctx.button("-").type_("submit").onClick("decrement_counter"),
         }),
+        // Typed `_call` round-trip demo: no form — the wasm export posts
+        // and the correlated reply sets the count.
+        ctx.button("call +").type_("button").onClick("verve_call_increment"),
         ctx.p().class("clicks").children(.{
             ctx.span().text("Total clicks: "),
             ctx.span().bind("clicks").text("0"),
