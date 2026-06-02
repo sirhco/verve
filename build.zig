@@ -610,6 +610,9 @@ fn buildI18nCatalog(b: *std.Build, dir: []const u8, default: ?[]const u8, verve_
         while (walker.next(io) catch @panic("i18n walk failed")) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.basename, ".json")) continue;
+            // Flat layout only: skip files nested in subdirs (their basenames
+            // could collide across dirs, producing duplicate locale tags).
+            if (!std.mem.eql(u8, entry.path, entry.basename)) continue;
             const tag = entry.basename[0 .. entry.basename.len - ".json".len];
             const tag_owned = b.allocator.dupe(u8, tag) catch @panic("OOM");
             if (first_tag == null or std.mem.lessThan(u8, tag_owned, first_tag.?)) first_tag = tag_owned;

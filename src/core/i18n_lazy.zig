@@ -71,7 +71,13 @@ pub const LazyCatalog = struct {
                 break;
             }
         }
-        self.cache.put(self.gpa, tag, parsed) catch {};
+        // Own the cache key: callers may pass a request-scoped (arena) locale
+        // slice (resolveLocale returns cookie/query/Accept-Language values), so
+        // dupe into the process-lifetime allocator before storing — otherwise
+        // the stored key dangles once the request arena is freed and the next
+        // lookup's key comparison reads freed memory.
+        const key_owned = self.gpa.dupe(u8, tag) catch return parsed;
+        self.cache.put(self.gpa, key_owned, parsed) catch {};
         return parsed;
     }
 };
@@ -137,6 +143,23 @@ test "isSupported reflects manifest tags without parsing" {
     try testing.expect(cat.isSupported("fr"));
     try testing.expect(!cat.isSupported("de"));
     try testing.expectEqual(@as(usize, 0), cat.cache.count()); // no parse triggered
+}
+
+test "cache key survives a freed caller locale slice" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var cat = LazyCatalog.init(&fixture, "en", arena.allocator());
+
+    // The caller passes a locale slice from a separate, short-lived arena —
+    // mirrors resolveLocale returning a request-scoped cookie/query value.
+    var req = std.heap.ArenaAllocator.init(testing.allocator);
+    const loc1 = try req.allocator().dupe(u8, "fr");
+    _ = cat.lookup(loc1, "greeting"); // caches "fr" — the key must be owned
+    req.deinit(); // free the caller's slice
+
+    // A later lookup whose key compares against the cached key. If the cache
+    // stored the freed `loc1` pointer, this comparison reads freed memory.
+    try testing.expectEqualStrings("Bonjour", cat.lookup("fr", "greeting"));
 }
 
 test "concurrent lookups are race-free" {
