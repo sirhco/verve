@@ -151,6 +151,7 @@ extern fn g_signal_handler_disconnect(instance: *anyopaque, handler_id: c_ulong)
 const AtkObject = opaque {};
 extern fn gtk_widget_get_accessible(w: *GtkWidget) *AtkObject;
 extern fn atk_object_set_name(obj: *AtkObject, name: [*:0]const u8) void;
+extern fn atk_object_set_description(obj: *AtkObject, description: [*:0]const u8) void;
 extern fn gtk_window_set_keep_above(w: *GtkWindow, on: gboolean) void;
 extern fn gtk_widget_set_opacity(w: *GtkWidget, value: f64) void;
 extern fn gtk_window_resize(w: *GtkWindow, width: c_int, height: c_int) void;
@@ -904,6 +905,33 @@ pub const Window = struct {
         defer self.ctx.allocator.free(z);
         const atk_obj = gtk_widget_get_accessible(w);
         atk_object_set_name(atk_obj, z.ptr);
+    }
+
+    /// `atk_object_set_description` — the supplementary description Orca
+    /// and other AT tools read after the name. The ATK analogue of
+    /// macOS's AXHelp.
+    pub fn setAccessibilityHelp(self: *Window, text: []const u8) void {
+        const w = self.ctx.window orelse return;
+        const z = self.ctx.allocator.dupeZ(u8, text) catch return;
+        defer self.ctx.allocator.free(z);
+        const atk_obj = gtk_widget_get_accessible(w);
+        atk_object_set_description(atk_obj, z.ptr);
+    }
+
+    /// No-op: ATK's role is a fixed enum (`AtkRole`); there is no clean
+    /// per-object role-description string channel without a custom
+    /// AtkObject subclass. Deferred.
+    pub fn setAccessibilityRoleDescription(self: *Window, text: []const u8) void {
+        _ = self;
+        _ = text;
+        std.log.info("verve.desktop[linux]: setAccessibilityRoleDescription no-op (ATK role is an enum)", .{});
+    }
+
+    /// No-op: ATK has no window-subrole concept.
+    pub fn setAccessibilitySubrole(self: *Window, subrole: opts_mod.AccessibilitySubrole) void {
+        _ = self;
+        _ = subrole;
+        std.log.info("verve.desktop[linux]: setAccessibilitySubrole no-op (no ATK subrole)", .{});
     }
 
     /// Toggle whether the window stays above normal-stack peers.
