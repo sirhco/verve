@@ -7,10 +7,13 @@
 //!
 //! Per-platform strategy:
 //!
-//! - **macOS** — `[NSUserNotification new]` +
-//!   `[NSUserNotificationCenter deliverNotification:]`. Deprecated on
-//!   macOS 11+ in favor of `UNUserNotificationCenter` but still
-//!   functional and avoids the permission-grant flow.
+//! - **macOS** — `UNUserNotificationCenter`. Requires a signed app
+//!   bundle (a bare/un-bundled process has no bundle id and is rejected
+//!   with `error.Unsupported`). The first `show` lazily requests
+//!   authorization and pumps a nested `NSRunLoop` until the grant
+//!   resolves (cookies/snapshot idiom); a denied grant yields
+//!   `error.Unsupported`. Delivery builds a `UNMutableNotificationContent`
+//!   + `UNNotificationRequest` (nil trigger = immediate).
 //! - **Linux** — `notify_init` + `notify_notification_new` +
 //!   `notify_notification_show`. libnotify is loaded at runtime via
 //!   `dlopen("libnotify.so.4")` so scaffolds on distros that don't
@@ -60,38 +63,151 @@ fn showWindows(opts: NotificationOptions) Error!void {
     };
 }
 
-// ---- macOS — NSUserNotification --------------------------------------------
+// ---- macOS — UNUserNotificationCenter --------------------------------------
 
 const m = if (builtin.os.tag == .macos) @import("msg.zig") else struct {};
 const id = ?*anyopaque;
 const SEL = ?*anyopaque;
 
+extern const _NSConcreteStackBlock: anyopaque;
+
+const BlockDescriptor = extern struct {
+    reserved: c_ulong = 0,
+    size: c_ulong,
+};
+const auth_block_desc: BlockDescriptor = .{ .size = @sizeOf(AuthBlock) };
+
+/// Completion block for `requestAuthorizationWithOptions:completionHandler:`.
+/// Invoke signature `(block, BOOL granted, NSError *error)`. BOOL maps to
+/// Zig `bool` on 64-bit darwin per the `msg.zig` ABI audit.
+const AuthBlock = extern struct {
+    isa: *const anyopaque,
+    flags: c_int,
+    reserved: c_int,
+    invoke: *const fn (*AuthBlock, bool, id) callconv(.c) void,
+    descriptor: *const BlockDescriptor,
+    granted: *bool,
+    done: *bool,
+};
+
+fn authBlockInvoke(block: *AuthBlock, granted: bool, err: id) callconv(.c) void {
+    _ = err;
+    block.granted.* = granted;
+    block.done.* = true;
+}
+
+// Process-wide authorization cache (requested once) + monotonic request id.
+var g_auth: ?bool = null;
+var g_note_seq: std.atomic.Value(u32) = .init(0);
+
+/// Spin the current run loop in default mode until `done` flips. Mirrors
+/// `macos.zig`'s helper. Re-entrancy: safe from IPC handlers (default
+/// mode); unsafe from inside a modal run loop.
+fn pumpUntilDone(done: *const bool) void {
+    const NSRunLoop = m.getClass("NSRunLoop");
+    const NSDate = m.getClass("NSDate");
+    const currentRunLoop = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const distantFuture = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const runMode = m.cast(*const fn (id, SEL, id, id) callconv(.c) bool);
+
+    const mode_str = nsString("kCFRunLoopDefaultMode");
+    while (!done.*) {
+        const rl = currentRunLoop(@as(id, @ptrCast(NSRunLoop)), m.sel("currentRunLoop"));
+        const date = distantFuture(@as(id, @ptrCast(NSDate)), m.sel("distantFuture"));
+        _ = runMode(rl, m.sel("runMode:beforeDate:"), mode_str, date);
+    }
+}
+
 fn showMacos(allocator: std.mem.Allocator, opts: NotificationOptions) Error!void {
     if (builtin.os.tag != .macos) return error.Unsupported;
     _ = allocator;
 
-    const NSUserNotification = m.getClass("NSUserNotification");
+    // UNUserNotificationCenter requires a bundle identifier; a bare
+    // (un-bundled) process raises on `currentNotificationCenter`.
+    const NSBundle = m.getClass("NSBundle");
+    const mainBundle = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const bundle = mainBundle(@as(id, @ptrCast(NSBundle)), m.sel("mainBundle"));
+    const bundleId = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const bid = bundleId(bundle, m.sel("bundleIdentifier"));
+    if (@intFromPtr(bid) == 0) {
+        std.log.warn("verve.desktop[macos]: notifications require an app bundle (no bundle id); skipping", .{});
+        return error.Unsupported;
+    }
+
+    const UNUserNotificationCenter = m.getClass("UNUserNotificationCenter");
+    const currentCenter = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const center = currentCenter(
+        @as(id, @ptrCast(UNUserNotificationCenter)),
+        m.sel("currentNotificationCenter"),
+    );
+    if (@intFromPtr(center) == 0) return error.Backend;
+
+    // Lazy one-time authorization, synchronous via nested run-loop pump.
+    if (g_auth == null) {
+        var granted: bool = false;
+        var done: bool = false;
+        var block: AuthBlock = .{
+            .isa = &_NSConcreteStackBlock,
+            .flags = 0,
+            .reserved = 0,
+            .invoke = &authBlockInvoke,
+            .descriptor = &auth_block_desc,
+            .granted = &granted,
+            .done = &done,
+        };
+        const UNAuthorizationOptionSound: c_ulong = 1 << 1;
+        const UNAuthorizationOptionAlert: c_ulong = 1 << 2;
+        const requestAuth = m.cast(*const fn (id, SEL, c_ulong, *AuthBlock) callconv(.c) void);
+        requestAuth(
+            center,
+            m.sel("requestAuthorizationWithOptions:completionHandler:"),
+            UNAuthorizationOptionAlert | UNAuthorizationOptionSound,
+            &block,
+        );
+        pumpUntilDone(&done);
+        g_auth = granted;
+    }
+    if (!(g_auth orelse false)) return error.Unsupported;
+
+    // Build the notification content.
+    const UNMutableNotificationContent = m.getClass("UNMutableNotificationContent");
     const alloc_id = m.cast(*const fn (id, SEL) callconv(.c) id);
     const init_id = m.cast(*const fn (id, SEL) callconv(.c) id);
-    const note = init_id(alloc_id(@as(id, @ptrCast(NSUserNotification)), m.sel("alloc")), m.sel("init"));
-    if (@intFromPtr(note) == 0) return error.Backend;
+    const content = init_id(
+        alloc_id(@as(id, @ptrCast(UNMutableNotificationContent)), m.sel("alloc")),
+        m.sel("init"),
+    );
+    if (@intFromPtr(content) == 0) return error.Backend;
+    const release = m.cast(*const fn (id, SEL) callconv(.c) void);
 
     const setTitle = m.cast(*const fn (id, SEL, id) callconv(.c) void);
-    setTitle(note, m.sel("setTitle:"), nsString(opts.title));
-    const setInformativeText = m.cast(*const fn (id, SEL, id) callconv(.c) void);
-    setInformativeText(note, m.sel("setInformativeText:"), nsString(opts.body));
+    setTitle(content, m.sel("setTitle:"), nsString(opts.title));
+    const setBody = m.cast(*const fn (id, SEL, id) callconv(.c) void);
+    setBody(content, m.sel("setBody:"), nsString(opts.body));
 
-    const NSUserNotificationCenter = m.getClass("NSUserNotificationCenter");
-    const defaultCenter = m.cast(*const fn (id, SEL) callconv(.c) id);
-    const center = defaultCenter(
-        @as(id, @ptrCast(NSUserNotificationCenter)),
-        m.sel("defaultUserNotificationCenter"),
+    // Unique request identifier from a process-static counter.
+    var idbuf: [32]u8 = undefined;
+    const seq = g_note_seq.fetchAdd(1, .monotonic);
+    const ident = std.fmt.bufPrint(&idbuf, "verve-note-{d}", .{seq}) catch "verve-note";
+
+    const UNNotificationRequest = m.getClass("UNNotificationRequest");
+    const reqWith = m.cast(*const fn (id, SEL, id, id, id) callconv(.c) id);
+    const req = reqWith(
+        @as(id, @ptrCast(UNNotificationRequest)),
+        m.sel("requestWithIdentifier:content:trigger:"),
+        nsString(ident),
+        content,
+        null,
     );
-    const deliver = m.cast(*const fn (id, SEL, id) callconv(.c) void);
-    deliver(center, m.sel("deliverNotification:"), note);
+    if (@intFromPtr(req) == 0) {
+        release(content, m.sel("release"));
+        return error.Backend;
+    }
 
-    const release = m.cast(*const fn (id, SEL) callconv(.c) void);
-    release(note, m.sel("release"));
+    const addReq = m.cast(*const fn (id, SEL, id, ?*anyopaque) callconv(.c) void);
+    addReq(center, m.sel("addNotificationRequest:withCompletionHandler:"), req, null);
+
+    release(content, m.sel("release"));
 }
 
 fn nsString(s: []const u8) id {
