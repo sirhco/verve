@@ -527,11 +527,16 @@
     // (no cross-module function table); they call back into the main runtime
     // via their `verve_runtime` imports. Scope the call to the enclosing
     // island's vid so name-keyed signal lookups resolve that island's signals.
+    const islandEl = target.closest("verve-island");
+    const islandName = islandEl ? islandEl.getAttribute("data-name") || "" : "";
     const fn =
-      typeof exp[action] === "function" ? exp[action] : chunkExports[action];
+      typeof exp[action] === "function"
+        ? exp[action]
+        : islandName && chunkExports[islandName]
+          ? chunkExports[islandName][action]
+          : undefined;
     if (typeof fn === "function") {
       e.preventDefault();
-      const islandEl = target.closest("verve-island");
       const vid = islandEl ? parseInt(islandEl.getAttribute("data-vid"), 10) || 0 : 0;
       const scope = vid && typeof exp.verve_enter_island === "function";
       if (scope) exp.verve_enter_island(vid);
@@ -1000,9 +1005,11 @@
   };
 
   const islandChunks = new Map();
-  // Exported handler fns from loaded island chunks, keyed by export name, so
-  // `z-on-click="<name>"` on an island's markup can reach a chunk handler.
-  // (Last-writer-wins across chunks; name your chunk handlers distinctly.)
+  // Exported handler fns from loaded island chunks, keyed by island `data-name`
+  // then by export name, so `z-on-click="<name>"` on an island's markup reaches
+  // *that* island's chunk handler. Nesting by island name prevents two
+  // different components that export the same handler name from colliding
+  // (dispatch scopes the lookup to the click target's enclosing island).
   const chunkExports = {};
   const loadIslandChunk = async (el, instanceId) => {
     const name = el.getAttribute("data-name") || "";
@@ -1029,9 +1036,11 @@
     const cexp = chunk.instance.exports;
     if (typeof cexp.hydrate !== "function") return;
     // Register this chunk's exported handlers (everything callable except the
-    // hydrate entry) so `z-on-click="<name>"` can dispatch to them.
+    // hydrate entry) under this island's name so `z-on-click="<name>"` can
+    // dispatch to them, scoped to this component.
+    const handlers = chunkExports[name] || (chunkExports[name] = {});
     for (const k of Object.keys(cexp)) {
-      if (k !== "hydrate" && typeof cexp[k] === "function") chunkExports[k] = cexp[k];
+      if (k !== "hydrate" && typeof cexp[k] === "function") handlers[k] = cexp[k];
     }
     const props = el.getAttribute("data-props") || "";
     // Re-stage THIS island's resource-state blob now: chunk load is async, so

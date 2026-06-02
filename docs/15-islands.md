@@ -156,7 +156,10 @@ dispatches into chunk code without further JS hops.
 
 Chunks that prefer the simpler string-name path still work — export
 a named handler and stamp `z-on-click="<exportName>"`. The bridge
-JS click delegate looks up the export on the chunk's own instance.
+JS click delegate looks up the export on the chunk's own instance:
+dispatch is scoped to the click target's enclosing `<verve-island>`
+by `data-name`, so two different components may export the same
+handler name without colliding — each resolves to its own chunk.
 
 ### Multi-instance islands
 
