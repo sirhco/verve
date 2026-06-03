@@ -949,7 +949,6 @@ fn customSchemeOptions(scheme: []const u8) ?*anyopaque {
     return @ptrCast(&g_env_options);
 }
 
-
 // ---- Filter for AddWebResourceRequestedFilter -------------------------------
 
 const COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL: c_int = 0;
