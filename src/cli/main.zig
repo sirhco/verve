@@ -17,6 +17,7 @@
 //!                   `src/desktop/`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const skeleton = @import("skeleton");
 const skeleton_desktop = @import("skeleton_desktop");
 const skeleton_desktop_minimal = @import("skeleton_desktop_minimal");
@@ -331,7 +332,23 @@ fn resolveRelativeVervePath(io: std.Io, gpa: std.mem.Allocator, dir_path: []cons
     const abs_verve = try canonicalize(io, gpa, lex_verve);
     defer gpa.free(abs_verve);
 
-    return std.fs.path.relativePosix(gpa, cwd_abs, abs_dir, abs_verve);
+    // Use the platform-dispatching `relative` (→ relativeWindows on Win,
+    // relativePosix elsewhere): the POSIX variant tokenizes on '/' only,
+    // so a Windows `C:\...` path shares no prefix with the target and
+    // yields a bogus `../C:\...`. relativeWindows understands drive
+    // letters + backslash separators.
+    const rel = try std.fs.path.relative(gpa, cwd_abs, null, abs_dir, abs_verve);
+
+    // build.zig.zon `.path` is a Zig string literal; backslashes are
+    // escape chars (`\U`, `\c` → "invalid escape character"). Zig's build
+    // system accepts '/' separators on every host, so normalize. Done
+    // in place — `rel` is freshly owned.
+    if (builtin.os.tag == .windows) {
+        for (rel) |*c| {
+            if (c.* == '\\') c.* = '/';
+        }
+    }
+    return rel;
 }
 
 fn parseTemplate(s: []const u8) !DesktopTemplate {

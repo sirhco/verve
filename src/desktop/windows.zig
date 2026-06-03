@@ -381,12 +381,14 @@ const IDropTarget = extern struct {
 };
 extern "shlwapi" fn SHCreateMemStream(bytes: ?[*]const u8, size: UINT) callconv(.winapi) ?*IStream;
 
-// `CapturePreview` writes through a writable IStream. `shlwapi`'s
-// `SHCreateStreamOnHGlobal(NULL, TRUE, &stream)` allocates a growable
+// `CapturePreview` writes through a writable IStream. ole32's
+// `CreateStreamOnHGlobal(NULL, TRUE, &stream)` allocates a growable
 // HGLOBAL-backed stream that releases its memory when the stream's
 // refcount hits zero. Caller reads back via IStream::Stat + Seek +
-// Read.
-extern "shlwapi" fn SHCreateStreamOnHGlobal(
+// Read. (Identical contract to shlwapi's SHCreateStreamOnHGlobal, but
+// ole32 — already linked — exports it reliably under the MinGW import
+// libs, where shlwapi's copy is absent.)
+extern "ole32" fn CreateStreamOnHGlobal(
     hGlobal: ?*anyopaque,
     fDeleteOnRelease: BOOL,
     ppstm: *?*IStreamW,
@@ -497,6 +499,7 @@ const Ctrl = extern struct { lpVtbl: *const anyopaque };
 const Wv2 = extern struct { lpVtbl: *const anyopaque };
 const Wv2_2 = extern struct { lpVtbl: *const anyopaque };
 const Wv2_16 = extern struct { lpVtbl: *const anyopaque };
+const Wv2_22 = extern struct { lpVtbl: *const anyopaque };
 const CookieMgr = extern struct { lpVtbl: *const anyopaque };
 const CookieT = extern struct { lpVtbl: *const anyopaque };
 const CookieList = extern struct { lpVtbl: *const anyopaque };
@@ -536,8 +539,21 @@ const SLOT_WV2_ExecuteScript: usize = 29;
 /// the runtime; output goes into the supplied stream.
 const SLOT_WV2_CapturePreview: usize = 30;
 const SLOT_WV2_add_WebMessageReceived: usize = 34;
-const SLOT_WV2_add_WebResourceRequested: usize = 52;
-const SLOT_WV2_AddWebResourceRequestedFilter: usize = 54;
+// ICoreWebView2 vtable slots (verified against the SDK header): the
+// WebResourceRequested pair sits at 55/57, not 52/54 — the off-by-three
+// here silently registered the asset handler against the wrong methods
+// (they returned S_OK but never fired), leaving every page blank on Windows.
+const SLOT_WV2_add_WebResourceRequested: usize = 55;
+const SLOT_WV2_AddWebResourceRequestedFilter: usize = 57;
+
+// ICoreWebView2_22.AddWebResourceRequestedFilterWithRequestSourceKinds — the
+// only way to intercept the *top-level document* request of a custom scheme.
+// The legacy AddWebResourceRequestedFilter only covers sub-resources, so a
+// page navigated via `<scheme>://app/index.html` never fires the handler and
+// renders blank. SOURCE_KINDS_ALL includes the document navigation itself.
+const IID_ICoreWebView2_22: GUID = .{ .Data1 = 0xdb75dfc7, .Data2 = 0xa857, .Data3 = 0x4632, .Data4 = .{ 0xa3, 0x98, 0x69, 0x69, 0xdd, 0xe2, 0x6c, 0x0a } };
+const SLOT_WV2_22_AddWebResourceRequestedFilterWithRequestSourceKinds: usize = 123;
+const COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL: u32 = 0xffffffff;
 
 const SLOT_RequestedArgs_get_Request: usize = 3;
 const SLOT_RequestedArgs_put_Response: usize = 5;
@@ -693,6 +709,244 @@ fn comAddRef(_: ?*const IUnknown) callconv(.winapi) ULONG {
 }
 fn comRelease(_: ?*const IUnknown) callconv(.winapi) ULONG {
     return 1;
+}
+
+// ---- Custom URL-scheme registration -----------------------------------------
+//
+// WebView2 is Chromium: it refuses to *navigate* to an unregistered URL
+// scheme, so `<scheme>://app/index.html` renders a blank page and the
+// WebResourceRequested filter below never even fires. WKWebView (macOS) has
+// no such restriction, which is why this only bites on Windows. The fix is to
+// declare the scheme at environment-creation time via
+// ICoreWebView2EnvironmentOptions4.CustomSchemeRegistrations. We hand
+// CreateCoreWebView2EnvironmentWithOptions a minimal options object exposing
+// exactly one registration. All three COM objects are process-global
+// singletons with no per-call state, so AddRef/Release are no-ops and
+// QueryInterface dispatches purely by IID. The scheme name is captured into
+// `g_scheme_name_w` immediately before env creation (see Window.init).
+
+extern "ole32" fn CoTaskMemAlloc(cb: usize) callconv(.winapi) ?*anyopaque;
+
+const S_OK: HRESULT = 0;
+const E_OUTOFMEMORY: HRESULT = @bitCast(@as(u32, 0x8007000E));
+
+const IID_IUnknown: GUID = .{ .Data1 = 0, .Data2 = 0, .Data3 = 0, .Data4 = .{ 0, 0, 0, 0xC0, 0, 0, 0, 0x46 } };
+const IID_EnvOptions: GUID = .{ .Data1 = 0x2fde08a8, .Data2 = 0x1e9a, .Data3 = 0x4766, .Data4 = .{ 0x8c, 0x05, 0x95, 0xa9, 0xce, 0xb9, 0xd1, 0xc5 } };
+const IID_EnvOptions4: GUID = .{ .Data1 = 0xac52d13f, .Data2 = 0x0d38, .Data3 = 0x475a, .Data4 = .{ 0x9d, 0xca, 0x87, 0x65, 0x80, 0xd6, 0x79, 0x3e } };
+const IID_CustomScheme: GUID = .{ .Data1 = 0xd60ac92c, .Data2 = 0x37a6, .Data3 = 0x4b26, .Data4 = .{ 0xa3, 0x9e, 0x95, 0xcf, 0xe5, 0x90, 0x47, 0xbb } };
+
+fn guidEq(a: *const IID, b: *const IID) bool {
+    return a.Data1 == b.Data1 and a.Data2 == b.Data2 and a.Data3 == b.Data3 and std.mem.eql(u8, &a.Data4, &b.Data4);
+}
+
+fn comAddRef1(_: ?*anyopaque) callconv(.winapi) ULONG {
+    return 1;
+}
+fn comRelease1(_: ?*anyopaque) callconv(.winapi) ULONG {
+    return 1;
+}
+
+// Scheme name as a NUL-terminated UTF-16 string, set before env creation.
+var g_scheme_name_w: [64]u16 = [_]u16{0} ** 64;
+
+// --- ICoreWebView2CustomSchemeRegistration (IID d60ac92c-…) ---
+const ICustomSchemeRegVtbl = extern struct {
+    QueryInterface: *const fn (?*anyopaque, *const IID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (?*anyopaque) callconv(.winapi) ULONG,
+    Release: *const fn (?*anyopaque) callconv(.winapi) ULONG,
+    get_SchemeName: *const fn (?*anyopaque, *LPWSTR) callconv(.winapi) HRESULT,
+    get_TreatAsSecure: *const fn (?*anyopaque, *BOOL) callconv(.winapi) HRESULT,
+    put_TreatAsSecure: *const fn (?*anyopaque, BOOL) callconv(.winapi) HRESULT,
+    GetAllowedOrigins: *const fn (?*anyopaque, *u32, *?*anyopaque) callconv(.winapi) HRESULT,
+    SetAllowedOrigins: *const fn (?*anyopaque, u32, ?*anyopaque) callconv(.winapi) HRESULT,
+    get_HasAuthorityComponent: *const fn (?*anyopaque, *BOOL) callconv(.winapi) HRESULT,
+    put_HasAuthorityComponent: *const fn (?*anyopaque, BOOL) callconv(.winapi) HRESULT,
+};
+fn schemeQI(this: ?*anyopaque, riid: *const IID, ppv: *?*anyopaque) callconv(.winapi) HRESULT {
+    if (guidEq(riid, &IID_IUnknown) or guidEq(riid, &IID_CustomScheme)) {
+        ppv.* = this;
+        return S_OK;
+    }
+    ppv.* = null;
+    return E_NOINTERFACE;
+}
+fn schemeGetName(_: ?*anyopaque, out: *LPWSTR) callconv(.winapi) HRESULT {
+    var n: usize = 0;
+    while (g_scheme_name_w[n] != 0) : (n += 1) {}
+    const count = n + 1; // include the NUL terminator
+    const mem = CoTaskMemAlloc(count * 2) orelse return E_OUTOFMEMORY;
+    const dst: [*]u16 = @ptrCast(@alignCast(mem));
+    @memcpy(dst[0..count], g_scheme_name_w[0..count]);
+    out.* = @ptrCast(dst);
+    return S_OK;
+}
+fn schemeGetSecure(_: ?*anyopaque, out: *BOOL) callconv(.winapi) HRESULT {
+    out.* = 1; // secure context (https-equivalent origin)
+    return S_OK;
+}
+fn schemeGetOrigins(_: ?*anyopaque, count: *u32, origins: *?*anyopaque) callconv(.winapi) HRESULT {
+    // Allow-list "*": permit any origin (including the programmatic top-level
+    // Navigate to `<scheme>://app/...`) to access the scheme. An EMPTY list
+    // makes WebView2 treat the scheme as access-restricted and silently blocks
+    // the initial navigation, so it hangs with no WebResourceRequested event.
+    const arr = CoTaskMemAlloc(@sizeOf(?*anyopaque)) orelse return E_OUTOFMEMORY;
+    const star = CoTaskMemAlloc(2 * 2) orelse return E_OUTOFMEMORY; // "*\0"
+    const s: [*]u16 = @ptrCast(@alignCast(star));
+    s[0] = '*';
+    s[1] = 0;
+    const slot: *?*anyopaque = @ptrCast(@alignCast(arr));
+    slot.* = @ptrCast(s);
+    count.* = 1;
+    origins.* = arr;
+    return S_OK;
+}
+fn schemeGetAuthority(_: ?*anyopaque, out: *BOOL) callconv(.winapi) HRESULT {
+    out.* = 1; // `<scheme>://app/...` parses `app` as the host
+    return S_OK;
+}
+fn schemePutBool(_: ?*anyopaque, _: BOOL) callconv(.winapi) HRESULT {
+    return S_OK;
+}
+fn schemeSetOrigins(_: ?*anyopaque, _: u32, _: ?*anyopaque) callconv(.winapi) HRESULT {
+    return S_OK;
+}
+const scheme_reg_vtbl: ICustomSchemeRegVtbl = .{
+    .QueryInterface = schemeQI,
+    .AddRef = comAddRef1,
+    .Release = comRelease1,
+    .get_SchemeName = schemeGetName,
+    .get_TreatAsSecure = schemeGetSecure,
+    .put_TreatAsSecure = schemePutBool,
+    .GetAllowedOrigins = schemeGetOrigins,
+    .SetAllowedOrigins = schemeSetOrigins,
+    .get_HasAuthorityComponent = schemeGetAuthority,
+    .put_HasAuthorityComponent = schemePutBool,
+};
+const SchemeRegObj = extern struct { lpVtbl: *const ICustomSchemeRegVtbl };
+var g_scheme_reg: SchemeRegObj = .{ .lpVtbl = &scheme_reg_vtbl };
+
+// --- ICoreWebView2EnvironmentOptions (IID 2fde08a8-…) + …Options4 (ac52d13f-…) ---
+const IEnvOptionsVtbl = extern struct {
+    QueryInterface: *const fn (?*anyopaque, *const IID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (?*anyopaque) callconv(.winapi) ULONG,
+    Release: *const fn (?*anyopaque) callconv(.winapi) ULONG,
+    get_AdditionalBrowserArguments: *const fn (?*anyopaque, *LPWSTR) callconv(.winapi) HRESULT,
+    put_AdditionalBrowserArguments: *const fn (?*anyopaque, LPCWSTR) callconv(.winapi) HRESULT,
+    get_Language: *const fn (?*anyopaque, *LPWSTR) callconv(.winapi) HRESULT,
+    put_Language: *const fn (?*anyopaque, LPCWSTR) callconv(.winapi) HRESULT,
+    get_TargetCompatibleBrowserVersion: *const fn (?*anyopaque, *LPWSTR) callconv(.winapi) HRESULT,
+    put_TargetCompatibleBrowserVersion: *const fn (?*anyopaque, LPCWSTR) callconv(.winapi) HRESULT,
+    get_AllowSingleSignOnUsingOSPrimaryAccount: *const fn (?*anyopaque, *BOOL) callconv(.winapi) HRESULT,
+    put_AllowSingleSignOnUsingOSPrimaryAccount: *const fn (?*anyopaque, BOOL) callconv(.winapi) HRESULT,
+};
+const IEnvOptions4Vtbl = extern struct {
+    QueryInterface: *const fn (?*anyopaque, *const IID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (?*anyopaque) callconv(.winapi) ULONG,
+    Release: *const fn (?*anyopaque) callconv(.winapi) ULONG,
+    GetCustomSchemeRegistrations: *const fn (?*anyopaque, *u32, *?*anyopaque) callconv(.winapi) HRESULT,
+    SetCustomSchemeRegistrations: *const fn (?*anyopaque, u32, ?*anyopaque) callconv(.winapi) HRESULT,
+};
+const EnvOptionsObj = extern struct {
+    lpVtbl: *const IEnvOptionsVtbl,
+    lpVtbl4: *const IEnvOptions4Vtbl,
+};
+fn envOptForIID(riid: *const IID, ppv: *?*anyopaque) HRESULT {
+    // IUnknown identity is the primary object regardless of which interface
+    // the QI started from (COM requires a stable IUnknown).
+    if (guidEq(riid, &IID_IUnknown) or guidEq(riid, &IID_EnvOptions)) {
+        ppv.* = @ptrCast(&g_env_options);
+        return S_OK;
+    }
+    if (guidEq(riid, &IID_EnvOptions4)) {
+        ppv.* = @ptrCast(&g_env_options.lpVtbl4);
+        return S_OK;
+    }
+    ppv.* = null;
+    return E_NOINTERFACE;
+}
+fn envQI(_: ?*anyopaque, riid: *const IID, ppv: *?*anyopaque) callconv(.winapi) HRESULT {
+    return envOptForIID(riid, ppv);
+}
+fn envGetNull(_: ?*anyopaque, out: *LPWSTR) callconv(.winapi) HRESULT {
+    // NULL means "no value — use the runtime default". An empty string is
+    // NOT equivalent: WebView2 rejects an empty TargetCompatibleBrowserVersion
+    // with E_INVALIDARG, which aborts the whole environment creation before
+    // it ever reads our custom-scheme registration.
+    out.* = null;
+    return S_OK;
+}
+fn envPutStr(_: ?*anyopaque, _: LPCWSTR) callconv(.winapi) HRESULT {
+    return S_OK;
+}
+fn envGetTargetVersion(_: ?*anyopaque, out: *LPWSTR) callconv(.winapi) HRESULT {
+    // Unlike the other option strings, this one cannot be null/empty:
+    // WebView2 validates the installed runtime against it and rejects a
+    // missing value with E_INVALIDARG (aborting env creation). "86.0.616.0"
+    // is the original GA baseline — every Evergreen runtime satisfies it,
+    // and the actual (newer) runtime still provides Options4/custom schemes.
+    const ver = std.unicode.utf8ToUtf16LeStringLiteral("86.0.616.0");
+    const count = ver.len + 1; // include NUL
+    const mem = CoTaskMemAlloc(count * 2) orelse return E_OUTOFMEMORY;
+    const dst: [*]u16 = @ptrCast(@alignCast(mem));
+    @memcpy(dst[0..ver.len], ver[0..ver.len]);
+    dst[ver.len] = 0;
+    out.* = @ptrCast(dst);
+    return S_OK;
+}
+fn envGetBoolFalse(_: ?*anyopaque, out: *BOOL) callconv(.winapi) HRESULT {
+    out.* = 0;
+    return S_OK;
+}
+fn envPutBool(_: ?*anyopaque, _: BOOL) callconv(.winapi) HRESULT {
+    return S_OK;
+}
+const env_options_vtbl: IEnvOptionsVtbl = .{
+    .QueryInterface = envQI,
+    .AddRef = comAddRef1,
+    .Release = comRelease1,
+    .get_AdditionalBrowserArguments = envGetNull,
+    .put_AdditionalBrowserArguments = envPutStr,
+    .get_Language = envGetNull,
+    .put_Language = envPutStr,
+    .get_TargetCompatibleBrowserVersion = envGetTargetVersion,
+    .put_TargetCompatibleBrowserVersion = envPutStr,
+    .get_AllowSingleSignOnUsingOSPrimaryAccount = envGetBoolFalse,
+    .put_AllowSingleSignOnUsingOSPrimaryAccount = envPutBool,
+};
+fn env4QI(_: ?*anyopaque, riid: *const IID, ppv: *?*anyopaque) callconv(.winapi) HRESULT {
+    return envOptForIID(riid, ppv);
+}
+fn env4GetSchemes(_: ?*anyopaque, count: *u32, regs: *?*anyopaque) callconv(.winapi) HRESULT {
+    // Hand back a 1-element array of interface pointers. WebView2 takes
+    // ownership of the array (frees it via CoTaskMemFree) and Releases each
+    // entry, so AddRef the registration to balance.
+    const arr = CoTaskMemAlloc(@sizeOf(?*anyopaque)) orelse return E_OUTOFMEMORY;
+    const slot: *?*anyopaque = @ptrCast(@alignCast(arr));
+    slot.* = @ptrCast(&g_scheme_reg);
+    _ = g_scheme_reg.lpVtbl.AddRef(@ptrCast(&g_scheme_reg));
+    count.* = 1;
+    regs.* = arr;
+    return S_OK;
+}
+fn env4SetSchemes(_: ?*anyopaque, _: u32, _: ?*anyopaque) callconv(.winapi) HRESULT {
+    return S_OK;
+}
+const env_options4_vtbl: IEnvOptions4Vtbl = .{
+    .QueryInterface = env4QI,
+    .AddRef = comAddRef1,
+    .Release = comRelease1,
+    .GetCustomSchemeRegistrations = env4GetSchemes,
+    .SetCustomSchemeRegistrations = env4SetSchemes,
+};
+var g_env_options: EnvOptionsObj = .{ .lpVtbl = &env_options_vtbl, .lpVtbl4 = &env_options4_vtbl };
+
+/// Capture `scheme` as UTF-16 and return the singleton environment-options
+/// object to pass to CreateCoreWebView2EnvironmentWithOptions. Returns null
+/// (→ caller passes null options) if the scheme name doesn't fit the buffer.
+fn customSchemeOptions(scheme: []const u8) ?*anyopaque {
+    const n = std.unicode.utf8ToUtf16Le(g_scheme_name_w[0 .. g_scheme_name_w.len - 1], scheme) catch return null;
+    g_scheme_name_w[n] = 0;
+    return @ptrCast(&g_env_options);
 }
 
 // ---- Filter for AddWebResourceRequestedFilter -------------------------------
@@ -862,7 +1116,10 @@ pub const Window = struct {
         // Async — actual webview creation runs in the env/controller
         // completion handlers below.
         std.log.debug("verve.desktop[windows]: CreateCoreWebView2EnvironmentWithOptions", .{});
-        const hr = CreateCoreWebView2EnvironmentWithOptions(null, null, null, &heap.env_handler);
+        // Register the app's custom URL scheme so WebView2 (Chromium) will
+        // navigate to `<scheme>://app/...` — without this the page is blank.
+        const env_options = customSchemeOptions(opts.scheme);
+        const hr = CreateCoreWebView2EnvironmentWithOptions(null, null, env_options, &heap.env_handler);
         if (hr < 0) {
             std.log.err(
                 "WebView2 runtime missing or failed (hr=0x{x:0>8}). Install Evergreen runtime: {s}",
@@ -1480,9 +1737,9 @@ pub const Window = struct {
         const wv = self.ctx.webview orelse return opts_mod.SnapshotError.Unsupported;
 
         var stream: ?*IStreamW = null;
-        // SHCreateStreamOnHGlobal(NULL, TRUE, ...) gives us a growable
+        // CreateStreamOnHGlobal(NULL, TRUE, ...) gives us a growable
         // HGLOBAL-backed stream that frees its memory on Release.
-        if (SHCreateStreamOnHGlobal(null, 1, &stream) < 0) return opts_mod.SnapshotError.CaptureFailed;
+        if (CreateStreamOnHGlobal(null, 1, &stream) < 0) return opts_mod.SnapshotError.CaptureFailed;
         const stm = stream orelse return opts_mod.SnapshotError.CaptureFailed;
         defer releaseRef(@ptrCast(stm));
 
@@ -1603,11 +1860,14 @@ fn runFileDialogWindows(
     const filter_ptr: LPCWSTR = if (opts.allowed_extensions.len > 0) blk: {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        var pattern_buf = std.ArrayList(u8).init(arena.allocator());
+        const a = arena.allocator();
+        // Zig 0.16: std.ArrayList is unmanaged — the allocator is passed
+        // per call, not bound at init.
+        var pattern_buf: std.ArrayList(u8) = .empty;
         for (opts.allowed_extensions, 0..) |ext, i| {
-            if (i > 0) pattern_buf.append(';') catch break :blk null;
-            pattern_buf.appendSlice("*.") catch break :blk null;
-            pattern_buf.appendSlice(ext) catch break :blk null;
+            if (i > 0) pattern_buf.append(a, ';') catch break :blk null;
+            pattern_buf.appendSlice(a, "*.") catch break :blk null;
+            pattern_buf.appendSlice(a, ext) catch break :blk null;
         }
         const description = "Allowed types";
         var idx: usize = 0;
@@ -1665,12 +1925,23 @@ fn runFileDialogWindows(
 fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
         WM_SIZE => {
-            if (lookupCtx(hwnd)) |cx| if (cx.controller) |ctrl| {
-                var rect: RECT = undefined;
-                _ = GetClientRect(hwnd, &rect);
-                const putBounds = vtSlot(*const fn (*Ctrl, RECT) callconv(.winapi) HRESULT, ctrl.lpVtbl, SLOT_CTRL_putBounds);
-                _ = putBounds(ctrl, rect);
-            };
+            if (lookupCtx(hwnd)) |cx| {
+                // Keep the WebView2 controller filling the client area.
+                if (cx.controller) |ctrl| {
+                    var rect: RECT = undefined;
+                    _ = GetClientRect(hwnd, &rect);
+                    const putBounds = vtSlot(*const fn (*Ctrl, RECT) callconv(.winapi) HRESULT, ctrl.lpVtbl, SLOT_CTRL_putBounds);
+                    _ = putBounds(ctrl, rect);
+                }
+                // Then fire the app's resize handler. lParam low word =
+                // client-area width, high word = height.
+                if (cx.on_resize) |cb| {
+                    const lp_u: usize = @bitCast(lparam);
+                    const w: u32 = @intCast(lp_u & 0xFFFF);
+                    const h: u32 = @intCast((lp_u >> 16) & 0xFFFF);
+                    cb(cx.on_resize_ctx, w, h);
+                }
+            }
             return 0;
         },
         WM_SETTINGCHANGE => {
@@ -1734,17 +2005,6 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             // forwarder is installed by `tray.zig` on first `Tray.init`.
             // No-op if no tray was created in this process.
             if (tray_dispatch_message) |dispatch| dispatch(@ptrCast(hwnd), wparam, lparam);
-            return 0;
-        },
-        WM_SIZE => {
-            // lParam low word = client-area width, high word = height.
-            // Fire the resize callback when set.
-            if (lookupCtx(hwnd)) |cx| if (cx.on_resize) |cb| {
-                const lp_u: usize = @bitCast(lparam);
-                const w: u32 = @intCast(lp_u & 0xFFFF);
-                const h: u32 = @intCast((lp_u >> 16) & 0xFFFF);
-                cb(cx.on_resize_ctx, w, h);
-            };
             return 0;
         },
         WM_ACTIVATE => {
@@ -2061,14 +2321,31 @@ fn onControllerReady(this: ?*const ICtrlCreatedHandler, hr: HRESULT, ctrl: ?*Ctr
     var filter_buf: [256]u16 = undefined;
     const filter_len = std.unicode.utf8ToUtf16Le(&filter_buf, filter_utf8) catch 0;
     filter_buf[@min(filter_buf.len - 1, filter_len)] = 0;
-    const addFilter = vtSlot(*const fn (*Wv2, LPCWSTR, c_int) callconv(.winapi) HRESULT, wv.?.lpVtbl, SLOT_WV2_AddWebResourceRequestedFilter);
-    _ = addFilter(wv.?, @ptrCast(&filter_buf), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+    // Prefer ICoreWebView2_22's source-kinds filter so the TOP-LEVEL document
+    // request of the custom scheme is intercepted (the legacy filter only sees
+    // sub-resources → blank page). Fall back to the legacy filter on runtimes
+    // that predate _22 (which also predate custom schemes, so they were never
+    // going to render anyway, but keep the call for parity).
+    var wv22_raw: ?*anyopaque = null;
+    const QI22 = vtSlot(*const fn (*Wv2, *const IID, *?*anyopaque) callconv(.winapi) HRESULT, wv.?.lpVtbl, 0);
+    const qi22_hr = QI22(wv.?, &IID_ICoreWebView2_22, &wv22_raw);
+    if (qi22_hr >= 0 and wv22_raw != null) {
+        const wv22: *Wv2_22 = @ptrCast(@alignCast(wv22_raw.?));
+        defer releaseRef(@ptrCast(wv22));
+        const addFilterSK = vtSlot(*const fn (*Wv2_22, LPCWSTR, c_int, u32) callconv(.winapi) HRESULT, wv22.lpVtbl, SLOT_WV2_22_AddWebResourceRequestedFilterWithRequestSourceKinds);
+        _ = addFilterSK(wv22, @ptrCast(&filter_buf), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL);
+    } else {
+        // Pre-_22 runtime: best-effort legacy filter (covers sub-resources only).
+        const addFilter = vtSlot(*const fn (*Wv2, LPCWSTR, c_int) callconv(.winapi) HRESULT, wv.?.lpVtbl, SLOT_WV2_AddWebResourceRequestedFilter);
+        _ = addFilter(wv.?, @ptrCast(&filter_buf), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+    }
 
     const addResource = vtSlot(*const fn (*Wv2, *const IResourceRequestedHandler, *anyopaque) callconv(.winapi) HRESULT, wv.?.lpVtbl, SLOT_WV2_add_WebResourceRequested);
     var token2: i64 = 0;
     _ = addResource(wv.?, &cx.res_handler, @ptrCast(&token2));
 
-    // Initial navigation.
+    // Initial navigation through the custom scheme; the resource handler
+    // serves the embedded asset bytes.
     if (cx.opts.initial_path.len > 0) {
         const gpa = std.heap.page_allocator;
         const utf8 = std.fmt.allocPrint(gpa, "{s}://app/{s}", .{ cx.opts.scheme, cx.opts.initial_path }) catch return 0;
@@ -2076,7 +2353,8 @@ fn onControllerReady(this: ?*const ICtrlCreatedHandler, hr: HRESULT, ctrl: ?*Ctr
         const w_url = std.unicode.utf8ToUtf16LeAllocZ(gpa, utf8) catch return 0;
         defer gpa.free(w_url);
         const Navigate = vtSlot(*const fn (*Wv2, LPCWSTR) callconv(.winapi) HRESULT, wv.?.lpVtbl, SLOT_WV2_Navigate);
-        _ = Navigate(wv.?, w_url.ptr);
+        const nav_hr = Navigate(wv.?, w_url.ptr);
+        if (nav_hr < 0) std.log.warn("verve.desktop[windows]: Navigate '{s}' failed hr=0x{x:0>8}", .{ utf8, @as(u32, @bitCast(nav_hr)) });
     }
     return 0;
 }

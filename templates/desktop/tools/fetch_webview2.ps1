@@ -1,4 +1,4 @@
-# fetch_webview2.ps1 — download the Microsoft.Web.WebView2 NuGet package
+# fetch_webview2.ps1 -- download the Microsoft.Web.WebView2 NuGet package
 # at the version pinned in `webview2.pinned.txt` and unpack it into
 # `third_party/webview2/`. Idempotent: refuses to overwrite an
 # existing SDK unless `-Force` is passed.
@@ -44,7 +44,10 @@ if ((Test-Path $LibPath) -and -not $Force) {
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 
 $Tmp = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath()) -Name ([System.Guid]::NewGuid().ToString())
-$Nupkg = Join-Path $Tmp.FullName "webview2.nupkg"
+# A .nupkg is a zip, but Windows PowerShell 5.1's Expand-Archive rejects
+# any extension other than .zip ("NotSupportedArchiveFileExtension"), so
+# save it as .zip up front for cross-version compatibility.
+$Nupkg = Join-Path $Tmp.FullName "webview2.zip"
 
 $Url = "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/$Version"
 Write-Host "fetch_webview2.ps1: downloading $Url"
@@ -64,7 +67,7 @@ if ($Sha512) {
         Write-Error "fetch_webview2.ps1: SHA mismatch`n  expected: $Sha512`n  actual:   $Actual"
     }
 } else {
-    Write-Host "fetch_webview2.ps1: WARNING — webview2.pinned.txt has no sha512= value, skipping verification"
+    Write-Host "fetch_webview2.ps1: WARNING -- webview2.pinned.txt has no sha512= value, skipping verification"
 }
 
 $Unpacked = Join-Path $Tmp.FullName "unpacked"
