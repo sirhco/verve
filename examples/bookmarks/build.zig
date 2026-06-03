@@ -86,6 +86,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app", .module = app_mod },
         },
     });
+    client_mod.addImport("app_client", app_client_mod);
 
     const public_wf = b.addWriteFiles();
     _ = public_wf.add("public_assets.zig",

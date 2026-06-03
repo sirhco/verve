@@ -79,7 +79,6 @@ pub fn build(b: *std.Build) void {
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(wasm.getEmittedBin(), "client.wasm");
     _ = wf.addCopyFile(b.path("../../src/bridge/verve.js"), "verve.js");
-    _ = wf.addCopyFile(generated_app_client, "app_client.zig");
 
     var assets_buf: std.ArrayList(u8) = .empty;
     assets_buf.appendSlice(b.allocator,
@@ -146,8 +145,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = wf.getDirectory().path(b, "assets.zig"),
     });
 
+    // Dedicated WriteFiles for app_client.zig — keeping it out of the
+    // assets `wf` (which holds client.wasm) avoids a client_mod ->
+    // app_client -> wf -> client_mod dependency loop. Mirrors the
+    // framework's own build.zig (`wf_app_client`).
+    const wf_app_client = b.addWriteFiles();
+    _ = wf_app_client.addCopyFile(generated_app_client, "app_client.zig");
     const app_client_mod = b.createModule(.{
-        .root_source_file = wf.getDirectory().path(b, "app_client.zig"),
+        .root_source_file = wf_app_client.getDirectory().path(b, "app_client.zig"),
         .imports = &.{
             .{ .name = "verve", .module = verve_mod },
             .{ .name = "app", .module = app_mod },
@@ -160,6 +165,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = wf_manifest.getDirectory().path(b, "client_manifest.zig"),
     });
     client_mod.addImport("client_manifest", client_manifest_mod);
+    client_mod.addImport("app_client", app_client_mod);
 
     const public_wf = b.addWriteFiles();
     _ = public_wf.add("public_assets.zig",

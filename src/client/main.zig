@@ -121,8 +121,15 @@ fn onCallIncrement(value: i32) void {
 /// Demo of the typed `_call` round-trip: POST /api/incrementCount, then
 /// the correlated reply's `value` lands in `onCallIncrement`. Also the
 /// real call-site that retains `app_client` in the wasm client.
+///
+/// Guarded on `incrementCount_call` existing so the shared client compiles
+/// against any app's generated (or stub) `app_client` — examples and
+/// scaffolds without that server fn get a no-op export instead of a
+/// missing-decl build failure.
 export fn verve_call_increment() void {
-    app_client.incrementCount_call(client_alloc.allocator(), .{}, onCallIncrement);
+    if (comptime @hasDecl(app_client, "incrementCount_call")) {
+        app_client.incrementCount_call(client_alloc.allocator(), .{}, onCallIncrement);
+    }
 }
 
 export fn current_count() i32 {
