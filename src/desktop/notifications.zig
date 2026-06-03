@@ -19,13 +19,14 @@
 //!   `dlopen("libnotify.so.4")` so scaffolds on distros that don't
 //!   ship it still build; the call returns `error.Unsupported`
 //!   when the library isn't present at runtime.
-//! - **Windows** — `Shell_NotifyIconW(NIM_MODIFY, NIF_INFO)` against
-//!   the active `desktop.tray` icon. Renders as a standard Win10/11
-//!   balloon tip (older shell) / Action Center entry (modern
-//!   shell). Requires `desktop.tray.init` to have been called first;
-//!   without an active tray the call returns `error.Backend`. The
-//!   modern WinRT `ToastNotificationManager` path needs COM + AUMID +
-//!   Start-menu shortcut registration and is deferred.
+//! - **Windows** — prefers the modern WinRT `ToastNotificationManager`
+//!   path (`windows.showToast`): sets a per-app AUMID, lazily creates the
+//!   Start-menu shortcut that carries it, then activates an `XmlDocument`
+//!   `ToastGeneric` template and `IToastNotifier::Show` — a rich Action
+//!   Center toast that needs no tray icon. If WinRT activation fails it
+//!   falls back to `Shell_NotifyIconW(NIM_MODIFY, NIF_INFO)` against the
+//!   active `desktop.tray` icon (a balloon tip), which requires
+//!   `desktop.tray.init` first and otherwise returns `error.Backend`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -46,20 +47,25 @@ pub fn show(allocator: std.mem.Allocator, opts: NotificationOptions) Error!void 
     switch (builtin.os.tag) {
         .macos => return showMacos(allocator, opts),
         .linux => return showLinux(allocator, opts),
-        .windows => return showWindows(opts),
+        .windows => return showWindows(allocator, opts),
         else => return error.Unsupported,
     }
 }
 
-fn showWindows(opts: NotificationOptions) Error!void {
+fn showWindows(allocator: std.mem.Allocator, opts: NotificationOptions) Error!void {
     if (builtin.os.tag != .windows) return error.Unsupported;
-    // Delegate to the tray module's NIF_INFO helper. The error
-    // domain matches ours (Unsupported / Backend), so propagate
-    // directly.
-    return tray_mod.showWindowsBalloon(opts.title, opts.body) catch |err| switch (err) {
-        tray_mod.Error.Unsupported => Error.Unsupported,
-        tray_mod.Error.OutOfMemory => Error.OutOfMemory,
-        tray_mod.Error.Backend => Error.Backend,
+    const win = @import("windows.zig");
+    // Prefer the modern WinRT Action Center toast (rich styling + Action
+    // Center grouping, no tray icon required). If it can't initialise —
+    // older shell, no AUMID shortcut writable, WinRT activation failure —
+    // fall back to the legacy `Shell_NotifyIconW` balloon, which needs an
+    // active tray icon (`desktop.tray.init`).
+    win.showToast(allocator, opts.title, opts.body) catch {
+        return tray_mod.showWindowsBalloon(opts.title, opts.body) catch |err| switch (err) {
+            tray_mod.Error.Unsupported => Error.Unsupported,
+            tray_mod.Error.OutOfMemory => Error.OutOfMemory,
+            tray_mod.Error.Backend => Error.Backend,
+        };
     };
 }
 
