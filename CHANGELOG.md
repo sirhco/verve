@@ -4,6 +4,69 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.37] - 2026-06-02
+
+### Added
+
+- **Windows image clipboard (`CF_DIBV5`).** `Clipboard.writeImage` /
+  `readImage` now work on Windows, at parity with macOS. The cross-platform
+  wire format stays raw PNG bytes; the backend transcodes PNG ↔ 32bpp-BGRA
+  DIB through WIC (`Windowscodecs`) — write packs a bottom-up
+  `BITMAPV5HEADER` blob under `CF_DIBV5`, read accepts `CF_DIBV5`/`CF_DIB`
+  (24/32bpp, opaque-BGRX handling) and re-encodes to PNG. The pure
+  `buildDibV5` / `dibToBgra` helpers are unit-tested. Linux remains
+  `error.Unsupported`.
+
+- **Windows accessibility UIA provider.** `setAccessibilityRoleDescription`,
+  `setAccessibilitySubrole`, and `setAccessibilityHelp` are no longer no-ops
+  on Windows: a per-window server-side `IRawElementProviderSimple` answers
+  `WM_GETOBJECT`/`UiaRootObjectId` (`UiaReturnRawElementProvider`), mapping
+  role description → `UIA_LocalizedControlType`, help → `UIA_HelpText`, and
+  the `dialog`/`system_dialog` subroles → `UIA_IsDialog`;
+  `UiaHostProviderFromHwnd` supplies Name/bounds and the WebView2 subtree.
+  Links `Uiautomationcore`. Brings Windows to parity with the macOS
+  NSAccessibility surface (Linux role-desc/subrole still pending an
+  AtkObject provider).
+
+- **Windows rich WinRT Toast.** `notifications.show` now prefers the modern
+  Action Center toast over the legacy balloon: it sets a per-app AUMID
+  (`SetCurrentProcessExplicitAppUserModelID`), lazily creates the Start-menu
+  `.lnk` carrying `System.AppUserModel.ID` (IShellLink + IPropertyStore +
+  IPersistFile), then activates an `XmlDocument` `ToastGeneric` template →
+  `ToastNotificationManager` → `IToastNotifier::Show`. Falls back to the
+  `Shell_NotifyIconW` balloon when WinRT activation fails. Links `combase`;
+  pure `buildToastXml`/`xmlEscape` unit-tested.
+
+- **Windows auto-updater apply.** `updates.applyUpdate` now installs on
+  Windows (previously macOS-only). Pure-Zig side-by-side swap: download +
+  SHA-256 verify → extract via the bundled `tar.exe` to `%TEMP%` → spawn a
+  detached `swap.cmd` that waits for the running PID, robocopy-/MOVEs the new
+  tree over the locked install dir, relaunches, and self-deletes. Unsigned
+  in-place replacement (not Squirrel/MSIX); `error.NotBundled` in the
+  `\zig-out\` dev layout. `applyUpdate` now dispatches per-OS; the pure
+  `buildSwapScript` is unit-tested. Linux apply remains `error.Unsupported`.
+
+  All four Windows backends are hand-rolled COM/WinRT and verified by
+  cross-compile (x86_64 + aarch64-windows) plus their pure-fn unit tests;
+  live delivery (clipboard paste, screen-reader announce, Action Center
+  banner, exe swap) is host-gated.
+
+### Fixed
+
+- **Example builds (`app_client` wiring).** All 11 `examples/*/build.zig`
+  failed the wasm-client build with `no module named 'app_client'` after the
+  shared `src/client/main.zig` began importing `app_client` for the typed
+  `_call` round-trip demo — each example created the module but only wired it
+  into the server, not the client. Each now adds
+  `client_mod.addImport("app_client", app_client_mod)`; the codegen examples
+  (`showcase`, `islands-demo`, `client-runtime`) additionally move the
+  generated `app_client.zig` into a dedicated `WriteFiles` to avoid a
+  `client → app_client → assets(client.wasm) → client` dependency loop. The
+  shared client's demo call site is now guarded with
+  `if (comptime @hasDecl(app_client, "incrementCount_call"))`, so it compiles
+  against any app's generated or stub `app_client` instead of requiring an
+  `incrementCount` server fn.
+
 ## [0.1.36] - 2026-06-02
 
 ### Added
