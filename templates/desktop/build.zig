@@ -158,20 +158,30 @@ pub fn build(b: *std.Build) void {
             // existing .lib short-circuits before any network I/O).
             const sdk = b.option([]const u8, "webview2-sdk", "Path to the WebView2 SDK") orelse "third_party/webview2";
             const skip_fetch = b.option(bool, "webview2-no-fetch", "Skip auto-vendor of WebView2 SDK from NuGet") orelse false;
-            if (!skip_fetch) {
-                const fetch_cmd = if (builtin.os.tag == .windows) blk: {
-                    const c = b.addSystemCommand(&.{ "pwsh", "-File", "tools/fetch_webview2.ps1", "-Dest" });
-                    c.addArg(sdk);
-                    break :blk c;
-                } else blk: {
-                    const c = b.addSystemCommand(&.{ "sh", "tools/fetch_webview2.sh" });
-                    c.addArg(b.fmt("--dest={s}", .{sdk}));
-                    break :blk c;
-                };
-                exe.step.dependOn(&fetch_cmd.step);
-            }
+            const fetch_cmd: ?*std.Build.Step.Run = if (skip_fetch) null else if (builtin.os.tag == .windows) blk: {
+                // Prefer PowerShell 7 (`pwsh`) but fall back to Windows
+                // PowerShell 5.1 (`powershell`), which ships on every
+                // Windows host — `pwsh` is an optional separate install.
+                const ps = b.findProgram(&.{ "pwsh", "powershell" }, &.{}) catch "powershell";
+                const c = b.addSystemCommand(&.{ ps, "-NoProfile", "-File", "tools/fetch_webview2.ps1", "-Dest" });
+                c.addArg(sdk);
+                break :blk c;
+            } else blk: {
+                const c = b.addSystemCommand(&.{ "sh", "tools/fetch_webview2.sh" });
+                c.addArg(b.fmt("--dest={s}", .{sdk}));
+                break :blk c;
+            };
+            if (fetch_cmd) |fc| exe.step.dependOn(&fc.step);
             desktop_mod.addLibraryPath(b.path(sdk));
             desktop_mod.linkSystemLibrary("WebView2Loader.dll", .{});
+
+            // The produced .exe has a load-time import of WebView2Loader.dll;
+            // the Windows loader resolves it next to the binary, so install a
+            // copy into bin/ alongside app.exe. Without this the app fails to
+            // start with STATUS_DLL_NOT_FOUND before main() runs.
+            const install_loader = b.addInstallBinFile(b.path(b.pathJoin(&.{ sdk, "WebView2Loader.dll" })), "WebView2Loader.dll");
+            if (fetch_cmd) |fc| install_loader.step.dependOn(&fc.step);
+            b.getInstallStep().dependOn(&install_loader.step);
         },
         .linux => {
             desktop_mod.linkSystemLibrary("gtk+-3.0", .{ .use_pkg_config = .force });
@@ -534,7 +544,9 @@ pub fn build(b: *std.Build) void {
             smoke_step.dependOn(&smoke.step);
         },
         .windows => {
-            const smoke = b.addSystemCommand(&.{ "pwsh", "-File", "tools/smoke_windows.ps1", "-App" });
+            // `pwsh` (PS7) is optional; fall back to bundled `powershell` (5.1).
+            const ps = b.findProgram(&.{ "pwsh", "powershell" }, &.{}) catch "powershell";
+            const smoke = b.addSystemCommand(&.{ ps, "-NoProfile", "-File", "tools/smoke_windows.ps1", "-App" });
             smoke.addArtifactArg(exe);
             smoke.step.dependOn(b.getInstallStep());
             const smoke_step = b.step("smoke", "Boot the app, screenshot the primary display, validate (Windows)");
