@@ -5,7 +5,7 @@ each carry their own "Not yet built / Deferred" notes; this file gathers
 them so the backlog is discoverable in one place. Desktop has its own
 authoritative backlog at [`docs/11-desktop-roadmap.md`](docs/11-desktop-roadmap.md).
 
-**Current:** v0.1.35 (pre-1.0; public APIs unstable). Status legend:
+**Current:** v0.1.36 (pre-1.0; public APIs unstable). Status legend:
 ✅ done · 🟡 partial · ⏳ remaining · 🔒 host-gated (needs a real Win/Linux
 host to verify) · 🍎 macOS-verifiable on a dev machine.
 

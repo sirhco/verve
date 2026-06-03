@@ -4,6 +4,44 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.36] - 2026-06-02
+
+### Added
+
+- **Scaffold `zig build notarize` step (macOS).** A new desktop-template
+  build step submits a signed + hardened `.app` to Apple's notary service
+  via a `notarytool` keychain profile, staples the ticket, and leaves a
+  distributable stapled zip: `ditto`-zip → `xcrun notarytool submit --wait`
+  → `xcrun stapler staple` → re-zip the stapled `.app`. Gated on
+  `-Dnotarize-profile=<name>` + `-Dcodesign=<Developer ID Application>`;
+  requesting notarize implies the hardened runtime. The framework has no
+  app of its own to notarize — each downstream app runs the step under its
+  own Developer ID. Setup + usage in `docs/19-desktop.md`.
+
+- **Windows `verve://` custom-scheme asset serving.** The Windows backend
+  now serves the embedded asset table to WebView2 through a real registered
+  custom scheme — an `ICustomSchemeRegistration` COM object supplied via
+  `ICoreWebView2EnvironmentOptions4` (hand-rolled vtable +
+  `CoTaskMemAlloc`-backed COM strings + `CreateStreamOnHGlobal` response
+  streams), plus the `ICoreWebView2_22` web-resource-requested filter.
+  This brings Windows to parity with macOS (`WKURLSchemeHandler`) and Linux
+  (WebKit custom scheme) for `verve://app/*` requests.
+
+### Fixed
+
+- **Windows scaffold generation.** `verve-cli new` now writes a valid
+  `build.zig.zon` on Windows: path relativization uses the platform-aware
+  `std.fs.path.relative` (the POSIX variant mis-tokenized `C:\` drive paths
+  into a bogus `../C:\…`), and backslashes in the generated `.path` literal
+  are normalized to `/` (a backslash is a Zig string-escape character, and
+  the build system accepts `/` separators on every host).
+
+- **Windows WebView2 vendoring + runtime.** The scaffold's WebView2 fetch
+  step falls back to Windows PowerShell 5.1 (`powershell`) when PowerShell 7
+  (`pwsh`, an optional install) is absent, and now installs
+  `WebView2Loader.dll` next to `app.exe` so the binary's load-time import
+  resolves.
+
 ## [0.1.35] - 2026-06-02
 
 ### Added
