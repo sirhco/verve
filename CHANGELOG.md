@@ -34,8 +34,10 @@ versions follow [Semantic Versioning](https://semver.org/).
   `.lnk` carrying `System.AppUserModel.ID` (IShellLink + IPropertyStore +
   IPersistFile), then activates an `XmlDocument` `ToastGeneric` template →
   `ToastNotificationManager` → `IToastNotifier::Show`. Falls back to the
-  `Shell_NotifyIconW` balloon when WinRT activation fails. Links `combase`;
-  pure `buildToastXml`/`xmlEscape` unit-tested.
+  `Shell_NotifyIconW` balloon when WinRT activation fails. Links the WinRT
+  API-set stubs (`api-ms-win-core-winrt-l1-1-0` +
+  `api-ms-win-core-winrt-string-l1-1-0` — zig's mingw has no x86_64
+  `combase` import lib); pure `buildToastXml`/`xmlEscape` unit-tested.
 
 - **Windows auto-updater apply.** `updates.applyUpdate` now installs on
   Windows (previously macOS-only). Pure-Zig side-by-side swap: download +

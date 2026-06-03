@@ -3582,17 +3582,23 @@ fn parseOffset(buf: []const u8, label: []const u8) ?usize {
 //
 // All of this is hand-rolled COM/WinRT over `vtSlot`; the WinRT vtables put
 // three IInspectable methods (GetIids/GetRuntimeClassName/GetTrustLevel)
-// after IUnknown, so runtime-class methods start at slot 6. Links
-// `combase` (Ro*/Windows*String) + `Shell32`/`Ole32`/`Shlwapi` (shortcut).
-// `notifications.show` calls this first and falls back to the balloon.
+// after IUnknown, so runtime-class methods start at slot 6. Links the WinRT
+// API-set stubs (Ro*/Windows*String) + `Shell32`/`Ole32`/`Shlwapi`
+// (shortcut). `notifications.show` calls this first and falls back to the
+// balloon.
 
 pub const ToastError = error{ Unsupported, Backend, OutOfMemory };
 
-extern "combase" fn RoInitialize(init_type: c_int) callconv(.winapi) HRESULT;
-extern "combase" fn WindowsCreateString(src: [*]const u16, len: u32, out: *?*anyopaque) callconv(.winapi) HRESULT;
-extern "combase" fn WindowsDeleteString(str: ?*anyopaque) callconv(.winapi) HRESULT;
-extern "combase" fn RoGetActivationFactory(class_id: ?*anyopaque, iid: *const IID, factory: *?*anyopaque) callconv(.winapi) HRESULT;
-extern "combase" fn RoActivateInstance(class_id: ?*anyopaque, instance: *?*anyopaque) callconv(.winapi) HRESULT;
+// The WinRT activation + HSTRING entry points are exported by combase.dll,
+// but zig's bundled mingw ships no x86_64 `combase` import lib — only the
+// split API-set stubs. Link the two that carry our symbols:
+//   api-ms-win-core-winrt-l1-1-0        -> Ro* (Initialize/Activate/Factory)
+//   api-ms-win-core-winrt-string-l1-1-0 -> Windows*String (HSTRING)
+extern "api-ms-win-core-winrt-l1-1-0" fn RoInitialize(init_type: c_int) callconv(.winapi) HRESULT;
+extern "api-ms-win-core-winrt-string-l1-1-0" fn WindowsCreateString(src: [*]const u16, len: u32, out: *?*anyopaque) callconv(.winapi) HRESULT;
+extern "api-ms-win-core-winrt-string-l1-1-0" fn WindowsDeleteString(str: ?*anyopaque) callconv(.winapi) HRESULT;
+extern "api-ms-win-core-winrt-l1-1-0" fn RoGetActivationFactory(class_id: ?*anyopaque, iid: *const IID, factory: *?*anyopaque) callconv(.winapi) HRESULT;
+extern "api-ms-win-core-winrt-l1-1-0" fn RoActivateInstance(class_id: ?*anyopaque, instance: *?*anyopaque) callconv(.winapi) HRESULT;
 extern "shell32" fn SetCurrentProcessExplicitAppUserModelID(id: [*:0]const u16) callconv(.winapi) HRESULT;
 extern "kernel32" fn GetModuleFileNameW(module: HMODULE, buf: [*]u16, size: DWORD) callconv(.winapi) DWORD;
 extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: [*]u16, size: DWORD) callconv(.winapi) DWORD;

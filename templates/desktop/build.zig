@@ -156,9 +156,11 @@ pub fn build(b: *std.Build) void {
             // Uiautomationcore backs the server-side UIA accessibility
             // provider (role description / subrole / help text).
             desktop_mod.linkSystemLibrary("Uiautomationcore", .{});
-            // combase exports the WinRT activation entry points
-            // (Ro*/Windows*String) used by the Action Center toast.
-            desktop_mod.linkSystemLibrary("combase", .{});
+            // WinRT activation entry points (Ro*/Windows*String) for the
+            // Action Center toast. combase.dll has no x86_64 import lib in
+            // zig's mingw, so link the split API-set stubs that carry them.
+            desktop_mod.linkSystemLibrary("api-ms-win-core-winrt-l1-1-0", .{});
+            desktop_mod.linkSystemLibrary("api-ms-win-core-winrt-string-l1-1-0", .{});
             // WebView2 loader. Ship the SDK under `third_party/webview2/`
             // or override with `-Dwebview2-sdk=...`. When the SDK is
             // not present, `tools/fetch_webview2.{sh,ps1}` downloads
