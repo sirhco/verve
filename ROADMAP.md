@@ -83,11 +83,13 @@ The original 6-phase roadmap is substantially complete:
 ### Desktop backlog (P6)
 
 Authoritative: [`docs/11-desktop-roadmap.md`](docs/11-desktop-roadmap.md).
-Most are host-gated — no Windows/Linux hosts available; cross-compile is
-clean but behavior is unvalidated.
+Windows is now validated on a real host (v0.1.36). Linux remains
+host-gated — no Linux host available, so its paths cross-compile clean
+but stay behavior-unvalidated.
 
-- ⏳🔒 **Windows rich WinRT Toast** — `ToastNotificationManager` + AUMID +
-  Start-menu shortcut. Balloon-tip path ships; rich Toast pending.
+- ⏳ **Windows rich WinRT Toast** — `ToastNotificationManager` + AUMID +
+  Start-menu shortcut. Balloon-tip path ships; rich Toast pending
+  (Windows host now available to verify).
 - ⏳🔒 **Updates apply (Win/Linux)** — Squirrel/MSIX (Win),
   AppImageUpdate (Linux). Check + macOS apply ship.
 - ⏳🔒 **GTK4 + WebKitGTK 6.0** behind `-Dgtk4` — largest item; GTK3 +
@@ -98,16 +100,22 @@ clean but behavior is unvalidated.
   `atk_object_set_description`; role-desc/subrole + Windows are documented
   no-ops pending a UIA/AtkObject provider). Web content + menus
   self-publish.
-- 🟡🍎 **macOS `UNUserNotificationCenter` migration** — done in code:
-  `notifications.show` now uses `UNUserNotificationCenter` with a
-  bundle-id guard + lazy synchronous authorization (nested `NSRunLoop`
-  pump). `NSUserNotification` removed; scaffold links
-  `UserNotifications.framework`. Live delivery requires a signed `.app`
-  bundle — end-to-end verification on a signing-capable host still
-  pending.
+- ✅🍎 **macOS `UNUserNotificationCenter` migration** —
+  `notifications.show` uses `UNUserNotificationCenter` with a bundle-id
+  guard + lazy synchronous authorization (nested `NSRunLoop` pump);
+  `NSUserNotification` removed; scaffold links `UserNotifications.framework`.
+  Verified live on a signed `.app` (v0.1.35): first-call permission prompt
+  + banner delivery.
 - ⏳🔒 **Image clipboard Win (`CF_DIB`) + Linux (`image/png` target)** —
   macOS (PNG) ships.
-- ⏳🔒 **Live Win/Linux validation** — boot every code path on real hosts.
+- ✅ **Windows `verve://` custom-scheme asset serving** — WebView2
+  `ICustomSchemeRegistration` via `ICoreWebView2EnvironmentOptions4` serves
+  the embedded asset table to the webview, at parity with macOS
+  (`WKURLSchemeHandler`) / Linux (WebKit scheme). Validated on a real
+  Windows host (v0.1.36).
+- 🟡 **Live Win/Linux validation** — Windows validated on a real host
+  (v0.1.36); Linux (🔒) still needs a real Ubuntu/Fedora boot of every
+  code path.
 - ✅ **Notarization automation (macOS)** — `zig build notarize` ships in the
   desktop scaffold (`-Dnotarize-profile=<keychain-profile>` →
   ditto-zip → `notarytool submit --wait` → `stapler staple` → stapled ship
