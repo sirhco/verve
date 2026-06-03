@@ -150,6 +150,15 @@ pub fn build(b: *std.Build) void {
             // Shcore provides GetDpiForMonitor (used by
             // `desktop.displays.list`). Available on Win 8.1+.
             desktop_mod.linkSystemLibrary("Shcore", .{});
+            // Windowscodecs (WIC) backs the CF_DIBV5 image clipboard
+            // (PNG <-> DIB transcode).
+            desktop_mod.linkSystemLibrary("Windowscodecs", .{});
+            // Uiautomationcore backs the server-side UIA accessibility
+            // provider (role description / subrole / help text).
+            desktop_mod.linkSystemLibrary("Uiautomationcore", .{});
+            // combase exports the WinRT activation entry points
+            // (Ro*/Windows*String) used by the Action Center toast.
+            desktop_mod.linkSystemLibrary("combase", .{});
             // WebView2 loader. Ship the SDK under `third_party/webview2/`
             // or override with `-Dwebview2-sdk=...`. When the SDK is
             // not present, `tools/fetch_webview2.{sh,ps1}` downloads

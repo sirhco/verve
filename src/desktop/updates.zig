@@ -9,10 +9,12 @@
 //!
 //! 2. **Apply** — `applyUpdate(allocator, io, info)` downloads the
 //!    artifact at `info.download_url`, verifies it against
-//!    `info.sha256`, swaps the running `.app` bundle, and relaunches
-//!    the new copy. macOS only — Win + Linux return
-//!    `error.Unsupported` (platform updaters like Squirrel /
-//!    AppImageUpdate handle those).
+//!    `info.sha256`, and installs it. macOS swaps the running `.app`
+//!    bundle (atomic rename) and `open -n` relaunches; Windows extracts
+//!    to a temp dir and hands a detached `swap.cmd` helper the job of
+//!    replacing the locked install dir + relaunching (pure-Zig
+//!    side-by-side swap — no Squirrel/MSIX). Linux returns
+//!    `error.Unsupported` (AppImageUpdate territory).
 //!
 //! Feed format (JSON):
 //!
@@ -49,6 +51,11 @@ const Writer = std.Io.Writer;
 /// required capacity).
 extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
 
+/// Win32: full path of the running `.exe` into `buf` (UTF-16). Returns the
+/// length, or `size` on truncation, 0 on failure.
+extern "kernel32" fn GetModuleFileNameW(module: ?*anyopaque, buf: [*]u16, size: u32) callconv(.winapi) u32;
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
 pub const Error = error{
     Network,
     BadResponse,
@@ -58,7 +65,8 @@ pub const Error = error{
 };
 
 pub const ApplyError = error{
-    /// Apply phase is macOS-only. Win + Linux return this.
+    /// Apply phase unsupported on this OS (Linux — AppImageUpdate
+    /// territory). macOS + Windows are implemented.
     Unsupported,
     /// HTTP request failed or returned non-2xx.
     Network,
@@ -169,7 +177,24 @@ pub fn parseUpdateFeed(
     };
 }
 
-/// Download + verify + swap + relaunch. macOS only.
+/// Download + verify + swap + relaunch. macOS and Windows; Linux returns
+/// `error.Unsupported` (AppImageUpdate territory). Dispatches to the
+/// platform implementation. Does not return on success (the process is
+/// replaced / relaunched) — IPC handlers should reply to the caller first.
+pub fn applyUpdate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    info: *const UpdateInfo,
+) ApplyError!void {
+    return switch (builtin.os.tag) {
+        .macos => applyUpdateMacos(allocator, io, info),
+        .windows => applyUpdateWindows(allocator, io, info),
+        else => error.Unsupported,
+    };
+}
+
+/// macOS apply: resolve the `.app` bundle, download + SHA-256 verify the
+/// `.tar.gz`, two-step atomic rename swap, `open -n` relaunch.
 ///
 /// Algorithm:
 /// 1. Resolve the current process's `.app` bundle by walking up
@@ -183,10 +208,7 @@ pub fn parseUpdateFeed(
 /// 5. Two-step rename: move current bundle aside, move new bundle
 ///    into place. Best-effort restore on failure.
 /// 6. `open -n <bundle>` to relaunch, then `std.process.exit(0)`.
-///
-/// IPC handlers should respond to the caller before invoking this —
-/// the function does not return on success.
-pub fn applyUpdate(
+fn applyUpdateMacos(
     allocator: std.mem.Allocator,
     io: std.Io,
     info: *const UpdateInfo,
@@ -232,6 +254,137 @@ pub fn applyUpdate(
     // relaunch terminates the process on success; if we reach here,
     // open -n returned but exit() wasn't called — that's a bug.
     unreachable;
+}
+
+/// Windows apply: pure-Zig side-by-side swap. A running `.exe` is
+/// file-locked, so we can't overwrite it in place (and Squirrel/MSIX both
+/// need external tooling + code-signing infra). Instead:
+///
+/// 1. Resolve the running exe via `GetModuleFileNameW`; `error.NotBundled`
+///    in the `\zig-out\` dev layout.
+/// 2. Download + SHA-256 verify `info.download_url` (a `.zip` or `.tar.gz`)
+///    into a `%TEMP%\verve-update-<pid>` staging dir.
+/// 3. Extract with the bundled `tar.exe` (Win10 1803+; bsdtar autodetects
+///    zip/gzip) into `staging\new`.
+/// 4. Write a detached `swap.cmd` that waits for this PID to exit,
+///    robocopy-/MOVEs `new` over the install dir, relaunches the exe, and
+///    deletes the staging dir + itself.
+/// 5. Spawn the helper via `cmd.exe /c`, then `std.process.exit(0)` so the
+///    OS releases the exe lock and the helper can replace it.
+///
+/// This is unsigned in-place replacement, not a Squirrel delta / MSIX
+/// package; apps wanting those layer them on top of `checkForUpdate`.
+fn applyUpdateWindows(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    info: *const UpdateInfo,
+) ApplyError!void {
+    if (builtin.os.tag != .windows) return error.Unsupported;
+    if (info.sha256.len != 64) return error.MissingChecksum;
+
+    var exe_w: [1024]u16 = undefined;
+    const n = GetModuleFileNameW(null, &exe_w, exe_w.len);
+    if (n == 0 or n >= exe_w.len) return error.NotBundled;
+    const exe_path = std.unicode.utf16LeToUtf8Alloc(allocator, exe_w[0..n]) catch return error.OutOfMemory;
+    defer allocator.free(exe_path);
+
+    // Dev layout (`...\zig-out\bin\app.exe`) has nothing to update.
+    if (std.mem.indexOf(u8, exe_path, "\\zig-out\\") != null) return error.NotBundled;
+
+    const install_dir = std.fs.path.dirname(exe_path) orelse return error.NotBundled;
+
+    const temp = std.process.getEnvVarOwned(allocator, "TEMP") catch return error.SwapFailed;
+    defer allocator.free(temp);
+    const pid = GetCurrentProcessId();
+
+    const staging = std.fmt.allocPrint(allocator, "{s}\\verve-update-{d}", .{ temp, pid }) catch return error.OutOfMemory;
+    defer allocator.free(staging);
+    const new_dir = std.fmt.allocPrint(allocator, "{s}\\new", .{staging}) catch return error.OutOfMemory;
+    defer allocator.free(new_dir);
+    const archive = std.fmt.allocPrint(allocator, "{s}\\update.archive", .{staging}) catch return error.OutOfMemory;
+    defer allocator.free(archive);
+    const script_path = std.fmt.allocPrint(allocator, "{s}\\swap.cmd", .{staging}) catch return error.OutOfMemory;
+    defer allocator.free(script_path);
+
+    // Fresh staging (tolerate a stale dir from a crashed prior run).
+    std.Io.Dir.createDirAbsolute(io, staging, .default_dir) catch {};
+    std.Io.Dir.createDirAbsolute(io, new_dir, .default_dir) catch {};
+
+    try downloadAndVerify(allocator, io, info.download_url, info.sha256, archive);
+    try extractArchiveWindows(allocator, io, archive, new_dir);
+
+    // Extracted archive must contain the new exe at the same basename.
+    const exe_base = std.fs.path.basename(exe_path);
+    const new_exe = std.fmt.allocPrint(allocator, "{s}\\{s}", .{ new_dir, exe_base }) catch return error.OutOfMemory;
+    defer allocator.free(new_exe);
+    std.Io.Dir.accessAbsolute(io, new_exe, .{}) catch return error.ExtractFailed;
+
+    const script = buildSwapScript(allocator, pid, new_dir, install_dir, exe_path, staging) catch return error.OutOfMemory;
+    defer allocator.free(script);
+    {
+        var f = std.Io.Dir.createFileAbsolute(io, script_path, .{ .truncate = true }) catch return error.SwapFailed;
+        defer f.close(io);
+        var wbuf: [1024]u8 = undefined;
+        var fw = f.writer(io, &wbuf);
+        fw.interface.writeAll(script) catch return error.SwapFailed;
+        fw.interface.flush() catch return error.SwapFailed;
+    }
+
+    // Detached helper; parent must exit so the exe unlocks.
+    _ = std.process.spawn(io, .{
+        .argv = &.{ "cmd.exe", "/c", script_path },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.RelaunchFailed;
+    std.process.exit(0);
+}
+
+/// Extract `archive_path` into `dest_dir` using the bundled `tar.exe`
+/// (Windows 10 1803+); bsdtar autodetects zip and gzip, so no compression
+/// flag is needed.
+fn extractArchiveWindows(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    archive_path: []const u8,
+    dest_dir: []const u8,
+) ApplyError!void {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "tar.exe", "-xf", archive_path, "-C", dest_dir },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return error.ExtractFailed;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.ExtractFailed,
+        else => return error.ExtractFailed,
+    }
+}
+
+/// Emit the detached swap batch script. Pure string assembly (no I/O) so
+/// it is unit-testable off-host. The wait loop polls `tasklist` until the
+/// parent PID is gone, then robocopy-/MOVEs the new tree over the install
+/// dir, relaunches, and self-deletes the staging dir + script. robocopy
+/// exit codes 0–7 are success, so its errorlevel is intentionally ignored.
+fn buildSwapScript(
+    allocator: std.mem.Allocator,
+    pid: u32,
+    new_dir: []const u8,
+    install_dir: []const u8,
+    exe_path: []const u8,
+    staging: []const u8,
+) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\@echo off
+        \\:wait
+        \\tasklist /FI "PID eq {[pid]d}" | find "{[pid]d}" >nul && (timeout /t 1 /nobreak >nul & goto wait)
+        \\robocopy "{[new]s}" "{[install]s}" /E /MOVE >nul
+        \\start "" "{[exe]s}"
+        \\rmdir /s /q "{[staging]s}" >nul 2>&1
+        \\(goto) 2>nul & del "%~f0"
+        \\
+    , .{ .pid = pid, .new = new_dir, .install = install_dir, .exe = exe_path, .staging = staging });
 }
 
 /// Best-effort recursive delete. Shells out to `/bin/rm -rf` because
@@ -495,7 +648,7 @@ test "findAppBundle returns null for bare binary" {
 }
 
 test "applyUpdate rejects empty sha256" {
-    if (builtin.os.tag != .macos) return; // stub returns Unsupported first
+    if (builtin.os.tag != .macos and builtin.os.tag != .windows) return; // else-branch returns Unsupported
     const info = UpdateInfo{
         .version = "",
         .download_url = "",
@@ -504,4 +657,21 @@ test "applyUpdate rejects empty sha256" {
         .allocator = testing.allocator,
     };
     try testing.expectError(error.MissingChecksum, applyUpdate(testing.allocator, std.testing.io, &info));
+}
+
+test "buildSwapScript: wait loop + robocopy MOVE + relaunch + self-delete" {
+    const s = try buildSwapScript(
+        testing.allocator,
+        4321,
+        "C:\\Temp\\verve-update-4321\\new",
+        "C:\\Program Files\\MyApp",
+        "C:\\Program Files\\MyApp\\MyApp.exe",
+        "C:\\Temp\\verve-update-4321",
+    );
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "PID eq 4321") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "goto wait") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "robocopy \"C:\\Temp\\verve-update-4321\\new\" \"C:\\Program Files\\MyApp\" /E /MOVE") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "start \"\" \"C:\\Program Files\\MyApp\\MyApp.exe\"") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "del \"%~f0\"") != null);
 }

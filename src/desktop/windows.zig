@@ -94,6 +94,7 @@ const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 const SW_SHOW: c_int = 5;
 const WM_SIZE: UINT = 0x0005;
 const WM_DESTROY: UINT = 0x0002;
+const WM_GETOBJECT: UINT = 0x003D;
 const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x80004002));
 
 extern "kernel32" fn GetModuleHandleW(name: LPCWSTR) callconv(.winapi) HINSTANCE;
@@ -949,6 +950,156 @@ fn customSchemeOptions(scheme: []const u8) ?*anyopaque {
     return @ptrCast(&g_env_options);
 }
 
+// ---- UI Automation provider (role description + subrole + help) -------------
+//
+// Window chrome on Windows has no NSAccessibility-equivalent setter; the
+// way to publish role-description / dialog-subrole / help-text semantics to
+// screen readers (Narrator, NVDA, JAWS) is a server-side UIA provider that
+// answers `WM_GETOBJECT` for `UiaRootObjectId`. We expose a minimal
+// `IRawElementProviderSimple` whose `GetPropertyValue` returns the strings
+// stashed on the `WindowCtx`, and delegate everything else (Name from the
+// window title, bounding rects, the WebView2 subtree) to the default host
+// provider via `UiaHostProviderFromHwnd`. One provider is embedded per
+// `WindowCtx`; AddRef/Release are no-ops because its lifetime is the
+// window's. Values are read live, so the setters just swap the stored
+// string and assistive tech picks them up on the next query/focus.
+
+extern "Uiautomationcore" fn UiaReturnRawElementProvider(hwnd: HWND, wparam: WPARAM, lparam: LPARAM, el: ?*anyopaque) callconv(.winapi) LRESULT;
+extern "Uiautomationcore" fn UiaHostProviderFromHwnd(hwnd: HWND, provider: *?*anyopaque) callconv(.winapi) HRESULT;
+extern "OleAut32" fn SysAllocString(psz: ?[*:0]const u16) callconv(.winapi) ?*anyopaque; // BSTR; UIA frees it
+
+const UiaRootObjectId: LPARAM = -25;
+const ProviderOptions_ServerSideProvider: c_int = 1;
+
+// UIA property IDs (uiautomationclient.h).
+const UIA_ControlTypePropertyId: c_int = 30003;
+const UIA_LocalizedControlTypePropertyId: c_int = 30004;
+const UIA_HelpTextPropertyId: c_int = 30013;
+const UIA_IsDialogPropertyId: c_int = 30174;
+const UIA_WindowControlTypeId: usize = 50032;
+
+const VT_EMPTY: u16 = 0;
+const VT_I4: u16 = 3;
+const VT_BSTR: u16 = 8;
+const VT_BOOL: u16 = 11;
+const VARIANT_TRUE: usize = 0xFFFF;
+
+// 24-byte x64 VARIANT: 8-byte header (vt + 3 reserved WORDs), 8-byte value
+// union at offset 8 (BSTR pointer / LONG / VARIANT_BOOL), 8-byte tail pad.
+const VARIANT = extern struct {
+    vt: u16,
+    r1: u16 = 0,
+    r2: u16 = 0,
+    r3: u16 = 0,
+    val: usize = 0,
+    pad: u64 = 0,
+};
+
+const IID_IRawElementProviderSimple: GUID = .{ .Data1 = 0xd6dd68d1, .Data2 = 0x86fd, .Data3 = 0x4332, .Data4 = .{ 0x86, 0x66, 0x9a, 0xbe, 0xde, 0xa2, 0xd2, 0x4c } };
+
+const RawElementProviderVtbl = extern struct {
+    QueryInterface: *const fn (?*anyopaque, *const IID, *?*anyopaque) callconv(.winapi) HRESULT,
+    AddRef: *const fn (?*anyopaque) callconv(.winapi) ULONG,
+    Release: *const fn (?*anyopaque) callconv(.winapi) ULONG,
+    get_ProviderOptions: *const fn (?*anyopaque, *c_int) callconv(.winapi) HRESULT,
+    GetPatternProvider: *const fn (?*anyopaque, c_int, *?*anyopaque) callconv(.winapi) HRESULT,
+    GetPropertyValue: *const fn (?*anyopaque, c_int, *VARIANT) callconv(.winapi) HRESULT,
+    get_HostRawElementProvider: *const fn (?*anyopaque, *?*anyopaque) callconv(.winapi) HRESULT,
+};
+
+const RawElementProvider = extern struct {
+    lpVtbl: *const RawElementProviderVtbl,
+    ctx: *WindowCtx,
+};
+
+fn uiaQueryInterface(this: ?*anyopaque, riid: *const IID, ppv: *?*anyopaque) callconv(.winapi) HRESULT {
+    if (guidEq(riid, &IID_IUnknown) or guidEq(riid, &IID_IRawElementProviderSimple)) {
+        ppv.* = this;
+        return S_OK;
+    }
+    ppv.* = null;
+    return E_NOINTERFACE;
+}
+
+fn uiaGetProviderOptions(_: ?*anyopaque, out: *c_int) callconv(.winapi) HRESULT {
+    out.* = ProviderOptions_ServerSideProvider;
+    return S_OK;
+}
+
+fn uiaGetPatternProvider(_: ?*anyopaque, _: c_int, out: *?*anyopaque) callconv(.winapi) HRESULT {
+    out.* = null; // no control patterns; window chrome only
+    return S_OK;
+}
+
+/// Map the cross-platform subrole onto a UIA control type. All window
+/// chrome reports as a Window control type; dialog vs. plain window is
+/// differentiated through `UIA_IsDialogPropertyId` (see below), matching
+/// how modern UIA surfaces dialogs.
+fn controlTypeForSubrole(_: opts_mod.AccessibilitySubrole) usize {
+    return UIA_WindowControlTypeId;
+}
+
+fn isDialogSubrole(sub: opts_mod.AccessibilitySubrole) bool {
+    return sub == .dialog or sub == .system_dialog;
+}
+
+fn uiaToBstr(allocator: std.mem.Allocator, s: []const u8) ?*anyopaque {
+    const w = std.unicode.utf8ToUtf16LeAllocZ(allocator, s) catch return null;
+    defer allocator.free(w);
+    return SysAllocString(w.ptr);
+}
+
+fn uiaGetPropertyValue(this: ?*anyopaque, pid: c_int, out: *VARIANT) callconv(.winapi) HRESULT {
+    out.* = .{ .vt = VT_EMPTY };
+    const self: *RawElementProvider = @ptrCast(@alignCast(this orelse return S_OK));
+    const cx = self.ctx;
+    switch (pid) {
+        UIA_LocalizedControlTypePropertyId => {
+            if (cx.a11y_role_desc) |s| {
+                if (uiaToBstr(cx.allocator, s)) |b| out.* = .{ .vt = VT_BSTR, .val = @intFromPtr(b) };
+            }
+        },
+        UIA_HelpTextPropertyId => {
+            if (cx.a11y_help) |s| {
+                if (uiaToBstr(cx.allocator, s)) |b| out.* = .{ .vt = VT_BSTR, .val = @intFromPtr(b) };
+            }
+        },
+        UIA_ControlTypePropertyId => {
+            out.* = .{ .vt = VT_I4, .val = controlTypeForSubrole(cx.a11y_subrole) };
+        },
+        UIA_IsDialogPropertyId => {
+            out.* = .{ .vt = VT_BOOL, .val = if (isDialogSubrole(cx.a11y_subrole)) VARIANT_TRUE else 0 };
+        },
+        else => {},
+    }
+    return S_OK;
+}
+
+fn uiaGetHostProvider(this: ?*anyopaque, out: *?*anyopaque) callconv(.winapi) HRESULT {
+    out.* = null;
+    const self: *RawElementProvider = @ptrCast(@alignCast(this orelse return S_OK));
+    _ = UiaHostProviderFromHwnd(self.ctx.hwnd, out);
+    return S_OK;
+}
+
+const raw_element_provider_vtbl: RawElementProviderVtbl = .{
+    .QueryInterface = uiaQueryInterface,
+    .AddRef = comAddRef1,
+    .Release = comRelease1,
+    .get_ProviderOptions = uiaGetProviderOptions,
+    .GetPatternProvider = uiaGetPatternProvider,
+    .GetPropertyValue = uiaGetPropertyValue,
+    .get_HostRawElementProvider = uiaGetHostProvider,
+};
+
+/// Replace an owned a11y string on the ctx, freeing any prior value. A
+/// failed dupe leaves the slot null (property reverts to default) rather
+/// than aborting — accessibility metadata is best-effort.
+fn setCtxA11yString(cx: *WindowCtx, slot: *?[]u8, text: []const u8) void {
+    if (slot.*) |old| cx.allocator.free(old);
+    slot.* = cx.allocator.dupe(u8, text) catch null;
+}
+
 // ---- Filter for AddWebResourceRequestedFilter -------------------------------
 
 const COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL: c_int = 0;
@@ -989,6 +1140,14 @@ const WindowCtx = struct {
     msg_handler: IMessageReceivedHandler,
     res_handler: IResourceRequestedHandler,
     drop_target: IDropTarget,
+    /// Server-side UIA provider answering `WM_GETOBJECT`; back-pointer to
+    /// this ctx so `GetPropertyValue` reads the live a11y strings below.
+    a11y_provider: RawElementProvider,
+    /// Accessibility metadata published through the UIA provider. Owned by
+    /// `allocator`; freed on `WM_DESTROY`.
+    a11y_role_desc: ?[]u8 = null,
+    a11y_help: ?[]u8 = null,
+    a11y_subrole: opts_mod.AccessibilitySubrole = .standard,
     /// Fullscreen state cache. `fullscreen` flag + saved style/rect
     /// let `setFullscreen(false)` restore the pre-fullscreen window
     /// without the caller threading state back.
@@ -1058,6 +1217,7 @@ pub const Window = struct {
             .msg_handler = .{ .lpVtbl = &message_handler_vtbl, .ctx = heap },
             .res_handler = .{ .lpVtbl = &resource_handler_vtbl, .ctx = heap },
             .drop_target = .{ .lpVtbl = &drop_target_vtbl, .ctx = heap },
+            .a11y_provider = .{ .lpVtbl = &raw_element_provider_vtbl, .ctx = heap },
         };
 
         const class_name = std.unicode.utf8ToUtf16LeStringLiteral("VerveWindow");
@@ -1267,37 +1427,33 @@ pub const Window = struct {
         std.log.info("verve.desktop[windows]: ShowPrintUI(kind={d}) ok", .{kind});
     }
 
-    /// On Windows the window's accessible name (what screen readers
-    /// read on focus) comes straight from `SetWindowTextW`. Without a
-    /// dedicated UIA / IAccessible2 provider there is no separate
-    /// accessibility-label channel, so this method delegates to
-    /// `setTitle` — apps that want title + label distinct should
-    /// ship a UIA provider; that scope is deferred.
+    /// The window's accessible Name (what screen readers read on focus)
+    /// comes from the window text, so the label channel delegates to
+    /// `setTitle`; the default host provider re-publishes it as the UIA
+    /// Name. Role-description / subrole / help ride the dedicated UIA
+    /// provider below.
     pub fn setAccessibilityLabel(self: *Window, label: []const u8) void {
         self.setTitle(label);
     }
 
-    /// No-op: without a dedicated UIA / IAccessible2 provider Windows has
-    /// no AXHelp-equivalent channel. Deferred — same scope note as
-    /// `setAccessibilityLabel`.
+    /// Publish UIA help text (`UIA_HelpTextPropertyId`) for the window
+    /// root. Read live by the provider; assistive tech picks it up on the
+    /// next query.
     pub fn setAccessibilityHelp(self: *Window, text: []const u8) void {
-        _ = self;
-        _ = text;
-        std.log.info("verve.desktop[windows]: setAccessibilityHelp no-op (no UIA provider)", .{});
+        setCtxA11yString(self.ctx, &self.ctx.a11y_help, text);
     }
 
-    /// No-op: no role-description channel without a UIA provider.
+    /// Override the spoken role name (`UIA_LocalizedControlTypePropertyId`)
+    /// via the UIA provider.
     pub fn setAccessibilityRoleDescription(self: *Window, text: []const u8) void {
-        _ = self;
-        _ = text;
-        std.log.info("verve.desktop[windows]: setAccessibilityRoleDescription no-op (no UIA provider)", .{});
+        setCtxA11yString(self.ctx, &self.ctx.a11y_role_desc, text);
     }
 
-    /// No-op: no subrole channel without a UIA provider.
+    /// Set the window's accessibility subrole. `dialog` / `system_dialog`
+    /// surface as `UIA_IsDialogPropertyId == true` through the provider so
+    /// assistive tech announces the window as a dialog.
     pub fn setAccessibilitySubrole(self: *Window, subrole: opts_mod.AccessibilitySubrole) void {
-        _ = self;
-        _ = subrole;
-        std.log.info("verve.desktop[windows]: setAccessibilitySubrole no-op (no UIA provider)", .{});
+        self.ctx.a11y_subrole = subrole;
     }
 
     /// Toggle topmost via `SetWindowPos(HWND_TOPMOST | HWND_NOTOPMOST)`.
@@ -1924,6 +2080,16 @@ fn runFileDialogWindows(
 
 fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
+        WM_GETOBJECT => {
+            // Hand assistive tech our server-side UIA provider for the
+            // window root; all other object ids fall through to default.
+            if (lparam == UiaRootObjectId) {
+                if (lookupCtx(hwnd)) |cx| {
+                    return UiaReturnRawElementProvider(hwnd, wparam, lparam, @ptrCast(&cx.a11y_provider));
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         WM_SIZE => {
             if (lookupCtx(hwnd)) |cx| {
                 // Keep the WebView2 controller filling the client area.
@@ -2053,6 +2219,14 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 if (cx.drop_registered) {
                     _ = RevokeDragDrop(hwnd);
                     cx.drop_registered = false;
+                }
+                if (cx.a11y_role_desc) |s| {
+                    cx.allocator.free(s);
+                    cx.a11y_role_desc = null;
+                }
+                if (cx.a11y_help) |s| {
+                    cx.allocator.free(s);
+                    cx.a11y_help = null;
                 }
             }
             unregisterCtx(hwnd);
@@ -2988,16 +3162,394 @@ pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_
     return allocator.dupe(u8, fragment) catch return opts_mod.ClipboardError.OutOfMemory;
 }
 
+// ---- Image clipboard (CF_DIBV5 via WIC) ------------------------------------
+//
+// The cross-platform wire format is raw PNG bytes (macOS parity). The
+// Windows clipboard image format is a DIB: `CF_DIBV5` (BITMAPV5HEADER,
+// carries an alpha channel) on write, `CF_DIBV5` || `CF_DIB` on read.
+// PNG <-> 32bpp-BGRA transcoding goes through WIC (`windowscodecs`) — the
+// pure byte<->DIB plumbing (`buildDibV5` / `dibToBgra`) is factored out so
+// it is unit-testable without a live COM stack.
+//
+// COM objects here are short-lived per call; we CoInitialize best-effort
+// (the WebView2 thread has usually already initialised an apartment, so
+// `S_FALSE` / `RPC_E_CHANGED_MODE` are expected and ignored) and Release
+// every interface on the way out via the shared `releaseRef` helper.
+
+extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) HRESULT;
+extern "ole32" fn CoCreateInstance(
+    rclsid: *const GUID,
+    unk_outer: ?*anyopaque,
+    cls_context: DWORD,
+    riid: *const GUID,
+    ppv: *?*anyopaque,
+) callconv(.winapi) HRESULT;
+extern "ole32" fn GetHGlobalFromStream(pstm: *IStreamW, phglobal: *?*anyopaque) callconv(.winapi) HRESULT;
+// `CreateStreamOnHGlobal` and `SHCreateMemStream` are declared above
+// (CapturePreview path) — reused here.
+
+const CLSCTX_INPROC_SERVER: DWORD = 1;
+const COINIT_APARTMENTTHREADED: DWORD = 2;
+const CF_DIB: UINT = 8;
+const CF_DIBV5: UINT = 17;
+const BI_RGB: u32 = 0;
+const BI_BITFIELDS: u32 = 3;
+const LCS_sRGB: u32 = 0x7352_4742; // 'sRGB'
+const LCS_GM_IMAGES: u32 = 4;
+
+// WIC enum values (from wincodec.h).
+const WICDecodeMetadataCacheOnDemand: c_int = 0;
+const WICBitmapDitherTypeNone: c_int = 0;
+const WICBitmapPaletteTypeCustom: c_int = 0;
+const WICBitmapEncoderNoCache: c_int = 2;
+
+const CLSID_WICImagingFactory: GUID = .{ .Data1 = 0xcacaf262, .Data2 = 0x9370, .Data3 = 0x4615, .Data4 = .{ 0xa1, 0x3b, 0x9f, 0x55, 0x39, 0xda, 0x4c, 0x0a } };
+const IID_IWICImagingFactory: GUID = .{ .Data1 = 0xec5ec8a9, .Data2 = 0xc395, .Data3 = 0x4314, .Data4 = .{ 0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70 } };
+const GUID_WICPixelFormat32bppBGRA: GUID = .{ .Data1 = 0x6fddc324, .Data2 = 0x4e03, .Data3 = 0x4bfe, .Data4 = .{ 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0f } };
+const GUID_ContainerFormatPng: GUID = .{ .Data1 = 0x1b7cfaf4, .Data2 = 0x713f, .Data3 = 0x473c, .Data4 = .{ 0xbb, 0xcd, 0x61, 0x37, 0x42, 0x5f, 0xae, 0xaf } };
+
+// Generic WIC interface handle — every interface we touch begins with an
+// `lpVtbl` pointer, so one shape + offset-based `vtSlot` covers them all.
+const WicObj = extern struct { lpVtbl: *const anyopaque };
+
+// Vtable slots (wincodec.h; first three are IUnknown).
+const SLOT_WICFactory_CreateDecoderFromStream: usize = 4;
+const SLOT_WICFactory_CreateEncoder: usize = 8;
+const SLOT_WICFactory_CreateFormatConverter: usize = 10;
+const SLOT_WICFactory_CreateBitmapFromMemory: usize = 20;
+const SLOT_WICSource_GetSize: usize = 3;
+const SLOT_WICSource_CopyPixels: usize = 7;
+const SLOT_WICDecoder_GetFrame: usize = 13;
+const SLOT_WICConverter_Initialize: usize = 8;
+const SLOT_WICEncoder_Initialize: usize = 3;
+const SLOT_WICEncoder_CreateNewFrame: usize = 10;
+const SLOT_WICEncoder_Commit: usize = 11;
+const SLOT_WICFrame_Initialize: usize = 3;
+const SLOT_WICFrame_SetSize: usize = 4;
+const SLOT_WICFrame_WriteSource: usize = 11;
+const SLOT_WICFrame_Commit: usize = 12;
+
+const CIEXYZ = extern struct { x: i32 = 0, y: i32 = 0, z: i32 = 0 };
+const CIEXYZTRIPLE = extern struct { r: CIEXYZ = .{}, g: CIEXYZ = .{}, b: CIEXYZ = .{} };
+const BITMAPV5HEADER = extern struct {
+    bV5Size: u32 = 124,
+    bV5Width: i32 = 0,
+    bV5Height: i32 = 0,
+    bV5Planes: u16 = 1,
+    bV5BitCount: u16 = 32,
+    bV5Compression: u32 = 0,
+    bV5SizeImage: u32 = 0,
+    bV5XPelsPerMeter: i32 = 0,
+    bV5YPelsPerMeter: i32 = 0,
+    bV5ClrUsed: u32 = 0,
+    bV5ClrImportant: u32 = 0,
+    bV5RedMask: u32 = 0,
+    bV5GreenMask: u32 = 0,
+    bV5BlueMask: u32 = 0,
+    bV5AlphaMask: u32 = 0,
+    bV5CSType: u32 = 0,
+    bV5Endpoints: CIEXYZTRIPLE = .{},
+    bV5GammaRed: u32 = 0,
+    bV5GammaGreen: u32 = 0,
+    bV5GammaBlue: u32 = 0,
+    bV5Intent: u32 = 0,
+    bV5ProfileData: u32 = 0,
+    bV5ProfileSize: u32 = 0,
+    bV5Reserved: u32 = 0,
+};
+
+comptime {
+    // The DIBV5 layout is ABI-fixed at 124 bytes; a mis-sized header
+    // means SetClipboardData hands the shell a malformed bitmap.
+    if (@sizeOf(BITMAPV5HEADER) != 124) @compileError("BITMAPV5HEADER must be 124 bytes");
+}
+
+// Reject absurd dimensions before any width*height*4 allocation so a
+// hostile or corrupt DIB can't overflow the size math.
+const MAX_IMAGE_BYTES: usize = 256 * 1024 * 1024;
+
+fn wicCreateFactory() ?*WicObj {
+    _ = CoInitializeEx(null, COINIT_APARTMENTTHREADED); // best-effort; S_FALSE/changed-mode tolerated
+    var factory: ?*anyopaque = null;
+    const hr = CoCreateInstance(&CLSID_WICImagingFactory, null, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, &factory);
+    if (hr < 0 or factory == null) return null;
+    return @ptrCast(@alignCast(factory));
+}
+
 pub fn clipboardWriteImage(window: *anyopaque, png: []const u8) opts_mod.ClipboardError!void {
-    _ = window;
-    _ = png;
-    return opts_mod.ClipboardError.Unsupported;
+    const self: *Window = @ptrCast(@alignCast(window));
+    if (png.len == 0) return opts_mod.ClipboardError.Backend;
+
+    const factory = wicCreateFactory() orelse return opts_mod.ClipboardError.Backend;
+    defer releaseRef(@ptrCast(factory));
+
+    // PNG bytes -> read IStream (SHCreateMemStream copies the buffer, so
+    // `png` need not outlive the call).
+    const stream = SHCreateMemStream(png.ptr, @intCast(png.len)) orelse return opts_mod.ClipboardError.Backend;
+    defer releaseRef(@ptrCast(stream));
+
+    const CreateDecoder = vtSlot(*const fn (*WicObj, *IStreamW, ?*const GUID, c_int, *?*WicObj) callconv(.winapi) HRESULT, factory.lpVtbl, SLOT_WICFactory_CreateDecoderFromStream);
+    var decoder: ?*WicObj = null;
+    if (CreateDecoder(factory, stream, null, WICDecodeMetadataCacheOnDemand, &decoder) < 0 or decoder == null) return opts_mod.ClipboardError.Backend;
+    defer releaseRef(@ptrCast(decoder.?));
+
+    const GetFrame = vtSlot(*const fn (*WicObj, u32, *?*WicObj) callconv(.winapi) HRESULT, decoder.?.lpVtbl, SLOT_WICDecoder_GetFrame);
+    var frame: ?*WicObj = null;
+    if (GetFrame(decoder.?, 0, &frame) < 0 or frame == null) return opts_mod.ClipboardError.Backend;
+    defer releaseRef(@ptrCast(frame.?));
+
+    // Normalise to 32bpp BGRA regardless of the PNG's native format.
+    const CreateConv = vtSlot(*const fn (*WicObj, *?*WicObj) callconv(.winapi) HRESULT, factory.lpVtbl, SLOT_WICFactory_CreateFormatConverter);
+    var conv: ?*WicObj = null;
+    if (CreateConv(factory, &conv) < 0 or conv == null) return opts_mod.ClipboardError.Backend;
+    defer releaseRef(@ptrCast(conv.?));
+
+    const ConvInit = vtSlot(*const fn (*WicObj, *WicObj, *const GUID, c_int, ?*anyopaque, f64, c_int) callconv(.winapi) HRESULT, conv.?.lpVtbl, SLOT_WICConverter_Initialize);
+    if (ConvInit(conv.?, frame.?, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, null, 0.0, WICBitmapPaletteTypeCustom) < 0) return opts_mod.ClipboardError.Backend;
+
+    const GetSize = vtSlot(*const fn (*WicObj, *u32, *u32) callconv(.winapi) HRESULT, conv.?.lpVtbl, SLOT_WICSource_GetSize);
+    var w: u32 = 0;
+    var h: u32 = 0;
+    if (GetSize(conv.?, &w, &h) < 0 or w == 0 or h == 0) return opts_mod.ClipboardError.Backend;
+
+    const stride: usize = @as(usize, w) * 4;
+    const pixel_bytes: usize = stride * @as(usize, h);
+    if (pixel_bytes > MAX_IMAGE_BYTES) return opts_mod.ClipboardError.Backend;
+
+    const bgra = self.ctx.allocator.alloc(u8, pixel_bytes) catch return opts_mod.ClipboardError.OutOfMemory;
+    defer self.ctx.allocator.free(bgra);
+
+    const CopyPixels = vtSlot(*const fn (*WicObj, ?*const anyopaque, u32, u32, [*]u8) callconv(.winapi) HRESULT, conv.?.lpVtbl, SLOT_WICSource_CopyPixels);
+    if (CopyPixels(conv.?, null, @intCast(stride), @intCast(pixel_bytes), bgra.ptr) < 0) return opts_mod.ClipboardError.Backend;
+
+    // Pack a bottom-up CF_DIBV5 blob (header + reversed rows).
+    const dib = buildDibV5(self.ctx.allocator, w, h, bgra) catch return opts_mod.ClipboardError.OutOfMemory;
+    defer self.ctx.allocator.free(dib);
+
+    const handle = GlobalAlloc(GMEM_MOVEABLE, dib.len) orelse return opts_mod.ClipboardError.OutOfMemory;
+    errdefer _ = GlobalFree(handle);
+    const locked = GlobalLock(handle) orelse {
+        _ = GlobalFree(handle);
+        return opts_mod.ClipboardError.Backend;
+    };
+    const dst: [*]u8 = @ptrCast(@alignCast(locked));
+    @memcpy(dst[0..dib.len], dib);
+    _ = GlobalUnlock(handle);
+
+    if (OpenClipboard(self.ctx.hwnd) == 0) return opts_mod.ClipboardError.Backend;
+    defer _ = CloseClipboard();
+    if (EmptyClipboard() == 0) return opts_mod.ClipboardError.Backend;
+    // SetClipboardData takes ownership of the HGLOBAL on success.
+    if (SetClipboardData(CF_DIBV5, handle) == null) {
+        _ = GlobalFree(handle);
+        return opts_mod.ClipboardError.Backend;
+    }
 }
 
 pub fn clipboardReadImage(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
-    _ = window;
-    _ = allocator;
-    return opts_mod.ClipboardError.Unsupported;
+    const self: *Window = @ptrCast(@alignCast(window));
+
+    const fmt: UINT = if (IsClipboardFormatAvailable(CF_DIBV5) != 0)
+        CF_DIBV5
+    else if (IsClipboardFormatAvailable(CF_DIB) != 0)
+        CF_DIB
+    else
+        return null;
+
+    if (OpenClipboard(self.ctx.hwnd) == 0) return opts_mod.ClipboardError.Backend;
+    defer _ = CloseClipboard();
+
+    const handle = GetClipboardData(fmt) orelse return null;
+    const locked = GlobalLock(handle) orelse return opts_mod.ClipboardError.Backend;
+    defer _ = GlobalUnlock(handle);
+    const total = GlobalSize(handle);
+    if (total < 40) return null;
+    const src: [*]const u8 = @ptrCast(@alignCast(locked));
+
+    // DIB -> top-down 32bpp BGRA (owned by `allocator`).
+    const img = dibToBgra(allocator, src[0..total]) catch |e| switch (e) {
+        error.OutOfMemory => return opts_mod.ClipboardError.OutOfMemory,
+        else => return opts_mod.ClipboardError.Backend,
+    };
+    defer allocator.free(img.pixels);
+
+    const factory = wicCreateFactory() orelse return opts_mod.ClipboardError.Backend;
+    defer releaseRef(@ptrCast(factory));
+
+    // Wrap the pixels as a WIC bitmap source, then PNG-encode it into a
+    // growable HGLOBAL-backed stream.
+    const stride: u32 = img.width * 4;
+    const buf_size: u32 = stride * img.height;
+    const CreateBmp = vtSlot(*const fn (*WicObj, u32, u32, *const GUID, u32, u32, [*]const u8, *?*WicObj) callconv(.winapi) HRESULT, factory.lpVtbl, SLOT_WICFactory_CreateBitmapFromMemory);
+    var bitmap: ?*WicObj = null;
+    if (CreateBmp(factory, img.width, img.height, &GUID_WICPixelFormat32bppBGRA, stride, buf_size, img.pixels.ptr, &bitmap) < 0 or bitmap == null) return opts_mod.ClipboardError.Backend;
+    defer releaseRef(@ptrCast(bitmap.?));
+
+    var ostream: ?*IStreamW = null;
+    if (CreateStreamOnHGlobal(null, 1, &ostream) < 0 or ostream == null) return opts_mod.ClipboardError.Backend;
+    defer releaseRef(@ptrCast(ostream.?)); // frees the backing HGLOBAL (delete-on-release)
+
+    const CreateEnc = vtSlot(*const fn (*WicObj, *const GUID, ?*const GUID, *?*WicObj) callconv(.winapi) HRESULT, factory.lpVtbl, SLOT_WICFactory_CreateEncoder);
+    var encoder: ?*WicObj = null;
+    if (CreateEnc(factory, &GUID_ContainerFormatPng, null, &encoder) < 0 or encoder == null) return opts_mod.ClipboardError.Backend;
+    defer releaseRef(@ptrCast(encoder.?));
+
+    const EncInit = vtSlot(*const fn (*WicObj, *IStreamW, c_int) callconv(.winapi) HRESULT, encoder.?.lpVtbl, SLOT_WICEncoder_Initialize);
+    if (EncInit(encoder.?, ostream.?, WICBitmapEncoderNoCache) < 0) return opts_mod.ClipboardError.Backend;
+
+    const CreateFrame = vtSlot(*const fn (*WicObj, *?*WicObj, *?*anyopaque) callconv(.winapi) HRESULT, encoder.?.lpVtbl, SLOT_WICEncoder_CreateNewFrame);
+    var enc_frame: ?*WicObj = null;
+    var bag: ?*anyopaque = null;
+    if (CreateFrame(encoder.?, &enc_frame, &bag) < 0 or enc_frame == null) return opts_mod.ClipboardError.Backend;
+    defer releaseRef(@ptrCast(enc_frame.?));
+
+    const FrameInit = vtSlot(*const fn (*WicObj, ?*anyopaque) callconv(.winapi) HRESULT, enc_frame.?.lpVtbl, SLOT_WICFrame_Initialize);
+    if (FrameInit(enc_frame.?, bag) < 0) return opts_mod.ClipboardError.Backend;
+
+    const SetFrameSize = vtSlot(*const fn (*WicObj, u32, u32) callconv(.winapi) HRESULT, enc_frame.?.lpVtbl, SLOT_WICFrame_SetSize);
+    if (SetFrameSize(enc_frame.?, img.width, img.height) < 0) return opts_mod.ClipboardError.Backend;
+
+    const WriteSource = vtSlot(*const fn (*WicObj, *WicObj, ?*const anyopaque) callconv(.winapi) HRESULT, enc_frame.?.lpVtbl, SLOT_WICFrame_WriteSource);
+    if (WriteSource(enc_frame.?, bitmap.?, null) < 0) return opts_mod.ClipboardError.Backend;
+
+    const FrameCommit = vtSlot(*const fn (*WicObj) callconv(.winapi) HRESULT, enc_frame.?.lpVtbl, SLOT_WICFrame_Commit);
+    if (FrameCommit(enc_frame.?) < 0) return opts_mod.ClipboardError.Backend;
+    const EncCommit = vtSlot(*const fn (*WicObj) callconv(.winapi) HRESULT, encoder.?.lpVtbl, SLOT_WICEncoder_Commit);
+    if (EncCommit(encoder.?) < 0) return opts_mod.ClipboardError.Backend;
+
+    // Pull the encoded PNG straight off the stream's HGLOBAL.
+    var hmem: ?*anyopaque = null;
+    if (GetHGlobalFromStream(ostream.?, &hmem) < 0 or hmem == null) return opts_mod.ClipboardError.Backend;
+    const png_locked = GlobalLock(hmem) orelse return opts_mod.ClipboardError.Backend;
+    defer _ = GlobalUnlock(hmem);
+    const png_size = GlobalSize(hmem);
+    if (png_size == 0) return opts_mod.ClipboardError.Backend;
+    const png_src: [*]const u8 = @ptrCast(@alignCast(png_locked));
+    return allocator.dupe(u8, png_src[0..png_size]) catch return opts_mod.ClipboardError.OutOfMemory;
+}
+
+// ---- Pure DIB <-> BGRA helpers (no COM; unit-testable) ---------------------
+
+/// Pack a top-down 32bpp-BGRA pixel buffer into a `CF_DIBV5` blob:
+/// a `BITMAPV5HEADER` (BI_BITFIELDS, explicit BGRA masks, positive height
+/// = bottom-up) followed by the rows in bottom-up order. Caller owns the
+/// returned slice.
+fn buildDibV5(allocator: std.mem.Allocator, w: u32, h: u32, bgra_topdown: []const u8) error{OutOfMemory}![]u8 {
+    const stride: usize = @as(usize, w) * 4;
+    const pixels: usize = stride * @as(usize, h);
+    const out = try allocator.alloc(u8, 124 + pixels);
+    errdefer allocator.free(out);
+
+    var hdr: BITMAPV5HEADER = .{};
+    hdr.bV5Width = @intCast(w);
+    hdr.bV5Height = @intCast(h); // positive => bottom-up rows
+    hdr.bV5Compression = BI_BITFIELDS;
+    hdr.bV5SizeImage = @intCast(pixels);
+    hdr.bV5RedMask = 0x00FF_0000;
+    hdr.bV5GreenMask = 0x0000_FF00;
+    hdr.bV5BlueMask = 0x0000_00FF;
+    hdr.bV5AlphaMask = 0xFF00_0000;
+    hdr.bV5CSType = LCS_sRGB;
+    hdr.bV5Intent = LCS_GM_IMAGES;
+    @memcpy(out[0..124], std.mem.asBytes(&hdr));
+
+    var y: usize = 0;
+    while (y < h) : (y += 1) {
+        const src_off = y * stride; // top-down source row y
+        const dst_off = 124 + (@as(usize, h) - 1 - y) * stride; // bottom-up dest
+        @memcpy(out[dst_off..][0..stride], bgra_topdown[src_off..][0..stride]);
+    }
+    return out;
+}
+
+const DibImage = struct { width: u32, height: u32, pixels: []u8 };
+
+/// Decode a packed DIB (`CF_DIB` / `CF_DIBV5` payload) into a top-down
+/// 32bpp-BGRA buffer. Supports 24bpp and 32bpp source DIBs (BI_RGB and
+/// BI_BITFIELDS); paletted/compressed inputs return `error.Unsupported`.
+/// A 32bpp source whose alpha bytes are entirely zero is treated as opaque
+/// (the common BGRX-as-BGRA screenshot case). Caller owns `pixels`.
+fn dibToBgra(allocator: std.mem.Allocator, bytes: []const u8) error{ OutOfMemory, Unsupported, Malformed }!DibImage {
+    if (bytes.len < 40) return error.Malformed;
+    const header_size = readU32(bytes, 0);
+    if (header_size < 40 or header_size > bytes.len) return error.Malformed;
+
+    const width_raw = readI32(bytes, 4);
+    const height_raw = readI32(bytes, 8);
+    const bit_count = readU16(bytes, 14);
+    const compression = readU32(bytes, 16);
+    if (width_raw <= 0 or height_raw == 0) return error.Malformed;
+    if (bit_count != 24 and bit_count != 32) return error.Unsupported;
+
+    const top_down = height_raw < 0;
+    const width: u32 = @intCast(width_raw);
+    const height: u32 = @intCast(if (height_raw < 0) -height_raw else height_raw);
+
+    // Pixel data offset: V4/V5 (>=108) carry their masks inside the
+    // header; a 40-byte header with BI_BITFIELDS is followed by three
+    // DWORD masks; BI_RGB has no mask/palette block for >8bpp.
+    var pixel_off: usize = header_size;
+    if (header_size < 108 and compression == BI_BITFIELDS) {
+        pixel_off += 12;
+    } else if (compression != BI_RGB and compression != BI_BITFIELDS) {
+        return error.Unsupported;
+    }
+
+    const src_stride: usize = ((@as(usize, bit_count) * width + 31) / 32) * 4; // DWORD-aligned
+    const need = pixel_off + src_stride * @as(usize, height);
+    if (need > bytes.len) return error.Malformed;
+
+    const dst_stride: usize = @as(usize, width) * 4;
+    const dst_bytes: usize = dst_stride * @as(usize, height);
+    if (dst_bytes > MAX_IMAGE_BYTES) return error.Malformed;
+
+    const pixels = try allocator.alloc(u8, dst_bytes);
+    errdefer allocator.free(pixels);
+
+    var any_alpha = false;
+    var y: usize = 0;
+    while (y < height) : (y += 1) {
+        // Source row index: bottom-up DIBs store the last image row first.
+        const src_row = if (top_down) y else (@as(usize, height) - 1 - y);
+        const s = bytes[pixel_off + src_row * src_stride ..];
+        const d = pixels[y * dst_stride ..];
+        var x: usize = 0;
+        while (x < width) : (x += 1) {
+            if (bit_count == 32) {
+                const b = s[x * 4 + 0];
+                const g = s[x * 4 + 1];
+                const r = s[x * 4 + 2];
+                const a = s[x * 4 + 3];
+                if (a != 0) any_alpha = true;
+                d[x * 4 + 0] = b;
+                d[x * 4 + 1] = g;
+                d[x * 4 + 2] = r;
+                d[x * 4 + 3] = a;
+            } else { // 24bpp BGR
+                d[x * 4 + 0] = s[x * 3 + 0];
+                d[x * 4 + 1] = s[x * 3 + 1];
+                d[x * 4 + 2] = s[x * 3 + 2];
+                d[x * 4 + 3] = 0xFF;
+                any_alpha = true;
+            }
+        }
+    }
+    // A 32bpp DIB with no alpha information at all is opaque BGRX.
+    if (!any_alpha) {
+        var i: usize = 3;
+        while (i < pixels.len) : (i += 4) pixels[i] = 0xFF;
+    }
+    return .{ .width = width, .height = height, .pixels = pixels };
+}
+
+fn readU16(b: []const u8, off: usize) u16 {
+    return std.mem.readInt(u16, b[off..][0..2], .little);
+}
+fn readU32(b: []const u8, off: usize) u32 {
+    return std.mem.readInt(u32, b[off..][0..4], .little);
+}
+fn readI32(b: []const u8, off: usize) i32 {
+    return std.mem.readInt(i32, b[off..][0..4], .little);
 }
 
 fn parseOffset(buf: []const u8, label: []const u8) ?usize {
@@ -3012,6 +3564,424 @@ fn parseOffset(buf: []const u8, label: []const u8) ?usize {
         saw_digit = true;
     }
     return if (saw_digit) n else null;
+}
+
+// ---- WinRT Toast notifications ----------------------------------------------
+//
+// The modern Action Center toast (vs. the legacy `Shell_NotifyIconW` balloon
+// in tray.zig). Three prerequisites the balloon path doesn't have:
+//
+//   1. An Application User Model ID (AUMID) — the identity a toast is filed
+//      under. Set process-wide via `SetCurrentProcessExplicitAppUserModelID`.
+//   2. A Start-menu `.lnk` shortcut carrying that same AUMID in its
+//      `System.AppUserModel.ID` property — without it the shell silently
+//      drops toasts from unpackaged (non-MSIX) apps. Created once.
+//   3. WinRT activation: `RoActivateInstance` an `XmlDocument`, load a
+//      `ToastGeneric` template, then `ToastNotificationManager` →
+//      `IToastNotifier::Show`.
+//
+// All of this is hand-rolled COM/WinRT over `vtSlot`; the WinRT vtables put
+// three IInspectable methods (GetIids/GetRuntimeClassName/GetTrustLevel)
+// after IUnknown, so runtime-class methods start at slot 6. Links
+// `combase` (Ro*/Windows*String) + `Shell32`/`Ole32`/`Shlwapi` (shortcut).
+// `notifications.show` calls this first and falls back to the balloon.
+
+pub const ToastError = error{ Unsupported, Backend, OutOfMemory };
+
+extern "combase" fn RoInitialize(init_type: c_int) callconv(.winapi) HRESULT;
+extern "combase" fn WindowsCreateString(src: [*]const u16, len: u32, out: *?*anyopaque) callconv(.winapi) HRESULT;
+extern "combase" fn WindowsDeleteString(str: ?*anyopaque) callconv(.winapi) HRESULT;
+extern "combase" fn RoGetActivationFactory(class_id: ?*anyopaque, iid: *const IID, factory: *?*anyopaque) callconv(.winapi) HRESULT;
+extern "combase" fn RoActivateInstance(class_id: ?*anyopaque, instance: *?*anyopaque) callconv(.winapi) HRESULT;
+extern "shell32" fn SetCurrentProcessExplicitAppUserModelID(id: [*:0]const u16) callconv(.winapi) HRESULT;
+extern "kernel32" fn GetModuleFileNameW(module: HMODULE, buf: [*]u16, size: DWORD) callconv(.winapi) DWORD;
+extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: [*]u16, size: DWORD) callconv(.winapi) DWORD;
+extern "shlwapi" fn PathFileExistsW(path: [*:0]const u16) callconv(.winapi) BOOL;
+
+const RO_INIT_SINGLETHREADED: c_int = 0;
+
+// WinRT runtime-method slots (IInspectable methods occupy slots 3-5).
+const SLOT_XmlDocumentIO_LoadXml: usize = 6;
+const SLOT_ToastMgr_CreateToastNotifierWithId: usize = 7;
+const SLOT_ToastFactory_CreateToastNotification: usize = 6;
+const SLOT_ToastNotifier_Show: usize = 6;
+// Shortcut COM slots (classic IUnknown-rooted interfaces).
+const SLOT_ShellLink_SetPath: usize = 20;
+const SLOT_PropertyStore_SetValue: usize = 6;
+const SLOT_PropertyStore_Commit: usize = 7;
+const SLOT_PersistFile_Save: usize = 6;
+
+const IID_IXmlDocument: GUID = .{ .Data1 = 0xf7f3a506, .Data2 = 0x1e87, .Data3 = 0x42d6, .Data4 = .{ 0xbc, 0xfb, 0xb8, 0xc8, 0x09, 0xfa, 0x54, 0x94 } };
+const IID_IXmlDocumentIO: GUID = .{ .Data1 = 0x6cd0e74e, .Data2 = 0xee65, .Data3 = 0x4489, .Data4 = .{ 0x9e, 0xbf, 0xca, 0x43, 0xe8, 0x7b, 0xa6, 0x37 } };
+const IID_IToastNotificationManagerStatics: GUID = .{ .Data1 = 0x50ac103f, .Data2 = 0xd235, .Data3 = 0x4598, .Data4 = .{ 0xbb, 0xef, 0x98, 0xfe, 0x4d, 0x1a, 0x3a, 0xd4 } };
+const IID_IToastNotificationFactory: GUID = .{ .Data1 = 0x04124b20, .Data2 = 0x82c6, .Data3 = 0x4229, .Data4 = .{ 0xb1, 0x09, 0xfd, 0x9e, 0xd4, 0x66, 0x2b, 0x53 } };
+const IID_IToastNotifier: GUID = .{ .Data1 = 0x75927b93, .Data2 = 0x03f3, .Data3 = 0x41ec, .Data4 = .{ 0x91, 0xd3, 0x6e, 0x5b, 0xac, 0x1b, 0x38, 0xe7 } };
+
+const CLSID_ShellLink: GUID = .{ .Data1 = 0x00021401, .Data2 = 0x0000, .Data3 = 0x0000, .Data4 = .{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+const IID_IShellLinkW: GUID = .{ .Data1 = 0x000214f9, .Data2 = 0x0000, .Data3 = 0x0000, .Data4 = .{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+const IID_IPersistFile: GUID = .{ .Data1 = 0x0000010b, .Data2 = 0x0000, .Data3 = 0x0000, .Data4 = .{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+const IID_IPropertyStore: GUID = .{ .Data1 = 0x886d8eeb, .Data2 = 0x8cf2, .Data3 = 0x4446, .Data4 = .{ 0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99 } };
+
+const VT_LPWSTR: u16 = 31;
+const PROPERTYKEY = extern struct { fmtid: GUID, pid: u32 };
+const PROPVARIANT = extern struct {
+    vt: u16,
+    r1: u16 = 0,
+    r2: u16 = 0,
+    r3: u16 = 0,
+    val: usize = 0,
+    pad: u64 = 0,
+};
+// System.AppUserModel.ID
+const PKEY_AppUserModel_ID: PROPERTYKEY = .{
+    .fmtid = .{ .Data1 = 0x9f4c2855, .Data2 = 0x9f79, .Data3 = 0x4b39, .Data4 = .{ 0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0xf3 } },
+    .pid = 5,
+};
+
+fn comQueryInterface(obj: *WicObj, iid: *const IID, out: *?*anyopaque) HRESULT {
+    const QI = vtSlot(*const fn (*WicObj, *const IID, *?*anyopaque) callconv(.winapi) HRESULT, obj.lpVtbl, 0);
+    return QI(obj, iid, out);
+}
+
+/// Create an HSTRING from a comptime ASCII class id. Caller deletes via
+/// `WindowsDeleteString`.
+fn hstr(comptime s: []const u8) ?*anyopaque {
+    const w = std.unicode.utf8ToUtf16LeStringLiteral(s);
+    var h: ?*anyopaque = null;
+    if (WindowsCreateString(w, w.len, &h) < 0) return null;
+    return h;
+}
+
+fn winrtString(w: []const u16) ?*anyopaque {
+    var h: ?*anyopaque = null;
+    if (WindowsCreateString(w.ptr, @intCast(w.len), &h) < 0) return null;
+    return h;
+}
+
+/// `RoActivateInstance` a runtime class by comptime id, returning its
+/// IInspectable. Caller Releases via `releaseRef`.
+fn roActivate(comptime class: []const u8) ?*WicObj {
+    const id = hstr(class) orelse return null;
+    defer _ = WindowsDeleteString(id);
+    var p: ?*anyopaque = null;
+    if (RoActivateInstance(id, &p) < 0 or p == null) return null;
+    return @ptrCast(@alignCast(p));
+}
+
+fn appendW(dst: []u16, i: *usize, src: []const u16) bool {
+    if (i.* + src.len >= dst.len) return false;
+    @memcpy(dst[i.*..][0..src.len], src);
+    i.* += src.len;
+    return true;
+}
+
+/// Emit the running executable's basename (no directory, `.exe` stripped)
+/// as UTF-16 into `out`; returns the length or null on failure. Used to
+/// derive a per-app AUMID and shortcut name.
+fn exeBaseNameW(out: []u16) ?usize {
+    var exe: [512]u16 = undefined;
+    const n = GetModuleFileNameW(null, &exe, exe.len);
+    if (n == 0 or n >= exe.len) return null;
+    var start: usize = 0;
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        if (exe[k] == '\\' or exe[k] == '/') start = k + 1;
+    }
+    var end: usize = n;
+    // Strip a trailing ".exe" (case-insensitive).
+    if (end >= start + 4) {
+        const tail = exe[end - 4 .. end];
+        if (tail[0] == '.' and (tail[1] | 0x20) == 'e' and (tail[2] | 0x20) == 'x' and (tail[3] | 0x20) == 'e') {
+            end -= 4;
+        }
+    }
+    const len = end - start;
+    if (len == 0 or len >= out.len) return null;
+    @memcpy(out[0..len], exe[start..end]);
+    return len;
+}
+
+/// Create the AUMID Start-menu shortcut once (idempotent — skips if the
+/// `.lnk` already exists). Best-effort: any failure leaves toasts to fall
+/// back. `*_z` are NUL-terminated UTF-16.
+fn ensureAumidShortcut(exe_z: [*:0]const u16, aumid_z: [*:0]const u16, lnk_z: [*:0]const u16) void {
+    if (PathFileExistsW(lnk_z) != 0) return;
+    _ = CoInitializeEx(null, COINIT_APARTMENTTHREADED);
+
+    var sl_p: ?*anyopaque = null;
+    if (CoCreateInstance(&CLSID_ShellLink, null, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, &sl_p) < 0 or sl_p == null) return;
+    const sl: *WicObj = @ptrCast(@alignCast(sl_p));
+    defer releaseRef(@ptrCast(sl));
+
+    const SetPath = vtSlot(*const fn (*WicObj, [*:0]const u16) callconv(.winapi) HRESULT, sl.lpVtbl, SLOT_ShellLink_SetPath);
+    if (SetPath(sl, exe_z) < 0) return;
+
+    var ps_p: ?*anyopaque = null;
+    if (comQueryInterface(sl, &IID_IPropertyStore, &ps_p) < 0 or ps_p == null) return;
+    const ps: *WicObj = @ptrCast(@alignCast(ps_p));
+    defer releaseRef(@ptrCast(ps));
+
+    var pv: PROPVARIANT = .{ .vt = VT_LPWSTR, .val = @intFromPtr(aumid_z) };
+    const SetValue = vtSlot(*const fn (*WicObj, *const PROPERTYKEY, *const PROPVARIANT) callconv(.winapi) HRESULT, ps.lpVtbl, SLOT_PropertyStore_SetValue);
+    if (SetValue(ps, &PKEY_AppUserModel_ID, &pv) < 0) return;
+    const Commit = vtSlot(*const fn (*WicObj) callconv(.winapi) HRESULT, ps.lpVtbl, SLOT_PropertyStore_Commit);
+    _ = Commit(ps);
+
+    var pf_p: ?*anyopaque = null;
+    if (comQueryInterface(sl, &IID_IPersistFile, &pf_p) < 0 or pf_p == null) return;
+    const pf: *WicObj = @ptrCast(@alignCast(pf_p));
+    defer releaseRef(@ptrCast(pf));
+    const Save = vtSlot(*const fn (*WicObj, [*:0]const u16, BOOL) callconv(.winapi) HRESULT, pf.lpVtbl, SLOT_PersistFile_Save);
+    _ = Save(pf, lnk_z, 1);
+}
+
+pub fn showToast(allocator: std.mem.Allocator, title: []const u8, body: []const u8) ToastError!void {
+    if (builtin.os.tag != .windows) return error.Unsupported;
+
+    // ---- identity: AUMID + shortcut path from the exe basename ----
+    var base: [256]u16 = undefined;
+    const base_len = exeBaseNameW(&base) orelse return error.Backend;
+
+    const prefix = std.unicode.utf8ToUtf16LeStringLiteral("Verve.");
+    var aumid: [320]u16 = undefined;
+    var ai: usize = 0;
+    if (!appendW(&aumid, &ai, prefix[0..])) return error.Backend;
+    if (!appendW(&aumid, &ai, base[0..base_len])) return error.Backend;
+    aumid[ai] = 0;
+
+    var appdata: [320]u16 = undefined;
+    const ad_name = std.unicode.utf8ToUtf16LeStringLiteral("APPDATA");
+    const ad_len = GetEnvironmentVariableW(ad_name, &appdata, appdata.len);
+    if (ad_len == 0 or ad_len >= appdata.len) return error.Backend;
+
+    var lnk: [768]u16 = undefined;
+    var li: usize = 0;
+    if (!appendW(&lnk, &li, appdata[0..ad_len])) return error.Backend;
+    if (!appendW(&lnk, &li, std.unicode.utf8ToUtf16LeStringLiteral("\\Microsoft\\Windows\\Start Menu\\Programs\\")[0..])) return error.Backend;
+    if (!appendW(&lnk, &li, base[0..base_len])) return error.Backend;
+    if (!appendW(&lnk, &li, std.unicode.utf8ToUtf16LeStringLiteral(".lnk")[0..])) return error.Backend;
+    lnk[li] = 0;
+
+    _ = SetCurrentProcessExplicitAppUserModelID(@ptrCast(&aumid));
+    ensureAumidShortcut(exeFullPathZ(), @ptrCast(&aumid), @ptrCast(&lnk));
+
+    _ = RoInitialize(RO_INIT_SINGLETHREADED); // S_FALSE / changed-mode tolerated
+
+    // ---- XmlDocument + ToastGeneric template ----
+    const xml_doc = roActivate("Windows.Data.Xml.Dom.XmlDocument") orelse return error.Backend;
+    defer releaseRef(@ptrCast(xml_doc));
+
+    var docio_p: ?*anyopaque = null;
+    if (comQueryInterface(xml_doc, &IID_IXmlDocumentIO, &docio_p) < 0 or docio_p == null) return error.Backend;
+    const docio: *WicObj = @ptrCast(@alignCast(docio_p));
+    defer releaseRef(@ptrCast(docio));
+
+    const xml = buildToastXml(allocator, title, body) catch return error.OutOfMemory;
+    defer allocator.free(xml);
+    const xml_w = std.unicode.utf8ToUtf16LeAlloc(allocator, xml) catch return error.OutOfMemory;
+    defer allocator.free(xml_w);
+    const xml_h = winrtString(xml_w) orelse return error.Backend;
+    defer _ = WindowsDeleteString(xml_h);
+
+    const LoadXml = vtSlot(*const fn (*WicObj, ?*anyopaque) callconv(.winapi) HRESULT, docio.lpVtbl, SLOT_XmlDocumentIO_LoadXml);
+    if (LoadXml(docio, xml_h) < 0) return error.Backend;
+
+    // The XmlDocument as IXmlDocument (what CreateToastNotification wants).
+    var doc_p: ?*anyopaque = null;
+    if (comQueryInterface(xml_doc, &IID_IXmlDocument, &doc_p) < 0 or doc_p == null) return error.Backend;
+    const doc: *WicObj = @ptrCast(@alignCast(doc_p));
+    defer releaseRef(@ptrCast(doc));
+
+    // ---- notifier (AUMID) ----
+    const mgr_id = hstr("Windows.UI.Notifications.ToastNotificationManager") orelse return error.Backend;
+    defer _ = WindowsDeleteString(mgr_id);
+    var statics_p: ?*anyopaque = null;
+    if (RoGetActivationFactory(mgr_id, &IID_IToastNotificationManagerStatics, &statics_p) < 0 or statics_p == null) return error.Backend;
+    const statics: *WicObj = @ptrCast(@alignCast(statics_p));
+    defer releaseRef(@ptrCast(statics));
+
+    const aumid_h = winrtString(aumid[0..ai]) orelse return error.Backend;
+    defer _ = WindowsDeleteString(aumid_h);
+    const CreateNotifier = vtSlot(*const fn (*WicObj, ?*anyopaque, *?*anyopaque) callconv(.winapi) HRESULT, statics.lpVtbl, SLOT_ToastMgr_CreateToastNotifierWithId);
+    var notifier_p: ?*anyopaque = null;
+    if (CreateNotifier(statics, aumid_h, &notifier_p) < 0 or notifier_p == null) return error.Backend;
+    const notifier: *WicObj = @ptrCast(@alignCast(notifier_p));
+    defer releaseRef(@ptrCast(notifier));
+
+    // ---- toast from the xml ----
+    const toast_id = hstr("Windows.UI.Notifications.ToastNotification") orelse return error.Backend;
+    defer _ = WindowsDeleteString(toast_id);
+    var tfac_p: ?*anyopaque = null;
+    if (RoGetActivationFactory(toast_id, &IID_IToastNotificationFactory, &tfac_p) < 0 or tfac_p == null) return error.Backend;
+    const tfac: *WicObj = @ptrCast(@alignCast(tfac_p));
+    defer releaseRef(@ptrCast(tfac));
+
+    const CreateToast = vtSlot(*const fn (*WicObj, *WicObj, *?*anyopaque) callconv(.winapi) HRESULT, tfac.lpVtbl, SLOT_ToastFactory_CreateToastNotification);
+    var toast_p: ?*anyopaque = null;
+    if (CreateToast(tfac, doc, &toast_p) < 0 or toast_p == null) return error.Backend;
+    const toast: *WicObj = @ptrCast(@alignCast(toast_p));
+    defer releaseRef(@ptrCast(toast));
+
+    const Show = vtSlot(*const fn (*WicObj, *WicObj) callconv(.winapi) HRESULT, notifier.lpVtbl, SLOT_ToastNotifier_Show);
+    if (Show(notifier, toast) < 0) return error.Backend;
+}
+
+/// Re-resolve the full exe path as a NUL-terminated UTF-16 buffer for the
+/// shortcut target. Returns a process-static buffer (single-threaded toast
+/// path); falls back to an empty string on failure (SetPath then no-ops).
+var g_exe_path_buf: [512]u16 = undefined;
+fn exeFullPathZ() [*:0]const u16 {
+    const n = GetModuleFileNameW(null, &g_exe_path_buf, g_exe_path_buf.len);
+    if (n == 0 or n >= g_exe_path_buf.len) {
+        g_exe_path_buf[0] = 0;
+    } else {
+        g_exe_path_buf[n] = 0;
+    }
+    return @ptrCast(&g_exe_path_buf);
+}
+
+/// XML-escape `&`, `<`, `>`, `"` for safe interpolation into the toast
+/// template. Caller owns the result.
+fn xmlEscape(allocator: std.mem.Allocator, s: []const u8) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (s) |c| {
+        switch (c) {
+            '&' => try out.appendSlice(allocator, "&amp;"),
+            '<' => try out.appendSlice(allocator, "&lt;"),
+            '>' => try out.appendSlice(allocator, "&gt;"),
+            '"' => try out.appendSlice(allocator, "&quot;"),
+            else => try out.append(allocator, c),
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Build a `ToastGeneric` toast XML payload (title + body). Caller owns the
+/// result.
+fn buildToastXml(allocator: std.mem.Allocator, title: []const u8, body: []const u8) error{OutOfMemory}![]u8 {
+    const et = try xmlEscape(allocator, title);
+    defer allocator.free(et);
+    const eb = try xmlEscape(allocator, body);
+    defer allocator.free(eb);
+    return std.fmt.allocPrint(
+        allocator,
+        "<toast><visual><binding template=\"ToastGeneric\"><text>{s}</text><text>{s}</text></binding></visual></toast>",
+        .{ et, eb },
+    );
+}
+
+// ---- tests (pure DIB helpers; run on a Windows host build) -----------------
+
+const testing = std.testing;
+
+test "buildDibV5: header + bottom-up packing" {
+    // 2x2 top-down BGRA: rows [A,B] then [C,D].
+    const px = [_]u8{
+        1, 2, 3, 4, 5, 6, 7, 8, // row0: A,B
+        9, 10, 11, 12, 13, 14, 15, 16, // row1: C,D
+    };
+    const out = try buildDibV5(testing.allocator, 2, 2, &px);
+    defer testing.allocator.free(out);
+
+    try testing.expectEqual(@as(usize, 124 + 16), out.len);
+    try testing.expectEqual(@as(u32, 124), readU32(out, 0));
+    try testing.expectEqual(@as(i32, 2), readI32(out, 4)); // width
+    try testing.expectEqual(@as(i32, 2), readI32(out, 8)); // height (positive => bottom-up)
+    try testing.expectEqual(BI_BITFIELDS, readU32(out, 16));
+    // Bottom-up: stored row0 == source row1 (C,D).
+    try testing.expectEqualSlices(u8, px[8..16], out[124..][0..8]);
+    try testing.expectEqualSlices(u8, px[0..8], out[124 + 8 ..][0..8]);
+}
+
+test "dibToBgra: round-trips buildDibV5" {
+    const px = [_]u8{
+        10, 20, 30, 255, 40, 50, 60, 128,
+        70, 80, 90, 1,   11, 22, 33, 200,
+    };
+    const dib = try buildDibV5(testing.allocator, 2, 2, &px);
+    defer testing.allocator.free(dib);
+
+    const img = try dibToBgra(testing.allocator, dib);
+    defer testing.allocator.free(img.pixels);
+    try testing.expectEqual(@as(u32, 2), img.width);
+    try testing.expectEqual(@as(u32, 2), img.height);
+    try testing.expectEqualSlices(u8, &px, img.pixels);
+}
+
+test "dibToBgra: 24bpp BI_RGB with row padding, opaque alpha" {
+    // 3x1 24bpp: row stride = ceil(3*24/32)*4 = 12 bytes (1 pad byte).
+    var bytes = [_]u8{0} ** (40 + 12);
+    std.mem.writeInt(u32, bytes[0..4], 40, .little); // header size
+    std.mem.writeInt(i32, bytes[4..8], 3, .little); // width
+    std.mem.writeInt(i32, bytes[8..12], -1, .little); // top-down height
+    std.mem.writeInt(u16, bytes[14..16], 24, .little); // bitcount
+    std.mem.writeInt(u32, bytes[16..20], BI_RGB, .little);
+    // pixels (BGR): (1,2,3)(4,5,6)(7,8,9) + 1 pad byte
+    const pix = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 0 };
+    @memcpy(bytes[40..][0..pix.len], &pix);
+
+    const img = try dibToBgra(testing.allocator, &bytes);
+    defer testing.allocator.free(img.pixels);
+    try testing.expectEqual(@as(u32, 3), img.width);
+    const expect = [_]u8{ 1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255 };
+    try testing.expectEqualSlices(u8, &expect, img.pixels);
+}
+
+test "dibToBgra: 32bpp all-zero alpha treated as opaque" {
+    var bytes = [_]u8{0} ** (40 + 4);
+    std.mem.writeInt(u32, bytes[0..4], 40, .little);
+    std.mem.writeInt(i32, bytes[4..8], 1, .little);
+    std.mem.writeInt(i32, bytes[8..12], -1, .little);
+    std.mem.writeInt(u16, bytes[14..16], 32, .little);
+    std.mem.writeInt(u32, bytes[16..20], BI_RGB, .little);
+    @memcpy(bytes[40..][0..4], &[_]u8{ 5, 6, 7, 0 }); // BGRX, alpha 0
+    const img = try dibToBgra(testing.allocator, &bytes);
+    defer testing.allocator.free(img.pixels);
+    try testing.expectEqualSlices(u8, &[_]u8{ 5, 6, 7, 255 }, img.pixels);
+}
+
+test "a11y subrole: dialogs flagged, all map to Window control type" {
+    try testing.expect(!isDialogSubrole(.standard));
+    try testing.expect(!isDialogSubrole(.floating));
+    try testing.expect(isDialogSubrole(.dialog));
+    try testing.expect(isDialogSubrole(.system_dialog));
+    try testing.expectEqual(UIA_WindowControlTypeId, controlTypeForSubrole(.standard));
+    try testing.expectEqual(UIA_WindowControlTypeId, controlTypeForSubrole(.dialog));
+}
+
+test "VARIANT is the 24-byte x64 layout with value at offset 8" {
+    try testing.expectEqual(@as(usize, 24), @sizeOf(VARIANT));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(VARIANT, "val"));
+}
+
+test "xmlEscape: escapes the XML metacharacters" {
+    const out = try xmlEscape(testing.allocator, "a & b < c > d \" e");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a &amp; b &lt; c &gt; d &quot; e", out);
+}
+
+test "buildToastXml: ToastGeneric with escaped title/body" {
+    const out = try buildToastXml(testing.allocator, "Hi <there>", "x & y");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "<toast><visual><binding template=\"ToastGeneric\"><text>Hi &lt;there&gt;</text><text>x &amp; y</text></binding></visual></toast>",
+        out,
+    );
+}
+
+test "PROPVARIANT matches the 24-byte VARIANT-shaped layout" {
+    try testing.expectEqual(@as(usize, 24), @sizeOf(PROPVARIANT));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(PROPVARIANT, "val"));
+}
+
+test "dibToBgra: rejects paletted 8bpp" {
+    var bytes = [_]u8{0} ** 64;
+    std.mem.writeInt(u32, bytes[0..4], 40, .little);
+    std.mem.writeInt(i32, bytes[4..8], 1, .little);
+    std.mem.writeInt(i32, bytes[8..12], 1, .little);
+    std.mem.writeInt(u16, bytes[14..16], 8, .little);
+    try testing.expectError(error.Unsupported, dibToBgra(testing.allocator, &bytes));
 }
 
 comptime {

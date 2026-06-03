@@ -87,27 +87,41 @@ Windows is now validated on a real host (v0.1.36). Linux remains
 host-gated — no Linux host available, so its paths cross-compile clean
 but stay behavior-unvalidated.
 
-- ⏳ **Windows rich WinRT Toast** — `ToastNotificationManager` + AUMID +
-  Start-menu shortcut. Balloon-tip path ships; rich Toast pending
-  (Windows host now available to verify).
-- ⏳🔒 **Updates apply (Win/Linux)** — Squirrel/MSIX (Win),
-  AppImageUpdate (Linux). Check + macOS apply ship.
+- ✅ **Windows rich WinRT Toast** — `notifications.show` now prefers the
+  modern Action Center toast: per-app AUMID via
+  `SetCurrentProcessExplicitAppUserModelID`, a lazily-created Start-menu
+  `.lnk` carrying `System.AppUserModel.ID` (IShellLink + IPropertyStore),
+  then WinRT activation of an `XmlDocument` `ToastGeneric` template →
+  `ToastNotificationManager` → `IToastNotifier::Show`. Falls back to the
+  `Shell_NotifyIconW` balloon if WinRT init fails. Links `combase`.
+  (🔒 live banner/Action-Center delivery needs the Windows host.)
+  → `src/desktop/windows.zig` (`showToast`), `src/desktop/notifications.zig`
+- 🟡 **Updates apply** — macOS (`.app` swap) + **Windows** ship.
+  Windows uses a pure-Zig side-by-side swap: download + SHA-256 verify →
+  `tar.exe` extract to `%TEMP%` → detached `swap.cmd` waits for the PID,
+  robocopy-/MOVEs over the locked install dir, relaunches, self-deletes
+  (no Squirrel/MSIX). Linux (AppImageUpdate) 🔒 remains. (🔒 live
+  end-to-end swap needs the Windows host.)
+  → `src/desktop/updates.zig` (`applyUpdateWindows`, `buildSwapScript`)
 - ⏳🔒 **GTK4 + WebKitGTK 6.0** behind `-Dgtk4` — largest item; GTK3 +
   WebKitGTK 4.1 wired today. Needs Ubuntu 24 LTS / Fedora 41 validation.
-- 🟡🍎 **Full a11y provider** — window-chrome NSAccessibility now covers
-  `setAccessibilityHelp` (AXHelp), `setAccessibilityRoleDescription`, and
-  `setAccessibilitySubrole` on macOS (Linux: help via
-  `atk_object_set_description`; role-desc/subrole + Windows are documented
-  no-ops pending a UIA/AtkObject provider). Web content + menus
-  self-publish.
+- 🟡 **Full a11y provider** — window-chrome accessibility covers
+  `setAccessibilityHelp`, `setAccessibilityRoleDescription`, and
+  `setAccessibilitySubrole` on **macOS** (NSAccessibility) and **Windows**
+  (a server-side UIA `IRawElementProviderSimple` answering `WM_GETOBJECT`:
+  role-desc → `LocalizedControlType`, help → `HelpText`, dialog subroles →
+  `IsDialog`; host provider supplies Name/bounds). Linux: help via
+  `atk_object_set_description`; role-desc/subrole still no-ops pending an
+  AtkObject provider (🔒). Web content + menus self-publish.
 - ✅🍎 **macOS `UNUserNotificationCenter` migration** —
   `notifications.show` uses `UNUserNotificationCenter` with a bundle-id
   guard + lazy synchronous authorization (nested `NSRunLoop` pump);
   `NSUserNotification` removed; scaffold links `UserNotifications.framework`.
   Verified live on a signed `.app` (v0.1.35): first-call permission prompt
   + banner delivery.
-- ⏳🔒 **Image clipboard Win (`CF_DIB`) + Linux (`image/png` target)** —
-  macOS (PNG) ships.
+- 🟡 **Image clipboard** — macOS (PNG) + **Windows (`CF_DIBV5`)** ship;
+  Windows transcodes PNG↔32bpp-BGRA DIB via WIC (`Clipboard.writeImage`/
+  `readImage`). Linux (`image/png` GtkClipboard target) 🔒 remains.
 - ✅ **Windows `verve://` custom-scheme asset serving** — WebView2
   `ICustomSchemeRegistration` via `ICoreWebView2EnvironmentOptions4` serves
   the embedded asset table to the webview, at parity with macOS

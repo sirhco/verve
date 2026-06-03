@@ -47,9 +47,15 @@ prior context.
   `setAccessibilitySubrole(AccessibilitySubrole)`. macOS: real
   `setAccessibilityHelp:` / `setAccessibilityRoleDescription:` /
   `setAccessibilitySubrole:` (subrole tags map to AXStandardWindow /
-  AXDialog / AXSystemDialog / AXFloatingWindow). Linux: help →
-  `atk_object_set_description`; role-desc + subrole no-op (logged).
-  Windows: all three no-op (no UIA provider). New `AccessibilitySubrole`
+  AXDialog / AXSystemDialog / AXFloatingWindow). **Windows: a server-side
+  UIA provider** — an `IRawElementProviderSimple` embedded per `WindowCtx`,
+  returned from `WM_GETOBJECT`/`UiaRootObjectId` via
+  `UiaReturnRawElementProvider`. `GetPropertyValue` maps role-desc →
+  `UIA_LocalizedControlTypePropertyId`, help → `UIA_HelpTextPropertyId`,
+  and dialog subroles → `UIA_IsDialogPropertyId`; `UiaHostProviderFromHwnd`
+  supplies Name/bounds and the WebView2 subtree. Links `Uiautomationcore`.
+  Linux: help → `atk_object_set_description`; role-desc + subrole no-op
+  (logged) pending an AtkObject provider. New `AccessibilitySubrole`
   enum in `options.zig`; ABI-guarded in `surface_test.zig`. No
   `src/verve.zig` change. Conformance enforced by the comptime list in
   `window.zig`; macOS verified via `zig build-obj -target aarch64-macos`,
@@ -617,10 +623,13 @@ Action Center entry (modern shell).
   tray-independent.
 
 Modern WinRT Toast (`Windows.UI.Notifications.ToastNotificationManager`)
-is deferred — it needs COM init + AUMID +
-`SetCurrentProcessExplicitAppUserModelID` + Start-menu shortcut
-registration + XML toast templates, ~500 LOC of WinRT plumbing.
-The balloon path covers the basic title/body case for v1.
+**shipped** (`windows.showToast`): RoInitialize + AUMID via
+`SetCurrentProcessExplicitAppUserModelID` + a lazily-created Start-menu
+`.lnk` carrying `System.AppUserModel.ID` (IShellLink + IPropertyStore +
+IPersistFile) + an `XmlDocument` `ToastGeneric` template → notifier
+`Show`. `notifications.show` prefers it and falls back to the balloon
+when WinRT init fails. Links `combase`. Pure `buildToastXml`/`xmlEscape`
+unit-tested; live banner + Action Center delivery is host-gated (🔒).
 
 ### Verification across all four bundles
 
@@ -1019,8 +1028,13 @@ now a Level-3 golden-diff harness:
   stdlib: SHA-256 verify + `/usr/bin/tar` extract + same-volume
   rename swap + `open -n` relaunch; requires running inside an
   `.app` bundle, returns `error.NotBundled` for bare binaries).
-  Win + Linux apply remains platform-updater territory (Squirrel /
-  MSIX / AppImageUpdate).
+  **Windows `applyUpdate` shipped** (pure stdlib: SHA-256 verify +
+  `tar.exe` extract to `%TEMP%` + a detached `swap.cmd` that waits for
+  the PID, robocopy-/MOVEs the new tree over the locked install dir,
+  relaunches, and self-deletes — `applyUpdateWindows` / `buildSwapScript`,
+  the latter unit-tested; `error.NotBundled` in the `\zig-out\` dev
+  layout). This is unsigned side-by-side replacement, not Squirrel/MSIX.
+  Linux apply remains platform-updater territory (AppImageUpdate).
 
 ### Out of P1 scope — shipped 2026-05-24
 
@@ -1399,10 +1413,12 @@ Third entry in the Win/Linux backfill plan. Closes the macOS-only
   `setData:forType:` / `dataForType:` with the `public.png` UTI
   (verified by a host round-trip: write a 1×1 PNG → read back
   identical; the system pasteboard reports `«class PNGf»`). The API
-  format is raw PNG bytes. **Windows (`CF_DIB`) + Linux (`image/png`
-  GtkClipboard target) still pending** — both backends return
-  `error.Unsupported` for now. (TIFF on macOS is a possible later add;
-  PNG pastes into modern apps.)
+  format is raw PNG bytes. **Windows ships** (`CF_DIBV5`): WIC transcodes
+  the PNG to a 32bpp-BGRA DIB on write and re-encodes `CF_DIBV5`/`CF_DIB`
+  back to PNG on read (`Windowscodecs`; pure `buildDibV5`/`dibToBgra`
+  helpers unit-tested, COM path host-gated). **Linux (`image/png`
+  GtkClipboard target) still pending** — returns `error.Unsupported`.
+  (TIFF on macOS is a possible later add; PNG pastes into modern apps.)
 
 Verified: framework `zig build test` (205 pass); 3-backend
 cross-compile clean for `windows.zig` + `linux.zig`;
