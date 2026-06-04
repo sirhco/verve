@@ -240,6 +240,38 @@ int    wv2_clip_write_image(WV2Host *host, const uint8_t *png, size_t len);
  * is on the clipboard. */
 size_t wv2_clip_read_image(WV2Host *host, uint8_t *buf, size_t cap);
 
+/* ---- Bundle 8: print, a11y, snapshot, lifecycle -------------------------- */
+/*
+ * print     : ICoreWebView2_16::ShowPrintUI. `dialog_kind`: 0 browser preview,
+ *             1 system dialog. Returns 0 on success, 1 = webview not ready,
+ *             2 = QI ICoreWebView2_16 failed (runtime older than ~v111 ->
+ *             treated as Unsupported by the Zig side), 3 = ShowPrintUI HRESULT
+ *             < 0 (Backend). copies/pages/printer are advisory on Windows and
+ *             not passed across the seam (the Zig side logs the warning).
+ *
+ * a11y      : backed by a server-side UI Automation provider
+ *             (IRawElementProviderSimple, returned from WM_GETOBJECT). label
+ *             sets the window text (accessible Name); help -> UIA_HelpText,
+ *             role-desc -> UIA_LocalizedControlType, subrole -> UIA_IsDialog,
+ *             read live by the provider's GetPropertyValue. Ported from legacy.
+ *
+ * snapshot  : ICoreWebView2::CapturePreview(PNG) into an HGLOBAL IStream, pumped
+ *             to completion via the same nested-pump pattern as GetCookies, then
+ *             the PNG bytes are written to `path` (UTF-8). Returns 0 on success,
+ *             1 = webview not ready (Unsupported), 2 = CapturePreview kickoff /
+ *             completion failed (CaptureFailed), 3 = empty stream / read failed
+ *             (EncodeFailed), 4 = file write failed (WriteFailed).
+ *
+ * terminate : PostQuitMessage(0) — unwinds the wv2_run message loop.
+ */
+int  wv2_print(WV2Host *host, int dialog_kind);
+void wv2_set_a11y_label(WV2Host *host, const char *text, size_t len);
+void wv2_set_a11y_help(WV2Host *host, const char *text, size_t len);
+void wv2_set_a11y_role_desc(WV2Host *host, const char *text, size_t len);
+void wv2_set_a11y_subrole(WV2Host *host, int subrole);
+int  wv2_snapshot_png(WV2Host *host, const char *path, size_t len);
+void wv2_terminate(WV2Host *host);
+
 #ifdef __cplusplus
 }
 #endif

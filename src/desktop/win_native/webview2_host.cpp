@@ -109,6 +109,18 @@ struct WV2Host {
     // or when the handler is cleared.
     IDropTarget *drop_target = nullptr;
     bool drop_registered = false;
+
+    // Bundle 8: server-side UI Automation provider. Ports the legacy
+    // windows.zig IRawElementProviderSimple: help text -> UIA_HelpTextPropertyId,
+    // role description -> UIA_LocalizedControlTypePropertyId, subrole ->
+    // UIA_ControlTypePropertyId / UIA_IsDialogPropertyId. The strings/enum are
+    // read live by the provider on each UIA query; the setters just swap them.
+    // The provider is created lazily on the first WM_GETOBJECT and released in
+    // wv2_destroy. NULL/0 slots make the property report its default.
+    wchar_t *a11y_help = nullptr;      // UIA HelpText (owned, free on destroy)
+    wchar_t *a11y_role_desc = nullptr; // UIA LocalizedControlType (owned)
+    int a11y_subrole = 0;              // AccessibilitySubrole enum ordinal
+    IUnknown *a11y_provider = nullptr; // RawElementProvider, lazily created
 };
 
 // Read HKCU\...\Personalize\AppsUseLightTheme. 1 = light, 0 = dark, missing =
@@ -155,6 +167,32 @@ static const IID kIID_IUnknown = {
         if (!ppv) return E_POINTER;                                           \
         if (IsEqualGUID(riid, kIID_IUnknown) ||                               \
             IsEqualGUID(riid, IID_##IFACE)) {                                 \
+            *ppv = static_cast<IFACE *>(this);                                \
+            AddRef();                                                         \
+            return S_OK;                                                      \
+        }                                                                     \
+        *ppv = nullptr;                                                       \
+        return E_NOINTERFACE;                                                 \
+    }
+
+// Same as WV2_IUNKNOWN_IMPL but Queries against an explicitly-supplied IID
+// constant (for interfaces whose IID we declare locally rather than via
+// WebView2.h's IID_<interface> — e.g. IRawElementProviderSimple).
+#define WV2_IUNKNOWN_IMPL_GUID(IFACE, IIDVAR)                                  \
+    LONG ref_ = 1;                                                             \
+    ULONG STDMETHODCALLTYPE AddRef() override {                               \
+        return (ULONG)InterlockedIncrement(&ref_);                            \
+    }                                                                         \
+    ULONG STDMETHODCALLTYPE Release() override {                             \
+        LONG c = InterlockedDecrement(&ref_);                                 \
+        if (c == 0) delete this;                                              \
+        return (ULONG)c;                                                      \
+    }                                                                         \
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv)         \
+        override {                                                            \
+        if (!ppv) return E_POINTER;                                           \
+        if (IsEqualGUID(riid, kIID_IUnknown) ||                               \
+            IsEqualGUID(riid, (IIDVAR))) {                                    \
             *ppv = static_cast<IFACE *>(this);                                \
             AddRef();                                                         \
             return S_OK;                                                      \
@@ -326,6 +364,28 @@ public:
     }
 };
 
+// ---- Bundle 8: CapturePreview completion ------------------------------------
+
+// Async completion for ICoreWebView2::CapturePreview, modeled on
+// GetCookiesHandler: Invoke records the HRESULT and flips done_, and the caller
+// pump_until()s the nested Win32 message loop until it fires. The PNG bytes land
+// in the IStream the caller passed to CapturePreview; this handler only carries
+// the completion signal + error code.
+class CapturePreviewHandler
+    : public ICoreWebView2CapturePreviewCompletedHandler {
+public:
+    WV2_IUNKNOWN_IMPL(ICoreWebView2CapturePreviewCompletedHandler)
+
+    HRESULT error_ = S_OK;
+    bool done_ = false;
+
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT error_code) override {
+        error_ = error_code;
+        done_ = true;
+        return S_OK;
+    }
+};
+
 // ---- Bundle 4: OLE drag-drop (IDropTarget) ----------------------------------
 
 // IID_IDropTarget {00000122-0000-0000-C000-000000000046}. Declared locally to
@@ -431,6 +491,153 @@ public:
         if (effect) *effect = DROPEFFECT_COPY;
         return S_OK;
     }
+};
+
+// ---- Server-side UI Automation provider (ports legacy windows.zig) ----------
+//
+// mingw's bundled SDK ships <uiautomation.h>; but to keep this file robust on
+// older mingw trees (and to avoid pulling the whole client-side UIA surface) we
+// hand-declare the minimal pieces the same way the file declares other missing
+// SDK bits: the IRawElementProviderSimple interface, the ProviderOptions enum,
+// the handful of UIA_*PropertyId integer constants, and the two link entry
+// points. PORTED VALUES MATCH legacy src/desktop/windows.zig exactly.
+#if defined(__has_include)
+#  if __has_include(<uiautomation.h>)
+#    define VERVE_HAVE_UIAUTOMATION 1
+#  endif
+#endif
+
+#ifdef VERVE_HAVE_UIAUTOMATION
+#  include <uiautomation.h>
+// The header declares get_ProviderOptions(enum ProviderOptions*); our override
+// must match exactly or the pure virtual stays unimplemented (abstract class).
+#  define VERVE_PROVIDER_OPTIONS enum ProviderOptions
+#else
+// Minimal hand-declared surface (uiautomationcore.h / uiautomationclient.h).
+typedef int PATTERNID;        // UIA pattern id (we only ever ignore it)
+typedef int PROPERTYID;       // UIA property id
+enum ProviderOptions {
+    ProviderOptions_ServerSideProvider = 0x1,
+};
+#  define VERVE_PROVIDER_OPTIONS enum ProviderOptions
+
+// IRawElementProviderSimple {d6dd68d1-86fd-4332-8666-9abedea2d24c}.
+struct IRawElementProviderSimple : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE get_ProviderOptions(enum ProviderOptions *pRetVal) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID patternId, IUnknown **pRetVal) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID propertyId, VARIANT *pRetVal) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_HostRawElementProvider(IRawElementProviderSimple **pRetVal) = 0;
+};
+#endif // VERVE_HAVE_UIAUTOMATION
+
+// IID_IRawElementProviderSimple, declared locally (mingw's libuuid coverage of
+// UIA is spotty and we avoid __uuidof — same rationale as kIID_IUnknown above).
+static const IID kIID_IRawElementProviderSimple = {
+    0xd6dd68d1, 0x86fd, 0x4332,
+    {0x86, 0x66, 0x9a, 0xbe, 0xde, 0xa2, 0xd2, 0x4c}};
+
+// UIA property ids (uiautomationclient.h) and the dialog/window control-type
+// constants — ported verbatim from legacy windows.zig.
+#ifndef UIA_ControlTypePropertyId
+#  define UIA_ControlTypePropertyId 30003
+#endif
+#ifndef UIA_LocalizedControlTypePropertyId
+#  define UIA_LocalizedControlTypePropertyId 30004
+#endif
+#ifndef UIA_HelpTextPropertyId
+#  define UIA_HelpTextPropertyId 30013
+#endif
+#ifndef UIA_IsDialogPropertyId
+#  define UIA_IsDialogPropertyId 30174
+#endif
+#ifndef UIA_WindowControlTypeId
+#  define UIA_WindowControlTypeId 50032
+#endif
+
+// UiaRootObjectId / the two link entry points. The real header declares these
+// in uiautomationcoreapi.h; only hand-declare when the header is absent. Both
+// live in uiautomationcore.dll (linked in build.zig).
+#ifndef VERVE_HAVE_UIAUTOMATION
+#  ifndef UiaRootObjectId
+#    define UiaRootObjectId (-25)
+#  endif
+extern "C" LRESULT WINAPI UiaReturnRawElementProvider(HWND hwnd, WPARAM wParam,
+                                                      LPARAM lParam,
+                                                      IRawElementProviderSimple *el);
+extern "C" HRESULT WINAPI UiaHostProviderFromHwnd(HWND hwnd,
+                                                  IRawElementProviderSimple **ppProvider);
+#endif
+
+// The provider holds a back-pointer to its host and reads the live a11y state on
+// each query (matching legacy's read-on-demand model). Subrole ordinal: 0
+// standard, 1 dialog, 2 system_dialog, 3 floating (AccessibilitySubrole order).
+class RawElementProvider : public IRawElementProviderSimple {
+public:
+    WV2_IUNKNOWN_IMPL_GUID(IRawElementProviderSimple, kIID_IRawElementProviderSimple)
+
+    explicit RawElementProvider(WV2Host *host) : host_(host) {}
+
+    HRESULT STDMETHODCALLTYPE get_ProviderOptions(VERVE_PROVIDER_OPTIONS *pRetVal) override {
+        if (!pRetVal) return E_POINTER;
+        *pRetVal = ProviderOptions_ServerSideProvider;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID, IUnknown **pRetVal) override {
+        if (!pRetVal) return E_POINTER;
+        *pRetVal = nullptr; // no control patterns; window chrome only
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID propertyId,
+                                               VARIANT *pRetVal) override {
+        if (!pRetVal) return E_POINTER;
+        VariantInit(pRetVal);
+        pRetVal->vt = VT_EMPTY;
+        if (!host_) return S_OK;
+        switch (propertyId) {
+        case UIA_LocalizedControlTypePropertyId:
+            if (host_->a11y_role_desc) {
+                BSTR b = SysAllocString(host_->a11y_role_desc);
+                if (b) { pRetVal->vt = VT_BSTR; pRetVal->bstrVal = b; }
+            }
+            break;
+        case UIA_HelpTextPropertyId:
+            if (host_->a11y_help) {
+                BSTR b = SysAllocString(host_->a11y_help);
+                if (b) { pRetVal->vt = VT_BSTR; pRetVal->bstrVal = b; }
+            }
+            break;
+        case UIA_ControlTypePropertyId:
+            // All window chrome reports as a Window control type; dialog vs.
+            // plain window is differentiated via UIA_IsDialogPropertyId below.
+            pRetVal->vt = VT_I4;
+            pRetVal->lVal = UIA_WindowControlTypeId;
+            break;
+        case UIA_IsDialogPropertyId:
+            pRetVal->vt = VT_BOOL;
+            pRetVal->boolVal = is_dialog() ? VARIANT_TRUE : VARIANT_FALSE;
+            break;
+        default:
+            break; // leave VT_EMPTY
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    get_HostRawElementProvider(IRawElementProviderSimple **pRetVal) override {
+        if (!pRetVal) return E_POINTER;
+        *pRetVal = nullptr;
+        if (host_ && host_->hwnd) UiaHostProviderFromHwnd(host_->hwnd, pRetVal);
+        return S_OK;
+    }
+
+private:
+    bool is_dialog() const {
+        return host_ && (host_->a11y_subrole == 1 /* dialog */ ||
+                         host_->a11y_subrole == 2 /* system_dialog */);
+    }
+    WV2Host *host_;
 };
 
 // Register (or revoke) the host's HWND as an OLE drop target. RegisterDragDrop
@@ -539,8 +746,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RevokeDragDrop(hwnd);
             host->drop_registered = false;
         }
+        // Release the UIA provider here too: WM_DESTROY fires when the window
+        // goes away regardless of how (X, close(), Alt+F4); wv2_destroy covers
+        // the explicit-teardown path.
+        if (host && host->a11y_provider) {
+            host->a11y_provider->Release();
+            host->a11y_provider = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
+    case WM_GETOBJECT:
+        // Hand assistive tech (Narrator/NVDA) our server-side UIA provider for
+        // the window root; all other object ids fall through to default. The
+        // provider is created once and cached on the host (released in
+        // WM_DESTROY / wv2_destroy). Ports legacy windows.zig WM_GETOBJECT.
+        if (host && (DWORD)lp == (DWORD)UiaRootObjectId) {
+            if (!host->a11y_provider)
+                host->a11y_provider = new RawElementProvider(host);
+            return UiaReturnRawElementProvider(
+                hwnd, wp, lp,
+                static_cast<IRawElementProviderSimple *>(
+                    static_cast<RawElementProvider *>(host->a11y_provider)));
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
     default:
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -1063,6 +1291,14 @@ void wv2_destroy(WV2Host *host) {
     }
     free(host->pending_html);
     free(host->pending_url);
+    // Bundle 8: tear down the UIA provider + owned a11y strings. WM_DESTROY (via
+    // DestroyWindow below) may have already released the provider; null-check.
+    if (host->a11y_provider) {
+        host->a11y_provider->Release();
+        host->a11y_provider = nullptr;
+    }
+    free(host->a11y_help);
+    free(host->a11y_role_desc);
     if (host->hwnd) DestroyWindow(host->hwnd);
     delete host;
 }
@@ -1965,6 +2201,149 @@ size_t wv2_clip_read_image(WV2Host *host, uint8_t *buf, size_t cap) {
     size_t full = fill_from_ptr(png, png_len, buf, cap);
     free(png);
     return full;
+}
+
+// ---- Bundle 8: print / a11y / snapshot / lifecycle --------------------------
+
+int wv2_print(WV2Host *host, int dialog_kind) {
+    if (!host || !host->webview) return 1; // not ready
+
+    // ShowPrintUI lives on ICoreWebView2_16 (Edge runtime ~v111+). An older
+    // runtime answers E_NOINTERFACE to the QI; report that as a distinct code
+    // the Zig side maps to Unsupported.
+    ICoreWebView2_16 *wv16 = nullptr;
+    if (FAILED(host->webview->QueryInterface(IID_ICoreWebView2_16,
+                                             (void **)&wv16)) ||
+        !wv16)
+        return 2; // unsupported runtime
+
+    COREWEBVIEW2_PRINT_DIALOG_KIND kind =
+        (dialog_kind == 1) ? COREWEBVIEW2_PRINT_DIALOG_KIND_SYSTEM
+                           : COREWEBVIEW2_PRINT_DIALOG_KIND_BROWSER;
+    HRESULT hr = wv16->ShowPrintUI(kind);
+    wv16->Release();
+    return FAILED(hr) ? 3 : 0; // backend failure vs ok
+}
+
+void wv2_set_a11y_label(WV2Host *host, const char *text, size_t len) {
+    // The window's accessible Name is its window text, so the label channel
+    // delegates to SetWindowTextW — same contract as legacy windows.zig's
+    // setAccessibilityLabel -> setTitle.
+    WV2_REQUIRE_HWND(host, );
+    wchar_t *w = widen(text, (int)len);
+    if (w) {
+        SetWindowTextW(hwnd, w);
+        free(w);
+    }
+}
+
+void wv2_set_a11y_help(WV2Host *host, const char *text, size_t len) {
+    // Publish UIA help text (UIA_HelpTextPropertyId) for the window root. Stored
+    // live; the server-side RawElementProvider reads it on the next UIA query.
+    // Ports legacy windows.zig setAccessibilityHelp.
+    if (!host) return;
+    wchar_t *w = widen(text, (int)len);
+    free(host->a11y_help); // swap; failed widen leaves the slot null (default)
+    host->a11y_help = w;
+}
+
+void wv2_set_a11y_role_desc(WV2Host *host, const char *text, size_t len) {
+    // Override the spoken role name (UIA_LocalizedControlTypePropertyId) via the
+    // server-side provider. Ports legacy windows.zig setAccessibilityRoleDescription.
+    if (!host) return;
+    wchar_t *w = widen(text, (int)len);
+    free(host->a11y_role_desc);
+    host->a11y_role_desc = w;
+}
+
+void wv2_set_a11y_subrole(WV2Host *host, int subrole) {
+    // AccessibilitySubrole ordinal (0 standard, 1 dialog, 2 system_dialog, 3
+    // floating). dialog/system_dialog surface as UIA_IsDialogPropertyId == true
+    // through the provider. Ports legacy windows.zig setAccessibilitySubrole.
+    if (!host) return;
+    host->a11y_subrole = subrole;
+}
+
+int wv2_snapshot_png(WV2Host *host, const char *path, size_t len) {
+    if (!host || !host->webview) return 1; // Unsupported
+
+    // Growable HGLOBAL-backed stream; frees its memory on Release.
+    IStream *stream = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) || !stream)
+        return 2; // CaptureFailed
+
+    auto *handler = new CapturePreviewHandler();
+    HRESULT hr = host->webview->CapturePreview(
+        COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, stream, handler);
+    if (FAILED(hr)) {
+        handler->Release();
+        stream->Release();
+        return 2; // CaptureFailed
+    }
+
+    // Safe to nest-pump here: the bridge handler that triggers this runs from
+    // WndProc (WM_VERVE_BRIDGE), not inside a WebView2 event callback, so the
+    // CapturePreview completion can fire (see GetCookies note above).
+    pump_until(&handler->done_);
+    HRESULT cap_err = handler->error_;
+    handler->Release();
+    if (FAILED(cap_err)) {
+        stream->Release();
+        return 2; // CaptureFailed
+    }
+
+    // Pull the PNG bytes out of the HGLOBAL behind the stream.
+    HGLOBAL hmem = nullptr;
+    if (FAILED(GetHGlobalFromStream(stream, &hmem)) || !hmem) {
+        stream->Release();
+        return 3; // EncodeFailed
+    }
+    size_t n = GlobalSize(hmem);
+    void *p = (n ? GlobalLock(hmem) : nullptr);
+    if (!p || n == 0) {
+        if (p) GlobalUnlock(hmem);
+        stream->Release();
+        return 3; // EncodeFailed
+    }
+    uint8_t *bytes = (uint8_t *)malloc(n);
+    if (bytes) memcpy(bytes, p, n);
+    GlobalUnlock(hmem);
+    stream->Release();
+    if (!bytes) return 3; // EncodeFailed
+
+    // Write to disk: UTF-8 path -> UTF-16, CreateFileW + WriteFile.
+    wchar_t *wpath = widen(path, (int)len);
+    if (!wpath) {
+        free(bytes);
+        return 4; // WriteFailed
+    }
+    HANDLE fh = CreateFileW(wpath, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    free(wpath);
+    if (fh == INVALID_HANDLE_VALUE) {
+        free(bytes);
+        return 4; // WriteFailed
+    }
+    int rc = 0;
+    size_t off = 0;
+    while (off < n) {
+        DWORD chunk = (DWORD)((n - off > 0x40000000u) ? 0x40000000u : (n - off));
+        DWORD wrote = 0;
+        if (!WriteFile(fh, bytes + off, chunk, &wrote, nullptr) || wrote == 0) {
+            rc = 4; // WriteFailed
+            break;
+        }
+        off += wrote;
+    }
+    CloseHandle(fh);
+    free(bytes);
+    return rc;
+}
+
+void wv2_terminate(WV2Host *host) {
+    // Unwind the wv2_run message loop. Matches legacy windows.zig terminate().
+    (void)host;
+    PostQuitMessage(0);
 }
 
 } // extern "C"

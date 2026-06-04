@@ -575,6 +575,17 @@ fn linkWinNative(b: *std.Build, mod: *std.Build.Module) void {
     mod.linkSystemLibrary("gdi32", .{});
     mod.linkSystemLibrary("windowscodecs", .{}); // WIC: clipboard PNG<->DIB transcode
     mod.linkSystemLibrary("shlwapi", .{}); // SHCreateMemStream (clipboard image)
+    // Bundle 8: server-side UIA provider (a11y). uiautomationcore.dll carries
+    // UiaReturnRawElementProvider / UiaHostProviderFromHwnd; oleaut32 carries
+    // SysAllocString / VariantInit for the property VARIANTs. Ports the legacy
+    // windows.zig backend's IRawElementProviderSimple.
+    mod.linkSystemLibrary("uiautomationcore", .{});
+    mod.linkSystemLibrary("oleaut32", .{});
+    // Bundle 8: WinRT toast. combase.dll has no x86_64 import lib in zig's
+    // bundled mingw — link the split API-set stubs that carry Ro*/Windows*String
+    // (proven to cross-compile by the legacy backend, commit 76a7374).
+    mod.linkSystemLibrary("api-ms-win-core-winrt-l1-1-0", .{}); // Ro* (Initialize/Activate/Factory)
+    mod.linkSystemLibrary("api-ms-win-core-winrt-string-l1-1-0", .{}); // Windows*String (HSTRING)
     mod.link_libc = true;
 }
 

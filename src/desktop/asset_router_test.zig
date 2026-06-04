@@ -32,6 +32,8 @@ comptime {
     _ = @import("win_native/cookie_codec.zig");
     // Native-host (Windows) CF_HTML clipboard marshalling — likewise pure Zig.
     _ = @import("win_native/clipboard_codec.zig");
+    // Native-host (Windows) WinRT toast XML payload — likewise pure Zig.
+    _ = @import("win_native/toast_codec.zig");
 }
 
 const entries = [_]options.AssetEntry{

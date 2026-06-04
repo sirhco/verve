@@ -20,6 +20,7 @@ const cookies_mod = @import("cookies.zig");
 const clipboard_mod = @import("clipboard.zig");
 const cookie_codec = @import("win_native/cookie_codec.zig");
 const clipboard_codec = @import("win_native/clipboard_codec.zig");
+const toast_codec = @import("win_native/toast_codec.zig");
 
 // Guard against the backend-mismatch segfault: if this native backend is
 // compiled in on Windows, the shared selector in backend.zig MUST have resolved
@@ -200,6 +201,17 @@ extern fn wv2_clip_write_html(host: *Host, cf_html: [*]const u8, len: usize) c_i
 extern fn wv2_clip_read_html(host: *Host, buf: [*]u8, cap: usize) usize;
 extern fn wv2_clip_write_image(host: *Host, png: [*]const u8, len: usize) c_int;
 extern fn wv2_clip_read_image(host: *Host, buf: [*]u8, cap: usize) usize;
+
+// ---- Bundle 8: print / a11y / snapshot / lifecycle --------------------------
+// print: 0 ok, 1 not-ready, 2 unsupported-runtime, 3 backend-fail.
+// snapshot: 0 ok, 1 unsupported, 2 capture-fail, 3 encode-fail, 4 write-fail.
+extern fn wv2_print(host: *Host, dialog_kind: c_int) c_int;
+extern fn wv2_set_a11y_label(host: *Host, text: [*]const u8, len: usize) void;
+extern fn wv2_set_a11y_help(host: *Host, text: [*]const u8, len: usize) void;
+extern fn wv2_set_a11y_role_desc(host: *Host, text: [*]const u8, len: usize) void;
+extern fn wv2_set_a11y_subrole(host: *Host, subrole: c_int) void;
+extern fn wv2_snapshot_png(host: *Host, path: [*]const u8, len: usize) c_int;
+extern fn wv2_terminate(host: *Host) void;
 
 /// Toast error set — mirrors the legacy `windows.zig` surface so the
 /// module-level `showToast` is signature-compatible.
@@ -583,52 +595,84 @@ pub const Window = struct {
 
     // ---- print / a11y / snapshot / lifecycle (bundle 8) ---------------------
 
+    /// Trigger the platform print dialog. Thin wrapper over
+    /// `printWithOptions(.{})`; swallows the error to match the legacy
+    /// `windows.zig` surface.
     pub fn print(self: *Window) void {
-        _ = self;
-        // TODO bundle 8
+        self.printWithOptions(.{}) catch {};
     }
 
+    /// Native print dialog via `ICoreWebView2_16::ShowPrintUI` (in the C++
+    /// host). Returns `error.Unsupported` when the Edge WebView2 runtime is
+    /// older than ~v111 (the QI for `ICoreWebView2_16` fails).
+    ///
+    /// `opts.copies`, `opts.pages`, and `opts.printer_name` are advisory on
+    /// Windows — `ShowPrintUI` takes no PrintSettings struct, so the user picks
+    /// values in the dialog. A warning is logged when those fields are
+    /// non-default, matching the legacy backend.
     pub fn printWithOptions(self: *Window, opts: opts_mod.PrintOptions) opts_mod.PrintError!void {
-        _ = self;
-        _ = opts;
-        // TODO bundle 8
-        return error.Unsupported;
+        if (opts.copies > 1 or opts.pages != null or opts.printer_name != null) {
+            std.log.warn("verve.desktop[windows]: opts.copies/pages/printer_name are advisory — ShowPrintUI doesn't accept PrintSettings. User picks in the dialog.", .{});
+        }
+        const kind: c_int = switch (opts.kind) {
+            .default, .browser => 0,
+            .system => 1,
+        };
+        return switch (wv2_print(self.ctx.host, kind)) {
+            0 => {},
+            2 => opts_mod.PrintError.Unsupported,
+            else => opts_mod.PrintError.Backend, // 1 not-ready, 3 ShowPrintUI fail
+        };
     }
 
+    /// Capture the WebView2 contents as PNG via `ICoreWebView2::CapturePreview`
+    /// (in the C++ host), then write the PNG bytes to `path`. The host pumps the
+    /// async completion with a nested message loop — safe because bridge
+    /// handlers run from WndProc, off the WebView2 event stack.
     pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
-        _ = self;
-        _ = path;
-        // TODO bundle 8
-        return error.Unsupported;
+        return switch (wv2_snapshot_png(self.ctx.host, path.ptr, path.len)) {
+            0 => {},
+            1 => opts_mod.SnapshotError.Unsupported,
+            2 => opts_mod.SnapshotError.CaptureFailed,
+            3 => opts_mod.SnapshotError.EncodeFailed,
+            else => opts_mod.SnapshotError.WriteFailed, // 4
+        };
     }
 
+    /// The window's accessible Name is its window text, so the label channel
+    /// delegates to `SetWindowTextW` in the host — same contract as legacy
+    /// `windows.zig` (which routes the label through `setTitle`).
     pub fn setAccessibilityLabel(self: *Window, label: []const u8) void {
-        _ = self;
-        _ = label;
-        // TODO bundle 8
+        wv2_set_a11y_label(self.ctx.host, label.ptr, label.len);
     }
 
+    /// Publish UIA help text (`UIA_HelpTextPropertyId`) for the window root.
+    /// The native host stores the string on its server-side
+    /// `IRawElementProviderSimple` and Narrator/NVDA read it on the next UIA
+    /// query — ports the legacy `windows.zig` provider, not advisory.
     pub fn setAccessibilityHelp(self: *Window, text: []const u8) void {
-        _ = self;
-        _ = text;
-        // TODO bundle 8
+        wv2_set_a11y_help(self.ctx.host, text.ptr, text.len);
     }
 
+    /// Override the spoken role name (`UIA_LocalizedControlTypePropertyId`)
+    /// through the native host's server-side UIA provider. Ports legacy
+    /// `windows.zig` `setAccessibilityRoleDescription`.
     pub fn setAccessibilityRoleDescription(self: *Window, text: []const u8) void {
-        _ = self;
-        _ = text;
-        // TODO bundle 8
+        wv2_set_a11y_role_desc(self.ctx.host, text.ptr, text.len);
     }
 
+    /// Set the window's accessibility subrole. `dialog` / `system_dialog`
+    /// surface as `UIA_IsDialogPropertyId == true` through the native host's
+    /// UIA provider so assistive tech announces the window as a dialog. Ports
+    /// legacy `windows.zig` `setAccessibilitySubrole`.
     pub fn setAccessibilitySubrole(self: *Window, subrole: opts_mod.AccessibilitySubrole) void {
-        _ = self;
-        _ = subrole;
-        // TODO bundle 8
+        wv2_set_a11y_subrole(self.ctx.host, @intFromEnum(subrole));
     }
 
+    /// Quit the app: posts `WM_QUIT` (via `PostQuitMessage(0)` in the host),
+    /// unwinding the `run()` message loop. Matches legacy `windows.zig`.
     pub fn terminate(self: *Window) void {
-        _ = self;
-        // TODO bundle 8
+        wv2_terminate(self.ctx.host);
     }
 
     pub fn close(self: *Window) void {
@@ -991,11 +1035,301 @@ fn allocatorForHtml() std.mem.Allocator {
 }
 
 // ---- module-level toast (bundle 8) ------------------------------------------
+//
+// Modern Action Center toast (vs. the legacy Shell_NotifyIconW balloon). This
+// is window-independent, so it lives outside the C++ host: it is a hand-rolled
+// WinRT/COM path identical to the legacy `windows.zig` toast, driven through
+// `vtSlot` over the vendored WinRT vtables. Three prerequisites the balloon
+// path lacks:
+//   1. An AUMID (`SetCurrentProcessExplicitAppUserModelID`).
+//   2. A Start-menu `.lnk` carrying that AUMID (`System.AppUserModel.ID`) — the
+//      shell drops toasts from unpackaged apps without it. Created once.
+//   3. WinRT activation: XmlDocument -> ToastGeneric -> ToastNotificationManager
+//      -> IToastNotifier::Show.
+//
+// WinRT activation + HSTRING live in combase.dll, but zig's bundled mingw ships
+// no x86_64 combase import lib — only the split API-set stubs. linkWinNative
+// links the two carrying our symbols (api-ms-win-core-winrt-l1-1-0 / -string).
+// Proven to cross-compile from macOS by the legacy backend (commit 76a7374).
 
+// --- Win32 / WinRT FFI types (local; mirror windows.zig) ---
+const HRESULT = c_long;
+const DWORD = c_ulong;
+const BOOL = c_int;
+const HMODULE = ?*opaque {};
+const GUID = extern struct { Data1: u32, Data2: u16, Data3: u16, Data4: [8]u8 };
+const IID = GUID;
+/// A bare COM/WinRT object: a pointer to its vtable. We index it via `vtSlot`.
+const ComObj = extern struct { lpVtbl: *const anyopaque };
+
+extern "api-ms-win-core-winrt-l1-1-0" fn RoInitialize(init_type: c_int) callconv(.winapi) HRESULT;
+extern "api-ms-win-core-winrt-string-l1-1-0" fn WindowsCreateString(src: [*]const u16, len: u32, out: *?*anyopaque) callconv(.winapi) HRESULT;
+extern "api-ms-win-core-winrt-string-l1-1-0" fn WindowsDeleteString(str: ?*anyopaque) callconv(.winapi) HRESULT;
+extern "api-ms-win-core-winrt-l1-1-0" fn RoGetActivationFactory(class_id: ?*anyopaque, iid: *const IID, factory: *?*anyopaque) callconv(.winapi) HRESULT;
+extern "api-ms-win-core-winrt-l1-1-0" fn RoActivateInstance(class_id: ?*anyopaque, instance: *?*anyopaque) callconv(.winapi) HRESULT;
+extern "shell32" fn SetCurrentProcessExplicitAppUserModelID(id: [*:0]const u16) callconv(.winapi) HRESULT;
+extern "kernel32" fn GetModuleFileNameW(module: HMODULE, buf: [*]u16, size: DWORD) callconv(.winapi) DWORD;
+extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: [*]u16, size: DWORD) callconv(.winapi) DWORD;
+extern "shlwapi" fn PathFileExistsW(path: [*:0]const u16) callconv(.winapi) BOOL;
+extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) HRESULT;
+extern "ole32" fn CoCreateInstance(
+    rclsid: *const GUID,
+    unk_outer: ?*anyopaque,
+    cls_context: DWORD,
+    riid: *const GUID,
+    ppv: *?*anyopaque,
+) callconv(.winapi) HRESULT;
+
+const RO_INIT_SINGLETHREADED: c_int = 0;
+const CLSCTX_INPROC_SERVER: DWORD = 1;
+const COINIT_APARTMENTTHREADED: DWORD = 2;
+
+// WinRT runtime-method slots (IInspectable methods occupy slots 3-5).
+const SLOT_XmlDocumentIO_LoadXml: usize = 6;
+const SLOT_ToastMgr_CreateToastNotifierWithId: usize = 7;
+const SLOT_ToastFactory_CreateToastNotification: usize = 6;
+const SLOT_ToastNotifier_Show: usize = 6;
+// Shortcut COM slots (classic IUnknown-rooted interfaces).
+const SLOT_ShellLink_SetPath: usize = 20;
+const SLOT_PropertyStore_SetValue: usize = 6;
+const SLOT_PropertyStore_Commit: usize = 7;
+const SLOT_PersistFile_Save: usize = 6;
+
+const IID_IXmlDocument: GUID = .{ .Data1 = 0xf7f3a506, .Data2 = 0x1e87, .Data3 = 0x42d6, .Data4 = .{ 0xbc, 0xfb, 0xb8, 0xc8, 0x09, 0xfa, 0x54, 0x94 } };
+const IID_IXmlDocumentIO: GUID = .{ .Data1 = 0x6cd0e74e, .Data2 = 0xee65, .Data3 = 0x4489, .Data4 = .{ 0x9e, 0xbf, 0xca, 0x43, 0xe8, 0x7b, 0xa6, 0x37 } };
+const IID_IToastNotificationManagerStatics: GUID = .{ .Data1 = 0x50ac103f, .Data2 = 0xd235, .Data3 = 0x4598, .Data4 = .{ 0xbb, 0xef, 0x98, 0xfe, 0x4d, 0x1a, 0x3a, 0xd4 } };
+const IID_IToastNotificationFactory: GUID = .{ .Data1 = 0x04124b20, .Data2 = 0x82c6, .Data3 = 0x4229, .Data4 = .{ 0xb1, 0x09, 0xfd, 0x9e, 0xd4, 0x66, 0x2b, 0x53 } };
+const IID_IToastNotifier: GUID = .{ .Data1 = 0x75927b93, .Data2 = 0x03f3, .Data3 = 0x41ec, .Data4 = .{ 0x91, 0xd3, 0x6e, 0x5b, 0xac, 0x1b, 0x38, 0xe7 } };
+
+const CLSID_ShellLink: GUID = .{ .Data1 = 0x00021401, .Data2 = 0x0000, .Data3 = 0x0000, .Data4 = .{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+const IID_IShellLinkW: GUID = .{ .Data1 = 0x000214f9, .Data2 = 0x0000, .Data3 = 0x0000, .Data4 = .{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+const IID_IPersistFile: GUID = .{ .Data1 = 0x0000010b, .Data2 = 0x0000, .Data3 = 0x0000, .Data4 = .{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+const IID_IPropertyStore: GUID = .{ .Data1 = 0x886d8eeb, .Data2 = 0x8cf2, .Data3 = 0x4446, .Data4 = .{ 0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99 } };
+
+const VT_LPWSTR: u16 = 31;
+const PROPERTYKEY = extern struct { fmtid: GUID, pid: u32 };
+const PROPVARIANT = extern struct {
+    vt: u16,
+    r1: u16 = 0,
+    r2: u16 = 0,
+    r3: u16 = 0,
+    val: usize = 0,
+    pad: u64 = 0,
+};
+// System.AppUserModel.ID
+const PKEY_AppUserModel_ID: PROPERTYKEY = .{
+    .fmtid = .{ .Data1 = 0x9f4c2855, .Data2 = 0x9f79, .Data3 = 0x4b39, .Data4 = .{ 0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0xf3 } },
+    .pid = 5,
+};
+
+/// Fetch vtable slot `slot` from `lpVtbl` as a typed fn pointer.
+fn vtSlot(comptime Fn: type, lpVtbl: *const anyopaque, slot: usize) Fn {
+    const arr: [*]const *const anyopaque = @ptrCast(@alignCast(lpVtbl));
+    return @ptrCast(arr[slot]);
+}
+
+/// IUnknown::Release at slot 2.
+fn releaseRef(obj: *ComObj) void {
+    const Release = vtSlot(*const fn (*ComObj) callconv(.winapi) c_ulong, obj.lpVtbl, 2);
+    _ = Release(obj);
+}
+
+/// IUnknown::QueryInterface at slot 0.
+fn comQueryInterface(obj: *ComObj, iid: *const IID, out: *?*anyopaque) HRESULT {
+    const QI = vtSlot(*const fn (*ComObj, *const IID, *?*anyopaque) callconv(.winapi) HRESULT, obj.lpVtbl, 0);
+    return QI(obj, iid, out);
+}
+
+/// Create an HSTRING from a comptime ASCII class id. Caller deletes.
+fn hstr(comptime s: []const u8) ?*anyopaque {
+    const w = std.unicode.utf8ToUtf16LeStringLiteral(s);
+    var h: ?*anyopaque = null;
+    if (WindowsCreateString(w, w.len, &h) < 0) return null;
+    return h;
+}
+
+fn winrtString(w: []const u16) ?*anyopaque {
+    var h: ?*anyopaque = null;
+    if (WindowsCreateString(w.ptr, @intCast(w.len), &h) < 0) return null;
+    return h;
+}
+
+/// `RoActivateInstance` a runtime class by comptime id. Caller Releases.
+fn roActivate(comptime class: []const u8) ?*ComObj {
+    const id = hstr(class) orelse return null;
+    defer _ = WindowsDeleteString(id);
+    var p: ?*anyopaque = null;
+    if (RoActivateInstance(id, &p) < 0 or p == null) return null;
+    return @ptrCast(@alignCast(p));
+}
+
+fn appendW(dst: []u16, i: *usize, src: []const u16) bool {
+    if (i.* + src.len >= dst.len) return false;
+    @memcpy(dst[i.*..][0..src.len], src);
+    i.* += src.len;
+    return true;
+}
+
+/// The running exe's basename (no dir, `.exe` stripped) as UTF-16 into `out`.
+/// Returns the length or null on failure. Drives the per-app AUMID + shortcut.
+fn exeBaseNameW(out: []u16) ?usize {
+    var exe: [512]u16 = undefined;
+    const n = GetModuleFileNameW(null, &exe, exe.len);
+    if (n == 0 or n >= exe.len) return null;
+    var start: usize = 0;
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        if (exe[k] == '\\' or exe[k] == '/') start = k + 1;
+    }
+    var end: usize = n;
+    if (end >= start + 4) {
+        const tail = exe[end - 4 .. end];
+        if (tail[0] == '.' and (tail[1] | 0x20) == 'e' and (tail[2] | 0x20) == 'x' and (tail[3] | 0x20) == 'e') {
+            end -= 4;
+        }
+    }
+    const len = end - start;
+    if (len == 0 or len >= out.len) return null;
+    @memcpy(out[0..len], exe[start..end]);
+    return len;
+}
+
+/// Re-resolve the full exe path as a NUL-terminated UTF-16 buffer for the
+/// shortcut target. Returns a process-static buffer; falls back to empty.
+var g_exe_path_buf: [512]u16 = undefined;
+fn exeFullPathZ() [*:0]const u16 {
+    const n = GetModuleFileNameW(null, &g_exe_path_buf, g_exe_path_buf.len);
+    if (n == 0 or n >= g_exe_path_buf.len) {
+        g_exe_path_buf[0] = 0;
+    } else {
+        g_exe_path_buf[n] = 0;
+    }
+    return @ptrCast(&g_exe_path_buf);
+}
+
+/// Create the AUMID Start-menu shortcut once (idempotent — skips if the `.lnk`
+/// already exists). Best-effort. `*_z` are NUL-terminated UTF-16.
+fn ensureAumidShortcut(exe_z: [*:0]const u16, aumid_z: [*:0]const u16, lnk_z: [*:0]const u16) void {
+    if (PathFileExistsW(lnk_z) != 0) return;
+    _ = CoInitializeEx(null, COINIT_APARTMENTTHREADED);
+
+    var sl_p: ?*anyopaque = null;
+    if (CoCreateInstance(&CLSID_ShellLink, null, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, &sl_p) < 0 or sl_p == null) return;
+    const sl: *ComObj = @ptrCast(@alignCast(sl_p));
+    defer releaseRef(sl);
+
+    const SetPath = vtSlot(*const fn (*ComObj, [*:0]const u16) callconv(.winapi) HRESULT, sl.lpVtbl, SLOT_ShellLink_SetPath);
+    if (SetPath(sl, exe_z) < 0) return;
+
+    var ps_p: ?*anyopaque = null;
+    if (comQueryInterface(sl, &IID_IPropertyStore, &ps_p) < 0 or ps_p == null) return;
+    const ps: *ComObj = @ptrCast(@alignCast(ps_p));
+    defer releaseRef(ps);
+
+    var pv: PROPVARIANT = .{ .vt = VT_LPWSTR, .val = @intFromPtr(aumid_z) };
+    const SetValue = vtSlot(*const fn (*ComObj, *const PROPERTYKEY, *const PROPVARIANT) callconv(.winapi) HRESULT, ps.lpVtbl, SLOT_PropertyStore_SetValue);
+    if (SetValue(ps, &PKEY_AppUserModel_ID, &pv) < 0) return;
+    const Commit = vtSlot(*const fn (*ComObj) callconv(.winapi) HRESULT, ps.lpVtbl, SLOT_PropertyStore_Commit);
+    _ = Commit(ps);
+
+    var pf_p: ?*anyopaque = null;
+    if (comQueryInterface(sl, &IID_IPersistFile, &pf_p) < 0 or pf_p == null) return;
+    const pf: *ComObj = @ptrCast(@alignCast(pf_p));
+    defer releaseRef(pf);
+    const Save = vtSlot(*const fn (*ComObj, [*:0]const u16, BOOL) callconv(.winapi) HRESULT, pf.lpVtbl, SLOT_PersistFile_Save);
+    _ = Save(pf, lnk_z, 1);
+}
+
+/// Show a modern Action Center toast (title + body). WinRT path identical to
+/// the legacy `windows.zig` `showToast`. Returns `error.Unsupported` off
+/// Windows, `error.Backend` on any WinRT failure.
 pub fn showToast(allocator: std.mem.Allocator, title: []const u8, body: []const u8) ToastError!void {
-    _ = allocator;
-    _ = title;
-    _ = body;
-    // TODO bundle 8
-    return error.Unsupported;
+    if (builtin.os.tag != .windows) return error.Unsupported;
+
+    // ---- identity: AUMID + shortcut path from the exe basename ----
+    var base: [256]u16 = undefined;
+    const base_len = exeBaseNameW(&base) orelse return error.Backend;
+
+    const prefix = std.unicode.utf8ToUtf16LeStringLiteral("Verve.");
+    var aumid: [320]u16 = undefined;
+    var ai: usize = 0;
+    if (!appendW(&aumid, &ai, prefix[0..])) return error.Backend;
+    if (!appendW(&aumid, &ai, base[0..base_len])) return error.Backend;
+    aumid[ai] = 0;
+
+    var appdata: [320]u16 = undefined;
+    const ad_name = std.unicode.utf8ToUtf16LeStringLiteral("APPDATA");
+    const ad_len = GetEnvironmentVariableW(ad_name, &appdata, appdata.len);
+    if (ad_len == 0 or ad_len >= appdata.len) return error.Backend;
+
+    var lnk: [768]u16 = undefined;
+    var li: usize = 0;
+    if (!appendW(&lnk, &li, appdata[0..ad_len])) return error.Backend;
+    if (!appendW(&lnk, &li, std.unicode.utf8ToUtf16LeStringLiteral("\\Microsoft\\Windows\\Start Menu\\Programs\\")[0..])) return error.Backend;
+    if (!appendW(&lnk, &li, base[0..base_len])) return error.Backend;
+    if (!appendW(&lnk, &li, std.unicode.utf8ToUtf16LeStringLiteral(".lnk")[0..])) return error.Backend;
+    lnk[li] = 0;
+
+    _ = SetCurrentProcessExplicitAppUserModelID(@ptrCast(&aumid));
+    ensureAumidShortcut(exeFullPathZ(), @ptrCast(&aumid), @ptrCast(&lnk));
+
+    _ = RoInitialize(RO_INIT_SINGLETHREADED); // S_FALSE / changed-mode tolerated
+
+    // ---- XmlDocument + ToastGeneric template ----
+    const xml_doc = roActivate("Windows.Data.Xml.Dom.XmlDocument") orelse return error.Backend;
+    defer releaseRef(xml_doc);
+
+    var docio_p: ?*anyopaque = null;
+    if (comQueryInterface(xml_doc, &IID_IXmlDocumentIO, &docio_p) < 0 or docio_p == null) return error.Backend;
+    const docio: *ComObj = @ptrCast(@alignCast(docio_p));
+    defer releaseRef(docio);
+
+    const xml = toast_codec.buildToastXml(allocator, title, body) catch return error.OutOfMemory;
+    defer allocator.free(xml);
+    const xml_w = std.unicode.utf8ToUtf16LeAlloc(allocator, xml) catch return error.OutOfMemory;
+    defer allocator.free(xml_w);
+    const xml_h = winrtString(xml_w) orelse return error.Backend;
+    defer _ = WindowsDeleteString(xml_h);
+
+    const LoadXml = vtSlot(*const fn (*ComObj, ?*anyopaque) callconv(.winapi) HRESULT, docio.lpVtbl, SLOT_XmlDocumentIO_LoadXml);
+    if (LoadXml(docio, xml_h) < 0) return error.Backend;
+
+    // The XmlDocument as IXmlDocument (what CreateToastNotification wants).
+    var doc_p: ?*anyopaque = null;
+    if (comQueryInterface(xml_doc, &IID_IXmlDocument, &doc_p) < 0 or doc_p == null) return error.Backend;
+    const doc: *ComObj = @ptrCast(@alignCast(doc_p));
+    defer releaseRef(doc);
+
+    // ---- notifier (AUMID) ----
+    const mgr_id = hstr("Windows.UI.Notifications.ToastNotificationManager") orelse return error.Backend;
+    defer _ = WindowsDeleteString(mgr_id);
+    var statics_p: ?*anyopaque = null;
+    if (RoGetActivationFactory(mgr_id, &IID_IToastNotificationManagerStatics, &statics_p) < 0 or statics_p == null) return error.Backend;
+    const statics: *ComObj = @ptrCast(@alignCast(statics_p));
+    defer releaseRef(statics);
+
+    const aumid_h = winrtString(aumid[0..ai]) orelse return error.Backend;
+    defer _ = WindowsDeleteString(aumid_h);
+    const CreateNotifier = vtSlot(*const fn (*ComObj, ?*anyopaque, *?*anyopaque) callconv(.winapi) HRESULT, statics.lpVtbl, SLOT_ToastMgr_CreateToastNotifierWithId);
+    var notifier_p: ?*anyopaque = null;
+    if (CreateNotifier(statics, aumid_h, &notifier_p) < 0 or notifier_p == null) return error.Backend;
+    const notifier: *ComObj = @ptrCast(@alignCast(notifier_p));
+    defer releaseRef(notifier);
+
+    // ---- toast from the xml ----
+    const toast_id = hstr("Windows.UI.Notifications.ToastNotification") orelse return error.Backend;
+    defer _ = WindowsDeleteString(toast_id);
+    var tfac_p: ?*anyopaque = null;
+    if (RoGetActivationFactory(toast_id, &IID_IToastNotificationFactory, &tfac_p) < 0 or tfac_p == null) return error.Backend;
+    const tfac: *ComObj = @ptrCast(@alignCast(tfac_p));
+    defer releaseRef(tfac);
+
+    const CreateToast = vtSlot(*const fn (*ComObj, *ComObj, *?*anyopaque) callconv(.winapi) HRESULT, tfac.lpVtbl, SLOT_ToastFactory_CreateToastNotification);
+    var toast_p: ?*anyopaque = null;
+    if (CreateToast(tfac, doc, &toast_p) < 0 or toast_p == null) return error.Backend;
+    const toast: *ComObj = @ptrCast(@alignCast(toast_p));
+    defer releaseRef(toast);
+
+    const Show = vtSlot(*const fn (*ComObj, *ComObj) callconv(.winapi) HRESULT, notifier.lpVtbl, SLOT_ToastNotifier_Show);
+    if (Show(notifier, toast) < 0) return error.Backend;
 }

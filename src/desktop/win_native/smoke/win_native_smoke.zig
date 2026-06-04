@@ -120,6 +120,21 @@ const page =
     \\    <br>(text/html/image round-trip through the native Win32 clipboard; paste into Notepad/Word to confirm)
     \\  </div>
     \\
+    \\  <div class="grp"><h3>Bundle 8 · print, a11y, snapshot, toast, terminate</h3>
+    \\    <button onclick="window.verve.post('cmd:print')">print (opens print UI)</button>
+    \\    <button onclick="window.verve.post('cmd:snapshot')">snapshot &rarr; snapshot.png</button>
+    \\    <button onclick="window.verve.post('cmd:toast')">toast (Action Center)</button>
+    \\    <br>
+    \\    <button onclick="window.verve.post('cmd:a11y-label')">a11y label</button>
+    \\    <button onclick="window.verve.post('cmd:a11y-help')">a11y help</button>
+    \\    <button onclick="window.verve.post('cmd:a11y-role')">a11y role-desc</button>
+    \\    <button onclick="window.verve.post('cmd:a11y-subrole')">a11y subrole (dialog)</button>
+    \\    <br>
+    \\    <button onclick="if(confirm('terminate quits the app — continue?')) window.verve.post('cmd:terminate')"
+    \\            style="background:#fdd">terminate (QUITS THE APP)</button>
+    \\    <br>(snapshot writes next to the exe; toast logs ok/Unsupported; a11y label updates the title-bar name)
+    \\  </div>
+    \\
     \\  <div id="log">waiting for round-trip&hellip;</div>
     \\  <script>
     \\    function verveLog(s) { document.getElementById('log').textContent = s; }
@@ -233,6 +248,27 @@ fn dispatchCommand(win: *wn.Window, payload: []const u8) bool {
         runClipWriteImage(win);
     } else if (std.mem.eql(u8, cmd, "clip-read-image")) {
         runClipReadImage(win);
+    } else if (std.mem.eql(u8, cmd, "print")) {
+        runPrint(win);
+    } else if (std.mem.eql(u8, cmd, "snapshot")) {
+        runSnapshot(win);
+    } else if (std.mem.eql(u8, cmd, "toast")) {
+        runToast(win);
+    } else if (std.mem.eql(u8, cmd, "a11y-label")) {
+        win.setAccessibilityLabel("Verve (a11y label)");
+        win.evalJs("verveLog('a11y label: applied (check title-bar / screen reader name)');");
+    } else if (std.mem.eql(u8, cmd, "a11y-help")) {
+        win.setAccessibilityHelp("Verve smoke window help text");
+        win.evalJs("verveLog('a11y help: applied (UIA HelpText — inspect with Narrator/Accessibility Insights)');");
+    } else if (std.mem.eql(u8, cmd, "a11y-role")) {
+        win.setAccessibilityRoleDescription("Verve panel");
+        win.evalJs("verveLog('a11y role-desc: applied (UIA LocalizedControlType)');");
+    } else if (std.mem.eql(u8, cmd, "a11y-subrole")) {
+        win.setAccessibilitySubrole(.dialog);
+        win.evalJs("verveLog('a11y subrole: applied (UIA IsDialog=true)');");
+    } else if (std.mem.eql(u8, cmd, "terminate")) {
+        std.debug.print("[zig] terminate -> quitting app\n", .{});
+        win.terminate();
     } else {
         std.debug.print("[zig] unknown cmd: {s}\n", .{cmd});
         return true;
@@ -573,6 +609,47 @@ fn runClipReadImage(win: *wn.Window) void {
         std.debug.print("[zig] clip read image -> (none)\n", .{});
         win.evalJs("verveLog('clip read image: (no image)');");
     }
+}
+
+// ---- Bundle 8 · print / snapshot / toast ------------------------------------
+
+/// "print" button — opens the WebView2 print UI (browser preview kind).
+fn runPrint(win: *wn.Window) void {
+    win.printWithOptions(.{}) catch |err| {
+        std.debug.print("[zig] print: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('print: error / unsupported (needs WebView2 runtime ~v111+)');");
+        return;
+    };
+    std.debug.print("[zig] print: opened print UI\n", .{});
+    win.evalJs("verveLog('print: opened the print UI');");
+}
+
+/// "snapshot" button — CapturePreview the page to "snapshot.png" next to the
+/// exe and log the resolved path (or the error).
+fn runSnapshot(win: *wn.Window) void {
+    const path = "snapshot.png";
+    win.takeSnapshotPng(path) catch |err| {
+        std.debug.print("[zig] snapshot: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('snapshot: error (" ++ "see console)');");
+        return;
+    };
+    std.debug.print("[zig] snapshot -> wrote {s} (next to the exe)\n", .{path});
+    win.evalJs("verveLog('snapshot: wrote " ++ path ++ " next to the exe');");
+}
+
+/// "toast" button — fire an Action Center toast. Logs whether the WinRT path
+/// ran or fell back (Unsupported / Backend).
+fn runToast(win: *wn.Window) void {
+    const alloc = std.heap.page_allocator;
+    wn.showToast(alloc, "Verve", "Toast from the native-host backend.") catch |err| {
+        std.debug.print("[zig] toast: {s}\n", .{@errorName(err)});
+        var buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "verveLog('toast: {s} (no toast shown)');", .{@errorName(err)}) catch return;
+        win.evalJs(line);
+        return;
+    };
+    std.debug.print("[zig] toast: shown\n", .{});
+    win.evalJs("verveLog('toast: shown (check the Action Center)');");
 }
 
 /// Registered via setColorSchemeHandler; logs OS light/dark toggles. Operator
