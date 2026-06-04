@@ -22,10 +22,10 @@ pub const impl = switch (builtin.os.tag) {
     .macos => @import("macos.zig"),
     .windows => @import("windows_native.zig"),
     .linux => blk: {
-        const use_gtk4 = comptime use_gtk4: {
+        const use_gtk4 = comptime detect: {
             const root = @import("root");
-            if (@hasDecl(root, "desktop_options")) break :use_gtk4 root.desktop_options.gtk4;
-            break :use_gtk4 false;
+            if (@hasDecl(root, "desktop_options")) break :detect root.desktop_options.gtk4;
+            break :detect false;
         };
         break :blk if (use_gtk4) @import("linux_gtk4.zig") else @import("linux.zig");
     },
