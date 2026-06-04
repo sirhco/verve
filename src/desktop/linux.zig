@@ -2082,6 +2082,7 @@ pub fn clipboardWriteImage(window: *anyopaque, png: []const u8) opts_mod.Clipboa
     var gerr: ?*GError = null;
     if (gdk_pixbuf_loader_write(loader, png.ptr, png.len, &gerr) == 0) {
         if (gerr) |e| g_error_free(e);
+        _ = gdk_pixbuf_loader_close(loader, null); // close before unref even on write error
         return opts_mod.ClipboardError.Backend;
     }
     if (gdk_pixbuf_loader_close(loader, &gerr) == 0) {
