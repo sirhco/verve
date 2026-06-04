@@ -54,9 +54,28 @@ extern fn wv2_request_attention(host: *Host, critical: c_int) void;
 extern fn wv2_set_resizable(host: *Host, on: c_int) void;
 extern fn wv2_set_fullscreen(host: *Host, on: c_int) void;
 
+// Bundle 3: navigation & webview state.
+const ColorSchemeFn = *const fn (ctx: ?*anyopaque, scheme: c_int) callconv(.c) void;
+extern fn wv2_reload(host: *Host) void;
+extern fn wv2_go_back(host: *Host) void;
+extern fn wv2_go_forward(host: *Host) void;
+extern fn wv2_can_go_back(host: *Host) c_int;
+extern fn wv2_can_go_forward(host: *Host) c_int;
+extern fn wv2_current_url(host: *Host, buf: [*]u8, cap: usize) usize;
+extern fn wv2_current_title(host: *Host, buf: [*]u8, cap: usize) usize;
+extern fn wv2_set_zoom(host: *Host, level: f64) void;
+extern fn wv2_get_zoom(host: *Host) f64;
+extern fn wv2_color_scheme(host: *Host) c_int;
+extern fn wv2_set_color_scheme_cb(host: *Host, cb: ?ColorSchemeFn, ctx: ?*anyopaque) void;
+
 /// Toast error set — mirrors the legacy `windows.zig` surface so the
 /// module-level `showToast` is signature-compatible.
 pub const ToastError = error{ Unsupported, Backend, OutOfMemory };
+
+/// Re-export so downstream drivers (the win-native smoke harness) can name the
+/// color-scheme types without a separate `options.zig` import.
+pub const ColorScheme = opts_mod.ColorScheme;
+pub const ColorSchemeHandler = opts_mod.ColorSchemeHandler;
 
 // ---- Heap-pinned window context ---------------------------------------------
 
@@ -65,6 +84,8 @@ const WindowCtx = struct {
     host: *Host,
     on_message: ?opts_mod.MessageHandler = null,
     on_message_ctx: ?*anyopaque = null,
+    on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
+    on_color_scheme_ctx: ?*anyopaque = null,
 };
 
 pub const Window = struct {
@@ -201,15 +222,11 @@ pub const Window = struct {
     }
 
     pub fn setZoom(self: *Window, level: f64) void {
-        _ = self;
-        _ = level;
-        // TODO bundle 3
+        wv2_set_zoom(self.ctx.host, level);
     }
 
     pub fn getZoom(self: *Window) f64 {
-        _ = self;
-        // TODO bundle 3
-        return 1.0;
+        return wv2_get_zoom(self.ctx.host);
     }
 
     pub fn scaleFactor(self: *Window) f32 {
@@ -235,51 +252,45 @@ pub const Window = struct {
     // ---- navigation (bundle 3) ----------------------------------------------
 
     pub fn reload(self: *Window) void {
-        _ = self;
-        // TODO bundle 3
+        wv2_reload(self.ctx.host);
     }
 
     pub fn goBack(self: *Window) void {
-        _ = self;
-        // TODO bundle 3
+        wv2_go_back(self.ctx.host);
     }
 
     pub fn goForward(self: *Window) void {
-        _ = self;
-        // TODO bundle 3
+        wv2_go_forward(self.ctx.host);
     }
 
     pub fn canGoBack(self: *Window) bool {
-        _ = self;
-        // TODO bundle 3
-        return false;
+        return wv2_can_go_back(self.ctx.host) != 0;
     }
 
     pub fn canGoForward(self: *Window) bool {
-        _ = self;
-        // TODO bundle 3
-        return false;
+        return wv2_can_go_forward(self.ctx.host) != 0;
     }
 
     pub fn currentUrl(self: *Window, allocator: std.mem.Allocator) ![]u8 {
-        _ = self;
-        // TODO bundle 3
-        return allocator.dupe(u8, "");
+        return wv2GetString(self.ctx.host, wv2_current_url, allocator);
     }
 
     pub fn currentTitle(self: *Window, allocator: std.mem.Allocator) ![]u8 {
-        _ = self;
-        // TODO bundle 3
-        return allocator.dupe(u8, "");
+        return wv2GetString(self.ctx.host, wv2_current_title, allocator);
     }
 
     // ---- events / handlers (bundle 4) ---------------------------------------
 
     pub fn setColorSchemeHandler(self: *Window, cb: ?opts_mod.ColorSchemeHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
-        // TODO bundle 4
+        self.ctx.on_color_scheme = cb;
+        self.ctx.on_color_scheme_ctx = ctx;
+        // The native host fires its callback for every registered window; we
+        // route through one trampoline that re-reads the per-window ctx.
+        wv2_set_color_scheme_cb(
+            self.ctx.host,
+            if (cb == null) null else colorSchemeTrampoline,
+            self.ctx,
+        );
     }
 
     pub fn setUrlOpenHandler(self: *Window, cb: ?opts_mod.UrlOpenHandler, ctx: ?*anyopaque) void {
@@ -324,9 +335,7 @@ pub const Window = struct {
     }
 
     pub fn colorScheme(self: *Window) opts_mod.ColorScheme {
-        _ = self;
-        // TODO bundle 4
-        return .unknown;
+        return intToColorScheme(wv2_color_scheme(self.ctx.host));
     }
 
     // ---- dialogs (bundle 5) -------------------------------------------------
@@ -421,6 +430,40 @@ pub const Window = struct {
 fn bridgeTrampoline(ctx: ?*anyopaque, msg: [*]const u8, len: usize) callconv(.c) void {
     const wc: *WindowCtx = @ptrCast(@alignCast(ctx.?));
     if (wc.on_message) |h| h(wc.on_message_ctx, msg[0..len]);
+}
+
+/// Map the host's int scheme (0 light, 1 dark, 2 unknown) to the enum.
+fn intToColorScheme(v: c_int) opts_mod.ColorScheme {
+    return switch (v) {
+        0 => .light,
+        1 => .dark,
+        else => .unknown,
+    };
+}
+
+/// Fired by the native host on the UI thread when the OS theme toggles. Maps
+/// the int and dispatches to the per-window handler stored in `ctx`.
+fn colorSchemeTrampoline(ctx: ?*anyopaque, scheme: c_int) callconv(.c) void {
+    const wc: *WindowCtx = @ptrCast(@alignCast(ctx.?));
+    if (wc.on_color_scheme) |h| h(wc.on_color_scheme_ctx, intToColorScheme(scheme));
+}
+
+/// Shared body for currentUrl / currentTitle. The C fn fills a caller buffer
+/// and returns the FULL byte length; if it overflows the stack buffer we
+/// allocate exactly and call again. Empty (0) on an unavailable webview —
+/// matching the legacy "" return.
+fn wv2GetString(
+    host: *Host,
+    getter: *const fn (*Host, [*]u8, usize) callconv(.c) usize,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    var stack: [2048]u8 = undefined;
+    const len = getter(host, &stack, stack.len);
+    if (len <= stack.len) return allocator.dupe(u8, stack[0..len]);
+    const heap = try allocator.alloc(u8, len);
+    errdefer allocator.free(heap);
+    const got = getter(host, heap.ptr, heap.len);
+    return heap[0..@min(got, heap.len)];
 }
 
 // ---- module-level cookie free fns (bundle 6) --------------------------------

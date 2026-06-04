@@ -72,6 +72,30 @@ void  wv2_request_attention(WV2Host *host, int critical);
 void  wv2_set_resizable(WV2Host *host, int on);
 void  wv2_set_fullscreen(WV2Host *host, int on);
 
+/* ---- Bundle 3: navigation & webview state -------------------------------- */
+
+void   wv2_reload(WV2Host *host);
+void   wv2_go_back(WV2Host *host);
+void   wv2_go_forward(WV2Host *host);
+int    wv2_can_go_back(WV2Host *host);
+int    wv2_can_go_forward(WV2Host *host);
+
+/* Fill `buf` (capacity `cap`) with the current Source URL / DocumentTitle as
+ * UTF-8 (no NUL). Returns the FULL byte length even when it exceeds `cap`;
+ * copies min(len, cap). 0 when the webview is not yet ready. */
+size_t wv2_current_url(WV2Host *host, uint8_t *buf, size_t cap);
+size_t wv2_current_title(WV2Host *host, uint8_t *buf, size_t cap);
+
+void   wv2_set_zoom(WV2Host *host, double level);
+double wv2_get_zoom(WV2Host *host);
+
+/* OS theme: 0 light, 1 dark, 2 unknown. */
+int    wv2_color_scheme(WV2Host *host);
+
+/* Called on the UI thread when the OS light/dark theme toggles. */
+typedef void (*verve_color_scheme_cb)(void *ctx, int scheme);
+void   wv2_set_color_scheme_cb(WV2Host *host, verve_color_scheme_cb cb, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

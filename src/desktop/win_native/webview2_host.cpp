@@ -22,6 +22,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 // Back operator new/delete with malloc so the spike links without the C++
 // runtime (compiled -fno-exceptions -fno-rtti). All our allocations are tiny
@@ -80,7 +81,26 @@ struct WV2Host {
     LONG saved_style = 0;
     LONG saved_exstyle = 0;
     WINDOWPLACEMENT saved_placement = {};
+
+    // Bundle 3: OS theme-change callback. Fired from WM_SETTINGCHANGE when the
+    // broadcast area is "ImmersiveColorSet" (the light/dark toggle signal).
+    verve_color_scheme_cb color_scheme_cb = nullptr;
+    void *color_scheme_ctx = nullptr;
 };
+
+// Read HKCU\...\Personalize\AppsUseLightTheme. 1 = light, 0 = dark, missing =
+// unknown — mirrors the legacy windows.zig readColorSchemeRegistry(). Shared by
+// wv2_color_scheme and the WM_SETTINGCHANGE dispatch.
+static int read_color_scheme() {
+    DWORD data = 0;
+    DWORD size = sizeof(data);
+    LSTATUS r = RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &data, &size);
+    if (r != ERROR_SUCCESS) return 2; // unknown
+    return data == 0 ? 1 /* dark */ : 0 /* light */;
+}
 
 // Pure-virtual placeholder: COM interface vtables reference it for unimplemented
 // slots. libc++abi normally supplies it; we compile without the C++ runtime.
@@ -264,6 +284,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
+    case WM_SETTINGCHANGE:
+        // lp -> LPCWSTR area name. Windows broadcasts "ImmersiveColorSet" when
+        // the user flips light/dark in Settings -> Personalization -> Colors.
+        if (host && host->color_scheme_cb && lp) {
+            const wchar_t *area = (const wchar_t *)lp;
+            if (wcscmp(area, L"ImmersiveColorSet") == 0) {
+                host->color_scheme_cb(host->color_scheme_ctx,
+                                      read_color_scheme());
+            }
+        }
+        return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -601,6 +632,94 @@ void wv2_set_fullscreen(WV2Host *host, int on) {
                          SWP_FRAMECHANGED);
         host->is_fullscreen = false;
     }
+}
+
+// ---- Bundle 3: navigation & webview state -----------------------------------
+
+void wv2_reload(WV2Host *host) {
+    if (host && host->webview) host->webview->Reload();
+}
+
+void wv2_go_back(WV2Host *host) {
+    if (host && host->webview) host->webview->GoBack();
+}
+
+void wv2_go_forward(WV2Host *host) {
+    if (host && host->webview) host->webview->GoForward();
+}
+
+int wv2_can_go_back(WV2Host *host) {
+    if (!host || !host->webview) return 0;
+    BOOL b = FALSE;
+    host->webview->get_CanGoBack(&b);
+    return b ? 1 : 0;
+}
+
+int wv2_can_go_forward(WV2Host *host) {
+    if (!host || !host->webview) return 0;
+    BOOL b = FALSE;
+    host->webview->get_CanGoForward(&b);
+    return b ? 1 : 0;
+}
+
+// Copy a CoTaskMem-owned LPWSTR getter result into `buf` as UTF-8. Returns the
+// full UTF-8 byte length (sans NUL); copies min(len, cap). Frees the LPWSTR.
+static size_t fill_utf8_from_wide(LPWSTR w, uint8_t *buf, size_t cap) {
+    if (!w) return 0;
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) {
+        CoTaskMemFree(w);
+        return 0;
+    }
+    size_t full = (size_t)(n - 1); // exclude trailing NUL
+    char *tmp = (char *)malloc((size_t)n);
+    if (!tmp) {
+        CoTaskMemFree(w);
+        return 0;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, tmp, n, nullptr, nullptr);
+    size_t copy = full < cap ? full : cap;
+    if (buf && copy) memcpy(buf, tmp, copy);
+    free(tmp);
+    CoTaskMemFree(w);
+    return full;
+}
+
+size_t wv2_current_url(WV2Host *host, uint8_t *buf, size_t cap) {
+    if (!host || !host->webview) return 0;
+    LPWSTR src = nullptr;
+    if (FAILED(host->webview->get_Source(&src)) || !src) return 0;
+    return fill_utf8_from_wide(src, buf, cap);
+}
+
+size_t wv2_current_title(WV2Host *host, uint8_t *buf, size_t cap) {
+    if (!host || !host->webview) return 0;
+    LPWSTR title = nullptr;
+    if (FAILED(host->webview->get_DocumentTitle(&title)) || !title) return 0;
+    return fill_utf8_from_wide(title, buf, cap);
+}
+
+void wv2_set_zoom(WV2Host *host, double level) {
+    if (host && host->controller) host->controller->put_ZoomFactor(level);
+}
+
+double wv2_get_zoom(WV2Host *host) {
+    if (!host || !host->controller) return 1.0;
+    double z = 1.0;
+    host->controller->get_ZoomFactor(&z);
+    return z;
+}
+
+int wv2_color_scheme(WV2Host *host) {
+    (void)host;
+    return read_color_scheme();
+}
+
+void wv2_set_color_scheme_cb(WV2Host *host, verve_color_scheme_cb cb,
+                             void *ctx) {
+    if (!host) return;
+    host->color_scheme_cb = cb;
+    host->color_scheme_ctx = ctx;
 }
 
 } // extern "C"

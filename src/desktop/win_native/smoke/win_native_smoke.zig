@@ -61,6 +61,18 @@ const page =
     \\    <button onclick="window.verve.post('cmd:report')">report state &rarr; Zig &rarr; here</button>
     \\  </div>
     \\
+    \\  <div class="grp"><h3>Bundle 3 · navigation &amp; webview state</h3>
+    \\    <a href="#a">anchor A</a> <a href="#b">anchor B</a> <a href="#c">anchor C</a>
+    \\    (click a few to populate session history)
+    \\    <br>
+    \\    <button onclick="window.verve.post('cmd:reload')">reload</button>
+    \\    <button onclick="window.verve.post('cmd:back')">goBack</button>
+    \\    <button onclick="window.verve.post('cmd:forward')">goForward</button>
+    \\    <button onclick="window.verve.post('cmd:zoom-in')">setZoom(1.5)</button>
+    \\    <button onclick="window.verve.post('cmd:zoom-reset')">setZoom(1.0)</button>
+    \\    <button onclick="window.verve.post('cmd:nav-report')">report nav &rarr; Zig &rarr; here</button>
+    \\  </div>
+    \\
     \\  <div id="log">waiting for round-trip&hellip;</div>
     \\  <script>
     \\    function verveLog(s) { document.getElementById('log').textContent = s; }
@@ -130,6 +142,18 @@ fn dispatchCommand(win: *wn.Window, payload: []const u8) bool {
         win.requestAttention(true);
     } else if (std.mem.eql(u8, cmd, "report")) {
         reportState(win);
+    } else if (std.mem.eql(u8, cmd, "reload")) {
+        win.reload();
+    } else if (std.mem.eql(u8, cmd, "back")) {
+        win.goBack();
+    } else if (std.mem.eql(u8, cmd, "forward")) {
+        win.goForward();
+    } else if (std.mem.eql(u8, cmd, "zoom-in")) {
+        win.setZoom(1.5);
+    } else if (std.mem.eql(u8, cmd, "zoom-reset")) {
+        win.setZoom(1.0);
+    } else if (std.mem.eql(u8, cmd, "nav-report")) {
+        reportNav(win);
     } else {
         std.debug.print("[zig] unknown cmd: {s}\n", .{cmd});
         return true;
@@ -148,6 +172,44 @@ fn reportState(win: *wn.Window) void {
         .{ win.isMinimized(), win.isMaximized(), win.isFullscreen(), win.scaleFactor() },
     ) catch return;
     win.evalJs(line);
+}
+
+/// Read back the nav queries (canGo*, getZoom, currentUrl/Title, colorScheme)
+/// and push a human-readable line into the page — proves the bool/double/
+/// buffer-grow/enum host fns round-trip.
+fn reportNav(win: *wn.Window) void {
+    const alloc = std.heap.page_allocator;
+    const url = win.currentUrl(alloc) catch "<err>";
+    defer if (!std.mem.eql(u8, url, "<err>")) alloc.free(url);
+    const title = win.currentTitle(alloc) catch "<err>";
+    defer if (!std.mem.eql(u8, title, "<err>")) alloc.free(title);
+
+    var buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        "verveLog('nav: back={} fwd={} zoom={d:.2} scheme={s} title=\"{s}\" url=\"{s}\"');",
+        .{
+            win.canGoBack(),             win.canGoForward(), win.getZoom(),
+            @tagName(win.colorScheme()), title,              url,
+        },
+    ) catch return;
+    win.evalJs(line);
+}
+
+/// Registered via setColorSchemeHandler; logs OS light/dark toggles. Operator
+/// flips the Windows theme to exercise it.
+fn onColorScheme(ctx: ?*anyopaque, scheme: wn.ColorScheme) void {
+    _ = ctx;
+    std.debug.print("[zig] color scheme changed: {s}\n", .{@tagName(scheme)});
+    if (g_win) |w| {
+        var buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "verveLog('OS theme -> {s}');",
+            .{@tagName(scheme)},
+        ) catch return;
+        w.evalJs(line);
+    }
 }
 
 fn onMsg(ctx: ?*anyopaque, payload: []const u8) void {
@@ -206,6 +268,7 @@ pub fn main() void {
     g_win = &win;
 
     win.setMessageHandler(onMsg, null);
+    win.setColorSchemeHandler(onColorScheme, null);
     win.loadHtml(page, null) catch {};
     win.run();
 }
