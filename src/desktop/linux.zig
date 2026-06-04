@@ -332,6 +332,18 @@ extern fn gtk_selection_data_free(selection_data: *GtkSelectionData) void;
 // path resolves the well-known string.
 extern fn gdk_atom_intern_static_string(name: [*:0]const u8) GdkAtom;
 
+// ---- GdkPixbuf (image clipboard) -------------------------------------------
+const GdkPixbuf = opaque {};
+const GdkPixbufLoader = opaque {};
+
+extern fn gdk_pixbuf_loader_new() *GdkPixbufLoader;
+extern fn gdk_pixbuf_loader_write(l: *GdkPixbufLoader, buf: [*]const u8, count: usize, err: ?*?*GError) gboolean;
+extern fn gdk_pixbuf_loader_close(l: *GdkPixbufLoader, err: ?*?*GError) gboolean;
+extern fn gdk_pixbuf_loader_get_pixbuf(l: *GdkPixbufLoader) ?*GdkPixbuf;
+extern fn gdk_pixbuf_save_to_buffer(pixbuf: *GdkPixbuf, buffer: *?[*]u8, buffer_size: *usize, type_str: [*:0]const u8, err: ?*?*GError, sentinel: ?*anyopaque) gboolean;
+extern fn gtk_clipboard_set_image(clipboard: *GtkClipboard, pixbuf: *GdkPixbuf) void;
+extern fn gtk_clipboard_wait_for_image(clipboard: *GtkClipboard) ?*GdkPixbuf;
+
 // ---- GtkSettings (color-scheme query) --------------------------------------
 const GtkSettings = opaque {};
 extern fn gtk_settings_get_default() ?*GtkSettings;
@@ -2064,12 +2076,40 @@ pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_
 
 pub fn clipboardWriteImage(window: *anyopaque, png: []const u8) opts_mod.ClipboardError!void {
     _ = window;
-    _ = png;
-    return opts_mod.ClipboardError.Unsupported;
+    const loader = gdk_pixbuf_loader_new();
+    defer g_object_unref(loader);
+
+    var gerr: ?*GError = null;
+    if (gdk_pixbuf_loader_write(loader, png.ptr, png.len, &gerr) == 0) {
+        if (gerr) |e| g_error_free(e);
+        return opts_mod.ClipboardError.Backend;
+    }
+    if (gdk_pixbuf_loader_close(loader, &gerr) == 0) {
+        if (gerr) |e| g_error_free(e);
+        return opts_mod.ClipboardError.Backend;
+    }
+    const pixbuf = gdk_pixbuf_loader_get_pixbuf(loader) orelse return opts_mod.ClipboardError.Backend;
+    defer g_object_unref(pixbuf);
+
+    const clip = clipboardHandle();
+    gtk_clipboard_set_image(clip, pixbuf);
+    gtk_clipboard_store(clip);
 }
 
 pub fn clipboardReadImage(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
     _ = window;
-    _ = allocator;
-    return opts_mod.ClipboardError.Unsupported;
+    const clip = clipboardHandle();
+    const pixbuf = gtk_clipboard_wait_for_image(clip) orelse return null;
+    defer g_object_unref(pixbuf);
+
+    var buf_ptr: ?[*]u8 = null;
+    var buf_size: usize = 0;
+    var gerr: ?*GError = null;
+    if (gdk_pixbuf_save_to_buffer(pixbuf, &buf_ptr, &buf_size, "png", &gerr, null) == 0) {
+        if (gerr) |e| g_error_free(e);
+        return opts_mod.ClipboardError.Backend;
+    }
+    const raw = buf_ptr orelse return opts_mod.ClipboardError.Backend;
+    defer g_free(raw);
+    return allocator.dupe(u8, raw[0..buf_size]) catch return opts_mod.ClipboardError.OutOfMemory;
 }
