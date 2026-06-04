@@ -30,6 +30,8 @@ comptime {
     // Native-host (Windows) cookie field marshalling — pure Zig, no extern
     // host fns, so its tests run on every host alongside the rest.
     _ = @import("win_native/cookie_codec.zig");
+    // Native-host (Windows) CF_HTML clipboard marshalling — likewise pure Zig.
+    _ = @import("win_native/clipboard_codec.zig");
 }
 
 const entries = [_]options.AssetEntry{

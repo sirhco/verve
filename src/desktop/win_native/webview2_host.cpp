@@ -19,6 +19,8 @@
 #include <oleidl.h>    // IDropTarget
 #include <shellapi.h>  // DragQueryFileW / CF_HDROP
 #include <commdlg.h>   // GetOpenFileNameW / GetSaveFileNameW / OPENFILENAMEW
+#include <shlwapi.h>   // SHCreateMemStream (PNG bytes -> IStream)
+#include <wincodec.h>  // WIC: PNG <-> 32bpp-BGRA DIB transcode (Bundle 7 image)
 
 #include <WebView2.h>
 
@@ -627,6 +629,325 @@ static bool cookie_name_is(ICoreWebView2Cookie *cookie, const wchar_t *want_w) {
     bool eq = (wcscmp(name, want_w) == 0);
     CoTaskMemFree(name);
     return eq;
+}
+
+// ---- Bundle 7: clipboard helpers (static) -----------------------------------
+//
+// Win32 clipboard text/HTML is straight HGLOBAL plumbing; the image path
+// transcodes PNG<->32bpp-BGRA DIB through WIC. mingw only DEFINE_GUID-declares
+// the WIC GUIDs (no definition, and we avoid __uuidof), so we define the few we
+// need locally — same approach as the IUnknown IID above and the legacy Zig
+// backend. Offsets/masks are ported byte-for-byte from windows.zig.
+
+static const CLSID kCLSID_WICImagingFactory = {
+    0xcacaf262, 0x9370, 0x4615, {0xa1, 0x3b, 0x9f, 0x55, 0x39, 0xda, 0x4c, 0x0a}};
+static const IID kIID_IWICImagingFactory = {
+    0xec5ec8a9, 0xc395, 0x4314, {0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70}};
+static const GUID kGUID_WICPixelFormat32bppBGRA = {
+    0x6fddc324, 0x4e03, 0x4bfe, {0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x0f}};
+static const GUID kGUID_ContainerFormatPng = {
+    0x1b7cfaf4, 0x713f, 0x473c, {0xbb, 0xcd, 0x61, 0x37, 0x42, 0x5f, 0xae, 0xaf}};
+
+static const UINT kCF_DIB = 8;
+static const UINT kCF_DIBV5 = 17;
+static const DWORD kBI_RGB = 0;
+static const DWORD kBI_BITFIELDS = 3;
+static const DWORD kLCS_sRGB = 0x73524742;  // 'sRGB'
+static const DWORD kLCS_GM_IMAGES = 4;
+// Reject absurd dimensions before any width*height*4 allocation.
+static const size_t kMaxImageBytes = 256u * 1024u * 1024u;
+
+// The registered "HTML Format" clipboard format id (process-wide, idempotent).
+static UINT cf_html_format() {
+    return RegisterClipboardFormatW(L"HTML Format");
+}
+
+// Copy `src[0..n]` into a fresh GMEM_MOVEABLE HGLOBAL. Returns NULL on failure.
+// Caller GlobalFree's on failure of a subsequent step; SetClipboardData takes
+// ownership on success.
+static HGLOBAL hglobal_from_bytes(const void *src, size_t n) {
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, n ? n : 1);
+    if (!h) return nullptr;
+    void *p = GlobalLock(h);
+    if (!p) {
+        GlobalFree(h);
+        return nullptr;
+    }
+    if (n) memcpy(p, src, n);
+    GlobalUnlock(h);
+    return h;
+}
+
+// Buffer-grow copy out of an HGLOBAL-backed clipboard handle: copies
+// min(size,cap) into buf and returns the FULL byte size. `size` is the byte
+// count to expose (caller computes it, e.g. GlobalSize or a NUL-trimmed length).
+static size_t fill_from_ptr(const void *src, size_t size, uint8_t *buf, size_t cap) {
+    size_t copy = size < cap ? size : cap;
+    if (buf && copy) memcpy(buf, src, copy);
+    return size;
+}
+
+// Acquire a +1 WIC imaging factory (caller Releases). The UI thread already
+// CoInitializeEx'd its STA in wv2_run (bridge handlers run on that same thread
+// via WM_VERVE_BRIDGE), so no COM init is needed or done here.
+static IWICImagingFactory *wic_factory() {
+    IWICImagingFactory *f = nullptr;
+    HRESULT hr = CoCreateInstance(kCLSID_WICImagingFactory, nullptr,
+                                  CLSCTX_INPROC_SERVER, kIID_IWICImagingFactory,
+                                  (void **)&f);
+    if (FAILED(hr) || !f) return nullptr;
+    return f;
+}
+
+#pragma pack(push, 1)
+typedef struct {
+    DWORD bV5Size;
+    LONG bV5Width;
+    LONG bV5Height;
+    WORD bV5Planes;
+    WORD bV5BitCount;
+    DWORD bV5Compression;
+    DWORD bV5SizeImage;
+    LONG bV5XPelsPerMeter;
+    LONG bV5YPelsPerMeter;
+    DWORD bV5ClrUsed;
+    DWORD bV5ClrImportant;
+    DWORD bV5RedMask;
+    DWORD bV5GreenMask;
+    DWORD bV5BlueMask;
+    DWORD bV5AlphaMask;
+    DWORD bV5CSType;
+    LONG bV5Endpoints[9];  // CIEXYZTRIPLE (3 * 3 LONG)
+    DWORD bV5GammaRed;
+    DWORD bV5GammaGreen;
+    DWORD bV5GammaBlue;
+    DWORD bV5Intent;
+    DWORD bV5ProfileData;
+    DWORD bV5ProfileSize;
+    DWORD bV5Reserved;
+} VERVE_BITMAPV5HEADER;
+#pragma pack(pop)
+
+static_assert(sizeof(VERVE_BITMAPV5HEADER) == 124,
+              "BITMAPV5HEADER must be 124 bytes");
+
+// Pack a top-down 32bpp-BGRA buffer into a CF_DIBV5 blob (124-byte header +
+// bottom-up rows). Returns a malloc'd buffer (caller frees) and sets *out_len.
+static uint8_t *build_dibv5(UINT w, UINT h, const uint8_t *bgra_topdown,
+                            size_t *out_len) {
+    size_t stride = (size_t)w * 4;
+    size_t pixels = stride * (size_t)h;
+    size_t total = 124 + pixels;
+    uint8_t *out = (uint8_t *)malloc(total);
+    if (!out) return nullptr;
+
+    VERVE_BITMAPV5HEADER hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.bV5Size = 124;
+    hdr.bV5Width = (LONG)w;
+    hdr.bV5Height = (LONG)h;  // positive => bottom-up rows
+    hdr.bV5Planes = 1;
+    hdr.bV5BitCount = 32;
+    hdr.bV5Compression = kBI_BITFIELDS;
+    hdr.bV5SizeImage = (DWORD)pixels;
+    hdr.bV5RedMask = 0x00FF0000;
+    hdr.bV5GreenMask = 0x0000FF00;
+    hdr.bV5BlueMask = 0x000000FF;
+    hdr.bV5AlphaMask = 0xFF000000;
+    hdr.bV5CSType = kLCS_sRGB;
+    hdr.bV5Intent = kLCS_GM_IMAGES;
+    memcpy(out, &hdr, 124);
+
+    for (UINT y = 0; y < h; ++y) {
+        size_t src_off = (size_t)y * stride;                  // top-down src row
+        size_t dst_off = 124 + (size_t)(h - 1 - y) * stride;  // bottom-up dst
+        memcpy(out + dst_off, bgra_topdown + src_off, stride);
+    }
+    *out_len = total;
+    return out;
+}
+
+// Decode a packed DIB (CF_DIB / CF_DIBV5 payload) into a top-down 32bpp-BGRA
+// buffer. Supports 24/32bpp BI_RGB and BI_BITFIELDS; paletted/compressed inputs
+// return NULL. A 32bpp source with all-zero alpha is treated as opaque BGRX.
+// Returns a malloc'd buffer (caller frees) and sets *ow/*oh.
+static uint8_t *dib_to_bgra(const uint8_t *bytes, size_t len, UINT *ow, UINT *oh) {
+    if (len < 40) return nullptr;
+    DWORD header_size = *(const DWORD *)(bytes + 0);
+    if (header_size < 40 || header_size > len) return nullptr;
+
+    LONG width_raw = *(const LONG *)(bytes + 4);
+    LONG height_raw = *(const LONG *)(bytes + 8);
+    WORD bit_count = *(const WORD *)(bytes + 14);
+    DWORD compression = *(const DWORD *)(bytes + 16);
+    if (width_raw <= 0 || height_raw == 0) return nullptr;
+    if (bit_count != 24 && bit_count != 32) return nullptr;
+
+    bool top_down = height_raw < 0;
+    UINT width = (UINT)width_raw;
+    UINT height = (UINT)(height_raw < 0 ? -height_raw : height_raw);
+
+    // Reject absurd dimensions up front so the stride/size multiplies below
+    // cannot overflow size_t (clipboard DIB content is untrusted). 0xFFFF px per
+    // side is far above any real screenshot and keeps width*height*4 < 2^34.
+    if (width > 0xFFFF || height > 0xFFFF) return nullptr;
+
+    size_t pixel_off = header_size;
+    if (header_size == 40 && compression == kBI_BITFIELDS) {
+        pixel_off += 12;  // three DWORD masks follow a 40-byte BI_BITFIELDS hdr
+    } else if (compression != kBI_RGB && compression != kBI_BITFIELDS) {
+        return nullptr;
+    }
+
+    size_t src_stride = (((size_t)bit_count * width + 31) / 32) * 4;  // DWORD-aligned
+    size_t need = pixel_off + src_stride * (size_t)height;
+    if (need > len) return nullptr;
+
+    size_t dst_stride = (size_t)width * 4;
+    size_t dst_bytes = dst_stride * (size_t)height;
+    if (dst_bytes > kMaxImageBytes) return nullptr;
+
+    uint8_t *pixels = (uint8_t *)malloc(dst_bytes);
+    if (!pixels) return nullptr;
+
+    bool any_alpha = false;
+    for (UINT y = 0; y < height; ++y) {
+        UINT src_row = top_down ? y : (height - 1 - y);
+        const uint8_t *s = bytes + pixel_off + (size_t)src_row * src_stride;
+        uint8_t *d = pixels + (size_t)y * dst_stride;
+        for (UINT x = 0; x < width; ++x) {
+            if (bit_count == 32) {
+                uint8_t b = s[x * 4 + 0], g = s[x * 4 + 1], r = s[x * 4 + 2],
+                        a = s[x * 4 + 3];
+                if (a != 0) any_alpha = true;
+                d[x * 4 + 0] = b;
+                d[x * 4 + 1] = g;
+                d[x * 4 + 2] = r;
+                d[x * 4 + 3] = a;
+            } else {  // 24bpp BGR
+                d[x * 4 + 0] = s[x * 3 + 0];
+                d[x * 4 + 1] = s[x * 3 + 1];
+                d[x * 4 + 2] = s[x * 3 + 2];
+                d[x * 4 + 3] = 0xFF;
+                any_alpha = true;
+            }
+        }
+    }
+    // A 32bpp DIB with no alpha at all is opaque BGRX.
+    if (!any_alpha) {
+        for (size_t i = 3; i < dst_bytes; i += 4) pixels[i] = 0xFF;
+    }
+    *ow = width;
+    *oh = height;
+    return pixels;
+}
+
+// PNG bytes -> top-down 32bpp-BGRA via WIC. Returns a malloc'd buffer (caller
+// frees) and sets *ow/*oh. NULL on any failure.
+static uint8_t *png_to_bgra(IWICImagingFactory *factory, const uint8_t *png,
+                            size_t len, UINT *ow, UINT *oh) {
+    IStream *stream = SHCreateMemStream(png, (UINT)len);
+    if (!stream) return nullptr;
+
+    IWICBitmapDecoder *decoder = nullptr;
+    IWICBitmapFrameDecode *frame = nullptr;
+    IWICFormatConverter *conv = nullptr;
+    uint8_t *out = nullptr;
+
+    if (FAILED(factory->CreateDecoderFromStream(
+            stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) ||
+        !decoder)
+        goto done;
+    if (FAILED(decoder->GetFrame(0, &frame)) || !frame) goto done;
+    if (FAILED(factory->CreateFormatConverter(&conv)) || !conv) goto done;
+    if (FAILED(conv->Initialize(frame, kGUID_WICPixelFormat32bppBGRA,
+                                WICBitmapDitherTypeNone, nullptr, 0.0,
+                                WICBitmapPaletteTypeCustom)))
+        goto done;
+
+    {
+        UINT w = 0, h = 0;
+        if (FAILED(conv->GetSize(&w, &h)) || w == 0 || h == 0) goto done;
+        size_t stride = (size_t)w * 4;
+        size_t pixel_bytes = stride * (size_t)h;
+        if (pixel_bytes > kMaxImageBytes) goto done;
+        out = (uint8_t *)malloc(pixel_bytes);
+        if (!out) goto done;
+        if (FAILED(conv->CopyPixels(nullptr, (UINT)stride, (UINT)pixel_bytes,
+                                    out))) {
+            free(out);
+            out = nullptr;
+            goto done;
+        }
+        *ow = w;
+        *oh = h;
+    }
+
+done:
+    if (conv) conv->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (stream) stream->Release();
+    return out;
+}
+
+// top-down 32bpp-BGRA -> PNG bytes via WIC. Returns a malloc'd buffer (caller
+// frees) and sets *out_len. NULL on any failure.
+static uint8_t *bgra_to_png(IWICImagingFactory *factory, UINT w, UINT h,
+                            const uint8_t *bgra, size_t *out_len) {
+    UINT stride = w * 4;
+    UINT buf_size = stride * h;
+
+    IWICBitmap *bitmap = nullptr;
+    IStream *ostream = nullptr;
+    IWICBitmapEncoder *encoder = nullptr;
+    IWICBitmapFrameEncode *enc_frame = nullptr;
+    IPropertyBag2 *bag = nullptr;
+    uint8_t *out = nullptr;
+
+    if (FAILED(factory->CreateBitmapFromMemory(
+            w, h, kGUID_WICPixelFormat32bppBGRA, stride, buf_size,
+            (BYTE *)bgra, &bitmap)) ||
+        !bitmap)
+        goto done;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &ostream)) || !ostream)
+        goto done;
+    if (FAILED(factory->CreateEncoder(kGUID_ContainerFormatPng, nullptr,
+                                      &encoder)) ||
+        !encoder)
+        goto done;
+    if (FAILED(encoder->Initialize(ostream, WICBitmapEncoderNoCache))) goto done;
+    if (FAILED(encoder->CreateNewFrame(&enc_frame, &bag)) || !enc_frame)
+        goto done;
+    if (FAILED(enc_frame->Initialize(bag))) goto done;
+    if (FAILED(enc_frame->SetSize(w, h))) goto done;
+    if (FAILED(enc_frame->WriteSource(bitmap, nullptr))) goto done;
+    if (FAILED(enc_frame->Commit())) goto done;
+    if (FAILED(encoder->Commit())) goto done;
+
+    {
+        HGLOBAL hmem = nullptr;
+        if (FAILED(GetHGlobalFromStream(ostream, &hmem)) || !hmem) goto done;
+        void *p = GlobalLock(hmem);
+        if (!p) goto done;
+        size_t n = GlobalSize(hmem);
+        if (n) {
+            out = (uint8_t *)malloc(n);
+            if (out) {
+                memcpy(out, p, n);
+                *out_len = n;
+            }
+        }
+        GlobalUnlock(hmem);
+    }
+
+done:
+    if (bag) bag->Release();
+    if (enc_frame) enc_frame->Release();
+    if (encoder) encoder->Release();
+    if (ostream) ostream->Release();
+    if (bitmap) bitmap->Release();
+    return out;
 }
 
 // ---- Public C ABI -----------------------------------------------------------
@@ -1438,6 +1759,212 @@ int wv2_cookie_get(WV2Host *host, const char *name, size_t nlen,
     free(wname);
     mgr->Release();
     return rc;
+}
+
+// ---- Bundle 7: clipboard (Win32 clipboard + WIC) ----------------------------
+
+int wv2_clip_write_text(WV2Host *host, const char *utf8, size_t len) {
+    WV2_REQUIRE_HWND(host, 1);
+
+    // UTF-8 -> NUL-terminated UTF-16LE. widen() appends the NUL.
+    wchar_t *w = widen(utf8, (int)len);
+    if (!w) return 2;
+    size_t wlen = wcslen(w);
+    HGLOBAL h = hglobal_from_bytes(w, (wlen + 1) * sizeof(wchar_t));
+    free(w);
+    if (!h) return 2;
+
+    if (!OpenClipboard(hwnd)) {
+        GlobalFree(h);
+        return 3;
+    }
+    if (!EmptyClipboard()) {
+        CloseClipboard();
+        GlobalFree(h);
+        return 3;
+    }
+    // SetClipboardData takes ownership of `h` on success; only free on failure.
+    if (!SetClipboardData(CF_UNICODETEXT, h)) {
+        GlobalFree(h);
+        CloseClipboard();
+        return 3;
+    }
+    CloseClipboard();
+    return 0;
+}
+
+size_t wv2_clip_read_text(WV2Host *host, uint8_t *buf, size_t cap) {
+    WV2_REQUIRE_HWND(host, 0);
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return 0;
+    if (!OpenClipboard(hwnd)) return 0;
+
+    size_t full = 0;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        const wchar_t *w = (const wchar_t *)GlobalLock(h);
+        if (w) {
+            full = fill_utf8_from_wide_noNUL(w, buf, cap);
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return full;
+}
+
+int wv2_clip_write_html(WV2Host *host, const char *cf_html, size_t len) {
+    WV2_REQUIRE_HWND(host, 1);
+    UINT fmt = cf_html_format();
+    if (!fmt) return 2;
+
+    // The Zig clipboard_codec already built the full CF_HTML blob; we ship it
+    // verbatim (plus a trailing NUL for tools that expect one).
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, len + 1);
+    if (!h) return 2;
+    void *p = GlobalLock(h);
+    if (!p) {
+        GlobalFree(h);
+        return 2;
+    }
+    if (len) memcpy(p, cf_html, len);
+    ((char *)p)[len] = '\0';
+    GlobalUnlock(h);
+
+    if (!OpenClipboard(hwnd)) {
+        GlobalFree(h);
+        return 3;
+    }
+    if (!EmptyClipboard()) {
+        CloseClipboard();
+        GlobalFree(h);
+        return 3;
+    }
+    if (!SetClipboardData(fmt, h)) {
+        GlobalFree(h);
+        CloseClipboard();
+        return 3;
+    }
+    CloseClipboard();
+    return 0;
+}
+
+size_t wv2_clip_read_html(WV2Host *host, uint8_t *buf, size_t cap) {
+    WV2_REQUIRE_HWND(host, 0);
+    UINT fmt = cf_html_format();
+    if (!fmt || !IsClipboardFormatAvailable(fmt)) return 0;
+    if (!OpenClipboard(hwnd)) return 0;
+
+    size_t full = 0;
+    HANDLE h = GetClipboardData(fmt);
+    if (h) {
+        const void *p = GlobalLock(h);
+        if (p) {
+            // CF_HTML is ASCII bytes; expose them up to (but not past) any
+            // trailing NUL so the Zig side parses clean header offsets.
+            size_t n = GlobalSize(h);
+            const char *s = (const char *)p;
+            while (n > 0 && s[n - 1] == '\0') n--;
+            full = fill_from_ptr(p, n, buf, cap);
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return full;
+}
+
+int wv2_clip_write_image(WV2Host *host, const uint8_t *png, size_t len) {
+    WV2_REQUIRE_HWND(host, 1);
+    if (!png || len == 0) return 2;
+
+    IWICImagingFactory *factory = wic_factory();
+    if (!factory) return 2;
+
+    UINT w = 0, h = 0;
+    uint8_t *bgra = png_to_bgra(factory, png, len, &w, &h);
+    factory->Release();
+    if (!bgra) return 2;
+
+    size_t dib_len = 0;
+    uint8_t *dib = build_dibv5(w, h, bgra, &dib_len);
+    free(bgra);
+    if (!dib) return 2;
+
+    HGLOBAL hg = hglobal_from_bytes(dib, dib_len);
+    free(dib);
+    if (!hg) return 2;
+
+    if (!OpenClipboard(hwnd)) {
+        GlobalFree(hg);
+        return 3;
+    }
+    if (!EmptyClipboard()) {
+        CloseClipboard();
+        GlobalFree(hg);
+        return 3;
+    }
+    if (!SetClipboardData(kCF_DIBV5, hg)) {
+        GlobalFree(hg);
+        CloseClipboard();
+        return 3;
+    }
+    CloseClipboard();
+    return 0;
+}
+
+size_t wv2_clip_read_image(WV2Host *host, uint8_t *buf, size_t cap) {
+    WV2_REQUIRE_HWND(host, 0);
+
+    UINT fmt;
+    if (IsClipboardFormatAvailable(kCF_DIBV5))
+        fmt = kCF_DIBV5;
+    else if (IsClipboardFormatAvailable(kCF_DIB))
+        fmt = kCF_DIB;
+    else
+        return 0;
+
+    if (!OpenClipboard(hwnd)) return 0;
+
+    // Copy the DIB out under the clipboard lock, then close the clipboard before
+    // the (possibly slow) WIC encode so we never hold the global clipboard open
+    // across a transcode.
+    uint8_t *dib_copy = nullptr;
+    size_t dib_len = 0;
+    HANDLE h = GetClipboardData(fmt);
+    if (h) {
+        const void *p = GlobalLock(h);
+        if (p) {
+            dib_len = GlobalSize(h);
+            if (dib_len) {
+                dib_copy = (uint8_t *)malloc(dib_len);
+                if (dib_copy) memcpy(dib_copy, p, dib_len);
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    if (!dib_copy || dib_len < 40) {
+        free(dib_copy);
+        return 0;
+    }
+
+    UINT w = 0, ht = 0;
+    uint8_t *bgra = dib_to_bgra(dib_copy, dib_len, &w, &ht);
+    free(dib_copy);
+    if (!bgra) return 0;
+
+    IWICImagingFactory *factory = wic_factory();
+    if (!factory) {
+        free(bgra);
+        return 0;
+    }
+    size_t png_len = 0;
+    uint8_t *png = bgra_to_png(factory, w, ht, bgra, &png_len);
+    factory->Release();
+    free(bgra);
+    if (!png) return 0;
+
+    size_t full = fill_from_ptr(png, png_len, buf, cap);
+    free(png);
+    return full;
 }
 
 } // extern "C"

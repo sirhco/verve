@@ -110,6 +110,16 @@ const page =
     \\    <br>(uses this page's own origin; load over a real http(s) page to exercise fully)
     \\  </div>
     \\
+    \\  <div class="grp"><h3>Bundle 7 · clipboard (Win32 clipboard + WIC)</h3>
+    \\    <button onclick="window.verve.post('cmd:clip-write-text')">clip write text</button>
+    \\    <button onclick="window.verve.post('cmd:clip-read-text')">clip read text</button>
+    \\    <button onclick="window.verve.post('cmd:clip-write-html')">clip write html</button>
+    \\    <button onclick="window.verve.post('cmd:clip-read-html')">clip read html</button>
+    \\    <button onclick="window.verve.post('cmd:clip-write-image')">clip write image</button>
+    \\    <button onclick="window.verve.post('cmd:clip-read-image')">clip read image</button>
+    \\    <br>(text/html/image round-trip through the native Win32 clipboard; paste into Notepad/Word to confirm)
+    \\  </div>
+    \\
     \\  <div id="log">waiting for round-trip&hellip;</div>
     \\  <script>
     \\    function verveLog(s) { document.getElementById('log').textContent = s; }
@@ -211,6 +221,18 @@ fn dispatchCommand(win: *wn.Window, payload: []const u8) bool {
         runCookieDelete(win);
     } else if (std.mem.eql(u8, cmd, "cookie-clear")) {
         runCookieClear(win);
+    } else if (std.mem.eql(u8, cmd, "clip-write-text")) {
+        runClipWriteText(win);
+    } else if (std.mem.eql(u8, cmd, "clip-read-text")) {
+        runClipReadText(win);
+    } else if (std.mem.eql(u8, cmd, "clip-write-html")) {
+        runClipWriteHtml(win);
+    } else if (std.mem.eql(u8, cmd, "clip-read-html")) {
+        runClipReadHtml(win);
+    } else if (std.mem.eql(u8, cmd, "clip-write-image")) {
+        runClipWriteImage(win);
+    } else if (std.mem.eql(u8, cmd, "clip-read-image")) {
+        runClipReadImage(win);
     } else {
         std.debug.print("[zig] unknown cmd: {s}\n", .{cmd});
         return true;
@@ -440,6 +462,117 @@ fn runCookieClear(win: *wn.Window) void {
         "verveLog('cookie clear: ran, but cookie STILL present (backend no-op)');"
     else
         "verveLog('cookie clear: ok — cookie now absent');");
+}
+
+// ---- Bundle 7 · clipboard ---------------------------------------------------
+//
+// All six route through win.clipboard() -> the Clipboard handle -> the
+// native-host clipboard ABI. Text is CF_UNICODETEXT, HTML is the registered
+// "HTML Format" (built/parsed by the pure-Zig clipboard_codec), images are
+// CF_DIBV5 transcoded PNG<->DIB via WIC. Paste into Notepad / Word / an image
+// editor to confirm the round-trip on real hardware.
+
+/// A 2x2 RGBA PNG (red/green/blue/white). Used by the image round-trip buttons.
+const TINY_PNG = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
+    0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00,
+    0x1d, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+    0x9f, 0x81, 0x81, 0x01, 0x86, 0xa0, 0x4c, 0x10, 0xc3, 0x7f, 0x0c, 0x0c,
+    0x0c, 0x00, 0x24, 0x06, 0x03, 0x01, 0x6d, 0x95, 0x84, 0x5b, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+};
+
+const CLIP_TEXT = "verve clipboard test";
+const CLIP_HTML = "<b>verve</b> clipboard <i>html</i>";
+
+fn runClipWriteText(win: *wn.Window) void {
+    win.clipboard().writeText(CLIP_TEXT) catch |err| {
+        std.debug.print("[zig] clip write text: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('clip write text: error / unsupported');");
+        return;
+    };
+    std.debug.print("[zig] clip write text ok\n", .{});
+    win.evalJs("verveLog('clip write text: ok (\"" ++ CLIP_TEXT ++ "\")');");
+}
+
+fn runClipReadText(win: *wn.Window) void {
+    const alloc = std.heap.page_allocator;
+    const maybe = win.clipboard().readText(alloc) catch |err| {
+        std.debug.print("[zig] clip read text: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('clip read text: error / unsupported');");
+        return;
+    };
+    if (maybe) |t| {
+        defer alloc.free(t);
+        std.debug.print("[zig] clip read text -> {s}\n", .{t});
+        var buf: [1024]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "verveLog('clip read text: \"{s}\"');", .{t}) catch return;
+        win.evalJs(line);
+    } else {
+        std.debug.print("[zig] clip read text -> (none)\n", .{});
+        win.evalJs("verveLog('clip read text: (no text)');");
+    }
+}
+
+fn runClipWriteHtml(win: *wn.Window) void {
+    win.clipboard().writeHtml(CLIP_HTML) catch |err| {
+        std.debug.print("[zig] clip write html: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('clip write html: error / unsupported');");
+        return;
+    };
+    std.debug.print("[zig] clip write html ok\n", .{});
+    win.evalJs("verveLog('clip write html: ok');");
+}
+
+fn runClipReadHtml(win: *wn.Window) void {
+    const alloc = std.heap.page_allocator;
+    const maybe = win.clipboard().readHtml(alloc) catch |err| {
+        std.debug.print("[zig] clip read html: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('clip read html: error / unsupported');");
+        return;
+    };
+    if (maybe) |h| {
+        defer alloc.free(h);
+        std.debug.print("[zig] clip read html -> {s}\n", .{h});
+        // The fragment is itself HTML; log it as a length + console dump rather
+        // than injecting raw markup into the page.
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "verveLog('clip read html: {d} fragment bytes (see console)');", .{h.len}) catch return;
+        win.evalJs(line);
+    } else {
+        std.debug.print("[zig] clip read html -> (none)\n", .{});
+        win.evalJs("verveLog('clip read html: (no html)');");
+    }
+}
+
+fn runClipWriteImage(win: *wn.Window) void {
+    win.clipboard().writeImage(&TINY_PNG) catch |err| {
+        std.debug.print("[zig] clip write image: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('clip write image: error / unsupported');");
+        return;
+    };
+    std.debug.print("[zig] clip write image ok ({d} PNG bytes in)\n", .{TINY_PNG.len});
+    win.evalJs("verveLog('clip write image: ok (2x2 PNG)');");
+}
+
+fn runClipReadImage(win: *wn.Window) void {
+    const alloc = std.heap.page_allocator;
+    const maybe = win.clipboard().readImage(alloc) catch |err| {
+        std.debug.print("[zig] clip read image: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('clip read image: error / unsupported');");
+        return;
+    };
+    if (maybe) |png| {
+        defer alloc.free(png);
+        std.debug.print("[zig] clip read image -> {d} PNG bytes\n", .{png.len});
+        var buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "verveLog('clip read image: {d} PNG bytes');", .{png.len}) catch return;
+        win.evalJs(line);
+    } else {
+        std.debug.print("[zig] clip read image -> (none)\n", .{});
+        win.evalJs("verveLog('clip read image: (no image)');");
+    }
 }
 
 /// Registered via setColorSchemeHandler; logs OS light/dark toggles. Operator

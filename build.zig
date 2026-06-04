@@ -573,6 +573,8 @@ fn linkWinNative(b: *std.Build, mod: *std.Build.Module) void {
     mod.linkSystemLibrary("comdlg32", .{}); // GetOpen/SaveFileNameW
     mod.linkSystemLibrary("user32", .{});
     mod.linkSystemLibrary("gdi32", .{});
+    mod.linkSystemLibrary("windowscodecs", .{}); // WIC: clipboard PNG<->DIB transcode
+    mod.linkSystemLibrary("shlwapi", .{}); // SHCreateMemStream (clipboard image)
     mod.link_libc = true;
 }
 

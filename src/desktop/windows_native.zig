@@ -19,6 +19,7 @@ const opts_mod = @import("options.zig");
 const cookies_mod = @import("cookies.zig");
 const clipboard_mod = @import("clipboard.zig");
 const cookie_codec = @import("win_native/cookie_codec.zig");
+const clipboard_codec = @import("win_native/clipboard_codec.zig");
 
 // Guard against the backend-mismatch segfault: if this native backend is
 // compiled in on Windows, the shared selector in backend.zig MUST have resolved
@@ -187,6 +188,19 @@ extern fn wv2_cookie_get(
     same_site: *c_int,
 ) c_int;
 
+// Bundle 7: clipboard. Text is CF_UNICODETEXT (host widens UTF-8). HTML crosses
+// as the finished CF_HTML blob built by clipboard_codec (host SetClipboardData's
+// the registered "HTML Format"); read returns raw CF_HTML bytes for the codec to
+// extract. Images cross as PNG bytes; the host WIC-transcodes PNG<->CF_DIBV5.
+// write fns return 0 on success, nonzero on error; read fns return the FULL byte
+// length (buffer-grow contract), 0 = no matching format on the clipboard.
+extern fn wv2_clip_write_text(host: *Host, utf8: [*]const u8, len: usize) c_int;
+extern fn wv2_clip_read_text(host: *Host, buf: [*]u8, cap: usize) usize;
+extern fn wv2_clip_write_html(host: *Host, cf_html: [*]const u8, len: usize) c_int;
+extern fn wv2_clip_read_html(host: *Host, buf: [*]u8, cap: usize) usize;
+extern fn wv2_clip_write_image(host: *Host, png: [*]const u8, len: usize) c_int;
+extern fn wv2_clip_read_image(host: *Host, buf: [*]u8, cap: usize) usize;
+
 /// Toast error set — mirrors the legacy `windows.zig` surface so the
 /// module-level `showToast` is signature-compatible.
 pub const ToastError = error{ Unsupported, Backend, OutOfMemory };
@@ -281,8 +295,10 @@ pub const Window = struct {
         return .{ .window = @ptrCast(self.ctx.host) };
     }
 
+    /// Per-window system-clipboard handle backed by the Win32 clipboard behind
+    /// the native host. The handle's `window` pointer is the native `*Host`; the
+    /// module-level clipboard free fns cast it back and call the C ABI.
     pub fn clipboard(self: *Window) clipboard_mod.Clipboard {
-        // TODO bundle 7: thread the real clipboard through the native host.
         return .{ .window = @ptrCast(self.ctx.host) };
     }
 
@@ -886,47 +902,92 @@ pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
 }
 
 // ---- module-level clipboard free fns (bundle 7) -----------------------------
+//
+// `window` is the native `*Host` pointer handed out by `clipboard()`. The Win32
+// clipboard work (Open/Empty/Set/Get/Close, CF_UNICODETEXT, the registered "HTML
+// Format", CF_DIBV5 via WIC) all runs inside the native host; here we just widen
+// to / narrow from the C ABI. The CF_HTML wrap/extract is pure Zig in
+// clipboard_codec — windows_native ships the codec's bytes across the seam.
+//
+// Read fns use the buffer-grow contract: a stack buffer first, re-alloc + re-read
+// only if the host reports a full length beyond the stack capacity. The host
+// returns 0 when the clipboard holds no matching format -> we surface `null`
+// (matching the legacy backend: null vs error.Unsupported).
+
+/// Run a native read-into-buffer getter with the buffer-grow contract. Returns an
+/// owned slice (caller frees), or `null` when the getter reports length 0. The
+/// first attempt uses a `stack_cap`-byte stack buffer; if the host's full length
+/// exceeds it, one heap re-read sizes to the full length.
+fn clipReadOwned(
+    comptime stack_cap: usize,
+    host: *Host,
+    getter: *const fn (*Host, [*]u8, usize) callconv(.c) usize,
+    allocator: std.mem.Allocator,
+) opts_mod.ClipboardError!?[]u8 {
+    var stack: [stack_cap]u8 = undefined;
+    const full = getter(host, &stack, stack.len);
+    if (full == 0) return null;
+    if (full <= stack.len) {
+        return allocator.dupe(u8, stack[0..full]) catch return error.OutOfMemory;
+    }
+    const heap = allocator.alloc(u8, full) catch return error.OutOfMemory;
+    errdefer allocator.free(heap);
+    const got = getter(host, heap.ptr, heap.len);
+    if (got == 0) {
+        allocator.free(heap);
+        return null;
+    }
+    if (got < heap.len) return allocator.realloc(heap, got) catch return error.OutOfMemory;
+    return heap;
+}
 
 pub fn clipboardWriteText(window: *anyopaque, text: []const u8) opts_mod.ClipboardError!void {
-    _ = window;
-    _ = text;
-    // TODO bundle 7
-    return error.Unsupported;
+    const host: *Host = @ptrCast(@alignCast(window));
+    if (wv2_clip_write_text(host, text.ptr, text.len) != 0) return error.Backend;
 }
 
 pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
-    _ = window;
-    _ = allocator;
-    // TODO bundle 7
-    return error.Unsupported;
+    const host: *Host = @ptrCast(@alignCast(window));
+    return clipReadOwned(4096, host, wv2_clip_read_text, allocator);
 }
 
 pub fn clipboardWriteHtml(window: *anyopaque, html: []const u8) opts_mod.ClipboardError!void {
-    _ = window;
-    _ = html;
-    // TODO bundle 7
-    return error.Unsupported;
+    const host: *Host = @ptrCast(@alignCast(window));
+    // Build the CF_HTML envelope (header offsets back-patched) in pure Zig, then
+    // hand the finished bytes to the host to SetClipboardData under "HTML Format".
+    const cf_html = try clipboard_codec.wrapCfHtml(allocatorForHtml(), html);
+    defer allocatorForHtml().free(cf_html);
+    if (wv2_clip_write_html(host, cf_html.ptr, cf_html.len) != 0) return error.Backend;
 }
 
 pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
-    _ = window;
-    _ = allocator;
-    // TODO bundle 7
-    return error.Unsupported;
+    const host: *Host = @ptrCast(@alignCast(window));
+    // Pull the raw CF_HTML bytes off the clipboard, then extract the inner
+    // fragment via the codec. `null` propagates both for "no HTML on clipboard"
+    // and "bytes weren't valid CF_HTML".
+    const raw = (try clipReadOwned(8192, host, wv2_clip_read_html, allocator)) orelse return null;
+    defer allocator.free(raw);
+    return clipboard_codec.extractCfHtmlFragment(allocator, raw);
 }
 
 pub fn clipboardWriteImage(window: *anyopaque, png: []const u8) opts_mod.ClipboardError!void {
-    _ = window;
-    _ = png;
-    // TODO bundle 7
-    return error.Unsupported;
+    const host: *Host = @ptrCast(@alignCast(window));
+    if (png.len == 0) return error.Backend;
+    if (wv2_clip_write_image(host, png.ptr, png.len) != 0) return error.Backend;
 }
 
 pub fn clipboardReadImage(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
-    _ = window;
-    _ = allocator;
-    // TODO bundle 7
-    return error.Unsupported;
+    const host: *Host = @ptrCast(@alignCast(window));
+    // Images are large — start with a generous 64 KB stack buffer, grow once if
+    // the encoded PNG is bigger.
+    return clipReadOwned(64 * 1024, host, wv2_clip_read_image, allocator);
+}
+
+/// CF_HTML wrap allocates a transient buffer that never escapes the write call.
+/// The clipboard ABI exposes no allocator, so use the process page allocator for
+/// this scratch (freed immediately after the host copies it).
+fn allocatorForHtml() std.mem.Allocator {
+    return std.heap.page_allocator;
 }
 
 // ---- module-level toast (bundle 8) ------------------------------------------

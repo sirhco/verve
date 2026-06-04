@@ -199,6 +199,47 @@ int wv2_cookie_get(WV2Host *host, const char *name, size_t nlen,
                    int *has_expiry, double *expiry, int *secure, int *http_only,
                    int *same_site);
 
+/* ---- Bundle 7: clipboard (Win32 clipboard + WIC) ------------------------- */
+/*
+ * The Win32 clipboard is process-global: the host OpenClipboard()s on the
+ * window's HWND, mutates, CloseClipboard()s — every path balances open/close so
+ * a left-open clipboard can't hang other apps. SetClipboardData transfers
+ * ownership of the HGLOBAL to the system on success.
+ *
+ * Text   : CF_UNICODETEXT (the host widens the UTF-8 (ptr,len) to UTF-16LE).
+ * HTML   : the registered "HTML Format" (RegisterClipboardFormatW). The CALLER
+ *          (Zig clipboard_codec) builds the full CF_HTML byte blob and passes it
+ *          here verbatim on write; on read the host returns the raw CF_HTML
+ *          bytes and the Zig side extracts the inner fragment.
+ * Image  : CF_DIBV5. The caller passes raw PNG bytes; the host transcodes
+ *          PNG<->32bpp-BGRA DIB via WIC (windowscodecs).
+ *
+ * Read fns follow the buffer-grow contract (copy min(full,cap), return the FULL
+ * byte length; 0 = no matching format on the clipboard).
+ */
+
+/* Write UTF-8 text as CF_UNICODETEXT. Returns 0 on success, nonzero on error. */
+int    wv2_clip_write_text(WV2Host *host, const char *utf8, size_t len);
+/* Read CF_UNICODETEXT as UTF-8 into `buf` (cap). Returns the FULL byte length
+ * (copies min(len,cap)); 0 when no text is on the clipboard. */
+size_t wv2_clip_read_text(WV2Host *host, uint8_t *buf, size_t cap);
+
+/* Write a finished CF_HTML byte blob (Zig built it) under "HTML Format".
+ * Returns 0 on success, nonzero on error. */
+int    wv2_clip_write_html(WV2Host *host, const char *cf_html, size_t len);
+/* Read the raw CF_HTML bytes under "HTML Format" into `buf` (cap). Returns the
+ * FULL byte length; 0 when no HTML is on the clipboard. The Zig side extracts
+ * the fragment from these bytes. */
+size_t wv2_clip_read_html(WV2Host *host, uint8_t *buf, size_t cap);
+
+/* Write a PNG image: the host WIC-transcodes PNG->32bpp-BGRA DIB and sets
+ * CF_DIBV5. Returns 0 on success, nonzero on error. */
+int    wv2_clip_write_image(WV2Host *host, const uint8_t *png, size_t len);
+/* Read CF_DIBV5/CF_DIB off the clipboard, WIC-transcode DIB->PNG, and write the
+ * PNG bytes into `buf` (cap). Returns the FULL PNG byte length; 0 when no image
+ * is on the clipboard. */
+size_t wv2_clip_read_image(WV2Host *host, uint8_t *buf, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif
