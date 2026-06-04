@@ -67,6 +67,7 @@ struct WV2Host {
     verve_bridge_cb bridge = nullptr;
     void *bridge_ctx = nullptr;
     wchar_t *pending_html = nullptr; // queued until controller is ready
+    wchar_t *pending_url = nullptr;  // queued until controller is ready
     bool ready = false;
 };
 
@@ -187,6 +188,11 @@ public:
                 free(host_->pending_html);
                 host_->pending_html = nullptr;
             }
+            if (host_->pending_url) {
+                host_->webview->Navigate(host_->pending_url);
+                free(host_->pending_url);
+                host_->pending_url = nullptr;
+            }
         }
 
         host_->ready = true;
@@ -293,6 +299,20 @@ void wv2_load_html(WV2Host *host, const char *html, size_t len) {
     }
 }
 
+void wv2_load_url(WV2Host *host, const char *url, size_t len) {
+    if (!host) return;
+    if (host->ready && host->webview) {
+        wchar_t *w = widen(url, (int)len);
+        if (w) {
+            host->webview->Navigate(w);
+            free(w);
+        }
+    } else {
+        free(host->pending_url);
+        host->pending_url = widen(url, (int)len);
+    }
+}
+
 void wv2_eval_js(WV2Host *host, const char *js, size_t len) {
     if (!host || !host->webview) return;
     wchar_t *w = widen(js, (int)len);
@@ -352,6 +372,7 @@ void wv2_destroy(WV2Host *host) {
         host->controller->Release();
     }
     free(host->pending_html);
+    free(host->pending_url);
     if (host->hwnd) DestroyWindow(host->hwnd);
     delete host;
 }

@@ -301,54 +301,50 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the Verve full-stack server");
     run_step.dependOn(&run_cmd.step);
 
-    // ---- WebView2 native-host spike (Windows) -------------------------------
-    // Standalone smoke exe proving the C++ host + Zig C-ABI pattern (see
-    // docs/superpowers/specs/2026-06-04-webview2-host-spike-design.md). Cross-
-    // compiles from any host so `zig build win-spike` works on macOS; gated to
-    // its own step so the default build never touches it.
+    // ---- WebView2 native-host smoke exe (Windows) ---------------------------
+    // Standalone smoke exe that drives the REAL native-host backend
+    // (src/desktop/windows_native.zig) through its public `Window` surface.
+    // Cross-compiles from any host so `zig build win-native` works on macOS;
+    // gated to its own step so the default build never touches it. The GUI is
+    // only runnable on Windows (human operator's job) — this gate just proves
+    // the cross-compile + link is clean.
     {
         const win_target = b.resolveTargetQuery(.{
             .cpu_arch = .x86_64,
             .os_tag = .windows,
             .abi = .gnu,
         });
-        const spike_mod = b.createModule(.{
-            .root_source_file = b.path("src/desktop/win_spike/spike.zig"),
+        const smoke_mod = b.createModule(.{
+            .root_source_file = b.path("src/desktop/win_native/smoke/win_native_smoke.zig"),
             .target = win_target,
             .optimize = optimize,
         });
-        spike_mod.link_libc = true;
-        spike_mod.addIncludePath(b.path("vendor/webview2"));
-        spike_mod.addIncludePath(b.path("src/desktop/win_spike"));
-        spike_mod.addCSourceFile(.{
-            .file = b.path("src/desktop/win_spike/webview2_host.cpp"),
-            .flags = &.{
-                "-std=c++17",
-                "-fms-extensions",
-                "-fno-exceptions",
-                "-fno-rtti",
-                "-DUNICODE",
-                "-D_UNICODE",
-            },
+        // The smoke harness drives the real backend. Expose it as a named
+        // import (a bare `@import("../../windows_native.zig")` would escape the
+        // smoke module's path). windows_native.zig roots at src/desktop, so its
+        // sibling `@import("options.zig")` etc. resolve naturally.
+        const windows_native_mod = b.createModule(.{
+            .root_source_file = b.path("src/desktop/windows_native.zig"),
+            .target = win_target,
+            .optimize = optimize,
         });
-        spike_mod.linkSystemLibrary("ole32", .{});
-        spike_mod.linkSystemLibrary("user32", .{});
-        spike_mod.linkSystemLibrary("gdi32", .{});
+        smoke_mod.addImport("windows_native", windows_native_mod);
+        linkWinNative(b, smoke_mod);
 
-        const spike_exe = b.addExecutable(.{
-            .name = "verve-win-spike",
-            .root_module = spike_mod,
+        const smoke_exe = b.addExecutable(.{
+            .name = "verve-win-native",
+            .root_module = smoke_mod,
         });
-        const spike_install = b.addInstallArtifact(spike_exe, .{});
+        const smoke_install = b.addInstallArtifact(smoke_exe, .{});
         // The exe resolves WebView2Loader.dll at runtime; ship it alongside so
         // zig-out/bin/ is runnable as-is.
         const loader_install = b.addInstallBinFile(
-            b.path("vendor/webview2/WebView2Loader.dll"),
+            b.path("src/desktop/win_native/include/WebView2Loader.dll"),
             "WebView2Loader.dll",
         );
-        const spike_step = b.step("win-spike", "Build the WebView2 host spike exe (Windows)");
-        spike_step.dependOn(&spike_install.step);
-        spike_step.dependOn(&loader_install.step);
+        const native_step = b.step("win-native", "Build the WebView2 native-host smoke exe (Windows)");
+        native_step.dependOn(&smoke_install.step);
+        native_step.dependOn(&loader_install.step);
     }
 
     // Dedicated server executable for the embed integration test, with
@@ -549,6 +545,33 @@ pub fn build(b: *std.Build) void {
     });
     const docs_step = b.step("docs", "Generate Zig autodoc for the verve module");
     docs_step.dependOn(&install_docs.step);
+}
+
+/// Wire the native WebView2 host (C++ behind a flat C ABI) into `mod`:
+/// the vendored WebView2 headers, the host translation unit, and the
+/// Win32/COM system libraries it links against. Used by both the
+/// `win-native` smoke exe and (later) any consumer that selects the
+/// native Windows backend.
+fn linkWinNative(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addIncludePath(b.path("src/desktop/win_native/include"));
+    mod.addCSourceFile(.{
+        .file = b.path("src/desktop/win_native/webview2_host.cpp"),
+        .flags = &.{
+            "-std=c++17",
+            "-fms-extensions",
+            "-fno-exceptions",
+            "-fno-rtti",
+            "-DUNICODE",
+            "-D_UNICODE",
+        },
+    });
+    // host.h is a sibling of webview2_host.cpp; addCSourceFile resolves
+    // quote-includes (`#include "host.h"`) relative to the .cpp's own
+    // directory, so no extra include path is needed for it.
+    mod.linkSystemLibrary("ole32", .{});
+    mod.linkSystemLibrary("user32", .{});
+    mod.linkSystemLibrary("gdi32", .{});
+    mod.link_libc = true;
 }
 
 /// Walk `dir_opt` (relative to build root) at configure time, copy each

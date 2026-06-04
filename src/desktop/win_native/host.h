@@ -31,6 +31,10 @@ WV2Host *wv2_create(const char *title, int width, int height);
  * immediately if it already is). */
 void wv2_load_html(WV2Host *host, const char *html, size_t len);
 
+/* Queue a URL to navigate to once the WebView2 controller is ready (or
+ * navigate immediately if it already is). */
+void wv2_load_url(WV2Host *host, const char *url, size_t len);
+
 /* Run script in the page. Safe to call from inside the bridge callback. */
 void wv2_eval_js(WV2Host *host, const char *js, size_t len);
 
