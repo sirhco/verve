@@ -301,6 +301,56 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the Verve full-stack server");
     run_step.dependOn(&run_cmd.step);
 
+    // ---- WebView2 native-host spike (Windows) -------------------------------
+    // Standalone smoke exe proving the C++ host + Zig C-ABI pattern (see
+    // docs/superpowers/specs/2026-06-04-webview2-host-spike-design.md). Cross-
+    // compiles from any host so `zig build win-spike` works on macOS; gated to
+    // its own step so the default build never touches it.
+    {
+        const win_target = b.resolveTargetQuery(.{
+            .cpu_arch = .x86_64,
+            .os_tag = .windows,
+            .abi = .gnu,
+        });
+        const spike_mod = b.createModule(.{
+            .root_source_file = b.path("src/desktop/win_spike/spike.zig"),
+            .target = win_target,
+            .optimize = optimize,
+        });
+        spike_mod.link_libc = true;
+        spike_mod.addIncludePath(b.path("vendor/webview2"));
+        spike_mod.addIncludePath(b.path("src/desktop/win_spike"));
+        spike_mod.addCSourceFile(.{
+            .file = b.path("src/desktop/win_spike/webview2_host.cpp"),
+            .flags = &.{
+                "-std=c++17",
+                "-fms-extensions",
+                "-fno-exceptions",
+                "-fno-rtti",
+                "-DUNICODE",
+                "-D_UNICODE",
+            },
+        });
+        spike_mod.linkSystemLibrary("ole32", .{});
+        spike_mod.linkSystemLibrary("user32", .{});
+        spike_mod.linkSystemLibrary("gdi32", .{});
+
+        const spike_exe = b.addExecutable(.{
+            .name = "verve-win-spike",
+            .root_module = spike_mod,
+        });
+        const spike_install = b.addInstallArtifact(spike_exe, .{});
+        // The exe resolves WebView2Loader.dll at runtime; ship it alongside so
+        // zig-out/bin/ is runnable as-is.
+        const loader_install = b.addInstallBinFile(
+            b.path("vendor/webview2/WebView2Loader.dll"),
+            "WebView2Loader.dll",
+        );
+        const spike_step = b.step("win-spike", "Build the WebView2 host spike exe (Windows)");
+        spike_step.dependOn(&spike_install.step);
+        spike_step.dependOn(&loader_install.step);
+    }
+
     // Dedicated server executable for the embed integration test, with
     // tests/public_fixture baked in regardless of the user's -Dpublic-dir
     // flag. Lets CI verify the embed path without polluting the main
