@@ -54,7 +54,7 @@ pub fn show(allocator: std.mem.Allocator, opts: NotificationOptions) Error!void 
 
 fn showWindows(allocator: std.mem.Allocator, opts: NotificationOptions) Error!void {
     if (builtin.os.tag != .windows) return error.Unsupported;
-    const win = @import("windows.zig");
+    const win = @import("backend.zig").impl;
     // Prefer the modern WinRT Action Center toast (rich styling + Action
     // Center grouping, no tray icon required). If it can't initialise —
     // older shell, no AUMID shortcut writable, WinRT activation failure —

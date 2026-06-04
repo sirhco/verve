@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -68,28 +67,37 @@ pub fn build(b: *std.Build) void {
             // Uiautomationcore backs the server-side UIA accessibility
             // provider (role description / subrole / help text).
             desktop_mod.linkSystemLibrary("Uiautomationcore", .{});
+            // Comdlg32: GetOpen/SaveFileNameW (native file dialogs).
+            desktop_mod.linkSystemLibrary("Comdlg32", .{});
+            // Gdi32: GetDeviceCaps (DPI scale factor in the native host).
+            desktop_mod.linkSystemLibrary("Gdi32", .{});
             // WinRT activation entry points (Ro*/Windows*String) for the
             // Action Center toast. combase.dll has no x86_64 import lib in
             // zig's mingw, so link the split API-set stubs that carry them.
             desktop_mod.linkSystemLibrary("api-ms-win-core-winrt-l1-1-0", .{});
             desktop_mod.linkSystemLibrary("api-ms-win-core-winrt-string-l1-1-0", .{});
-            // Auto-vendor the pinned WebView2 SDK on first build.
-            const sdk = b.option([]const u8, "webview2-sdk", "Path to the WebView2 SDK") orelse "third_party/webview2";
-            const skip_fetch = b.option(bool, "webview2-no-fetch", "Skip auto-vendor of WebView2 SDK") orelse false;
-            if (!skip_fetch) {
-                const fetch_cmd = if (builtin.os.tag == .windows) blk: {
-                    const c = b.addSystemCommand(&.{ "pwsh", "-File", "tools/fetch_webview2.ps1", "-Dest" });
-                    c.addArg(sdk);
-                    break :blk c;
-                } else blk: {
-                    const c = b.addSystemCommand(&.{ "sh", "tools/fetch_webview2.sh" });
-                    c.addArg(b.fmt("--dest={s}", .{sdk}));
-                    break :blk c;
-                };
-                exe.step.dependOn(&fetch_cmd.step);
-            }
-            desktop_mod.addLibraryPath(b.path(sdk));
-            desktop_mod.linkSystemLibrary("WebView2Loader.dll", .{});
+
+            // Native C++ WebView2 host. The Windows desktop backend
+            // (src/desktop/windows_native.zig) is a thin Zig shim over this
+            // flat-C-ABI host; the host loads WebView2Loader.dll dynamically at
+            // runtime, so only the vendored headers + the DLL (shipped next to
+            // the exe below) are needed — no import lib / SDK fetch.
+            desktop_mod.addIncludePath(b.path("src/desktop/win_native/include"));
+            desktop_mod.addCSourceFile(.{
+                .file = b.path("src/desktop/win_native/webview2_host.cpp"),
+                .flags = &.{
+                    "-std=c++17", "-fms-extensions", "-fno-exceptions", "-fno-rtti",
+                    "-DUNICODE",  "-D_UNICODE",
+                },
+            });
+
+            // Ship the vendored loader next to app.exe; the host
+            // LoadLibraryW()s it at startup (else STATUS_DLL_NOT_FOUND).
+            const install_loader = b.addInstallBinFile(
+                b.path("src/desktop/win_native/include/WebView2Loader.dll"),
+                "WebView2Loader.dll",
+            );
+            b.getInstallStep().dependOn(&install_loader.step);
         },
         .linux => {
             desktop_mod.linkSystemLibrary("gtk+-3.0", .{ .use_pkg_config = .force });

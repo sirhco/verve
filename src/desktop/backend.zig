@@ -9,20 +9,18 @@
 //! OTHER backend, which dereferenced the foreign pointer — a segfault. Routing
 //! every consumer through this one selection makes that mismatch impossible.
 const builtin = @import("builtin");
-const root = @import("root");
-
-/// Native-host backend opt-in. A desktop/template build that links the C++
-/// WebView2 host declares `pub const verve_win_backend_native = true;` in its
-/// ROOT source file. `@hasDecl` guards the access so test runners and bare
-/// modules without the decl still compile (default: legacy).
-pub const win_backend_native = @hasDecl(root, "verve_win_backend_native") and root.verve_win_backend_native;
 
 /// The selected backend module. Only the taken switch prong is imported
 /// (`builtin.os.tag` is comptime), so non-Windows builds never touch the
 /// Windows backends and vice-versa.
+///
+/// Windows resolves to the native C++ WebView2 host (`windows_native.zig`,
+/// backed by `win_native/webview2_host.cpp` behind a flat C ABI). The legacy
+/// pure-Zig hand-rolled COM backend was deleted in the Bundle 9 cutover, so
+/// there is no longer a fallback or a `verve_win_backend_native` opt-in.
 pub const impl = switch (builtin.os.tag) {
     .macos => @import("macos.zig"),
-    .windows => if (win_backend_native) @import("windows_native.zig") else @import("windows.zig"),
+    .windows => @import("windows_native.zig"),
     .linux => @import("linux.zig"),
     else => @compileError("verve.desktop: unsupported OS — only macOS, Windows, and Linux are wired today"),
 };

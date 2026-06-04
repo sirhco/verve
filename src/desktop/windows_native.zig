@@ -1,16 +1,10 @@
 //! windows_native.zig — Windows desktop backend backed by a native C++
 //! WebView2 host behind a flat C ABI (src/desktop/win_native/host.h).
 //!
-//! This is the eventual replacement for the 4129-line pure-Zig hand-rolled
-//! COM backend in `windows.zig`. It mirrors the same `Window` surface so the
-//! `window.zig` conformance check is satisfied and the backend is a drop-in.
-//!
-//! Bundle 1 (this file): the migration scaffold. CORE methods (init, run,
-//! load*, evalJs, setMessageHandler, deinit) delegate to the native host for
-//! real; every other conformance method is a typed stub that compiles and
-//! returns a sane default, each tagged with the later bundle that fills it in
-//! (geometry=2, nav=3, events=4, dialogs=5, cookies=6, clipboard=7,
-//! print/a11y/snapshot/toast/terminate=8).
+//! This is the sole Windows desktop backend (the 4129-line pure-Zig
+//! hand-rolled COM backend in `windows.zig` was deleted in the Bundle 9
+//! cutover). It mirrors the `Window` surface so the `window.zig` conformance
+//! check is satisfied; `backend.zig` selects it unconditionally on Windows.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,19 +15,6 @@ const clipboard_mod = @import("clipboard.zig");
 const cookie_codec = @import("win_native/cookie_codec.zig");
 const clipboard_codec = @import("win_native/clipboard_codec.zig");
 const toast_codec = @import("win_native/toast_codec.zig");
-
-// Guard against the backend-mismatch segfault: if this native backend is
-// compiled in on Windows, the shared selector in backend.zig MUST have resolved
-// to native. Otherwise cookies.zig/clipboard.zig dispatch this exe's native
-// WV2Host* into the legacy windows.zig backend, which derefs it and crashes.
-// This turns that runtime segfault into a compile error caught on the build host.
-comptime {
-    if (builtin.os.tag == .windows and !@import("backend.zig").win_backend_native) {
-        @compileError("windows_native.zig compiled but backend.win_backend_native is false: " ++
-            "cookies/clipboard would dispatch a native WV2Host* into the legacy windows.zig " ++
-            "backend and segfault. Declare `pub const verve_win_backend_native = true;` in the root.");
-    }
-}
 
 // ---- Flat C ABI to the native WebView2 host ---------------------------------
 
@@ -95,6 +76,14 @@ extern fn wv2_set_focus_cb(host: *Host, cb: ?FocusFn, ctx: ?*anyopaque) void;
 extern fn wv2_set_close_cb(host: *Host, cb: ?CloseFn, ctx: ?*anyopaque) void;
 extern fn wv2_set_drag_drop_cb(host: *Host, cb: ?DragDropFn, ctx: ?*anyopaque) void;
 extern fn wv2_close(host: *Host) void;
+
+// Tray dispatch (desktop.tray). The host WndProc forwards WM_COMMAND tray-block
+// ids and WM_VERVE_TRAY to these callbacks; wv2_hwnd exposes the window handle
+// the tray layer anchors its icon/menu to.
+const TrayCommandFn = *const fn (hwnd: ?*anyopaque, cmd_id: u16) callconv(.c) c_int;
+const TrayMessageFn = *const fn (hwnd: ?*anyopaque, wparam: usize, lparam: isize) callconv(.c) void;
+extern fn wv2_set_tray_dispatch(cmd: ?TrayCommandFn, msg: ?TrayMessageFn) void;
+extern fn wv2_hwnd(host: *Host) ?*anyopaque;
 
 // Bundle 5: dialogs & child windows.
 extern fn wv2_open_file_dialog(
@@ -681,6 +670,53 @@ pub const Window = struct {
         wv2_close(self.ctx.host);
     }
 };
+
+// ---- Tray dispatch surface (consumed by desktop/tray.zig) -------------------
+//
+// `tray.zig` resolves the Windows backend through `backend.zig`'s `impl` and
+// expects these three names (the legacy `windows.zig` exposed the same surface):
+//   - `WM_VERVE_TRAY`        : the NOTIFYICONDATAW callback message constant.
+//   - `tray_dispatch_command`/`tray_dispatch_message`: forwarders it installs on
+//     `Tray.init`; the native host's WndProc invokes them via C trampolines.
+//   - `hwndOf`               : the host window's HWND for icon/menu anchoring.
+
+/// Tray-icon callback message — must equal the C++ host's `WM_VERVE_TRAY`
+/// (WM_USER + 100). `tray.zig` writes it into `NOTIFYICONDATAW.uCallbackMessage`.
+pub const WM_VERVE_TRAY: u32 = 0x0400 + 100; // WM_USER + 100
+
+/// Forwarders installed by `tray.zig` once `Tray.init` runs. The C++ host's
+/// WndProc calls the C trampolines below, which fan out to these. Null until a
+/// tray exists in this process (v1 single-tray-per-process).
+pub var tray_dispatch_command: ?*const fn (hwnd: ?*anyopaque, cmd_id: u16) bool = null;
+pub var tray_dispatch_message: ?*const fn (hwnd: ?*anyopaque, wparam: usize, lparam: isize) void = null;
+
+fn trayCommandTrampoline(hwnd: ?*anyopaque, cmd_id: u16) callconv(.c) c_int {
+    if (tray_dispatch_command) |dispatch| return if (dispatch(hwnd, cmd_id)) 1 else 0;
+    return 0;
+}
+
+fn trayMessageTrampoline(hwnd: ?*anyopaque, wparam: usize, lparam: isize) callconv(.c) void {
+    if (tray_dispatch_message) |dispatch| dispatch(hwnd, wparam, lparam);
+}
+
+var tray_dispatch_registered: bool = false;
+
+/// Register the C trampolines with the native host (idempotent). Called from
+/// `hwndOf`, which `tray.zig` invokes during `Tray.init` before any tray message
+/// can arrive, so the forwarders are live by the time Shell32 fires WM_VERVE_TRAY.
+fn ensureTrayDispatchRegistered() void {
+    if (tray_dispatch_registered) return;
+    wv2_set_tray_dispatch(&trayCommandTrampoline, &trayMessageTrampoline);
+    tray_dispatch_registered = true;
+}
+
+/// The host window's HWND, for `tray.zig` to anchor its NOTIFYICONDATAW icon and
+/// TrackPopupMenu. Registering the dispatch trampolines here piggybacks on the
+/// fact that `tray.zig` calls this during `Tray.init`.
+pub fn hwndOf(window: *Window) ?*anyopaque {
+    ensureTrayDispatchRegistered();
+    return wv2_hwnd(window.ctx.host);
+}
 
 // ---- JS -> host -> Zig trampoline -------------------------------------------
 

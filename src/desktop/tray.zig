@@ -868,13 +868,13 @@ const WindowsTray = struct {
 
     fn getHwnd(window: *window_mod.Window) ?*anyopaque {
         if (builtin.os.tag != .windows) return null;
-        const w_backend = if (builtin.os.tag == .windows) @import("windows.zig") else struct {};
+        const w_backend = if (builtin.os.tag == .windows) @import("backend.zig").impl else struct {};
         return w_backend.hwndOf(window);
     }
 
     fn windowsTrayMessage() UINT {
         if (builtin.os.tag != .windows) return 0;
-        const w_backend = @import("windows.zig");
+        const w_backend = @import("backend.zig").impl;
         return w_backend.WM_VERVE_TRAY;
     }
 };
@@ -917,7 +917,7 @@ pub fn showWindowsBalloon(title: []const u8, body: []const u8) Error!void {
 fn installWindowsDispatchHooks() void {
     if (builtin.os.tag != .windows) return;
     if (windows_hooks_installed) return;
-    const w_backend = @import("windows.zig");
+    const w_backend = @import("backend.zig").impl;
     w_backend.tray_dispatch_command = &handleWindowsTrayCommand;
     w_backend.tray_dispatch_message = &handleWindowsTrayMessage;
     windows_hooks_installed = true;

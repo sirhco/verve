@@ -40,6 +40,44 @@ work needed to call it "fully functional." Written 2026-05-22, last
 updated 2026-05-28. Fresh sessions should be able to pick up without
 prior context.
 
+## Done in the 2026-06-04 session — Windows native-host CUTOVER (Bundle 9)
+
+- [x] **The Windows desktop backend is now the native C++ WebView2 host.**
+  `src/desktop/windows_native.zig` (a thin Zig shim over the flat C ABI in
+  `src/desktop/win_native/host.h`, implemented by
+  `src/desktop/win_native/webview2_host.cpp`) is the **sole** Windows backend.
+  `backend.zig` selects it **unconditionally** on Windows — the
+  `verve_win_backend_native` root-decl / `@hasDecl` opt-in gate is gone, and
+  with it the legacy-vs-native fallback. `window.zig`, `cookies.zig`,
+  `clipboard.zig`, `tray.zig`, and `notifications.zig` all resolve the Windows
+  backend through `backend.zig`'s `impl`; none import a backend file directly
+  anymore.
+- [x] **Deleted the 4129-line pure-Zig hand-rolled COM backend**
+  (`src/desktop/windows.zig`). The native host owns the Win32 window, the
+  WebView2 controller, the message loop, cookies/clipboard, dialogs, the UIA
+  a11y provider, WinRT toasts, and now **tray dispatch**: the host `WndProc`
+  forwards `WM_COMMAND` (0xC000 tray-id block) and `WM_VERVE_TRAY` to Zig
+  trampolines registered via the new `wv2_set_tray_dispatch`, and exposes the
+  window handle via `wv2_hwnd` (consumed by `tray.zig`'s `hwndOf`). The Zig
+  identity holds: the **framework core stays pure-Zig**; the desktop native
+  hosts (macOS objc, Windows C++, Linux GTK) are thin platform glue behind a
+  uniform `Window` surface.
+- [x] **Scaffold templates compile the C++ host.** `templates/desktop/build.zig`
+  and `templates/desktop-minimal/build.zig` now `addCSourceFile` the vendored
+  `webview2_host.cpp` (c++17, `-fms-extensions -fno-exceptions -fno-rtti`,
+  `UNICODE`), add the `win_native/include` header path, link `Comdlg32`/`Gdi32`
+  alongside the existing Win libs, and install the vendored
+  `WebView2Loader.dll` next to `app.exe` (the host `LoadLibraryW`s it at
+  startup — no import lib or NuGet SDK fetch). The scaffold embed pipeline
+  already vendors `src/desktop/win_native/**` (cpp + headers + DLL) verbatim,
+  so a `--desktop` app is self-contained.
+- [x] **Validated on real Windows** through Bundles 1–8 (window/geometry/nav/
+  events/dialogs/cookies/clipboard/print/a11y/snapshot/toast/terminate). This
+  cutover verified by: `zig build`, `zig build test` (336/336),
+  `zig build win-native`, and — definitively — a scaffolded `--desktop` app
+  (both `full` and `minimal` templates) cross-compiling clean for
+  `x86_64-windows-gnu`, producing `app.exe` + `WebView2Loader.dll`.
+
 ## Done in the 2026-06-02 session
 
 - [x] **Window-chrome a11y provider.** Three new `Window` methods on all

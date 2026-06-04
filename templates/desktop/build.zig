@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -156,42 +155,40 @@ pub fn build(b: *std.Build) void {
             // Uiautomationcore backs the server-side UIA accessibility
             // provider (role description / subrole / help text).
             desktop_mod.linkSystemLibrary("Uiautomationcore", .{});
+            // Comdlg32: GetOpen/SaveFileNameW (native file dialogs).
+            desktop_mod.linkSystemLibrary("Comdlg32", .{});
+            // Gdi32: GetDeviceCaps (DPI scale factor in the native host).
+            desktop_mod.linkSystemLibrary("Gdi32", .{});
             // WinRT activation entry points (Ro*/Windows*String) for the
             // Action Center toast. combase.dll has no x86_64 import lib in
             // zig's mingw, so link the split API-set stubs that carry them.
             desktop_mod.linkSystemLibrary("api-ms-win-core-winrt-l1-1-0", .{});
             desktop_mod.linkSystemLibrary("api-ms-win-core-winrt-string-l1-1-0", .{});
-            // WebView2 loader. Ship the SDK under `third_party/webview2/`
-            // or override with `-Dwebview2-sdk=...`. When the SDK is
-            // not present, `tools/fetch_webview2.{sh,ps1}` downloads
-            // the pinned NuGet release. The script is idempotent so
-            // running it from every Windows build is cheap (an
-            // existing .lib short-circuits before any network I/O).
-            const sdk = b.option([]const u8, "webview2-sdk", "Path to the WebView2 SDK") orelse "third_party/webview2";
-            const skip_fetch = b.option(bool, "webview2-no-fetch", "Skip auto-vendor of WebView2 SDK from NuGet") orelse false;
-            const fetch_cmd: ?*std.Build.Step.Run = if (skip_fetch) null else if (builtin.os.tag == .windows) blk: {
-                // Prefer PowerShell 7 (`pwsh`) but fall back to Windows
-                // PowerShell 5.1 (`powershell`), which ships on every
-                // Windows host — `pwsh` is an optional separate install.
-                const ps = b.findProgram(&.{ "pwsh", "powershell" }, &.{}) catch "powershell";
-                const c = b.addSystemCommand(&.{ ps, "-NoProfile", "-File", "tools/fetch_webview2.ps1", "-Dest" });
-                c.addArg(sdk);
-                break :blk c;
-            } else blk: {
-                const c = b.addSystemCommand(&.{ "sh", "tools/fetch_webview2.sh" });
-                c.addArg(b.fmt("--dest={s}", .{sdk}));
-                break :blk c;
-            };
-            if (fetch_cmd) |fc| exe.step.dependOn(&fc.step);
-            desktop_mod.addLibraryPath(b.path(sdk));
-            desktop_mod.linkSystemLibrary("WebView2Loader.dll", .{});
 
-            // The produced .exe has a load-time import of WebView2Loader.dll;
-            // the Windows loader resolves it next to the binary, so install a
-            // copy into bin/ alongside app.exe. Without this the app fails to
-            // start with STATUS_DLL_NOT_FOUND before main() runs.
-            const install_loader = b.addInstallBinFile(b.path(b.pathJoin(&.{ sdk, "WebView2Loader.dll" })), "WebView2Loader.dll");
-            if (fetch_cmd) |fc| install_loader.step.dependOn(&fc.step);
+            // Native C++ WebView2 host. The Windows desktop backend
+            // (src/desktop/windows_native.zig) is a thin Zig shim over this
+            // flat-C-ABI host; it owns the Win32 window + WebView2 controller.
+            // The host loads WebView2Loader.dll dynamically at runtime
+            // (LoadLibraryW), so no import lib / SDK fetch is needed at build
+            // time — only the vendored headers and the DLL shipped next to the
+            // exe (see the install below).
+            desktop_mod.addIncludePath(b.path("src/desktop/win_native/include"));
+            desktop_mod.addCSourceFile(.{
+                .file = b.path("src/desktop/win_native/webview2_host.cpp"),
+                .flags = &.{
+                    "-std=c++17", "-fms-extensions", "-fno-exceptions", "-fno-rtti",
+                    "-DUNICODE",  "-D_UNICODE",
+                },
+            });
+
+            // The host LoadLibraryW("WebView2Loader.dll")s at startup; the
+            // Windows loader resolves it next to the binary, so install the
+            // vendored loader into bin/ alongside app.exe. Without this the
+            // app fails to start a WebView2 (STATUS_DLL_NOT_FOUND on load).
+            const install_loader = b.addInstallBinFile(
+                b.path("src/desktop/win_native/include/WebView2Loader.dll"),
+                "WebView2Loader.dll",
+            );
             b.getInstallStep().dependOn(&install_loader.step);
         },
         .linux => {

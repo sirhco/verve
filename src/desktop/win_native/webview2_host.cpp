@@ -217,6 +217,18 @@ struct BridgeMsg {
     size_t len;
 };
 
+// Tray callback message. Must match desktop/tray.zig's WM_VERVE_TRAY, which the
+// Zig side writes into NOTIFYICONDATAW.uCallbackMessage so Shell32 routes tray
+// mouse events through this window's WndProc. WM_USER + 100, mirroring the legacy
+// windows.zig backend.
+static const UINT WM_VERVE_TRAY = WM_USER + 100;
+
+// Process-global tray dispatch hooks (v1 single-tray-per-process). Registered by
+// desktop.tray via wv2_set_tray_dispatch; invoked from WndProc on WM_COMMAND
+// (tray id block) and WM_VERVE_TRAY. NULL until a tray is created.
+static verve_tray_command_cb g_tray_command = nullptr;
+static verve_tray_message_cb g_tray_message = nullptr;
+
 class WebMessageHandler : public ICoreWebView2WebMessageReceivedEventHandler {
     WV2Host *host_;
 
@@ -769,6 +781,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     static_cast<RawElementProvider *>(host->a11y_provider)));
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
+    case WM_COMMAND: {
+        // Tray menu IDs live in the 0xC000 block (mirrors legacy windows.zig).
+        // Forward them to the Zig tray dispatch; everything else is not ours.
+        uint16_t id = (uint16_t)(wp & 0xFFFF);
+        if ((id & 0xF000) == 0xC000 && g_tray_command) {
+            g_tray_command((void *)hwnd, id);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    case WM_VERVE_TRAY:
+        // Shell32 fires this on tray-icon mouse events once desktop.tray has
+        // installed the NOTIFYICONDATAW callback. No-op if no tray exists.
+        if (g_tray_message)
+            g_tray_message((void *)hwnd, (size_t)wp, (intptr_t)lp);
+        return 0;
     default:
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -1644,6 +1672,15 @@ void wv2_close(WV2Host *host) {
     // Send WM_CLOSE synchronously so the close path (incl. any veto handler)
     // runs, exactly as legacy windows.zig close() does via SendMessageW.
     SendMessageW(hwnd, WM_CLOSE, 0, 0);
+}
+
+void wv2_set_tray_dispatch(verve_tray_command_cb cmd, verve_tray_message_cb msg) {
+    g_tray_command = cmd;
+    g_tray_message = msg;
+}
+
+void *wv2_hwnd(WV2Host *host) {
+    return host ? (void *)host->hwnd : nullptr;
 }
 
 // ---- Bundle 5: dialogs & child windows --------------------------------------

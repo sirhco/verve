@@ -117,6 +117,23 @@ void wv2_set_drag_drop_cb(WV2Host *host, verve_drag_drop_cb cb, void *ctx);
 /* Send WM_CLOSE synchronously so the close path (incl. any veto handler) runs. */
 void wv2_close(WV2Host *host);
 
+/* ---- Tray dispatch (desktop.tray on Windows) ----------------------------- */
+
+/* The host's WndProc forwards two message classes to the Zig tray layer:
+ *   - WM_COMMAND whose menu id is in the tray-reserved 0xC000 block routes to
+ *     `cmd` (return non-zero to mark the id consumed).
+ *   - WM_VERVE_TRAY (the NOTIFYICONDATAW callback message, == WM_USER+100)
+ *     routes to `msg` (the icon's mouse-event id is in lParam's low word).
+ * Both are process-global (v1 single-tray-per-process). Pass NULLs to detach.
+ * The hwnd argument the callbacks receive is the host window's HWND. */
+typedef int  (*verve_tray_command_cb)(void *hwnd, uint16_t cmd_id);
+typedef void (*verve_tray_message_cb)(void *hwnd, size_t wparam, intptr_t lparam);
+void wv2_set_tray_dispatch(verve_tray_command_cb cmd, verve_tray_message_cb msg);
+
+/* The host window's HWND (as an opaque pointer), or NULL. desktop.tray needs it
+ * to anchor the NOTIFYICONDATAW icon and TrackPopupMenu to the app window. */
+void *wv2_hwnd(WV2Host *host);
+
 /* ---- Bundle 5: dialogs & child windows ----------------------------------- */
 
 /* Modal Win32 common file dialogs (GetOpenFileNameW / GetSaveFileNameW).
