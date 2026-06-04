@@ -2089,7 +2089,6 @@ pub fn clipboardWriteImage(window: *anyopaque, png: []const u8) opts_mod.Clipboa
         return opts_mod.ClipboardError.Backend;
     }
     const pixbuf = gdk_pixbuf_loader_get_pixbuf(loader) orelse return opts_mod.ClipboardError.Backend;
-    defer g_object_unref(pixbuf);
 
     const clip = clipboardHandle();
     gtk_clipboard_set_image(clip, pixbuf);
