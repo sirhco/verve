@@ -236,6 +236,11 @@ public:
 
 static const wchar_t *kWindowClass = L"VerveWv2SpikeWindow";
 
+// Bind `hwnd` to the host window, early-returning VAL if there is none.
+#define WV2_REQUIRE_HWND(host, VAL) \
+    HWND hwnd = (host) ? (host)->hwnd : nullptr; \
+    if (!hwnd) return VAL;
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     WV2Host *host =
         (WV2Host *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -403,81 +408,89 @@ void wv2_destroy(WV2Host *host) {
 // ---- Bundle 2: window geometry & state --------------------------------------
 
 void wv2_set_title(WV2Host *host, const char *title, size_t len) {
-    if (!host || !host->hwnd) return;
+    WV2_REQUIRE_HWND(host, );
     wchar_t *w = widen(title, (int)len);
     if (!w) return;
-    SetWindowTextW(host->hwnd, w);
+    SetWindowTextW(hwnd, w);
     free(w);
 }
 
 void wv2_set_always_on_top(WV2Host *host, int on) {
-    if (!host || !host->hwnd) return;
-    SetWindowPos(host->hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+    WV2_REQUIRE_HWND(host, );
+    SetWindowPos(hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE);
 }
 
 void wv2_set_opacity(WV2Host *host, double v) {
-    if (!host || !host->hwnd) return;
+    WV2_REQUIRE_HWND(host, );
     // WS_EX_LAYERED must be set before SetLayeredWindowAttributes works.
-    LONG_PTR ex = GetWindowLongPtrW(host->hwnd, GWL_EXSTYLE);
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     if ((ex & WS_EX_LAYERED) == 0)
-        SetWindowLongPtrW(host->hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
     if (v < 0.0) v = 0.0;
     if (v > 1.0) v = 1.0;
     BYTE alpha = (BYTE)(v * 255.0);
-    SetLayeredWindowAttributes(host->hwnd, 0, alpha, LWA_ALPHA);
+    SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
 }
 
 void wv2_set_size(WV2Host *host, uint32_t w, uint32_t h) {
-    if (!host || !host->hwnd) return;
-    SetWindowPos(host->hwnd, nullptr, 0, 0, (int)w, (int)h,
+    WV2_REQUIRE_HWND(host, );
+    SetWindowPos(hwnd, nullptr, 0, 0, (int)w, (int)h,
                  SWP_NOMOVE | SWP_NOZORDER);
 }
 
 void wv2_set_position(WV2Host *host, int32_t x, int32_t y) {
-    if (!host || !host->hwnd) return;
-    SetWindowPos(host->hwnd, nullptr, (int)x, (int)y, 0, 0,
+    WV2_REQUIRE_HWND(host, );
+    SetWindowPos(hwnd, nullptr, (int)x, (int)y, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER);
 }
 
 void wv2_center(WV2Host *host) {
-    if (!host || !host->hwnd) return;
-    RECT rc;
-    GetWindowRect(host->hwnd, &rc);
-    int w = rc.right - rc.left;
-    int h = rc.bottom - rc.top;
-    int screen_w = GetSystemMetrics(SM_CXSCREEN);
-    int screen_h = GetSystemMetrics(SM_CYSCREEN);
-    SetWindowPos(host->hwnd, nullptr, (screen_w - w) / 2, (screen_h - h) / 2, 0,
-                 0, SWP_NOSIZE | SWP_NOZORDER);
+    WV2_REQUIRE_HWND(host, );
+    RECT wr;
+    GetWindowRect(hwnd, &wr);
+    int w = wr.right - wr.left;
+    int h = wr.bottom - wr.top;
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi;
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) return;
+    int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - w) / 2;
+    int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - h) / 2;
+    SetWindowPos(hwnd, nullptr, x, y, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 void wv2_minimize(WV2Host *host) {
-    if (host && host->hwnd) ShowWindow(host->hwnd, SW_MINIMIZE);
+    WV2_REQUIRE_HWND(host, );
+    ShowWindow(hwnd, SW_MINIMIZE);
 }
 
 void wv2_maximize(WV2Host *host) {
-    if (host && host->hwnd) ShowWindow(host->hwnd, SW_MAXIMIZE);
+    WV2_REQUIRE_HWND(host, );
+    ShowWindow(hwnd, SW_MAXIMIZE);
 }
 
 void wv2_restore(WV2Host *host) {
-    if (host && host->hwnd) ShowWindow(host->hwnd, SW_RESTORE);
+    WV2_REQUIRE_HWND(host, );
+    ShowWindow(hwnd, SW_RESTORE);
 }
 
 void wv2_show(WV2Host *host) {
-    if (!host || !host->hwnd) return;
-    ShowWindow(host->hwnd, SW_SHOW);
-    SetForegroundWindow(host->hwnd);
+    WV2_REQUIRE_HWND(host, );
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
 }
 
 void wv2_hide(WV2Host *host) {
-    if (host && host->hwnd) ShowWindow(host->hwnd, SW_HIDE);
+    WV2_REQUIRE_HWND(host, );
+    ShowWindow(hwnd, SW_HIDE);
 }
 
 void wv2_focus(WV2Host *host) {
-    if (!host || !host->hwnd) return;
-    ShowWindow(host->hwnd, SW_RESTORE);
-    SetForegroundWindow(host->hwnd);
+    WV2_REQUIRE_HWND(host, );
+    ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
 }
 
 void wv2_set_min_size(WV2Host *host, uint32_t w, uint32_t h) {
@@ -493,7 +506,7 @@ void wv2_set_max_size(WV2Host *host, uint32_t w, uint32_t h) {
 }
 
 float wv2_scale_factor(WV2Host *host) {
-    if (!host || !host->hwnd) return 1.0f;
+    WV2_REQUIRE_HWND(host, 1.0f);
     // GetDpiForWindow is Win10 1607+. Resolve dynamically so the host still
     // links/runs on older systems, falling back to the device-context DPI.
     typedef UINT(WINAPI * PFN_GetDpiForWindow)(HWND);
@@ -507,12 +520,12 @@ float wv2_scale_factor(WV2Host *host) {
     }
     UINT dpi = 96;
     if (fn) {
-        dpi = fn(host->hwnd);
+        dpi = fn(hwnd);
     } else {
-        HDC dc = GetDC(host->hwnd);
+        HDC dc = GetDC(hwnd);
         if (dc) {
             dpi = (UINT)GetDeviceCaps(dc, LOGPIXELSX);
-            ReleaseDC(host->hwnd, dc);
+            ReleaseDC(hwnd, dc);
         }
     }
     if (dpi == 0) dpi = 96;
@@ -520,11 +533,13 @@ float wv2_scale_factor(WV2Host *host) {
 }
 
 int wv2_is_minimized(WV2Host *host) {
-    return (host && host->hwnd && IsIconic(host->hwnd)) ? 1 : 0;
+    WV2_REQUIRE_HWND(host, 0);
+    return IsIconic(hwnd) ? 1 : 0;
 }
 
 int wv2_is_maximized(WV2Host *host) {
-    return (host && host->hwnd && IsZoomed(host->hwnd)) ? 1 : 0;
+    WV2_REQUIRE_HWND(host, 0);
+    return IsZoomed(hwnd) ? 1 : 0;
 }
 
 int wv2_is_fullscreen(WV2Host *host) {
@@ -532,10 +547,10 @@ int wv2_is_fullscreen(WV2Host *host) {
 }
 
 void wv2_request_attention(WV2Host *host, int critical) {
-    if (!host || !host->hwnd) return;
+    WV2_REQUIRE_HWND(host, );
     FLASHWINFO fwi = {};
     fwi.cbSize = sizeof(fwi);
-    fwi.hwnd = host->hwnd;
+    fwi.hwnd = hwnd;
     fwi.dwFlags = critical ? (FLASHW_ALL | FLASHW_TIMERNOFG) : FLASHW_ALL;
     fwi.uCount = critical ? 0 : 5;
     fwi.dwTimeout = 0;
@@ -543,33 +558,33 @@ void wv2_request_attention(WV2Host *host, int critical) {
 }
 
 void wv2_set_resizable(WV2Host *host, int on) {
-    if (!host || !host->hwnd) return;
-    LONG_PTR style = GetWindowLongPtrW(host->hwnd, GWL_STYLE);
+    WV2_REQUIRE_HWND(host, );
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     LONG_PTR mask = WS_THICKFRAME | WS_MAXIMIZEBOX;
     LONG_PTR next = on ? (style | mask) : (style & ~mask);
-    SetWindowLongPtrW(host->hwnd, GWL_STYLE, next);
-    SetWindowPos(host->hwnd, nullptr, 0, 0, 0, 0,
+    SetWindowLongPtrW(hwnd, GWL_STYLE, next);
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 }
 
 void wv2_set_fullscreen(WV2Host *host, int on) {
-    if (!host || !host->hwnd) return;
+    WV2_REQUIRE_HWND(host, );
     if (on) {
         if (host->is_fullscreen) return;
         // Save the current style + placement, strip the frame, expand to the
         // monitor's full bounds.
-        host->saved_style = (LONG)GetWindowLongPtrW(host->hwnd, GWL_STYLE);
-        host->saved_exstyle = (LONG)GetWindowLongPtrW(host->hwnd, GWL_EXSTYLE);
+        host->saved_style = (LONG)GetWindowLongPtrW(hwnd, GWL_STYLE);
+        host->saved_exstyle = (LONG)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         host->saved_placement.length = sizeof(host->saved_placement);
-        GetWindowPlacement(host->hwnd, &host->saved_placement);
+        GetWindowPlacement(hwnd, &host->saved_placement);
 
         MONITORINFO mi = {};
         mi.cbSize = sizeof(mi);
-        HMONITOR mon = MonitorFromWindow(host->hwnd, MONITOR_DEFAULTTONEAREST);
+        HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         if (GetMonitorInfoW(mon, &mi)) {
-            SetWindowLongPtrW(host->hwnd, GWL_STYLE,
+            SetWindowLongPtrW(hwnd, GWL_STYLE,
                               host->saved_style & ~(LONG)WS_OVERLAPPEDWINDOW);
-            SetWindowPos(host->hwnd, HWND_TOP, mi.rcMonitor.left,
+            SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left,
                          mi.rcMonitor.top,
                          mi.rcMonitor.right - mi.rcMonitor.left,
                          mi.rcMonitor.bottom - mi.rcMonitor.top,
@@ -578,10 +593,10 @@ void wv2_set_fullscreen(WV2Host *host, int on) {
         }
     } else {
         if (!host->is_fullscreen) return;
-        SetWindowLongPtrW(host->hwnd, GWL_STYLE, host->saved_style);
-        SetWindowLongPtrW(host->hwnd, GWL_EXSTYLE, host->saved_exstyle);
-        SetWindowPlacement(host->hwnd, &host->saved_placement);
-        SetWindowPos(host->hwnd, nullptr, 0, 0, 0, 0,
+        SetWindowLongPtrW(hwnd, GWL_STYLE, host->saved_style);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, host->saved_exstyle);
+        SetWindowPlacement(hwnd, &host->saved_placement);
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
                          SWP_FRAMECHANGED);
         host->is_fullscreen = false;

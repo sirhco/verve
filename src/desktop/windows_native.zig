@@ -203,12 +203,12 @@ pub const Window = struct {
     pub fn setZoom(self: *Window, level: f64) void {
         _ = self;
         _ = level;
-        // TODO bundle 2
+        // TODO bundle 3
     }
 
     pub fn getZoom(self: *Window) f64 {
         _ = self;
-        // TODO bundle 2
+        // TODO bundle 3
         return 1.0;
     }
 
