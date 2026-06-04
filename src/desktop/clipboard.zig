@@ -12,17 +12,13 @@
 //! an empty string.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const opts_mod = @import("options.zig");
 
 pub const ClipboardError = opts_mod.ClipboardError;
 
-const backend = switch (builtin.target.os.tag) {
-    .macos => @import("macos.zig"),
-    .windows => @import("windows.zig"),
-    .linux => @import("linux.zig"),
-    else => @compileError("desktop backend unimplemented for this OS"),
-};
+// Single-sourced so this clipboard's dispatch always matches the Window's
+// backend (no native pointer handed to the legacy backend). See backend.zig.
+const backend = @import("backend.zig").impl;
 
 /// Per-window clipboard handle. The underlying clipboard is process-
 /// global on every host backend; the per-window scoping just gives

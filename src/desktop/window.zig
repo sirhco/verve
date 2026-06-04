@@ -61,24 +61,10 @@ pub const CloseHandler = options.CloseHandler;
 pub const DevAssetsConfig = options.DevAssetsConfig;
 pub const CookieStore = cookies.CookieStore;
 
-const root = @import("root");
-
-// Native-host backend opt-in. `@hasDecl` guards the field access, so this
-// compiles whether or not root declares it (test runners, bare modules).
-const win_backend_native = @hasDecl(root, "verve_win_backend_native") and root.verve_win_backend_native;
-
-const backend = switch (builtin.os.tag) {
-    .macos => @import("macos.zig"),
-    // Windows backend selection. Default: the legacy pure-Zig COM backend.
-    // A desktop/template build opts into the native C++ WebView2 host
-    // backend by declaring `pub const verve_win_backend_native = true;` in
-    // its ROOT source file; this is wired into the framework + scaffold
-    // builds at the Bundle 9 cutover. Until then `windows_native.zig` is
-    // exercised only via `zig build win-native`.
-    .windows => if (win_backend_native) @import("windows_native.zig") else @import("windows.zig"),
-    .linux => @import("linux.zig"),
-    else => @compileError("verve.desktop: unsupported OS — only macOS, Windows, and Linux are wired today"),
-};
+// Backend selection is single-sourced in backend.zig so window.zig and the
+// CookieStore/Clipboard handed out by cookies.zig/clipboard.zig never resolve
+// to different backends (that mismatch segfaults — see backend.zig).
+const backend = @import("backend.zig").impl;
 
 pub const Window = backend.Window;
 

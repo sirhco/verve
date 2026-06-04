@@ -15,6 +15,12 @@
 const std = @import("std");
 const wn = @import("windows_native");
 
+// Opt into the native-host backend. backend.zig reads this via `@import("root")`
+// (this file is the exe's root module), so cookies.zig/clipboard.zig resolve to
+// windows_native.zig instead of the legacy windows.zig — otherwise the native
+// CookieStore/Clipboard would hand a WV2Host* to the legacy backend and segfault.
+pub const verve_win_backend_native = true;
+
 var g_win: ?*wn.Window = null;
 var g_close_attempts: u32 = 0;
 // Child window opened by the "child window" button. Kept so it can be

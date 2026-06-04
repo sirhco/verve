@@ -13,11 +13,25 @@
 //! print/a11y/snapshot/toast/terminate=8).
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const opts_mod = @import("options.zig");
 const cookies_mod = @import("cookies.zig");
 const clipboard_mod = @import("clipboard.zig");
 const cookie_codec = @import("win_native/cookie_codec.zig");
+
+// Guard against the backend-mismatch segfault: if this native backend is
+// compiled in on Windows, the shared selector in backend.zig MUST have resolved
+// to native. Otherwise cookies.zig/clipboard.zig dispatch this exe's native
+// WV2Host* into the legacy windows.zig backend, which derefs it and crashes.
+// This turns that runtime segfault into a compile error caught on the build host.
+comptime {
+    if (builtin.os.tag == .windows and !@import("backend.zig").win_backend_native) {
+        @compileError("windows_native.zig compiled but backend.win_backend_native is false: " ++
+            "cookies/clipboard would dispatch a native WV2Host* into the legacy windows.zig " ++
+            "backend and segfault. Declare `pub const verve_win_backend_native = true;` in the root.");
+    }
+}
 
 // ---- Flat C ABI to the native WebView2 host ---------------------------------
 

@@ -11,19 +11,15 @@
 //! `get` on a known name.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const opts_mod = @import("options.zig");
 
 pub const Cookie = opts_mod.Cookie;
 pub const CookieError = opts_mod.CookieError;
 pub const SameSite = opts_mod.SameSite;
 
-const backend = switch (builtin.target.os.tag) {
-    .macos => @import("macos.zig"),
-    .windows => @import("windows.zig"),
-    .linux => @import("linux.zig"),
-    else => @compileError("desktop backend unimplemented for this OS"),
-};
+// Single-sourced so this store's dispatch always matches the Window's backend
+// (a native WV2Host* must not be handed to the legacy COM backend). See backend.zig.
+const backend = @import("backend.zig").impl;
 
 /// Per-window cookie store handle. Callers obtain it via
 /// `Window.cookies()`. Lifetime is tied to the parent Window.
