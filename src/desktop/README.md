@@ -129,8 +129,10 @@ another modal run loop (a file picker, for example) are risky.
 - **macOS**: ships with WebKit. No install needed. Builds against
   the `Cocoa`, `WebKit`, and `Foundation` frameworks.
 - **Windows**: requires the Edge WebView2 Evergreen runtime. Win11
-  has it preinstalled; Win10 returns a failing HRESULT. The build-
-  time SDK is auto-vendored via `tools/fetch_webview2.{sh,ps1}`.
+  has it preinstalled; Win10 returns a failing HRESULT. The WebView2
+  SDK header + x64 `WebView2Loader.dll` are vendored in-tree under
+  `win_native/include/`; the build compiles `win_native/webview2_host.cpp`
+  (the native C++ host) and ships the loader next to the exe. No SDK fetch.
 - **Linux**: install `libgtk-3-dev` + `libwebkit2gtk-4.1-dev`
   (Debian/Ubuntu) or `gtk3-devel` + `webkit2gtk4.1-devel` (Fedora).
 
