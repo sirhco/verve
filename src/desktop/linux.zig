@@ -340,7 +340,7 @@ extern fn gdk_pixbuf_loader_new() *GdkPixbufLoader;
 extern fn gdk_pixbuf_loader_write(l: *GdkPixbufLoader, buf: [*]const u8, count: usize, err: ?*?*GError) gboolean;
 extern fn gdk_pixbuf_loader_close(l: *GdkPixbufLoader, err: ?*?*GError) gboolean;
 extern fn gdk_pixbuf_loader_get_pixbuf(l: *GdkPixbufLoader) ?*GdkPixbuf;
-extern fn gdk_pixbuf_save_to_buffer(pixbuf: *GdkPixbuf, buffer: *?[*]u8, buffer_size: *usize, type_str: [*:0]const u8, err: ?*?*GError, sentinel: ?*anyopaque) gboolean;
+extern fn gdk_pixbuf_save_to_bufferv(pixbuf: *GdkPixbuf, buffer: *?[*]u8, buffer_size: *usize, type_str: [*:0]const u8, option_keys: ?[*:null]const ?[*:0]const u8, option_values: ?[*:null]const ?[*:0]const u8, err: ?*?*GError) gboolean;
 extern fn gtk_clipboard_set_image(clipboard: *GtkClipboard, pixbuf: *GdkPixbuf) void;
 extern fn gtk_clipboard_wait_for_image(clipboard: *GtkClipboard) ?*GdkPixbuf;
 
@@ -2105,11 +2105,11 @@ pub fn clipboardReadImage(window: *anyopaque, allocator: std.mem.Allocator) opts
     var buf_ptr: ?[*]u8 = null;
     var buf_size: usize = 0;
     var gerr: ?*GError = null;
-    if (gdk_pixbuf_save_to_buffer(pixbuf, &buf_ptr, &buf_size, "png", &gerr, null) == 0) {
+    if (gdk_pixbuf_save_to_bufferv(pixbuf, &buf_ptr, &buf_size, "png", null, null, &gerr) == 0) {
         if (gerr) |e| g_error_free(e);
         return opts_mod.ClipboardError.Backend;
     }
     const raw = buf_ptr orelse return opts_mod.ClipboardError.Backend;
-    defer g_free(raw);
+    defer g_free(@ptrCast(raw));
     return allocator.dupe(u8, raw[0..buf_size]) catch return opts_mod.ClipboardError.OutOfMemory;
 }
