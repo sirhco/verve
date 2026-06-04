@@ -163,6 +163,20 @@ static const IID kIID_IUnknown = {
 
 // ---- WebMessageReceived: JS -> host -> Zig ----------------------------------
 
+// Bridge messages are delivered to the Zig handler via a POSTED window message
+// (WM_VERVE_BRIDGE), not synchronously inside WebView2's WebMessageReceived
+// callback. WebView2 serializes its event callbacks and will not fire an async
+// completion (e.g. GetCookies) while one of its event handlers is still on the
+// stack. A bridge handler that synchronously waits on such a completion —
+// cookies().get()/delete() pump the message loop until GetCookies finishes —
+// would therefore deadlock. Running the handler from WndProc (one message-loop
+// turn later) takes the WebView2 event off the stack so completions can fire.
+static const UINT WM_VERVE_BRIDGE = WM_APP + 0x21;
+struct BridgeMsg {
+    uint8_t *data; // malloc'd UTF-8, freed in WndProc after dispatch
+    size_t len;
+};
+
 class WebMessageHandler : public ICoreWebView2WebMessageReceivedEventHandler {
     WV2Host *host_;
 
@@ -179,8 +193,20 @@ public:
             size_t len = 0;
             char *utf8 = narrow(msg, &len);
             if (utf8) {
-                host_->bridge(host_->bridge_ctx, (const uint8_t *)utf8, len);
-                free(utf8);
+                // Defer to WndProc (see WM_VERVE_BRIDGE note above). Ownership of
+                // `utf8` transfers to the posted message on success.
+                auto *bm = (BridgeMsg *)malloc(sizeof(BridgeMsg));
+                if (bm) {
+                    bm->data = (uint8_t *)utf8;
+                    bm->len = len;
+                    if (!PostMessageW(host_->hwnd, WM_VERVE_BRIDGE, 0,
+                                      (LPARAM)bm)) {
+                        free(utf8);
+                        free(bm);
+                    }
+                } else {
+                    free(utf8);
+                }
             }
             CoTaskMemFree(msg);
         }
@@ -494,6 +520,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (host->close_cb(host->close_ctx) == 0) return 0; // vetoed
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
+    case WM_VERVE_BRIDGE: {
+        // Deferred bridge delivery, posted from WebMessageHandler::Invoke so the
+        // Zig handler runs outside WebView2's event callback (see note there).
+        BridgeMsg *bm = (BridgeMsg *)lp;
+        if (bm) {
+            if (host && host->bridge)
+                host->bridge(host->bridge_ctx, bm->data, bm->len);
+            free(bm->data);
+            free(bm);
+        }
+        return 0;
+    }
     case WM_DESTROY:
         if (host && host->drop_registered) {
             RevokeDragDrop(hwnd);

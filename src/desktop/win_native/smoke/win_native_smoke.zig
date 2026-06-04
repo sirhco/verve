@@ -347,6 +347,11 @@ fn runCookieSet(win: *wn.Window) void {
     win.cookies().set(.{
         .name = COOKIE_NAME,
         .value = "hello-from-zig",
+        // Concrete domain so WebView2 actually stores it: the smoke page is a
+        // NavigateToString opaque origin, so an empty/origin-derived domain has
+        // nothing to bind to. GetCookies(null) is profile-wide, so a real
+        // domain round-trips through set -> get -> delete regardless of origin.
+        .domain = "verve.local",
         .path = "/",
         .same_site = .lax,
     }) catch |err| {
@@ -390,26 +395,51 @@ fn runCookieGet(win: *wn.Window) void {
     }
 }
 
-/// "cookie delete" — remove the test cookie and log.
+/// True if COOKIE_NAME currently exists (frees any returned cookie). Used to
+/// show real before/after status so delete/clear visibly do something.
+fn cookiePresent(win: *wn.Window) bool {
+    const alloc = std.heap.page_allocator;
+    const maybe = win.cookies().get(alloc, COOKIE_NAME) catch return false;
+    if (maybe) |c| {
+        alloc.free(c.name);
+        alloc.free(c.value);
+        alloc.free(c.domain);
+        alloc.free(c.path);
+        return true;
+    }
+    return false;
+}
+
+/// "cookie delete" — remove the test cookie, then re-query to report whether it
+/// is actually gone (visible confirmation the op took effect).
 fn runCookieDelete(win: *wn.Window) void {
     win.cookies().delete(COOKIE_NAME) catch |err| {
         std.debug.print("[zig] cookie delete: {s}\n", .{@errorName(err)});
         win.evalJs("verveLog('cookie delete: error / unsupported');");
         return;
     };
-    std.debug.print("[zig] cookie delete ok\n", .{});
-    win.evalJs("verveLog('cookie delete: ok');");
+    const still = cookiePresent(win);
+    std.debug.print("[zig] cookie delete ok, still_present={}\n", .{still});
+    win.evalJs(if (still)
+        "verveLog('cookie delete: ran, but cookie STILL present (backend no-op)');"
+    else
+        "verveLog('cookie delete: ok — cookie now absent');");
 }
 
-/// "cookie clear" — wipe the per-profile cookie store and log.
+/// "cookie clear" — wipe the store, then re-query to report whether the test
+/// cookie is actually gone.
 fn runCookieClear(win: *wn.Window) void {
     win.cookies().clear() catch |err| {
         std.debug.print("[zig] cookie clear: {s}\n", .{@errorName(err)});
         win.evalJs("verveLog('cookie clear: error / unsupported');");
         return;
     };
-    std.debug.print("[zig] cookie clear ok\n", .{});
-    win.evalJs("verveLog('cookie clear: ok');");
+    const still = cookiePresent(win);
+    std.debug.print("[zig] cookie clear ok, still_present={}\n", .{still});
+    win.evalJs(if (still)
+        "verveLog('cookie clear: ran, but cookie STILL present (backend no-op)');"
+    else
+        "verveLog('cookie clear: ok — cookie now absent');");
 }
 
 /// Registered via setColorSchemeHandler; logs OS light/dark toggles. Operator
