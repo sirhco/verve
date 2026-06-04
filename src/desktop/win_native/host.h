@@ -114,7 +114,7 @@ void wv2_set_focus_cb(WV2Host *host, verve_focus_cb cb, void *ctx);
 void wv2_set_close_cb(WV2Host *host, verve_close_cb cb, void *ctx);
 void wv2_set_drag_drop_cb(WV2Host *host, verve_drag_drop_cb cb, void *ctx);
 
-/* Post WM_CLOSE so the close path (incl. any veto handler) runs. */
+/* Send WM_CLOSE synchronously so the close path (incl. any veto handler) runs. */
 void wv2_close(WV2Host *host);
 
 #ifdef __cplusplus

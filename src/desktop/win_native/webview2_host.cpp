@@ -385,7 +385,7 @@ static void drop_register(WV2Host *host, bool on) {
     if (!host || !host->hwnd) return;
     if (on) {
         if (host->drop_registered) return;
-        OleInitialize(nullptr); // idempotent per-thread; pairs the OLE apartment
+        OleInitialize(nullptr); // inits the OLE apartment once per UI thread for RegisterDragDrop; left to thread/process teardown (no explicit OleUninitialize)
         if (!host->drop_target) host->drop_target = new DropTarget(host);
         if (SUCCEEDED(RegisterDragDrop(host->hwnd, host->drop_target)))
             host->drop_registered = true;
@@ -941,8 +941,8 @@ void wv2_set_drag_drop_cb(WV2Host *host, verve_drag_drop_cb cb, void *ctx) {
 
 void wv2_close(WV2Host *host) {
     WV2_REQUIRE_HWND(host, );
-    // Post WM_CLOSE so the close path (incl. any veto handler) runs, exactly as
-    // legacy windows.zig close() does via SendMessageW.
+    // Send WM_CLOSE synchronously so the close path (incl. any veto handler)
+    // runs, exactly as legacy windows.zig close() does via SendMessageW.
     SendMessageW(hwnd, WM_CLOSE, 0, 0);
 }
 

@@ -569,7 +569,6 @@ fn linkWinNative(b: *std.Build, mod: *std.Build.Module) void {
     // quote-includes (`#include "host.h"`) relative to the .cpp's own
     // directory, so no extra include path is needed for it.
     mod.linkSystemLibrary("ole32", .{});
-    mod.linkSystemLibrary("oleaut32", .{});
     mod.linkSystemLibrary("shell32", .{}); // DragQueryFileW (CF_HDROP)
     mod.linkSystemLibrary("user32", .{});
     mod.linkSystemLibrary("gdi32", .{});
