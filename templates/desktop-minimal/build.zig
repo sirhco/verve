@@ -100,8 +100,18 @@ pub fn build(b: *std.Build) void {
             b.getInstallStep().dependOn(&install_loader.step);
         },
         .linux => {
-            desktop_mod.linkSystemLibrary("gtk+-3.0", .{ .use_pkg_config = .force });
-            desktop_mod.linkSystemLibrary("webkit2gtk-4.1", .{ .use_pkg_config = .force });
+            const use_gtk4 = b.option(bool, "gtk4",
+                "Use GTK4 + WebKitGTK 6.0 instead of GTK3 + WebKitGTK 4.1") orelse false;
+            if (use_gtk4) {
+                desktop_mod.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
+                desktop_mod.linkSystemLibrary("webkitgtk-6.0", .{ .use_pkg_config = .force });
+            } else {
+                desktop_mod.linkSystemLibrary("gtk+-3.0", .{ .use_pkg_config = .force });
+                desktop_mod.linkSystemLibrary("webkit2gtk-4.1", .{ .use_pkg_config = .force });
+            }
+            const gtk4_opts = b.addOptions();
+            gtk4_opts.addOption(bool, "gtk4", use_gtk4);
+            desktop_mod.addOptions("desktop_options", gtk4_opts);
         },
         else => @panic("unsupported OS — desktop builds target macOS, Windows, or Linux"),
     }

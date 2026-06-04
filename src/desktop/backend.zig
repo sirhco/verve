@@ -21,6 +21,13 @@ const builtin = @import("builtin");
 pub const impl = switch (builtin.os.tag) {
     .macos => @import("macos.zig"),
     .windows => @import("windows_native.zig"),
-    .linux => @import("linux.zig"),
+    .linux => blk: {
+        const use_gtk4 = comptime use_gtk4: {
+            const root = @import("root");
+            if (@hasDecl(root, "desktop_options")) break :use_gtk4 root.desktop_options.gtk4;
+            break :use_gtk4 false;
+        };
+        break :blk if (use_gtk4) @import("linux_gtk4.zig") else @import("linux.zig");
+    },
     else => @compileError("verve.desktop: unsupported OS — only macOS, Windows, and Linux are wired today"),
 };
