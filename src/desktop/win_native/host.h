@@ -48,6 +48,30 @@ void wv2_run(WV2Host *host);
 /* Tear down. */
 void wv2_destroy(WV2Host *host);
 
+/* ---- Bundle 2: window geometry & state ----------------------------------- */
+
+void  wv2_set_title(WV2Host *host, const char *title, size_t len);
+void  wv2_set_always_on_top(WV2Host *host, int on);
+void  wv2_set_opacity(WV2Host *host, double v);
+void  wv2_set_size(WV2Host *host, uint32_t w, uint32_t h);
+void  wv2_set_position(WV2Host *host, int32_t x, int32_t y);
+void  wv2_center(WV2Host *host);
+void  wv2_minimize(WV2Host *host);
+void  wv2_maximize(WV2Host *host);
+void  wv2_restore(WV2Host *host);
+void  wv2_show(WV2Host *host);
+void  wv2_hide(WV2Host *host);
+void  wv2_focus(WV2Host *host);
+void  wv2_set_min_size(WV2Host *host, uint32_t w, uint32_t h);
+void  wv2_set_max_size(WV2Host *host, uint32_t w, uint32_t h);
+float wv2_scale_factor(WV2Host *host);
+int   wv2_is_minimized(WV2Host *host);
+int   wv2_is_maximized(WV2Host *host);
+int   wv2_is_fullscreen(WV2Host *host);
+void  wv2_request_attention(WV2Host *host, int critical);
+void  wv2_set_resizable(WV2Host *host, int on);
+void  wv2_set_fullscreen(WV2Host *host, int on);
+
 #ifdef __cplusplus
 }
 #endif

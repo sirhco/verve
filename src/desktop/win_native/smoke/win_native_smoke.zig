@@ -21,10 +21,46 @@ const page =
     \\<!doctype html><html><head><meta charset="utf-8"><style>
     \\  body { font-family: system-ui, sans-serif; padding: 2rem; }
     \\  #log { margin-top: 1rem; padding: .75rem; background: #eef; border-radius: 6px; }
+    \\  button { margin: .15rem; padding: .4rem .7rem; }
+    \\  .grp { margin-top: 1rem; }
+    \\  .grp h3 { margin: .4rem 0 .2rem; font-size: .9rem; color: #446; }
     \\</style></head><body>
     \\  <h1>Verve · WebView2 native-host</h1>
     \\  <p>Native C++ host + Zig backend (windows_native.Window). No WRL, no hand-rolled Zig COM.</p>
     \\  <button onclick="window.verve.post('ping ' + Date.now())">ping &rarr; Zig</button>
+    \\
+    \\  <div class="grp"><h3>Bundle 2 · geometry &amp; state (click → command → Zig backend)</h3>
+    \\    <button onclick="window.verve.post('cmd:title')">setTitle("Changed")</button>
+    \\    <button onclick="window.verve.post('cmd:resize')">setSize(640,480)</button>
+    \\    <button onclick="window.verve.post('cmd:move')">setPosition(80,80)</button>
+    \\    <button onclick="window.verve.post('cmd:center')">center</button>
+    \\    <br>
+    \\    <button onclick="window.verve.post('cmd:min')">minimize</button>
+    \\    <button onclick="window.verve.post('cmd:max')">maximize</button>
+    \\    <button onclick="window.verve.post('cmd:restore')">restore</button>
+    \\    <button onclick="window.verve.post('cmd:hide')">hide (then re-show via taskbar/timer)</button>
+    \\    <button onclick="window.verve.post('cmd:show')">show</button>
+    \\    <button onclick="window.verve.post('cmd:focus')">focus</button>
+    \\    <br>
+    \\    <button onclick="window.verve.post('cmd:topmost-on')">alwaysOnTop on</button>
+    \\    <button onclick="window.verve.post('cmd:topmost-off')">alwaysOnTop off</button>
+    \\    <button onclick="window.verve.post('cmd:opacity-dim')">opacity 0.6</button>
+    \\    <button onclick="window.verve.post('cmd:opacity-full')">opacity 1.0</button>
+    \\    <br>
+    \\    <button onclick="window.verve.post('cmd:resizable-off')">resizable off</button>
+    \\    <button onclick="window.verve.post('cmd:resizable-on')">resizable on</button>
+    \\    <button onclick="window.verve.post('cmd:minsize')">minSize(400,300)</button>
+    \\    <button onclick="window.verve.post('cmd:maxsize')">maxSize(1200,900)</button>
+    \\    <button onclick="window.verve.post('cmd:clearsize')">clear min/max</button>
+    \\    <br>
+    \\    <button onclick="window.verve.post('cmd:fs-on')">fullscreen on</button>
+    \\    <button onclick="window.verve.post('cmd:fs-off')">fullscreen off</button>
+    \\    <button onclick="window.verve.post('cmd:flash')">requestAttention(false)</button>
+    \\    <button onclick="window.verve.post('cmd:flash-crit')">requestAttention(true)</button>
+    \\    <br>
+    \\    <button onclick="window.verve.post('cmd:report')">report state &rarr; Zig &rarr; here</button>
+    \\  </div>
+    \\
     \\  <div id="log">waiting for round-trip&hellip;</div>
     \\  <script>
     \\    function verveLog(s) { document.getElementById('log').textContent = s; }
@@ -38,9 +74,89 @@ const page =
 /// Fired by the backend on the UI thread whenever JS posts a message. Echo the
 /// text back into the page through `Window.evalJs` — that visible echo is the
 /// proof the JS -> host -> Zig -> JS loop closed.
+/// Dispatch a `cmd:<name>` bridge message to a backend Window method. Returns
+/// true if it handled the payload (so the echo below is skipped).
+fn dispatchCommand(win: *wn.Window, payload: []const u8) bool {
+    const prefix = "cmd:";
+    if (!std.mem.startsWith(u8, payload, prefix)) return false;
+    const cmd = payload[prefix.len..];
+
+    if (std.mem.eql(u8, cmd, "title")) {
+        win.setTitle("Changed");
+    } else if (std.mem.eql(u8, cmd, "resize")) {
+        win.setSize(640, 480);
+    } else if (std.mem.eql(u8, cmd, "move")) {
+        win.setPosition(80, 80);
+    } else if (std.mem.eql(u8, cmd, "center")) {
+        win.center();
+    } else if (std.mem.eql(u8, cmd, "min")) {
+        win.minimize();
+    } else if (std.mem.eql(u8, cmd, "max")) {
+        win.maximize();
+    } else if (std.mem.eql(u8, cmd, "restore")) {
+        win.restore();
+    } else if (std.mem.eql(u8, cmd, "hide")) {
+        win.hide();
+    } else if (std.mem.eql(u8, cmd, "show")) {
+        win.show();
+    } else if (std.mem.eql(u8, cmd, "focus")) {
+        win.focus();
+    } else if (std.mem.eql(u8, cmd, "topmost-on")) {
+        win.setAlwaysOnTop(true);
+    } else if (std.mem.eql(u8, cmd, "topmost-off")) {
+        win.setAlwaysOnTop(false);
+    } else if (std.mem.eql(u8, cmd, "opacity-dim")) {
+        win.setOpacity(0.6);
+    } else if (std.mem.eql(u8, cmd, "opacity-full")) {
+        win.setOpacity(1.0);
+    } else if (std.mem.eql(u8, cmd, "resizable-off")) {
+        win.setResizable(false);
+    } else if (std.mem.eql(u8, cmd, "resizable-on")) {
+        win.setResizable(true);
+    } else if (std.mem.eql(u8, cmd, "minsize")) {
+        win.setMinSize(400, 300);
+    } else if (std.mem.eql(u8, cmd, "maxsize")) {
+        win.setMaxSize(1200, 900);
+    } else if (std.mem.eql(u8, cmd, "clearsize")) {
+        win.setMinSize(0, 0);
+        win.setMaxSize(0, 0);
+    } else if (std.mem.eql(u8, cmd, "fs-on")) {
+        win.setFullscreen(true);
+    } else if (std.mem.eql(u8, cmd, "fs-off")) {
+        win.setFullscreen(false);
+    } else if (std.mem.eql(u8, cmd, "flash")) {
+        win.requestAttention(false);
+    } else if (std.mem.eql(u8, cmd, "flash-crit")) {
+        win.requestAttention(true);
+    } else if (std.mem.eql(u8, cmd, "report")) {
+        reportState(win);
+    } else {
+        std.debug.print("[zig] unknown cmd: {s}\n", .{cmd});
+        return true;
+    }
+    std.debug.print("[zig] ran cmd: {s}\n", .{cmd});
+    return true;
+}
+
+/// Read back the is*/scaleFactor queries and push a human-readable line into
+/// the page — proves the bool/float-returning host fns round-trip.
+fn reportState(win: *wn.Window) void {
+    var buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        "verveLog('state: minimized={} maximized={} fullscreen={} scale={d:.2}');",
+        .{ win.isMinimized(), win.isMaximized(), win.isFullscreen(), win.scaleFactor() },
+    ) catch return;
+    win.evalJs(line);
+}
+
 fn onMsg(ctx: ?*anyopaque, payload: []const u8) void {
     _ = ctx;
     std.debug.print("[zig] onMsg received: {s}\n", .{payload});
+
+    if (g_win) |w| {
+        if (dispatchCommand(w, payload)) return;
+    }
 
     // Build  verveLog('Zig received: <text>');  escaping for a JS single-quoted
     // string literal (\, ', and newlines).

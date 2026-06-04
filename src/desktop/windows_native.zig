@@ -31,6 +31,29 @@ extern fn wv2_set_bridge(host: *Host, cb: BridgeFn, ctx: ?*anyopaque) void;
 extern fn wv2_run(host: *Host) void;
 extern fn wv2_destroy(host: *Host) void;
 
+// Bundle 2: window geometry & state.
+extern fn wv2_set_title(host: *Host, title: [*]const u8, len: usize) void;
+extern fn wv2_set_always_on_top(host: *Host, on: c_int) void;
+extern fn wv2_set_opacity(host: *Host, v: f64) void;
+extern fn wv2_set_size(host: *Host, w: u32, h: u32) void;
+extern fn wv2_set_position(host: *Host, x: i32, y: i32) void;
+extern fn wv2_center(host: *Host) void;
+extern fn wv2_minimize(host: *Host) void;
+extern fn wv2_maximize(host: *Host) void;
+extern fn wv2_restore(host: *Host) void;
+extern fn wv2_show(host: *Host) void;
+extern fn wv2_hide(host: *Host) void;
+extern fn wv2_focus(host: *Host) void;
+extern fn wv2_set_min_size(host: *Host, w: u32, h: u32) void;
+extern fn wv2_set_max_size(host: *Host, w: u32, h: u32) void;
+extern fn wv2_scale_factor(host: *Host) f32;
+extern fn wv2_is_minimized(host: *Host) c_int;
+extern fn wv2_is_maximized(host: *Host) c_int;
+extern fn wv2_is_fullscreen(host: *Host) c_int;
+extern fn wv2_request_attention(host: *Host, critical: c_int) void;
+extern fn wv2_set_resizable(host: *Host, on: c_int) void;
+extern fn wv2_set_fullscreen(host: *Host, on: c_int) void;
+
 /// Toast error set — mirrors the legacy `windows.zig` surface so the
 /// module-level `showToast` is signature-compatible.
 pub const ToastError = error{ Unsupported, Backend, OutOfMemory };
@@ -114,96 +137,67 @@ pub const Window = struct {
     // ---- geometry / chrome (bundle 2) ---------------------------------------
 
     pub fn setTitle(self: *Window, title: []const u8) void {
-        _ = self;
-        _ = title;
-        // TODO bundle 2
+        wv2_set_title(self.ctx.host, title.ptr, title.len);
     }
 
     pub fn setAlwaysOnTop(self: *Window, on: bool) void {
-        _ = self;
-        _ = on;
-        // TODO bundle 2
+        wv2_set_always_on_top(self.ctx.host, @intFromBool(on));
     }
 
     pub fn setOpacity(self: *Window, value: f64) void {
-        _ = self;
-        _ = value;
-        // TODO bundle 2
+        wv2_set_opacity(self.ctx.host, value);
     }
 
     pub fn setSize(self: *Window, width: u32, height: u32) void {
-        _ = self;
-        _ = width;
-        _ = height;
-        // TODO bundle 2
+        wv2_set_size(self.ctx.host, width, height);
     }
 
     pub fn setPosition(self: *Window, x: i32, y: i32) void {
-        _ = self;
-        _ = x;
-        _ = y;
-        // TODO bundle 2
+        wv2_set_position(self.ctx.host, x, y);
     }
 
     pub fn center(self: *Window) void {
-        _ = self;
-        // TODO bundle 2
+        wv2_center(self.ctx.host);
     }
 
     pub fn minimize(self: *Window) void {
-        _ = self;
-        // TODO bundle 2
+        wv2_minimize(self.ctx.host);
     }
 
     pub fn maximize(self: *Window) void {
-        _ = self;
-        // TODO bundle 2
+        wv2_maximize(self.ctx.host);
     }
 
     pub fn restore(self: *Window) void {
-        _ = self;
-        // TODO bundle 2
+        wv2_restore(self.ctx.host);
     }
 
     pub fn setFullscreen(self: *Window, on: bool) void {
-        _ = self;
-        _ = on;
-        // TODO bundle 2
+        wv2_set_fullscreen(self.ctx.host, @intFromBool(on));
     }
 
     pub fn show(self: *Window) void {
-        _ = self;
-        // TODO bundle 2
+        wv2_show(self.ctx.host);
     }
 
     pub fn hide(self: *Window) void {
-        _ = self;
-        // TODO bundle 2
+        wv2_hide(self.ctx.host);
     }
 
     pub fn focus(self: *Window) void {
-        _ = self;
-        // TODO bundle 2
+        wv2_focus(self.ctx.host);
     }
 
     pub fn setResizable(self: *Window, on: bool) void {
-        _ = self;
-        _ = on;
-        // TODO bundle 2
+        wv2_set_resizable(self.ctx.host, @intFromBool(on));
     }
 
     pub fn setMinSize(self: *Window, width: u32, height: u32) void {
-        _ = self;
-        _ = width;
-        _ = height;
-        // TODO bundle 2
+        wv2_set_min_size(self.ctx.host, width, height);
     }
 
     pub fn setMaxSize(self: *Window, width: u32, height: u32) void {
-        _ = self;
-        _ = width;
-        _ = height;
-        // TODO bundle 2
+        wv2_set_max_size(self.ctx.host, width, height);
     }
 
     pub fn setZoom(self: *Window, level: f64) void {
@@ -219,33 +213,23 @@ pub const Window = struct {
     }
 
     pub fn scaleFactor(self: *Window) f32 {
-        _ = self;
-        // TODO bundle 2
-        return 1.0;
+        return wv2_scale_factor(self.ctx.host);
     }
 
     pub fn requestAttention(self: *Window, critical: bool) void {
-        _ = self;
-        _ = critical;
-        // TODO bundle 2
+        wv2_request_attention(self.ctx.host, @intFromBool(critical));
     }
 
     pub fn isMinimized(self: *Window) bool {
-        _ = self;
-        // TODO bundle 2
-        return false;
+        return wv2_is_minimized(self.ctx.host) != 0;
     }
 
     pub fn isMaximized(self: *Window) bool {
-        _ = self;
-        // TODO bundle 2
-        return false;
+        return wv2_is_maximized(self.ctx.host) != 0;
     }
 
     pub fn isFullscreen(self: *Window) bool {
-        _ = self;
-        // TODO bundle 2
-        return false;
+        return wv2_is_fullscreen(self.ctx.host) != 0;
     }
 
     // ---- navigation (bundle 3) ----------------------------------------------
