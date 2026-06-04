@@ -117,6 +117,46 @@ void wv2_set_drag_drop_cb(WV2Host *host, verve_drag_drop_cb cb, void *ctx);
 /* Send WM_CLOSE synchronously so the close path (incl. any veto handler) runs. */
 void wv2_close(WV2Host *host);
 
+/* ---- Bundle 5: dialogs & child windows ----------------------------------- */
+
+/* Modal Win32 common file dialogs (GetOpenFileNameW / GetSaveFileNameW).
+ *
+ * Strings are UTF-8 (ptr,len). `filters` is the pattern string already joined
+ * by the Zig side (e.g. "*.txt;*.json"); empty (filters_len==0) => allow any.
+ * The host wraps it under a single "Allowed types" description and builds the
+ * double-NUL-terminated OPENFILENAMEW filter buffer.
+ *
+ * Result: the chosen path is written into `buf` (capacity `cap`) as UTF-8 (no
+ * NUL); the FULL byte length is returned even when it exceeds `cap` (caller
+ * re-allocs + re-calls, same buffer-grow contract as wv2_current_url). A return
+ * of 0 means the user cancelled / picked nothing. */
+size_t wv2_open_file_dialog(WV2Host *host, const char *title, size_t title_len,
+                            const char *default_path, size_t default_path_len,
+                            const char *filters, size_t filters_len,
+                            int allow_multiple, uint8_t *buf, size_t cap);
+size_t wv2_save_file_dialog(WV2Host *host, const char *title, size_t title_len,
+                            const char *default_path, size_t default_path_len,
+                            const char *default_name, size_t default_name_len,
+                            const char *filters, size_t filters_len,
+                            uint8_t *buf, size_t cap);
+
+/* Modal alert via MessageBoxW. `style`: 0 informational, 1 warning, 2 critical.
+ * `button_count` (1/2/3+) maps onto MB_OK / MB_YESNO / MB_YESNOCANCEL exactly
+ * as the legacy backend does. Returns the chosen button INDEX in the caller's
+ * button order: 1-button => 0; 2-button => IDYES=0/IDNO=1; 3-button =>
+ * IDYES=0/IDNO=1/IDCANCEL=2. The custom button label strings are not honored by
+ * MessageBoxW and are therefore not passed across the ABI (documented at the
+ * Zig surface). */
+size_t wv2_show_alert(WV2Host *host, const char *title, size_t title_len,
+                      const char *message, size_t message_len, int style,
+                      size_t button_count);
+
+/* Create an independent top-level host + Win32 window (same as wv2_create but
+ * conceptually a child of `parent`'s app session). Returns the new WV2Host* or
+ * NULL on failure. The caller owns it and must wv2_destroy it. */
+WV2Host *wv2_open_child(WV2Host *parent, const char *title, size_t title_len,
+                        int width, int height);
+
 #ifdef __cplusplus
 }
 #endif

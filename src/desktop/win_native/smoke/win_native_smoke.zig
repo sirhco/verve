@@ -17,6 +17,9 @@ const wn = @import("windows_native");
 
 var g_win: ?*wn.Window = null;
 var g_close_attempts: u32 = 0;
+// Child window opened by the "child window" button. Kept so it can be
+// deinit'd at process exit rather than leaked.
+var g_child: ?wn.Window = null;
 
 const page =
     \\<!doctype html><html><head><meta charset="utf-8"><style>
@@ -84,6 +87,13 @@ const page =
     \\    <button onclick="window.verve.post('cmd:deliver-url')">deliverUrl("verve://deep/link")</button>
     \\    <a href="https://example.com">https://example.com</a>
     \\    (external link — legacy backend does NOT auto-route this; use the button)
+    \\  </div>
+    \\
+    \\  <div class="grp"><h3>Bundle 5 · dialogs &amp; child windows</h3>
+    \\    <button onclick="window.verve.post('cmd:open-file')">openFileDialog (txt/json)</button>
+    \\    <button onclick="window.verve.post('cmd:save-file')">saveFileDialog (default note.txt)</button>
+    \\    <button onclick="window.verve.post('cmd:alert')">showAlert (Yes/No → index)</button>
+    \\    <button onclick="window.verve.post('cmd:child')">openChildWindow (2nd window)</button>
     \\  </div>
     \\
     \\  <div id="log">waiting for round-trip&hellip;</div>
@@ -171,6 +181,14 @@ fn dispatchCommand(win: *wn.Window, payload: []const u8) bool {
         win.close();
     } else if (std.mem.eql(u8, cmd, "deliver-url")) {
         win.deliverUrl("verve://deep/link");
+    } else if (std.mem.eql(u8, cmd, "open-file")) {
+        runOpenFile(win);
+    } else if (std.mem.eql(u8, cmd, "save-file")) {
+        runSaveFile(win);
+    } else if (std.mem.eql(u8, cmd, "alert")) {
+        runAlert(win);
+    } else if (std.mem.eql(u8, cmd, "child")) {
+        runChild(win);
     } else {
         std.debug.print("[zig] unknown cmd: {s}\n", .{cmd});
         return true;
@@ -211,6 +229,86 @@ fn reportNav(win: *wn.Window) void {
         },
     ) catch return;
     win.evalJs(line);
+}
+
+/// "open file" button — modal open dialog filtered to txt/json. Logs the chosen
+/// path or "cancelled" both to the console and into the page.
+fn runOpenFile(win: *wn.Window) void {
+    const alloc = std.heap.page_allocator;
+    const path = win.openFileDialog(alloc, .{
+        .title = "Open a file",
+        .allowed_extensions = &.{ "txt", "json" },
+    }) catch |err| {
+        std.debug.print("[zig] openFileDialog: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('open: cancelled / unsupported');");
+        return;
+    };
+    defer alloc.free(path);
+    std.debug.print("[zig] openFileDialog -> {s}\n", .{path});
+    var buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "verveLog('open: {s}');", .{path}) catch return;
+    win.evalJs(line);
+}
+
+/// "save file" button — modal save dialog seeded with a default name. Logs the
+/// chosen path or "cancelled".
+fn runSaveFile(win: *wn.Window) void {
+    const alloc = std.heap.page_allocator;
+    const path = win.saveFileDialog(alloc, .{
+        .title = "Save a file",
+        .default_name = "note.txt",
+        .allowed_extensions = &.{"txt"},
+    }) catch |err| {
+        std.debug.print("[zig] saveFileDialog: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('save: cancelled / unsupported');");
+        return;
+    };
+    defer alloc.free(path);
+    std.debug.print("[zig] saveFileDialog -> {s}\n", .{path});
+    var buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "verveLog('save: {s}');", .{path}) catch return;
+    win.evalJs(line);
+}
+
+/// "alert" button — modal Yes/No alert. Logs the chosen button index (0 = Yes,
+/// 1 = No), proving the button/return-index mapping round-trips.
+fn runAlert(win: *wn.Window) void {
+    const idx = win.showAlert(.{
+        .title = "Confirm",
+        .message = "Pick a button — its index comes back to Zig.",
+        .buttons = &.{ "Yes", "No" },
+        .style = .warning,
+    });
+    std.debug.print("[zig] showAlert -> index {d}\n", .{idx});
+    var buf: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "verveLog('alert: chose index {d}');", .{idx}) catch return;
+    win.evalJs(line);
+}
+
+/// "child window" button — opens a second independent top-level window with its
+/// own page. Kept in g_child so main() can deinit it on exit. Re-clicking
+/// replaces the reference (the old child leaks its HWND until process exit —
+/// acceptable for the smoke).
+fn runChild(win: *wn.Window) void {
+    const child = win.openChildWindow(.{
+        .title = "Verve child window",
+        .width = 500,
+        .height = 360,
+    }) catch |err| {
+        std.debug.print("[zig] openChildWindow: {s}\n", .{@errorName(err)});
+        return;
+    };
+    g_child = child;
+    if (g_child) |*c| {
+        c.loadHtml(
+            \\<!doctype html><html><body style="font-family:system-ui;padding:2rem">
+            \\<h1>Child window</h1><p>Independent top-level window + WebView2.</p>
+            \\</body></html>
+        , null) catch {};
+        c.show();
+    }
+    std.debug.print("[zig] openChildWindow -> opened\n", .{});
+    win.evalJs("verveLog('child: opened a second window');");
 }
 
 /// Registered via setColorSchemeHandler; logs OS light/dark toggles. Operator
@@ -335,4 +433,7 @@ pub fn main() void {
     win.setUrlOpenHandler(onUrlOpen, null);
     win.loadHtml(page, null) catch {};
     win.run();
+
+    // Clean up the child window if one was opened.
+    if (g_child) |*c| c.deinit();
 }

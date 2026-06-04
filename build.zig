@@ -570,6 +570,7 @@ fn linkWinNative(b: *std.Build, mod: *std.Build.Module) void {
     // directory, so no extra include path is needed for it.
     mod.linkSystemLibrary("ole32", .{});
     mod.linkSystemLibrary("shell32", .{}); // DragQueryFileW (CF_HDROP)
+    mod.linkSystemLibrary("comdlg32", .{}); // GetOpen/SaveFileNameW
     mod.linkSystemLibrary("user32", .{});
     mod.linkSystemLibrary("gdi32", .{});
     mod.link_libc = true;

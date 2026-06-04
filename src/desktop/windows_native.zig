@@ -79,6 +79,49 @@ extern fn wv2_set_close_cb(host: *Host, cb: ?CloseFn, ctx: ?*anyopaque) void;
 extern fn wv2_set_drag_drop_cb(host: *Host, cb: ?DragDropFn, ctx: ?*anyopaque) void;
 extern fn wv2_close(host: *Host) void;
 
+// Bundle 5: dialogs & child windows.
+extern fn wv2_open_file_dialog(
+    host: *Host,
+    title: [*]const u8,
+    title_len: usize,
+    default_path: [*]const u8,
+    default_path_len: usize,
+    filters: [*]const u8,
+    filters_len: usize,
+    allow_multiple: c_int,
+    buf: [*]u8,
+    cap: usize,
+) usize;
+extern fn wv2_save_file_dialog(
+    host: *Host,
+    title: [*]const u8,
+    title_len: usize,
+    default_path: [*]const u8,
+    default_path_len: usize,
+    default_name: [*]const u8,
+    default_name_len: usize,
+    filters: [*]const u8,
+    filters_len: usize,
+    buf: [*]u8,
+    cap: usize,
+) usize;
+extern fn wv2_show_alert(
+    host: *Host,
+    title: [*]const u8,
+    title_len: usize,
+    message: [*]const u8,
+    message_len: usize,
+    style: c_int,
+    button_count: usize,
+) usize;
+extern fn wv2_open_child(
+    parent: *Host,
+    title: [*]const u8,
+    title_len: usize,
+    width: c_int,
+    height: c_int,
+) ?*Host;
+
 /// Toast error set — mirrors the legacy `windows.zig` surface so the
 /// module-level `showToast` is signature-compatible.
 pub const ToastError = error{ Unsupported, Backend, OutOfMemory };
@@ -379,33 +422,80 @@ pub const Window = struct {
 
     // ---- dialogs (bundle 5) -------------------------------------------------
 
+    /// Modal open-file dialog via `GetOpenFileNameW` behind the native host.
+    /// `pick_directory` is rejected with `error.Unsupported` (the Win32 common
+    /// file dialog can't pick directories — legacy returns the same error). On
+    /// cancel returns `error.Cancelled`, matching legacy.
+    ///
+    /// `allow_multiple` currently returns only the leading path (the directory),
+    /// matching the legacy `windows.zig` limitation; full `dir\0file1\0...`
+    /// unpacking is a follow-up.
     pub fn openFileDialog(self: *Window, allocator: std.mem.Allocator, opts: opts_mod.FileDialogOptions) opts_mod.DialogError![]u8 {
-        _ = self;
-        _ = allocator;
-        _ = opts;
-        // TODO bundle 5
-        return error.Unsupported;
+        if (opts.pick_directory) return opts_mod.DialogError.Unsupported;
+        return runFileDialog(self, allocator, opts, .open);
     }
 
+    /// Modal save-file dialog via `GetSaveFileNameW` behind the native host.
+    /// On cancel returns `error.Cancelled`.
     pub fn saveFileDialog(self: *Window, allocator: std.mem.Allocator, opts: opts_mod.FileDialogOptions) opts_mod.DialogError![]u8 {
-        _ = self;
-        _ = allocator;
-        _ = opts;
-        // TODO bundle 5
-        return error.Unsupported;
+        return runFileDialog(self, allocator, opts, .save);
     }
 
+    /// Modal alert via `MessageBoxW`. Win32 doesn't honor arbitrary button
+    /// labels — the surface accepts up to three buttons and maps the COUNT onto
+    /// MB_OK / MB_YESNO / MB_YESNOCANCEL, then translates the return code back
+    /// to the caller's button index (0 = first button). The custom label
+    /// strings in `opts.buttons` are ignored on Windows (macOS honors them).
+    /// Mapping is identical to the legacy `windows.zig` backend.
     pub fn showAlert(self: *Window, opts: opts_mod.AlertOptions) usize {
-        _ = self;
-        _ = opts;
-        // TODO bundle 5
-        return 0;
+        const style: c_int = switch (opts.style) {
+            .informational => 0,
+            .warning => 1,
+            .critical => 2,
+        };
+        const button_count: usize = if (opts.buttons.len == 0) 1 else opts.buttons.len;
+        return wv2_show_alert(
+            self.ctx.host,
+            opts.title.ptr,
+            opts.title.len,
+            opts.message.ptr,
+            opts.message.len,
+            style,
+            button_count,
+        );
     }
 
+    /// Open a second top-level window in the same app session. Mints a fresh
+    /// native host (HWND + WebView2 environment/controller) and wraps it in a
+    /// new `WindowCtx`/`Window` exactly like `init` does, wiring the message
+    /// handler from `opts`. The caller owns the returned window and must
+    /// `deinit` it. Independent window, matching legacy semantics.
     pub fn openChildWindow(self: *Window, opts: opts_mod.WindowOptions) !Window {
-        // TODO bundle 5: spawn a distinct top-level window. For now just
-        // construct another native host with the same options.
-        return Window.init(self.ctx.allocator, opts);
+        const allocator = self.ctx.allocator;
+        const heap = try allocator.create(WindowCtx);
+        errdefer allocator.destroy(heap);
+
+        var tbuf: [512]u8 = undefined;
+        const src = opts.title[0..@min(opts.title.len, tbuf.len - 1)];
+        @memcpy(tbuf[0..src.len], src);
+        tbuf[src.len] = 0;
+
+        const host = wv2_open_child(
+            self.ctx.host,
+            &tbuf,
+            src.len,
+            @intCast(opts.width),
+            @intCast(opts.height),
+        ) orelse return error.BackendInit;
+
+        heap.* = .{
+            .allocator = allocator,
+            .host = host,
+            .on_message = opts.on_message,
+            .on_message_ctx = opts.on_message_ctx,
+        };
+        wv2_set_bridge(host, bridgeTrampoline, heap);
+        return .{ .ctx = heap };
     }
 
     // ---- print / a11y / snapshot / lifecycle (bundle 8) ---------------------
@@ -549,6 +639,81 @@ fn wv2GetString(
     errdefer allocator.free(heap);
     const got = getter(host, heap.ptr, heap.len);
     return heap[0..@min(got, heap.len)];
+}
+
+// ---- file-dialog driver (bundle 5) ------------------------------------------
+
+const FileDialogKind = enum { open, save };
+
+/// Shared open/save dialog driver. Builds the `*.ext;*.ext` filter pattern from
+/// `opts.allowed_extensions` (empty = allow any), then calls the native host
+/// EXACTLY ONCE. A modal dialog must not use the url/title buffer-grow re-call
+/// pattern: a second call would pop the dialog again, forcing the user to pick
+/// twice. The host caps the path at a 4096-wchar `lpstrFile`; the UTF-8
+/// encoding of <=4096 UTF-16 code units is at most ~3 bytes/unit (~12 KB), so a
+/// single 16 KB buffer ALWAYS holds the full result in one call. The host
+/// copies min(full, cap) and returns the full UTF-8 length (0 on cancel).
+fn runFileDialog(
+    self: *Window,
+    allocator: std.mem.Allocator,
+    opts: opts_mod.FileDialogOptions,
+    kind: FileDialogKind,
+) opts_mod.DialogError![]u8 {
+    // Build the ';'-joined pattern string the host wraps under "Allowed types".
+    var pattern_buf: std.ArrayList(u8) = .empty;
+    defer pattern_buf.deinit(allocator);
+    for (opts.allowed_extensions, 0..) |ext, i| {
+        if (i > 0) pattern_buf.append(allocator, ';') catch return opts_mod.DialogError.OutOfMemory;
+        pattern_buf.appendSlice(allocator, "*.") catch return opts_mod.DialogError.OutOfMemory;
+        pattern_buf.appendSlice(allocator, ext) catch return opts_mod.DialogError.OutOfMemory;
+    }
+    const filters = pattern_buf.items;
+
+    // Single fixed buffer, sized to always hold the host's max output in one
+    // call (16 KB > the ~12 KB worst case for the 4096-wchar host cap). The
+    // `@min` clamp is belt-and-suspenders; it never actually clamps here.
+    var buf: [16384]u8 = undefined;
+    const len = callFileDialog(self.ctx.host, opts, filters, kind, &buf, buf.len);
+    if (len == 0) return opts_mod.DialogError.Cancelled;
+    return allocator.dupe(u8, buf[0..@min(len, buf.len)]) catch opts_mod.DialogError.OutOfMemory;
+}
+
+/// Dispatch one open/save call to the matching native host fn.
+fn callFileDialog(
+    host: *Host,
+    opts: opts_mod.FileDialogOptions,
+    filters: []const u8,
+    kind: FileDialogKind,
+    buf: [*]u8,
+    cap: usize,
+) usize {
+    return switch (kind) {
+        .open => wv2_open_file_dialog(
+            host,
+            opts.title.ptr,
+            opts.title.len,
+            opts.default_path.ptr,
+            opts.default_path.len,
+            filters.ptr,
+            filters.len,
+            @intFromBool(opts.allow_multiple),
+            buf,
+            cap,
+        ),
+        .save => wv2_save_file_dialog(
+            host,
+            opts.title.ptr,
+            opts.title.len,
+            opts.default_path.ptr,
+            opts.default_path.len,
+            opts.default_name.ptr,
+            opts.default_name.len,
+            filters.ptr,
+            filters.len,
+            buf,
+            cap,
+        ),
+    };
 }
 
 // ---- module-level cookie free fns (bundle 6) --------------------------------

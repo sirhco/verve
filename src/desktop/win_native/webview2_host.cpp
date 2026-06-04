@@ -18,6 +18,7 @@
 #include <ole2.h>      // OleInitialize / RegisterDragDrop / ReleaseStgMedium
 #include <oleidl.h>    // IDropTarget
 #include <shellapi.h>  // DragQueryFileW / CF_HDROP
+#include <commdlg.h>   // GetOpenFileNameW / GetSaveFileNameW / OPENFILENAMEW
 
 #include <WebView2.h>
 
@@ -873,6 +874,24 @@ static size_t fill_utf8_from_wide(LPWSTR w, uint8_t *buf, size_t cap) {
     return full;
 }
 
+// Copy a caller-owned NUL-terminated wide string into `buf` as UTF-8 (no NUL),
+// following the same buffer-grow contract as fill_utf8_from_wide but WITHOUT
+// freeing the source (it is not CoTaskMem-owned). Used by the file dialogs.
+static size_t fill_utf8_from_wide_noNUL(const wchar_t *w, uint8_t *buf,
+                                        size_t cap) {
+    if (!w) return 0;
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return 0;
+    size_t full = (size_t)(n - 1); // exclude trailing NUL
+    char *tmp = (char *)malloc((size_t)n);
+    if (!tmp) return 0;
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, tmp, n, nullptr, nullptr);
+    size_t copy = full < cap ? full : cap;
+    if (buf && copy) memcpy(buf, tmp, copy);
+    free(tmp);
+    return full;
+}
+
 size_t wv2_current_url(WV2Host *host, uint8_t *buf, size_t cap) {
     WV2_REQUIRE_WEBVIEW(host, 0);
     LPWSTR src = nullptr;
@@ -944,6 +963,205 @@ void wv2_close(WV2Host *host) {
     // Send WM_CLOSE synchronously so the close path (incl. any veto handler)
     // runs, exactly as legacy windows.zig close() does via SendMessageW.
     SendMessageW(hwnd, WM_CLOSE, 0, 0);
+}
+
+// ---- Bundle 5: dialogs & child windows --------------------------------------
+
+// Build the OPENFILENAMEW filter buffer from the Zig-side pattern string. The
+// format is a sequence of NUL-separated "<description>\0<pattern>\0" pairs,
+// double-NUL terminated. We wrap the (already ';'-joined) pattern under a single
+// "Allowed types" description, mirroring legacy runFileDialogWindows. Returns a
+// malloc'd wide buffer (caller frees) or NULL when `patterns` is empty/NULL —
+// NULL lStrFilter means "no filter" (allow any), which is what we want.
+static wchar_t *build_ofn_filter(const char *patterns, size_t plen) {
+    if (!patterns || plen == 0) return nullptr;
+    static const wchar_t kDesc[] = L"Allowed types";
+    const size_t desc_len = (sizeof(kDesc) / sizeof(wchar_t)) - 1; // sans NUL
+    int pat_n = MultiByteToWideChar(CP_UTF8, 0, patterns, (int)plen, nullptr, 0);
+    if (pat_n <= 0) return nullptr;
+    // Layout: desc \0 pattern \0 \0
+    size_t total = desc_len + 1 + (size_t)pat_n + 1 + 1;
+    wchar_t *buf = (wchar_t *)malloc(total * sizeof(wchar_t));
+    if (!buf) return nullptr;
+    size_t i = 0;
+    memcpy(buf + i, kDesc, desc_len * sizeof(wchar_t));
+    i += desc_len;
+    buf[i++] = 0;
+    MultiByteToWideChar(CP_UTF8, 0, patterns, (int)plen, buf + i, pat_n);
+    i += (size_t)pat_n;
+    buf[i++] = 0;
+    buf[i++] = 0; // double-NUL terminate
+    return buf;
+}
+
+// Shared driver for the open/save dialogs. `save` selects GetSaveFileNameW +
+// OFN_OVERWRITEPROMPT; otherwise GetOpenFileNameW + FILEMUSTEXIST (+ optional
+// OFN_ALLOWMULTISELECT). The selected path is returned UTF-8 via the buffer-grow
+// contract; 0 on cancel.
+static size_t run_file_dialog(WV2Host *host, bool save, const char *title,
+                              size_t title_len, const char *default_path,
+                              size_t default_path_len, const char *default_name,
+                              size_t default_name_len, const char *filters,
+                              size_t filters_len, int allow_multiple,
+                              uint8_t *buf, size_t cap) {
+    HWND owner = host ? host->hwnd : nullptr;
+
+    // GetOpen/SaveFileNameW writes the chosen path back into lpstrFile, so it
+    // must be a large mutable wide buffer. MAX_PATH is too small for modern
+    // long paths; use a generous fixed buffer like the legacy std.fs.max_path.
+    const size_t kFileBufLen = 4096;
+    wchar_t *file_buf = (wchar_t *)malloc(kFileBufLen * sizeof(wchar_t));
+    if (!file_buf) return 0;
+    file_buf[0] = 0;
+
+    // Pre-populate save dialogs with the suggested file name.
+    if (save && default_name && default_name_len) {
+        MultiByteToWideChar(CP_UTF8, 0, default_name, (int)default_name_len,
+                            file_buf, (int)kFileBufLen - 1);
+        // MultiByteToWideChar with explicit src len does NOT NUL-terminate.
+        int wn2 = MultiByteToWideChar(CP_UTF8, 0, default_name,
+                                      (int)default_name_len, nullptr, 0);
+        if (wn2 > 0 && (size_t)wn2 < kFileBufLen) file_buf[wn2] = 0;
+    }
+
+    wchar_t *wtitle =
+        (title && title_len) ? widen(title, (int)title_len) : nullptr;
+    wchar_t *wdir = (default_path && default_path_len)
+                        ? widen(default_path, (int)default_path_len)
+                        : nullptr;
+    wchar_t *wfilter = build_ofn_filter(filters, filters_len);
+
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFile = file_buf;
+    ofn.nMaxFile = (DWORD)kFileBufLen;
+    ofn.lpstrFilter = wfilter;
+    ofn.lpstrInitialDir = wdir;
+    ofn.lpstrTitle = wtitle;
+    ofn.Flags = OFN_EXPLORER;
+    if (save) {
+        ofn.Flags |= OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    } else {
+        ofn.Flags |= OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+        if (allow_multiple) ofn.Flags |= OFN_ALLOWMULTISELECT;
+    }
+
+    BOOL ok = save ? GetSaveFileNameW(&ofn) : GetOpenFileNameW(&ofn);
+
+    size_t full = 0;
+    if (ok) {
+        // Single-select returns one NUL-terminated path. (Multi-select returns
+        // dir\0file1\0file2\0\0 which we don't unpack here — same limitation as
+        // legacy: callers get the leading dir/path string.)
+        full = fill_utf8_from_wide_noNUL(file_buf, buf, cap);
+    }
+
+    free(file_buf);
+    free(wtitle);
+    free(wdir);
+    free(wfilter);
+    return full;
+}
+
+size_t wv2_open_file_dialog(WV2Host *host, const char *title, size_t title_len,
+                            const char *default_path, size_t default_path_len,
+                            const char *filters, size_t filters_len,
+                            int allow_multiple, uint8_t *buf, size_t cap) {
+    return run_file_dialog(host, /*save=*/false, title, title_len, default_path,
+                           default_path_len, nullptr, 0, filters, filters_len,
+                           allow_multiple, buf, cap);
+}
+
+size_t wv2_save_file_dialog(WV2Host *host, const char *title, size_t title_len,
+                            const char *default_path, size_t default_path_len,
+                            const char *default_name, size_t default_name_len,
+                            const char *filters, size_t filters_len,
+                            uint8_t *buf, size_t cap) {
+    return run_file_dialog(host, /*save=*/true, title, title_len, default_path,
+                           default_path_len, default_name, default_name_len,
+                           filters, filters_len, /*allow_multiple=*/0, buf, cap);
+}
+
+size_t wv2_show_alert(WV2Host *host, const char *title, size_t title_len,
+                      const char *message, size_t message_len, int style,
+                      size_t button_count) {
+    HWND owner = host ? host->hwnd : nullptr;
+
+    UINT icon;
+    switch (style) {
+    case 1:
+        icon = MB_ICONWARNING;
+        break;
+    case 2:
+        icon = MB_ICONERROR;
+        break;
+    default:
+        icon = MB_ICONINFORMATION;
+        break;
+    }
+
+    // Win32 MessageBoxW has no arbitrary-label button support; map the button
+    // COUNT onto the standard sets exactly as legacy showAlert does.
+    size_t count = button_count == 0 ? 1 : button_count;
+    UINT buttons;
+    if (count == 1)
+        buttons = MB_OK;
+    else if (count == 2)
+        buttons = MB_YESNO;
+    else
+        buttons = MB_YESNOCANCEL;
+
+    wchar_t *wtitle =
+        (title && title_len) ? widen(title, (int)title_len) : nullptr;
+    wchar_t *wmsg =
+        (message && message_len) ? widen(message, (int)message_len) : nullptr;
+
+    int ret = MessageBoxW(owner, wmsg, wtitle, buttons | icon);
+    free(wtitle);
+    free(wmsg);
+
+    // Map the Win32 return code back to the caller's button index in the same
+    // order legacy used: 1-button => 0; 2-button => IDYES=0/IDNO=1; 3-button =>
+    // IDYES=0/IDNO=1/IDCANCEL=2. Unexpected codes => 0.
+    if (count == 1) return 0;
+    if (count == 2) {
+        switch (ret) {
+        case IDYES:
+            return 0;
+        case IDNO:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+    switch (ret) {
+    case IDYES:
+        return 0;
+    case IDNO:
+        return 1;
+    case IDCANCEL:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+WV2Host *wv2_open_child(WV2Host *parent, const char *title, size_t title_len,
+                        int width, int height) {
+    (void)parent; // an independent top-level window, same as legacy.
+    WV2Host *host = new WV2Host();
+    if (!host) return nullptr;
+    wchar_t *wtitle =
+        (title && title_len) ? widen(title, (int)title_len) : nullptr;
+    host->hwnd =
+        create_window(host, wtitle ? wtitle : L"Verve", width, height);
+    free(wtitle);
+    if (!host->hwnd) {
+        delete host;
+        return nullptr;
+    }
+    return host;
 }
 
 } // extern "C"
