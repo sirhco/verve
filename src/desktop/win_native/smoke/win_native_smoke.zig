@@ -16,6 +16,7 @@ const std = @import("std");
 const wn = @import("windows_native");
 
 var g_win: ?*wn.Window = null;
+var g_close_attempts: u32 = 0;
 
 const page =
     \\<!doctype html><html><head><meta charset="utf-8"><style>
@@ -71,6 +72,18 @@ const page =
     \\    <button onclick="window.verve.post('cmd:zoom-in')">setZoom(1.5)</button>
     \\    <button onclick="window.verve.post('cmd:zoom-reset')">setZoom(1.0)</button>
     \\    <button onclick="window.verve.post('cmd:nav-report')">report nav &rarr; Zig &rarr; here</button>
+    \\  </div>
+    \\
+    \\  <div class="grp"><h3>Bundle 4 · events &amp; lifecycle</h3>
+    \\    <button onclick="window.verve.post('cmd:close')">close() (1st close vetoed, 2nd allowed — see console)</button>
+    \\    <br>
+    \\    Drag files onto this window (drop handler logs paths to console).
+    \\    Drag the window edge (resize handler logs w&times;h). Alt-tab away/back
+    \\    (focus handler logs focus/blur).
+    \\    <br>
+    \\    <button onclick="window.verve.post('cmd:deliver-url')">deliverUrl("verve://deep/link")</button>
+    \\    <a href="https://example.com">https://example.com</a>
+    \\    (external link — legacy backend does NOT auto-route this; use the button)
     \\  </div>
     \\
     \\  <div id="log">waiting for round-trip&hellip;</div>
@@ -154,6 +167,10 @@ fn dispatchCommand(win: *wn.Window, payload: []const u8) bool {
         win.setZoom(1.0);
     } else if (std.mem.eql(u8, cmd, "nav-report")) {
         reportNav(win);
+    } else if (std.mem.eql(u8, cmd, "close")) {
+        win.close();
+    } else if (std.mem.eql(u8, cmd, "deliver-url")) {
+        win.deliverUrl("verve://deep/link");
     } else {
         std.debug.print("[zig] unknown cmd: {s}\n", .{cmd});
         return true;
@@ -208,6 +225,48 @@ fn onColorScheme(ctx: ?*anyopaque, scheme: wn.ColorScheme) void {
             "verveLog('OS theme -> {s}');",
             .{@tagName(scheme)},
         ) catch return;
+        w.evalJs(line);
+    }
+}
+
+/// Registered via setResizeHandler; logs client-area size on every WM_SIZE.
+fn onResize(ctx: ?*anyopaque, w: u32, h: u32) void {
+    _ = ctx;
+    std.debug.print("[zig] resize: {d}x{d}\n", .{ w, h });
+}
+
+/// Registered via setFocusHandler; logs window focus/blur on WM_ACTIVATE.
+fn onFocus(ctx: ?*anyopaque, focused: bool) void {
+    _ = ctx;
+    std.debug.print("[zig] focus: {s}\n", .{if (focused) "focused" else "blurred"});
+}
+
+/// Registered via setCloseHandler. Vetoes the FIRST close attempt and allows
+/// the second — exercises the veto path. Returns true to allow, false to veto.
+fn onClose(ctx: ?*anyopaque) bool {
+    _ = ctx;
+    g_close_attempts += 1;
+    const allow = g_close_attempts >= 2;
+    std.debug.print("[zig] close attempt #{d} -> {s}\n", .{
+        g_close_attempts, if (allow) "allow" else "VETO",
+    });
+    return allow;
+}
+
+/// Registered via setDragDropHandler; logs each dropped file path.
+fn onDragDrop(ctx: ?*anyopaque, paths: []const []const u8) void {
+    _ = ctx;
+    std.debug.print("[zig] drop: {d} path(s)\n", .{paths.len});
+    for (paths, 0..) |p, i| std.debug.print("[zig]   [{d}] {s}\n", .{ i, p });
+}
+
+/// Registered via setUrlOpenHandler; logs deep-link URLs (driven by deliverUrl).
+fn onUrlOpen(ctx: ?*anyopaque, url: []const u8) void {
+    _ = ctx;
+    std.debug.print("[zig] url-open: {s}\n", .{url});
+    if (g_win) |w| {
+        var buf: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "verveLog('url-open: {s}');", .{url}) catch return;
         w.evalJs(line);
     }
 }
@@ -269,6 +328,11 @@ pub fn main() void {
 
     win.setMessageHandler(onMsg, null);
     win.setColorSchemeHandler(onColorScheme, null);
+    win.setResizeHandler(onResize, null);
+    win.setFocusHandler(onFocus, null);
+    win.setCloseHandler(onClose, null);
+    win.setDragDropHandler(onDragDrop, null);
+    win.setUrlOpenHandler(onUrlOpen, null);
     win.loadHtml(page, null) catch {};
     win.run();
 }

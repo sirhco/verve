@@ -15,6 +15,9 @@
  */
 #include <windows.h>
 #include <objbase.h>
+#include <ole2.h>      // OleInitialize / RegisterDragDrop / ReleaseStgMedium
+#include <oleidl.h>    // IDropTarget
+#include <shellapi.h>  // DragQueryFileW / CF_HDROP
 
 #include <WebView2.h>
 
@@ -86,6 +89,23 @@ struct WV2Host {
     // broadcast area is "ImmersiveColorSet" (the light/dark toggle signal).
     verve_color_scheme_cb color_scheme_cb = nullptr;
     void *color_scheme_ctx = nullptr;
+
+    // Bundle 4: lifecycle/event callbacks. resize fired from WM_SIZE, focus
+    // from WM_ACTIVATE, close from WM_CLOSE (close_cb returns 0 => veto).
+    verve_resize_cb resize_cb = nullptr;
+    void *resize_ctx = nullptr;
+    verve_focus_cb focus_cb = nullptr;
+    void *focus_ctx = nullptr;
+    verve_close_cb close_cb = nullptr;
+    void *close_ctx = nullptr;
+    verve_drag_drop_cb drag_drop_cb = nullptr;
+    void *drag_drop_ctx = nullptr;
+
+    // Bundle 4: OLE drag-drop registration. The drop target is lazily created
+    // and RegisterDragDrop'd when a handler is first set; revoked on teardown
+    // or when the handler is cleared.
+    IDropTarget *drop_target = nullptr;
+    bool drop_registered = false;
 };
 
 // Read HKCU\...\Personalize\AppsUseLightTheme. 1 = light, 0 = dark, missing =
@@ -252,6 +272,130 @@ public:
     }
 };
 
+// ---- Bundle 4: OLE drag-drop (IDropTarget) ----------------------------------
+
+// IID_IDropTarget {00000122-0000-0000-C000-000000000046}. Declared locally to
+// avoid depending on mingw's libuuid (same rationale as kIID_IUnknown).
+static const IID kIID_IDropTarget = {
+    0x00000122, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+
+// Minimal file-only drop target: advertises DROPEFFECT_COPY on enter/over, and
+// on Drop extracts CF_HDROP paths (UTF-8), NUL-joins them, and hands the buffer
+// to the host's drag_drop_cb. Models the legacy windows.zig IDropTarget, but as
+// a real C++ COM class so the compiler emits the vtable.
+class DropTarget : public IDropTarget {
+    WV2Host *host_;
+
+public:
+    explicit DropTarget(WV2Host *h) : host_(h) {}
+
+    // IUnknown — QueryInterface accepts IUnknown + IDropTarget.
+    LONG ref_ = 1;
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return (ULONG)InterlockedIncrement(&ref_);
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG c = InterlockedDecrement(&ref_);
+        if (c == 0) delete this;
+        return (ULONG)c;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (!ppv) return E_POINTER;
+        if (IsEqualGUID(riid, kIID_IUnknown) ||
+            IsEqualGUID(riid, kIID_IDropTarget)) {
+            *ppv = static_cast<IDropTarget *>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject * /*obj*/, DWORD /*ks*/,
+                                        POINTL /*pt*/, DWORD *effect) override {
+        if (effect) *effect = DROPEFFECT_COPY;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD /*ks*/, POINTL /*pt*/,
+                                       DWORD *effect) override {
+        if (effect) *effect = DROPEFFECT_COPY;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override { return S_OK; }
+
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject *obj, DWORD /*ks*/, POINTL /*pt*/,
+                                   DWORD *effect) override {
+        if (effect) *effect = DROPEFFECT_NONE;
+        if (!host_ || !host_->drag_drop_cb || !obj) return S_OK;
+
+        FORMATETC fmt = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM medium = {};
+        if (FAILED(obj->GetData(&fmt, &medium))) return S_OK;
+
+        HDROP hdrop = (HDROP)medium.hGlobal;
+        if (hdrop) {
+            UINT n = DragQueryFileW(hdrop, 0xFFFFFFFF, nullptr, 0);
+            // Build one UTF-8 buffer of all paths joined by '\0'. Grow as we go.
+            char *out = nullptr;
+            size_t out_len = 0, out_cap = 0;
+            for (UINT i = 0; i < n; ++i) {
+                UINT wlen = DragQueryFileW(hdrop, i, nullptr, 0);
+                wchar_t *wbuf =
+                    (wchar_t *)malloc((size_t)(wlen + 1) * sizeof(wchar_t));
+                if (!wbuf) continue;
+                DragQueryFileW(hdrop, i, wbuf, wlen + 1);
+                int u8n = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)wlen,
+                                              nullptr, 0, nullptr, nullptr);
+                size_t need = out_len + (size_t)u8n + 1; // path + NUL sep
+                if (need > out_cap) {
+                    size_t ncap = out_cap ? out_cap * 2 : 256;
+                    while (ncap < need) ncap *= 2;
+                    char *grown = (char *)realloc(out, ncap);
+                    if (!grown) {
+                        free(wbuf);
+                        break;
+                    }
+                    out = grown;
+                    out_cap = ncap;
+                }
+                if (u8n > 0)
+                    WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)wlen,
+                                        out + out_len, u8n, nullptr, nullptr);
+                out_len += (size_t)u8n;
+                out[out_len++] = '\0'; // separator between paths
+                free(wbuf);
+            }
+            if (out && out_len) {
+                // Deliver without the trailing separator counted, so the Zig
+                // splitter sees N records (it splits on '\0').
+                host_->drag_drop_cb(host_->drag_drop_ctx, (const uint8_t *)out,
+                                    out_len - 1);
+            }
+            free(out);
+        }
+        ReleaseStgMedium(&medium);
+        if (effect) *effect = DROPEFFECT_COPY;
+        return S_OK;
+    }
+};
+
+// Register (or revoke) the host's HWND as an OLE drop target. RegisterDragDrop
+// requires the calling thread to have an OLE apartment, so OleInitialize first.
+static void drop_register(WV2Host *host, bool on) {
+    if (!host || !host->hwnd) return;
+    if (on) {
+        if (host->drop_registered) return;
+        OleInitialize(nullptr); // idempotent per-thread; pairs the OLE apartment
+        if (!host->drop_target) host->drop_target = new DropTarget(host);
+        if (SUCCEEDED(RegisterDragDrop(host->hwnd, host->drop_target)))
+            host->drop_registered = true;
+    } else {
+        if (!host->drop_registered) return;
+        RevokeDragDrop(host->hwnd);
+        host->drop_registered = false;
+    }
+}
+
 // ---- Win32 window -----------------------------------------------------------
 
 static const wchar_t *kWindowClass = L"VerveWv2SpikeWindow";
@@ -260,6 +404,13 @@ static const wchar_t *kWindowClass = L"VerveWv2SpikeWindow";
 #define WV2_REQUIRE_HWND(host, VAL) \
     HWND hwnd = (host) ? (host)->hwnd : nullptr; \
     if (!hwnd) return VAL;
+
+// Bind `wv` to the host's ICoreWebView2, early-returning VAL if there is none
+// (host null, or the controller/webview not yet created). Parallel to
+// WV2_REQUIRE_HWND; used by the navigation + event-routing methods.
+#define WV2_REQUIRE_WEBVIEW(host, VAL) \
+    ICoreWebView2 *wv = (host) ? (host)->webview : nullptr; \
+    if (!wv) return VAL;
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     WV2Host *host =
@@ -270,6 +421,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc;
             GetClientRect(hwnd, &rc);
             host->controller->put_Bounds(rc);
+        }
+        // Then fire the app resize handler. lParam low word = client width,
+        // high word = client height (matches legacy windows.zig WM_SIZE).
+        if (host && host->resize_cb) {
+            host->resize_cb(host->resize_ctx, (uint32_t)LOWORD(lp),
+                            (uint32_t)HIWORD(lp));
         }
         return 0;
     case WM_GETMINMAXINFO:
@@ -295,7 +452,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return 0;
+    case WM_ACTIVATE:
+        // wParam low word: 0 = inactive (blur), non-zero = activated (focus).
+        // Matches legacy windows.zig WM_ACTIVATE dispatch.
+        if (host && host->focus_cb) {
+            host->focus_cb(host->focus_ctx, (LOWORD(wp) != 0) ? 1 : 0);
+        }
+        return 0;
+    case WM_CLOSE:
+        // Title-bar X / system Close. Run the veto handler if present: a 0
+        // return vetoes (keep the window alive, return 0 here). Otherwise fall
+        // through to DefWindowProcW, which DestroyWindows -> WM_DESTROY ->
+        // PostQuitMessage. Matches legacy windows.zig WM_CLOSE.
+        if (host && host->close_cb) {
+            if (host->close_cb(host->close_ctx) == 0) return 0; // vetoed
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_DESTROY:
+        if (host && host->drop_registered) {
+            RevokeDragDrop(hwnd);
+            host->drop_registered = false;
+        }
         PostQuitMessage(0);
         return 0;
     default:
@@ -429,6 +606,14 @@ void wv2_destroy(WV2Host *host) {
     if (host->controller) {
         host->controller->Close();
         host->controller->Release();
+    }
+    if (host->drop_registered && host->hwnd) {
+        RevokeDragDrop(host->hwnd);
+        host->drop_registered = false;
+    }
+    if (host->drop_target) {
+        host->drop_target->Release();
+        host->drop_target = nullptr;
     }
     free(host->pending_html);
     free(host->pending_url);
@@ -637,28 +822,31 @@ void wv2_set_fullscreen(WV2Host *host, int on) {
 // ---- Bundle 3: navigation & webview state -----------------------------------
 
 void wv2_reload(WV2Host *host) {
-    if (host && host->webview) host->webview->Reload();
+    WV2_REQUIRE_WEBVIEW(host, );
+    wv->Reload();
 }
 
 void wv2_go_back(WV2Host *host) {
-    if (host && host->webview) host->webview->GoBack();
+    WV2_REQUIRE_WEBVIEW(host, );
+    wv->GoBack();
 }
 
 void wv2_go_forward(WV2Host *host) {
-    if (host && host->webview) host->webview->GoForward();
+    WV2_REQUIRE_WEBVIEW(host, );
+    wv->GoForward();
 }
 
 int wv2_can_go_back(WV2Host *host) {
-    if (!host || !host->webview) return 0;
+    WV2_REQUIRE_WEBVIEW(host, 0);
     BOOL b = FALSE;
-    host->webview->get_CanGoBack(&b);
+    wv->get_CanGoBack(&b);
     return b ? 1 : 0;
 }
 
 int wv2_can_go_forward(WV2Host *host) {
-    if (!host || !host->webview) return 0;
+    WV2_REQUIRE_WEBVIEW(host, 0);
     BOOL b = FALSE;
-    host->webview->get_CanGoForward(&b);
+    wv->get_CanGoForward(&b);
     return b ? 1 : 0;
 }
 
@@ -686,16 +874,16 @@ static size_t fill_utf8_from_wide(LPWSTR w, uint8_t *buf, size_t cap) {
 }
 
 size_t wv2_current_url(WV2Host *host, uint8_t *buf, size_t cap) {
-    if (!host || !host->webview) return 0;
+    WV2_REQUIRE_WEBVIEW(host, 0);
     LPWSTR src = nullptr;
-    if (FAILED(host->webview->get_Source(&src)) || !src) return 0;
+    if (FAILED(wv->get_Source(&src)) || !src) return 0;
     return fill_utf8_from_wide(src, buf, cap);
 }
 
 size_t wv2_current_title(WV2Host *host, uint8_t *buf, size_t cap) {
-    if (!host || !host->webview) return 0;
+    WV2_REQUIRE_WEBVIEW(host, 0);
     LPWSTR title = nullptr;
-    if (FAILED(host->webview->get_DocumentTitle(&title)) || !title) return 0;
+    if (FAILED(wv->get_DocumentTitle(&title)) || !title) return 0;
     return fill_utf8_from_wide(title, buf, cap);
 }
 
@@ -720,6 +908,42 @@ void wv2_set_color_scheme_cb(WV2Host *host, verve_color_scheme_cb cb,
     if (!host) return;
     host->color_scheme_cb = cb;
     host->color_scheme_ctx = ctx;
+}
+
+// ---- Bundle 4: event handlers & lifecycle -----------------------------------
+
+void wv2_set_resize_cb(WV2Host *host, verve_resize_cb cb, void *ctx) {
+    if (!host) return;
+    host->resize_cb = cb;
+    host->resize_ctx = ctx;
+}
+
+void wv2_set_focus_cb(WV2Host *host, verve_focus_cb cb, void *ctx) {
+    if (!host) return;
+    host->focus_cb = cb;
+    host->focus_ctx = ctx;
+}
+
+void wv2_set_close_cb(WV2Host *host, verve_close_cb cb, void *ctx) {
+    if (!host) return;
+    host->close_cb = cb;
+    host->close_ctx = ctx;
+}
+
+void wv2_set_drag_drop_cb(WV2Host *host, verve_drag_drop_cb cb, void *ctx) {
+    if (!host) return;
+    host->drag_drop_cb = cb;
+    host->drag_drop_ctx = ctx;
+    // Register the HWND as a drop target on first non-null handler; revoke when
+    // cleared. Mirrors legacy setDragDropHandler.
+    drop_register(host, cb != nullptr);
+}
+
+void wv2_close(WV2Host *host) {
+    WV2_REQUIRE_HWND(host, );
+    // Post WM_CLOSE so the close path (incl. any veto handler) runs, exactly as
+    // legacy windows.zig close() does via SendMessageW.
+    SendMessageW(hwnd, WM_CLOSE, 0, 0);
 }
 
 } // extern "C"

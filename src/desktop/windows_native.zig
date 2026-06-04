@@ -68,6 +68,17 @@ extern fn wv2_get_zoom(host: *Host) f64;
 extern fn wv2_color_scheme(host: *Host) c_int;
 extern fn wv2_set_color_scheme_cb(host: *Host, cb: ?ColorSchemeFn, ctx: ?*anyopaque) void;
 
+// Bundle 4: event handlers & lifecycle.
+const ResizeFn = *const fn (ctx: ?*anyopaque, w: u32, h: u32) callconv(.c) void;
+const FocusFn = *const fn (ctx: ?*anyopaque, focused: c_int) callconv(.c) void;
+const CloseFn = *const fn (ctx: ?*anyopaque) callconv(.c) c_int;
+const DragDropFn = *const fn (ctx: ?*anyopaque, paths: [*]const u8, len: usize) callconv(.c) void;
+extern fn wv2_set_resize_cb(host: *Host, cb: ?ResizeFn, ctx: ?*anyopaque) void;
+extern fn wv2_set_focus_cb(host: *Host, cb: ?FocusFn, ctx: ?*anyopaque) void;
+extern fn wv2_set_close_cb(host: *Host, cb: ?CloseFn, ctx: ?*anyopaque) void;
+extern fn wv2_set_drag_drop_cb(host: *Host, cb: ?DragDropFn, ctx: ?*anyopaque) void;
+extern fn wv2_close(host: *Host) void;
+
 /// Toast error set — mirrors the legacy `windows.zig` surface so the
 /// module-level `showToast` is signature-compatible.
 pub const ToastError = error{ Unsupported, Backend, OutOfMemory };
@@ -86,6 +97,16 @@ const WindowCtx = struct {
     on_message_ctx: ?*anyopaque = null,
     on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
     on_color_scheme_ctx: ?*anyopaque = null,
+    on_url_open: ?opts_mod.UrlOpenHandler = null,
+    on_url_open_ctx: ?*anyopaque = null,
+    on_drag_drop: ?opts_mod.DragDropHandler = null,
+    on_drag_drop_ctx: ?*anyopaque = null,
+    on_resize: ?opts_mod.ResizeHandler = null,
+    on_resize_ctx: ?*anyopaque = null,
+    on_focus: ?opts_mod.FocusHandler = null,
+    on_focus_ctx: ?*anyopaque = null,
+    on_close: ?opts_mod.CloseHandler = null,
+    on_close_ctx: ?*anyopaque = null,
 };
 
 pub const Window = struct {
@@ -293,45 +314,63 @@ pub const Window = struct {
         );
     }
 
+    /// Register a deep-link URL handler. As in the legacy backend, the URL is
+    /// not routed from in-page navigations (WebView2 NavigationStarting is only
+    /// a debug probe there); delivery is via `deliverUrl` (cold-launch argv) —
+    /// the handler+ctx are stored Zig-side and invoked directly. `null` clears.
     pub fn setUrlOpenHandler(self: *Window, cb: ?opts_mod.UrlOpenHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
-        // TODO bundle 4
+        self.ctx.on_url_open = cb;
+        self.ctx.on_url_open_ctx = ctx;
     }
 
+    /// Synthesize a URL delivery — call the registered url-open handler with
+    /// `url`. Used by templates to feed argv-derived cold-launch URLs through
+    /// the same callback a future WM_COPYDATA receiver will drive. Pure Zig: no
+    /// C-ABI round trip needed since the handler lives in WindowCtx.
     pub fn deliverUrl(self: *Window, url: []const u8) void {
-        _ = self;
-        _ = url;
-        // TODO bundle 4
+        if (self.ctx.on_url_open) |cb| cb(self.ctx.on_url_open_ctx, url);
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
-        // TODO bundle 4
+        self.ctx.on_drag_drop = cb;
+        self.ctx.on_drag_drop_ctx = ctx;
+        wv2_set_drag_drop_cb(
+            self.ctx.host,
+            if (cb == null) null else dragDropTrampoline,
+            self.ctx,
+        );
     }
 
     pub fn setResizeHandler(self: *Window, cb: ?opts_mod.ResizeHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
-        // TODO bundle 4
+        self.ctx.on_resize = cb;
+        self.ctx.on_resize_ctx = ctx;
+        wv2_set_resize_cb(
+            self.ctx.host,
+            if (cb == null) null else resizeTrampoline,
+            self.ctx,
+        );
     }
 
     pub fn setFocusHandler(self: *Window, cb: ?opts_mod.FocusHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
-        // TODO bundle 4
+        self.ctx.on_focus = cb;
+        self.ctx.on_focus_ctx = ctx;
+        wv2_set_focus_cb(
+            self.ctx.host,
+            if (cb == null) null else focusTrampoline,
+            self.ctx,
+        );
     }
 
     pub fn setCloseHandler(self: *Window, cb: ?opts_mod.CloseHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
-        // TODO bundle 4
+        self.ctx.on_close = cb;
+        self.ctx.on_close_ctx = ctx;
+        // No handler => leave the native close-cb unregistered so WM_CLOSE
+        // takes the normal (allow) default; legacy has no veto without a cb.
+        wv2_set_close_cb(
+            self.ctx.host,
+            if (cb == null) null else closeTrampoline,
+            self.ctx,
+        );
     }
 
     pub fn colorScheme(self: *Window) opts_mod.ColorScheme {
@@ -420,8 +459,9 @@ pub const Window = struct {
     }
 
     pub fn close(self: *Window) void {
-        _ = self;
-        // TODO bundle 8
+        // Post WM_CLOSE so the standard close path (and any veto handler) runs,
+        // matching legacy windows.zig close().
+        wv2_close(self.ctx.host);
     }
 };
 
@@ -448,6 +488,48 @@ fn colorSchemeTrampoline(ctx: ?*anyopaque, scheme: c_int) callconv(.c) void {
     if (wc.on_color_scheme) |h| h(wc.on_color_scheme_ctx, intToColorScheme(scheme));
 }
 
+/// WM_SIZE -> app resize handler (client-area width/height).
+fn resizeTrampoline(ctx: ?*anyopaque, w: u32, h: u32) callconv(.c) void {
+    const wc: *WindowCtx = @ptrCast(@alignCast(ctx.?));
+    if (wc.on_resize) |h_fn| h_fn(wc.on_resize_ctx, w, h);
+}
+
+/// WM_ACTIVATE -> app focus handler (focused = activated).
+fn focusTrampoline(ctx: ?*anyopaque, focused: c_int) callconv(.c) void {
+    const wc: *WindowCtx = @ptrCast(@alignCast(ctx.?));
+    if (wc.on_focus) |h| h(wc.on_focus_ctx, focused != 0);
+}
+
+/// WM_CLOSE veto gate. Returns 1 to allow the close, 0 to veto. With no handler
+/// stored, default to allow (1) — though the native side won't register us then.
+fn closeTrampoline(ctx: ?*anyopaque) callconv(.c) c_int {
+    const wc: *WindowCtx = @ptrCast(@alignCast(ctx.?));
+    if (wc.on_close) |h| return if (h(wc.on_close_ctx)) 1 else 0;
+    return 1;
+}
+
+/// OLE Drop -> app drag-drop handler. `paths` is a UTF-8 buffer of dropped file
+/// paths separated by '\0' (no trailing separator). Split into a slice-of-slices
+/// pointing into the buffer (valid for the synchronous handler call) and invoke.
+fn dragDropTrampoline(ctx: ?*anyopaque, paths: [*]const u8, len: usize) callconv(.c) void {
+    const wc: *WindowCtx = @ptrCast(@alignCast(ctx.?));
+    const cb = wc.on_drag_drop orelse return;
+    const buf = paths[0..len];
+
+    // Count records (NUL-separated, no trailing NUL) and split. Cap at a fixed
+    // stack array to avoid an allocation on the synchronous drop path; extra
+    // paths beyond the cap are dropped (a multi-thousand-file drop is absurd).
+    var slices: [256][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, buf, 0);
+    while (it.next()) |seg| {
+        if (n >= slices.len) break;
+        slices[n] = seg;
+        n += 1;
+    }
+    cb(wc.on_drag_drop_ctx, slices[0..n]);
+}
+
 /// Shared body for currentUrl / currentTitle. The C fn fills a caller buffer
 /// and returns the FULL byte length; if it overflows the stack buffer we
 /// allocate exactly and call again. Empty (0) on an unavailable webview —
@@ -460,6 +542,9 @@ fn wv2GetString(
     var stack: [2048]u8 = undefined;
     const len = getter(host, &stack, stack.len);
     if (len <= stack.len) return allocator.dupe(u8, stack[0..len]);
+    // NOTE: the heap-retry path can TOCTOU-truncate if the url/title grows
+    // between the two getter calls (we size to the first call's length, then
+    // min() the second). Spike-acceptable for a synchronous UI-thread getter.
     const heap = try allocator.alloc(u8, len);
     errdefer allocator.free(heap);
     const got = getter(host, heap.ptr, heap.len);

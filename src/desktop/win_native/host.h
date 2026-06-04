@@ -96,6 +96,27 @@ int    wv2_color_scheme(WV2Host *host);
 typedef void (*verve_color_scheme_cb)(void *ctx, int scheme);
 void   wv2_set_color_scheme_cb(WV2Host *host, verve_color_scheme_cb cb, void *ctx);
 
+/* ---- Bundle 4: event handlers & lifecycle -------------------------------- */
+
+/* All fired on the UI thread. resize: client-area size on WM_SIZE. focus:
+ * activated(1)/blurred(0) on WM_ACTIVATE. close: WM_CLOSE veto gate — return 0
+ * to veto (keep the window), non-zero to allow the default close. drag_drop:
+ * dropped file paths as one UTF-8 buffer with paths separated by '\0' (no
+ * trailing separator); `len` is the buffer length. */
+typedef void (*verve_resize_cb)(void *ctx, uint32_t w, uint32_t h);
+typedef void (*verve_focus_cb)(void *ctx, int focused);
+typedef int  (*verve_close_cb)(void *ctx);
+typedef void (*verve_drag_drop_cb)(void *ctx, const uint8_t *paths_nul_joined,
+                                   size_t len);
+
+void wv2_set_resize_cb(WV2Host *host, verve_resize_cb cb, void *ctx);
+void wv2_set_focus_cb(WV2Host *host, verve_focus_cb cb, void *ctx);
+void wv2_set_close_cb(WV2Host *host, verve_close_cb cb, void *ctx);
+void wv2_set_drag_drop_cb(WV2Host *host, verve_drag_drop_cb cb, void *ctx);
+
+/* Post WM_CLOSE so the close path (incl. any veto handler) runs. */
+void wv2_close(WV2Host *host);
+
 #ifdef __cplusplus
 }
 #endif
