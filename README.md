@@ -41,7 +41,7 @@ Verve is the bet that you can have all three web targets *and* desktop, in **pur
 - **SSR-first.** Pages render server-side as `*Node` trees streamed straight to the socket. Search engines and noscript clients see real content. No hydration handshake required to read the page.
 - **Real reactivity on the client.** The same `Signal` / `Effect` / `Owner` / `Resource` graph the server uses ships into a wasm32-freestanding client runtime. DOM updates are a *consequence* of `Signal.set` — not a parallel write path tacked on for "JS interactivity."
 - **One binary, two surfaces.** `zig build` produces either an HTTP server with the WASM client, per-island chunks, JS bridge, public assets, and manifest baked in — *or* a native desktop binary opening a system webview, with the build-time-SSR'd page + the same wasm hydration served from the embedded asset table via a `verve://` URL scheme. No Chromium, no Node runtime, no bundler config. Deploy by `scp` either way.
-- **Pure Zig.** Zero third-party dependencies. The framework, scaffolder, server-fn codegen, island chunker, reactive runtime, *and* the three desktop backends (objc runtime for WKWebView, hand-rolled COM offsets for WebView2, GTK 3 + WebKit 4.1 for Linux) are all in this repo, in one language, behind the same `zig fmt` rules.
+- **Pure Zig.** Zero third-party Zig dependencies. The framework, scaffolder, server-fn codegen, island chunker, and reactive runtime are all pure Zig in this repo, behind the same `zig fmt` rules. The desktop backends bind the native platform webview (objc runtime for WKWebView, a native C++ host for WebView2, GTK 3 + WebKit 4.1 for Linux) — all in-tree, compiled by the bundled `zig cc`, no external SDK fetch.
 
 If the goal is to ship a server-rendered, reactive web app with the operational profile of a Go binary and the type ergonomics of a hand-written `view!` macro — *or* a native desktop app that doesn't bundle a whole browser — without taking on Rust's compile times, npm's lockfile churn, or React's hydration cost, that's what Verve exists for.
 
@@ -153,7 +153,7 @@ Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed
 - **WASM hydration** — `src/client/main.zig` compiled to `wasm32-freestanding` (ReleaseSmall, ~470 B for the demo), served at `verve://app/client.wasm`. A stripped bridge (`verve_desktop.js`) instantiates it and dispatches `[z-on-click]` to wasm exports.
 - **Typed IPC** — `desktop.Router(Ctx, Routes)` with comptime `Args` + `Reply` types; JS callers `await window.verve.request({type, ...})` and get a typed Promise back.
 - **Cookies** — per-window `CookieStore` with real implementations on all three backends (sync wrappers over the native async cookie managers via nested run-loop pumps).
-- **Clipboard** — `Window.clipboard().writeText(s)` / `.readText(alloc)` / `.writeHtml(html)` against `NSPasteboard` (macOS), `CF_UNICODETEXT` + HGLOBAL (Windows), and `GtkClipboard` on the CLIPBOARD selection (Linux). `.writeImage(png)` / `.readImage(alloc)` for PNG bitmaps (macOS; Unsupported on Windows + Linux).
+- **Clipboard** — `Window.clipboard().writeText(s)` / `.readText(alloc)` / `.writeHtml(html)` against `NSPasteboard` (macOS), `CF_UNICODETEXT` / `CF_HTML` + HGLOBAL (Windows), and `GtkClipboard` on the CLIPBOARD selection (Linux). `.writeImage(png)` / `.readImage(alloc)` for PNG bitmaps (macOS + Windows via WIC `CF_DIBV5`; Unsupported on Linux).
 - **Multi-window** — `Window.openChildWindow(opts)`; last-window-quit semantics on all three platforms.
 - **Single-instance enforcement** — `desktop.single_instance.acquire(alloc, "my-app")` returns a `Lock` held for process lifetime. POSIX `flock` on macOS + Linux, `CreateMutexW` under `Local\` on Windows.
 - **Color-scheme follow** — `Window.colorScheme()` returns `.light` / `.dark` / `.unknown` from the OS preference; `Window.setColorSchemeHandler(cb, ctx)` fires live on toggle (NSDistributedNotificationCenter / WM_SETTINGCHANGE / GtkSettings notify).
@@ -164,7 +164,7 @@ Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed
 - **Level-3 golden-diff smoke** — `zig build smoke` runs the app under `--smoke`, drives a deterministic interaction sequence, captures a PNG via `Window.takeSnapshotPng`, diffs a DOM checksum vs `tests/golden/`.
 - **Dev-loop watcher** — `zig build dev` polls watched sources and respawns the app on change.
 - **`--dev <dir>` hot-reload** — runtime asset fallback in the scheme handler. Edit `frontend/style.css` or `frontend/verve_desktop.js`, reload with Cmd+R, see the change without a rebuild. Path traversal rejected; 16 MB per-file cap.
-- **WebView2 auto-vendor** — Windows builds fetch the pinned SDK from NuGet on first build (idempotent).
+- **Vendored WebView2, native C++ host** — the Windows backend is a native C++ WebView2 host (`src/desktop/win_native/webview2_host.cpp`) behind a flat C ABI; the WebView2 SDK header + x64 `WebView2Loader.dll` are vendored in-tree, so builds (including cross-compiles) need no network fetch and ship the loader next to the `.exe`. Requires the WebView2 **Evergreen Runtime** at runtime (preinstalled on Windows 11; on Windows 10 install Microsoft's bootstrapper).
 
 See **[docs/19-desktop.md](docs/19-desktop.md)** for the full feature
 tour and platform support matrix.
@@ -186,7 +186,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.1.37
+VERSION=0.1.38
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256

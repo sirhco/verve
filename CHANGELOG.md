@@ -4,6 +4,70 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.38] - 2026-06-04
+
+### Changed
+
+- **Windows desktop backend reimplemented as a native C++ WebView2 host.**
+  The previous backend was ~4000 lines of pure-Zig hand-rolled COM (vtable
+  offsets transcribed by hand from `WebView2.h`). It is replaced by a native
+  C++ host (`src/desktop/win_native/webview2_host.cpp`) behind a thin flat C
+  ABI, with `src/desktop/windows_native.zig` as the Zig backend. The C++
+  compiler generates the COM vtables from the real (vendored) `WebView2.h`, so
+  there are no more hand-counted offsets. **The public `Window` / `desktop`
+  API is unchanged** — this is an implementation + reliability change, not an
+  API change. The Windows backend is now **verified on real Windows hardware**
+  (it was previously cross-compile-only): window/webview lifecycle, the
+  JS↔Zig bridge, geometry/state, navigation, events, drag-and-drop, dialogs,
+  child windows, cookies, clipboard (text/HTML/image), print, snapshot,
+  accessibility, tray, and notifications were all exercised on-device.
+
+### Added
+
+- **Windows HTML clipboard (`CF_HTML`).** `Clipboard.writeHtml` / `readHtml`
+  now work on Windows (registered `HTML Format` with a byte-accurate `CF_HTML`
+  header built by a unit-tested pure-Zig codec), so HTML pastes into Word /
+  WordPad as formatted content. Linux remains `error.Unsupported`.
+
+### Removed
+
+- **NuGet WebView2 auto-vendor.** Windows builds no longer fetch the WebView2
+  SDK from NuGet on first build. The SDK header and the x64
+  `WebView2Loader.dll` are vendored in-tree under
+  `src/desktop/win_native/include/`; the build compiles the native C++ host
+  and ships `WebView2Loader.dll` next to the produced `.exe`. Scaffolded
+  `--desktop` apps build offline with no network step. The
+  `tools/fetch_webview2.{sh,ps1}` scripts are gone.
+
+### Fixed
+
+- **Windows cookie/clipboard deadlock.** Synchronous cookie reads
+  (`cookies().get()/delete()`) pump a nested message loop awaiting WebView2's
+  async `GetCookies` completion. WebView2 serializes its event callbacks and
+  will not fire the completion while a `WebMessageReceived` handler is on the
+  stack, so calling these from inside the JS bridge deadlocked. Bridge
+  messages are now delivered via a posted window message handled in `WndProc`,
+  off the WebView2 callback stack.
+- **Windows backend-selection segfault.** `cookies.zig` / `clipboard.zig`
+  selected the desktop backend independently of `window.zig`; a `Window` from
+  one backend could hand its native window pointer to a `CookieStore` /
+  `Clipboard` that dispatched into the other, dereferencing a foreign pointer.
+  Backend selection is now single-sourced in `src/desktop/backend.zig`.
+
+### Upgrade notes
+
+- **No app source changes** — the desktop `Window` / `desktop` API is unchanged.
+- **Existing scaffolded `--desktop` apps** (generated before 0.1.38) carry a
+  vendored copy of the framework's `src/desktop/` plus the old template
+  `build.zig`. To pick up the native host, **re-scaffold** with the 0.1.38
+  `verve-cli` (or re-vendor `src/desktop/` + the desktop `build.zig`). Old
+  projects also still contain now-unused `tools/fetch_webview2.{sh,ps1}` +
+  `tools/webview2.pinned.txt` — safe to delete.
+- **Windows runtime**: requires the Microsoft Edge WebView2 Evergreen Runtime
+  (preinstalled on Windows 11; on Windows 10 install Microsoft's bootstrapper).
+  The build ships `WebView2Loader.dll` next to the `.exe`.
+- **macOS and Linux desktop backends are unchanged.**
+
 ## [0.1.37] - 2026-06-02
 
 ### Added

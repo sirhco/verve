@@ -61,9 +61,7 @@ my-app/
 ├── tools/
 │   ├── render_index.zig                 ← build-time SSR binary
 │   ├── dev.zig                          ← dev-loop watcher
-│   ├── smoke_{macos,linux,windows}.{sh,ps1}
-│   ├── fetch_webview2.{sh,ps1}          ← Windows: auto-vendor WebView2 SDK
-│   └── webview2.pinned.txt
+│   └── smoke_{macos,linux,windows}.{sh,ps1}
 ├── tests/golden/
 │   └── checksum.txt                     ← smoke harness golden
 └── public/                              ← optional extra assets (-Dpublic-dir override)
@@ -272,8 +270,12 @@ reference. Headline list:
   copies it into `Contents/Resources/AppIcon.icns` and adds the
   matching `CFBundleIconFile` key to `Info.plist`. Without it Finder
   falls back to the generic app glyph.
-- **WebView2 auto-vendor** — Windows builds fetch the pinned SDK
-  from NuGet on first build (idempotent)
+- **Vendored WebView2** — the WebView2 SDK header + x64
+  `WebView2Loader.dll` are vendored in-tree under
+  `src/desktop/win_native/include/`; the build compiles the native C++
+  host (`win_native/webview2_host.cpp`) and ships the loader next to the
+  `.exe`. No NuGet / network fetch. Needs the WebView2 Evergreen Runtime
+  at runtime (preinstalled on Win11; Win10 needs Microsoft's bootstrapper)
 - **Dev loop** — `zig build dev` watches sources, rebuilds, respawns
 - **`--dev <dir>` runtime fallback** — scheme handler tries
   `<dir>/<path>` before the embedded asset table on every request, so
@@ -322,8 +324,8 @@ Zig calls via nested event-loop pumps.
 | Native print dialog | ✓ | ✓ | ✓ |
 | Print copies / pages / printer | ✓ | stub | stub |
 | Clipboard (text) | ✓ | ✓ | ✓ |
-| Clipboard (HTML) | ✓ | stub | stub |
-| Clipboard (image/PNG) | ✓ | pending | pending |
+| Clipboard (HTML) | ✓ | ✓ | stub |
+| Clipboard (image/PNG) | ✓ | ✓ | pending |
 | Battery / charging (`desktop.power`) | ✓ | ✓ | ✓ |
 | Disk space (`desktop.disk`) | ✓ | ✓ | ✓ |
 | System info (`desktop.system`) | ✓ | ✓ | ✓ |

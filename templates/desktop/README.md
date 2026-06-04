@@ -25,12 +25,13 @@ zig build test    # any zig tests in the project
 - **macOS**: WebKit/Cocoa ship with the OS. Nothing to install.
 - **Windows**: requires the Microsoft Edge WebView2 Evergreen runtime
   at run time. Win11 ships with it; Win10 may not — install from
-  <https://developer.microsoft.com/microsoft-edge/webview2/>. The
-  build-time SDK (`WebView2Loader.dll.lib`) is fetched automatically
-  by `tools/fetch_webview2.ps1` when `third_party/webview2/` is empty;
-  the script honours the version pinned in `tools/webview2.pinned.txt`.
-  To skip the fetch (CI cache hits, air-gapped builds) pass
-  `-Dwebview2-no-fetch=true` and supply the SDK via `-Dwebview2-sdk=PATH`.
+  <https://developer.microsoft.com/microsoft-edge/webview2/>. There is
+  no build-time SDK fetch: the WebView2 header and the x64
+  `WebView2Loader.dll` are vendored in this project under
+  `src/desktop/win_native/include/`, the build compiles the native C++
+  host (`src/desktop/win_native/webview2_host.cpp`), and the loader DLL
+  is installed next to the produced `.exe`. Builds (including
+  cross-compiles from macOS/Linux) work offline.
 - **Linux (Debian/Ubuntu)**: `sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev`
 - **Linux (Fedora)**: `sudo dnf install gtk3-devel webkit2gtk4.1-devel`
 
@@ -44,7 +45,6 @@ src/client/main.zig  WASM client — compiled to wasm32-freestanding.
 src/desktop/         Platform abstraction (vendored, do not edit casually).
 tools/render_index.zig  Build-time SSR binary — runs verve.Renderer.
 tools/dev.zig        Dev-loop watcher — rebuild + respawn on file change.
-tools/fetch_webview2.{sh,ps1}  WebView2 SDK auto-vendor (Windows).
 frontend/style.css   Static stylesheet (CSS, fonts, images go here).
 frontend/verve_desktop.js  Desktop bridge — fetches client.wasm + hydrates.
 public/              Optional extra assets.
@@ -748,8 +748,6 @@ Overrides:
 | `-Dicon=<path>` | (none) | macOS bundle icon (`.icns`); copied to `Contents/Resources/AppIcon.icns` |
 | `-Dcodesign=<identity>` | (none) | macOS bundle signing identity |
 | `-Dhardened=<bool>` | `false` | macOS: hardened runtime + WKWebView entitlements |
-| `-Dwebview2-sdk=<path>` | `third_party/webview2` | Windows: WebView2 SDK location |
-| `-Dwebview2-no-fetch=<bool>` | `false` | Windows: skip NuGet fetch (use existing SDK) |
 
 ## Platform support matrix
 

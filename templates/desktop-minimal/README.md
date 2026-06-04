@@ -32,7 +32,7 @@ frontend/
   index.html           single page
   style.css            responsive styling
 public/                drop-in static files (served alongside frontend/)
-tools/                 WebView2 SDK auto-vendor scripts (Windows)
+tools/                 build-time SSR + dev-loop helpers
 ```
 
 ## IPC
@@ -50,6 +50,9 @@ public decl is a route with `Args`, `Reply`, and a `handle` fn.
 ## Platform notes
 
 - **macOS**: bundles fine with `Cocoa` + `WebKit`. No extra deps.
-- **Windows**: the build auto-downloads the pinned WebView2 SDK to
-  `third_party/webview2/` on first run.
+- **Windows**: the WebView2 header + x64 `WebView2Loader.dll` are
+  vendored in-tree (`src/desktop/win_native/include/`); the build
+  compiles the native C++ host and ships the loader next to the `.exe`.
+  No SDK download. Needs the WebView2 Evergreen Runtime at run time
+  (preinstalled on Win11; Win10 needs Microsoft's bootstrapper).
 - **Linux**: needs `gtk+-3.0` + `webkit2gtk-4.1` dev packages.
