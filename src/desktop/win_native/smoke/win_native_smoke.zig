@@ -96,6 +96,14 @@ const page =
     \\    <button onclick="window.verve.post('cmd:child')">openChildWindow (2nd window)</button>
     \\  </div>
     \\
+    \\  <div class="grp"><h3>Bundle 6 · cookies (ICoreWebView2CookieManager)</h3>
+    \\    <button onclick="window.verve.post('cmd:cookie-set')">cookie set (verve_smoke)</button>
+    \\    <button onclick="window.verve.post('cmd:cookie-get')">cookie get</button>
+    \\    <button onclick="window.verve.post('cmd:cookie-delete')">cookie delete</button>
+    \\    <button onclick="window.verve.post('cmd:cookie-clear')">cookie clear</button>
+    \\    <br>(uses this page's own origin; load over a real http(s) page to exercise fully)
+    \\  </div>
+    \\
     \\  <div id="log">waiting for round-trip&hellip;</div>
     \\  <script>
     \\    function verveLog(s) { document.getElementById('log').textContent = s; }
@@ -189,6 +197,14 @@ fn dispatchCommand(win: *wn.Window, payload: []const u8) bool {
         runAlert(win);
     } else if (std.mem.eql(u8, cmd, "child")) {
         runChild(win);
+    } else if (std.mem.eql(u8, cmd, "cookie-set")) {
+        runCookieSet(win);
+    } else if (std.mem.eql(u8, cmd, "cookie-get")) {
+        runCookieGet(win);
+    } else if (std.mem.eql(u8, cmd, "cookie-delete")) {
+        runCookieDelete(win);
+    } else if (std.mem.eql(u8, cmd, "cookie-clear")) {
+        runCookieClear(win);
     } else {
         std.debug.print("[zig] unknown cmd: {s}\n", .{cmd});
         return true;
@@ -309,6 +325,85 @@ fn runChild(win: *wn.Window) void {
     }
     std.debug.print("[zig] openChildWindow -> opened\n", .{});
     win.evalJs("verveLog('child: opened a second window');");
+}
+
+// ---- Bundle 6 · cookies -----------------------------------------------------
+//
+// All four route through win.cookies() -> the CookieStore -> the native-host
+// cookie ABI. They use the page's own origin (empty domain lets WebView2 apply
+// it), so loading the smoke over the verve:// HTML page exercises the plumbing;
+// a real http(s) page exercises full round-trips.
+
+const COOKIE_NAME = "verve_smoke";
+
+/// "cookie set" — write a test cookie and log success/failure.
+fn runCookieSet(win: *wn.Window) void {
+    win.cookies().set(.{
+        .name = COOKIE_NAME,
+        .value = "hello-from-zig",
+        .path = "/",
+        .same_site = .lax,
+    }) catch |err| {
+        std.debug.print("[zig] cookie set: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('cookie set: error / unsupported');");
+        return;
+    };
+    std.debug.print("[zig] cookie set ok\n", .{});
+    win.evalJs("verveLog('cookie set: ok');");
+}
+
+/// "cookie get" — read the test cookie back and log its fields.
+fn runCookieGet(win: *wn.Window) void {
+    const alloc = std.heap.page_allocator;
+    const maybe = win.cookies().get(alloc, COOKIE_NAME) catch |err| {
+        std.debug.print("[zig] cookie get: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('cookie get: error / unsupported');");
+        return;
+    };
+    if (maybe) |c| {
+        defer {
+            alloc.free(c.name);
+            alloc.free(c.value);
+            alloc.free(c.domain);
+            alloc.free(c.path);
+        }
+        std.debug.print(
+            "[zig] cookie get -> name={s} value={s} domain={s} path={s} expires={d} secure={} httpOnly={} sameSite={s}\n",
+            .{ c.name, c.value, c.domain, c.path, c.expires_unix, c.secure, c.http_only, @tagName(c.same_site) },
+        );
+        var buf: [1024]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buf,
+            "verveLog('cookie get: {s}={s} domain=\"{s}\" path=\"{s}\" sameSite={s}');",
+            .{ c.name, c.value, c.domain, c.path, @tagName(c.same_site) },
+        ) catch return;
+        win.evalJs(line);
+    } else {
+        std.debug.print("[zig] cookie get -> (none)\n", .{});
+        win.evalJs("verveLog('cookie get: (no match)');");
+    }
+}
+
+/// "cookie delete" — remove the test cookie and log.
+fn runCookieDelete(win: *wn.Window) void {
+    win.cookies().delete(COOKIE_NAME) catch |err| {
+        std.debug.print("[zig] cookie delete: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('cookie delete: error / unsupported');");
+        return;
+    };
+    std.debug.print("[zig] cookie delete ok\n", .{});
+    win.evalJs("verveLog('cookie delete: ok');");
+}
+
+/// "cookie clear" — wipe the per-profile cookie store and log.
+fn runCookieClear(win: *wn.Window) void {
+    win.cookies().clear() catch |err| {
+        std.debug.print("[zig] cookie clear: {s}\n", .{@errorName(err)});
+        win.evalJs("verveLog('cookie clear: error / unsupported');");
+        return;
+    };
+    std.debug.print("[zig] cookie clear ok\n", .{});
+    win.evalJs("verveLog('cookie clear: ok');");
 }
 
 /// Registered via setColorSchemeHandler; logs OS light/dark toggles. Operator

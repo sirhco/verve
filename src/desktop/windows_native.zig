@@ -17,6 +17,7 @@ const std = @import("std");
 const opts_mod = @import("options.zig");
 const cookies_mod = @import("cookies.zig");
 const clipboard_mod = @import("clipboard.zig");
+const cookie_codec = @import("win_native/cookie_codec.zig");
 
 // ---- Flat C ABI to the native WebView2 host ---------------------------------
 
@@ -122,6 +123,56 @@ extern fn wv2_open_child(
     height: c_int,
 ) ?*Host;
 
+// Bundle 6: cookies (ICoreWebView2CookieManager behind the host). Fields cross
+// as explicit args; `same_site` is the COREWEBVIEW2_COOKIE_SAME_SITE_KIND int
+// produced by cookie_codec. set/delete/clear return 0 on success; get returns
+// 1 found / 0 not-found / <0 error and fills the out buffers/scalars.
+extern fn wv2_cookie_set(
+    host: *Host,
+    name: [*]const u8,
+    nlen: usize,
+    value: [*]const u8,
+    vlen: usize,
+    domain: [*]const u8,
+    dlen: usize,
+    path: [*]const u8,
+    plen: usize,
+    has_expiry: c_int,
+    expiry: f64,
+    secure: c_int,
+    http_only: c_int,
+    same_site: c_int,
+) c_int;
+extern fn wv2_cookie_delete(
+    host: *Host,
+    name: [*]const u8,
+    nlen: usize,
+    domain: [*]const u8,
+    dlen: usize,
+    path: [*]const u8,
+    plen: usize,
+) c_int;
+extern fn wv2_cookie_clear(host: *Host) c_int;
+extern fn wv2_cookie_get(
+    host: *Host,
+    name: [*]const u8,
+    nlen: usize,
+    value_buf: [*]u8,
+    value_cap: usize,
+    value_len: *usize,
+    domain_buf: [*]u8,
+    domain_cap: usize,
+    domain_len: *usize,
+    path_buf: [*]u8,
+    path_cap: usize,
+    path_len: *usize,
+    has_expiry: *c_int,
+    expiry: *f64,
+    secure: *c_int,
+    http_only: *c_int,
+    same_site: *c_int,
+) c_int;
+
 /// Toast error set — mirrors the legacy `windows.zig` surface so the
 /// module-level `showToast` is signature-compatible.
 pub const ToastError = error{ Unsupported, Backend, OutOfMemory };
@@ -209,8 +260,10 @@ pub const Window = struct {
 
     // ---- cookies / clipboard handles ----------------------------------------
 
+    /// Per-window cookie store backed by ICoreWebView2CookieManager. The
+    /// store's `window` handle is the native host pointer; the module-level
+    /// cookie free fns cast it back to `*Host` and call the C ABI.
     pub fn cookies(self: *Window) cookies_mod.CookieStore {
-        // TODO bundle 6: thread the real cookie store through the native host.
         return .{ .window = @ptrCast(self.ctx.host) };
     }
 
@@ -718,32 +771,104 @@ fn callFileDialog(
 
 // ---- module-level cookie free fns (bundle 6) --------------------------------
 
+/// Read the first cookie matching `name`. `window` is the native `*Host`
+/// pointer handed out by `cookies()`. The async GetCookies pump runs entirely
+/// inside the host (`wv2_cookie_get`); here we just hand it fixed out-buffers
+/// and decode the flat result into an owned `Cookie` via `cookie_codec`. The
+/// returned slices are owned by `allocator` (CookieStore contract). Returns
+/// null when no cookie matches.
 pub fn cookieGet(window: *anyopaque, allocator: std.mem.Allocator, name: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
-    _ = window;
-    _ = allocator;
-    _ = name;
-    // TODO bundle 6
-    return error.Unsupported;
+    const host: *Host = @ptrCast(@alignCast(window));
+
+    // Generous fixed buffers — cookie values can be large, but a single 4 KB
+    // buffer per field comfortably covers real cookies; the host clamps writes
+    // to the cap (no dialog-style grow needed here).
+    var value_buf: [4096]u8 = undefined;
+    var domain_buf: [4096]u8 = undefined;
+    var path_buf: [4096]u8 = undefined;
+    var value_len: usize = 0;
+    var domain_len: usize = 0;
+    var path_len: usize = 0;
+    var has_expiry: c_int = 0;
+    var expiry: f64 = 0;
+    var secure: c_int = 0;
+    var http_only: c_int = 0;
+    var same_site: c_int = cookie_codec.SAME_SITE_LAX;
+
+    const rc = wv2_cookie_get(
+        host,
+        name.ptr,
+        name.len,
+        &value_buf,
+        value_buf.len,
+        &value_len,
+        &domain_buf,
+        domain_buf.len,
+        &domain_len,
+        &path_buf,
+        path_buf.len,
+        &path_len,
+        &has_expiry,
+        &expiry,
+        &secure,
+        &http_only,
+        &same_site,
+    );
+    if (rc < 0) return opts_mod.CookieError.Backend;
+    if (rc == 0) return null;
+
+    return try cookie_codec.decodeCookie(
+        allocator,
+        name,
+        value_buf[0..@min(value_len, value_buf.len)],
+        domain_buf[0..@min(domain_len, domain_buf.len)],
+        path_buf[0..@min(path_len, path_buf.len)],
+        has_expiry != 0,
+        expiry,
+        secure != 0,
+        http_only != 0,
+        same_site,
+    );
 }
 
+/// Create-or-update a cookie. `window` is the native `*Host`. SameSite is
+/// mapped to the WebView2 kind int by `cookie_codec.sameSiteToInt`; expiry is
+/// passed as epoch-seconds with a has_expiry flag (0 = session cookie).
 pub fn cookieSet(window: *anyopaque, cookie: opts_mod.Cookie) opts_mod.CookieError!void {
-    _ = window;
-    _ = cookie;
-    // TODO bundle 6
-    return error.Unsupported;
+    const host: *Host = @ptrCast(@alignCast(window));
+    const rc = wv2_cookie_set(
+        host,
+        cookie.name.ptr,
+        cookie.name.len,
+        cookie.value.ptr,
+        cookie.value.len,
+        cookie.domain.ptr,
+        cookie.domain.len,
+        cookie.path.ptr,
+        cookie.path.len,
+        @intFromBool(cookie.expires_unix > 0),
+        @floatFromInt(cookie.expires_unix),
+        @intFromBool(cookie.secure),
+        @intFromBool(cookie.http_only),
+        cookie_codec.sameSiteToInt(cookie.same_site),
+    );
+    if (rc != 0) return opts_mod.CookieError.Backend;
 }
 
+/// Delete the first cookie matching `name`. No-op if no match. Domain/path are
+/// not narrowed here (matches legacy delete-by-name), so they're passed empty.
 pub fn cookieDelete(window: *anyopaque, name: []const u8) opts_mod.CookieError!void {
-    _ = window;
-    _ = name;
-    // TODO bundle 6
-    return error.Unsupported;
+    const host: *Host = @ptrCast(@alignCast(window));
+    const empty: [*]const u8 = name.ptr; // any valid ptr; len 0 => host ignores
+    const rc = wv2_cookie_delete(host, name.ptr, name.len, empty, 0, empty, 0);
+    if (rc != 0) return opts_mod.CookieError.Backend;
 }
 
+/// Remove every cookie in the per-profile store.
 pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
-    _ = window;
-    // TODO bundle 6
-    return error.Unsupported;
+    const host: *Host = @ptrCast(@alignCast(window));
+    const rc = wv2_cookie_clear(host);
+    if (rc != 0) return opts_mod.CookieError.Backend;
 }
 
 // ---- module-level clipboard free fns (bundle 7) -----------------------------

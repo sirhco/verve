@@ -273,6 +273,31 @@ public:
     }
 };
 
+// ---- Bundle 6: cookies — async GetCookies completion handler ----------------
+
+// ICoreWebView2CookieManager::GetCookies is the only async cookie call: it
+// delivers an ICoreWebView2CookieList to this handler on the UI thread. We
+// sync-wrap by spinning a nested Win32 message pump until `done_` flips (same
+// model the legacy windows.zig backend used). On Invoke we AddRef the list so
+// it outlives the callback frame; the caller Releases after iterating.
+class GetCookiesHandler : public ICoreWebView2GetCookiesCompletedHandler {
+public:
+    WV2_IUNKNOWN_IMPL(ICoreWebView2GetCookiesCompletedHandler)
+
+    ICoreWebView2CookieList *list_ = nullptr;
+    bool done_ = false;
+
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT error_code,
+                                     ICoreWebView2CookieList *result) override {
+        if (SUCCEEDED(error_code) && result) {
+            result->AddRef();
+            list_ = result;
+        }
+        done_ = true;
+        return S_OK;
+    }
+};
+
 // ---- Bundle 4: OLE drag-drop (IDropTarget) ----------------------------------
 
 // IID_IDropTarget {00000122-0000-0000-C000-000000000046}. Declared locally to
@@ -504,6 +529,67 @@ typedef HRESULT(STDAPICALLTYPE *PFN_CreateEnv)(
     PCWSTR browserExecutableFolder, PCWSTR userDataFolder,
     ICoreWebView2EnvironmentOptions *environmentOptions,
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *handler);
+
+// ---- Bundle 6: cookie helpers (static) --------------------------------------
+
+// Acquire the per-profile cookie manager off the webview. The CookieManager
+// hangs off ICoreWebView2_2 (a later interface version than the base webview),
+// reached via QueryInterface. Returns a +1 cookie-manager ref (caller Releases)
+// and Releases the ICoreWebView2_2 it queried before returning. NULL when the
+// webview isn't ready or the QI / get_CookieManager fails.
+static ICoreWebView2CookieManager *cookie_manager(WV2Host *host) {
+    if (!host || !host->webview) return nullptr;
+    ICoreWebView2_2 *wv2 = nullptr;
+    if (FAILED(host->webview->QueryInterface(IID_ICoreWebView2_2,
+                                             (void **)&wv2)) ||
+        !wv2)
+        return nullptr;
+    ICoreWebView2CookieManager *mgr = nullptr;
+    HRESULT hr = wv2->get_CookieManager(&mgr);
+    wv2->Release();
+    if (FAILED(hr) || !mgr) return nullptr;
+    return mgr;
+}
+
+// Spin a nested Win32 message pump until `done` flips. Matches the legacy
+// pumpMsgUntilDone: GetMessageW blocks for the next message and we dispatch it,
+// so the GetCookies completion (posted to this UI thread) runs and sets `done`.
+// A GetMessageW return of <= 0 (WM_QUIT / error) breaks the loop so a failed
+// GetCookies can't hang the wait forever.
+static void pump_until(const bool *done) {
+    MSG msg;
+    while (!*done) {
+        BOOL got = GetMessageW(&msg, nullptr, 0, 0);
+        if (got <= 0) break;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+// Fetch the full cookie list synchronously (kick off async GetCookies, pump to
+// completion). Returns a +1 list ref (caller Releases) or NULL. `uri` NULL =>
+// all cookies, matching legacy fetchAllCookies.
+static ICoreWebView2CookieList *fetch_all_cookies(ICoreWebView2CookieManager *mgr) {
+    auto *handler = new GetCookiesHandler();
+    if (FAILED(mgr->GetCookies(nullptr, handler))) {
+        handler->Release();
+        return nullptr;
+    }
+    pump_until(&handler->done_);
+    ICoreWebView2CookieList *list = handler->list_; // +1 from Invoke (or NULL)
+    handler->Release();
+    return list;
+}
+
+// True when `cookie`'s name equals the UTF-8 span (`want`,`wlen`). Compares in
+// UTF-16 by widening the wanted name, avoiding a per-cookie narrow alloc.
+static bool cookie_name_is(ICoreWebView2Cookie *cookie, const wchar_t *want_w) {
+    LPWSTR name = nullptr;
+    if (FAILED(cookie->get_Name(&name)) || !name) return false;
+    bool eq = (wcscmp(name, want_w) == 0);
+    CoTaskMemFree(name);
+    return eq;
+}
 
 // ---- Public C ABI -----------------------------------------------------------
 
@@ -1162,6 +1248,158 @@ WV2Host *wv2_open_child(WV2Host *parent, const char *title, size_t title_len,
         return nullptr;
     }
     return host;
+}
+
+// ---- Bundle 6: cookies ------------------------------------------------------
+
+int wv2_cookie_set(WV2Host *host, const char *name, size_t nlen, const char *value,
+                   size_t vlen, const char *domain, size_t dlen, const char *path,
+                   size_t plen, int has_expiry, double expiry, int secure,
+                   int http_only, int same_site) {
+    ICoreWebView2CookieManager *mgr = cookie_manager(host);
+    if (!mgr) return 1;
+
+    // CreateCookie wants name/value/domain/path; empty domain/path let WebView2
+    // apply its defaults (origin domain, "/" path), matching legacy buildNsCookie.
+    wchar_t *wname = widen(name, (int)nlen);
+    wchar_t *wval = widen(value, (int)vlen);
+    wchar_t *wdom = (domain && dlen) ? widen(domain, (int)dlen) : nullptr;
+    wchar_t *wpath = (path && plen) ? widen(path, (int)plen) : nullptr;
+
+    ICoreWebView2Cookie *cookie = nullptr;
+    HRESULT hr = mgr->CreateCookie(wname ? wname : L"", wval ? wval : L"",
+                                   wdom, wpath, &cookie);
+    free(wname);
+    free(wval);
+    free(wdom);
+    free(wpath);
+
+    if (FAILED(hr) || !cookie) {
+        mgr->Release();
+        return 2;
+    }
+
+    if (secure) cookie->put_IsSecure(TRUE);
+    if (http_only) cookie->put_IsHttpOnly(TRUE);
+    if (has_expiry) cookie->put_Expires(expiry);
+    // The Zig cookie_codec maps Verve's SameSite to this int (none/lax/strict);
+    // .default already coalesced to LAX there, so any value here is a real kind.
+    cookie->put_SameSite((COREWEBVIEW2_COOKIE_SAME_SITE_KIND)same_site);
+
+    HRESULT addhr = mgr->AddOrUpdateCookie(cookie);
+    cookie->Release();
+    mgr->Release();
+    return FAILED(addhr) ? 3 : 0;
+}
+
+int wv2_cookie_delete(WV2Host *host, const char *name, size_t nlen,
+                      const char *domain, size_t dlen, const char *path,
+                      size_t plen) {
+    (void)domain;
+    (void)dlen;
+    (void)path;
+    (void)plen;
+    ICoreWebView2CookieManager *mgr = cookie_manager(host);
+    if (!mgr) return 1;
+
+    wchar_t *wname = widen(name, (int)nlen);
+    ICoreWebView2CookieList *list = fetch_all_cookies(mgr);
+    if (!list) {
+        free(wname);
+        mgr->Release();
+        return 0; // nothing to delete
+    }
+
+    UINT32 count = 0;
+    list->get_Count(&count);
+    for (UINT32 i = 0; i < count; ++i) {
+        ICoreWebView2Cookie *c = nullptr;
+        if (FAILED(list->GetValueAtIndex(i, &c)) || !c) continue;
+        if (wname && cookie_name_is(c, wname)) {
+            mgr->DeleteCookie(c);
+            c->Release();
+            break;
+        }
+        c->Release();
+    }
+    list->Release();
+    free(wname);
+    mgr->Release();
+    return 0;
+}
+
+int wv2_cookie_clear(WV2Host *host) {
+    ICoreWebView2CookieManager *mgr = cookie_manager(host);
+    if (!mgr) return 1;
+    HRESULT hr = mgr->DeleteAllCookies();
+    mgr->Release();
+    return FAILED(hr) ? 2 : 0;
+}
+
+int wv2_cookie_get(WV2Host *host, const char *name, size_t nlen,
+                   uint8_t *value_buf, size_t value_cap, size_t *value_len,
+                   uint8_t *domain_buf, size_t domain_cap, size_t *domain_len,
+                   uint8_t *path_buf, size_t path_cap, size_t *path_len,
+                   int *has_expiry, double *expiry, int *secure, int *http_only,
+                   int *same_site) {
+    ICoreWebView2CookieManager *mgr = cookie_manager(host);
+    if (!mgr) return -1;
+
+    wchar_t *wname = widen(name, (int)nlen);
+    ICoreWebView2CookieList *list = fetch_all_cookies(mgr);
+    if (!list) {
+        free(wname);
+        mgr->Release();
+        return -1;
+    }
+
+    int rc = 0; // not found
+    UINT32 count = 0;
+    list->get_Count(&count);
+    for (UINT32 i = 0; i < count; ++i) {
+        ICoreWebView2Cookie *c = nullptr;
+        if (FAILED(list->GetValueAtIndex(i, &c)) || !c) continue;
+        if (!wname || !cookie_name_is(c, wname)) {
+            c->Release();
+            continue;
+        }
+
+        // Match — marshal every field out. WebView2 returns CoTaskMem strings.
+        LPWSTR wval = nullptr, wdom = nullptr, wpath = nullptr;
+        c->get_Value(&wval);
+        c->get_Domain(&wdom);
+        c->get_Path(&wpath);
+        if (value_len) *value_len = fill_utf8_from_wide_noNUL(wval, value_buf, value_cap);
+        if (domain_len) *domain_len = fill_utf8_from_wide_noNUL(wdom, domain_buf, domain_cap);
+        if (path_len) *path_len = fill_utf8_from_wide_noNUL(wpath, path_buf, path_cap);
+        if (wval) CoTaskMemFree(wval);
+        if (wdom) CoTaskMemFree(wdom);
+        if (wpath) CoTaskMemFree(wpath);
+
+        double exp = -1;
+        c->get_Expires(&exp);
+        if (expiry) *expiry = exp;
+        if (has_expiry) *has_expiry = (exp > 0) ? 1 : 0;
+
+        BOOL sec = FALSE, http = FALSE;
+        c->get_IsSecure(&sec);
+        c->get_IsHttpOnly(&http);
+        if (secure) *secure = sec ? 1 : 0;
+        if (http_only) *http_only = http ? 1 : 0;
+
+        COREWEBVIEW2_COOKIE_SAME_SITE_KIND ss =
+            COREWEBVIEW2_COOKIE_SAME_SITE_KIND_LAX;
+        c->get_SameSite(&ss);
+        if (same_site) *same_site = (int)ss;
+
+        rc = 1; // found
+        c->Release();
+        break;
+    }
+    list->Release();
+    free(wname);
+    mgr->Release();
+    return rc;
 }
 
 } // extern "C"

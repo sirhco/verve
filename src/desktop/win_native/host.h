@@ -157,6 +157,48 @@ size_t wv2_show_alert(WV2Host *host, const char *title, size_t title_len,
 WV2Host *wv2_open_child(WV2Host *parent, const char *title, size_t title_len,
                         int width, int height);
 
+/* ---- Bundle 6: cookies (ICoreWebView2CookieManager) ---------------------- */
+/*
+ * Cookie fields cross the seam as explicit args (no JSON). Strings are UTF-8
+ * (ptr,len); the host widens to UTF-16 for WebView2. `same_site` is the
+ * COREWEBVIEW2_COOKIE_SAME_SITE_KIND int (0 none / 1 lax / 2 strict); the Zig
+ * cookie_codec owns the SameSite<->int mapping. `has_expiry`==0 => session
+ * cookie (no put_Expires); otherwise `expiry` is Unix epoch seconds as a double.
+ * secure / http_only are 0/1 bools.
+ *
+ * All four require the WebView2 to be ready; they return a backend error code
+ * when it is not (set/delete/clear: nonzero; get: <0). get pumps the async
+ * GetCookies completion to a bounded finish before returning.
+ */
+
+/* Set (create-or-update) a cookie. Returns 0 on success, nonzero on error
+ * (webview not ready, CreateCookie / AddOrUpdateCookie HRESULT < 0). */
+int wv2_cookie_set(WV2Host *host, const char *name, size_t nlen, const char *value,
+                   size_t vlen, const char *domain, size_t dlen, const char *path,
+                   size_t plen, int has_expiry, double expiry, int secure,
+                   int http_only, int same_site);
+
+/* Delete the first cookie matching `name` (scoped by domain/path when given).
+ * No-op when no match. Returns 0 on success, nonzero on error. */
+int wv2_cookie_delete(WV2Host *host, const char *name, size_t nlen,
+                      const char *domain, size_t dlen, const char *path,
+                      size_t plen);
+
+/* Delete every cookie in the manager's store. Returns 0 on success, nonzero on
+ * error (webview not ready, DeleteAllCookies HRESULT < 0). */
+int wv2_cookie_clear(WV2Host *host);
+
+/* Read the first cookie matching `name`. Fills the string out-buffers (UTF-8,
+ * no NUL) and the scalar out-params. Returns 1 = found, 0 = not found, <0 =
+ * error (webview not ready / GetCookies failed). The string lengths written to
+ * *_len are clamped to the matching *_cap (4096 each is generous). */
+int wv2_cookie_get(WV2Host *host, const char *name, size_t nlen,
+                   uint8_t *value_buf, size_t value_cap, size_t *value_len,
+                   uint8_t *domain_buf, size_t domain_cap, size_t *domain_len,
+                   uint8_t *path_buf, size_t path_cap, size_t *path_len,
+                   int *has_expiry, double *expiry, int *secure, int *http_only,
+                   int *same_site);
+
 #ifdef __cplusplus
 }
 #endif
