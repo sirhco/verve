@@ -741,8 +741,9 @@ pub const Window = struct {
     pub fn deinit(self: *Window) void {
         const alloc = self.ctx.allocator;
         if (self.ctx.main_loop) |loop| g_main_loop_unref(loop);
+        if (self.ctx.web_context) |wc| g_object_unref(wc);
         alloc.destroy(self.ctx);
-        alloc.destroy(self);
+        // Window is returned by value from init — caller owns it; do NOT destroy self here.
     }
 
     pub fn terminate(self: *Window) void {
@@ -1060,9 +1061,9 @@ fn onCloseRequest(widget: *GtkWidget, user_data: ?*anyopaque) callconv(.c) gbool
     _ = widget;
     const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
     if (ctx.on_close) |cb| {
-        if (!cb(ctx.on_close_ctx)) return 1; // true = block close
+        if (!cb(ctx.on_close_ctx)) return 1; // cb returns false = block close
     }
-    return 0; // false = allow close
+    return 0; // allow close
 }
 
 fn onScriptMessage(ucm: *WebKitUserContentManager, result: *WebKitJavascriptResult, user_data: ?*anyopaque) callconv(.c) void {
