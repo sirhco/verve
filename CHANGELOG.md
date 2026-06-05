@@ -4,6 +4,42 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.40] - 2026-06-05
+
+### Fixed
+
+- **Windows `verve://` top-level navigation (blank webview).** The previous
+  release added `AddWebResourceRequestedFilter` but omitted the required
+  `ICoreWebView2EnvironmentOptions4::SetCustomSchemeRegistrations` call at
+  environment creation time. WebView2 silently rejects `Navigate("verve://…")`
+  for any scheme that wasn't pre-registered — the filter alone only intercepts
+  sub-resource requests from existing `http/https` pages, not the navigation
+  document itself. Fixed by:
+  - `CustomSchemeRegistration`: minimal `ICoreWebView2CustomSchemeRegistration`
+    implementation. `TreatAsSecure = TRUE` (enables WASM, `window.crypto`, and
+    other secure-context APIs). `HasAuthorityComponent = TRUE` (correct for the
+    `verve://app/…` URL structure where `app` is the authority).
+  - `VerveEnvironmentOptions`: minimal `ICoreWebView2EnvironmentOptions` v1–v4
+    chain. Only v4 `GetCustomSchemeRegistrations` has a real body; all other
+    property getters return safe defaults. WebView2 QIs through the version
+    chain and uses whatever is present.
+  - `wv2_run`: constructs `VerveEnvironmentOptions` when a scheme handler is
+    registered and passes it as the third argument to
+    `CreateCoreWebView2EnvironmentWithOptions` (was `nullptr`).
+  - `ControllerHandler`: QIs `ICoreWebView2_22` to use
+    `AddWebResourceRequestedFilterWithRequestSourceKinds(…,
+    SOURCE_KINDS_ALL)` so document-level requests are also intercepted.
+    Falls back to the base `AddWebResourceRequestedFilter` on older WebView2
+    runtimes that don't expose `ICoreWebView2_22`.
+- **Stale "spike" strings removed** from `webview2_host.cpp` file header and
+  error dialog captions.
+
+### Upgrade notes
+
+- **No app source changes.** Re-vendor `src/desktop/win_native/webview2_host.cpp`
+  to pick up the fix. Apps scaffolded from 0.1.39 will have the broken version;
+  apps scaffolded from 0.1.40 onward will be correct.
+
 ## [0.1.39] - 2026-06-05
 
 ### Added
