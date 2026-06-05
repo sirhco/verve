@@ -4,6 +4,84 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.39] - 2026-06-05
+
+### Added
+
+- **Linux GTK4 + WebKitGTK 6.0 backend (`-Dgtk4=true`).** A full parallel
+  Linux backend (`src/desktop/linux_gtk4.zig`, ~2000 lines) targets GTK 4 +
+  WebKitGTK 6.0 — the stack shipping by default on Ubuntu 24.04 LTS and
+  Fedora 41+. The existing GTK3 + WebKitGTK 4.1 path is unchanged. Enable
+  with `-Dgtk4=true` at build time:
+  ```
+  zig build run -Dgtk4=true
+  ```
+  The GTK4 backend covers the full `Window` surface at parity with macOS and
+  Windows: window lifecycle (GMainLoop), navigation, window chrome, IPC
+  (`webkit_web_view_evaluate_javascript`), cookies via `WebKitNetworkSession`,
+  clipboard via `GdkClipboard` (async API), file/alert dialogs
+  (`GtkFileDialog` / `GtkAlertDialog`, GTK 4.10+), drag-and-drop
+  (`GtkDropTarget`), focus events (`GtkEventControllerFocus`), resize via
+  `notify::default-width/height`, color-scheme, deep link, print, snapshot
+  (WK6 `GdkTexture` path — no Cairo), and accessibility. Live validation on
+  Ubuntu 24.04 is in progress.
+
+- **Linux GTK3 image clipboard.** `Clipboard.writeImage` / `readImage` are
+  now implemented on GTK3 via `GdkPixbuf` (loader → `gtk_clipboard_set_image`
+  on write; `gtk_clipboard_wait_for_image` → `gdk_pixbuf_save_to_bufferv` on
+  read). No extra linker line needed — `gdk-pixbuf-2.0` is a transitive dep
+  of `gtk+-3.0`.
+
+- **Windows `verve://` asset-serving scheme handler.** `wv2_set_scheme_handler`
+  added to `host.h` / `webview2_host.cpp`. The native C++ host now registers
+  `AddWebResourceRequestedFilter("scheme://*")` once the WebView2 controller
+  is ready; `SchemeRequestHandler` resolves paths via the Zig `asset_router`,
+  copies bytes through `SHCreateMemStream`, and sets `Content-Type` headers.
+  `windows_native.zig` wires the handler in `init()` + `openChildWindow()` and
+  queues the initial `verve://app/<initial_path>` navigation. Previously the
+  Windows native backend loaded no assets (the `opts.assets`, `opts.scheme`,
+  and `opts.initial_path` fields were silently ignored).
+
+### Fixed
+
+- **GTK4 geometry hints.** `gtk_window_set_geometry_hints` was removed in
+  GTK4; replaced with `gtk_widget_set_size_request` for minimum size
+  constraints.
+- **WK6 snapshot API.** `webkit_web_view_get_snapshot` is a WebKitGTK 4.1
+  API; WK6 uses `webkit_web_view_snapshot` returning `GdkTexture*` (no
+  Cairo surface). `takeSnapshotPng` rewritten to the `GdkTexture` → RGBA →
+  `GdkPixbuf` → `gdk_pixbuf_save_to_bufferv` path.
+- **GTK4 cookie done-flags not atomic.** Async completion callbacks used
+  plain assignment; replaced with `@atomicStore(.release)` /
+  `@atomicLoad(.acquire)` to prevent the compiler hoisting the load out of
+  the spin loop.
+- **GdkPixbuf ABI bug (GTK3 image clipboard).** `gdk_pixbuf_save_to_buffer`
+  is C variadic (`...`); on x86-64 SysV the variadic and non-variadic calling
+  conventions differ, producing UB. Fixed by using `gdk_pixbuf_save_to_bufferv`
+  (fixed-arity with `option_keys`/`option_values` arrays).
+- **Borrowed pixbuf double-unref.** `gdk_pixbuf_loader_get_pixbuf` returns a
+  borrowed ref owned by the loader; the extra `g_object_unref(pixbuf)` call
+  corrupted the refcount. Removed.
+- **Loader not closed on error path.** `gdk_pixbuf_loader_close` must be
+  called before `g_object_unref(loader)` even when a write fails.
+- Various GTK4 backend fixes: `g_file_get_path` result freed after DnD
+  callback; both `notify::default-width` and `notify::default-height` signal
+  IDs stored and disconnected; `stackFallback` used in `clipboardWriteText`
+  (no allocator available at that call site); sentinel array double-null
+  removed; `evaluate_javascript` callback param fixed from double-optional to
+  single; `Window.deinit` no longer calls `alloc.destroy(self)` on a
+  stack-allocated `Window`.
+
+### Upgrade notes
+
+- **GTK4 backend is opt-in.** Existing GTK3 builds are unchanged. To use
+  GTK4, install `libgtk-4-dev` + `libwebkitgtk-6.0-dev` and pass
+  `-Dgtk4=true` to `zig build`.
+- **Windows asset serving** now works end-to-end. Apps scaffolded before
+  0.1.39 should re-vendor `src/desktop/win_native/` to pick up
+  `webview2_host.cpp` and `host.h` changes.
+- **macOS desktop backend unchanged.**
+
 ## [0.1.38] - 2026-06-04
 
 ### Changed
