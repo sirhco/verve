@@ -1245,28 +1245,179 @@ pub fn attachUrlSocket(window: *Window, fd: c_int) !void {
     return error.TODO;
 }
 
+// ---- Cookie helpers ---------------------------------------------------------
+//
+// WK6 replaces the per-WebContext cookie manager with a per-NetworkSession one.
+// We retrieve the session from the WebView and ask it for the cookie manager.
+
+/// Continuation cell for webkit_cookie_manager_get_all_cookies async callback.
+const GetAllCookiesCell = extern struct {
+    result: ?*GAsyncResult = null,
+    done: bool = false,
+};
+
+/// Continuation cell for single-step async cookie ops (add / delete).
+const SimpleAsyncCell = extern struct {
+    done: bool = false,
+};
+
+fn onGetAllCookiesDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *GetAllCookiesCell = @ptrCast(@alignCast(user_data orelse return));
+    cell.result = res;
+    cell.done = true;
+}
+
+fn onSimpleAsyncDone(_: ?*anyopaque, _: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *SimpleAsyncCell = @ptrCast(@alignCast(user_data orelse return));
+    cell.done = true;
+}
+
+fn cookieManagerFor(window: *anyopaque) opts_mod.CookieError!*WebKitCookieManager {
+    const win: *Window = @ptrCast(@alignCast(window));
+    const wv = win.ctx.webview orelse return opts_mod.CookieError.NotReady;
+    const session = webkit_web_view_get_network_session(wv);
+    return webkit_network_session_get_cookie_manager(session);
+}
+
+fn fetchAllCookies(mgr: *WebKitCookieManager) ?*GList {
+    var cell: GetAllCookiesCell = .{};
+    webkit_cookie_manager_get_all_cookies(mgr, null, &onGetAllCookiesDone, @ptrCast(&cell));
+    pumpMainContextUntilDone(&cell.done);
+    const res = cell.result orelse return null;
+    var err: ?*GError = null;
+    const list = webkit_cookie_manager_get_all_cookies_finish(mgr, res, &err);
+    if (err) |e| {
+        std.log.warn("verve.desktop[linux-gtk4]: get_all_cookies_finish failed", .{});
+        g_error_free(e);
+        return null;
+    }
+    return list;
+}
+
+fn marshalCookie(allocator: std.mem.Allocator, c: *SoupCookie) opts_mod.CookieError!opts_mod.Cookie {
+    const name = std.mem.span(soup_cookie_get_name(c));
+    const value = std.mem.span(soup_cookie_get_value(c));
+    const domain = std.mem.span(soup_cookie_get_domain(c));
+    const path = std.mem.span(soup_cookie_get_path(c));
+
+    var out: opts_mod.Cookie = .{
+        .name = allocator.dupe(u8, name) catch return opts_mod.CookieError.OutOfMemory,
+        .value = allocator.dupe(u8, value) catch return opts_mod.CookieError.OutOfMemory,
+        .domain = allocator.dupe(u8, domain) catch return opts_mod.CookieError.OutOfMemory,
+        .path = allocator.dupe(u8, path) catch return opts_mod.CookieError.OutOfMemory,
+        .secure = soup_cookie_get_secure(c) != 0,
+        .http_only = soup_cookie_get_http_only(c) != 0,
+    };
+
+    if (soup_cookie_get_expires(c)) |date| {
+        out.expires_unix = @intCast(soup_date_to_time_t(date));
+    }
+
+    out.same_site = switch (soup_cookie_get_same_site_policy(c)) {
+        SOUP_SAME_SITE_NONE => .none,
+        SOUP_SAME_SITE_LAX => .lax,
+        SOUP_SAME_SITE_STRICT => .strict,
+        else => .default,
+    };
+
+    return out;
+}
+
+fn buildSoupCookie(allocator: std.mem.Allocator, cookie: opts_mod.Cookie) opts_mod.CookieError!*SoupCookie {
+    const name_z = allocator.dupeZ(u8, cookie.name) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(name_z);
+    const value_z = allocator.dupeZ(u8, cookie.value) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(value_z);
+    const domain_src = if (cookie.domain.len > 0) cookie.domain else "";
+    const domain_z = allocator.dupeZ(u8, domain_src) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(domain_z);
+    const path_src = if (cookie.path.len > 0) cookie.path else "/";
+    const path_z = allocator.dupeZ(u8, path_src) catch return opts_mod.CookieError.OutOfMemory;
+    defer allocator.free(path_z);
+
+    // max_age == -1 → session cookie. soup_cookie_new ignores expires;
+    // we override below via soup_cookie_set_expires if requested.
+    const c = soup_cookie_new(name_z.ptr, value_z.ptr, domain_z.ptr, path_z.ptr, -1) orelse return opts_mod.CookieError.Backend;
+
+    if (cookie.secure) soup_cookie_set_secure(c, 1);
+    if (cookie.http_only) soup_cookie_set_http_only(c, 1);
+    if (cookie.expires_unix > 0) {
+        const date = soup_date_new_from_time_t(@intCast(cookie.expires_unix));
+        soup_cookie_set_expires(c, date);
+        soup_date_free(date);
+    }
+    soup_cookie_set_same_site_policy(c, switch (cookie.same_site) {
+        .default, .lax => SOUP_SAME_SITE_LAX,
+        .none => SOUP_SAME_SITE_NONE,
+        .strict => SOUP_SAME_SITE_STRICT,
+    });
+
+    return c;
+}
+
 pub fn cookieGet(window: *anyopaque, allocator: std.mem.Allocator, name: []const u8) opts_mod.CookieError!?opts_mod.Cookie {
-    _ = window;
-    _ = allocator;
-    _ = name;
-    return error.TODO;
+    const mgr = try cookieManagerFor(window);
+    const list = fetchAllCookies(mgr) orelse return null;
+    defer g_list_free_full(list, @ptrCast(&soup_cookie_free));
+
+    const count = g_list_length(list);
+    var i: c_uint = 0;
+    while (i < count) : (i += 1) {
+        const raw = g_list_nth_data(list, i) orelse continue;
+        const c: *SoupCookie = @ptrCast(@alignCast(raw));
+        const c_name = std.mem.span(soup_cookie_get_name(c));
+        if (std.mem.eql(u8, c_name, name)) {
+            return try marshalCookie(allocator, c);
+        }
+    }
+    return null;
 }
 
 pub fn cookieSet(window: *anyopaque, cookie: opts_mod.Cookie) opts_mod.CookieError!void {
-    _ = window;
-    _ = cookie;
-    return error.TODO;
+    const mgr = try cookieManagerFor(window);
+    const win: *Window = @ptrCast(@alignCast(window));
+    const c = try buildSoupCookie(win.ctx.allocator, cookie);
+    defer soup_cookie_free(c);
+
+    var cell: SimpleAsyncCell = .{};
+    webkit_cookie_manager_add_cookie(mgr, c, null, &onSimpleAsyncDone, @ptrCast(&cell));
+    pumpMainContextUntilDone(&cell.done);
 }
 
 pub fn cookieDelete(window: *anyopaque, name: []const u8) opts_mod.CookieError!void {
-    _ = window;
-    _ = name;
-    return error.TODO;
+    const mgr = try cookieManagerFor(window);
+    const list = fetchAllCookies(mgr) orelse return;
+    defer g_list_free_full(list, @ptrCast(&soup_cookie_free));
+
+    const count = g_list_length(list);
+    var i: c_uint = 0;
+    while (i < count) : (i += 1) {
+        const raw = g_list_nth_data(list, i) orelse continue;
+        const c: *SoupCookie = @ptrCast(@alignCast(raw));
+        const c_name = std.mem.span(soup_cookie_get_name(c));
+        if (std.mem.eql(u8, c_name, name)) {
+            var cell: SimpleAsyncCell = .{};
+            webkit_cookie_manager_delete_cookie(mgr, c, null, &onSimpleAsyncDone, @ptrCast(&cell));
+            pumpMainContextUntilDone(&cell.done);
+            return;
+        }
+    }
 }
 
 pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
-    _ = window;
-    return error.TODO;
+    const mgr = try cookieManagerFor(window);
+    const list = fetchAllCookies(mgr) orelse return;
+    defer g_list_free_full(list, @ptrCast(&soup_cookie_free));
+
+    const count = g_list_length(list);
+    var i: c_uint = 0;
+    while (i < count) : (i += 1) {
+        const raw = g_list_nth_data(list, i) orelse continue;
+        const c: *SoupCookie = @ptrCast(@alignCast(raw));
+        var cell: SimpleAsyncCell = .{};
+        webkit_cookie_manager_delete_cookie(mgr, c, null, &onSimpleAsyncDone, @ptrCast(&cell));
+        pumpMainContextUntilDone(&cell.done);
+    }
 }
 
 pub fn clipboardWriteText(window: *anyopaque, text: []const u8) opts_mod.ClipboardError!void {
