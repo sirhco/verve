@@ -633,6 +633,7 @@ const WindowCtx = struct {
     color_scheme_signal: c_ulong = 0,
     close_signal: c_ulong = 0,
     resize_signal: c_ulong = 0,
+    resize_signal_h: c_ulong = 0,
     focus_in_signal: c_ulong = 0,
     focus_out_signal: c_ulong = 0,
     drag_signal: c_ulong = 0,
@@ -1007,7 +1008,7 @@ pub const Window = struct {
                 0,
             );
             self.ctx.resize_signal = sig;
-            _ = g_signal_connect_data(
+            self.ctx.resize_signal_h = g_signal_connect_data(
                 win,
                 "notify::default-height",
                 @as(GCallback, @ptrCast(&onWindowSizeChanged)),
@@ -1018,6 +1019,10 @@ pub const Window = struct {
         } else if (cb == null and self.ctx.resize_signal != 0) {
             g_signal_handler_disconnect(win, self.ctx.resize_signal);
             self.ctx.resize_signal = 0;
+            if (self.ctx.resize_signal_h != 0) {
+                g_signal_handler_disconnect(win, self.ctx.resize_signal_h);
+                self.ctx.resize_signal_h = 0;
+            }
         }
     }
 
@@ -1413,7 +1418,8 @@ fn onDrop(_: *GtkDropTarget, value: *const GValue, _: f64, _: f64, user_data: ?*
     const files = gdk_file_list_get_files(file_list_ptr) orelse return 0;
 
     // Stack buffer for up to 64 dropped file paths.
-    // g_file_get_path returns a glib-allocated [*:0]u8; wrap as []const u8 via span.
+    // g_file_get_path returns a glib-allocated [*:0]u8; must be freed with g_free.
+    var path_ptrs: [64][*:0]u8 = undefined;
     var paths_buf: [64][]const u8 = undefined;
     var count: usize = 0;
     var node: ?*GSList = files;
@@ -1421,6 +1427,7 @@ fn onDrop(_: *GtkDropTarget, value: *const GValue, _: f64, _: f64, user_data: ?*
         if (count >= paths_buf.len) break;
         const gfile: *GFile = @ptrCast(@alignCast(n.data orelse continue));
         const path = g_file_get_path(gfile) orelse continue;
+        path_ptrs[count] = path;
         paths_buf[count] = std.mem.span(path);
         count += 1;
     }
@@ -1428,6 +1435,7 @@ fn onDrop(_: *GtkDropTarget, value: *const GValue, _: f64, _: f64, user_data: ?*
     if (ctx.on_drag_drop) |cb| {
         cb(ctx.on_drag_drop_ctx, paths_buf[0..count]);
     }
+    for (path_ptrs[0..count]) |p| g_free(@ptrCast(p));
     return 1; // handled
 }
 
