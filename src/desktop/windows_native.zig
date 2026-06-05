@@ -10,6 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const opts_mod = @import("options.zig");
+const router = @import("asset_router.zig");
 const cookies_mod = @import("cookies.zig");
 const clipboard_mod = @import("clipboard.zig");
 const cookie_codec = @import("win_native/cookie_codec.zig");
@@ -28,6 +29,22 @@ extern fn wv2_eval_js(host: *Host, js: [*]const u8, len: usize) void;
 extern fn wv2_set_bridge(host: *Host, cb: BridgeFn, ctx: ?*anyopaque) void;
 extern fn wv2_run(host: *Host) void;
 extern fn wv2_destroy(host: *Host) void;
+
+const SchemeCb = *const fn (
+    ctx: ?*anyopaque,
+    path: [*]const u8,
+    path_len: usize,
+    out_bytes: *[*]const u8,
+    out_len: *usize,
+    out_ct: *[*:0]const u8,
+) callconv(.c) c_int;
+extern fn wv2_set_scheme_handler(
+    host: *Host,
+    scheme: [*]const u8,
+    scheme_len: usize,
+    cb: SchemeCb,
+    ctx: ?*anyopaque,
+) void;
 
 // Bundle 2: window geometry & state.
 extern fn wv2_set_title(host: *Host, title: [*]const u8, len: usize) void;
@@ -216,6 +233,7 @@ pub const ColorSchemeHandler = opts_mod.ColorSchemeHandler;
 const WindowCtx = struct {
     allocator: std.mem.Allocator,
     host: *Host,
+    opts: opts_mod.WindowOptions = .{},
     on_message: ?opts_mod.MessageHandler = null,
     on_message_ctx: ?*anyopaque = null,
     on_color_scheme: ?opts_mod.ColorSchemeHandler = null,
@@ -230,6 +248,10 @@ const WindowCtx = struct {
     on_focus_ctx: ?*anyopaque = null,
     on_close: ?opts_mod.CloseHandler = null,
     on_close_ctx: ?*anyopaque = null,
+    /// Holds the last dev-mode Resolved from schemeCallback so its allocated
+    /// bytes stay alive until the C++ host copies them into the IStream.
+    /// Freed on the next scheme request or on deinit.
+    last_scheme_resolved: ?router.Resolved = null,
 };
 
 pub const Window = struct {
@@ -254,10 +276,18 @@ pub const Window = struct {
         heap.* = .{
             .allocator = allocator,
             .host = host,
+            .opts = opts,
             .on_message = opts.on_message,
             .on_message_ctx = opts.on_message_ctx,
         };
         wv2_set_bridge(host, bridgeTrampoline, heap);
+        wv2_set_scheme_handler(host, opts.scheme.ptr, opts.scheme.len, schemeCallback, heap);
+
+        var url_buf: [512]u8 = undefined;
+        const initial_url = std.fmt.bufPrint(&url_buf, "{s}://app/{s}", .{ opts.scheme, opts.initial_path }) catch
+            return error.OutOfMemory;
+        wv2_load_url(host, initial_url.ptr, initial_url.len);
+
         return .{ .ctx = heap };
     }
 
@@ -575,10 +605,18 @@ pub const Window = struct {
         heap.* = .{
             .allocator = allocator,
             .host = host,
+            .opts = opts,
             .on_message = opts.on_message,
             .on_message_ctx = opts.on_message_ctx,
         };
         wv2_set_bridge(host, bridgeTrampoline, heap);
+        wv2_set_scheme_handler(host, opts.scheme.ptr, opts.scheme.len, schemeCallback, heap);
+
+        var url_buf: [512]u8 = undefined;
+        const initial_url = std.fmt.bufPrint(&url_buf, "{s}://app/{s}", .{ opts.scheme, opts.initial_path }) catch
+            return error.OutOfMemory;
+        wv2_load_url(host, initial_url.ptr, initial_url.len);
+
         return .{ .ctx = heap };
     }
 
@@ -723,6 +761,44 @@ pub fn hwndOf(window: *Window) ?*anyopaque {
 fn bridgeTrampoline(ctx: ?*anyopaque, msg: [*]const u8, len: usize) callconv(.c) void {
     const wc: *WindowCtx = @ptrCast(@alignCast(ctx.?));
     if (wc.on_message) |h| h(wc.on_message_ctx, msg[0..len]);
+}
+
+fn schemeCallback(
+    ctx: ?*anyopaque,
+    path_ptr: [*]const u8,
+    path_len: usize,
+    out_bytes: *[*]const u8,
+    out_len: *usize,
+    out_ct: *[*:0]const u8,
+) callconv(.c) c_int {
+    const wc: *WindowCtx = @ptrCast(@alignCast(ctx orelse return 0));
+    const path = path_ptr[0..path_len];
+
+    // Free any previously allocated dev-mode response. The C++ host calls
+    // SHCreateMemStream (copies bytes) before returning from the event
+    // handler, so the prior response is safe to release on the next call.
+    if (wc.last_scheme_resolved) |prev| {
+        prev.deinit(wc.allocator);
+        wc.last_scheme_resolved = null;
+    }
+
+    const resolved = blk: {
+        if (wc.opts.dev_assets) |dev| {
+            break :blk router.resolveWithFallback(
+                wc.allocator, dev.io, wc.opts.assets, path, dev.dir,
+            ) catch return 0;
+        }
+        break :blk router.resolve(wc.opts.assets, path) catch return 0;
+    };
+
+    if (resolved.owned) wc.last_scheme_resolved = resolved;
+
+    out_bytes.* = resolved.bytes.ptr;
+    out_len.* = resolved.bytes.len;
+    // content_type is always a Zig string literal from guessContentType —
+    // NUL-terminated in the binary even though the slice length excludes the NUL.
+    out_ct.* = @ptrCast(resolved.content_type.ptr);
+    return 1;
 }
 
 /// Map the host's int scheme (0 light, 1 dark, 2 unknown) to the enum.

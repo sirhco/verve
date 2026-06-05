@@ -121,6 +121,15 @@ struct WV2Host {
     wchar_t *a11y_role_desc = nullptr; // UIA LocalizedControlType (owned)
     int a11y_subrole = 0;              // AccessibilitySubrole enum ordinal
     IUnknown *a11y_provider = nullptr; // RawElementProvider, lazily created
+
+    // Asset serving via AddWebResourceRequestedFilter. env is retained so
+    // CreateWebResourceResponse is available inside the handler. scheme_filter
+    // is the wide "scheme://*" pattern (owned, freed in wv2_destroy).
+    ICoreWebView2Environment *env = nullptr;
+    verve_scheme_cb scheme_cb = nullptr;
+    void *scheme_ctx = nullptr;
+    wchar_t *scheme_filter = nullptr;
+    EventRegistrationToken scheme_token = {};
 };
 
 // Read HKCU\...\Personalize\AppsUseLightTheme. 1 = light, 0 = dark, missing =
@@ -278,6 +287,84 @@ public:
     }
 };
 
+// ---- Scheme request handler: serves verve:// assets ------------------------
+
+class SchemeRequestHandler
+    : public ICoreWebView2WebResourceRequestedEventHandler {
+    WV2Host *host_;
+
+public:
+    explicit SchemeRequestHandler(WV2Host *h) : host_(h) {}
+    WV2_IUNKNOWN_IMPL(ICoreWebView2WebResourceRequestedEventHandler)
+
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *,
+        ICoreWebView2WebResourceRequestedEventArgs *args) override
+    {
+        ICoreWebView2WebResourceRequest *req = nullptr;
+        args->get_Request(&req);
+        if (!req) return S_OK;
+
+        LPWSTR uri_w = nullptr;
+        req->get_Uri(&uri_w);
+        req->Release();
+        if (!uri_w) return S_OK;
+
+        // Convert URI to UTF-8, then extract the path after "://app/".
+        size_t uri_len = 0;
+        char *uri_u8 = narrow(uri_w, &uri_len);
+        CoTaskMemFree(uri_w);
+        if (!uri_u8) return S_OK;
+
+        const char *auth = "://app/";
+        const size_t auth_len = 7;
+        const char *path = uri_u8;
+        size_t path_len = uri_len;
+        for (size_t i = 0; i + auth_len <= uri_len; i++) {
+            if (memcmp(uri_u8 + i, auth, auth_len) == 0) {
+                path = uri_u8 + i + auth_len;
+                path_len = uri_len - (i + auth_len);
+                break;
+            }
+        }
+
+        const uint8_t *bytes = nullptr;
+        size_t bytes_len = 0;
+        const char *ct = nullptr;
+        int found = host_->scheme_cb(host_->scheme_ctx, path, path_len,
+                                      &bytes, &bytes_len, &ct);
+        free(uri_u8);
+
+        ICoreWebView2WebResourceResponse *resp = nullptr;
+        if (found && bytes) {
+            // SHCreateMemStream copies the bytes into the IStream.
+            IStream *stream = SHCreateMemStream(bytes, (UINT)bytes_len);
+            const char *ct_str = ct ? ct : "application/octet-stream";
+            size_t ct_slen = strlen(ct_str);
+            // Build "Content-Type: <ct>" header.
+            char *hdr_u8 = (char *)malloc(14 + ct_slen + 1);
+            if (hdr_u8) {
+                memcpy(hdr_u8, "Content-Type: ", 14);
+                memcpy(hdr_u8 + 14, ct_str, ct_slen + 1);
+            }
+            wchar_t *hdr_w = hdr_u8 ? widen(hdr_u8, (int)(14 + ct_slen)) : nullptr;
+            free(hdr_u8);
+            host_->env->CreateWebResourceResponse(stream, 200, L"OK",
+                                                   hdr_w ? hdr_w : L"", &resp);
+            free(hdr_w);
+            if (stream) stream->Release();
+        } else {
+            host_->env->CreateWebResourceResponse(nullptr, 404, L"Not Found",
+                                                   L"", &resp);
+        }
+        if (resp) {
+            args->put_Response(resp);
+            resp->Release();
+        }
+        return S_OK;
+    }
+};
+
 // ---- Controller created: wire up the webview --------------------------------
 
 class ControllerHandler
@@ -313,6 +400,16 @@ public:
             host_->webview->add_WebMessageReceived(wmh, &token);
             wmh->Release(); // add_* took its own ref
 
+            // Register custom URL scheme handler for asset serving.
+            if (host_->scheme_cb && host_->scheme_filter && host_->env) {
+                host_->webview->AddWebResourceRequestedFilter(
+                    host_->scheme_filter,
+                    COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+                auto *srh = new SchemeRequestHandler(host_);
+                host_->webview->add_WebResourceRequested(srh, &host_->scheme_token);
+                srh->Release();
+            }
+
             if (host_->pending_html) {
                 host_->webview->NavigateToString(host_->pending_html);
                 free(host_->pending_html);
@@ -344,6 +441,9 @@ public:
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT result,
                                      ICoreWebView2Environment *env) override {
         if (FAILED(result) || !env) return S_OK;
+        // Retain env so SchemeRequestHandler can call CreateWebResourceResponse.
+        host_->env = env;
+        env->AddRef();
         auto *ch = new ControllerHandler(host_);
         env->CreateCoreWebView2Controller(host_->hwnd, ch);
         ch->Release();
@@ -1267,6 +1367,25 @@ void wv2_set_bridge(WV2Host *host, verve_bridge_cb cb, void *ctx) {
     host->bridge_ctx = ctx;
 }
 
+void wv2_set_scheme_handler(WV2Host *host, const char *scheme, size_t scheme_len,
+                             verve_scheme_cb cb, void *ctx) {
+    if (!host) return;
+    free(host->scheme_filter);
+    host->scheme_filter = nullptr;
+    host->scheme_cb = cb;
+    host->scheme_ctx = ctx;
+    if (!scheme || scheme_len == 0) return;
+    // Build wide "scheme://*" filter string.
+    const char *suffix = "://*";
+    size_t flen = scheme_len + 4;
+    char *filter_u8 = (char *)malloc(flen + 1);
+    if (!filter_u8) return;
+    memcpy(filter_u8, scheme, scheme_len);
+    memcpy(filter_u8 + scheme_len, suffix, 5); // 4 chars + NUL
+    host->scheme_filter = widen(filter_u8, (int)flen);
+    free(filter_u8);
+}
+
 void wv2_run(WV2Host *host) {
     if (!host) return;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -1327,6 +1446,8 @@ void wv2_destroy(WV2Host *host) {
     }
     free(host->a11y_help);
     free(host->a11y_role_desc);
+    if (host->env) host->env->Release();
+    free(host->scheme_filter);
     if (host->hwnd) DestroyWindow(host->hwnd);
     delete host;
 }

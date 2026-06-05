@@ -41,6 +41,25 @@ void wv2_eval_js(WV2Host *host, const char *js, size_t len);
 /* Register the JS->host bridge callback. */
 void wv2_set_bridge(WV2Host *host, verve_bridge_cb cb, void *ctx);
 
+/* Called synchronously on the UI thread for each request matching the
+ * registered scheme.  path is everything after "://app/" in the URL (UTF-8,
+ * NOT NUL-terminated), path_len its byte count.  On a hit, write the asset
+ * bytes pointer (valid for the duration of this call) + byte count into
+ * *out_bytes / *out_len, and a NUL-terminated UTF-8 content-type into *out_ct.
+ * Return 1.  Return 0 for a miss (the host sends a 404 response). */
+typedef int (*verve_scheme_cb)(void *ctx,
+                                const char *path, size_t path_len,
+                                const uint8_t **out_bytes, size_t *out_len,
+                                const char **out_ct);
+
+/* Register a custom URL scheme handler.  scheme is the scheme name without
+ * "://" (e.g. "verve").  Must be called before wv2_run(); the
+ * WebResourceRequested filter is installed once the WebView2 controller is
+ * ready.  Replaces any previously registered handler. */
+void wv2_set_scheme_handler(WV2Host *host,
+                             const char *scheme, size_t scheme_len,
+                             verve_scheme_cb cb, void *ctx);
+
 /* Show the window, create the WebView2 environment/controller, and pump the
  * Win32 message loop until the window closes. Blocks. */
 void wv2_run(WV2Host *host);
