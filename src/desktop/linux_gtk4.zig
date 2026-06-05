@@ -49,9 +49,6 @@ const WebKitSettings = opaque {};
 const WebKitCookieManager = opaque {};
 const WebKitNetworkSession = opaque {};
 
-// Cairo (for snapshot)
-const CairoSurface = opaque {};
-
 // GTK4 widget types (present in GTK4 — GtkContainer removed)
 const GtkWidget = opaque {};
 const GtkWindow = opaque {};
@@ -135,11 +132,9 @@ const GTK_ACCESSIBLE_PROPERTY_DESCRIPTION: GtkAccessibleProperty = 3;
 // WebKitGTK snapshot
 const WebKitSnapshotRegion = c_uint;
 const WebKitSnapshotOptions = c_uint;
-const CairoStatus = c_int;
 
 const WEBKIT_SNAPSHOT_REGION_VISIBLE: WebKitSnapshotRegion = 0;
 const WEBKIT_SNAPSHOT_OPTIONS_NONE: WebKitSnapshotOptions = 0;
-const CAIRO_STATUS_SUCCESS: CairoStatus = 0;
 
 // Print
 const GTK_PRINT_PAGES_RANGES: c_int = 2;
@@ -181,32 +176,9 @@ extern fn gtk_widget_grab_focus(w: *GtkWidget) gboolean;
 extern fn gtk_widget_set_opacity(w: *GtkWidget, opacity: f64) void;
 extern fn gtk_widget_get_scale_factor(w: *GtkWidget) c_int;
 extern fn gtk_widget_add_controller(widget: *GtkWidget, controller: *anyopaque) void;
-// `gtk_window_set_geometry_hints` reads bitfields from `GdkGeometry`
-// based on which `GdkWindowHints` flags are set. We only ever set
-// `GDK_HINT_MIN_SIZE = 4` and `GDK_HINT_MAX_SIZE = 8`; the other
-// hint slots stay zero. Layout matches the GTK3 ABI verbatim.
-const GdkGeometry = extern struct {
-    min_width: c_int = 0,
-    min_height: c_int = 0,
-    max_width: c_int = 0,
-    max_height: c_int = 0,
-    base_width: c_int = 0,
-    base_height: c_int = 0,
-    width_inc: c_int = 0,
-    height_inc: c_int = 0,
-    min_aspect: f64 = 0,
-    max_aspect: f64 = 0,
-    win_gravity: c_int = 0,
-};
-const GdkWindowHints = c_uint;
-const GDK_HINT_MIN_SIZE: GdkWindowHints = 4;
-const GDK_HINT_MAX_SIZE: GdkWindowHints = 8;
-extern fn gtk_window_set_geometry_hints(
-    w: *GtkWindow,
-    geometry_widget: ?*GtkWidget,
-    geometry: ?*const GdkGeometry,
-    geom_mask: GdkWindowHints,
-) void;
+// GTK4: gtk_window_set_geometry_hints removed. Use gtk_widget_set_size_request
+// for minimum size. Maximum size has no GTK4 equivalent (Wayland compositor handles it).
+extern fn gtk_widget_set_size_request(widget: *GtkWidget, width: c_int, height: c_int) void;
 
 // GTK4 event controllers (replace GTK3 signal-based event handling)
 extern fn gtk_event_controller_focus_new() *GtkEventControllerFocus;
@@ -544,23 +516,20 @@ extern fn webkit_web_view_evaluate_javascript(
 extern fn webkit_web_view_get_network_session(wv: *WebKitWebView) *WebKitNetworkSession;
 extern fn webkit_network_session_get_cookie_manager(session: *WebKitNetworkSession) *WebKitCookieManager;
 
-// Snapshot
-extern fn webkit_web_view_get_snapshot(
-    web_view: *WebKitWebView,
+// Snapshot (WebKitGTK 6.0: no get_ prefix, returns GdkTexture not CairoSurface)
+extern fn webkit_web_view_snapshot(
+    wv: *WebKitWebView,
     region: WebKitSnapshotRegion,
     options: WebKitSnapshotOptions,
     cancellable: ?*GCancellable,
     callback: GAsyncReadyCallback,
     user_data: ?*anyopaque,
 ) void;
-extern fn webkit_web_view_get_snapshot_finish(
-    web_view: *WebKitWebView,
+extern fn webkit_web_view_snapshot_finish(
+    wv: *WebKitWebView,
     result: *GAsyncResult,
     err: ?*?*GError,
-) ?*CairoSurface;
-
-extern fn cairo_surface_write_to_png(surface: *CairoSurface, filename: [*:0]const u8) CairoStatus;
-extern fn cairo_surface_destroy(surface: *CairoSurface) void;
+) ?*GdkTexture;
 
 extern fn webkit_uri_scheme_request_get_uri(req: *WebKitURISchemeRequest) [*:0]const u8;
 extern fn webkit_uri_scheme_request_finish(
@@ -1085,10 +1054,8 @@ pub const Window = struct {
         self.ctx.on_close_ctx = ctx;
     }
 
-    /// Constraints honored by GTK + the WM. `(0, 0)` clears the
-    /// minimum. Pairs with `setMaxSize` — both must be re-applied
-    /// together because `gtk_window_set_geometry_hints` takes a
-    /// single struct covering both bounds.
+    /// Set minimum window size via gtk_widget_set_size_request.
+    /// `(0, 0)` clears the minimum.
     pub fn setMinSize(self: *Window, width: u32, height: u32) void {
         self.ctx.min_width = @intCast(width);
         self.ctx.min_height = @intCast(height);
@@ -1304,53 +1271,55 @@ pub const Window = struct {
         return if (cell.result < 0) 0 else @intCast(cell.result);
     }
 
-    pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
-        const wv = self.ctx.webview orelse return opts_mod.SnapshotError.Unsupported;
-
-        var cell: SnapshotCell = .{};
-        webkit_web_view_get_snapshot(
-            wv,
-            WEBKIT_SNAPSHOT_REGION_VISIBLE,
-            WEBKIT_SNAPSHOT_OPTIONS_NONE,
-            null,
-            &onSnapshotDone,
-            @ptrCast(&cell),
-        );
+    pub fn takeSnapshotPng(self: *Window, allocator: std.mem.Allocator) ![]u8 {
+        const wv = self.ctx.webview orelse return error.NotReady;
+        var cell = SnapshotCell{ .wv = wv };
+        webkit_web_view_snapshot(wv, WEBKIT_SNAPSHOT_REGION_VISIBLE, WEBKIT_SNAPSHOT_OPTIONS_NONE,
+            null, @ptrCast(&onSnapshotDone), @ptrCast(&cell));
         pumpMainContextUntilDone(&cell.done);
+        const texture = cell.texture orelse return error.Backend;
+        defer g_object_unref(texture);
 
-        const result = cell.result orelse return opts_mod.SnapshotError.CaptureFailed;
-        const surface = webkit_web_view_get_snapshot_finish(wv, result, null) orelse return opts_mod.SnapshotError.CaptureFailed;
-        defer cairo_surface_destroy(surface);
+        const w = gdk_texture_get_width(texture);
+        const h = gdk_texture_get_height(texture);
+        const stride: usize = @intCast(w * 4);
+        const rgba = try allocator.alloc(u8, @intCast(h) * stride);
+        defer allocator.free(rgba);
+        gdk_texture_download(texture, rgba.ptr, stride);
 
-        const path_z = self.ctx.allocator.dupeZ(u8, path) catch return opts_mod.SnapshotError.WriteFailed;
-        defer self.ctx.allocator.free(path_z);
-        if (cairo_surface_write_to_png(surface, path_z.ptr) != CAIRO_STATUS_SUCCESS) {
-            return opts_mod.SnapshotError.WriteFailed;
+        // RGBA → pixbuf → PNG bytes (same as clipboardReadImage)
+        const pixbuf = gdk_pixbuf_new_from_data(rgba.ptr, 0, 1, 8, w, h, @intCast(stride), null, null)
+            orelse return error.Backend;
+        defer g_object_unref(pixbuf);
+
+        var out_ptr: ?[*]u8 = null;
+        var out_size: usize = 0;
+        var gerr: ?*GError = null;
+        if (gdk_pixbuf_save_to_bufferv(pixbuf, &out_ptr, &out_size, "png", null, null, &gerr) == 0) {
+            if (gerr) |e| g_error_free(e);
+            return error.Backend;
         }
+        const raw = out_ptr orelse return error.Backend;
+        defer g_free(@ptrCast(raw));
+        return allocator.dupe(u8, raw[0..out_size]) catch error.OutOfMemory;
     }
 };
 
 // ---- Private signal handlers and helpers -----------------------------------
 
-/// Compose the current min/max constraints into one GdkGeometry
-/// struct + flag mask, then push through gtk_window_set_geometry_hints.
-/// Called from both `setMinSize` and `setMaxSize` so the two bounds
-/// stay coherent on the WM side.
+/// Apply size constraints to the window.
+/// GTK4 dropped gtk_window_set_geometry_hints; min size uses
+/// gtk_widget_set_size_request, max size is unsupported on Wayland.
 fn applyGeometryHints(ctx: *WindowCtx) void {
-    const w = ctx.window orelse return;
-    var hints: GdkGeometry = .{};
-    var flags: GdkWindowHints = 0;
-    if (ctx.min_width != 0 or ctx.min_height != 0) {
-        hints.min_width = ctx.min_width;
-        hints.min_height = ctx.min_height;
-        flags |= GDK_HINT_MIN_SIZE;
+    const win = ctx.window orelse return;
+    // GTK4: gtk_window_set_geometry_hints removed. Use gtk_widget_set_size_request for min.
+    // Max size has no GTK4 equivalent (Wayland compositor-enforced).
+    if (ctx.min_width > 0 or ctx.min_height > 0) {
+        gtk_widget_set_size_request(@ptrCast(win), ctx.min_width, ctx.min_height);
     }
-    if (ctx.max_width != 0 or ctx.max_height != 0) {
-        hints.max_width = if (ctx.max_width != 0) ctx.max_width else std.math.maxInt(c_int);
-        hints.max_height = if (ctx.max_height != 0) ctx.max_height else std.math.maxInt(c_int);
-        flags |= GDK_HINT_MAX_SIZE;
+    if (ctx.max_width > 0 or ctx.max_height > 0) {
+        std.log.debug("verve.desktop[linux-gtk4]: setMaxSize not supported in GTK4/Wayland", .{});
     }
-    gtk_window_set_geometry_hints(@ptrCast(w), null, &hints, flags);
 }
 
 /// "destroy" fires after the GTK window has been torn down.
@@ -1568,13 +1537,16 @@ fn alertCb(_: ?*anyopaque, result: *GAsyncResult, user_data: ?*anyopaque) callco
 }
 
 const SnapshotCell = extern struct {
-    result: ?*GAsyncResult = null,
+    wv: *WebKitWebView,
     done: bool = false,
+    texture: ?*GdkTexture = null,
 };
 
-fn onSnapshotDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
-    const cell: *SnapshotCell = @ptrCast(@alignCast(user_data orelse return));
-    cell.result = res;
+fn onSnapshotDone(_: ?*anyopaque, result: *GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *SnapshotCell = @ptrCast(@alignCast(user_data));
+    var gerr: ?*GError = null;
+    cell.texture = webkit_web_view_snapshot_finish(cell.wv, result, &gerr);
+    if (gerr) |e| g_error_free(e);
     @atomicStore(bool, &cell.done, true, .release);
 }
 
@@ -1637,12 +1609,12 @@ const SimpleAsyncCell = extern struct {
 fn onGetAllCookiesDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     const cell: *GetAllCookiesCell = @ptrCast(@alignCast(user_data orelse return));
     cell.result = res;
-    cell.done = true;
+    @atomicStore(bool, &cell.done, true, .release);
 }
 
 fn onSimpleAsyncDone(_: ?*anyopaque, _: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     const cell: *SimpleAsyncCell = @ptrCast(@alignCast(user_data orelse return));
-    cell.done = true;
+    @atomicStore(bool, &cell.done, true, .release);
 }
 
 fn cookieManagerFor(window: *anyopaque) opts_mod.CookieError!*WebKitCookieManager {
