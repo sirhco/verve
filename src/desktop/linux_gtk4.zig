@@ -889,9 +889,37 @@ pub const Window = struct {
     }
 
     pub fn printWithOptions(self: *Window, opts: opts_mod.PrintOptions) opts_mod.PrintError!void {
-        _ = self;
-        _ = opts;
-        return error.TODO;
+        const wv = self.ctx.webview orelse return opts_mod.PrintError.Backend;
+        const op = webkit_print_operation_new(wv) orelse return opts_mod.PrintError.Backend;
+        defer g_object_unref(@ptrCast(op));
+
+        if (opts.copies > 1 or opts.pages != null or opts.printer_name != null) {
+            const settings = gtk_print_settings_new();
+            defer g_object_unref(@ptrCast(settings));
+
+            if (opts.copies > 1) gtk_print_settings_set_n_copies(settings, @intCast(opts.copies));
+
+            if (opts.pages) |range| {
+                const start: c_int = @intCast(@max(range.from, 1) - 1);
+                const end: c_int = if (range.to == 0) std.math.maxInt(c_int) else @intCast(range.to - 1);
+                const gtk_ranges = [_]GtkPageRange{.{ .start = start, .end = end }};
+                gtk_print_settings_set_page_ranges(settings, &gtk_ranges, 1);
+                gtk_print_settings_set_print_pages(settings, GTK_PRINT_PAGES_RANGES);
+            }
+
+            if (opts.printer_name) |pname| {
+                const z = self.ctx.allocator.dupeZ(u8, pname) catch return opts_mod.PrintError.OutOfMemory;
+                defer self.ctx.allocator.free(z);
+                gtk_print_settings_set_printer(settings, z.ptr);
+            }
+
+            webkit_print_operation_set_print_settings(op, settings);
+        }
+
+        const parent: ?*GtkWindow = if (self.ctx.window) |w| @ptrCast(w) else null;
+        const response = webkit_print_operation_run_dialog(op, parent);
+        if (response == WEBKIT_PRINT_OPERATION_RESPONSE_CANCEL) return opts_mod.PrintError.Cancelled;
+        std.log.info("verve.desktop[linux-gtk4]: print dialog response={d} (copies={d})", .{ response, opts.copies });
     }
 
     pub fn setAccessibilityLabel(self: *Window, label: []const u8) void {
@@ -1183,33 +1211,122 @@ pub const Window = struct {
 
     pub fn colorScheme(self: *Window) opts_mod.ColorScheme {
         _ = self;
-        return .unknown;
+        const settings = gtk_settings_get_default() orelse return .unknown;
+        var prefer_dark: gboolean = 0;
+        g_object_get(settings, "gtk-application-prefer-dark-theme", &prefer_dark, @as(?*anyopaque, null));
+        return if (prefer_dark != 0) .dark else .light;
     }
 
     pub fn openFileDialog(self: *Window, allocator: std.mem.Allocator, opts: opts_mod.FileDialogOptions) opts_mod.DialogError![]u8 {
-        _ = self;
-        _ = allocator;
-        _ = opts;
-        return error.TODO;
+        const dialog = gtk_file_dialog_new();
+        defer g_object_unref(dialog);
+
+        if (opts.title.len > 0) {
+            const t = allocator.dupeZ(u8, opts.title) catch return error.OutOfMemory;
+            defer allocator.free(t);
+            gtk_file_dialog_set_title(dialog, t.ptr);
+        }
+
+        const parent: ?*GtkWindow = if (self.ctx.window) |w| @ptrCast(w) else null;
+        var cell: OpenFileCell = .{ .dialog = dialog };
+        gtk_file_dialog_open(dialog, parent, null, &openFileCb, @ptrCast(&cell));
+        pumpMainContextUntilDone(&cell.done);
+
+        const gfile = cell.file orelse return error.Cancelled;
+        defer g_object_unref(gfile);
+        const raw = g_file_get_path(gfile) orelse return error.Unsupported;
+        defer g_free(@ptrCast(raw));
+        return allocator.dupe(u8, std.mem.span(raw)) catch error.OutOfMemory;
     }
 
     pub fn saveFileDialog(self: *Window, allocator: std.mem.Allocator, opts: opts_mod.FileDialogOptions) opts_mod.DialogError![]u8 {
-        _ = self;
-        _ = allocator;
-        _ = opts;
-        return error.TODO;
+        const dialog = gtk_file_dialog_new();
+        defer g_object_unref(dialog);
+
+        if (opts.title.len > 0) {
+            const t = allocator.dupeZ(u8, opts.title) catch return error.OutOfMemory;
+            defer allocator.free(t);
+            gtk_file_dialog_set_title(dialog, t.ptr);
+        }
+        if (opts.default_name.len > 0) {
+            const n = allocator.dupeZ(u8, opts.default_name) catch return error.OutOfMemory;
+            defer allocator.free(n);
+            gtk_file_dialog_set_initial_name(dialog, n.ptr);
+        }
+
+        const parent: ?*GtkWindow = if (self.ctx.window) |w| @ptrCast(w) else null;
+        var cell: SaveFileCell = .{ .dialog = dialog };
+        gtk_file_dialog_save(dialog, parent, null, &saveFileCb, @ptrCast(&cell));
+        pumpMainContextUntilDone(&cell.done);
+
+        const gfile = cell.file orelse return error.Cancelled;
+        defer g_object_unref(gfile);
+        const raw = g_file_get_path(gfile) orelse return error.Unsupported;
+        defer g_free(@ptrCast(raw));
+        return allocator.dupe(u8, std.mem.span(raw)) catch error.OutOfMemory;
     }
 
     pub fn showAlert(self: *Window, opts: opts_mod.AlertOptions) usize {
-        _ = self;
-        _ = opts;
-        return 0;
+        const dialog = gtk_alert_dialog_new("%s", "");
+        defer g_object_unref(dialog);
+
+        // Message
+        const msg_src = if (opts.message.len > 0) opts.message else " ";
+        const msg_z = self.ctx.allocator.dupeZ(u8, msg_src) catch return 0;
+        defer self.ctx.allocator.free(msg_z);
+        gtk_alert_dialog_set_message(dialog, msg_z.ptr);
+
+        // Buttons — build a null-terminated array of ?[*:0]const u8
+        const btn_src = if (opts.buttons.len == 0) &[_][]const u8{"OK"} else opts.buttons;
+        // stack-allocate up to 64 button pointers + null terminator
+        var btn_ptrs: [65]?[*:0]const u8 = undefined;
+        var btn_strs: [64][:0]u8 = undefined;
+        const btn_count = @min(btn_src.len, 64);
+        var allocated: usize = 0;
+        for (btn_src[0..btn_count], 0..) |label, i| {
+            const z = self.ctx.allocator.dupeZ(u8, label) catch break;
+            btn_strs[i] = z;
+            btn_ptrs[i] = z.ptr;
+            allocated = i + 1;
+        }
+        btn_ptrs[allocated] = null;
+        defer {
+            for (0..allocated) |i| self.ctx.allocator.free(btn_strs[i]);
+        }
+        gtk_alert_dialog_set_buttons(dialog, &btn_ptrs);
+        gtk_alert_dialog_set_default_button(dialog, 0);
+
+        const parent: ?*GtkWindow = if (self.ctx.window) |w| @ptrCast(w) else null;
+        var cell: AlertCell = .{ .dialog = dialog };
+        gtk_alert_dialog_choose(dialog, parent, null, &alertCb, @ptrCast(&cell));
+        pumpMainContextUntilDone(&cell.done);
+
+        return if (cell.result < 0) 0 else @intCast(cell.result);
     }
 
     pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
-        _ = self;
-        _ = path;
-        return error.TODO;
+        const wv = self.ctx.webview orelse return opts_mod.SnapshotError.Unsupported;
+
+        var cell: SnapshotCell = .{};
+        webkit_web_view_get_snapshot(
+            wv,
+            WEBKIT_SNAPSHOT_REGION_VISIBLE,
+            WEBKIT_SNAPSHOT_OPTIONS_NONE,
+            null,
+            &onSnapshotDone,
+            @ptrCast(&cell),
+        );
+        pumpMainContextUntilDone(&cell.done);
+
+        const result = cell.result orelse return opts_mod.SnapshotError.CaptureFailed;
+        const surface = webkit_web_view_get_snapshot_finish(wv, result, null) orelse return opts_mod.SnapshotError.CaptureFailed;
+        defer cairo_surface_destroy(surface);
+
+        const path_z = self.ctx.allocator.dupeZ(u8, path) catch return opts_mod.SnapshotError.WriteFailed;
+        defer self.ctx.allocator.free(path_z);
+        if (cairo_surface_write_to_png(surface, path_z.ptr) != CAIRO_STATUS_SUCCESS) {
+            return opts_mod.SnapshotError.WriteFailed;
+        }
     }
 };
 
@@ -1406,6 +1523,61 @@ fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callcon
     g_object_unref(stream);
 }
 
+// ---- Dialog async-to-sync cells + callbacks ---------------------------------
+
+const OpenFileCell = extern struct {
+    dialog: *GtkFileDialog,
+    done: bool = false,
+    file: ?*GFile = null,
+};
+
+fn openFileCb(_: ?*anyopaque, result: *GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *OpenFileCell = @ptrCast(@alignCast(user_data orelse return));
+    var gerr: ?*GError = null;
+    cell.file = gtk_file_dialog_open_finish(cell.dialog, result, &gerr);
+    if (gerr) |e| g_error_free(e);
+    @atomicStore(bool, &cell.done, true, .release);
+}
+
+const SaveFileCell = extern struct {
+    dialog: *GtkFileDialog,
+    done: bool = false,
+    file: ?*GFile = null,
+};
+
+fn saveFileCb(_: ?*anyopaque, result: *GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *SaveFileCell = @ptrCast(@alignCast(user_data orelse return));
+    var gerr: ?*GError = null;
+    cell.file = gtk_file_dialog_save_finish(cell.dialog, result, &gerr);
+    if (gerr) |e| g_error_free(e);
+    @atomicStore(bool, &cell.done, true, .release);
+}
+
+const AlertCell = extern struct {
+    dialog: *GtkAlertDialog,
+    done: bool = false,
+    result: c_int = 0,
+};
+
+fn alertCb(_: ?*anyopaque, result: *GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *AlertCell = @ptrCast(@alignCast(user_data orelse return));
+    var gerr: ?*GError = null;
+    cell.result = gtk_alert_dialog_choose_finish(cell.dialog, result, &gerr);
+    if (gerr) |e| g_error_free(e);
+    @atomicStore(bool, &cell.done, true, .release);
+}
+
+const SnapshotCell = extern struct {
+    result: ?*GAsyncResult = null,
+    done: bool = false,
+};
+
+fn onSnapshotDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    const cell: *SnapshotCell = @ptrCast(@alignCast(user_data orelse return));
+    cell.result = res;
+    @atomicStore(bool, &cell.done, true, .release);
+}
+
 /// Spin the GLib main context until `done` flips true.
 /// Used by async-to-sync wrappers (cookies, clipboard, dialogs).
 fn pumpMainContextUntilDone(done: *const bool) void {
@@ -1418,10 +1590,32 @@ fn pumpMainContextUntilDone(done: *const bool) void {
 //
 // All stubs — implementations follow in tasks D through I.
 
+/// Wrap an already-bound `AF_UNIX` SOCK_DGRAM fd in a GIOChannel
+/// watch keyed on `G_IO_IN`. Called by `deep_link.startListener` on
+/// the Linux backend; the fd ownership transfers — we set
+/// `close_on_unref(true)` so the channel cleans the fd up at
+/// window destruction.
 pub fn attachUrlSocket(window: *Window, fd: c_int) !void {
-    _ = window;
-    _ = fd;
-    return error.TODO;
+    const ch = g_io_channel_unix_new(fd);
+    g_io_channel_set_close_on_unref(ch, 1);
+    const watch = g_io_add_watch(ch, G_IO_IN, &onUrlSocketReadable, @ptrCast(window.ctx));
+    g_io_channel_unref(ch);
+    window.ctx.url_socket_fd = fd;
+    window.ctx.url_socket_watch = watch;
+}
+
+/// `G_IO_IN` callback. One datagram per `recv`; URL bytes are UTF-8
+/// with no terminator. Returns `1` (TRUE) to keep the watch active.
+fn onUrlSocketReadable(source: *GIOChannel, _cond: GIOCondition, data: ?*anyopaque) callconv(.c) gboolean {
+    _ = source;
+    _ = _cond;
+    const cx: *WindowCtx = @ptrCast(@alignCast(data orelse return 1));
+    var buf: [4096]u8 = undefined;
+    const n = recv(cx.url_socket_fd, &buf, buf.len, 0);
+    if (n <= 0) return 1;
+    const url = buf[0..@intCast(n)];
+    if (cx.on_url_open) |cb| cb(cx.on_url_open_ctx, url);
+    return 1;
 }
 
 // ---- Cookie helpers ---------------------------------------------------------
