@@ -181,11 +181,31 @@ extern fn gtk_widget_grab_focus(w: *GtkWidget) gboolean;
 extern fn gtk_widget_set_opacity(w: *GtkWidget, opacity: f64) void;
 extern fn gtk_widget_get_scale_factor(w: *GtkWidget) c_int;
 extern fn gtk_widget_add_controller(widget: *GtkWidget, controller: *anyopaque) void;
+// `gtk_window_set_geometry_hints` reads bitfields from `GdkGeometry`
+// based on which `GdkWindowHints` flags are set. We only ever set
+// `GDK_HINT_MIN_SIZE = 4` and `GDK_HINT_MAX_SIZE = 8`; the other
+// hint slots stay zero. Layout matches the GTK3 ABI verbatim.
+const GdkGeometry = extern struct {
+    min_width: c_int = 0,
+    min_height: c_int = 0,
+    max_width: c_int = 0,
+    max_height: c_int = 0,
+    base_width: c_int = 0,
+    base_height: c_int = 0,
+    width_inc: c_int = 0,
+    height_inc: c_int = 0,
+    min_aspect: f64 = 0,
+    max_aspect: f64 = 0,
+    win_gravity: c_int = 0,
+};
+const GdkWindowHints = c_uint;
+const GDK_HINT_MIN_SIZE: GdkWindowHints = 4;
+const GDK_HINT_MAX_SIZE: GdkWindowHints = 8;
 extern fn gtk_window_set_geometry_hints(
     w: *GtkWindow,
     geometry_widget: ?*GtkWidget,
-    geometry: ?*anyopaque,
-    geom_mask: c_int,
+    geometry: ?*const GdkGeometry,
+    geom_mask: GdkWindowHints,
 ) void;
 
 // GTK4 event controllers (replace GTK3 signal-based event handling)
@@ -755,26 +775,33 @@ pub const Window = struct {
     }
 
     pub fn setTitle(self: *Window, title: []const u8) void {
-        _ = self;
-        _ = title;
+        const z = self.ctx.allocator.dupeZ(u8, title) catch return;
+        defer self.ctx.allocator.free(z);
+        if (self.ctx.window) |w| gtk_window_set_title(@ptrCast(w), z.ptr);
     }
 
     pub fn loadUrl(self: *Window, url: []const u8) !void {
-        _ = self;
-        _ = url;
-        return error.TODO;
+        const wv = self.ctx.webview orelse return error.NotReady;
+        const z = try self.ctx.allocator.dupeZ(u8, url);
+        defer self.ctx.allocator.free(z);
+        webkit_web_view_load_uri(wv, z.ptr);
     }
 
     pub fn loadHtml(self: *Window, html: []const u8, base_url: ?[]const u8) !void {
-        _ = self;
-        _ = html;
-        _ = base_url;
-        return error.TODO;
+        const wv = self.ctx.webview orelse return error.NotReady;
+        const z = try self.ctx.allocator.dupeZ(u8, html);
+        defer self.ctx.allocator.free(z);
+        const base_z: ?[:0]u8 = if (base_url) |b| (self.ctx.allocator.dupeZ(u8, b) catch null) else null;
+        defer if (base_z) |bz| self.ctx.allocator.free(bz);
+        const base_ptr: ?[*:0]const u8 = if (base_z) |bz| bz.ptr else null;
+        webkit_web_view_load_html(wv, z.ptr, base_ptr);
     }
 
     pub fn evalJs(self: *Window, script: []const u8) void {
-        _ = self;
-        _ = script;
+        const wv = self.ctx.webview orelse return;
+        const z = self.ctx.allocator.dupeZ(u8, script) catch return;
+        defer self.ctx.allocator.free(z);
+        webkit_web_view_evaluate_javascript(wv, z.ptr, -1, null, null, null, null, null);
     }
 
     pub fn setMessageHandler(self: *Window, handler: opts_mod.MessageHandler, handler_ctx: ?*anyopaque) void {
@@ -782,10 +809,11 @@ pub const Window = struct {
         self.ctx.on_message_ctx = handler_ctx;
     }
 
+    /// Open a second window in the same GTK main loop. Returned
+    /// Window owns its own GtkWindow + WebKitWebContext + WebView;
+    /// the GMainLoop quits only when the last live window closes.
     pub fn openChildWindow(self: *Window, opts: opts_mod.WindowOptions) !Window {
-        _ = self;
-        _ = opts;
-        return error.TODO;
+        return Window.init(self.ctx.allocator, opts);
     }
 
     pub fn cookies(self: *Window) cookies_mod.CookieStore {
@@ -840,161 +868,191 @@ pub const Window = struct {
         std.log.info("verve.desktop[linux-gtk4]: setAccessibilitySubrole no-op (no GTK4 subrole)", .{});
     }
 
+    /// GTK4 removed `gtk_window_set_keep_above` (Wayland does not
+    /// expose this as a reliable client-side hint). Log and return.
     pub fn setAlwaysOnTop(self: *Window, on: bool) void {
         _ = self;
         _ = on;
+        std.log.debug("verve.desktop[linux-gtk4]: setAlwaysOnTop not reliably supported in GTK4", .{});
     }
 
+    /// Window-wide opacity in `[0.0, 1.0]`. `gtk_widget_set_opacity`
+    /// composites through the active compositor; opaque-only Wayland
+    /// sessions silently clamp to 1.0.
     pub fn setOpacity(self: *Window, value: f64) void {
-        _ = self;
-        _ = value;
+        const w = self.ctx.window orelse return;
+        gtk_widget_set_opacity(w, std.math.clamp(value, 0.0, 1.0));
     }
 
     pub fn setSize(self: *Window, width: u32, height: u32) void {
-        _ = self;
-        _ = width;
-        _ = height;
+        const w = self.ctx.window orelse return;
+        gtk_window_set_default_size(@ptrCast(w), @intCast(width), @intCast(height));
     }
 
+    /// GTK4/Wayland does not permit arbitrary window positioning.
     pub fn setPosition(self: *Window, x: i32, y: i32) void {
         _ = self;
         _ = x;
         _ = y;
+        std.log.debug("verve.desktop[linux-gtk4]: setPosition not supported in GTK4 (Wayland)", .{});
     }
 
+    /// GTK4 removed `gtk_window_set_position`; centering is compositor-managed.
     pub fn center(self: *Window) void {
         _ = self;
+        std.log.debug("verve.desktop[linux-gtk4]: center not supported in GTK4 (Wayland)", .{});
     }
 
     pub fn minimize(self: *Window) void {
-        _ = self;
+        const w = self.ctx.window orelse return;
+        gtk_window_minimize(@ptrCast(w));
     }
 
     pub fn maximize(self: *Window) void {
-        _ = self;
+        const w = self.ctx.window orelse return;
+        gtk_window_maximize(@ptrCast(w));
     }
 
     pub fn restore(self: *Window) void {
-        _ = self;
+        const w = self.ctx.window orelse return;
+        gtk_window_unmaximize(@ptrCast(w));
+        gtk_window_present(@ptrCast(w));
     }
 
     pub fn setFullscreen(self: *Window, on: bool) void {
-        _ = self;
-        _ = on;
+        const w = self.ctx.window orelse return;
+        if (on) gtk_window_fullscreen(@ptrCast(w)) else gtk_window_unfullscreen(@ptrCast(w));
     }
 
     pub fn show(self: *Window) void {
-        _ = self;
+        const w = self.ctx.window orelse return;
+        gtk_widget_show(w);
+        gtk_window_present(@ptrCast(w));
     }
 
     pub fn hide(self: *Window) void {
-        _ = self;
+        const w = self.ctx.window orelse return;
+        gtk_widget_hide(w);
     }
 
     pub fn focus(self: *Window) void {
-        _ = self;
+        const w = self.ctx.window orelse return;
+        gtk_window_present(@ptrCast(w));
     }
 
     pub fn setResizable(self: *Window, on: bool) void {
-        _ = self;
-        _ = on;
+        const w = self.ctx.window orelse return;
+        gtk_window_set_resizable(@ptrCast(w), if (on) 1 else 0);
     }
 
     pub fn setResizeHandler(self: *Window, cb: ?opts_mod.ResizeHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
+        self.ctx.on_resize = cb;
+        self.ctx.on_resize_ctx = ctx;
     }
 
     pub fn setFocusHandler(self: *Window, cb: ?opts_mod.FocusHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
+        self.ctx.on_focus = cb;
+        self.ctx.on_focus_ctx = ctx;
     }
 
     pub fn setCloseHandler(self: *Window, cb: ?opts_mod.CloseHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
+        self.ctx.on_close = cb;
+        self.ctx.on_close_ctx = ctx;
     }
 
+    /// Constraints honored by GTK + the WM. `(0, 0)` clears the
+    /// minimum. Pairs with `setMaxSize` — both must be re-applied
+    /// together because `gtk_window_set_geometry_hints` takes a
+    /// single struct covering both bounds.
     pub fn setMinSize(self: *Window, width: u32, height: u32) void {
-        _ = self;
-        _ = width;
-        _ = height;
+        self.ctx.min_width = @intCast(width);
+        self.ctx.min_height = @intCast(height);
+        applyGeometryHints(self.ctx);
     }
 
     pub fn setMaxSize(self: *Window, width: u32, height: u32) void {
-        _ = self;
-        _ = width;
-        _ = height;
+        self.ctx.max_width = @intCast(width);
+        self.ctx.max_height = @intCast(height);
+        applyGeometryHints(self.ctx);
     }
 
     pub fn reload(self: *Window) void {
-        _ = self;
+        const wv = self.ctx.webview orelse return;
+        webkit_web_view_reload(wv);
     }
 
     pub fn goBack(self: *Window) void {
-        _ = self;
+        const wv = self.ctx.webview orelse return;
+        webkit_web_view_go_back(wv);
     }
 
     pub fn goForward(self: *Window) void {
-        _ = self;
+        const wv = self.ctx.webview orelse return;
+        webkit_web_view_go_forward(wv);
     }
 
     pub fn canGoBack(self: *Window) bool {
-        _ = self;
-        return false;
+        const wv = self.ctx.webview orelse return false;
+        return webkit_web_view_can_go_back(wv) != 0;
     }
 
     pub fn canGoForward(self: *Window) bool {
-        _ = self;
-        return false;
+        const wv = self.ctx.webview orelse return false;
+        return webkit_web_view_can_go_forward(wv) != 0;
     }
 
     pub fn currentUrl(self: *Window, allocator: std.mem.Allocator) ![]u8 {
-        _ = self;
-        return allocator.dupe(u8, "");
+        const wv = self.ctx.webview orelse return allocator.dupe(u8, "");
+        const uri = webkit_web_view_get_uri(wv) orelse return allocator.dupe(u8, "");
+        return allocator.dupe(u8, std.mem.span(uri));
     }
 
     pub fn currentTitle(self: *Window, allocator: std.mem.Allocator) ![]u8 {
-        _ = self;
-        return allocator.dupe(u8, "");
+        const wv = self.ctx.webview orelse return allocator.dupe(u8, "");
+        const title = webkit_web_view_get_title(wv) orelse return allocator.dupe(u8, "");
+        return allocator.dupe(u8, std.mem.span(title));
     }
 
     pub fn setZoom(self: *Window, level: f64) void {
-        _ = self;
-        _ = level;
+        const wv = self.ctx.webview orelse return;
+        webkit_web_view_set_zoom_level(wv, level);
     }
 
     pub fn getZoom(self: *Window) f64 {
-        _ = self;
-        return 1.0;
+        const wv = self.ctx.webview orelse return 1.0;
+        return webkit_web_view_get_zoom_level(wv);
     }
 
     pub fn scaleFactor(self: *Window) f32 {
-        _ = self;
-        return 1.0;
+        const w = self.ctx.window orelse return 1.0;
+        return @floatFromInt(gtk_widget_get_scale_factor(w));
     }
 
     pub fn isMinimized(self: *Window) bool {
-        _ = self;
-        return false;
+        const w = self.ctx.window orelse return false;
+        const surface = gtk_native_get_surface(@ptrCast(w)) orelse return false;
+        const state = gdk_toplevel_get_state(@ptrCast(surface));
+        return (state & GDK_TOPLEVEL_STATE_MINIMIZED) != 0;
     }
 
     pub fn isMaximized(self: *Window) bool {
-        _ = self;
-        return false;
+        const w = self.ctx.window orelse return false;
+        return gtk_window_is_maximized(@ptrCast(w)) != 0;
     }
 
     pub fn isFullscreen(self: *Window) bool {
-        _ = self;
-        return false;
+        const w = self.ctx.window orelse return false;
+        const surface = gtk_native_get_surface(@ptrCast(w)) orelse return false;
+        const state = gdk_toplevel_get_state(@ptrCast(surface));
+        return (state & GDK_TOPLEVEL_STATE_FULLSCREEN) != 0;
     }
 
+    /// GTK4 removed `gtk_window_set_urgency_hint`. Best-effort: present
+    /// the window to bring it to the user's attention.
     pub fn requestAttention(self: *Window, critical: bool) void {
-        _ = self;
         _ = critical;
+        const w = self.ctx.window orelse return;
+        gtk_window_present(@ptrCast(w));
     }
 
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
@@ -1004,8 +1062,7 @@ pub const Window = struct {
     }
 
     pub fn deliverUrl(self: *Window, url: []const u8) void {
-        _ = self;
-        _ = url;
+        if (self.ctx.on_url_open) |cb| cb(self.ctx.on_url_open_ctx, url);
     }
 
     pub fn colorScheme(self: *Window) opts_mod.ColorScheme {
@@ -1041,6 +1098,27 @@ pub const Window = struct {
 };
 
 // ---- Private signal handlers and helpers -----------------------------------
+
+/// Compose the current min/max constraints into one GdkGeometry
+/// struct + flag mask, then push through gtk_window_set_geometry_hints.
+/// Called from both `setMinSize` and `setMaxSize` so the two bounds
+/// stay coherent on the WM side.
+fn applyGeometryHints(ctx: *WindowCtx) void {
+    const w = ctx.window orelse return;
+    var hints: GdkGeometry = .{};
+    var flags: GdkWindowHints = 0;
+    if (ctx.min_width != 0 or ctx.min_height != 0) {
+        hints.min_width = ctx.min_width;
+        hints.min_height = ctx.min_height;
+        flags |= GDK_HINT_MIN_SIZE;
+    }
+    if (ctx.max_width != 0 or ctx.max_height != 0) {
+        hints.max_width = if (ctx.max_width != 0) ctx.max_width else std.math.maxInt(c_int);
+        hints.max_height = if (ctx.max_height != 0) ctx.max_height else std.math.maxInt(c_int);
+        flags |= GDK_HINT_MAX_SIZE;
+    }
+    gtk_window_set_geometry_hints(@ptrCast(w), null, &hints, flags);
+}
 
 /// "destroy" fires after the GTK window has been torn down.
 /// Decrements live_windows; quits the per-window GMainLoop when
