@@ -1288,7 +1288,7 @@ pub const Window = struct {
         const w = gdk_texture_get_width(texture);
         const h = gdk_texture_get_height(texture);
         const stride: usize = @intCast(w * 4);
-        const rgba = try allocator.alloc(u8, @intCast(h) * stride);
+        const rgba = try allocator.alloc(u8, @as(usize, @intCast(h)) * stride);
         defer allocator.free(rgba);
         gdk_texture_download(texture, rgba.ptr, stride);
 
