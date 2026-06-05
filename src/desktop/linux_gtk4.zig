@@ -1246,7 +1246,7 @@ fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callcon
 /// Spin the GLib main context until `done` flips true.
 /// Used by async-to-sync wrappers (cookies, clipboard, dialogs).
 fn pumpMainContextUntilDone(done: *const bool) void {
-    while (!done.*) {
+    while (!@atomicLoad(bool, done, .acquire)) {
         _ = g_main_context_iteration(null, 1); // 1 = may_block
     }
 }
@@ -1451,10 +1451,10 @@ fn getClipboard() ?*GdkClipboard {
 pub fn clipboardWriteText(window: *anyopaque, text: []const u8) opts_mod.ClipboardError!void {
     _ = window;
     const clip = getClipboard() orelse return opts_mod.ClipboardError.Backend;
-    // Need a Zig allocator here; borrow the GPA via std.heap.c_allocator which
-    // is always available in the desktop build (links libc).
-    const z = std.heap.c_allocator.dupeZ(u8, text) catch return opts_mod.ClipboardError.OutOfMemory;
-    defer std.heap.c_allocator.free(z);
+    var sfb = std.heap.stackFallback(4096, std.heap.c_allocator);
+    const alloc = sfb.get();
+    const z = alloc.dupeZ(u8, text) catch return opts_mod.ClipboardError.OutOfMemory;
+    defer alloc.free(z);
     gdk_clipboard_set_text(clip, z.ptr);
 }
 
@@ -1469,7 +1469,7 @@ const ReadTextCell = extern struct {
 fn readTextCb(src: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     _ = src;
     const cell: *ReadTextCell = @ptrCast(@alignCast(user_data));
-    defer cell.done = true;
+    defer @atomicStore(bool, &cell.done, true, .release);
     const res = result orelse return;
     var gerr: ?*GError = null;
     cell.text = gdk_clipboard_read_text_finish(cell.clip, res, &gerr);
@@ -1510,7 +1510,7 @@ const ReadHtmlCell = extern struct {
 fn readHtmlCb(src: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     _ = src;
     const cell: *ReadHtmlCell = @ptrCast(@alignCast(user_data));
-    defer cell.done = true;
+    defer @atomicStore(bool, &cell.done, true, .release);
     const res = result orelse return;
     var gerr: ?*GError = null;
     var out_mime: ?[*:0]const u8 = null;
@@ -1519,7 +1519,7 @@ fn readHtmlCb(src: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) 
 }
 
 // mime_types sentinel-terminated array for gdk_clipboard_read_async
-const html_mime_types = [_:null]?[*:0]const u8{ "text/html", null };
+const html_mime_types = [_:null]?[*:0]const u8{"text/html"};
 
 pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
     _ = window;
@@ -1588,7 +1588,7 @@ const ReadTexCell = extern struct {
 fn readTexCb(src: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     _ = src;
     const cell: *ReadTexCell = @ptrCast(@alignCast(user_data));
-    defer cell.done = true;
+    defer @atomicStore(bool, &cell.done, true, .release);
     const res = result orelse return;
     var gerr: ?*GError = null;
     cell.texture = gdk_clipboard_read_texture_finish(cell.clip, res, &gerr);
