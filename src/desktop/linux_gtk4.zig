@@ -482,7 +482,7 @@ extern fn webkit_web_view_evaluate_javascript(
     world_name: ?[*:0]const u8,
     source_uri: ?[*:0]const u8,
     cancellable: ?*GCancellable,
-    callback: ?GAsyncReadyCallback,
+    callback: GAsyncReadyCallback,
     user_data: ?*anyopaque,
 ) void;
 
