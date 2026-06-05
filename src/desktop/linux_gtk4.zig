@@ -282,6 +282,24 @@ extern fn g_bytes_unref(bytes: *GBytes) void;
 
 extern fn gtk_settings_get_default() ?*GtkSettings;
 
+// ---- GValue / GSList (drag-drop file list) ----------------------------------
+
+/// Minimal GValue layout: type tag + two 64-bit data slots.
+/// Matches the GLib ABI on LP64 (all supported Linux targets).
+const GValue = extern struct {
+    g_type: GType,
+    data: [2]u64,
+};
+
+/// Singly-linked list node (GLib GSList).
+const GSList = extern struct {
+    data: ?*anyopaque,
+    next: ?*GSList,
+};
+
+extern fn g_value_get_boxed(value: *const GValue) ?*anyopaque;
+extern fn gdk_file_list_get_files(file_list: *anyopaque) ?*GSList;
+
 // ---- GTK4 accessibility (replaces ATK) -------------------------------------
 //
 // GTK4 removes ATK. Accessibility is now exposed via gtk_accessible_update_property
@@ -840,16 +858,30 @@ pub const Window = struct {
         return .{ .window = @ptrCast(self) };
     }
 
-    pub fn setColorSchemeHandler(self: *Window, cb: ?opts_mod.ColorSchemeHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
+    pub fn setColorSchemeHandler(self: *Window, cb: ?opts_mod.ColorSchemeHandler, ctx_ptr: ?*anyopaque) void {
+        self.ctx.on_color_scheme = cb;
+        self.ctx.on_color_scheme_ctx = ctx_ptr;
+        if (self.ctx.color_scheme_signal == 0 and cb != null) {
+            const settings = gtk_settings_get_default() orelse return;
+            const sig = g_signal_connect_data(
+                @ptrCast(settings),
+                "notify::gtk-application-prefer-dark-theme",
+                @as(GCallback, @ptrCast(&onColorSchemeChanged)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+            self.ctx.color_scheme_signal = sig;
+        } else if (cb == null and self.ctx.color_scheme_signal != 0) {
+            const settings = gtk_settings_get_default() orelse return;
+            g_signal_handler_disconnect(@ptrCast(settings), self.ctx.color_scheme_signal);
+            self.ctx.color_scheme_signal = 0;
+        }
     }
 
-    pub fn setUrlOpenHandler(self: *Window, cb: ?opts_mod.UrlOpenHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
+    pub fn setUrlOpenHandler(self: *Window, cb: ?opts_mod.UrlOpenHandler, ctx_ptr: ?*anyopaque) void {
+        self.ctx.on_url_open = cb;
+        self.ctx.on_url_open_ctx = ctx_ptr;
     }
 
     pub fn print(self: *Window) void {
@@ -863,13 +895,16 @@ pub const Window = struct {
     }
 
     pub fn setAccessibilityLabel(self: *Window, label: []const u8) void {
+        // GTK4: gtk_accessible_update_property is variadic — cannot call directly from Zig.
+        // Best-effort: log and return.
+        std.log.debug("verve.desktop[linux-gtk4]: setAccessibilityLabel (no-op in GTK4, label='{s}')", .{label});
         _ = self;
-        _ = label;
     }
 
     pub fn setAccessibilityHelp(self: *Window, text: []const u8) void {
+        // GTK4: same limitation as setAccessibilityLabel.
+        std.log.debug("verve.desktop[linux-gtk4]: setAccessibilityHelp (no-op in GTK4, text='{s}')", .{text});
         _ = self;
-        _ = text;
     }
 
     pub fn setAccessibilityRoleDescription(self: *Window, text: []const u8) void {
@@ -961,14 +996,60 @@ pub const Window = struct {
         gtk_window_set_resizable(@ptrCast(w), if (on) 1 else 0);
     }
 
-    pub fn setResizeHandler(self: *Window, cb: ?opts_mod.ResizeHandler, ctx: ?*anyopaque) void {
+    pub fn setResizeHandler(self: *Window, cb: ?opts_mod.ResizeHandler, ctx_ptr: ?*anyopaque) void {
         self.ctx.on_resize = cb;
-        self.ctx.on_resize_ctx = ctx;
+        self.ctx.on_resize_ctx = ctx_ptr;
+        const win = self.ctx.window orelse return;
+        if (cb != null and self.ctx.resize_signal == 0) {
+            const sig = g_signal_connect_data(
+                win,
+                "notify::default-width",
+                @as(GCallback, @ptrCast(&onWindowSizeChanged)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+            self.ctx.resize_signal = sig;
+            _ = g_signal_connect_data(
+                win,
+                "notify::default-height",
+                @as(GCallback, @ptrCast(&onWindowSizeChanged)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+        } else if (cb == null and self.ctx.resize_signal != 0) {
+            g_signal_handler_disconnect(win, self.ctx.resize_signal);
+            self.ctx.resize_signal = 0;
+        }
     }
 
-    pub fn setFocusHandler(self: *Window, cb: ?opts_mod.FocusHandler, ctx: ?*anyopaque) void {
+    pub fn setFocusHandler(self: *Window, cb: ?opts_mod.FocusHandler, ctx_ptr: ?*anyopaque) void {
         self.ctx.on_focus = cb;
-        self.ctx.on_focus_ctx = ctx;
+        self.ctx.on_focus_ctx = ctx_ptr;
+        const win = self.ctx.window orelse return;
+        if (cb != null and self.ctx.focus_in_signal == 0) {
+            const focus_ctrl = gtk_event_controller_focus_new();
+            gtk_widget_add_controller(win, @ptrCast(focus_ctrl));
+            const sig_in = g_signal_connect_data(
+                focus_ctrl,
+                "enter",
+                @as(GCallback, @ptrCast(&onFocusIn)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+            self.ctx.focus_in_signal = sig_in;
+            const sig_out = g_signal_connect_data(
+                focus_ctrl,
+                "leave",
+                @as(GCallback, @ptrCast(&onFocusOut)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+            self.ctx.focus_out_signal = sig_out;
+        }
     }
 
     pub fn setCloseHandler(self: *Window, cb: ?opts_mod.CloseHandler, ctx: ?*anyopaque) void {
@@ -1071,10 +1152,29 @@ pub const Window = struct {
         gtk_window_present(@ptrCast(w));
     }
 
-    pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx: ?*anyopaque) void {
-        _ = self;
-        _ = cb;
-        _ = ctx;
+    pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx_ptr: ?*anyopaque) void {
+        self.ctx.on_drag_drop = cb;
+        self.ctx.on_drag_drop_ctx = ctx_ptr;
+        const win = self.ctx.window orelse return;
+        if (cb != null and self.ctx.drag_signal == 0) {
+            // GdkFileList type — lazy-load via g_type_from_name.
+            const file_list_type = g_type_from_name("GdkFileList");
+            if (file_list_type == 0) {
+                std.log.warn("verve.desktop[linux-gtk4]: GdkFileList type not registered — DnD unavailable", .{});
+                return;
+            }
+            const drop_target = gtk_drop_target_new(file_list_type, GDK_ACTION_COPY);
+            gtk_widget_add_controller(win, @ptrCast(drop_target));
+            const sig = g_signal_connect_data(
+                drop_target,
+                "drop",
+                @as(GCallback, @ptrCast(&onDrop)),
+                @ptrCast(self.ctx),
+                null,
+                0,
+            );
+            self.ctx.drag_signal = sig;
+        }
     }
 
     pub fn deliverUrl(self: *Window, url: []const u8) void {
@@ -1180,6 +1280,69 @@ fn onScriptMessage(ucm: *WebKitUserContentManager, result: *WebKitJavascriptResu
     if (ctx.on_message) |cb| {
         cb(ctx.on_message_ctx, slice);
     }
+}
+
+/// GtkSettings property-notify trampoline. Fires on every change to
+/// `gtk-application-prefer-dark-theme`; re-reads the property and
+/// forwards the resulting ColorScheme to the user callback.
+fn onColorSchemeChanged(settings: *GtkSettings, _: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+    const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
+    var dark: gboolean = 0;
+    g_object_get(settings, "gtk-application-prefer-dark-theme", &dark, @as(?*anyopaque, null));
+    if (ctx.on_color_scheme) |cb| {
+        cb(ctx.on_color_scheme_ctx, if (dark != 0) .dark else .light);
+    }
+}
+
+/// `notify::default-width` / `notify::default-height` on GtkWindow.
+/// GTK4 removed `configure-event`; property-notify is the replacement.
+fn onWindowSizeChanged(win: *GtkWidget, _: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+    const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
+    var w: c_int = 0;
+    var h: c_int = 0;
+    gtk_window_get_default_size(@ptrCast(win), &w, &h);
+    if (ctx.on_resize) |cb| {
+        cb(ctx.on_resize_ctx, @intCast(w), @intCast(h));
+    }
+}
+
+/// GtkEventControllerFocus "enter" — window gained focus.
+fn onFocusIn(_: *anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+    const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
+    if (ctx.on_focus) |cb| cb(ctx.on_focus_ctx, true);
+}
+
+/// GtkEventControllerFocus "leave" — window lost focus.
+fn onFocusOut(_: *anyopaque, user_data: ?*anyopaque) callconv(.c) void {
+    const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
+    if (ctx.on_focus) |cb| cb(ctx.on_focus_ctx, false);
+}
+
+/// GtkDropTarget "drop" signal. `value` holds a GdkFileList boxed type.
+/// Extracts paths via `GSList`, builds a stack-allocated slice of up to
+/// 64 entries (as `[]const u8` slices), then invokes the user callback.
+fn onDrop(_: *GtkDropTarget, value: *const GValue, _: f64, _: f64, user_data: ?*anyopaque) callconv(.c) gboolean {
+    const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
+    const file_list_ptr = g_value_get_boxed(value) orelse return 0;
+    const files = gdk_file_list_get_files(file_list_ptr) orelse return 0;
+
+    // Stack buffer for up to 64 dropped file paths.
+    // g_file_get_path returns a glib-allocated [*:0]u8; wrap as []const u8 via span.
+    var paths_buf: [64][]const u8 = undefined;
+    var count: usize = 0;
+    var node: ?*GSList = files;
+    while (node) |n| : (node = n.next) {
+        if (count >= paths_buf.len) break;
+        const gfile: *GFile = @ptrCast(@alignCast(n.data orelse continue));
+        const path = g_file_get_path(gfile) orelse continue;
+        paths_buf[count] = std.mem.span(path);
+        count += 1;
+    }
+
+    if (ctx.on_drag_drop) |cb| {
+        cb(ctx.on_drag_drop_ctx, paths_buf[0..count]);
+    }
+    return 1; // handled
 }
 
 fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callconv(.c) void {
