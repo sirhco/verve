@@ -624,25 +624,133 @@ pub const Window = struct {
     ctx: *WindowCtx,
 
     pub fn init(allocator: std.mem.Allocator, opts: opts_mod.WindowOptions) !Window {
-        _ = allocator;
-        _ = opts;
-        return error.TODO;
+        std.log.debug("verve.desktop[linux-gtk4]: gtk_init", .{});
+        gtk_init();
+
+        const heap = try allocator.create(WindowCtx);
+        errdefer allocator.destroy(heap);
+        heap.* = .{
+            .allocator = allocator,
+            .opts = opts,
+            .on_message = opts.on_message,
+            .on_message_ctx = opts.on_message_ctx,
+            .on_url_open = opts.on_url_open,
+            .on_url_open_ctx = opts.on_url_open_ctx,
+            .on_drag_drop = opts.on_drag_drop,
+            .on_drag_drop_ctx = opts.on_drag_drop_ctx,
+            .on_resize = opts.on_resize,
+            .on_resize_ctx = opts.on_resize_ctx,
+            .on_focus = opts.on_focus,
+            .on_focus_ctx = opts.on_focus_ctx,
+            .on_close = opts.on_close,
+            .on_close_ctx = opts.on_close_ctx,
+        };
+
+        // GTK4: gtk_window_new() takes no type argument.
+        const window_widget = gtk_window_new();
+        heap.window = window_widget;
+
+        const title_z = try allocator.dupeZ(u8, opts.title);
+        defer allocator.free(title_z);
+        gtk_window_set_title(@ptrCast(window_widget), title_z.ptr);
+        gtk_window_set_default_size(@ptrCast(window_widget), @intCast(opts.width), @intCast(opts.height));
+
+        // "destroy" fires after the window has been torn down.
+        _ = g_signal_connect_data(window_widget, "destroy", @as(GCallback, @ptrCast(&onDestroy)), @ptrCast(heap), null, 0);
+
+        // GTK4: "close-request" replaces "delete-event". Returns gboolean:
+        // 1 = block close, 0 = allow close.
+        _ = g_signal_connect_data(window_widget, "close-request", @as(GCallback, @ptrCast(&onCloseRequest)), @ptrCast(heap), null, 0);
+
+        // Per-window WebContext. Scheme handlers must be registered
+        // BEFORE the WebView is constructed; the WebView resolves its
+        // context-bound handlers at first navigation.
+        const web_ctx = webkit_web_context_new();
+        heap.web_context = web_ctx;
+        const scheme_z = try allocator.dupeZ(u8, opts.scheme);
+        defer allocator.free(scheme_z);
+        std.log.debug("verve.desktop[linux-gtk4]: register scheme '{s}://' (per-window context)", .{opts.scheme});
+        webkit_web_context_register_uri_scheme(web_ctx, scheme_z.ptr, &onSchemeRequest, @ptrCast(heap), null);
+
+        const ucm = webkit_user_content_manager_new();
+        heap.ucm = ucm;
+        const shim_z = try allocator.dupeZ(u8, ipc.shim_js);
+        defer allocator.free(shim_z);
+        const script = webkit_user_script_new(
+            shim_z.ptr,
+            WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+            null,
+            null,
+        );
+        webkit_user_content_manager_add_script(ucm, script);
+        webkit_user_script_unref(script);
+
+        // WK6: extra null world_name parameter for default world.
+        _ = webkit_user_content_manager_register_script_message_handler(ucm, "verve", null);
+        _ = g_signal_connect_data(ucm, "script-message-received::verve", @as(GCallback, @ptrCast(&onScriptMessage)), @ptrCast(heap), null, 0);
+
+        // Construct WebView with BOTH our custom WebContext and our
+        // UserContentManager. No WK6 single-call helper takes both,
+        // so go through g_object_new with explicit properties.
+        const wv_obj = g_object_new(
+            webkit_web_view_get_type(),
+            "web-context",
+            web_ctx,
+            @as(?[*:0]const u8, "user-content-manager"),
+            ucm,
+            @as(?[*:0]const u8, null),
+        ) orelse return error.WebViewCreateFailed;
+        const wv: *WebKitWebView = @ptrCast(wv_obj);
+        heap.webview = wv;
+
+        if (opts.devtools) {
+            const settings = webkit_web_view_get_settings(wv);
+            webkit_settings_set_enable_developer_extras(settings, 1);
+        }
+
+        // GTK4: gtk_window_set_child replaces gtk_container_add.
+        // Menu bar has no GtkApplication-free GTK4 equivalent — skip.
+        if (opts.install_default_menu) {
+            std.log.debug("verve.desktop[linux-gtk4]: install_default_menu skipped (no GtkApplication-free menu bar in GTK4)", .{});
+        }
+        gtk_window_set_child(@ptrCast(window_widget), @ptrCast(wv));
+
+        // GTK4: gtk_widget_show replaces gtk_widget_show_all.
+        gtk_widget_show(window_widget);
+        live_windows += 1;
+        std.log.info("verve.desktop[linux-gtk4]: window shown ({d}x{d})", .{ opts.width, opts.height });
+
+        heap.main_loop = g_main_loop_new(null, 0);
+
+        // Initial navigation.
+        if (opts.initial_path.len > 0) {
+            var url_buf: [1024]u8 = undefined;
+            const url = try std.fmt.bufPrintZ(&url_buf, "{s}://app/{s}", .{ opts.scheme, opts.initial_path });
+            std.log.debug("verve.desktop[linux-gtk4]: navigate {s}", .{url});
+            webkit_web_view_load_uri(wv, url.ptr);
+        }
+
+        return Window{ .ctx = heap };
     }
 
     pub fn run(self: *Window) void {
-        _ = self;
+        g_main_loop_run(self.ctx.main_loop.?);
     }
 
     pub fn deinit(self: *Window) void {
-        _ = self;
+        const alloc = self.ctx.allocator;
+        if (self.ctx.main_loop) |loop| g_main_loop_unref(loop);
+        alloc.destroy(self.ctx);
+        alloc.destroy(self);
     }
 
     pub fn terminate(self: *Window) void {
-        _ = self;
+        if (self.ctx.main_loop) |loop| g_main_loop_quit(loop);
     }
 
     pub fn close(self: *Window) void {
-        _ = self;
+        if (self.ctx.window) |w| gtk_window_destroy(@ptrCast(w));
     }
 
     pub fn setTitle(self: *Window, title: []const u8) void {
@@ -669,9 +777,8 @@ pub const Window = struct {
     }
 
     pub fn setMessageHandler(self: *Window, handler: opts_mod.MessageHandler, handler_ctx: ?*anyopaque) void {
-        _ = self;
-        _ = handler;
-        _ = handler_ctx;
+        self.ctx.on_message = handler;
+        self.ctx.on_message_ctx = handler_ctx;
     }
 
     pub fn openChildWindow(self: *Window, opts: opts_mod.WindowOptions) !Window {
@@ -931,6 +1038,123 @@ pub const Window = struct {
         return error.TODO;
     }
 };
+
+// ---- Private signal handlers and helpers -----------------------------------
+
+/// "destroy" fires after the GTK window has been torn down.
+/// Decrements live_windows; quits the per-window GMainLoop when
+/// the last window closes.
+fn onDestroy(widget: *GtkWidget, user_data: ?*anyopaque) callconv(.c) void {
+    _ = widget;
+    const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
+    if (live_windows > 0) live_windows -= 1;
+    if (live_windows == 0) {
+        if (ctx.main_loop) |loop| g_main_loop_quit(loop);
+    }
+}
+
+/// GTK4 "close-request" replaces GTK3 "delete-event".
+/// Returns gboolean: 1 = block close, 0 = allow close.
+/// on_close callback returns true to allow close, false to block.
+fn onCloseRequest(widget: *GtkWidget, user_data: ?*anyopaque) callconv(.c) gboolean {
+    _ = widget;
+    const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
+    if (ctx.on_close) |cb| {
+        if (!cb(ctx.on_close_ctx)) return 1; // true = block close
+    }
+    return 0; // false = allow close
+}
+
+fn onScriptMessage(ucm: *WebKitUserContentManager, result: *WebKitJavascriptResult, user_data: ?*anyopaque) callconv(.c) void {
+    _ = ucm;
+    const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
+    const jsval = webkit_javascript_result_get_js_value(result);
+    if (jsc_value_is_string(jsval) == 0) return;
+    const str = jsc_value_to_string(jsval);
+    defer g_free(@ptrCast(str));
+    const slice = std.mem.span(str);
+    // Intercept the title-sync marker before forwarding.
+    const title_prefix = "__verve_title:";
+    if (std.mem.startsWith(u8, slice, title_prefix)) {
+        const title = slice[title_prefix.len..];
+        const z = ctx.allocator.dupeZ(u8, title) catch return;
+        defer ctx.allocator.free(z);
+        if (ctx.window) |w| gtk_window_set_title(@ptrCast(w), z.ptr);
+        return;
+    }
+    if (ctx.on_message) |cb| {
+        cb(ctx.on_message_ctx, slice);
+    }
+}
+
+fn onSchemeRequest(req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callconv(.c) void {
+    const cx: *WindowCtx = @ptrCast(@alignCast(user_data orelse return));
+
+    const uri = webkit_uri_scheme_request_get_uri(req);
+    const uri_slice = std.mem.span(uri);
+
+    const auth = "://app/";
+    const path: []const u8 = if (std.mem.indexOf(u8, uri_slice, auth)) |i| uri_slice[i + auth.len ..] else uri_slice;
+    std.log.debug("verve.desktop[linux-gtk4]: scheme '{s}' → '{s}'", .{ uri_slice, path });
+
+    const resolved = blk: {
+        if (cx.opts.dev_assets) |dev| {
+            break :blk router.resolveWithFallback(cx.allocator, dev.io, cx.opts.assets, path, dev.dir) catch {
+                std.log.warn("verve.desktop[linux-gtk4]: 404 {s}", .{path});
+                const err = g_error_new_literal(g_quark_from_static_string("verve"), 404, "not found");
+                webkit_uri_scheme_request_finish_error(req, err);
+                g_error_free(err);
+                return;
+            };
+        }
+        break :blk router.resolve(cx.opts.assets, path) catch {
+            std.log.warn("verve.desktop[linux-gtk4]: 404 {s}", .{path});
+            const err = g_error_new_literal(g_quark_from_static_string("verve"), 404, "not found");
+            webkit_uri_scheme_request_finish_error(req, err);
+            g_error_free(err);
+            return;
+        };
+    };
+    defer resolved.deinit(cx.allocator);
+
+    // WebKitGTK's `from_data` does NOT copy the input buffer — the
+    // bytes must outlive the stream. Embedded entries are static, so
+    // passing the slice directly with a null destroy notify is fine.
+    // Dev-mode owned bytes are about to be freed by the defer above,
+    // so we hand a glib-allocated copy to the stream with `g_free` as
+    // the destroy notify.
+    const len_c: c_long = @intCast(resolved.bytes.len);
+    var stream: *GInputStream = undefined;
+    if (resolved.owned) {
+        const copy = g_memdup2(resolved.bytes.ptr, resolved.bytes.len) orelse {
+            std.log.warn("verve.desktop[linux-gtk4]: g_memdup2 OOM", .{});
+            const err = g_error_new_literal(g_quark_from_static_string("verve"), 500, "out of memory");
+            webkit_uri_scheme_request_finish_error(req, err);
+            g_error_free(err);
+            return;
+        };
+        stream = g_memory_input_stream_new_from_data(@ptrCast(copy), len_c, g_free);
+    } else {
+        stream = g_memory_input_stream_new_from_data(resolved.bytes.ptr, len_c, null);
+    }
+
+    var ct_buf: [128]u8 = undefined;
+    const ct_z = std.fmt.bufPrintZ(&ct_buf, "{s}", .{resolved.content_type}) catch {
+        webkit_uri_scheme_request_finish(req, stream, len_c, "application/octet-stream");
+        g_object_unref(stream);
+        return;
+    };
+    webkit_uri_scheme_request_finish(req, stream, len_c, ct_z.ptr);
+    g_object_unref(stream);
+}
+
+/// Spin the GLib main context until `done` flips true.
+/// Used by async-to-sync wrappers (cookies, clipboard, dialogs).
+fn pumpMainContextUntilDone(done: *const bool) void {
+    while (!done.*) {
+        _ = g_main_context_iteration(null, 1); // 1 = may_block
+    }
+}
 
 // ---- Module-level functions (cookie + clipboard + socket) ------------------
 //
