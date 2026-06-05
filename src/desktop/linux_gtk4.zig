@@ -363,6 +363,22 @@ extern fn gdk_pixbuf_new_from_data(
     destroy_fn: ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void,
     destroy_fn_data: ?*anyopaque,
 ) ?*GdkPixbuf;
+extern fn gdk_texture_new_for_pixbuf(pixbuf: *GdkPixbuf) *GdkTexture;
+
+// ---- GInputStream externs (GTK4 async clipboard HTML read) -----------------
+
+extern fn g_input_stream_read(
+    stream: *GInputStream,
+    buffer: [*]u8,
+    count: usize,
+    cancellable: ?*anyopaque,
+    err: ?*?*GError,
+) isize;
+extern fn g_input_stream_close(
+    stream: *GInputStream,
+    cancellable: ?*anyopaque,
+    err: ?*?*GError,
+) gboolean;
 
 // ---- GTK4 dialog externs (GTK 4.10+) ---------------------------------------
 //
@@ -1420,38 +1436,207 @@ pub fn cookieClear(window: *anyopaque) opts_mod.CookieError!void {
     }
 }
 
+// ---- Clipboard (GTK4 / GdkClipboard) ---------------------------------------
+//
+// GTK4 removed GtkClipboard. All reads are async; writes are synchronous
+// (text) or via a GdkContentProvider (HTML/image).
+
+fn getClipboard() ?*GdkClipboard {
+    const display = gdk_display_get_default() orelse return null;
+    return gdk_display_get_clipboard(display);
+}
+
+// ---- clipboardWriteText ----------------------------------------------------
+
 pub fn clipboardWriteText(window: *anyopaque, text: []const u8) opts_mod.ClipboardError!void {
     _ = window;
-    _ = text;
-    return error.TODO;
+    const clip = getClipboard() orelse return opts_mod.ClipboardError.Backend;
+    // Need a Zig allocator here; borrow the GPA via std.heap.c_allocator which
+    // is always available in the desktop build (links libc).
+    const z = std.heap.c_allocator.dupeZ(u8, text) catch return opts_mod.ClipboardError.OutOfMemory;
+    defer std.heap.c_allocator.free(z);
+    gdk_clipboard_set_text(clip, z.ptr);
+}
+
+// ---- clipboardReadText -----------------------------------------------------
+
+const ReadTextCell = extern struct {
+    clip: *GdkClipboard,
+    done: bool = false,
+    text: ?[*:0]u8 = null,
+};
+
+fn readTextCb(src: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    _ = src;
+    const cell: *ReadTextCell = @ptrCast(@alignCast(user_data));
+    defer cell.done = true;
+    const res = result orelse return;
+    var gerr: ?*GError = null;
+    cell.text = gdk_clipboard_read_text_finish(cell.clip, res, &gerr);
+    if (gerr) |e| g_error_free(e);
 }
 
 pub fn clipboardReadText(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
     _ = window;
-    _ = allocator;
-    return error.TODO;
+    const clip = getClipboard() orelse return null;
+    var cell = ReadTextCell{ .clip = clip };
+    gdk_clipboard_read_text_async(clip, null, @ptrCast(&readTextCb), @ptrCast(&cell));
+    pumpMainContextUntilDone(&cell.done);
+    const raw = cell.text orelse return null;
+    defer g_free(@ptrCast(raw));
+    return allocator.dupe(u8, std.mem.span(raw)) catch return opts_mod.ClipboardError.OutOfMemory;
 }
+
+// ---- clipboardWriteHtml ----------------------------------------------------
 
 pub fn clipboardWriteHtml(window: *anyopaque, html: []const u8) opts_mod.ClipboardError!void {
     _ = window;
-    _ = html;
-    return error.TODO;
+    const clip = getClipboard() orelse return opts_mod.ClipboardError.Backend;
+    const bytes = g_bytes_new(html.ptr, html.len);
+    defer g_bytes_unref(bytes);
+    const provider = gdk_content_provider_new_for_bytes("text/html", bytes);
+    defer g_object_unref(provider);
+    _ = gdk_clipboard_set_content(clip, provider);
 }
+
+// ---- clipboardReadHtml -----------------------------------------------------
+
+const ReadHtmlCell = extern struct {
+    clip: *GdkClipboard,
+    done: bool = false,
+    stream: ?*GInputStream = null,
+};
+
+fn readHtmlCb(src: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    _ = src;
+    const cell: *ReadHtmlCell = @ptrCast(@alignCast(user_data));
+    defer cell.done = true;
+    const res = result orelse return;
+    var gerr: ?*GError = null;
+    var out_mime: ?[*:0]const u8 = null;
+    cell.stream = gdk_clipboard_read_finish(cell.clip, res, &out_mime, &gerr);
+    if (gerr) |e| g_error_free(e);
+}
+
+// mime_types sentinel-terminated array for gdk_clipboard_read_async
+const html_mime_types = [_:null]?[*:0]const u8{ "text/html", null };
 
 pub fn clipboardReadHtml(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
     _ = window;
-    _ = allocator;
-    return error.TODO;
+    const clip = getClipboard() orelse return null;
+    var cell = ReadHtmlCell{ .clip = clip };
+    gdk_clipboard_read_async(clip, &html_mime_types, 0, null, @ptrCast(&readHtmlCb), @ptrCast(&cell));
+    pumpMainContextUntilDone(&cell.done);
+    const stream = cell.stream orelse return null;
+    defer _ = g_input_stream_close(stream, null, null);
+    defer g_object_unref(stream);
+
+    // Read chunks into a growable list.
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    var chunk: [1024]u8 = undefined;
+    while (true) {
+        var rd_err: ?*GError = null;
+        const n = g_input_stream_read(stream, &chunk, chunk.len, null, &rd_err);
+        if (rd_err) |e| {
+            g_error_free(e);
+            break;
+        }
+        if (n <= 0) break;
+        buf.appendSlice(chunk[0..@intCast(n)]) catch return opts_mod.ClipboardError.OutOfMemory;
+    }
+    if (buf.items.len == 0) return null;
+    return buf.toOwnedSlice() catch return opts_mod.ClipboardError.OutOfMemory;
 }
+
+// ---- clipboardWriteImage ---------------------------------------------------
 
 pub fn clipboardWriteImage(window: *anyopaque, png: []const u8) opts_mod.ClipboardError!void {
     _ = window;
-    _ = png;
-    return error.TODO;
+    const clip = getClipboard() orelse return opts_mod.ClipboardError.Backend;
+
+    // Decode PNG → GdkPixbuf via loader.
+    const loader = gdk_pixbuf_loader_new();
+    defer g_object_unref(loader);
+    var gerr: ?*GError = null;
+    if (gdk_pixbuf_loader_write(loader, png.ptr, png.len, &gerr) == 0) {
+        if (gerr) |e| g_error_free(e);
+        _ = gdk_pixbuf_loader_close(loader, null);
+        return opts_mod.ClipboardError.Backend;
+    }
+    gerr = null;
+    if (gdk_pixbuf_loader_close(loader, &gerr) == 0) {
+        if (gerr) |e| g_error_free(e);
+        return opts_mod.ClipboardError.Backend;
+    }
+    const pixbuf = gdk_pixbuf_loader_get_pixbuf(loader) orelse return opts_mod.ClipboardError.Backend;
+
+    // Wrap in a GdkTexture (GTK4 clipboard expects a texture, not a pixbuf).
+    const texture = gdk_texture_new_for_pixbuf(pixbuf);
+    defer g_object_unref(texture);
+    gdk_clipboard_set_texture(clip, texture);
+}
+
+// ---- clipboardReadImage ----------------------------------------------------
+
+const ReadTexCell = extern struct {
+    clip: *GdkClipboard,
+    done: bool = false,
+    texture: ?*GdkTexture = null,
+};
+
+fn readTexCb(src: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+    _ = src;
+    const cell: *ReadTexCell = @ptrCast(@alignCast(user_data));
+    defer cell.done = true;
+    const res = result orelse return;
+    var gerr: ?*GError = null;
+    cell.texture = gdk_clipboard_read_texture_finish(cell.clip, res, &gerr);
+    if (gerr) |e| g_error_free(e);
 }
 
 pub fn clipboardReadImage(window: *anyopaque, allocator: std.mem.Allocator) opts_mod.ClipboardError!?[]u8 {
     _ = window;
-    _ = allocator;
-    return error.TODO;
+    const clip = getClipboard() orelse return null;
+    var cell = ReadTexCell{ .clip = clip };
+    gdk_clipboard_read_texture_async(clip, null, @ptrCast(&readTexCb), @ptrCast(&cell));
+    pumpMainContextUntilDone(&cell.done);
+    const texture = cell.texture orelse return null;
+    defer g_object_unref(texture);
+
+    const w: c_int = gdk_texture_get_width(texture);
+    const h: c_int = gdk_texture_get_height(texture);
+    const stride: usize = @as(usize, @intCast(w)) * 4;
+    const rgba_size: usize = @as(usize, @intCast(h)) * stride;
+
+    // Download raw RGBA bytes from texture.
+    const rgba_buf = allocator.alloc(u8, rgba_size) catch return opts_mod.ClipboardError.OutOfMemory;
+    defer allocator.free(rgba_buf);
+    gdk_texture_download(texture, rgba_buf.ptr, stride);
+
+    // Re-encode as PNG via GdkPixbuf.
+    // GDK_COLORSPACE_RGB = 0, has_alpha = 1, bits_per_sample = 8
+    const pixbuf = gdk_pixbuf_new_from_data(
+        rgba_buf.ptr,
+        0, // GDK_COLORSPACE_RGB
+        1, // has_alpha
+        8,
+        w,
+        h,
+        @intCast(stride),
+        null,
+        null,
+    ) orelse return opts_mod.ClipboardError.Backend;
+    defer g_object_unref(pixbuf);
+
+    var buf_ptr: ?[*]u8 = null;
+    var buf_size: usize = 0;
+    var gerr: ?*GError = null;
+    if (gdk_pixbuf_save_to_bufferv(pixbuf, &buf_ptr, &buf_size, "png", null, null, &gerr) == 0) {
+        if (gerr) |e| g_error_free(e);
+        return opts_mod.ClipboardError.Backend;
+    }
+    const raw = buf_ptr orelse return opts_mod.ClipboardError.Backend;
+    defer g_free(@ptrCast(raw));
+    return allocator.dupe(u8, raw[0..buf_size]) catch return opts_mod.ClipboardError.OutOfMemory;
 }
