@@ -1,17 +1,13 @@
 /*
- * webview2_host.cpp — native WebView2 host for the C-ABI spike.
- *
- * Goal: prove the native-host pattern (a la vercel-labs/zero-native) works for
- * Verve on Windows, as an alternative to the 4129-line pure-Zig hand-rolled COM
- * backend in src/desktop/windows.zig.
+ * webview2_host.cpp — native C++ WebView2 host behind a flat C ABI.
  *
  * The C++ compiler generates correct COM vtables from the vendored WebView2.h;
- * we never count offsets. We deliberately avoid WRL (so the file cross-compiles
- * from macOS under zig's bundled mingw clang with only the vendored header) and
- * avoid libc++ (raw malloc buffers, so the link stays dependency-light).
+ * we never count offsets. WRL and libc++ are deliberately avoided so the file
+ * cross-compiles from macOS under zig's bundled mingw clang with only the
+ * vendored header (raw malloc buffers keep the link dependency-light).
  *
  * Build: zig c++ -target x86_64-windows-gnu -fms-extensions -std=c++17
- *               -I vendor/webview2 -c src/desktop/win_spike/webview2_host.cpp
+ *               -I src/desktop/win_native/include -c src/desktop/win_native/webview2_host.cpp
  */
 #include <windows.h>
 #include <objbase.h>
@@ -401,10 +397,24 @@ public:
             wmh->Release(); // add_* took its own ref
 
             // Register custom URL scheme handler for asset serving.
+            // Use ICoreWebView2_22::AddWebResourceRequestedFilterWithRequestSourceKinds
+            // with SOURCE_KINDS_ALL so the filter intercepts the navigation document
+            // itself (not just sub-resource requests). Fall back to the base filter
+            // on older runtimes that don't QI to _22.
             if (host_->scheme_cb && host_->scheme_filter && host_->env) {
-                host_->webview->AddWebResourceRequestedFilter(
-                    host_->scheme_filter,
-                    COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+                ICoreWebView2_22 *wv22 = nullptr;
+                if (SUCCEEDED(host_->webview->QueryInterface(
+                        IID_ICoreWebView2_22, (void **)&wv22))) {
+                    wv22->AddWebResourceRequestedFilterWithRequestSourceKinds(
+                        host_->scheme_filter,
+                        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                        COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL);
+                    wv22->Release();
+                } else {
+                    host_->webview->AddWebResourceRequestedFilter(
+                        host_->scheme_filter,
+                        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+                }
                 auto *srh = new SchemeRequestHandler(host_);
                 host_->webview->add_WebResourceRequested(srh, &host_->scheme_token);
                 srh->Release();
@@ -1386,6 +1396,173 @@ void wv2_set_scheme_handler(WV2Host *host, const char *scheme, size_t scheme_len
     free(filter_u8);
 }
 
+// ---- Custom scheme registration (verve://) ----------------------------------
+// WebView2 requires custom schemes to be registered in the environment options
+// at creation time (ICoreWebView2EnvironmentOptions4::SetCustomSchemeRegistrations).
+// Without this, top-level Navigate("verve://...") fails silently regardless of
+// AddWebResourceRequestedFilter — that filter only intercepts sub-resource
+// requests from existing http/https pages, not the navigation document itself.
+
+// Strip "://*" suffix to recover bare scheme name from host->scheme_filter.
+static wchar_t *schemeFromFilter(const wchar_t *filter) {
+    if (!filter) return nullptr;
+    size_t flen = wcslen(filter);
+    if (flen <= 4) return nullptr;
+    if (wcsncmp(filter + flen - 4, L"://*", 4) != 0) return nullptr;
+    size_t nlen = flen - 4;
+    wchar_t *name = (wchar_t *)malloc((nlen + 1) * sizeof(wchar_t));
+    if (!name) return nullptr;
+    memcpy(name, filter, nlen * sizeof(wchar_t));
+    name[nlen] = 0;
+    return name;
+}
+
+class CustomSchemeRegistration : public ICoreWebView2CustomSchemeRegistration {
+    wchar_t *name_;
+    LONG ref_ = 1;
+
+public:
+    explicit CustomSchemeRegistration(const wchar_t *name) {
+        int n = (int)wcslen(name);
+        name_ = (wchar_t *)malloc((n + 1) * sizeof(wchar_t));
+        if (name_) { memcpy(name_, name, n * sizeof(wchar_t)); name_[n] = 0; }
+    }
+    ~CustomSchemeRegistration() { free(name_); }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (IsEqualIID(riid, IID_IUnknown) ||
+            IsEqualIID(riid, IID_ICoreWebView2CustomSchemeRegistration))
+            { *ppv = this; AddRef(); return S_OK; }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef()  override { return (ULONG)InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = (ULONG)InterlockedDecrement(&ref_);
+        if (!r) delete this;
+        return r;
+    }
+
+    HRESULT STDMETHODCALLTYPE get_SchemeName(LPWSTR *out) override {
+        if (!out) return E_POINTER;
+        if (!name_) { *out = nullptr; return E_OUTOFMEMORY; }
+        size_t n = wcslen(name_);
+        *out = (LPWSTR)CoTaskMemAlloc((n + 1) * sizeof(WCHAR));
+        if (!*out) return E_OUTOFMEMORY;
+        memcpy(*out, name_, (n + 1) * sizeof(WCHAR));
+        return S_OK;
+    }
+    // TreatAsSecure = TRUE: makes verve:// a secure context (WASM, crypto, etc.)
+    HRESULT STDMETHODCALLTYPE get_TreatAsSecure(BOOL *out) override
+        { if (out) *out = TRUE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE put_TreatAsSecure(BOOL) override { return S_OK; }
+    // Empty allowed-origins = allow from any origin.
+    HRESULT STDMETHODCALLTYPE GetAllowedOrigins(UINT32 *cnt, LPWSTR **origins) override
+        { if (cnt) *cnt = 0; if (origins) *origins = nullptr; return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetAllowedOrigins(UINT32, LPWSTR *) override { return S_OK; }
+    // HasAuthorityComponent = TRUE: verve://app/... — "app" is the host/authority.
+    HRESULT STDMETHODCALLTYPE get_HasAuthorityComponent(BOOL *out) override
+        { if (out) *out = TRUE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE put_HasAuthorityComponent(BOOL) override { return S_OK; }
+};
+
+// Minimal env-options implementation covering v1–v4. Only v4 (custom scheme
+// registrations) needs a real body; everything else returns safe defaults.
+// WebView2 QIs through the version chain and uses whatever is present.
+class VerveEnvironmentOptions
+    : public ICoreWebView2EnvironmentOptions
+    , public ICoreWebView2EnvironmentOptions2
+    , public ICoreWebView2EnvironmentOptions3
+    , public ICoreWebView2EnvironmentOptions4
+{
+    ICoreWebView2CustomSchemeRegistration *scheme_reg_;
+    LONG ref_ = 1;
+
+public:
+    explicit VerveEnvironmentOptions(ICoreWebView2CustomSchemeRegistration *reg)
+        : scheme_reg_(reg) { if (reg) reg->AddRef(); }
+    ~VerveEnvironmentOptions() { if (scheme_reg_) scheme_reg_->Release(); }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (IsEqualIID(riid, IID_IUnknown) ||
+            IsEqualIID(riid, IID_ICoreWebView2EnvironmentOptions))
+            { *ppv = static_cast<ICoreWebView2EnvironmentOptions *>(this); AddRef(); return S_OK; }
+        if (IsEqualIID(riid, IID_ICoreWebView2EnvironmentOptions2))
+            { *ppv = static_cast<ICoreWebView2EnvironmentOptions2 *>(this); AddRef(); return S_OK; }
+        if (IsEqualIID(riid, IID_ICoreWebView2EnvironmentOptions3))
+            { *ppv = static_cast<ICoreWebView2EnvironmentOptions3 *>(this); AddRef(); return S_OK; }
+        if (IsEqualIID(riid, IID_ICoreWebView2EnvironmentOptions4))
+            { *ppv = static_cast<ICoreWebView2EnvironmentOptions4 *>(this); AddRef(); return S_OK; }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef()  override { return (ULONG)InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = (ULONG)InterlockedDecrement(&ref_);
+        if (!r) delete this;
+        return r;
+    }
+
+    // ICoreWebView2EnvironmentOptions (v1) — all defaults
+    HRESULT STDMETHODCALLTYPE get_AdditionalBrowserArguments(LPWSTR *out) override {
+        if (!out) return E_POINTER;
+        *out = (LPWSTR)CoTaskMemAlloc(sizeof(WCHAR));
+        if (*out) (*out)[0] = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE put_AdditionalBrowserArguments(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_Language(LPWSTR *out) override {
+        if (!out) return E_POINTER;
+        *out = (LPWSTR)CoTaskMemAlloc(sizeof(WCHAR));
+        if (*out) (*out)[0] = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE put_Language(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_TargetCompatibleBrowserVersion(LPWSTR *out) override {
+        if (!out) return E_POINTER;
+        *out = (LPWSTR)CoTaskMemAlloc(sizeof(WCHAR));
+        if (*out) (*out)[0] = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE put_TargetCompatibleBrowserVersion(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE get_AllowSingleSignOnUsingOSPrimaryAccount(BOOL *out) override
+        { if (out) *out = FALSE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE put_AllowSingleSignOnUsingOSPrimaryAccount(BOOL) override { return S_OK; }
+
+    // ICoreWebView2EnvironmentOptions2 (v2)
+    HRESULT STDMETHODCALLTYPE get_ExclusiveUserDataFolderAccess(BOOL *out) override
+        { if (out) *out = FALSE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE put_ExclusiveUserDataFolderAccess(BOOL) override { return S_OK; }
+
+    // ICoreWebView2EnvironmentOptions3 (v3)
+    HRESULT STDMETHODCALLTYPE get_IsCustomCrashReportingEnabled(BOOL *out) override
+        { if (out) *out = FALSE; return S_OK; }
+    HRESULT STDMETHODCALLTYPE put_IsCustomCrashReportingEnabled(BOOL) override { return S_OK; }
+
+    // ICoreWebView2EnvironmentOptions4 (v4) — the reason this class exists
+    HRESULT STDMETHODCALLTYPE GetCustomSchemeRegistrations(
+        UINT32 *cnt, ICoreWebView2CustomSchemeRegistration ***regs) override
+    {
+        if (!cnt || !regs) return E_POINTER;
+        if (!scheme_reg_) { *cnt = 0; *regs = nullptr; return S_OK; }
+        *cnt = 1;
+        *regs = (ICoreWebView2CustomSchemeRegistration **)CoTaskMemAlloc(
+            sizeof(ICoreWebView2CustomSchemeRegistration *));
+        if (!*regs) return E_OUTOFMEMORY;
+        (*regs)[0] = scheme_reg_;
+        scheme_reg_->AddRef();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetCustomSchemeRegistrations(
+        UINT32 cnt, ICoreWebView2CustomSchemeRegistration **regs) override
+    {
+        if (scheme_reg_) { scheme_reg_->Release(); scheme_reg_ = nullptr; }
+        if (cnt > 0 && regs && regs[0]) {
+            scheme_reg_ = regs[0];
+            scheme_reg_->AddRef();
+        }
+        return S_OK;
+    }
+};
+
 void wv2_run(WV2Host *host) {
     if (!host) return;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -1395,7 +1572,7 @@ void wv2_run(WV2Host *host) {
         MessageBoxW(host->hwnd,
                     L"WebView2Loader.dll not found. Install the WebView2 "
                     L"Runtime / place the loader next to the exe.",
-                    L"Verve spike", MB_OK | MB_ICONERROR);
+                    L"Verve", MB_OK | MB_ICONERROR);
         return;
     }
     auto create_env = (PFN_CreateEnv)GetProcAddress(
@@ -1405,12 +1582,25 @@ void wv2_run(WV2Host *host) {
     ShowWindow(host->hwnd, SW_SHOW);
     UpdateWindow(host->hwnd);
 
+    // Register the custom scheme so WebView2 accepts top-level verve:// navigation.
+    VerveEnvironmentOptions *env_opts = nullptr;
+    if (host->scheme_filter && host->scheme_cb) {
+        wchar_t *scheme_name = schemeFromFilter(host->scheme_filter);
+        if (scheme_name) {
+            auto *reg = new CustomSchemeRegistration(scheme_name);
+            free(scheme_name);
+            env_opts = new VerveEnvironmentOptions(reg);
+            reg->Release();
+        }
+    }
+
     auto *eh = new EnvHandler(host);
-    HRESULT hr = create_env(nullptr, nullptr, nullptr, eh);
+    HRESULT hr = create_env(nullptr, nullptr, env_opts, eh);
     eh->Release();
+    if (env_opts) env_opts->Release();
     if (FAILED(hr)) {
         MessageBoxW(host->hwnd, L"CreateCoreWebView2Environment failed.",
-                    L"Verve spike", MB_OK | MB_ICONERROR);
+                    L"Verve", MB_OK | MB_ICONERROR);
         return;
     }
 
