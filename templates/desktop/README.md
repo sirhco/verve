@@ -32,8 +32,20 @@ zig build test    # any zig tests in the project
   host (`src/desktop/win_native/webview2_host.cpp`), and the loader DLL
   is installed next to the produced `.exe`. Builds (including
   cross-compiles from macOS/Linux) work offline.
-- **Linux (Debian/Ubuntu)**: `sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev`
-- **Linux (Fedora)**: `sudo dnf install gtk3-devel webkit2gtk4.1-devel`
+- **Linux (Debian/Ubuntu — GTK3, default)**:
+  `sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev`
+- **Linux (Debian/Ubuntu — GTK4)**:
+  `sudo apt install libgtk-4-dev libwebkitgtk-6.0-dev`
+  then build with `zig build -Dgtk4=true run`
+- **Linux (Fedora — GTK3, default)**:
+  `sudo dnf install gtk3-devel webkit2gtk4.1-devel`
+- **Linux (Fedora — GTK4)**:
+  `sudo dnf install gtk4-devel webkitgtk6.0-devel`
+  then build with `zig build -Dgtk4=true run`
+
+> **Linux GTK4 known limitations**: tray icon and window snapshot return
+> `error.Unsupported`. The WebKit sandbox is disabled automatically
+> (requires no env-var workaround).
 
 ## Project layout
 
@@ -748,6 +760,7 @@ Overrides:
 | `-Dicon=<path>` | (none) | macOS bundle icon (`.icns`); copied to `Contents/Resources/AppIcon.icns` |
 | `-Dcodesign=<identity>` | (none) | macOS bundle signing identity |
 | `-Dhardened=<bool>` | `false` | macOS: hardened runtime + WKWebView entitlements |
+| `-Dgtk4=<bool>` | `false` | Linux: build against GTK4 + WebKitGTK 6.0 instead of GTK3 + WebKitGTK 4.1 |
 
 ## Platform support matrix
 
@@ -765,9 +778,9 @@ Overrides:
 | File / save dialogs | ✓ | ✓ (file only) | ✓ |
 | Alerts | ✓ | ✓ (standard buttons) | ✓ |
 | Native menu bar | ✓ | ✓ | ✓ |
-| Tray icon | ✓ | ✓ | ✓ |
+| Tray icon | ✓ | ✓ | ✓ GTK3 / stub GTK4 |
 | Notifications | ✓ | stub | ✓ |
-| Window snapshot (PNG) | ✓ | ✓ | ✓ |
+| Window snapshot (PNG) | ✓ | ✓ | stub |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
 | Dev-loop watcher | ✓ | ✓ | ✓ |

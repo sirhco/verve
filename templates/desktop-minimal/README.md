@@ -55,4 +55,9 @@ public decl is a route with `Args`, `Reply`, and a `handle` fn.
   compiles the native C++ host and ships the loader next to the `.exe`.
   No SDK download. Needs the WebView2 Evergreen Runtime at run time
   (preinstalled on Win11; Win10 needs Microsoft's bootstrapper).
-- **Linux**: needs `gtk+-3.0` + `webkit2gtk-4.1` dev packages.
+- **Linux (GTK3, default)**: `sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev`
+  (Fedora: `sudo dnf install gtk3-devel webkit2gtk4.1-devel`)
+- **Linux (GTK4)**: `sudo apt install libgtk-4-dev libwebkitgtk-6.0-dev`
+  (Fedora: `sudo dnf install gtk4-devel webkitgtk6.0-devel`)
+  Build with `zig build -Dgtk4=true run`. GTK4 known limitations: tray and
+  window snapshot return `error.Unsupported`.
