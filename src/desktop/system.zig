@@ -128,11 +128,12 @@ fn uptimeLinux() u64 {
     // /proc/uptime contains "<uptime_seconds> <idle_seconds>\n".
     // We only want the first float, truncated to seconds.
     const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/uptime", .{ .ACCMODE = .RDONLY }, 0) catch return 0;
-    const file = std.fs.File{ .handle = fd };
-    defer file.close();
+    defer _ = std.os.linux.close(fd);
     var buf: [64]u8 = undefined;
-    const n = file.read(&buf) catch return 0;
-    if (n == 0) return 0;
+    const rc = std.os.linux.read(fd, &buf, buf.len);
+    const n_signed: isize = @bitCast(rc);
+    if (n_signed <= 0) return 0;
+    const n: usize = @intCast(n_signed);
     const space = std.mem.indexOfScalar(u8, buf[0..n], ' ') orelse return 0;
     const seconds_str = buf[0..space];
     const dot = std.mem.indexOfScalar(u8, seconds_str, '.') orelse seconds_str.len;
@@ -268,14 +269,16 @@ fn osVersionLinux(allocator: std.mem.Allocator) Error![]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, "/etc/os-release", .{ .ACCMODE = .RDONLY }, 0) catch {
         return allocator.dupe(u8, "Linux") catch error.OutOfMemory;
     };
-    const file = std.fs.File{ .handle = fd };
-    defer file.close();
-
+    defer _ = std.os.linux.close(fd);
     var buf: [4096]u8 = undefined;
-    const n = file.readAll(&buf) catch {
-        return allocator.dupe(u8, "Linux") catch error.OutOfMemory;
-    };
-    const body = buf[0..n];
+    var total: usize = 0;
+    while (total < buf.len) {
+        const rc = std.os.linux.read(fd, buf[total..].ptr, buf.len - total);
+        const got: isize = @bitCast(rc);
+        if (got <= 0) break;
+        total += @intCast(got);
+    }
+    const body = buf[0..total];
 
     if (extractOsReleaseValue(body, "PRETTY_NAME")) |v| {
         return allocator.dupe(u8, v) catch error.OutOfMemory;
