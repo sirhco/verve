@@ -127,7 +127,7 @@ fn uptimeLinux() u64 {
     if (builtin.os.tag != .linux) return 0;
     // /proc/uptime contains "<uptime_seconds> <idle_seconds>\n".
     // We only want the first float, truncated to seconds.
-    const fd = std.posix.open("/proc/uptime", .{ .ACCMODE = .RDONLY }, 0) catch return 0;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/uptime", .{ .ACCMODE = .RDONLY }, 0) catch return 0;
     defer std.posix.close(fd);
     var buf: [64]u8 = undefined;
     const n = std.posix.read(fd, &buf) catch return 0;
@@ -264,7 +264,7 @@ fn osVersionLinux(allocator: std.mem.Allocator) Error![]u8 {
     // `/etc/os-release` is the freedesktop standard; every modern
     // distro ships it. We parse manually (no shell, no `source`)
     // and look for `PRETTY_NAME=...` first, fall back to `NAME=...`.
-    const file = std.fs.openFileAbsolute("/etc/os-release", .{}) catch {
+    const file = std.fs.cwd().openFile("/etc/os-release", .{}) catch {
         return allocator.dupe(u8, "Linux") catch error.OutOfMemory;
     };
     defer file.close();

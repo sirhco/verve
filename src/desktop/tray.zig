@@ -961,7 +961,7 @@ const LinuxTray = struct {
     menu: ?*anyopaque = null,
     allocator: std.mem.Allocator = undefined,
     items_storage: []const TrayMenuItem = &.{},
-    item_boxes: std.ArrayListUnmanaged(*ItemBox) = .{},
+    item_boxes: std.ArrayListUnmanaged(*ItemBox) = .empty,
     on_click: ?TrayClickHandler = null,
     on_click_ctx: ?*anyopaque = null,
     on_menu_item: ?TrayMenuItemHandler = null,
@@ -1205,7 +1205,7 @@ const LinuxTray = struct {
     fn freeItemBoxes(self: *LinuxTray) void {
         for (self.item_boxes.items) |box| self.allocator.destroy(box);
         self.item_boxes.deinit(self.allocator);
-        self.item_boxes = .{};
+        self.item_boxes = .empty;
     }
 };
 
