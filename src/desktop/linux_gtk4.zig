@@ -686,9 +686,12 @@ pub const Window = struct {
         // Per-window WebContext. Scheme handlers must be registered
         // BEFORE the WebView is constructed; the WebView resolves its
         // context-bound handlers at first navigation.
+        // WebKitGTK 6.0 removed webkit_web_context_set_sandbox_enabled.
+        // Set env var before context creation — bubblewrap reads it at init.
+        // Needed on VMs / kernels with unprivileged_userns_clone=0.
+        _ = std.c.setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
         const web_ctx = webkit_web_context_new();
         heap.web_context = web_ctx;
-        // Sandbox disabled via env var if needed: WEBKIT_FORCE_SANDBOX=0
         const scheme_z = try allocator.dupeZ(u8, opts.scheme);
         defer allocator.free(scheme_z);
         std.log.debug("verve.desktop[linux-gtk4]: register scheme '{s}://' (per-window context)", .{opts.scheme});
