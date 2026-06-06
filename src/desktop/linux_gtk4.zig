@@ -270,6 +270,17 @@ extern fn gdk_file_list_get_files(file_list: *anyopaque) ?*GSList;
 // (variadic in C — Zig 0.16.0 uses `...`).
 
 extern fn gtk_accessible_update_property(accessible: *GtkWidget, first_property: GtkAccessibleProperty, ...) void;
+extern fn g_value_init(value: *GValue, g_type: GType) *GValue;
+extern fn g_value_set_string(value: *GValue, v_string: [*:0]const u8) void;
+extern fn g_value_unset(value: *GValue) void;
+extern fn gtk_accessible_update_property_value(
+    accessible: *GtkWidget,
+    n_properties: c_int,
+    properties: [*]const GtkAccessibleProperty,
+    values: [*]const GValue,
+) void;
+
+const G_TYPE_STRING: GType = 64; // 16 << 2 — GLib fundamental type
 
 // ---- GdkClipboard externs (replaces GtkClipboard in GTK4) -----------------
 
@@ -881,16 +892,31 @@ pub const Window = struct {
     }
 
     pub fn setAccessibilityLabel(self: *Window, label: []const u8) void {
-        // GTK4: gtk_accessible_update_property is variadic — cannot call directly from Zig.
-        // Best-effort: log and return.
-        std.log.debug("verve.desktop[linux-gtk4]: setAccessibilityLabel (no-op in GTK4, label='{s}')", .{label});
-        _ = self;
+        const window = self.ctx.window orelse return;
+        var buf: [1024]u8 = undefined;
+        if (label.len >= buf.len) return;
+        @memcpy(buf[0..label.len], label);
+        buf[label.len] = 0;
+        var value: GValue = std.mem.zeroes(GValue);
+        _ = g_value_init(&value, G_TYPE_STRING);
+        g_value_set_string(&value, @ptrCast(&buf));
+        defer g_value_unset(&value);
+        const props = [1]GtkAccessibleProperty{GTK_ACCESSIBLE_PROPERTY_LABEL};
+        gtk_accessible_update_property_value(window, 1, &props, &value);
     }
 
     pub fn setAccessibilityHelp(self: *Window, text: []const u8) void {
-        // GTK4: same limitation as setAccessibilityLabel.
-        std.log.debug("verve.desktop[linux-gtk4]: setAccessibilityHelp (no-op in GTK4, text='{s}')", .{text});
-        _ = self;
+        const window = self.ctx.window orelse return;
+        var buf: [1024]u8 = undefined;
+        if (text.len >= buf.len) return;
+        @memcpy(buf[0..text.len], text);
+        buf[text.len] = 0;
+        var value: GValue = std.mem.zeroes(GValue);
+        _ = g_value_init(&value, G_TYPE_STRING);
+        g_value_set_string(&value, @ptrCast(&buf));
+        defer g_value_unset(&value);
+        const props = [1]GtkAccessibleProperty{GTK_ACCESSIBLE_PROPERTY_DESCRIPTION};
+        gtk_accessible_update_property_value(window, 1, &props, &value);
     }
 
     pub fn setAccessibilityRoleDescription(self: *Window, text: []const u8) void {
