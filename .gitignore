@@ -5,3 +5,6 @@ zig-out/
 
 # Local-dev superpowers artifacts (specs/plans) — never committed
 docs/superpowers/
+
+# Git worktrees
+.worktrees/
