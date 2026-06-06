@@ -1076,6 +1076,7 @@ const LinuxTray = struct {
 
     fn bareInit(allocator: std.mem.Allocator, _: *window_mod.Window, opts: TrayOptions) Error!LinuxTray {
         if (builtin.os.tag != .linux) return error.Unsupported;
+        if (comptime use_gtk4) return error.Unsupported; // ayatana-appindicator3 links GTK3, conflicts with GTK4 process
 
         const ay = loadAyatana() orelse return error.Unsupported;
 
