@@ -456,7 +456,7 @@ extern fn gtk_print_settings_set_printer(settings: *GtkPrintSettings, printer: [
 //     webkit_network_session_get_cookie_manager (no per-context cookie manager).
 
 const WebKitURISchemeRequestCallback = *const fn (req: *WebKitURISchemeRequest, user_data: ?*anyopaque) callconv(.c) void;
-const ScriptMessageCallback = *const fn (ucm: *WebKitUserContentManager, msg: *WebKitJavascriptResult, user_data: ?*anyopaque) callconv(.c) void;
+const ScriptMessageCallback = *const fn (ucm: *WebKitUserContentManager, jsval: *JSCValue, user_data: ?*anyopaque) callconv(.c) void;
 
 extern fn webkit_web_context_new() *WebKitWebContext;
 extern fn webkit_web_context_register_uri_scheme(
@@ -1507,21 +1507,6 @@ fn alertCb(_: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callc
     @atomicStore(bool, &cell.done, true, .release);
 }
 
-const SnapshotCell = extern struct {
-    wv: *WebKitWebView,
-    done: bool = false,
-    texture: ?*GdkTexture = null,
-};
-
-fn onSnapshotDone(_: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
-    const cell: *SnapshotCell = @ptrCast(@alignCast(user_data));
-    if (result) |r| {
-        var gerr: ?*GError = null;
-        cell.texture = webkit_web_view_snapshot_finish(cell.wv, r, &gerr);
-        if (gerr) |e| g_error_free(e);
-    }
-    @atomicStore(bool, &cell.done, true, .release);
-}
 
 /// Spin the GLib main context until `done` flips true.
 /// Used by async-to-sync wrappers (cookies, clipboard, dialogs).
