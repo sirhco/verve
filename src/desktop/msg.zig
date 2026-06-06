@@ -69,15 +69,17 @@ pub fn sel(name: [*:0]const u8) SEL {
 }
 
 pub fn getClass(name: [*:0]const u8) Class {
-    return objc_getClass(name) orelse {
-        std.debug.panic("objc class missing: {s}", .{std.mem.span(name)});
-    };
+    if (objc_getClass(name)) |cls| return cls;
+    // @panic doesn't accept format strings; log the name first so it
+    // appears in the crash report, then panic with a static message.
+    std.log.err("verve.desktop[macos]: objc class missing: {s}", .{std.mem.span(name)});
+    @panic("objc class missing");
 }
 
 pub fn allocateClass(super: Class, name: [*:0]const u8) Class {
-    return objc_allocateClassPair(super, name, 0) orelse {
-        std.debug.panic("objc_allocateClassPair failed: class '{s}' may already be registered", .{std.mem.span(name)});
-    };
+    if (objc_allocateClassPair(super, name, 0)) |cls| return cls;
+    std.log.err("verve.desktop[macos]: objc_allocateClassPair failed for class '{s}' — may already be registered", .{std.mem.span(name)});
+    @panic("objc_allocateClassPair failed");
 }
 
 pub fn registerClass(cls: Class) void {

@@ -53,6 +53,7 @@ pub const Error = error{
     Unsupported,
     OutOfMemory,
     Backend,
+    ObjcClassMissing,
 };
 
 /// One row in a tray menu. `label = null` is a separator. Non-empty
@@ -529,7 +530,7 @@ fn ensureTrayTarget() !MacosTray.id {
     const NSObject = msg.getClass("NSObject");
     const cls = blk: {
         if (g_macos_tray_class_registered) {
-            const looked = msg.objc_lookUpClass("VerveTrayTarget") orelse return error.Backend;
+            const looked = msg.objc_lookUpClass("VerveTrayTarget") orelse return error.ObjcClassMissing;
             break :blk looked;
         }
         const c = msg.allocateClass(NSObject, "VerveTrayTarget");
