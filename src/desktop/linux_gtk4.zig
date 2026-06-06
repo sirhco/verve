@@ -1555,7 +1555,7 @@ fn onUrlSocketReadable(source: *GIOChannel, _cond: GIOCondition, data: ?*anyopaq
 
 /// Continuation cell for webkit_cookie_manager_get_all_cookies async callback.
 const GetAllCookiesCell = extern struct {
-    result: ?*GAsyncResult = null,
+    list: ?*GList = null,
     done: bool = false,
 };
 
@@ -1564,10 +1564,17 @@ const SimpleAsyncCell = extern struct {
     done: bool = false,
 };
 
-fn onGetAllCookiesDone(_: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+fn onGetAllCookiesDone(src: ?*anyopaque, res: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     const cell: *GetAllCookiesCell = @ptrCast(@alignCast(user_data orelse return));
-    cell.result = res;
-    @atomicStore(bool, &cell.done, true, .release);
+    defer @atomicStore(bool, &cell.done, true, .release);
+    const mgr: *WebKitCookieManager = @ptrCast(@alignCast(src orelse return));
+    const r = res orelse return;
+    var gerr: ?*GError = null;
+    cell.list = webkit_cookie_manager_get_all_cookies_finish(mgr, r, &gerr);
+    if (gerr) |e| {
+        std.log.warn("verve.desktop[linux-gtk4]: get_all_cookies_finish failed", .{});
+        g_error_free(e);
+    }
 }
 
 fn onSimpleAsyncDone(_: ?*anyopaque, _: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
@@ -1586,15 +1593,7 @@ fn fetchAllCookies(mgr: *WebKitCookieManager) ?*GList {
     var cell: GetAllCookiesCell = .{};
     webkit_cookie_manager_get_all_cookies(mgr, null, &onGetAllCookiesDone, @ptrCast(&cell));
     pumpMainContextUntilDone(&cell.done);
-    const res = cell.result orelse return null;
-    var err: ?*GError = null;
-    const list = webkit_cookie_manager_get_all_cookies_finish(mgr, res, &err);
-    if (err) |e| {
-        std.log.warn("verve.desktop[linux-gtk4]: get_all_cookies_finish failed", .{});
-        g_error_free(e);
-        return null;
-    }
-    return list;
+    return cell.list;
 }
 
 fn marshalCookie(allocator: std.mem.Allocator, c: *SoupCookie) opts_mod.CookieError!opts_mod.Cookie {
