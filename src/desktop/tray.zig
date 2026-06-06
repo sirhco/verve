@@ -957,6 +957,14 @@ pub fn handleWindowsTrayMessage(_hwnd: ?*anyopaque, _wparam: usize, lparam: isiz
 // ---- Linux — libayatana-appindicator3 + GtkMenu ----------------------------
 
 const LinuxTray = struct {
+    // Comptime: is GTK4 the active backend? On non-Linux hosts always false so
+    // @import("desktop_options") is never evaluated (only the .linux switch arm
+    // in backend.zig compiles this struct's methods).
+    const use_gtk4: bool = comptime blk: {
+        if (builtin.os.tag != .linux) break :blk false;
+        break :blk @import("desktop_options").gtk4;
+    };
+
     indicator: ?*anyopaque = null,
     menu: ?*anyopaque = null,
     allocator: std.mem.Allocator = undefined,
@@ -1143,6 +1151,7 @@ const LinuxTray = struct {
 
     fn setMenu(self: *LinuxTray, items: []const TrayMenuItem) Error!void {
         if (builtin.os.tag != .linux) return error.Unsupported;
+        if (comptime use_gtk4) return; // GtkMenu removed in GTK4; tray menu unsupported
         self.freeItemBoxes();
         if (self.items_storage.len > 0) {
             freeMenu(self.allocator, self.items_storage);
@@ -1167,6 +1176,7 @@ const LinuxTray = struct {
     }
 
     fn buildLinuxMenu(self: *LinuxTray, items: []const TrayMenuItem) Error!*GtkWidget {
+        if (comptime use_gtk4) return error.Unsupported;
         const menu = gtk_menu_new();
         for (items) |it| {
             const child = blk: {
