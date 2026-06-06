@@ -4,6 +4,60 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.41] - 2026-06-06
+
+### Fixed
+
+- **Linux GTK4: live validation on aarch64 Linux** — first real-hardware boot
+  of the `-Dgtk4=true` backend (aarch64, WebKitGTK 6.0 / libsoup 3). Multiple
+  API incompatibilities surfaced and resolved:
+  - **`SnapshotError` set mismatch** — `error.Backend` and `error.OutOfMemory`
+    returned from `takeSnapshotPng` are not members of `SnapshotError`. Mapped
+    to `CaptureFailed` / `EncodeFailed` / `WriteFailed` as appropriate.
+  - **libsoup 3 cookie API** — `SoupDate` and `soup_date_*` removed in libsoup
+    3; migrated `marshalCookie` / `buildSoupCookie` to `GDateTime` +
+    `g_date_time_new_from_unix_utc` / `g_date_time_to_unix` /
+    `g_date_time_unref`. Updated `soup_cookie_get/set_expires` signatures.
+  - **WebKitGTK 6.0 script-message callback** — `WebKitJavascriptResult` and
+    `webkit_javascript_result_get_js_value` removed; `script-message-received`
+    now delivers `JSCValue *` as the second argument directly. Updated
+    `onScriptMessage` and `ScriptMessageCallback` type alias.
+  - **Snapshot stub** — `webkit_web_view_snapshot[_finish]` absent in installed
+    webkitgtk-6.0; `takeSnapshotPng` returns `error.Unsupported`. Dead
+    `SnapshotCell` / `onSnapshotDone` removed.
+  - **Tray GTK4 conflict** — `libayatana-appindicator3` links GTK3
+    (`libgdk-3.so`); loading it in a GTK4 process double-registers GLib types
+    and segfaults. `LinuxTray.bareInit` now returns `error.Unsupported` when
+    built with `-Dgtk4=true`.
+  - **Cookie async lifetime** — `GetAllCookiesCell` stored a raw `GAsyncResult
+    *` past the callback boundary; GLib frees the GTask after the callback
+    returns, leaving a dangling pointer and a failing `g_task_is_valid`
+    assertion. `webkit_cookie_manager_get_all_cookies_finish` is now called
+    inside `onGetAllCookiesDone` with the source manager. Cell now stores the
+    resulting `GList *`, matching the pattern used by file/alert dialog
+    callbacks.
+  - **WebKit sandbox** — `bwrap` crashes on kernels where unprivileged user
+    namespaces are disabled (`kernel.unprivileged_userns_clone=0`).
+    `webkit_web_context_set_sandbox_enabled(ctx, 0)` is called after context
+    creation, removing the need for `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS`.
+
+### Changed
+
+- **Linux GTK4 scaffold docs** — `templates/desktop/README.md` and
+  `templates/desktop-minimal/README.md` now document GTK4 prerequisite packages
+  (`libgtk-4-dev libwebkitgtk-6.0-dev` / `gtk4-devel webkitgtk6.0-devel`), the
+  `-Dgtk4=true` build flag, and known GTK4 limitations (tray + snapshot return
+  `error.Unsupported`). Platform support matrix corrected: Linux snapshot was
+  incorrectly `✓` (now `stub`); Linux tray entry now shows
+  `✓ GTK3 / stub GTK4`.
+
+### Upgrade notes
+
+- **GTK4 apps**: re-vendor `src/desktop/` to pick up the libsoup 3 and WebKit
+  callback fixes. No app-level source changes required.
+
+---
+
 ## [0.1.40] - 2026-06-05
 
 ### Fixed

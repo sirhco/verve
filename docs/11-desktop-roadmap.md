@@ -1709,7 +1709,7 @@ signing infra.
 | File / area | Issue | Severity |
 |---|---|---|
 | `templates/desktop/tools/webview2.pinned.txt` | SHA-512 still blank — first CI run needs to populate after verifying the published value | Low (auto-vendor still works; integrity check skipped). |
-| Linux backend overall | Never run live on a real Linux host — diagnostic logs instrumented but no end-to-end validation | Medium. Cookies / multi-window / scheme handler / drag-drop / tray menu all unverified live. |
+| Linux backend overall | ~~Never run live on a real Linux host~~ **First-boot validated 2026-06-06 on aarch64 (WebKitGTK 6.0 / libsoup 3, v0.1.41).** Cookies, scheme handler, IPC, tray guard, sandbox all exercised. Multi-window / drag-drop / tray menu unverified. | Addressed. |
 | `src/desktop/windows.zig` vtable slot indexes | Hand-extracted from public MS docs (not generated from SDK headers) | Medium. First live Windows boot should verify against actual `webview2.h` slots. The newer cookie / zoom / nav-query slots are particularly load-bearing. |
 | `src/desktop/macos.zig` `pumpUntilDone` | Nested `[NSRunLoop runMode:beforeDate:]` re-entrant in modal contexts | Low. Safe from IPC handlers (the dominant call site); risky if a caller is already inside another modal run loop. |
 | ~~Linux `libayatana-appindicator3` + `libnotify` linked unconditionally~~ | **Closed 2026-05-30 (Bundle 1).** Both libs now loaded via `std.c.dlopen` + `dlsym` with a memoized fn-pointer struct; missing-lib paths return `error.Unsupported` at runtime. Distros without ayatana / libnotify build cleanly. | — |
@@ -1782,16 +1782,18 @@ from earlier bundles are established.
 Bundles **deferred** (host-required or scope-too-large):
 - **Bundle 9** — WinRT Toast. Needs Windows host for AUMID +
   Start-menu shortcut + COM init validation.
-- **Bundle 10** — GTK4 + WebKitGTK 6.0 behind `-Dgtk4`. Needs
-  Linux host for live validation against Ubuntu 24 LTS / Fedora 41.
+- ~~**Bundle 10**~~ — **shipped 2026-06-06** — GTK4 + WebKitGTK 6.0
+  live-validated on aarch64 Linux. libsoup 3 API migration, JSC callback
+  update, tray GTK3/GTK4 conflict resolved, cookie async lifetime fix,
+  WebKit sandbox programmatic disable. Snapshot returns `error.Unsupported`
+  (webkit_web_view_snapshot absent in installed webkitgtk-6.0).
 - **Bundle 11** — Win/Linux auto-updater apply. Squirrel or MSIX
   on Win, AppImageUpdate on Linux. Each is a full framework
   integration with its own signing model. Defer until update
   signing infra is picked.
-- **Bundle 12** — Live validation pass on a real Linux host
-  followed by a real Windows host. Boot every code path; fix
-  what breaks; verify WebView2 vtable slot indexes against
-  actual SDK headers. Cannot be planned without host availability.
+- **Bundle 12** — Linux live validation complete (2026-06-06, aarch64,
+  v0.1.41). Windows host validation still pending: WebView2 vtable slot
+  verification, WinRT Toast, silent print.
 - **Bundle 13** — Full a11y provider (UIA on Win + ATK on
   Linux). Polish vs. shipped `setAccessibilityLabel`. Web content
   + menus already self-publish; remaining gap is window-chrome
