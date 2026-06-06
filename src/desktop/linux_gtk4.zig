@@ -31,13 +31,12 @@ const GClosureNotify = ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void;
 const GAsyncReadyCallback = ?*const fn (?*anyopaque, ?*GAsyncResult, ?*anyopaque) callconv(.c) void;
 const GDestroyNotify = ?*const fn (?*anyopaque) callconv(.c) void;
 
-// libsoup 3.x (WebKitGTK 6.0 dependency — same struct names as soup2)
+// libsoup 3.x (WebKitGTK 6.0 dependency)
 const SoupCookie = opaque {};
-const SoupDate = opaque {};
+const GDateTime = opaque {};
 
 // JavaScriptCore (present in WK6)
 const JSCValue = opaque {};
-const WebKitJavascriptResult = opaque {};
 
 // WebKitGTK 6.0 types
 const WebKitWebView = opaque {};
@@ -128,13 +127,6 @@ const G_IO_IN: GIOCondition = 1;
 // GTK4 accessibility properties
 const GTK_ACCESSIBLE_PROPERTY_LABEL: GtkAccessibleProperty = 8;
 const GTK_ACCESSIBLE_PROPERTY_DESCRIPTION: GtkAccessibleProperty = 3;
-
-// WebKitGTK snapshot
-const WebKitSnapshotRegion = c_uint;
-const WebKitSnapshotOptions = c_uint;
-
-const WEBKIT_SNAPSHOT_REGION_VISIBLE: WebKitSnapshotRegion = 0;
-const WEBKIT_SNAPSHOT_OPTIONS_NONE: WebKitSnapshotOptions = 0;
 
 // Print
 const GTK_PRINT_PAGES_RANGES: c_int = 2;
@@ -524,21 +516,6 @@ extern fn webkit_web_view_evaluate_javascript(
 extern fn webkit_web_view_get_network_session(wv: *WebKitWebView) *WebKitNetworkSession;
 extern fn webkit_network_session_get_cookie_manager(session: *WebKitNetworkSession) *WebKitCookieManager;
 
-// Snapshot (WebKitGTK 6.0: no get_ prefix, returns GdkTexture not CairoSurface)
-extern fn webkit_web_view_snapshot(
-    wv: *WebKitWebView,
-    region: WebKitSnapshotRegion,
-    options: WebKitSnapshotOptions,
-    cancellable: ?*GCancellable,
-    callback: GAsyncReadyCallback,
-    user_data: ?*anyopaque,
-) void;
-extern fn webkit_web_view_snapshot_finish(
-    wv: *WebKitWebView,
-    result: *GAsyncResult,
-    err: ?*?*GError,
-) ?*GdkTexture;
-
 extern fn webkit_uri_scheme_request_get_uri(req: *WebKitURISchemeRequest) [*:0]const u8;
 extern fn webkit_uri_scheme_request_finish(
     req: *WebKitURISchemeRequest,
@@ -548,7 +525,6 @@ extern fn webkit_uri_scheme_request_finish(
 ) void;
 extern fn webkit_uri_scheme_request_finish_error(req: *WebKitURISchemeRequest, err: *GError) void;
 
-extern fn webkit_javascript_result_get_js_value(result: *WebKitJavascriptResult) *JSCValue;
 extern fn jsc_value_is_string(v: *JSCValue) gboolean;
 extern fn jsc_value_to_string(v: *JSCValue) [*:0]u8;
 
@@ -594,15 +570,15 @@ extern fn soup_cookie_get_domain(c: *SoupCookie) [*:0]const u8;
 extern fn soup_cookie_get_path(c: *SoupCookie) [*:0]const u8;
 extern fn soup_cookie_get_secure(c: *SoupCookie) gboolean;
 extern fn soup_cookie_get_http_only(c: *SoupCookie) gboolean;
-extern fn soup_cookie_get_expires(c: *SoupCookie) ?*SoupDate;
+extern fn soup_cookie_get_expires(c: *SoupCookie) ?*GDateTime;
 extern fn soup_cookie_get_same_site_policy(c: *SoupCookie) c_int;
 extern fn soup_cookie_set_secure(c: *SoupCookie, v: gboolean) void;
 extern fn soup_cookie_set_http_only(c: *SoupCookie, v: gboolean) void;
 extern fn soup_cookie_set_same_site_policy(c: *SoupCookie, p: c_int) void;
-extern fn soup_cookie_set_expires(c: *SoupCookie, date: ?*SoupDate) void;
-extern fn soup_date_new_from_time_t(t: c_long) *SoupDate;
-extern fn soup_date_to_time_t(d: *SoupDate) c_long;
-extern fn soup_date_free(d: *SoupDate) void;
+extern fn soup_cookie_set_expires(c: *SoupCookie, date: ?*GDateTime) void;
+extern fn g_date_time_new_from_unix_utc(t: i64) ?*GDateTime;
+extern fn g_date_time_to_unix(dt: *GDateTime) i64;
+extern fn g_date_time_unref(dt: *GDateTime) void;
 
 // ---- Implementation ---------------------------------------------------------
 
@@ -1285,32 +1261,10 @@ pub const Window = struct {
     }
 
     pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
-        const wv = self.ctx.webview orelse return error.CaptureFailed;
-        var cell = SnapshotCell{ .wv = wv };
-        webkit_web_view_snapshot(wv, WEBKIT_SNAPSHOT_REGION_VISIBLE, WEBKIT_SNAPSHOT_OPTIONS_NONE,
-            null, @ptrCast(&onSnapshotDone), @ptrCast(&cell));
-        pumpMainContextUntilDone(&cell.done);
-        const texture = cell.texture orelse return error.CaptureFailed;
-        defer g_object_unref(texture);
-
-        const w = gdk_texture_get_width(texture);
-        const h = gdk_texture_get_height(texture);
-        const stride: usize = @intCast(w * 4);
-        const rgba = std.heap.page_allocator.alloc(u8, @as(usize, @intCast(h)) * stride) catch return error.CaptureFailed;
-        defer std.heap.page_allocator.free(rgba);
-        gdk_texture_download(texture, rgba.ptr, stride);
-
-        const pixbuf = gdk_pixbuf_new_from_data(rgba.ptr, 0, 1, 8, w, h, @intCast(stride), null, null)
-            orelse return error.EncodeFailed;
-        defer g_object_unref(pixbuf);
-
-        const path_z = std.heap.page_allocator.dupeZ(u8, path) catch return error.WriteFailed;
-        defer std.heap.page_allocator.free(path_z);
-        var gerr: ?*GError = null;
-        if (gdk_pixbuf_savev(pixbuf, path_z.ptr, "png", null, null, &gerr) == 0) {
-            if (gerr) |e| g_error_free(e);
-            return error.WriteFailed;
-        }
+        _ = self;
+        _ = path;
+        // webkit_web_view_snapshot not yet available in installed webkitgtk-6.0
+        return error.Unsupported;
     }
 };
 
@@ -1355,10 +1309,9 @@ fn onCloseRequest(widget: *GtkWidget, user_data: ?*anyopaque) callconv(.c) gbool
     return 0; // allow close
 }
 
-fn onScriptMessage(ucm: *WebKitUserContentManager, result: *WebKitJavascriptResult, user_data: ?*anyopaque) callconv(.c) void {
+fn onScriptMessage(ucm: *WebKitUserContentManager, jsval: *JSCValue, user_data: ?*anyopaque) callconv(.c) void {
     _ = ucm;
     const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
-    const jsval = webkit_javascript_result_get_js_value(result);
     if (jsc_value_is_string(jsval) == 0) return;
     const str = jsc_value_to_string(jsval);
     defer g_free(@ptrCast(str));
@@ -1675,7 +1628,7 @@ fn marshalCookie(allocator: std.mem.Allocator, c: *SoupCookie) opts_mod.CookieEr
     };
 
     if (soup_cookie_get_expires(c)) |date| {
-        out.expires_unix = @intCast(soup_date_to_time_t(date));
+        out.expires_unix = @intCast(g_date_time_to_unix(date));
     }
 
     out.same_site = switch (soup_cookie_get_same_site_policy(c)) {
@@ -1707,9 +1660,9 @@ fn buildSoupCookie(allocator: std.mem.Allocator, cookie: opts_mod.Cookie) opts_m
     if (cookie.secure) soup_cookie_set_secure(c, 1);
     if (cookie.http_only) soup_cookie_set_http_only(c, 1);
     if (cookie.expires_unix > 0) {
-        const date = soup_date_new_from_time_t(@intCast(cookie.expires_unix));
+        const date = g_date_time_new_from_unix_utc(@intCast(cookie.expires_unix));
         soup_cookie_set_expires(c, date);
-        soup_date_free(date);
+        if (date) |d| g_date_time_unref(d);
     }
     soup_cookie_set_same_site_policy(c, switch (cookie.same_site) {
         .default, .lax => SOUP_SAME_SITE_LAX,
