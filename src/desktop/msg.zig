@@ -69,11 +69,15 @@ pub fn sel(name: [*:0]const u8) SEL {
 }
 
 pub fn getClass(name: [*:0]const u8) Class {
-    return objc_getClass(name) orelse @panic("objc class missing");
+    return objc_getClass(name) orelse {
+        std.debug.panic("objc class missing: {s}", .{std.mem.span(name)});
+    };
 }
 
 pub fn allocateClass(super: Class, name: [*:0]const u8) Class {
-    return objc_allocateClassPair(super, name, 0) orelse @panic("objc_allocateClassPair failed");
+    return objc_allocateClassPair(super, name, 0) orelse {
+        std.debug.panic("objc_allocateClassPair failed: class '{s}' may already be registered", .{std.mem.span(name)});
+    };
 }
 
 pub fn registerClass(cls: Class) void {
@@ -81,7 +85,7 @@ pub fn registerClass(cls: Class) void {
 }
 
 pub fn addMethod(cls: Class, name: SEL, imp: IMP, types: [*:0]const u8) void {
-    if (!class_addMethod(cls, name, imp, types)) @panic("class_addMethod failed");
+    if (!class_addMethod(cls, name, imp, types)) @panic("class_addMethod failed: method already registered or class is metaclass");
 }
 
 pub fn addProtocol(cls: Class, name: [*:0]const u8) void {

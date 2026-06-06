@@ -170,7 +170,7 @@ pub fn init(
             if (opts.menu.len > 0) {
                 try heap.setMenu(opts.menu);
             } else if (opts.on_click != null) {
-                heap.wireButtonClick();
+                try heap.wireButtonClick();
             }
             return .{ .impl = heap, .allocator = allocator };
         },
@@ -429,7 +429,7 @@ const MacosTray = struct {
         g_macos_tray = self;
         self.items_storage = try deepCopyMenu(self.allocator, items);
 
-        const target = ensureTrayTarget();
+        const target = try ensureTrayTarget();
         const menu = buildMacMenu(self.items_storage, target);
 
         // Retain so we can release on tear-down without relying on
@@ -444,13 +444,13 @@ const MacosTray = struct {
         }
     }
 
-    fn wireButtonClick(self: *MacosTray) void {
+    fn wireButtonClick(self: *MacosTray) Error!void {
         if (builtin.os.tag != .macos) return;
         const item = self.status_item orelse return;
         const button_sel = m.cast(*const fn (id, SEL) callconv(.c) id);
         const button = button_sel(item, m.sel("button"));
         if (@intFromPtr(button) == 0) return;
-        const target = ensureTrayTarget();
+        const target = try ensureTrayTarget();
         const set_target = m.cast(*const fn (id, SEL, id) callconv(.c) void);
         set_target(button, m.sel("setTarget:"), target);
         const set_action = m.cast(*const fn (id, SEL, SEL) callconv(.c) void);
@@ -521,7 +521,7 @@ var g_macos_tray: ?*MacosTray = null;
 var g_macos_tray_target: ?MacosTray.id = null;
 var g_macos_tray_class_registered: bool = false;
 
-fn ensureTrayTarget() MacosTray.id {
+fn ensureTrayTarget() !MacosTray.id {
     if (builtin.os.tag != .macos) return null;
     if (g_macos_tray_target) |t| return t;
 
@@ -529,7 +529,7 @@ fn ensureTrayTarget() MacosTray.id {
     const NSObject = msg.getClass("NSObject");
     const cls = blk: {
         if (g_macos_tray_class_registered) {
-            const looked = msg.objc_lookUpClass("VerveTrayTarget") orelse @panic("VerveTrayTarget vanished");
+            const looked = msg.objc_lookUpClass("VerveTrayTarget") orelse return error.Backend;
             break :blk looked;
         }
         const c = msg.allocateClass(NSObject, "VerveTrayTarget");
