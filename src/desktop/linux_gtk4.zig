@@ -466,6 +466,7 @@ extern fn webkit_web_context_register_uri_scheme(
     user_data: ?*anyopaque,
     destroy: ?*const fn (?*anyopaque) callconv(.c) void,
 ) void;
+extern fn webkit_web_context_set_sandbox_enabled(ctx: *WebKitWebContext, enabled: gboolean) void;
 
 extern fn webkit_user_content_manager_new() *WebKitUserContentManager;
 extern fn webkit_user_content_manager_add_script(ucm: *WebKitUserContentManager, script: *WebKitUserScript) void;
@@ -675,6 +676,9 @@ pub const Window = struct {
         // context-bound handlers at first navigation.
         const web_ctx = webkit_web_context_new();
         heap.web_context = web_ctx;
+        // bubblewrap sandbox requires unprivileged user namespaces; disable
+        // if the kernel doesn't support them (sysctl kernel.unprivileged_userns_clone=0).
+        webkit_web_context_set_sandbox_enabled(web_ctx, 0);
         const scheme_z = try allocator.dupeZ(u8, opts.scheme);
         defer allocator.free(scheme_z);
         std.log.debug("verve.desktop[linux-gtk4]: register scheme '{s}://' (per-window context)", .{opts.scheme});
