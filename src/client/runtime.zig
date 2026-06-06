@@ -20,7 +20,7 @@ const reconciler = @import("reconciler.zig");
 const client_alloc = @import("allocator.zig");
 const scratch = @import("scratch.zig");
 
-const MAX_SLOTS = 256;
+const MAX_SLOTS = 1024;
 
 const Slot = struct {
     vid: u32,
@@ -51,7 +51,7 @@ const BindBoxF32 = struct {
 var slots: [MAX_SLOTS]Slot = undefined;
 var slot_count: usize = 0;
 
-const MAX_ISLAND_OWNERS = 64;
+const MAX_ISLAND_OWNERS = 256;
 
 var root_owner: ?*verve.Owner = null;
 var island_owner_ids: [MAX_ISLAND_OWNERS]u32 = undefined;
@@ -77,7 +77,7 @@ pub fn ensureOwner() *verve.Owner {
     while (i < island_owner_count) : (i += 1) {
         if (island_owner_ids[i] == vid) return island_owner_ptrs[i];
     }
-    if (island_owner_count >= MAX_ISLAND_OWNERS) @panic("verve client: island owner capacity exceeded");
+    if (island_owner_count >= MAX_ISLAND_OWNERS) @panic("verve client: island owner capacity exceeded (raise MAX_ISLAND_OWNERS in src/client/runtime.zig)");
     const child = root.createChild() catch @panic("verve client: OOM allocating island Owner");
     island_owner_ids[island_owner_count] = vid;
     island_owner_ptrs[island_owner_count] = child;
@@ -98,7 +98,7 @@ pub fn ensureOwner() *verve.Owner {
 /// `root_id` the chunk's `hydrate` receives into the bind-name).
 pub fn registerI32(name: []const u8, initial: i32) *verve.Signal(i32) {
     if (signalI32(name)) |existing| return existing;
-    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
+    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded (raise MAX_SLOTS in src/client/runtime.zig)");
     const owner = ensureOwner();
     const gpa = owner.allocator();
 
@@ -147,7 +147,7 @@ fn onSetI32(ctx: *anyopaque, value: i32) void {
 /// name — see `registerI32` for the contract.
 pub fn registerStr(name: []const u8, initial: []const u8) *verve.Signal([]const u8) {
     if (signalStr(name)) |existing| return existing;
-    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
+    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded (raise MAX_SLOTS in src/client/runtime.zig)");
     const owner = ensureOwner();
     const gpa = owner.allocator();
 
@@ -194,7 +194,7 @@ fn onSetStr(ctx: *anyopaque, value: []const u8) void {
 /// see `registerI32` for the contract.
 pub fn registerBool(name: []const u8, class_name: []const u8, initial: bool) *verve.Signal(bool) {
     if (signalBool(name)) |existing| return existing;
-    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
+    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded (raise MAX_SLOTS in src/client/runtime.zig)");
     const owner = ensureOwner();
     const gpa = owner.allocator();
 
@@ -247,7 +247,7 @@ fn onSetBool(ctx: *anyopaque, value: bool) void {
 /// the contract.
 pub fn registerF32(name: []const u8, initial: f32) *verve.Signal(f32) {
     if (signalF32(name)) |existing| return existing;
-    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded");
+    if (slot_count >= MAX_SLOTS) @panic("verve client: signal slot capacity exceeded (raise MAX_SLOTS in src/client/runtime.zig)");
     const owner = ensureOwner();
     const gpa = owner.allocator();
 
@@ -728,7 +728,7 @@ test "registerStr allocates a string Signal" {
 // 256 entries enough for typical apps (one slot per visually-distinct
 // handler, not per render).
 
-const MAX_EVENT_SLOTS: u32 = 1024;
+const MAX_EVENT_SLOTS: u32 = 4096;
 
 var event_slots: [MAX_EVENT_SLOTS]?*const fn () void = [_]?*const fn () void{null} ** MAX_EVENT_SLOTS;
 /// Per-slot owning island vid, parallel to `event_slots` (preserves the
@@ -741,10 +741,10 @@ var event_slot_count: u32 = 0;
 /// Register a closure-style click handler. Returns the slot id the
 /// renderer should stamp on the node via `Node.onClickFn(id)`. Panics
 /// when capacity is exhausted — the cap is enforced because the slot
-/// table is statically sized; raise `MAX_EVENT_SLOTS` if a real app
-/// needs more.
+/// table is statically sized; raise `MAX_EVENT_SLOTS` in
+/// `src/client/runtime.zig` if a real app needs more.
 pub fn registerEvent(handler: *const fn () void) u32 {
-    if (event_slot_count >= MAX_EVENT_SLOTS) @panic("verve client: event slot capacity exceeded");
+    if (event_slot_count >= MAX_EVENT_SLOTS) @panic("verve client: event slot capacity exceeded (raise MAX_EVENT_SLOTS in src/client/runtime.zig)");
     const id = event_slot_count;
     event_slots[id] = handler;
     event_slot_vids[id] = @import("island.zig").current_island_id;
@@ -817,8 +817,8 @@ pub fn slotCount() u32 {
     return @intCast(slot_count);
 }
 
-/// Static cap on signal slots — raises `@panic` past this. Bump
-/// `MAX_SLOTS` if a real app needs more.
+/// Static cap on signal slots — raises `@panic` past this (default 1024).
+/// Bump `MAX_SLOTS` in `src/client/runtime.zig` if a real app needs more.
 pub fn slotCapacity() u32 {
     return MAX_SLOTS;
 }
@@ -828,7 +828,8 @@ pub fn eventSlotCount() u32 {
     return event_slot_count;
 }
 
-/// Static cap on event slots. Bump `MAX_EVENT_SLOTS` if needed.
+/// Static cap on event slots (default 4096). Bump `MAX_EVENT_SLOTS` in
+/// `src/client/runtime.zig` if a real app needs more.
 pub fn eventSlotCapacity() u32 {
     return MAX_EVENT_SLOTS;
 }
@@ -874,7 +875,7 @@ const ResponseSlot = struct {
     once: bool = false,
 };
 
-const MAX_RESPONSE_SLOTS: u32 = 256;
+const MAX_RESPONSE_SLOTS: u32 = 1024;
 var response_slots: [MAX_RESPONSE_SLOTS]?ResponseSlot = [_]?ResponseSlot{null} ** MAX_RESPONSE_SLOTS;
 var response_slot_count: u32 = 0;
 var server_fn_req_seq: u32 = 0;
@@ -884,7 +885,7 @@ var server_fn_req_seq: u32 = 0;
 /// lifetime of the slot table (typically the page lifetime); chunks
 /// should pass static string literals.
 pub fn registerResponseHandler(route: []const u8, handler: *const fn ([*]const u8, u32) void) void {
-    if (response_slot_count >= MAX_RESPONSE_SLOTS) @panic("verve client: response slot capacity exceeded");
+    if (response_slot_count >= MAX_RESPONSE_SLOTS) @panic("verve client: response slot capacity exceeded (raise MAX_RESPONSE_SLOTS in src/client/runtime.zig)");
     response_slots[response_slot_count] = .{ .route = route, .fn_ptr = handler, .vid = @import("island.zig").current_island_id };
     response_slot_count += 1;
 }
@@ -894,7 +895,7 @@ pub fn registerResponseHandler(route: []const u8, handler: *const fn ([*]const u
 /// then is removed from the slot table. Use `nextReqId()` to allocate
 /// a fresh correlation id before issuing the outbound call.
 pub fn registerResponseHandlerOnce(route: []const u8, rid: u32, handler: *const fn ([*]const u8, u32) void) void {
-    if (response_slot_count >= MAX_RESPONSE_SLOTS) @panic("verve client: response slot capacity exceeded");
+    if (response_slot_count >= MAX_RESPONSE_SLOTS) @panic("verve client: response slot capacity exceeded (raise MAX_RESPONSE_SLOTS in src/client/runtime.zig)");
     response_slots[response_slot_count] = .{
         .route = route,
         .fn_ptr = handler,
