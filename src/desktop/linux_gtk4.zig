@@ -212,6 +212,7 @@ extern fn g_object_get(
 extern fn g_object_ref(o: ?*anyopaque) ?*anyopaque;
 extern fn g_object_unref(o: ?*anyopaque) void;
 extern fn g_free(p: ?*anyopaque) void;
+extern fn g_setenv(variable: [*:0]const u8, value: [*:0]const u8, overwrite: gboolean) gboolean;
 extern fn g_memdup2(mem: ?*const anyopaque, byte_size: usize) ?*anyopaque;
 extern fn g_quark_from_static_string(s: [*:0]const u8) GQuark;
 extern fn g_error_new_literal(domain: GQuark, code: c_int, message: [*:0]const u8) *GError;
@@ -689,7 +690,7 @@ pub const Window = struct {
         // WebKitGTK 6.0 removed webkit_web_context_set_sandbox_enabled.
         // Set env var before context creation — bubblewrap reads it at init.
         // Needed on VMs / kernels with unprivileged_userns_clone=0.
-        _ = std.c.setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
+        _ = g_setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 1);
         const web_ctx = webkit_web_context_new();
         heap.web_context = web_ctx;
         const scheme_z = try allocator.dupeZ(u8, opts.scheme);
