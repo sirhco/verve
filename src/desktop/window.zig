@@ -10,6 +10,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Re-export build-time options so backend.zig can read them via @import("root").
+// On non-Linux targets the desktop_options module is not added by build.zig, so
+// we provide a stub with gtk4=false; the comptime branch is never evaluated on
+// those targets anyway.
+pub const desktop_options = if (builtin.os.tag == .linux)
+    @import("desktop_options")
+else
+    struct { pub const gtk4 = false; };
+
 pub const options = @import("options.zig");
 pub const ipc = @import("ipc.zig");
 pub const ipc_router = @import("ipc_router.zig");
