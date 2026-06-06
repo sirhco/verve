@@ -1285,7 +1285,7 @@ pub const Window = struct {
     }
 
     pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
-        const wv = self.ctx.webview orelse return error.NotReady;
+        const wv = self.ctx.webview orelse return error.CaptureFailed;
         var cell = SnapshotCell{ .wv = wv };
         webkit_web_view_snapshot(wv, WEBKIT_SNAPSHOT_REGION_VISIBLE, WEBKIT_SNAPSHOT_OPTIONS_NONE,
             null, @ptrCast(&onSnapshotDone), @ptrCast(&cell));
