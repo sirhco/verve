@@ -1290,26 +1290,26 @@ pub const Window = struct {
         webkit_web_view_snapshot(wv, WEBKIT_SNAPSHOT_REGION_VISIBLE, WEBKIT_SNAPSHOT_OPTIONS_NONE,
             null, @ptrCast(&onSnapshotDone), @ptrCast(&cell));
         pumpMainContextUntilDone(&cell.done);
-        const texture = cell.texture orelse return error.Backend;
+        const texture = cell.texture orelse return error.CaptureFailed;
         defer g_object_unref(texture);
 
         const w = gdk_texture_get_width(texture);
         const h = gdk_texture_get_height(texture);
         const stride: usize = @intCast(w * 4);
-        const rgba = std.heap.page_allocator.alloc(u8, @as(usize, @intCast(h)) * stride) catch return error.OutOfMemory;
+        const rgba = std.heap.page_allocator.alloc(u8, @as(usize, @intCast(h)) * stride) catch return error.CaptureFailed;
         defer std.heap.page_allocator.free(rgba);
         gdk_texture_download(texture, rgba.ptr, stride);
 
         const pixbuf = gdk_pixbuf_new_from_data(rgba.ptr, 0, 1, 8, w, h, @intCast(stride), null, null)
-            orelse return error.Backend;
+            orelse return error.EncodeFailed;
         defer g_object_unref(pixbuf);
 
-        const path_z = std.heap.page_allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+        const path_z = std.heap.page_allocator.dupeZ(u8, path) catch return error.WriteFailed;
         defer std.heap.page_allocator.free(path_z);
         var gerr: ?*GError = null;
         if (gdk_pixbuf_savev(pixbuf, path_z.ptr, "png", null, null, &gerr) == 0) {
             if (gerr) |e| g_error_free(e);
-            return error.Backend;
+            return error.WriteFailed;
         }
     }
 };
