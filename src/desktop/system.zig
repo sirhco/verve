@@ -128,9 +128,10 @@ fn uptimeLinux() u64 {
     // /proc/uptime contains "<uptime_seconds> <idle_seconds>\n".
     // We only want the first float, truncated to seconds.
     const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/uptime", .{ .ACCMODE = .RDONLY }, 0) catch return 0;
-    defer std.posix.close(fd);
+    const file = std.fs.File{ .handle = fd };
+    defer file.close();
     var buf: [64]u8 = undefined;
-    const n = std.posix.read(fd, &buf) catch return 0;
+    const n = file.read(&buf) catch return 0;
     if (n == 0) return 0;
     const space = std.mem.indexOfScalar(u8, buf[0..n], ' ') orelse return 0;
     const seconds_str = buf[0..space];
@@ -264,9 +265,10 @@ fn osVersionLinux(allocator: std.mem.Allocator) Error![]u8 {
     // `/etc/os-release` is the freedesktop standard; every modern
     // distro ships it. We parse manually (no shell, no `source`)
     // and look for `PRETTY_NAME=...` first, fall back to `NAME=...`.
-    const file = std.fs.cwd().openFile("/etc/os-release", .{}) catch {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/etc/os-release", .{ .ACCMODE = .RDONLY }, 0) catch {
         return allocator.dupe(u8, "Linux") catch error.OutOfMemory;
     };
+    const file = std.fs.File{ .handle = fd };
     defer file.close();
 
     var buf: [4096]u8 = undefined;
