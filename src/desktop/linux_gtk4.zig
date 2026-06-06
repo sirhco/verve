@@ -899,6 +899,7 @@ pub const Window = struct {
         buf[label.len] = 0;
         var value: GValue = std.mem.zeroes(GValue);
         _ = g_value_init(&value, G_TYPE_STRING);
+        // g_value_set_string copies the string (calls g_strdup internally); buf may go away after this call.
         g_value_set_string(&value, @ptrCast(&buf));
         defer g_value_unset(&value);
         const props = [1]GtkAccessibleProperty{GTK_ACCESSIBLE_PROPERTY_LABEL};
@@ -913,6 +914,7 @@ pub const Window = struct {
         buf[text.len] = 0;
         var value: GValue = std.mem.zeroes(GValue);
         _ = g_value_init(&value, G_TYPE_STRING);
+        // g_value_set_string copies the string (calls g_strdup internally); buf may go away after this call.
         g_value_set_string(&value, @ptrCast(&buf));
         defer g_value_unset(&value);
         const props = [1]GtkAccessibleProperty{GTK_ACCESSIBLE_PROPERTY_DESCRIPTION};
