@@ -960,7 +960,7 @@ const LinuxTray = struct {
     // Comptime: is GTK4 the active backend? On non-Linux hosts always false so
     // @import("desktop_options") is never evaluated (only the .linux switch arm
     // in backend.zig compiles this struct's methods).
-    const use_gtk4: bool = comptime blk: {
+    const use_gtk4: bool = blk: {
         if (builtin.os.tag != .linux) break :blk false;
         break :blk @import("desktop_options").gtk4;
     };

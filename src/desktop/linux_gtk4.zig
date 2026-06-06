@@ -342,6 +342,14 @@ extern fn gdk_pixbuf_save_to_bufferv(
     option_values: ?[*:null]const ?[*:0]const u8,
     err: ?*?*GError,
 ) gboolean;
+extern fn gdk_pixbuf_savev(
+    pixbuf: *GdkPixbuf,
+    filename: [*:0]const u8,
+    type_str: [*:0]const u8,
+    option_keys: ?[*:null]const ?[*:0]const u8,
+    option_values: ?[*:null]const ?[*:0]const u8,
+    err: ?*?*GError,
+) gboolean;
 extern fn gdk_pixbuf_new_from_data(
     data: [*]const u8,
     colorspace: c_int,
@@ -1276,7 +1284,7 @@ pub const Window = struct {
         return if (cell.result < 0) 0 else @intCast(cell.result);
     }
 
-    pub fn takeSnapshotPng(self: *Window, allocator: std.mem.Allocator) ![]u8 {
+    pub fn takeSnapshotPng(self: *Window, path: []const u8) opts_mod.SnapshotError!void {
         const wv = self.ctx.webview orelse return error.NotReady;
         var cell = SnapshotCell{ .wv = wv };
         webkit_web_view_snapshot(wv, WEBKIT_SNAPSHOT_REGION_VISIBLE, WEBKIT_SNAPSHOT_OPTIONS_NONE,
@@ -1288,25 +1296,21 @@ pub const Window = struct {
         const w = gdk_texture_get_width(texture);
         const h = gdk_texture_get_height(texture);
         const stride: usize = @intCast(w * 4);
-        const rgba = try allocator.alloc(u8, @as(usize, @intCast(h)) * stride);
-        defer allocator.free(rgba);
+        const rgba = std.heap.page_allocator.alloc(u8, @as(usize, @intCast(h)) * stride) catch return error.OutOfMemory;
+        defer std.heap.page_allocator.free(rgba);
         gdk_texture_download(texture, rgba.ptr, stride);
 
-        // RGBA → pixbuf → PNG bytes (same as clipboardReadImage)
         const pixbuf = gdk_pixbuf_new_from_data(rgba.ptr, 0, 1, 8, w, h, @intCast(stride), null, null)
             orelse return error.Backend;
         defer g_object_unref(pixbuf);
 
-        var out_ptr: ?[*]u8 = null;
-        var out_size: usize = 0;
+        const path_z = std.heap.page_allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+        defer std.heap.page_allocator.free(path_z);
         var gerr: ?*GError = null;
-        if (gdk_pixbuf_save_to_bufferv(pixbuf, &out_ptr, &out_size, "png", null, null, &gerr) == 0) {
+        if (gdk_pixbuf_savev(pixbuf, path_z.ptr, "png", null, null, &gerr) == 0) {
             if (gerr) |e| g_error_free(e);
             return error.Backend;
         }
-        const raw = out_ptr orelse return error.Backend;
-        defer g_free(@ptrCast(raw));
-        return allocator.dupe(u8, raw[0..out_size]) catch error.OutOfMemory;
     }
 };
 
@@ -1508,11 +1512,13 @@ const OpenFileCell = extern struct {
     file: ?*GFile = null,
 };
 
-fn openFileCb(_: ?*anyopaque, result: *GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+fn openFileCb(_: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     const cell: *OpenFileCell = @ptrCast(@alignCast(user_data orelse return));
-    var gerr: ?*GError = null;
-    cell.file = gtk_file_dialog_open_finish(cell.dialog, result, &gerr);
-    if (gerr) |e| g_error_free(e);
+    if (result) |r| {
+        var gerr: ?*GError = null;
+        cell.file = gtk_file_dialog_open_finish(cell.dialog, r, &gerr);
+        if (gerr) |e| g_error_free(e);
+    }
     @atomicStore(bool, &cell.done, true, .release);
 }
 
@@ -1522,11 +1528,13 @@ const SaveFileCell = extern struct {
     file: ?*GFile = null,
 };
 
-fn saveFileCb(_: ?*anyopaque, result: *GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+fn saveFileCb(_: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     const cell: *SaveFileCell = @ptrCast(@alignCast(user_data orelse return));
-    var gerr: ?*GError = null;
-    cell.file = gtk_file_dialog_save_finish(cell.dialog, result, &gerr);
-    if (gerr) |e| g_error_free(e);
+    if (result) |r| {
+        var gerr: ?*GError = null;
+        cell.file = gtk_file_dialog_save_finish(cell.dialog, r, &gerr);
+        if (gerr) |e| g_error_free(e);
+    }
     @atomicStore(bool, &cell.done, true, .release);
 }
 
@@ -1536,11 +1544,13 @@ const AlertCell = extern struct {
     result: c_int = 0,
 };
 
-fn alertCb(_: ?*anyopaque, result: *GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+fn alertCb(_: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     const cell: *AlertCell = @ptrCast(@alignCast(user_data orelse return));
-    var gerr: ?*GError = null;
-    cell.result = gtk_alert_dialog_choose_finish(cell.dialog, result, &gerr);
-    if (gerr) |e| g_error_free(e);
+    if (result) |r| {
+        var gerr: ?*GError = null;
+        cell.result = gtk_alert_dialog_choose_finish(cell.dialog, r, &gerr);
+        if (gerr) |e| g_error_free(e);
+    }
     @atomicStore(bool, &cell.done, true, .release);
 }
 
@@ -1550,11 +1560,13 @@ const SnapshotCell = extern struct {
     texture: ?*GdkTexture = null,
 };
 
-fn onSnapshotDone(_: ?*anyopaque, result: *GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
+fn onSnapshotDone(_: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callconv(.c) void {
     const cell: *SnapshotCell = @ptrCast(@alignCast(user_data));
-    var gerr: ?*GError = null;
-    cell.texture = webkit_web_view_snapshot_finish(cell.wv, result, &gerr);
-    if (gerr) |e| g_error_free(e);
+    if (result) |r| {
+        var gerr: ?*GError = null;
+        cell.texture = webkit_web_view_snapshot_finish(cell.wv, r, &gerr);
+        if (gerr) |e| g_error_free(e);
+    }
     @atomicStore(bool, &cell.done, true, .release);
 }
 

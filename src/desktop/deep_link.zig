@@ -29,7 +29,7 @@ const window_mod = @import("window.zig");
 // Linux backend is reached directly for GIOChannel-side socket
 // attachment. Other targets shortcut to a void struct so the import
 // graph stays acyclic and the file compiles on every host.
-const linux_backend = if (builtin.os.tag == .linux) @import("linux.zig") else struct {};
+const linux_backend = if (builtin.os.tag == .linux) @import("backend.zig").impl else struct {};
 
 pub const Error = error{
     /// The platform does not require / does not support cross-process
