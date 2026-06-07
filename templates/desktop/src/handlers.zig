@@ -88,10 +88,9 @@ pub fn onUrlOpen(c: ?*anyopaque, url: []const u8) void {
 
 /// Drag-and-drop handler. Called when the user drops files onto the window.
 /// Logs each path; evalJs broadcasts to the page for demo purposes.
-pub fn onDragDrop(c: ?*anyopaque, paths: []const [*:0]const u8) void {
+pub fn onDragDrop(c: ?*anyopaque, paths: []const []const u8) void {
     const r: *RouterCtx = @ptrCast(@alignCast(c orelse return));
-    for (paths) |raw| {
-        const path = std.mem.span(raw);
+    for (paths) |path| {
         std.log.info("[drag-drop] {s}", .{path});
         var buf: [4096]u8 = undefined;
         const js = std.fmt.bufPrint(&buf,
