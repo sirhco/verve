@@ -1,12 +1,12 @@
 # Verve
 
-> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.1.x. Public
+> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.2.x. Public
 > APIs are not stable and **will** break between minor versions.
-> All three desktop backends (macOS, Windows, Linux GTK4) have been
-> booted and validated on real hardware. Known limitations: desktop
-> auto-updater apply is macOS-only; full a11y provider not yet
-> implemented; Linux image clipboard returns `Unsupported`. Use for
-> learning, experiments, and personal projects. Not production-ready.
+> All three desktop backends (macOS, Windows, Linux GTK4) are validated
+> on real hardware as of v0.2.0. Known limitations: desktop auto-updater
+> apply is macOS-only; full a11y provider not yet implemented; Linux
+> image clipboard returns `Unsupported`. Use for learning, experiments,
+> and personal projects. Not production-ready.
 
 Full-stack Zig framework for **both web apps and native desktop apps**.
 Server-side rendering with fine-grained reactivity, a wasm32-freestanding
@@ -174,8 +174,7 @@ tour and platform support matrix.
 
 > Pre-1.0 — release artifacts are published for each tag, but
 > behavior is experimental. All three desktop backends (macOS,
-> Windows, Linux GTK4) have been booted and validated on real
-> hardware as of v0.1.42.
+> Windows, Linux GTK4) are validated on real hardware as of v0.2.0.
 
 Tagged releases publish `verve-server` + `verve-cli` tarballs for
 five targets:
@@ -187,7 +186,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.1.42
+VERSION=0.2.0
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256

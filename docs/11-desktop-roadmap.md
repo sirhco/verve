@@ -1798,7 +1798,7 @@ signing infra.
 ### Suggested next-session bundle picks
 
 All three backends (macOS, Windows, Linux GTK4) have been live-validated
-on real hardware as of v0.1.42. The remaining open work is:
+on real hardware as of v0.2.0. The remaining open work is:
 
 | Priority | Bundle | What |
 |---|---|---|

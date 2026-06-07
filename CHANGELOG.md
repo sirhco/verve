@@ -6,6 +6,24 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-07
+
+### Changed
+
+- **All three desktop backends now real-hardware validated** — macOS
+  (aarch64, live since v0.1.9), Linux GTK4 + WebKitGTK 6.0 (aarch64,
+  2026-06-06), and Windows 11 + WebView2 (2026-06-07, v0.1.42 fixes).
+  First release where "it works on all three platforms" is a verified
+  claim rather than a cross-compile assumption.
+
+### Known limitations
+
+- Desktop auto-updater apply: macOS only; Win/Linux pending signing-infra decision.
+- Full a11y provider (UIA Win + ATK Linux): beyond current `setAccessibilityLabel`.
+- Linux image clipboard (`writeImage` / `readImage`): returns `Unsupported`.
+- Silent print on Windows: `ShowPrintUI` only (advisory print settings).
+- Global hotkeys Linux: X11 only; Wayland stub returns `Unsupported`.
+
 ## [0.1.42] - 2026-06-07
 
 ### Fixed
