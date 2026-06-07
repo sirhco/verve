@@ -101,6 +101,23 @@ validation) closed** (see the deferred-bundles list below):
   Windows item still open is **silent print**, which is an unimplemented feature
   (advisory-only today), not a validation gap.
 
+Also the same day — **Linux GTK4 drag-drop fixes** (commits `2cf8afd` →
+`48a20d5` → `5f322c9` → `d2247c3`):
+
+- [x] **Scaffold drag-drop handler added** (`2cf8afd`) — `templates/desktop/src/main.zig`
+  gained `on_drag_drop` wiring to log dropped file paths via IPC.
+- [x] **`onDragDrop` signature corrected** (`48a20d5`) — parameter was
+  `[*:0]const u8` (single C-string); corrected to `[]const []const u8` (slice
+  of UTF-8 path slices) matching the `DragDropHandler` typedef in `options.zig`.
+- [x] **WebKit file:// navigation blocked on drag-drop** (`5f322c9`) — GTK4
+  `drag-data-received` trampoline returned without calling `gtk_drag_finish`,
+  letting WebKit interpret the dropped `file://` URI as a navigation request and
+  blank the webview. Fixed: call `gtk_drag_finish(ctx, TRUE, FALSE, time)` after
+  the user callback returns.
+- [x] **`decide-policy` narrowed to file:// URLs** (`d2247c3`) — the
+  `decide_policy` signal handler blocked all navigation; changed to only block
+  `file://` scheme navigations so non-file navigations still work correctly.
+
 ## Done in the 2026-06-04 session — Windows native-host CUTOVER (Bundle 9)
 
 - [x] **The Windows desktop backend is now the native C++ WebView2 host.**
@@ -1771,12 +1788,12 @@ signing infra.
 | File / area | Issue | Severity |
 |---|---|---|
 | `templates/desktop/tools/webview2.pinned.txt` | SHA-512 still blank — first CI run needs to populate after verifying the published value | Low (auto-vendor still works; integrity check skipped). |
-| Linux backend overall | ~~Never run live on a real Linux host~~ **First-boot validated 2026-06-06 on aarch64 (WebKitGTK 6.0 / libsoup 3, v0.1.41).** Cookies, scheme handler, IPC, tray guard, sandbox all exercised. Multi-window / drag-drop / tray menu unverified. | Addressed. |
-| `src/desktop/windows.zig` vtable slot indexes | Hand-extracted from public MS docs (not generated from SDK headers) | Medium. First live Windows boot should verify against actual `webview2.h` slots. The newer cookie / zoom / nav-query slots are particularly load-bearing. |
+| Linux backend overall | ~~Never run live on a real Linux host~~ **First-boot validated 2026-06-06 on aarch64 (WebKitGTK 6.0 / libsoup 3, v0.1.41).** Cookies, scheme handler, IPC, tray guard, sandbox all exercised. ~~Drag-drop code fixed 2026-06-07 (signature + WebKit file:// navigation guard).~~ Multi-window / tray menu unverified live. | Substantially addressed; drag-drop correct in code. |
+| ~~`src/desktop/windows_native.zig` vtable slot indexes~~ | ~~Hand-extracted from public MS docs (not generated from SDK headers)~~ | ~~Medium.~~ **Closed 2026-06-07 (Bundle 12).** Core path + async cookie manager verified on real Windows 11. |
 | `src/desktop/macos.zig` `pumpUntilDone` | Nested `[NSRunLoop runMode:beforeDate:]` re-entrant in modal contexts | Low. Safe from IPC handlers (the dominant call site); risky if a caller is already inside another modal run loop. |
 | ~~Linux `libayatana-appindicator3` + `libnotify` linked unconditionally~~ | **Closed 2026-05-30 (Bundle 1).** Both libs now loaded via `std.c.dlopen` + `dlsym` with a memoized fn-pointer struct; missing-lib paths return `error.Unsupported` at runtime. Distros without ayatana / libnotify build cleanly. | — |
 | `desktop.tray` single-tray-per-process v1 | `g_macos_tray` + `g_windows_tray` are unguarded singletons | Low. Multi-tray apps would need per-target ivars on macOS + HWND-keyed registry on Windows. No current use case. |
-| `notifications.show` on Windows | Requires `desktop.tray.init` first; without an active tray, returns `error.Backend` | Documented limitation, not a bug. WinRT Toast bundle (above) decouples them. |
+| `notifications.show` on Windows | ~~Requires `desktop.tray.init` first; without an active tray, returns `error.Backend`.~~ WinRT Toast path (Bundle 9, validated 2026-06-07) is now the primary path and does not require a tray. Balloon fallback still requires tray. | Addressed for the primary path. |
 
 ### Suggested next-session bundle picks
 
@@ -1936,15 +1953,15 @@ ls zig-out/app.app/Contents/{Info.plist,MacOS/app}   # both should exist
 
 - Don't touch `src/verve.zig` — keeping its public web surface
   unchanged is a hard constraint.
-- The Linux backend has never run live — diagnostic logs are
-  instrumented but no host has booted it. Live-validate cookies
-  (#22) + multi-window (#16) + scheme handler on Linux when one
-  is available.
-- WebView2 vtable slot indexes in `src/desktop/windows.zig` were
-  hand-extracted from public docs (including the new cookie slots
-  added 2026-05-23 — `SLOT_WV2_2_get_CookieManager = 66` is
-  particularly load-bearing). Verify against actual SDK headers
-  during first Windows live boot.
+- ~~The Linux backend has never run live~~ **First-boot validated
+  2026-06-06 on aarch64** (GTK4 + WebKitGTK 6.0; cookies, scheme
+  handler, IPC, tray guard, sandbox confirmed). Drag-drop code fixed
+  2026-06-07 (signature + WebKit file:// navigation guard). Multi-window
+  and tray menu not yet live-validated.
+- ~~WebView2 vtable slot indexes in `src/desktop/windows_native.zig`
+  were hand-extracted and unverified~~ **Verified 2026-06-07 (Bundle 12)**
+  on real Windows 11 (v0.1.42): core path + async cookie manager
+  confirmed. No further vtable verification needed.
 - macOS cookie store sync wrapper (`pumpUntilDone` in `macos.zig`)
   uses a nested `[NSRunLoop runMode:beforeDate:]` — re-entrant in
   the wrong context. Safe from IPC handlers (the dominant path).
