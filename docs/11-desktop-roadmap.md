@@ -82,6 +82,25 @@ tests: 336/336. (Pre-existing, unrelated: `tests/integration.zig`'s `floodWorker
 crashes under concurrent HTTP on Windows — a std.Io socket-concurrency issue in
 the server test, not desktop.)
 
+Follow-up the same day — **Bundle 9 (WinRT Toast) and Bundle 12 (Windows live
+validation) closed** (see the deferred-bundles list below):
+
+- **Bundle 9 — WinRT Action Center toast**: live-validated. A startup
+  `notifications.show` logged `showToast OK (WinRT Action Center path)` (no
+  balloon fallback), proving the hand-rolled WinRT/COM vtable-slot chain
+  (`RoInitialize` → `XmlDocument.LoadXml` → `ToastNotificationManager.
+  CreateToastNotifierWithId` → `CreateToastNotification` → `IToastNotifier::Show`)
+  works, and the AUMID Start-menu `.lnk` was created (IShellLink / IPropertyStore
+  / IPersistFile chain). No code change required — the deferral was a
+  live-validation gate only.
+- **Bundle 12 — Windows live validation**: the remaining WebView2 vtable surface
+  is verified — the core path (env/controller/nav/custom-scheme/
+  `WebMessageReceived`/`CapturePreview`) via the `--smoke` round-trip, plus the
+  async `ICoreWebView2CookieManager::GetCookies` nested-pump path via a set→get
+  cookie roundtrip (`cookie roundtrip OK: verve_diag=bundle12`). The only
+  Windows item still open is **silent print**, which is an unimplemented feature
+  (advisory-only today), not a validation gap.
+
 ## Done in the 2026-06-04 session — Windows native-host CUTOVER (Bundle 9)
 
 - [x] **The Windows desktop backend is now the native C++ WebView2 host.**
@@ -1823,8 +1842,14 @@ from earlier bundles are established.
 | 8 | ~~**Print extras (Linux full / Win advisory)**~~ — **shipped 2026-05-30** | Linux: `gtk_print_settings_new` → `_set_n_copies` / `_set_page_ranges` (1-indexed PageRange translated to GTK's 0-indexed GtkPageRange) / `_set_print_pages(RANGES)` / `_set_printer` → `webkit_print_operation_set_print_settings` before `_run_dialog`. Settings pre-fill the dialog; user can override. Win: `ShowPrintUI` doesn't accept settings — extras are advisory + the framework logs a warning when caller sets them. Full silent-print via `ICoreWebView2_16::Print` + `ICoreWebView2PrintSettings` + completion-handler COM impostor deferred (needs Windows host to validate vtable slot indexes) | advisory | done | — |
 
 Bundles **deferred** (host-required or scope-too-large):
-- **Bundle 9** — WinRT Toast. Needs Windows host for AUMID +
-  Start-menu shortcut + COM init validation.
+- ~~**Bundle 9**~~ — **validated 2026-06-07** — WinRT Action Center toast.
+  Live-validated on real Windows 11 (see the 2026-06-07 session entry above):
+  `showToast` returns success (the full hand-rolled WinRT/COM vtable-slot chain
+  — `RoInitialize` → `XmlDocument.LoadXml` → `ToastNotificationManager`
+  `CreateToastNotifierWithId` → `CreateToastNotification` → `IToastNotifier::Show`
+  — all succeed) and the AUMID Start-menu `.lnk` is created via the
+  IShellLink / IPropertyStore / IPersistFile COM chain. No code change was
+  needed; the deferral was purely a live-validation gate, now cleared.
 - ~~**Bundle 10**~~ — **shipped 2026-06-06** — GTK4 + WebKitGTK 6.0
   live-validated on aarch64 Linux. libsoup 3 API migration, JSC callback
   update, tray GTK3/GTK4 conflict resolved, cookie async lifetime fix,
@@ -1834,9 +1859,19 @@ Bundles **deferred** (host-required or scope-too-large):
   on Win, AppImageUpdate on Linux. Each is a full framework
   integration with its own signing model. Defer until update
   signing infra is picked.
-- **Bundle 12** — Linux live validation complete (2026-06-06, aarch64,
-  v0.1.41). Windows host validation still pending: WebView2 vtable slot
-  verification, WinRT Toast, silent print.
+- **Bundle 12** — live validation. Linux complete (2026-06-06, aarch64,
+  v0.1.41); **Windows complete 2026-06-07** (v0.1.42 + the 2026-06-07 session).
+  Of the three Windows items it tracked: **WebView2 vtable slot verification** —
+  done (env/controller/navigation/custom-scheme/`WebMessageReceived`/
+  `CapturePreview` exercised by the `--smoke` round-trip, and the async
+  `ICoreWebView2CookieManager::GetCookies` nested-pump path verified by a
+  set→get cookie roundtrip); **WinRT Toast** — done (Bundle 9 above);
+  **silent print** — still open, but that is an *unimplemented feature*
+  (Windows print is advisory-only per Bundle 8; full silent print via
+  `ICoreWebView2_16::Print` + `ICoreWebView2PrintSettings` remains its own
+  future bundle), not a live-validation gap. Net: Windows live validation is
+  effectively complete; the only Windows backlog left is the silent-print
+  feature itself.
 - **Bundle 13** — Full a11y provider (UIA on Win + ATK on
   Linux). Polish vs. shipped `setAccessibilityLabel`. Web content
   + menus already self-publish; remaining gap is window-chrome
