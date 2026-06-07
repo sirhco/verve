@@ -2,6 +2,7 @@
 zig-out/
 *.o
 *.obj
+*.dll
 .DS_Store
 
 # Local-dev superpowers artifacts (specs/plans) — never committed

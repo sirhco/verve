@@ -1,0 +1,3 @@
+# Mark vendored Microsoft WebView2 SDK headers as vendor code so GitHub
+# Linguist excludes them from language statistics.
+src/desktop/win_native/include/** linguist-vendored
