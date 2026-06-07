@@ -594,6 +594,10 @@ extern fn g_date_time_new_from_unix_utc(t: i64) ?*GDateTime;
 extern fn g_date_time_to_unix(dt: *GDateTime) i64;
 extern fn g_date_time_unref(dt: *GDateTime) void;
 
+extern fn webkit_navigation_policy_decision_get_navigation_action(decision: *anyopaque) *anyopaque;
+extern fn webkit_navigation_action_get_navigation_type(action: *anyopaque) u32;
+extern fn webkit_policy_decision_ignore(decision: *anyopaque) void;
+
 // ---- Implementation ---------------------------------------------------------
 
 /// Per-window state. Each window owns its own WebKitWebContext so that
@@ -729,6 +733,10 @@ pub const Window = struct {
         ) orelse return error.WebViewCreateFailed;
         const wv: *WebKitWebView = @ptrCast(wv_obj);
         heap.webview = wv;
+
+        // Block WebKit from navigating to file:// URLs on drag-and-drop.
+        // WEBKIT_NAVIGATION_TYPE_OTHER (5) is what WebCore uses for DnD.
+        _ = g_signal_connect_data(wv, "decide-policy", @as(GCallback, @ptrCast(&onDecidePolicy)), null, null, 0);
 
         if (opts.devtools) {
             const settings = webkit_web_view_get_settings(wv);
@@ -1174,7 +1182,7 @@ pub const Window = struct {
     pub fn setDragDropHandler(self: *Window, cb: ?opts_mod.DragDropHandler, ctx_ptr: ?*anyopaque) void {
         self.ctx.on_drag_drop = cb;
         self.ctx.on_drag_drop_ctx = ctx_ptr;
-        const win = self.ctx.window orelse return;
+        const wv = self.ctx.webview orelse return;
         if (cb != null and self.ctx.drag_signal == 0) {
             // GdkFileList type — lazy-load via g_type_from_name.
             const file_list_type = g_type_from_name("GdkFileList");
@@ -1183,7 +1191,9 @@ pub const Window = struct {
                 return;
             }
             const drop_target = gtk_drop_target_new(file_list_type, GDK_ACTION_COPY);
-            gtk_widget_add_controller(win, @ptrCast(drop_target));
+            // Attach to the WebKitWebView widget, not the GtkWindow, so the
+            // drop target has higher priority than WebKit's internal DnD handler.
+            gtk_widget_add_controller(@ptrCast(wv), @ptrCast(drop_target));
             const sig = g_signal_connect_data(
                 drop_target,
                 "drop",
@@ -1399,6 +1409,25 @@ fn onFocusIn(_: *anyopaque, user_data: ?*anyopaque) callconv(.c) void {
 fn onFocusOut(_: *anyopaque, user_data: ?*anyopaque) callconv(.c) void {
     const ctx: *WindowCtx = @ptrCast(@alignCast(user_data));
     if (ctx.on_focus) |cb| cb(ctx.on_focus_ctx, false);
+}
+
+/// WebKitWebView "decide-policy" signal. Intercepts drag-and-drop navigation:
+/// WebCore emits navigation type OTHER (5) when the user drops a file, which
+/// would otherwise load the file:// URL in the view. Return 1 to suppress it.
+fn onDecidePolicy(
+    _: *anyopaque,
+    decision: *anyopaque,
+    decision_type: u32,
+    _: ?*anyopaque,
+) callconv(.c) gboolean {
+    if (decision_type == 0) { // WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION
+        const action = webkit_navigation_policy_decision_get_navigation_action(decision);
+        if (webkit_navigation_action_get_navigation_type(action) == 5) { // WEBKIT_NAVIGATION_TYPE_OTHER
+            webkit_policy_decision_ignore(decision);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /// GtkDropTarget "drop" signal. `value` holds a GdkFileList boxed type.
