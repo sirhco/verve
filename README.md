@@ -2,10 +2,11 @@
 
 > ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.1.x. Public
 > APIs are not stable and **will** break between minor versions.
-> The Linux backend has never been booted on a real Linux host;
-> the Windows backend has been validated only via cross-compile.
-> macOS is the only surface verified live. Use for learning,
-> experiments, and personal projects. Not production-ready.
+> All three desktop backends (macOS, Windows, Linux GTK4) have been
+> booted and validated on real hardware. Known limitations: desktop
+> auto-updater apply is macOS-only; full a11y provider not yet
+> implemented; Linux image clipboard returns `Unsupported`. Use for
+> learning, experiments, and personal projects. Not production-ready.
 
 Full-stack Zig framework for **both web apps and native desktop apps**.
 Server-side rendering with fine-grained reactivity, a wasm32-freestanding
@@ -24,7 +25,7 @@ Targets **Zig 0.16.0**.
 ```sh
 # Web app — HTTP server + wasm hydration
 zig build                           # native server + wasm client + per-island chunks
-zig build test --summary all        # 205 tests across core + server + client + desktop + integration
+zig build test --summary all        # 336 tests across core + server + client + desktop + integration
 zig build docs                      # zig-out/docs/api/index.html — Zig autodoc for the public verve module
 ./zig-out/bin/verve-server          # open http://127.0.0.1:8080
 
@@ -172,9 +173,9 @@ tour and platform support matrix.
 ## Install
 
 > Pre-1.0 — release artifacts are published for each tag, but
-> behavior is experimental. macOS is verified live; Linux and
-> Windows binaries are produced via cross-compile and have not
-> been booted by maintainers.
+> behavior is experimental. All three desktop backends (macOS,
+> Windows, Linux GTK4) have been booted and validated on real
+> hardware as of v0.1.42.
 
 Tagged releases publish `verve-server` + `verve-cli` tarballs for
 five targets:
@@ -186,7 +187,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.1.41
+VERSION=0.1.42
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256

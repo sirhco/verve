@@ -319,23 +319,23 @@ Zig calls via nested event-loop pumps.
 | Native menu bar | ✓ | ✓ | ✓ |
 | Tray icon | ✓ | ✓ | ✓ |
 | Tray SF Symbol fallback | ✓ | — | — |
-| Notifications | ✓ | balloon | ✓ |
+| Notifications | ✓ | WinRT Toast + balloon | ✓ |
 | Window snapshot (PNG) | ✓ | ✓ | ✓ |
 | Native print dialog | ✓ | ✓ | ✓ |
-| Print copies / pages / printer | ✓ | stub | stub |
+| Print copies / pages / printer | ✓ | advisory | ✓ |
 | Clipboard (text) | ✓ | ✓ | ✓ |
-| Clipboard (HTML) | ✓ | ✓ | stub |
+| Clipboard (HTML) | ✓ | ✓ | ✓ |
 | Clipboard (image/PNG) | ✓ | ✓ | pending |
 | Battery / charging (`desktop.power`) | ✓ | ✓ | ✓ |
 | Disk space (`desktop.disk`) | ✓ | ✓ | ✓ |
 | System info (`desktop.system`) | ✓ | ✓ | ✓ |
 | Standard paths (`desktop.paths`) | ✓ | ✓ | ✓ |
 | Network reachability (`desktop.network`) | ✓ | ✓ | ✓ |
-| File watcher (`desktop.fswatch`) | ✓ | stub | stub |
-| Global hotkeys (`desktop.hotkeys`) | ✓ | stub | stub |
+| File watcher (`desktop.fswatch`) | ✓ | ✓ | ✓ |
+| Global hotkeys (`desktop.hotkeys`) | ✓ | ✓ | ✓ (X11; Wayland stub) |
 | Process spawn (`desktop.process`) | ✓ | ✓ | ✓ |
 | Deep-link URL handler | ✓ | ✓ | ✓ |
-| Deep-link runtime scheme registration | ✓ | stub | stub |
+| Deep-link runtime scheme registration | ✓ | ✓ | ✓ |
 | `.app` bundle | ✓ | — | — |
 | Level-3 smoke | ✓ | — | — |
 | Dev-loop watcher | ✓ | ✓ | ✓ |
@@ -367,14 +367,17 @@ tray, four new modules (`desktop.network`, `desktop.fswatch`,
 `desktop.hotkeys`, `desktop.process`), clipboard HTML, runtime
 URL-scheme registration, print page-range / copies / printer
 settings, plus `LSMinimumSystemVersion` bump to 11.0 and
-`pumpUntilDone` re-entrancy doc. Remaining P3 follow-ups: GTK4
-+ WebKitGTK 6.0 backend, Win + Linux backfill for file-watch /
-hotkeys / clipboard-HTML / URL-scheme-registration / print
-extras, full a11y provider (NSAccessibility / UIA / ATK roles +
-states), Win Toast notifications (`ToastNotificationManager`),
-auto-updater apply phase (Sparkle / Squirrel / AppImageUpdate),
-and macOS `UNUserNotificationCenter` migration (needs
-entitlements).
+`pumpUntilDone` re-entrancy doc. All Win + Linux backfill bundles shipped 2026-05-30 (file-watch /
+hotkeys / clipboard-HTML / URL-scheme-registration / print extras).
+GTK4 + WebKitGTK 6.0 backend live-validated on aarch64 Linux
+2026-06-06. Windows native host first real-hardware boot 2026-06-07
+(v0.1.42); IPC, WASM hydration, cookies, and WinRT Toast all
+verified on Windows 11. Remaining open items: full a11y provider
+(NSAccessibility / UIA / ATK roles + states beyond `setAccessibilityLabel`),
+auto-updater apply on Win + Linux (macOS apply ships; Win/Linux need
+signing-infra decision), Linux image clipboard (`writeImage`/`readImage`),
+silent print on Windows, and macOS `UNUserNotificationCenter` migration
+(needs entitlements).
 
 ## Constraints
 

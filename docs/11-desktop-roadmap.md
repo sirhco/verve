@@ -1797,47 +1797,24 @@ signing infra.
 
 ### Suggested next-session bundle picks
 
-macOS is feature-complete for self-built apps as of v0.1.9 (the
-2026-05-29 updater + signing close-out built on the 2026-05-28
-sweep). Remaining work is Windows and Linux backfill + the
-entitlement-gated items + notarization automation if a CI flow
-wants to bundle that.
+All three backends (macOS, Windows, Linux GTK4) have been live-validated
+on real hardware as of v0.1.42. The remaining open work is:
 
-By scope:
-- **Small (~1-2h)**: Linux libayatana weak-symbol fix; Win/Linux
-  clipboard HTML; Win/Linux URL-scheme runtime registration.
-- **Medium (~2-3h)**: Win/Linux file-watch (`ReadDirectoryChangesW` +
-  inotify); Win/Linux global hotkeys (`RegisterHotKey` + X11/Wayland);
-  full a11y provider; Win/Linux print page-range settings.
-- **Large (~5h+)**: GTK4 backend; auto-updater apply (needs signing
-  infra); WinRT Toast (needs Windows host); UNUserNotificationCenter
-  migration (needs entitlements).
+| Priority | Bundle | What |
+|---|---|---|
+| High | **Bundle 13 — full a11y** | UIA Win + ATK Linux provider beyond current `setAccessibilityLabel`; cross-compile feasible, live validation is the value |
+| High | **Bundle 11 — auto-updater (Win/Linux)** | Win: Squirrel or MSIX; Linux: AppImageUpdate. Needs signing-infra decision first. |
+| Medium | **Silent print (Windows)** | `ICoreWebView2_16::Print` + `ICoreWebView2PrintSettings` + COM completion-handler; currently advisory-only |
+| Medium | **Linux image clipboard** | `image/png` GtkClipboard target; macOS + Windows ship `writeImage`/`readImage` |
+| Low | **`UNUserNotificationCenter` migration (macOS)** | Off deprecated `NSUserNotification`; needs entitlements + bundled app |
+| Low | **`webview2.pinned.txt` SHA-512** | Populate after first CI run |
 
-Pick by user-facing impact:
-- **Apps needing rich clipboard on Win/Linux**: clipboard HTML +
-  image formats.
-- **Apps using global hotkeys on Win/Linux**: hotkeys backfill.
-- **Apps watching config dirs on Win/Linux**: file-watch backfill.
-- **Apps shipping to other Macs via App Store / outside Gatekeeper
-  warnings**: notarization automation (Developer ID cert + hardened
-  build already wired; CI script needed for `xcrun notarytool` +
-  `stapler`).
+### Win + Linux backfill plan (post-v0.1.9) — completed
 
-Pick by platform completeness:
-- **WinRT Toast** — closes the Windows notifications polish gap.
-- **GTK4** — closes the long-term Linux story.
-- **Linux backend live validation** — never run on a real Linux
-  host; the existing surface (cookies / multi-window / tray menu /
-  drag-drop / print / new fswatch / hotkeys / network paths) is
-  diagnostic-instrumented but unverified.
-
-### Win + Linux backfill plan (post-v0.1.9, ~16-20h across 8 sessions)
-
-Recommended sequence for the next eight one-bundle-per-session
-cycles. Assumes no live Win or Linux hosts available — bundles
-that *need* a host (WinRT Toast, GTK4, full live validation,
-auto-updater apply via platform updaters) are deliberately
-deferred. Each bundle ships under the existing convention:
+All 8 backfill bundles shipped (2026-05-30). GTK4 live-validated
+2026-06-06 (Bundle 10). Windows live-validated 2026-06-07 (Bundle 12).
+WinRT Toast validated 2026-06-07 (Bundle 9). The table below is a
+historical record of what was done and how. Each bundle ships under the existing convention:
 cross-compile clean on all three backends + macOS smoke PASS +
 single commit + roadmap update.
 
