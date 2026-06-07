@@ -64,7 +64,10 @@ fn showWindows(allocator: std.mem.Allocator, opts: NotificationOptions) Error!vo
         return tray_mod.showWindowsBalloon(opts.title, opts.body) catch |err| switch (err) {
             tray_mod.Error.Unsupported => Error.Unsupported,
             tray_mod.Error.OutOfMemory => Error.OutOfMemory,
-            tray_mod.Error.Backend => Error.Backend,
+            // `ObjcClassMissing` is a macOS-only variant of `tray.Error`; it
+            // can't arise on the Windows balloon path but the switch must be
+            // exhaustive over the shared error set.
+            tray_mod.Error.Backend, tray_mod.Error.ObjcClassMissing => Error.Backend,
         };
     };
 }

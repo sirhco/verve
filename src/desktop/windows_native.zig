@@ -11,6 +11,7 @@ const builtin = @import("builtin");
 
 const opts_mod = @import("options.zig");
 const router = @import("asset_router.zig");
+const ipc = @import("ipc.zig");
 const cookies_mod = @import("cookies.zig");
 const clipboard_mod = @import("clipboard.zig");
 const cookie_codec = @import("win_native/cookie_codec.zig");
@@ -27,6 +28,7 @@ extern fn wv2_load_html(host: *Host, html: [*]const u8, len: usize) void;
 extern fn wv2_load_url(host: *Host, url: [*]const u8, len: usize) void;
 extern fn wv2_eval_js(host: *Host, js: [*]const u8, len: usize) void;
 extern fn wv2_set_bridge(host: *Host, cb: BridgeFn, ctx: ?*anyopaque) void;
+extern fn wv2_add_user_script(host: *Host, utf8: [*]const u8, len: usize) void;
 extern fn wv2_run(host: *Host) void;
 extern fn wv2_destroy(host: *Host) void;
 
@@ -281,6 +283,10 @@ pub const Window = struct {
             .on_message_ctx = opts.on_message_ctx,
         };
         wv2_set_bridge(host, bridgeTrampoline, heap);
+        // Document-start IPC shim (window.verve.{send,request,onMessage,_dispatch}).
+        // Without this, the page has no IPC surface on Windows — matches macOS's
+        // WKUserScript injection of the same source.
+        wv2_add_user_script(host, ipc.shim_js.ptr, ipc.shim_js.len);
         wv2_set_scheme_handler(host, opts.scheme.ptr, opts.scheme.len, schemeCallback, heap);
 
         var url_buf: [512]u8 = undefined;
@@ -610,6 +616,10 @@ pub const Window = struct {
             .on_message_ctx = opts.on_message_ctx,
         };
         wv2_set_bridge(host, bridgeTrampoline, heap);
+        // Document-start IPC shim (window.verve.{send,request,onMessage,_dispatch}).
+        // Without this, the page has no IPC surface on Windows — matches macOS's
+        // WKUserScript injection of the same source.
+        wv2_add_user_script(host, ipc.shim_js.ptr, ipc.shim_js.len);
         wv2_set_scheme_handler(host, opts.scheme.ptr, opts.scheme.len, schemeCallback, heap);
 
         var url_buf: [512]u8 = undefined;
@@ -760,7 +770,17 @@ pub fn hwndOf(window: *Window) ?*anyopaque {
 
 fn bridgeTrampoline(ctx: ?*anyopaque, msg: [*]const u8, len: usize) callconv(.c) void {
     const wc: *WindowCtx = @ptrCast(@alignCast(ctx.?));
-    if (wc.on_message) |h| h(wc.on_message_ctx, msg[0..len]);
+    const payload = msg[0..len];
+    // Intercept the IPC shim's title-sync marker before forwarding to the user's
+    // MessageHandler — the shim polls document.title and posts this prefix on
+    // change. Mirrors the macOS trampoline.
+    const title_prefix = "__verve_title:";
+    if (std.mem.startsWith(u8, payload, title_prefix)) {
+        const title = payload[title_prefix.len..];
+        wv2_set_title(wc.host, title.ptr, title.len);
+        return;
+    }
+    if (wc.on_message) |h| h(wc.on_message_ctx, payload);
 }
 
 fn schemeCallback(

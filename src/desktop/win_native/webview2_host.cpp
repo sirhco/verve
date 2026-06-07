@@ -71,6 +71,7 @@ struct WV2Host {
     void *bridge_ctx = nullptr;
     wchar_t *pending_html = nullptr; // queued until controller is ready
     wchar_t *pending_url = nullptr;  // queued until controller is ready
+    wchar_t *pending_user_script = nullptr; // document-start shim, queued until ready
     bool ready = false;
 
     // Bundle 2: min/max track-size constraints, enforced in WM_GETMINMAXINFO.
@@ -324,6 +325,16 @@ public:
             }
         }
 
+        // Trim the query string / fragment so the asset router sees a bare
+        // path: "index.html?smoke=1" -> "index.html". macOS gets this free
+        // via NSURL.path; here we parse the raw URI, so strip it explicitly.
+        // Without this, any navigation carrying a query (e.g. the --smoke
+        // harness's index.html?smoke=1) misses the asset table and the load
+        // fails with ERR_INVALID_RESPONSE.
+        for (size_t j = 0; j < path_len; j++) {
+            if (path[j] == '?' || path[j] == '#') { path_len = j; break; }
+        }
+
         const uint8_t *bytes = nullptr;
         size_t bytes_len = 0;
         const char *ct = nullptr;
@@ -385,10 +396,22 @@ public:
         controller->put_Bounds(rc);
 
         if (host_->webview) {
-            // Bridge: expose window.verve.post(msg) -> postMessage.
+            // Document-start IPC shim from Zig (src/desktop/ipc.zig): defines
+            // window.verve.{send,request,onMessage,_dispatch}. Injected FIRST so
+            // its `if (window.verve) return` guard sees an undefined window.verve
+            // and installs the full surface. Without it the page has no IPC at
+            // all — round-trips, server-fns, and the smoke driver all no-op.
+            if (host_->pending_user_script) {
+                host_->webview->AddScriptToExecuteOnDocumentCreated(
+                    host_->pending_user_script, nullptr);
+            }
+            // Low-level window.verve.post(msg) -> postMessage. Augments (does not
+            // clobber) the shim above so both coexist; also self-creates
+            // window.verve for the standalone win_native smoke harness, which
+            // injects no shim.
             host_->webview->AddScriptToExecuteOnDocumentCreated(
-                L"window.verve = { post: function (m) {"
-                L" window.chrome.webview.postMessage(String(m)); } };",
+                L"window.verve = window.verve || {}; window.verve.post = function (m) {"
+                L" window.chrome.webview.postMessage(String(m)); };",
                 nullptr);
 
             EventRegistrationToken token;
@@ -1377,6 +1400,15 @@ void wv2_set_bridge(WV2Host *host, verve_bridge_cb cb, void *ctx) {
     host->bridge_ctx = ctx;
 }
 
+void wv2_add_user_script(WV2Host *host, const char *utf8, size_t len) {
+    if (!host || !utf8 || len == 0) return;
+    // Queue the document-start script; ControllerHandler::Invoke injects it via
+    // AddScriptToExecuteOnDocumentCreated once the webview exists. Called before
+    // wv2_run, so the controller isn't up yet — store and inject later.
+    free(host->pending_user_script);
+    host->pending_user_script = widen(utf8, (int)len);
+}
+
 void wv2_set_scheme_handler(WV2Host *host, const char *scheme, size_t scheme_len,
                              verve_scheme_cb cb, void *ctx) {
     if (!host) return;
@@ -1458,7 +1490,7 @@ public:
     // Empty allowed-origins = allow from any origin.
     HRESULT STDMETHODCALLTYPE GetAllowedOrigins(UINT32 *cnt, LPWSTR **origins) override
         { if (cnt) *cnt = 0; if (origins) *origins = nullptr; return S_OK; }
-    HRESULT STDMETHODCALLTYPE SetAllowedOrigins(UINT32, LPWSTR *) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetAllowedOrigins(UINT32, LPCWSTR *) override { return S_OK; }
     // HasAuthorityComponent = TRUE: verve://app/... — "app" is the host/authority.
     HRESULT STDMETHODCALLTYPE get_HasAuthorityComponent(BOOL *out) override
         { if (out) *out = TRUE; return S_OK; }
@@ -1516,10 +1548,20 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE put_Language(LPCWSTR) override { return S_OK; }
+    // Must report a real, parseable version: CreateCoreWebView2EnvironmentWithOptions
+    // rejects an options object whose TargetCompatibleBrowserVersion is empty with
+    // E_INVALIDARG (the runtime can't compare ""), leaving the webview blank. Mirror
+    // Microsoft's own default — CORE_WEBVIEW_TARGET_PRODUCT_VERSION from the vendored
+    // WebView2EnvironmentOptions.h (not #included here: it drags in WRL, which this
+    // file deliberately avoids). Keep this in sync with that header when re-vendoring
+    // the WebView2 SDK (tools/fetch_webview2).
     HRESULT STDMETHODCALLTYPE get_TargetCompatibleBrowserVersion(LPWSTR *out) override {
         if (!out) return E_POINTER;
-        *out = (LPWSTR)CoTaskMemAlloc(sizeof(WCHAR));
-        if (*out) (*out)[0] = 0;
+        static const wchar_t kTargetVersion[] = L"148.0.3967.48";
+        const size_t n = wcslen(kTargetVersion);
+        *out = (LPWSTR)CoTaskMemAlloc((n + 1) * sizeof(WCHAR));
+        if (!*out) return E_OUTOFMEMORY;
+        memcpy(*out, kTargetVersion, (n + 1) * sizeof(WCHAR));
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE put_TargetCompatibleBrowserVersion(LPCWSTR) override { return S_OK; }
@@ -1628,6 +1670,7 @@ void wv2_destroy(WV2Host *host) {
     }
     free(host->pending_html);
     free(host->pending_url);
+    free(host->pending_user_script);
     // Bundle 8: tear down the UIA provider + owned a11y strings. WM_DESTROY (via
     // DestroyWindow below) may have already released the provider; null-check.
     if (host->a11y_provider) {

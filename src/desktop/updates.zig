@@ -55,6 +55,7 @@ extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
 /// length, or `size` on truncation, 0 on failure.
 extern "kernel32" fn GetModuleFileNameW(module: ?*anyopaque, buf: [*]u16, size: u32) callconv(.winapi) u32;
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: [*]u16, size: u32) callconv(.winapi) u32;
 
 pub const Error = error{
     Network,
@@ -293,7 +294,13 @@ fn applyUpdateWindows(
 
     const install_dir = std.fs.path.dirname(exe_path) orelse return error.NotBundled;
 
-    const temp = std.process.getEnvVarOwned(allocator, "TEMP") catch return error.SwapFailed;
+    // Read %TEMP% via Win32 directly. std.process.getEnvVarOwned was removed in
+    // Zig 0.16's io-based process API; GetEnvironmentVariableW keeps this
+    // Windows-only path self-contained and matches the file's Win32 idiom.
+    var temp_w: [1024]u16 = undefined;
+    const tn = GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("TEMP"), &temp_w, temp_w.len);
+    if (tn == 0 or tn >= temp_w.len) return error.SwapFailed;
+    const temp = std.unicode.utf16LeToUtf8Alloc(allocator, temp_w[0..tn]) catch return error.OutOfMemory;
     defer allocator.free(temp);
     const pid = GetCurrentProcessId();
 

@@ -41,6 +41,12 @@ void wv2_eval_js(WV2Host *host, const char *js, size_t len);
 /* Register the JS->host bridge callback. */
 void wv2_set_bridge(WV2Host *host, verve_bridge_cb cb, void *ctx);
 
+/* Queue a document-start user script (UTF-8, NOT NUL-terminated), injected via
+ * AddScriptToExecuteOnDocumentCreated before the first navigation and re-run on
+ * every navigation. Verve uses this to install the window.verve IPC shim
+ * (src/desktop/ipc.zig). Call before wv2_run. */
+void wv2_add_user_script(WV2Host *host, const char *utf8, size_t len);
+
 /* Called synchronously on the UI thread for each request matching the
  * registered scheme.  path is everything after "://app/" in the URL (UTF-8,
  * NOT NUL-terminated), path_len its byte count.  On a hit, write the asset

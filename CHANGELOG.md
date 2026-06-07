@@ -4,6 +4,100 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.42] - 2026-06-07
+
+### Fixed
+
+- **Windows desktop scaffold: first real-hardware boot** — the Bundle 9 native
+  WebView2 host had only ever been cross-compiled; running a scaffolded
+  `--desktop` app on real Windows 11 surfaced five Windows-only defects (all in
+  code paths the macOS/Linux CI never compiles), now fixed:
+  - **`ICoreWebView2CustomSchemeRegistration::SetAllowedOrigins` signature** —
+    the vendored `WebView2.h` declares the 2nd parameter as `LPCWSTR *`, not
+    `LPWSTR *`; the mismatch left the COM class abstract and failed to compile.
+  - **`notifications.zig` non-exhaustive switch** — the Windows balloon-fallback
+    switch over `tray.Error` omitted the (macOS-only) `ObjcClassMissing` variant,
+    a compile error on the Windows path.
+  - **Blank webview (`E_INVALIDARG`)** — `VerveEnvironmentOptions.
+    get_TargetCompatibleBrowserVersion` returned an empty string, so
+    `CreateCoreWebView2EnvironmentWithOptions` rejected the options object
+    (`0x80070057`) and the window showed an error dialog over a blank page. Now
+    reports the SDK target version (`148.0.3967.48`, matching
+    `CORE_WEBVIEW_TARGET_PRODUCT_VERSION` in the vendored
+    `WebView2EnvironmentOptions.h`).
+  - **Query-string navigations failed (`ERR_INVALID_RESPONSE`)** — the
+    `verve://app/...` scheme handler passed the raw URL path (including `?query`)
+    to the asset router, so any navigation carrying a query string (e.g. the
+    smoke harness's `index.html?smoke=1`) missed the asset table. The host now
+    trims `?`/`#` before lookup, matching macOS's `NSURL.path`.
+  - **IPC entirely non-functional** — Windows injected only a minimal
+    `window.verve = { post }` document-start script and never the shared
+    `ipc.zig` shim, so `window.verve.send` / `request` / `onMessage` were
+    undefined and every IPC round-trip (server-fns, the demo "Send ping", the
+    smoke driver, the minimal template's "Greet") silently no-op'd. Added a
+    `wv2_add_user_script` host ABI; `windows_native.zig` now injects
+    `ipc.shim_js` at document-start (mirroring macOS's `WKUserScript`) and
+    intercepts the `__verve_title:` marker for native title sync.
+- **`desktop.updates` Windows build** — `applyUpdateWindows` used
+  `std.process.getEnvVarOwned`, removed in Zig 0.16's io-based process API,
+  which broke the desktop test compile on Windows. Reads `%TEMP%` via
+  `GetEnvironmentVariableW` instead.
+- **Linux GTK4: WebKitGTK 6.0 sandbox** — `webkit_web_context_set_sandbox_enabled`
+  was removed in WebKitGTK 6.0; the sandbox is now disabled via
+  `g_setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", …)`
+  (`std.c.setenv` is absent in Zig 0.16.0), which also fixes VMs / kernels with
+  unprivileged user namespaces disabled.
+- **Linux GTK4: drag-drop loaded the file instead of firing the callback** —
+  the `GtkDropTarget` is now attached to the `WebKitWebView` (higher priority
+  than the window), and the `decide-policy` handler ignores
+  `WEBKIT_NAVIGATION_TYPE_OTHER` navigations **only** when the URI starts with
+  `file://`. The earlier type-only check also swallowed the initial
+  programmatic `verve://` page load (white screen).
+- **macOS: ObjC error handling** — unrecoverable ObjC failures now `@panic`
+  with descriptive messages instead of being swallowed, and tray init returns a
+  name-specific error so callers can degrade gracefully.
+- **Client runtime capacity** — raised the static-array slot limits
+  (`MAX_SLOTS` 256→1024, `MAX_ISLAND_OWNERS` 64→256, `MAX_EVENT_SLOTS`
+  1024→4096, `MAX_RESPONSE_SLOTS` 256→1024) so production apps don't hit
+  capacity under normal workloads; capacity-exceeded panics now name the
+  constant + file to raise.
+
+### Added
+
+- **`tools/validate_scaffold_windows.ps1`** — local regression guard that
+  reproduces the CI scaffold → build → verify for both the `full` and `minimal`
+  `--desktop` templates. The full template's gate runs `app.exe --smoke` and
+  requires `checksum.txt` + a clean self-terminate (page load + WASM hydration +
+  IPC round-trip + webview snapshot), catching blank-webview / broken-IPC
+  regressions that the per-app screen-capture `smoke_windows.ps1` silently
+  passes.
+- **Desktop template: drag-drop demo** — the `--desktop` scaffold now wires
+  `setDragDropHandler` in `main.zig` with an `onDragDrop` handler in
+  `handlers.zig` that logs each dropped path and calls
+  `window.verve.handleDragDrop` for the demo. (`onDragDrop` takes
+  `[]const []const u8`, not a NUL-terminated pointer.)
+- **Linux GTK4: window-chrome accessibility** — `setAccessibilityLabel` /
+  `setAccessibilityHelp` implemented via `gtk_accessible_update_property_value`
+  (`g_value_set_string` copies the string, so the stack buffer is safe after
+  the call).
+
+### Changed
+
+- **Docs: API stability tiers** — `src/verve.zig` now splits its exports into
+  **Stable** and **Internal** sections with a module-level policy explaining
+  what each tier means for app code vs framework tooling.
+- **Chore** — `.worktrees/` added to `.gitignore`.
+
+### Upgrade notes
+
+- **Desktop apps (Windows + Linux GTK4)**: re-vendor `src/desktop/` (re-run
+  `verve-cli new`, or copy the tree) to pick up the WebView2 host + IPC-shim
+  fixes and the GTK4 sandbox/drag-drop fixes. No app-level source changes
+  required. To adopt the new drag-drop demo, re-scaffold or copy the
+  `setDragDropHandler` wiring from `templates/desktop/src/{main,handlers}.zig`.
+
+---
+
 ## [0.1.41] - 2026-06-06
 
 ### Fixed

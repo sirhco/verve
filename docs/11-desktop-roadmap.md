@@ -40,6 +40,48 @@ work needed to call it "fully functional." Written 2026-05-22, last
 updated 2026-05-28. Fresh sessions should be able to pick up without
 prior context.
 
+## Done in the 2026-06-07 session — Windows native host: first REAL-HARDWARE boot
+
+The Bundle 9 native WebView2 host (2026-06-04) had only ever been
+**cross-compiled** (`x86_64-windows-gnu`) — never run on a real Windows host.
+This session scaffolded and ran both `--desktop` templates on real Windows 11
+(Zig 0.16.0, WebView2 Evergreen 149). Five Windows-only defects surfaced — none
+caught by the macOS/Linux CI, which never compiles these paths, nor by the
+template's `zig build smoke` (it only screenshots + checks PNG size, so it
+**false-passed** over a `CreateCoreWebView2Environment failed` dialog on a blank
+webview). All fixed; shipped in v0.1.42:
+
+- [x] **`SetAllowedOrigins` COM signature** — vendored `WebView2.h` declares the
+  2nd param `LPCWSTR *`; the `LPWSTR *` override left `CustomSchemeRegistration`
+  abstract (compile error).
+- [x] **`notifications.zig` non-exhaustive switch** — Windows balloon fallback
+  over `tray.Error` missed the macOS-only `ObjcClassMissing` variant (compile
+  error).
+- [x] **Blank webview / `E_INVALIDARG`** — `VerveEnvironmentOptions.
+  get_TargetCompatibleBrowserVersion` returned `""`;
+  `CreateCoreWebView2EnvironmentWithOptions` rejects an options object with no
+  parseable version. Now returns `CORE_WEBVIEW_TARGET_PRODUCT_VERSION`
+  (`148.0.3967.48`).
+- [x] **`?query` navigation → `ERR_INVALID_RESPONSE`** — the `verve://app/`
+  scheme handler did not strip the query/fragment before the asset lookup
+  (macOS gets this free via `NSURL.path`). Broke `index.html?smoke=1`.
+- [x] **IPC fully broken** — Windows injected only `window.verve = { post }`,
+  never `ipc.zig`'s `shim_js`, so `send` / `request` / `onMessage` were
+  undefined. Added the `wv2_add_user_script` host ABI;
+  `windows_native.zig` injects the shim at document-start like macOS, and
+  `bridgeTrampoline` now intercepts the `__verve_title:` marker.
+- [x] **`desktop.updates` test compile** — `applyUpdateWindows` used the removed
+  `std.process.getEnvVarOwned`; switched to `GetEnvironmentVariableW`.
+
+Verified end-to-end on real hardware: both templates build, render, hydrate
+WASM, and complete an IPC round-trip; the full template's `app.exe --smoke`
+self-driving harness now writes `checksum.txt` + `shot.png` and self-terminates.
+Regression guard added: **`tools/validate_scaffold_windows.ps1`** (rigorous
+`--smoke` gate, not the false-passing screen capture). Desktop + core + client
+tests: 336/336. (Pre-existing, unrelated: `tests/integration.zig`'s `floodWorker`
+crashes under concurrent HTTP on Windows — a std.Io socket-concurrency issue in
+the server test, not desktop.)
+
 ## Done in the 2026-06-04 session — Windows native-host CUTOVER (Bundle 9)
 
 - [x] **The Windows desktop backend is now the native C++ WebView2 host.**
@@ -71,12 +113,13 @@ prior context.
   startup — no import lib or NuGet SDK fetch). The scaffold embed pipeline
   already vendors `src/desktop/win_native/**` (cpp + headers + DLL) verbatim,
   so a `--desktop` app is self-contained.
-- [x] **Validated on real Windows** through Bundles 1–8 (window/geometry/nav/
-  events/dialogs/cookies/clipboard/print/a11y/snapshot/toast/terminate). This
-  cutover verified by: `zig build`, `zig build test` (336/336),
-  `zig build win-native`, and — definitively — a scaffolded `--desktop` app
-  (both `full` and `minimal` templates) cross-compiling clean for
-  `x86_64-windows-gnu`, producing `app.exe` + `WebView2Loader.dll`.
+- [x] **Cross-compile verified** at cutover: `zig build`, `zig build test`
+  (336/336), `zig build win-native`, and a scaffolded `--desktop` app (both
+  `full` and `minimal`) cross-compiling clean for `x86_64-windows-gnu`,
+  producing `app.exe` + `WebView2Loader.dll`. **NB:** this was cross-compile
+  only — the native host was *not* run on real Windows until the 2026-06-07
+  session above, which found five blocking defects. Treat "compiles" and "boots"
+  as separate gates for the native backends.
 
 ## Done in the 2026-06-02 session
 
