@@ -131,6 +131,7 @@ pub fn main(init: std.process.Init) !void {
     const ctx_ptr = handlers.attach(&window, asset_entries, smoke_dir, io, init.minimal.environ);
     window.setMessageHandler(handlers.onMessage, ctx_ptr);
     window.setUrlOpenHandler(handlers.onUrlOpen, ctx_ptr);
+    window.setDragDropHandler(handlers.onDragDrop, ctx_ptr);
 
     // Optional tray icon with a submenu. Best-effort: a runtime error
     // (libayatana missing on Linux, status-bar unavailable in headless

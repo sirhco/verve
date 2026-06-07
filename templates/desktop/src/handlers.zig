@@ -86,6 +86,22 @@ pub fn onUrlOpen(c: ?*anyopaque, url: []const u8) void {
     r.window.evalJs(buf.items);
 }
 
+/// Drag-and-drop handler. Called when the user drops files onto the window.
+/// Logs each path; evalJs broadcasts to the page for demo purposes.
+pub fn onDragDrop(c: ?*anyopaque, paths: []const [*:0]const u8) void {
+    const r: *RouterCtx = @ptrCast(@alignCast(c orelse return));
+    for (paths) |raw| {
+        const path = std.mem.span(raw);
+        std.log.info("[drag-drop] {s}", .{path});
+        var buf: [4096]u8 = undefined;
+        const js = std.fmt.bufPrint(&buf,
+            "window.verve.handleDragDrop && window.verve.handleDragDrop(\"{s}\");",
+            .{path},
+        ) catch continue;
+        r.window.evalJs(js);
+    }
+}
+
 pub fn attach(window: *desktop.Window, assets: []const desktop.AssetEntry, smoke_dir: ?[]const u8, io: std.Io, environ: std.process.Environ) *RouterCtx {
     ctx = .{ .window = window, .assets = assets, .smoke_dir = smoke_dir, .io = io, .environ = environ };
     return &ctx;
