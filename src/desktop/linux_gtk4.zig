@@ -596,6 +596,8 @@ extern fn g_date_time_unref(dt: *GDateTime) void;
 
 extern fn webkit_navigation_policy_decision_get_navigation_action(decision: *anyopaque) *anyopaque;
 extern fn webkit_navigation_action_get_navigation_type(action: *anyopaque) u32;
+extern fn webkit_navigation_action_get_request(action: *anyopaque) *anyopaque;
+extern fn webkit_uri_request_get_uri(request: *anyopaque) [*:0]const u8;
 extern fn webkit_policy_decision_ignore(decision: *anyopaque) void;
 
 // ---- Implementation ---------------------------------------------------------
@@ -1423,8 +1425,14 @@ fn onDecidePolicy(
     if (decision_type == 0) { // WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION
         const action = webkit_navigation_policy_decision_get_navigation_action(decision);
         if (webkit_navigation_action_get_navigation_type(action) == 5) { // WEBKIT_NAVIGATION_TYPE_OTHER
-            webkit_policy_decision_ignore(decision);
-            return 1;
+            // Only block file:// — programmatic load_uri also fires type OTHER,
+            // so we must not block verve:// or other scheme navigations.
+            const req = webkit_navigation_action_get_request(action);
+            const uri = webkit_uri_request_get_uri(req);
+            if (std.mem.startsWith(u8, std.mem.span(uri), "file://")) {
+                webkit_policy_decision_ignore(decision);
+                return 1;
+            }
         }
     }
     return 0;
