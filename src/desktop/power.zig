@@ -227,11 +227,17 @@ const SysfsReadResult = struct {
 fn readSysFile(path_buf: *[128]u8, path_len: usize) ?SysfsReadResult {
     if (builtin.os.tag != .linux) return null;
     if (path_len >= path_buf.len) return null;
-    var file = std.fs.openFileAbsolute(path_buf[0..path_len], .{}) catch return null;
-    defer file.close();
+    // NUL-terminate for the raw open(2) syscall.
+    path_buf[path_len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(path_buf);
+    const rc = std.os.linux.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
+    if (std.os.linux.getErrno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    defer _ = std.os.linux.close(fd);
     var out: SysfsReadResult = .{};
-    out.len = file.read(&out.buf) catch return null;
-    if (out.len == 0) return null;
+    const n = std.os.linux.read(fd, &out.buf, out.buf.len);
+    if (std.os.linux.getErrno(n) != .SUCCESS or n == 0) return null;
+    out.len = n;
     return out;
 }
 
