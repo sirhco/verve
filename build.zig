@@ -485,12 +485,13 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        // power.zig + (future modules) extern CoreFoundation / IOKit
-        // symbols. Lazy compilation skips bodies on non-matching OSes,
-        // but the host-target test build compiles + links the macOS
-        // branch when run on macOS — link the frameworks so symbols
-        // resolve. The link is a no-op when test runs on Linux / Win
-        // since the macOS branch ifs out before any extern is called.
+        // power.zig + single_instance.zig use extern "c" symbols (flock,
+        // getenv, CoreFoundation / IOKit). Link libc on both macOS and
+        // Linux so the test binary resolves them; Windows path uses
+        // kernel32 which Zig links automatically.
+        if (target.result.os.tag == .linux) {
+            desktop_test_mod.link_libc = true;
+        }
         if (target.result.os.tag == .macos) {
             desktop_test_mod.link_libc = true;
             desktop_test_mod.linkFramework("IOKit", .{});

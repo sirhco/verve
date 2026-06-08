@@ -442,8 +442,8 @@ test "streamRender drains suspended boundaries in completion order, not registra
         }
     };
     // SLOW boundary registers FIRST (id 0); FAST boundary second (id 1).
-    var slow_fetcher: SleepFetcher = .{ .io = io, .ms = 60, .value = 100 };
-    var fast_fetcher: SleepFetcher = .{ .io = io, .ms = 1, .value = 200 };
+    var slow_fetcher: SleepFetcher = .{ .io = io, .ms = 300, .value = 100 };
+    var fast_fetcher: SleepFetcher = .{ .io = io, .ms = 5, .value = 200 };
 
     const slow_res = try resource_mod.create(u32, io, &owner, &slow_fetcher, SleepFetcher.run);
     const fast_res = try resource_mod.create(u32, io, &owner, &fast_fetcher, SleepFetcher.run);

@@ -226,15 +226,11 @@ const SysfsReadResult = struct {
 
 fn readSysFile(path_buf: *[128]u8, path_len: usize) ?SysfsReadResult {
     if (builtin.os.tag != .linux) return null;
-    // Sentinel NUL so we can hand `open(2)` a cstr without a
-    // separate dupeZ allocation.
     if (path_len >= path_buf.len) return null;
-    path_buf[path_len] = 0;
-    const cstr: [*:0]const u8 = @ptrCast(path_buf);
-    const fd = std.posix.open(cstr, .{ .ACCMODE = .RDONLY }, 0) catch return null;
-    defer std.posix.close(fd);
+    var file = std.fs.openFileAbsolute(path_buf[0..path_len], .{}) catch return null;
+    defer file.close();
     var out: SysfsReadResult = .{};
-    out.len = std.posix.read(fd, &out.buf) catch return null;
+    out.len = file.read(&out.buf) catch return null;
     if (out.len == 0) return null;
     return out;
 }
