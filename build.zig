@@ -363,6 +363,42 @@ pub fn build(b: *std.Build) void {
         break :blk true;
     };
 
+    // ---- tidy linter --------------------------------------------------------
+    // Standalone host tool that scans the source tree for consistency
+    // regressions (line/function length ratchets + banned tokens). Guarded on
+    // `tools/tidy.zig` presence so package consumers — who receive only `src`
+    // + LICENSE per build.zig.zon `.paths` — degrade gracefully like tests.
+    const tidy_present = blk: {
+        const io_h = b.graph.io;
+        var f = b.build_root.handle.openFile(io_h, "tools/tidy.zig", .{}) catch break :blk false;
+        f.close(io_h);
+        break :blk true;
+    };
+    var run_tidy_opt: ?*std.Build.Step.Run = null;
+    if (tidy_present) {
+        const tidy_exe = b.addExecutable(.{
+            .name = "verve-tidy",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/tidy.zig"),
+                .target = host_target,
+                .optimize = optimize,
+            }),
+        });
+
+        const run_tidy = b.addRunArtifact(tidy_exe);
+        run_tidy.addArg(b.build_root.path orelse ".");
+        const tidy_step = b.step("tidy", "Lint source for consistency (line/function length, banned tokens)");
+        tidy_step.dependOn(&run_tidy.step);
+
+        const run_tidy_update = b.addRunArtifact(tidy_exe);
+        run_tidy_update.addArg(b.build_root.path orelse ".");
+        run_tidy_update.addArg("--update");
+        const tidy_update_step = b.step("tidy-update", "Regenerate tools/tidy_baseline.txt from the current tree");
+        tidy_update_step.dependOn(&run_tidy_update.step);
+
+        run_tidy_opt = run_tidy;
+    }
+
     if (tests_present) {
         const embed_assets_mod = buildPublicAssets(b, "tests/public_fixture");
         const embed_server_mod = b.createModule(.{
@@ -524,6 +560,7 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_client_tests.step);
         test_step.dependOn(&run_integration_tests.step);
         test_step.dependOn(&run_desktop_tests.step);
+        if (run_tidy_opt) |run_tidy| test_step.dependOn(&run_tidy.step);
     } // end if (tests_present)
 
     // ---- Autodoc generation -------------------------------------------------

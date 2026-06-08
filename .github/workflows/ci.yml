@@ -29,6 +29,9 @@ jobs:
       - name: zig fmt --check
         run: zig fmt --check build.zig src tests
 
+      - name: tidy
+        run: zig build tidy
+
       - name: zig build (default)
         run: zig build
 
