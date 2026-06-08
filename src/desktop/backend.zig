@@ -22,9 +22,14 @@ pub const impl = switch (builtin.os.tag) {
     .macos => @import("macos.zig"),
     .windows => @import("windows_native.zig"),
     .linux => blk: {
-        // desktop_options is always added by build.zig on Linux; safe to import directly
-        // from the .linux prong because Zig only compiles the matching switch arm.
-        const use_gtk4 = @import("desktop_options").gtk4;
+        // Guard the named-module import with a comptime if: in Zig 0.16.0, switch
+        // arm bodies are semantically analysed for all targets (unlike comptime-if
+        // dead branches), so the bare @import("desktop_options") would fail during
+        // cross-compile checks targeting aarch64-macos or x86_64-windows.
+        const use_gtk4 = if (builtin.os.tag == .linux)
+            @import("desktop_options").gtk4
+        else
+            false;
         break :blk if (use_gtk4) @import("linux_gtk4.zig") else @import("linux.zig");
     },
     else => @compileError("verve.desktop: unsupported OS — only macOS, Windows, and Linux are wired today"),

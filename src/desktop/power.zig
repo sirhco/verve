@@ -231,12 +231,12 @@ fn readSysFile(path_buf: *[128]u8, path_len: usize) ?SysfsReadResult {
     path_buf[path_len] = 0;
     const path_z: [*:0]const u8 = @ptrCast(path_buf);
     const rc = std.os.linux.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
-    if (std.os.linux.getErrno(rc) != .SUCCESS) return null;
+    if (@as(isize, @bitCast(rc)) < 0) return null;
     const fd: i32 = @intCast(rc);
     defer _ = std.os.linux.close(fd);
     var out: SysfsReadResult = .{};
     const n = std.os.linux.read(fd, &out.buf, out.buf.len);
-    if (std.os.linux.getErrno(n) != .SUCCESS or n == 0) return null;
+    if (@as(isize, @bitCast(n)) <= 0) return null;
     out.len = n;
     return out;
 }
