@@ -1579,7 +1579,6 @@ fn alertCb(_: ?*anyopaque, result: ?*GAsyncResult, user_data: ?*anyopaque) callc
     @atomicStore(bool, &cell.done, true, .release);
 }
 
-
 /// Spin the GLib main context until `done` flips true.
 /// Used by async-to-sync wrappers (cookies, clipboard, dialogs).
 fn pumpMainContextUntilDone(done: *const bool) void {

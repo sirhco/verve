@@ -805,7 +805,11 @@ fn schemeCallback(
     const resolved = blk: {
         if (wc.opts.dev_assets) |dev| {
             break :blk router.resolveWithFallback(
-                wc.allocator, dev.io, wc.opts.assets, path, dev.dir,
+                wc.allocator,
+                dev.io,
+                wc.opts.assets,
+                path,
+                dev.dir,
             ) catch return 0;
         }
         break :blk router.resolve(wc.opts.assets, path) catch return 0;

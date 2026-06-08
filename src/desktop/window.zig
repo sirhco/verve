@@ -17,7 +17,9 @@ const builtin = @import("builtin");
 pub const desktop_options = if (builtin.os.tag == .linux)
     @import("desktop_options")
 else
-    struct { pub const gtk4 = false; };
+    struct {
+        pub const gtk4 = false;
+    };
 
 pub const options = @import("options.zig");
 pub const ipc = @import("ipc.zig");
