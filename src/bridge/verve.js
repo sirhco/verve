@@ -78,18 +78,40 @@
         const key = readStr(kp, kl);
         const html = readStr(hp, hl);
         const anchorKey = al ? readStr(ap, al) : null;
-        const tpl = document.createElement("template");
-        tpl.innerHTML = html;
-        const node = tpl.content.firstElementChild;
-        if (!node) return;
-        node.setAttribute("data-vkey", key);
+        const SVG_NS = "http://www.w3.org/2000/svg";
+        // Build the element in the parent's namespace. SVG fragments parsed via
+        // `template.innerHTML` land in the HTML namespace and won't render —
+        // parse them as SVG instead. Re-parse per parent so each bound parent
+        // gets its own node.
+        const make = (parent) => {
+          const inSvg = parent.namespaceURI === SVG_NS || !!parent.closest("svg");
+          let node;
+          if (inSvg) {
+            const doc = new DOMParser().parseFromString(
+              '<svg xmlns="' + SVG_NS + '">' + html + "</svg>",
+              "image/svg+xml",
+            );
+            const first =
+              doc.documentElement && doc.documentElement.firstElementChild;
+            if (!first) return null;
+            node = document.importNode(first, true);
+          } else {
+            const tpl = document.createElement("template");
+            tpl.innerHTML = html;
+            const f = tpl.content.firstElementChild;
+            if (!f) return null;
+            node = f.cloneNode(true);
+          }
+          node.setAttribute("data-vkey", key);
+          return node;
+        };
         eachBind(parentName, (parent) => {
+          const node = make(parent);
+          if (!node) return;
           const anchor = anchorKey
             ? parent.querySelector(`[data-vkey="${CSS.escape(anchorKey)}"]`)
             : null;
-          // Re-clone for each matching parent so multiple bound parents
-          // don't share the same node reference.
-          parent.insertBefore(node.cloneNode(true), anchor);
+          parent.insertBefore(node, anchor);
         });
       },
       move_keyed_child: (pp, pl, kp, kl, ap, al) => {
