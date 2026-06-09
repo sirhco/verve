@@ -1,15 +1,19 @@
 //! Layered (Sugiyama) layout for directed acyclic graphs — flowcharts,
-//! dependency graphs, pipelines. Three phases:
+//! dependency graphs, pipelines. Four phases:
 //!
 //!   1. **Layering** — longest-path: each node sits one layer below its deepest
 //!      predecessor. Cycles are tolerated (relaxation bounded to `n` passes).
-//!   2. **Ordering** — crossing minimization: alternating down/up sweeps reorder
-//!      each layer by the barycenter (mean position) of its neighbors in the
-//!      adjacent layer; the ordering with the fewest edge crossings across the
-//!      sweeps is kept. Set `Opts.crossing_iterations = 0` to skip (stable
-//!      id-order). Long edges spanning >1 layer are not yet split into virtual
-//!      nodes — crossings are reduced over edges between adjacent layers.
-//!   3. **Positioning** — depth → y, in-layer slot → x (each layer centered).
+//!   2. **Virtual nodes** — every forward edge spanning >1 layer is split into a
+//!      chain of dummy nodes, one per intermediate layer, so the edge is a run
+//!      of span-1 segments. They reserve routing channels and let ordering +
+//!      crossing-counting account for long edges at every layer boundary.
+//!   3. **Ordering** — crossing minimization: alternating down/up barycenter
+//!      sweeps over real + virtual nodes, keeping the ordering with the fewest
+//!      crossings (`crossing_iterations`, 0 = stable id-order).
+//!   4. **Positioning** — depth → y, in-layer slot → x (each layer centered).
+//!
+//! `layoutRouted` returns real-node positions plus a polyline per input edge
+//! (bending through its virtual nodes); `layout` is the positions-only form.
 
 const std = @import("std");
 const geom = @import("../geom.zig");
@@ -25,13 +29,39 @@ pub const Opts = struct {
     crossing_iterations: usize = 8,
 };
 
-/// Compute a position per node from directed edges. Caller owns the slice.
-pub fn layout(alloc: std.mem.Allocator, n: usize, edges: []const common.Edge, opts: Opts) ![]Vec2 {
-    const out = try alloc.alloc(Vec2, n);
-    errdefer alloc.free(out);
-    if (n == 0) return out;
+/// Layout result with routed edges. `positions` has one entry per real node
+/// (indices 0..n); `paths[i]` is the polyline for `edges[i]` — `[from, bend…,
+/// to]` for routed long edges, `[from, to]` otherwise. Caller owns it.
+pub const Routed = struct {
+    positions: []Vec2,
+    paths: [][]Vec2,
+    alloc: std.mem.Allocator,
 
-    // All scratch lives in a child arena — freed in one shot at return.
+    pub fn deinit(self: *Routed) void {
+        for (self.paths) |p| self.alloc.free(p);
+        self.alloc.free(self.paths);
+        self.alloc.free(self.positions);
+    }
+};
+
+/// Positions-only form (back-compat). Routed paths are computed then dropped.
+pub fn layout(alloc: std.mem.Allocator, n: usize, edges: []const common.Edge, opts: Opts) ![]Vec2 {
+    const routed = try layoutRouted(alloc, n, edges, opts);
+    for (routed.paths) |p| alloc.free(p);
+    alloc.free(routed.paths);
+    return routed.positions;
+}
+
+/// Full layout with virtual-node edge routing.
+pub fn layoutRouted(alloc: std.mem.Allocator, n: usize, edges: []const common.Edge, opts: Opts) !Routed {
+    const positions = try alloc.alloc(Vec2, n);
+    errdefer alloc.free(positions);
+    if (n == 0) {
+        const paths = try alloc.alloc([]Vec2, edges.len);
+        for (paths) |*p| p.* = try alloc.alloc(Vec2, 0);
+        return .{ .positions = positions, .paths = paths, .alloc = alloc };
+    }
+
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -51,55 +81,86 @@ pub fn layout(alloc: std.mem.Allocator, n: usize, edges: []const common.Edge, op
         }
         if (!changed) break;
     }
-
     var max_layer: usize = 0;
     for (layer) |l| max_layer = @max(max_layer, l);
-    const width = try a.alloc(usize, max_layer + 1);
-    @memset(width, 0);
-    for (0..n) |i| width[layer[i]] += 1;
+
+    // --- 2. Virtual nodes: split forward long edges into span-1 chains ---
+    const chains = try a.alloc([]usize, edges.len);
+    @memset(chains, &.{});
+    var vlayers: std.ArrayList(usize) = .empty; // layer of virtual node n+idx
+    var segs: std.ArrayList([2]usize) = .empty; // all span-1 segments
+    var total = n;
+    for (edges, 0..) |e, i| {
+        if (e[0] >= n or e[1] >= n) continue;
+        const lu = layer[e[0]];
+        const lv = layer[e[1]];
+        if (lv > lu + 1) {
+            const chain = try a.alloc(usize, lv - lu - 1);
+            var prev = e[0];
+            var l = lu + 1;
+            var k: usize = 0;
+            while (l < lv) : (l += 1) {
+                const vn = total;
+                total += 1;
+                try vlayers.append(a, l);
+                chain[k] = vn;
+                k += 1;
+                try segs.append(a, .{ prev, vn });
+                prev = vn;
+            }
+            try segs.append(a, .{ prev, e[1] });
+            chains[i] = chain;
+        } else {
+            try segs.append(a, .{ e[0], e[1] });
+        }
+    }
+
+    // Node layer for real + virtual.
+    const nlayer = try a.alloc(usize, total);
+    for (0..n) |i| nlayer[i] = layer[i];
+    for (vlayers.items, 0..) |vl, idx| nlayer[n + idx] = vl;
 
     // --- per-layer node lists + node→in-layer position ---
+    const width = try a.alloc(usize, max_layer + 1);
+    @memset(width, 0);
+    for (0..total) |i| width[nlayer[i]] += 1;
     const layers = try a.alloc([]usize, max_layer + 1);
     for (0..max_layer + 1) |l| layers[l] = try a.alloc(usize, width[l]);
     const fill = try a.alloc(usize, max_layer + 1);
     @memset(fill, 0);
-    const order_pos = try a.alloc(usize, n);
-    for (0..n) |i| {
-        const l = layer[i];
+    const order_pos = try a.alloc(usize, total);
+    for (0..total) |i| {
+        const l = nlayer[i];
         layers[l][fill[l]] = i;
         order_pos[i] = fill[l];
         fill[l] += 1;
     }
 
-    // --- 2. Crossing minimization ---
+    // --- 3. Crossing minimization over real + virtual nodes ---
     if (opts.crossing_iterations > 0 and max_layer > 0) {
-        // Undirected adjacency.
-        var adj = try a.alloc(std.ArrayList(usize), n);
+        var adj = try a.alloc(std.ArrayList(usize), total);
         for (adj) |*x| x.* = .empty;
-        for (edges) |e| {
-            if (e[0] >= n or e[1] >= n or e[0] == e[1]) continue;
-            try adj[e[0]].append(a, e[1]);
-            try adj[e[1]].append(a, e[0]);
+        for (segs.items) |s| {
+            try adj[s[0]].append(a, s[1]);
+            try adj[s[1]].append(a, s[0]);
         }
-
         var max_width: usize = 0;
         for (width) |w| max_width = @max(max_width, w);
         const items = try a.alloc(Item, max_width);
-        const recs = try a.alloc(Rec, edges.len);
-        const best_pos = try a.alloc(usize, n);
+        const recs = try a.alloc(Rec, segs.items.len);
+        const best_pos = try a.alloc(usize, total);
         @memcpy(best_pos, order_pos);
-        var best_cross = countCrossings(edges, layer, order_pos, recs);
-
+        var best_cross = countCrossings(segs.items, nlayer, order_pos, recs);
         var it: usize = 0;
         while (it < opts.crossing_iterations) : (it += 1) {
-            var l: usize = 1; // down sweep: order each layer by the one above
-            while (l <= max_layer) : (l += 1) orderLayer(layers[l], order_pos, layer, adj, l - 1, items);
-            l = max_layer; // up sweep: order each layer by the one below
+            var l: usize = 1;
+            while (l <= max_layer) : (l += 1) orderLayer(layers[l], order_pos, nlayer, adj, l - 1, items);
+            l = max_layer;
             while (l > 0) {
                 l -= 1;
-                orderLayer(layers[l], order_pos, layer, adj, l + 1, items);
+                orderLayer(layers[l], order_pos, nlayer, adj, l + 1, items);
             }
-            const c = countCrossings(edges, layer, order_pos, recs);
+            const c = countCrossings(segs.items, nlayer, order_pos, recs);
             if (c < best_cross) {
                 best_cross = c;
                 @memcpy(best_pos, order_pos);
@@ -109,23 +170,48 @@ pub fn layout(alloc: std.mem.Allocator, n: usize, edges: []const common.Edge, op
         @memcpy(order_pos, best_pos);
     }
 
-    // --- 3. Positioning ---
-    for (0..n) |i| {
-        const count = width[layer[i]];
+    // --- 4. Positioning (all nodes) ---
+    const allpos = try a.alloc(Vec2, total);
+    for (0..total) |i| {
+        const count = width[nlayer[i]];
         const offset = (@as(f64, @floatFromInt(count)) - 1.0) / 2.0;
-        out[i] = .{
+        allpos[i] = .{
             .x = opts.origin.x + (@as(f64, @floatFromInt(order_pos[i])) - offset) * opts.x_gap,
-            .y = opts.origin.y + @as(f64, @floatFromInt(layer[i])) * opts.y_gap,
+            .y = opts.origin.y + @as(f64, @floatFromInt(nlayer[i])) * opts.y_gap,
         };
     }
-    return out;
+    for (0..n) |i| positions[i] = allpos[i];
+
+    // --- edge polylines (caller-owned) ---
+    const paths = try alloc.alloc([]Vec2, edges.len);
+    var built: usize = 0;
+    errdefer {
+        for (paths[0..built]) |p| alloc.free(p);
+        alloc.free(paths);
+    }
+    for (edges, 0..) |e, i| {
+        if (e[0] >= n or e[1] >= n) {
+            paths[i] = try alloc.alloc(Vec2, 0);
+            built = i + 1;
+            continue;
+        }
+        const chain = chains[i];
+        const p = try alloc.alloc(Vec2, chain.len + 2);
+        p[0] = allpos[e[0]];
+        for (chain, 0..) |vn, k| p[k + 1] = allpos[vn];
+        p[chain.len + 1] = allpos[e[1]];
+        paths[i] = p;
+        built = i + 1;
+    }
+
+    return .{ .positions = positions, .paths = paths, .alloc = alloc };
 }
 
 const Item = struct { key: f64, ord: usize, node: usize };
 
 /// Reorder `nodes` (one layer) by the barycenter of each node's neighbors in
-/// `adj_layer`. Nodes with no neighbor there keep their current position (so
-/// they don't drift). Ties break by prior order → stable + deterministic.
+/// `adj_layer`. No-neighbor nodes keep their position; ties break by prior
+/// order → stable + deterministic.
 fn orderLayer(
     nodes: []usize,
     order_pos: []usize,
@@ -162,11 +248,11 @@ fn lessItem(_: void, x: Item, y: Item) bool {
 
 const Rec = struct { boundary: usize, up: usize, low: usize };
 
-/// Total edge crossings between adjacent layers, for the current ordering. Only
-/// span-1 edges (endpoints in consecutive layers) are counted.
-fn countCrossings(edges: []const common.Edge, layer: []const usize, order_pos: []const usize, recs: []Rec) usize {
+/// Total edge crossings between adjacent layers for the current ordering. With
+/// virtual nodes every segment is span-1, so all are counted.
+fn countCrossings(segments: []const common.Edge, layer: []const usize, order_pos: []const usize, recs: []Rec) usize {
     var m: usize = 0;
-    for (edges) |e| {
+    for (segments) |e| {
         if (e[0] >= layer.len or e[1] >= layer.len) continue;
         const la = layer[e[0]];
         const lb = layer[e[1]];
@@ -203,8 +289,6 @@ test "longest-path layering assigns correct depths" {
 }
 
 test "siblings share a layer and spread horizontally" {
-    // 0→1, 0→2, 0→3 : all children share parent 0 → equal barycenters → stable
-    // id-order preserved (no spurious reordering).
     const edges = [_]common.Edge{ .{ 0, 1 }, .{ 0, 2 }, .{ 0, 3 } };
     const pos = try layout(testing.allocator, 4, &edges, .{ .x_gap = 50, .y_gap = 80 });
     defer testing.allocator.free(pos);
@@ -222,14 +306,10 @@ test "cycle does not hang and stays finite" {
 }
 
 test "crossing minimization untangles a crossed bipartite pair" {
-    // 0,1 on layer 0; 2,3 on layer 1. Edges 0→3 and 1→2 cross under id-order
-    // (layer 1 = [2,3]); the sweep reorders layer 1 to [3,2] so 3 sits under 0.
     const edges = [_]common.Edge{ .{ 0, 3 }, .{ 1, 2 } };
     const pos = try layout(testing.allocator, 4, &edges, .{ .x_gap = 100 });
     defer testing.allocator.free(pos);
-    // node 3 placed left of node 2 → no crossing.
     try testing.expect(pos[3].x < pos[2].x);
-    // node 0 stays left of node 1.
     try testing.expect(pos[0].x < pos[1].x);
 }
 
@@ -237,7 +317,6 @@ test "crossing_iterations = 0 keeps stable id-order (still crossed)" {
     const edges = [_]common.Edge{ .{ 0, 3 }, .{ 1, 2 } };
     const pos = try layout(testing.allocator, 4, &edges, .{ .x_gap = 100, .crossing_iterations = 0 });
     defer testing.allocator.free(pos);
-    // id-order layer 1 = [2,3] → node 2 left of node 3.
     try testing.expect(pos[2].x < pos[3].x);
 }
 
@@ -245,10 +324,37 @@ test "countCrossings: zero when untangled, positive when crossed" {
     var recs: [4]Rec = undefined;
     const edges = [_]common.Edge{ .{ 0, 3 }, .{ 1, 2 } };
     const layer = [_]usize{ 0, 0, 1, 1 };
-    // crossed ordering: 0@0,1@1 (upper), 2@0,3@1 (lower)
     const crossed = [_]usize{ 0, 1, 0, 1 };
     try testing.expectEqual(@as(usize, 1), countCrossings(&edges, &layer, &crossed, &recs));
-    // untangled: swap lower so 3@0, 2@1
     const clean = [_]usize{ 0, 1, 1, 0 };
     try testing.expectEqual(@as(usize, 0), countCrossings(&edges, &layer, &clean, &recs));
+}
+
+test "long edge routes through a virtual bend at each intermediate layer" {
+    // 0→1→2 plus the long edge 0→2 (spans layers 0..2).
+    const edges = [_]common.Edge{ .{ 0, 1 }, .{ 1, 2 }, .{ 0, 2 } };
+    var routed = try layoutRouted(testing.allocator, 3, &edges, .{ .y_gap = 100 });
+    defer routed.deinit();
+    // span-1 edges: straight (2 points).
+    try testing.expectEqual(@as(usize, 2), routed.paths[0].len);
+    try testing.expectEqual(@as(usize, 2), routed.paths[1].len);
+    // long edge 0→2: one bend → 3 points, the bend on layer 1 (y = 100).
+    try testing.expectEqual(@as(usize, 3), routed.paths[2].len);
+    try testing.expectEqual(@as(f64, 0), routed.paths[2][0].y); // from, layer 0
+    try testing.expectEqual(@as(f64, 100), routed.paths[2][1].y); // bend, layer 1
+    try testing.expectEqual(@as(f64, 200), routed.paths[2][2].y); // to, layer 2
+}
+
+test "virtual node reserves a channel: real node shifts to make room" {
+    // Without the long edge 0→2, node 1 is alone on layer 1 (x=0). With it, a
+    // virtual node shares layer 1, so node 1 is pushed off-center.
+    const straight = [_]common.Edge{ .{ 0, 1 }, .{ 1, 2 } };
+    const p1 = try layout(testing.allocator, 3, &straight, .{ .x_gap = 100 });
+    defer testing.allocator.free(p1);
+    try testing.expectEqual(@as(f64, 0), p1[1].x);
+
+    const withlong = [_]common.Edge{ .{ 0, 1 }, .{ 1, 2 }, .{ 0, 2 } };
+    const p2 = try layout(testing.allocator, 3, &withlong, .{ .x_gap = 100 });
+    defer testing.allocator.free(p2);
+    try testing.expect(p2[1].x != 0); // layer 1 now has 2 nodes → node 1 off-center
 }

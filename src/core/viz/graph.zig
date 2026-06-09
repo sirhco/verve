@@ -81,9 +81,45 @@ pub fn computePositions(ctx: *const Context, g: Graph, opts: Opts) ![]Vec2 {
 }
 
 /// Render `g` to an SVG `*Node` tree. Uses the request arena (`ctx.allocator`).
+/// The `.dag` layout routes long edges through virtual-node bends (polylines);
+/// other layouts draw straight edges.
 pub fn render(ctx: *const Context, g: Graph, opts: Opts) *Node {
+    if (g.layout == .dag) return renderDag(ctx, g, opts);
     const positions = computePositions(ctx, g, opts) catch return errNode(ctx);
     return renderWithPositions(ctx, g, opts, positions);
+}
+
+/// Render the `.dag` layout with virtual-node edge routing: each edge is a
+/// polyline bending through its intermediate-layer virtual nodes.
+fn renderDag(ctx: *const Context, g: Graph, opts: Opts) *Node {
+    const a = ctx.allocator;
+    const edges = buildEdgePairs(ctx, g) catch return errNode(ctx);
+    const routed = dag_layout.layoutRouted(a, g.nodes.len, edges, .{ .crossing_iterations = opts.dag_crossing_iterations }) catch return errNode(ctx);
+    if (routed.positions.len == 0) {
+        return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = &.{} });
+    }
+
+    // Fit real positions to the viewport, then apply the SAME transform to the
+    // edge bend points so routed edges line up with the nodes.
+    const f = computeFit(routed.positions, opts);
+    for (routed.positions) |*p| p.* = applyFit(p.*, f);
+    for (routed.paths) |path| for (path) |*pp| {
+        pp.* = applyFit(pp.*, f);
+    };
+
+    var shapes: std.ArrayList(scene.Shape) = .empty;
+    for (routed.paths) |path| {
+        if (path.len < 2) continue;
+        shapes.append(a, .{ .polyline = .{
+            .points = path,
+            .style = .{ .stroke = opts.edge_color, .stroke_width = 1.5, .fill = "none" },
+        } }) catch return errNode(ctx);
+    }
+    for (g.nodes, 0..) |node, i| {
+        const grp = nodeGroupShape(ctx, opts, node, routed.positions[i], i) catch return errNode(ctx);
+        shapes.append(a, grp) catch return errNode(ctx);
+    }
+    return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
 }
 
 /// Render with caller-supplied positions (one per node). Lets an island reuse
@@ -108,24 +144,32 @@ pub fn renderWithPositions(ctx: *const Context, g: Graph, opts: Opts, positions:
 
     // Node groups (translate to position; ref for hydration).
     for (g.nodes, 0..) |node, i| {
-        const ref = std.fmt.allocPrint(a, "{s}-{d}", .{ opts.ref_prefix, i }) catch return errNode(ctx);
-        const transform = std.fmt.allocPrint(a, "translate({d},{d})", .{ positions[i].x, positions[i].y }) catch return errNode(ctx);
-        var kids: std.ArrayList(scene.Shape) = .empty;
-        kids.append(a, .{ .circle = .{ .cx = 0, .cy = 0, .r = opts.node_radius, .style = .{ .fill = opts.node_color } } }) catch return errNode(ctx);
-        if (node.label.len != 0) {
-            kids.append(a, .{ .text = .{
-                .x = 0,
-                .y = opts.node_radius + opts.label_size,
-                .content = node.label,
-                .anchor = .middle,
-                .font_size = opts.label_size,
-                .style = .{ .fill = opts.label_color },
-            } }) catch return errNode(ctx);
-        }
-        shapes.append(a, .{ .group = .{ .transform = transform, .children = kids.items, .ref = ref } }) catch return errNode(ctx);
+        const grp = nodeGroupShape(ctx, opts, node, positions[i], i) catch return errNode(ctx);
+        shapes.append(a, grp) catch return errNode(ctx);
     }
 
     return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+}
+
+/// A node as a `<g translate(x,y)>` carrying a circle + optional label and a
+/// `data-ref` (for hydration). Shared by the straight and routed renderers.
+fn nodeGroupShape(ctx: *const Context, opts: Opts, node: GraphNode, pos: Vec2, i: usize) !scene.Shape {
+    const a = ctx.allocator;
+    const ref = try std.fmt.allocPrint(a, "{s}-{d}", .{ opts.ref_prefix, i });
+    const transform = try std.fmt.allocPrint(a, "translate({d},{d})", .{ pos.x, pos.y });
+    var kids: std.ArrayList(scene.Shape) = .empty;
+    try kids.append(a, .{ .circle = .{ .cx = 0, .cy = 0, .r = opts.node_radius, .style = .{ .fill = opts.node_color } } });
+    if (node.label.len != 0) {
+        try kids.append(a, .{ .text = .{
+            .x = 0,
+            .y = opts.node_radius + opts.label_size,
+            .content = node.label,
+            .anchor = .middle,
+            .font_size = opts.label_size,
+            .style = .{ .fill = opts.label_color },
+        } });
+    }
+    return .{ .group = .{ .transform = transform, .children = kids.items, .ref = ref } };
 }
 
 /// Build the interactive scaffold: an `<svg>` with view-level pointer/wheel
@@ -209,17 +253,14 @@ pub fn renderInteractive(ctx: *const Context, g: Graph, opts: Opts) *Node {
         .children(.{root});
 }
 
-/// Translate + uniformly scale positions to fit inside the margin box,
-/// centered. No-op for an empty set; a degenerate (single-point or
-/// axis-aligned) set is just centered.
-fn fitPositions(positions: []Vec2, opts: Opts) void {
-    if (positions.len == 0) return;
+/// Uniform scale + translate that fits a point set into the margin box,
+/// centered. Computed from the real-node bbox so routed edge bends can reuse it.
+const Fit = struct { s: f64, cx: f64, cy: f64, bx: f64, by: f64 };
+
+fn computeFit(positions: []const Vec2, opts: Opts) Fit {
     const box = geom.Rect.bounds(positions);
     const avail_w = opts.width - 2 * opts.margin;
     const avail_h = opts.height - 2 * opts.margin;
-    const cx = opts.width / 2.0;
-    const cy = opts.height / 2.0;
-
     var s: f64 = 1;
     if (box.w > 1e-9 and box.h > 1e-9) {
         s = @min(avail_w / box.w, avail_h / box.h);
@@ -228,12 +269,18 @@ fn fitPositions(positions: []Vec2, opts: Opts) void {
     } else if (box.h > 1e-9) {
         s = avail_h / box.h;
     }
-    const box_cx = box.x + box.w / 2.0;
-    const box_cy = box.y + box.h / 2.0;
-    for (positions) |*p| {
-        p.x = cx + (p.x - box_cx) * s;
-        p.y = cy + (p.y - box_cy) * s;
-    }
+    return .{ .s = s, .cx = opts.width / 2.0, .cy = opts.height / 2.0, .bx = box.x + box.w / 2.0, .by = box.y + box.h / 2.0 };
+}
+
+fn applyFit(p: Vec2, f: Fit) Vec2 {
+    return .{ .x = f.cx + (p.x - f.bx) * f.s, .y = f.cy + (p.y - f.by) * f.s };
+}
+
+/// Translate + uniformly scale positions in place to fit the margin box.
+fn fitPositions(positions: []Vec2, opts: Opts) void {
+    if (positions.len == 0) return;
+    const f = computeFit(positions, opts);
+    for (positions) |*p| p.* = applyFit(p.*, f);
 }
 
 fn errNode(ctx: *const Context) *Node {
@@ -289,6 +336,8 @@ test "dag layout renders a layered graph" {
     const out = try renderGraph(&arena, .{ .nodes = &nodes, .edges = &edges, .layout = .dag }, .{ .width = 400, .height = 400 }, &buf);
     try testing.expect(std.mem.indexOf(u8, out, "<svg") != null);
     try testing.expect(std.mem.indexOf(u8, out, "data-ref=\"viz-node-2\"") != null);
+    // a→c spans 2 layers → routed as a bent polyline (3 points).
+    try testing.expect(std.mem.indexOf(u8, out, "<polyline") != null);
 }
 
 test "interactive graph stamps root, edge refs, data-node, pointer handlers, tooltip" {

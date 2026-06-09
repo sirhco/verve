@@ -85,6 +85,10 @@ pub const renderGraphInteractive = graph_mod.renderInteractive;
 pub const treeLayout = tree_mod.layout;
 pub const radialLayout = radial_mod.layout;
 pub const dagLayout = dag_mod.layout;
+/// DAG layout with virtual-node edge routing: returns real positions + a
+/// polyline per edge bending through intermediate-layer virtual nodes.
+pub const dagLayoutRouted = dag_mod.layoutRouted;
+pub const DagRouted = dag_mod.Routed;
 pub const forceLayout = force_mod.run;
 pub const ForceState = force_mod.State;
 pub const forceInit = force_mod.init;

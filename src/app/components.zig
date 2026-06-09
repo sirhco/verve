@@ -80,9 +80,20 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
     };
     const copts = verve.viz.ChartOpts{ .width = 420, .height = 260, .color = "#1f6feb", .axis_color = "#8b949e" };
 
-    // A directed pipeline rendered with the layered (DAG) layout.
-    const dag = verve.viz.Graph{ .nodes = &nodes, .edges = &edges, .layout = .dag };
-    const dag_svg = verve.viz.renderGraph(ctx, dag, .{ .width = 560, .height = 360, .node_color = "#8b5cf6", .edge_color = "#30363d", .label_color = "#f5f5f5" });
+    // A directed pipeline with a skip edge (src→emit spans 3 layers) so the
+    // long edge routes through virtual-node bends instead of cutting straight.
+    const dag_nodes = [_]verve.viz.GraphNode{
+        .{ .id = "src", .label = "source" },   .{ .id = "parse", .label = "parse" },
+        .{ .id = "opt", .label = "optimize" }, .{ .id = "emit", .label = "emit" },
+        .{ .id = "log", .label = "log" },
+    };
+    const dag_edges = [_]verve.viz.GraphEdge{
+        .{ .from = "src", .to = "parse" }, .{ .from = "parse", .to = "opt" },
+        .{ .from = "opt", .to = "emit" },  .{ .from = "opt", .to = "log" },
+        .{ .from = "src", .to = "emit" }, // skip edge → bends through parse/opt layers
+    };
+    const dag = verve.viz.Graph{ .nodes = &dag_nodes, .edges = &dag_edges, .layout = .dag };
+    const dag_svg = verve.viz.renderGraph(ctx, dag, .{ .width = 560, .height = 380, .node_color = "#8b5cf6", .edge_color = "#30363d", .label_color = "#f5f5f5" });
 
     // Crossing-minimization A/B: a deliberately tangled DAG (A→Z, B→Y, C→X).
     // Under id-order the three edges all cross; the sweep reorders the bottom
@@ -102,7 +113,7 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         ctx.h1("Visualizations"),
         ctx.p().text("Native verve.viz: SVG scene model, scales/axes, and tree/radial/force/dag layouts — computed in Zig, rendered server-side. The graph below is an island: nodes reveal on hydrate, yet the page is fully formed with JS off."),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Force-directed graph — interactive"), ctx.p().class("hint").text("Scroll to zoom, drag the background to pan, drag a node to move it, hover for a label, click to select."), graph_island }),
-        ctx.section().class("card viz-card").children(.{ ctx.h2("Layered DAG"), dag_svg }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Layered DAG"), ctx.p().class("hint").text("The src→emit skip edge spans 3 layers — it routes through virtual-node bends rather than cutting straight across."), dag_svg }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — OFF"), ctx.p().class("hint").text("dag_crossing_iterations = 0 → A→Z, B→Y, C→X all cross (id-order)."), dag_off }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — ON"), ctx.p().class("hint").text("Default sweeps reorder the bottom layer to Z,Y,X → edges fan cleanly, zero crossings."), dag_on }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Bar chart"), verve.viz.barChart(ctx, &bars, copts) }),
