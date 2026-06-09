@@ -395,9 +395,12 @@ draws no edge.
 
 For flowcharts, pipelines, and dependency graphs. Edges are read as **directed**
 (`from → to`); longest-path layering assigns each node to a row one below its
-deepest predecessor; nodes in a layer spread horizontally. Cycles are tolerated
-(bounded relaxation) but won't layer cleanly. (Crossing-minimization is the
-remaining piece of a full Sugiyama pipeline — not done yet.)
+deepest predecessor. A crossing-minimization pass (median/barycenter sweeps,
+keeping the ordering with the fewest crossings) then reorders nodes within each
+layer to untangle edges — set `crossing_iterations = 0` on the low-level
+`dagLayout` to skip it. Cycles are tolerated (bounded relaxation) but won't layer
+cleanly. (Long edges spanning >1 layer aren't yet split into virtual nodes, so
+crossings are reduced over edges between adjacent layers.)
 
 ```zig
 const pipeline = viz.Graph{
@@ -785,8 +788,9 @@ stay static. See [Not yet](#not-yet-phase-2).
   (needs a dynamic `createElementNS`-by-ref bridge primitive).
 - **Pointer capture** — drag/pan are bounded to pointer-over-svg; dragging past
   the svg edge ends the gesture. Document-level capture is a later refinement.
-- **Sugiyama crossing-minimization** — the `.dag` layout layers nodes but does
-  not yet reorder within layers to reduce edge crossings.
+- **Virtual nodes for long DAG edges** — crossing-minimization currently acts on
+  edges between adjacent layers; edges spanning multiple layers aren't yet split
+  into routed virtual nodes.
 - **Canvas draw-command path** for thousands-of-elements scale and smooth
   high-frequency animation.
 - **Stacked / candlestick** chart types — buildable today from the
