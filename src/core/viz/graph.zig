@@ -186,28 +186,36 @@ pub fn renderInteractive(ctx: *const Context, g: Graph, opts: Opts) *Node {
 
     const root = ctx.el("g").attr("data-ref", "viz-root");
 
-    // Edges (each ref'd so a node drag can rewrite its endpoints).
-    for (edges, 0..) |e, i| {
-        const ref = std.fmt.allocPrint(a, "viz-edge-{d}", .{i}) catch return errNode(ctx);
-        _ = root.children(.{ctx.el("line")
+    // Keyed edge container (data-vh="viz-edges", vid-scoped by the island so
+    // listDiff can target it). Each edge keyed + ref'd by "from|to".
+    const edges_g = ctx.el("g").bind("viz-edges");
+    for (edges) |e| {
+        const from = g.nodes[e[0]].id;
+        const to = g.nodes[e[1]].id;
+        const key = std.fmt.allocPrint(a, "{s}|{s}", .{ from, to }) catch return errNode(ctx);
+        const ref = std.fmt.allocPrint(a, "viz-edge-{s}|{s}", .{ from, to }) catch return errNode(ctx);
+        _ = edges_g.children(.{ctx.el("line")
+            .attr("data-vkey", key)
+            .attr("data-ref", ref)
             .attrFmt("x1", "{d}", .{positions[e[0]].x})
             .attrFmt("y1", "{d}", .{positions[e[0]].y})
             .attrFmt("x2", "{d}", .{positions[e[1]].x})
             .attrFmt("y2", "{d}", .{positions[e[1]].y})
             .attr("stroke", opts.edge_color)
-            .attr("stroke-width", "1.5")
-            .attr("data-ref", ref)});
-        if (root.err != null) return root;
+            .attr("stroke-width", "1.5")});
+        if (edges_g.err != null) return edges_g;
     }
+    _ = root.children(.{edges_g});
 
-    // Node groups: ref + data-node index + pointer/click handlers.
+    // Keyed node container; each node keyed + ref'd by stable id.
+    const nodes_g = ctx.el("g").bind("viz-nodes");
     for (g.nodes, 0..) |node, i| {
-        const ref = std.fmt.allocPrint(a, "{s}-{d}", .{ opts.ref_prefix, i }) catch return errNode(ctx);
+        const ref = std.fmt.allocPrint(a, "viz-node-{s}", .{node.id}) catch return errNode(ctx);
         const transform = std.fmt.allocPrint(a, "translate({d},{d})", .{ positions[i].x, positions[i].y }) catch return errNode(ctx);
-        const idx = std.fmt.allocPrint(a, "{d}", .{i}) catch return errNode(ctx);
         const grp = ctx.el("g")
+            .attr("data-vkey", node.id)
             .attr("data-ref", ref)
-            .attr("data-node", idx)
+            .attr("data-node", node.id)
             .attr("transform", transform)
             .class("viz-node")
             .onPointerDown("viz_pointerdown")
@@ -224,9 +232,10 @@ pub fn renderInteractive(ctx: *const Context, g: Graph, opts: Opts) *Node {
                 .attr("fill", opts.label_color)
                 .text(node.label)});
         }
-        _ = root.children(.{grp});
-        if (root.err != null) return root;
+        _ = nodes_g.children(.{grp});
+        if (nodes_g.err != null) return nodes_g;
     }
+    _ = root.children(.{nodes_g});
 
     // Hidden tooltip — inside viz-root so it rides the zoom/pan transform.
     _ = root.children(.{ctx.el("g")
@@ -281,6 +290,23 @@ fn fitPositions(positions: []Vec2, opts: Opts) void {
     if (positions.len == 0) return;
     const f = computeFit(positions, opts);
     for (positions) |*p| p.* = applyFit(p.*, f);
+}
+
+/// SVG-fragment string for one node group, keyed by `id` and ref'd by `ref`
+/// (the caller supplies the full, possibly vid-suffixed, ref). Used by the
+/// client chunk to build `listDiff` markup for runtime-created nodes; the SSR
+/// path builds the equivalent as real `*Node`s so refs auto-suffix.
+pub fn nodeFragment(buf: []u8, opts: Opts, id: []const u8, ref: []const u8, label: []const u8, pos: Vec2) ![]const u8 {
+    if (label.len == 0) {
+        return std.fmt.bufPrint(buf, "<g data-vkey=\"{s}\" data-ref=\"{s}\" data-node=\"{s}\" class=\"viz-node\" transform=\"translate({d},{d})\" z-on-pointerdown=\"viz_pointerdown\" z-on-pointerover=\"viz_node_over\" z-on-pointerout=\"viz_node_out\" z-on-click=\"viz_node_click\"><circle cx=\"0\" cy=\"0\" r=\"{d}\" fill=\"{s}\"/></g>", .{ id, ref, id, pos.x, pos.y, opts.node_radius, opts.node_color });
+    }
+    return std.fmt.bufPrint(buf, "<g data-vkey=\"{s}\" data-ref=\"{s}\" data-node=\"{s}\" class=\"viz-node\" transform=\"translate({d},{d})\" z-on-pointerdown=\"viz_pointerdown\" z-on-pointerover=\"viz_node_over\" z-on-pointerout=\"viz_node_out\" z-on-click=\"viz_node_click\"><circle cx=\"0\" cy=\"0\" r=\"{d}\" fill=\"{s}\"/><text x=\"0\" y=\"{d}\" text-anchor=\"middle\" font-size=\"{d}\" fill=\"{s}\">{s}</text></g>", .{ id, ref, id, pos.x, pos.y, opts.node_radius, opts.node_color, opts.node_radius + opts.label_size, opts.label_size, opts.label_color, label });
+}
+
+/// SVG-fragment string for one edge line, keyed by `key` (`from|to`) and ref'd
+/// by `ref`. See `nodeFragment`.
+pub fn edgeFragment(buf: []u8, opts: Opts, key: []const u8, ref: []const u8, p0: Vec2, p1: Vec2) ![]const u8 {
+    return std.fmt.bufPrint(buf, "<line data-vkey=\"{s}\" data-ref=\"{s}\" x1=\"{d}\" y1=\"{d}\" x2=\"{d}\" y2=\"{d}\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, ref, p0.x, p0.y, p1.x, p1.y, opts.edge_color });
 }
 
 fn errNode(ctx: *const Context) *Node {
@@ -340,7 +366,7 @@ test "dag layout renders a layered graph" {
     try testing.expect(std.mem.indexOf(u8, out, "<polyline") != null);
 }
 
-test "interactive graph stamps root, edge refs, data-node, pointer handlers, tooltip" {
+test "interactive graph uses keyed id-based containers" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var buf: [16384]u8 = undefined;
@@ -353,11 +379,34 @@ test "interactive graph stamps root, edge refs, data-node, pointer handlers, too
     const out = w.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "data-ref=\"viz-svg\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "data-ref=\"viz-root\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "data-ref=\"viz-edge-0\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "data-node=\"0\"") != null);
+    // keyed containers
+    try testing.expect(std.mem.indexOf(u8, out, "data-vh=\"viz-nodes\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "data-vh=\"viz-edges\"") != null);
+    // id-based node + edge keys/refs
+    try testing.expect(std.mem.indexOf(u8, out, "data-vkey=\"a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "data-ref=\"viz-node-a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "data-node=\"a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "data-vkey=\"a|b\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "data-ref=\"viz-edge-a|b\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "z-on-wheel=\"viz_wheel\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "z-on-pointerover=\"viz_node_over\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "data-ref=\"viz-tooltip\"") != null);
+}
+
+test "node/edge fragment builders emit keyed id-based markup" {
+    var buf: [1024]u8 = undefined;
+    const opts = Opts{ .node_radius = 14, .node_color = "#1f6feb", .label_color = "#fff", .label_size = 11, .edge_color = "#888" };
+    const ns = try nodeFragment(&buf, opts, "a", "viz-node-a", "API", .{ .x = 10, .y = 20 });
+    try testing.expect(std.mem.indexOf(u8, ns, "data-vkey=\"a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ns, "data-ref=\"viz-node-a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ns, "data-node=\"a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ns, "translate(10,20)") != null);
+    try testing.expect(std.mem.indexOf(u8, ns, ">API</text>") != null);
+    var ebuf: [256]u8 = undefined;
+    const es = try edgeFragment(&ebuf, opts, "a|b", "viz-edge-a|b", .{ .x = 0, .y = 0 }, .{ .x = 5, .y = 9 });
+    try testing.expect(std.mem.indexOf(u8, es, "data-vkey=\"a|b\"") != null);
+    try testing.expect(std.mem.indexOf(u8, es, "data-ref=\"viz-edge-a|b\"") != null);
+    try testing.expect(std.mem.indexOf(u8, es, "x2=\"5\"") != null);
 }
 
 test "unknown edge endpoints are skipped, not fatal" {
