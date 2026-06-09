@@ -2,6 +2,101 @@
 
 const std = @import("std");
 const verve = @import("verve");
+const islands = @import("islands.zig");
+
+/// Visualization demo: an interactive force-directed graph (VizGraph island,
+/// nodes reveal on hydrate) plus static SSR charts — all from `verve.viz`.
+pub fn viz(ctx: *const verve.Context) !*verve.Node {
+    // --- Force graph as an island -------------------------------------------
+    const nodes = [_]verve.viz.GraphNode{
+        .{ .id = "core", .label = "core" },
+        .{ .id = "server", .label = "server" },
+        .{ .id = "client", .label = "client" },
+        .{ .id = "desktop", .label = "desktop" },
+        .{ .id = "viz", .label = "viz" },
+        .{ .id = "cli", .label = "cli" },
+    };
+    const edges = [_]verve.viz.GraphEdge{
+        .{ .from = "core", .to = "server" },
+        .{ .from = "core", .to = "client" },
+        .{ .from = "core", .to = "desktop" },
+        .{ .from = "core", .to = "viz" },
+        .{ .from = "viz", .to = "client" },
+        .{ .from = "server", .to = "cli" },
+    };
+    const g = verve.viz.Graph{ .nodes = &nodes, .edges = &edges, .layout = .force };
+    const gopts = verve.viz.GraphOpts{ .width = 640, .height = 420, .node_color = "#1f6feb", .edge_color = "#30363d", .label_color = "#f5f5f5" };
+
+    // Positions reused for SSR; node/edge/label arrays feed the island props.
+    const positions = try verve.viz.graphPositions(ctx, g, gopts);
+    const xs = try ctx.alloc().alloc(f64, positions.len);
+    const ys = try ctx.alloc().alloc(f64, positions.len);
+    const node_labels = try ctx.alloc().alloc([]const u8, nodes.len);
+    for (positions, 0..) |p, i| {
+        xs[i] = p.x;
+        ys[i] = p.y;
+    }
+    for (nodes, 0..) |nd, i| node_labels[i] = nd.label;
+    var ef: std.ArrayList(u32) = .empty;
+    var et: std.ArrayList(u32) = .empty;
+    for (edges) |e| {
+        var fi: u32 = 0;
+        var ti: u32 = 0;
+        for (nodes, 0..) |nd, i| {
+            if (std.mem.eql(u8, nd.id, e.from)) fi = @intCast(i);
+            if (std.mem.eql(u8, nd.id, e.to)) ti = @intCast(i);
+        }
+        try ef.append(ctx.alloc(), fi);
+        try et.append(ctx.alloc(), ti);
+    }
+    const props = try verve.encodeProps(ctx, islands.VizGraphInteractive.Props{
+        .xs = xs,
+        .ys = ys,
+        .ef = ef.items,
+        .et = et.items,
+        .labels = node_labels,
+    });
+    const graph_svg = verve.viz.renderGraphInteractive(ctx, g, gopts);
+    const graph_island = verve.island(ctx, .{ .name = "VizGraphInteractive", .props = props }, graph_svg);
+
+    // --- Static charts ------------------------------------------------------
+    const bars = [_]verve.viz.Datum{
+        .{ .label = "Jan", .value = 12 }, .{ .label = "Feb", .value = 19 },
+        .{ .label = "Mar", .value = 7 },  .{ .label = "Apr", .value = 24 },
+        .{ .label = "May", .value = 15 },
+    };
+    const cure = [_]verve.viz.Point{
+        .{ .x = 0, .y = 2 }, .{ .x = 1, .y = 5 }, .{ .x = 2, .y = 3 },
+        .{ .x = 3, .y = 8 }, .{ .x = 4, .y = 6 }, .{ .x = 5, .y = 9 },
+    };
+    const cloud = [_]verve.viz.Point{
+        .{ .x = 1, .y = 3 },   .{ .x = 2, .y = 5 },   .{ .x = 3, .y = 2 },
+        .{ .x = 4, .y = 7 },   .{ .x = 5, .y = 4 },   .{ .x = 6, .y = 6 },
+        .{ .x = 2.5, .y = 8 }, .{ .x = 4.5, .y = 3 },
+    };
+    const slices = [_]verve.viz.Datum{
+        .{ .label = "core", .value = 40 },   .{ .label = "client", .value = 25 },
+        .{ .label = "server", .value = 20 }, .{ .label = "desktop", .value = 15 },
+    };
+    const copts = verve.viz.ChartOpts{ .width = 420, .height = 260, .color = "#1f6feb", .axis_color = "#8b949e" };
+
+    // A directed pipeline rendered with the layered (DAG) layout.
+    const dag = verve.viz.Graph{ .nodes = &nodes, .edges = &edges, .layout = .dag };
+    const dag_svg = verve.viz.renderGraph(ctx, dag, .{ .width = 560, .height = 360, .node_color = "#8b5cf6", .edge_color = "#30363d", .label_color = "#f5f5f5" });
+
+    return ctx.div().class("viz-page").children(.{
+        ctx.h1("Visualizations"),
+        ctx.p().text("Native verve.viz: SVG scene model, scales/axes, and tree/radial/force/dag layouts — computed in Zig, rendered server-side. The graph below is an island: nodes reveal on hydrate, yet the page is fully formed with JS off."),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Force-directed graph — interactive"), ctx.p().class("hint").text("Scroll to zoom, drag the background to pan, drag a node to move it, hover for a label, click to select."), graph_island }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Layered DAG"), dag_svg }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Bar chart"), verve.viz.barChart(ctx, &bars, copts) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Line chart"), verve.viz.lineChart(ctx, &cure, copts) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Area chart"), verve.viz.areaChart(ctx, &cure, copts) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Scatter plot"), verve.viz.scatterChart(ctx, &cloud, copts) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Donut chart"), verve.viz.pieChart(ctx, &slices, .{ .width = 280, .height = 280, .inner_ratio = 0.55 }) }),
+        ctx.p().children(.{verve.link(ctx, "/", "← Home", .{})}),
+    }).build();
+}
 
 pub fn counter(ctx: *const verve.Context, initial: i32) !*verve.Node {
     return ctx.div().class("counter-card").children(.{
@@ -179,6 +274,10 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.todo-list li span{flex:1}
                 \\.todo-remove button{background:#3d1d1d;padding:.25rem .5rem}
                 \\.todo-remove button:hover{background:#5b2727}
+                \\.hint{color:#8b949e;font-size:.85rem;margin:.25rem 0 .75rem}
+                \\.viz-card svg{touch-action:none;max-width:100%}
+                \\.viz-node{cursor:grab}
+                \\.viz-node.selected circle{stroke:#fff;stroke-width:3}
             ),
         }),
         ctx.el("body").children(.{

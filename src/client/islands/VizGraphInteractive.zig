@@ -66,13 +66,25 @@ var panning: bool = false;
 var last_sx: f64 = 0;
 var last_sy: f64 = 0;
 var selected: ?usize = null;
+// This island's vid (server `data-vid`). The framework suffixes every
+// `data-ref` with `__v{vid}` for vid>0 so multiple instances don't collide, and
+// `query_ref` does NOT auto-scope — so we suffix ref names ourselves.
+var vid: u32 = 0;
+
+/// Resolve a (possibly vid-suffixed) `data-ref` to an element handle.
+fn resolve(name: []const u8) ?i32 {
+    if (vid == 0) return verve.queryRef(name);
+    var buf: [80]u8 = undefined;
+    const full: []const u8 = std.fmt.bufPrint(&buf, "{s}__v{d}", .{ name, vid }) catch return null;
+    return verve.queryRef(full);
+}
 
 fn ref(comptime name: []const u8) ?i32 {
-    return verve.queryRef(@as([]const u8, name));
+    return resolve(@as([]const u8, name));
 }
 
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
-    _ = root_id;
+    vid = root_id;
     if (props_len == 0) return;
     const bytes = @as([*]const u8, @ptrFromInt(@as(usize, props_ptr)))[0..props_len];
     const mark = verve.chunkArenaMark();
@@ -126,10 +138,14 @@ fn applyRootTransform() void {
     verve.setRefAttr(h, "transform", t);
 }
 
-fn setNodeTransform(i: usize, p: Vec2) void {
+fn resolveNode(i: usize) ?i32 {
     var rbuf: [32]u8 = undefined;
-    const id: []const u8 = std.fmt.bufPrint(&rbuf, "viz-node-{d}", .{i}) catch return;
-    const h = verve.queryRef(id) orelse return;
+    const id: []const u8 = std.fmt.bufPrint(&rbuf, "viz-node-{d}", .{i}) catch return null;
+    return resolve(id);
+}
+
+fn setNodeTransform(i: usize, p: Vec2) void {
+    const h = resolveNode(i) orelse return;
     var tbuf: [64]u8 = undefined;
     const t = std.fmt.bufPrint(&tbuf, "translate({d},{d})", .{ p.x, p.y }) catch return;
     verve.setRefAttr(h, "transform", t);
@@ -138,7 +154,7 @@ fn setNodeTransform(i: usize, p: Vec2) void {
 fn setEdgeEnd(e: usize, comptime suffix: []const u8, p: Vec2) void {
     var rbuf: [32]u8 = undefined;
     const id: []const u8 = std.fmt.bufPrint(&rbuf, "viz-edge-{d}", .{e}) catch return;
-    const h = verve.queryRef(id) orelse return;
+    const h = resolve(id) orelse return;
     var vbuf: [24]u8 = undefined;
     const xv = std.fmt.bufPrint(&vbuf, "{d}", .{p.x}) catch return;
     verve.setRefAttr(h, "x" ++ suffix, xv);
@@ -218,12 +234,9 @@ export fn viz_node_out() void {
 export fn viz_node_click() void {
     const i = hitNode() orelse return;
     if (i >= n) return;
-    var rbuf: [32]u8 = undefined;
     if (selected) |prev| {
-        const pid: []const u8 = std.fmt.bufPrint(&rbuf, "viz-node-{d}", .{prev}) catch return;
-        if (verve.queryRef(pid)) |h| verve.setRefClass(h, "selected", false);
+        if (resolveNode(prev)) |h| verve.setRefClass(h, "selected", false);
     }
-    const id: []const u8 = std.fmt.bufPrint(&rbuf, "viz-node-{d}", .{i}) catch return;
-    if (verve.queryRef(id)) |h| verve.setRefClass(h, "selected", true);
+    if (resolveNode(i)) |h| verve.setRefClass(h, "selected", true);
     selected = i;
 }

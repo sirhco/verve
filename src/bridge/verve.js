@@ -468,6 +468,12 @@
     if (typeof e.clientX === "number") {
       exp.verve_event_set_coords(e.clientX, e.clientY);
     }
+    if (typeof e.deltaY === "number" && typeof exp.verve_event_set_scroll === "function") {
+      exp.verve_event_set_scroll(e.deltaY);
+    }
+    if (typeof e.button === "number" && typeof exp.verve_event_set_button === "function") {
+      exp.verve_event_set_button(e.button | 0);
+    }
     const scratchPtr =
       typeof exp.verve_island_scratch_ptr === "function"
         ? exp.verve_island_scratch_ptr()
@@ -512,6 +518,36 @@
     stageEvent(e, node);
     if (prevent) e.preventDefault();
     exp.verve_event_dispatch(id >>> 0);
+    applyEventFlags(e);
+    return true;
+  };
+
+  // Named-export dispatch for `z-on-<event>="<name>"` — the form island chunks
+  // use (mirrors the click handler's named path). Resolves the export on the
+  // main client first, then the enclosing island's chunk, scoping to its vid.
+  const dispatchEventName = (e, attr, prevent) => {
+    const target = e.target.closest(`[${attr}]`);
+    if (!target) return false;
+    const action = target.getAttribute(attr);
+    const islandEl = target.closest("verve-island");
+    const islandName = islandEl ? islandEl.getAttribute("data-name") || "" : "";
+    const fn =
+      typeof exp[action] === "function"
+        ? exp[action]
+        : islandName && chunkExports[islandName]
+          ? chunkExports[islandName][action]
+          : undefined;
+    if (typeof fn !== "function") return false;
+    stageEvent(e, target);
+    if (prevent) e.preventDefault();
+    const vid = islandEl ? parseInt(islandEl.getAttribute("data-vid"), 10) || 0 : 0;
+    const scope = vid && typeof exp.verve_enter_island === "function";
+    if (scope) exp.verve_enter_island(vid);
+    try {
+      fn();
+    } finally {
+      if (scope && typeof exp.verve_exit_island === "function") exp.verve_exit_island();
+    }
     applyEventFlags(e);
     return true;
   };
@@ -578,6 +614,30 @@
   document.addEventListener("keydown", (e) => {
     dispatchEventId(e, "z-on-keydown-id", false);
   });
+
+  // Phase 2b — pointer + wheel for interactive viz. Each supports both the
+  // closure-id and the named-export form; islands use the named form. Wheel is
+  // non-passive so the handler's eventPreventDefault() can stop page scroll.
+  document.addEventListener(
+    "wheel",
+    (e) => {
+      if (dispatchEventId(e, "z-on-wheel-id", false)) return;
+      dispatchEventName(e, "z-on-wheel", false);
+    },
+    { passive: false },
+  );
+  for (const [type, attr] of [
+    ["pointerdown", "z-on-pointerdown"],
+    ["pointermove", "z-on-pointermove"],
+    ["pointerup", "z-on-pointerup"],
+    ["pointerover", "z-on-pointerover"],
+    ["pointerout", "z-on-pointerout"],
+  ]) {
+    document.addEventListener(type, (e) => {
+      if (dispatchEventId(e, attr + "-id", false)) return;
+      dispatchEventName(e, attr, false);
+    });
+  }
 
   // ---- Phase 13: island hydration dispatch ----------------------------
   // Register `<verve-island>` so the browser stops complaining about
