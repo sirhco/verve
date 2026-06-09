@@ -26,3 +26,37 @@ pub const Greeting = struct {
 pub const JsonProbe = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// Interactive node-link graph (verve.viz). SSR renders the converged layout
+/// (works with JS off); the client chunk reveals the nodes — scaling each from
+/// 0→1 in place — by mutating each group's `transform` by ref over a few
+/// animation frames. No new bridge primitives; the element set is fixed at SSR.
+/// Source: `src/client/islands/VizGraph.zig`.
+pub const VizGraph = struct {
+    pub const props_schema: []const u8 = "{\"xs\":\"f64[]\",\"ys\":\"f64[]\"}";
+
+    /// Final fitted node positions, shared verbatim between the server encoder
+    /// and the client decoder so the reveal lands exactly on the SSR layout.
+    pub const Props = struct {
+        xs: []const f64,
+        ys: []const f64,
+    };
+};
+
+/// Interactive node-link graph: wheel-zoom, drag-to-pan, node drag (incident
+/// edges follow), hover tooltip, click-select. SSR renders the full static
+/// graph; the client chunk wires interaction over the fixed element set. No new
+/// elements created. Source: `src/client/islands/VizGraphInteractive.zig`.
+pub const VizGraphInteractive = struct {
+    pub const props_schema: []const u8 = "{\"xs\":\"f64[]\",\"ys\":\"f64[]\",\"ef\":\"u32[]\",\"et\":\"u32[]\",\"labels\":\"string[]\"}";
+
+    /// Positionally mirrored in the client chunk. `ef`/`et` are edge endpoint
+    /// node indices; `labels` feeds tooltips.
+    pub const Props = struct {
+        xs: []const f64,
+        ys: []const f64,
+        ef: []const u32,
+        et: []const u32,
+        labels: []const []const u8,
+    };
+};
