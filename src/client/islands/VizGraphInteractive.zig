@@ -263,3 +263,236 @@ export fn viz_node_click() void {
     sel_len = @min(id.len, MAX_ID);
     @memcpy(sel_buf[0..sel_len], id[0..sel_len]);
 }
+
+// ---- runtime mutation -------------------------------------------------------
+
+var fvx: [MAX_N]f64 = undefined;
+var fvy: [MAX_N]f64 = undefined;
+
+/// Relax the current `gx/gy` with `iters` force steps (repulsion + edge springs
+/// + centroid gravity). Seeded from current positions → survivors barely move.
+fn forceRelax(iters: usize) void {
+    if (n == 0) return;
+    var ccx: f64 = 0;
+    var ccy: f64 = 0;
+    for (0..n) |i| {
+        ccx += gx[i];
+        ccy += gy[i];
+    }
+    ccx /= @floatFromInt(n);
+    ccy /= @floatFromInt(n);
+    const rep: f64 = 3000;
+    const spring: f64 = 0.04;
+    const rest: f64 = 90;
+    const grav: f64 = 0.02;
+    const damp: f64 = 0.85;
+    const dt: f64 = 0.6;
+    @memset(fvx[0..n], 0);
+    @memset(fvy[0..n], 0);
+    for (0..iters) |_| {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var j: usize = i + 1;
+            while (j < n) : (j += 1) {
+                var dx = gx[i] - gx[j];
+                var dy = gy[i] - gy[j];
+                var d = @sqrt(dx * dx + dy * dy);
+                if (d < 1) {
+                    dx = 1;
+                    dy = 0;
+                    d = 1;
+                }
+                const f = rep / (d * d);
+                const ux = dx / d * f * dt;
+                const uy = dy / d * f * dt;
+                fvx[i] += ux;
+                fvy[i] += uy;
+                fvx[j] -= ux;
+                fvy[j] -= uy;
+            }
+        }
+        for (0..edge_n) |e| {
+            const u = ef[e];
+            const v = et[e];
+            if (u >= n or v >= n or u == v) continue;
+            const dx = gx[v] - gx[u];
+            const dy = gy[v] - gy[u];
+            var d = @sqrt(dx * dx + dy * dy);
+            if (d < 1) d = 1;
+            const f = spring * (d - rest);
+            const ux = dx / d * f * dt;
+            const uy = dy / d * f * dt;
+            fvx[u] += ux;
+            fvy[u] += uy;
+            fvx[v] -= ux;
+            fvy[v] -= uy;
+        }
+        for (0..n) |k| {
+            fvx[k] = (fvx[k] + (ccx - gx[k]) * grav * dt) * damp;
+            fvy[k] = (fvy[k] + (ccy - gy[k]) * grav * dt) * damp;
+            gx[k] += fvx[k] * dt;
+            gy[k] += fvy[k] * dt;
+        }
+    }
+}
+
+// Mirrors core/viz/graph.zig nodeFragment/edgeFragment with the island's style
+// constants. `ref` is the full (vid-scoped) data-ref baked in here.
+fn nodeFragment(buf: []u8, id: []const u8, refn: []const u8, label: []const u8, x: f64, y: f64) ![]const u8 {
+    if (label.len == 0) {
+        return std.fmt.bufPrint(buf, "<g data-vkey=\"{s}\" data-ref=\"{s}\" data-node=\"{s}\" class=\"viz-node\" transform=\"translate({d},{d})\" z-on-pointerdown=\"viz_pointerdown\" z-on-pointerover=\"viz_node_over\" z-on-pointerout=\"viz_node_out\" z-on-click=\"viz_node_click\"><circle cx=\"0\" cy=\"0\" r=\"{d}\" fill=\"{s}\"/></g>", .{ id, refn, id, x, y, NODE_R, NODE_FILL });
+    }
+    return std.fmt.bufPrint(buf, "<g data-vkey=\"{s}\" data-ref=\"{s}\" data-node=\"{s}\" class=\"viz-node\" transform=\"translate({d},{d})\" z-on-pointerdown=\"viz_pointerdown\" z-on-pointerover=\"viz_node_over\" z-on-pointerout=\"viz_node_out\" z-on-click=\"viz_node_click\"><circle cx=\"0\" cy=\"0\" r=\"{d}\" fill=\"{s}\"/><text x=\"0\" y=\"{d}\" text-anchor=\"middle\" font-size=\"{d}\" fill=\"{s}\">{s}</text></g>", .{ id, refn, id, x, y, NODE_R, NODE_FILL, NODE_R + LABEL_SIZE, LABEL_SIZE, LABEL_FILL, label });
+}
+fn edgeFragment(buf: []u8, key: []const u8, refn: []const u8, x1: f64, y1: f64, x2: f64, y2: f64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "<line data-vkey=\"{s}\" data-ref=\"{s}\" x1=\"{d}\" y1=\"{d}\" x2=\"{d}\" y2=\"{d}\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, refn, x1, y1, x2, y2, EDGE_STROKE });
+}
+
+/// Rebuild graph state + DOM from a desired graph (arena-owned id/label copies +
+/// slot-pair edges). Survivors keep positions; new nodes seed near the centroid;
+/// force relaxes; the keyed reconciler creates/moves/removes DOM elements.
+/// Zoom/pan (`viz-root` transform) is untouched → preserved.
+fn reconcile(new_ids: []const []const u8, new_labels: []const []const u8, new_edges: []const [2]usize) void {
+    const mark = verve.chunkArenaMark();
+    defer verve.chunkArenaReset(mark);
+    const a = verve.chunkArena();
+    const nn = @min(new_ids.len, MAX_N);
+
+    var ccx: f64 = 0;
+    var ccy: f64 = 0;
+    if (n > 0) {
+        for (0..n) |i| {
+            ccx += gx[i];
+            ccy += gy[i];
+        }
+        ccx /= @floatFromInt(n);
+        ccy /= @floatFromInt(n);
+    } else {
+        ccx = vbw / 2;
+        ccy = vbh / 2;
+    }
+
+    const nx = a.alloc(f64, nn) catch return;
+    const ny = a.alloc(f64, nn) catch return;
+    for (0..nn) |i| {
+        if (slotOfId(new_ids[i])) |s| {
+            nx[i] = gx[s];
+            ny[i] = gy[s];
+        } else {
+            const ang = 2.0 * std.math.pi * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(@max(nn, 1)));
+            nx[i] = ccx + 40 * @cos(ang);
+            ny[i] = ccy + 40 * @sin(ang);
+        }
+    }
+
+    // Capture current DOM keys before overwriting state.
+    const old_nkeys = a.alloc([]const u8, n) catch return;
+    for (0..n) |i| old_nkeys[i] = a.dupe(u8, idOf(i)) catch return;
+    const old_ekeys = a.alloc([]const u8, edge_n) catch return;
+    for (0..edge_n) |e| old_ekeys[e] = std.fmt.allocPrint(a, "{s}|{s}", .{ idOf(ef[e]), idOf(et[e]) }) catch return;
+
+    // Commit new node state.
+    var ioff: usize = 0;
+    var loff: usize = 0;
+    for (0..nn) |i| {
+        gx[i] = nx[i];
+        gy[i] = ny[i];
+        id_off[i] = ioff;
+        const idt = @min(new_ids[i].len, MAX_ID);
+        @memcpy(id_buf[ioff .. ioff + idt], new_ids[i][0..idt]);
+        ioff += idt;
+        label_off[i] = loff;
+        const lt = @min(new_labels[i].len, MAX_LABEL);
+        @memcpy(label_buf[loff .. loff + lt], new_labels[i][0..lt]);
+        loff += lt;
+    }
+    id_off[nn] = ioff;
+    label_off[nn] = loff;
+    n = nn;
+    edge_n = @min(new_edges.len, MAX_E);
+    for (0..edge_n) |e| {
+        ef[e] = new_edges[e][0];
+        et[e] = new_edges[e][1];
+    }
+
+    forceRelax(50);
+
+    // New keys + html (refs baked vid-scoped).
+    const nkeys = a.alloc([]const u8, n) catch return;
+    const nhtml = a.alloc([]const u8, n) catch return;
+    for (0..n) |i| {
+        nkeys[i] = idOf(i);
+        const base = std.fmt.allocPrint(a, "viz-node-{s}", .{idOf(i)}) catch return;
+        const sbuf = a.alloc(u8, 96) catch return;
+        const sref = scopedRef(sbuf, base) orelse return;
+        const hbuf = a.alloc(u8, 1024) catch return;
+        nhtml[i] = nodeFragment(hbuf, idOf(i), sref, labelOf(i), gx[i], gy[i]) catch return;
+    }
+    verve.listDiff("viz-nodes", old_nkeys, nkeys, nhtml);
+
+    const ekeys = a.alloc([]const u8, edge_n) catch return;
+    const ehtml = a.alloc([]const u8, edge_n) catch return;
+    for (0..edge_n) |e| {
+        const key = std.fmt.allocPrint(a, "{s}|{s}", .{ idOf(ef[e]), idOf(et[e]) }) catch return;
+        ekeys[e] = key;
+        const base = std.fmt.allocPrint(a, "viz-edge-{s}", .{key}) catch return;
+        const sbuf = a.alloc(u8, 96) catch return;
+        const sref = scopedRef(sbuf, base) orelse return;
+        const hbuf = a.alloc(u8, 320) catch return;
+        ehtml[e] = edgeFragment(hbuf, key, sref, gx[ef[e]], gy[ef[e]], gx[et[e]], gy[et[e]]) catch return;
+    }
+    verve.listDiff("viz-edges", old_ekeys, ekeys, ehtml);
+
+    // Snap survivors to exact final positions (created elements already carry
+    // them, but moved survivors need updating).
+    for (0..n) |i| setNodeXY(i);
+    for (0..edge_n) |e| updateEdge(e);
+
+    drag_node = null;
+    panning = false;
+    if (sel_len != 0 and slotOfId(sel_buf[0..sel_len]) == null) sel_len = 0;
+}
+
+var add_seq: u32 = 0;
+
+/// Demo imperative API: add a synthetic node connected to node 0.
+export fn viz_add_node() void {
+    if (n == 0 or n >= MAX_N) return;
+    const mark = verve.chunkArenaMark();
+    defer verve.chunkArenaReset(mark);
+    const a = verve.chunkArena();
+    add_seq += 1;
+    const ids = a.alloc([]const u8, n + 1) catch return;
+    const labels = a.alloc([]const u8, n + 1) catch return;
+    for (0..n) |i| {
+        ids[i] = a.dupe(u8, idOf(i)) catch return;
+        labels[i] = a.dupe(u8, labelOf(i)) catch return;
+    }
+    const new_id = std.fmt.allocPrint(a, "n{d}", .{add_seq}) catch return;
+    ids[n] = new_id;
+    labels[n] = new_id;
+    const edges = a.alloc([2]usize, edge_n + 1) catch return;
+    for (0..edge_n) |e| edges[e] = .{ ef[e], et[e] };
+    edges[edge_n] = .{ 0, n };
+    reconcile(ids, labels, edges);
+}
+
+/// Demo imperative API: remove the last node + its incident edges.
+export fn viz_remove_node() void {
+    if (n <= 1) return;
+    const mark = verve.chunkArenaMark();
+    defer verve.chunkArenaReset(mark);
+    const a = verve.chunkArena();
+    const gone = n - 1;
+    const ids = a.alloc([]const u8, gone) catch return;
+    const labels = a.alloc([]const u8, gone) catch return;
+    for (0..gone) |i| {
+        ids[i] = a.dupe(u8, idOf(i)) catch return;
+        labels[i] = a.dupe(u8, labelOf(i)) catch return;
+    }
+    var edges: std.ArrayList([2]usize) = .empty;
+    for (0..edge_n) |e| {
+        if (ef[e] < gone and et[e] < gone) edges.append(a, .{ ef[e], et[e] }) catch return;
+    }
+    reconcile(ids, labels, edges.items);
+}
