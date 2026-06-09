@@ -397,10 +397,15 @@ For flowcharts, pipelines, and dependency graphs. Edges are read as **directed**
 (`from → to`); longest-path layering assigns each node to a row one below its
 deepest predecessor. A crossing-minimization pass (median/barycenter sweeps,
 keeping the ordering with the fewest crossings) then reorders nodes within each
-layer to untangle edges — set `crossing_iterations = 0` on the low-level
-`dagLayout` to skip it. Cycles are tolerated (bounded relaxation) but won't layer
-cleanly. (Long edges spanning >1 layer aren't yet split into virtual nodes, so
-crossings are reduced over edges between adjacent layers.)
+layer to untangle edges — set `crossing_iterations = 0` (on `GraphOpts` or the
+low-level `dagLayout`) to skip it. Forward edges spanning more than one layer are
+split into **virtual nodes** — one per intermediate layer — so crossing
+minimization accounts for them at every boundary, the virtuals reserve routing
+channels, and each long edge renders as a **polyline bending** through them
+rather than cutting straight across. `renderGraph(..., .{ .layout = .dag })`
+draws these automatically; `dagLayoutRouted` exposes the positions + per-edge
+polylines for custom rendering. Cycles are tolerated (bounded relaxation) but
+won't layer cleanly.
 
 ```zig
 const pipeline = viz.Graph{
@@ -788,9 +793,9 @@ stay static. See [Not yet](#not-yet-phase-2).
   (needs a dynamic `createElementNS`-by-ref bridge primitive).
 - **Pointer capture** — drag/pan are bounded to pointer-over-svg; dragging past
   the svg edge ends the gesture. Document-level capture is a later refinement.
-- **Virtual nodes for long DAG edges** — crossing-minimization currently acts on
-  edges between adjacent layers; edges spanning multiple layers aren't yet split
-  into routed virtual nodes.
+- **Orthogonal / curved edge routing** — routed DAG edges bend through virtual
+  nodes as straight polyline segments; smooth splines or orthogonal routing
+  aren't done.
 - **Canvas draw-command path** for thousands-of-elements scale and smooth
   high-frequency animation.
 - **Stacked / candlestick** chart types — buildable today from the
