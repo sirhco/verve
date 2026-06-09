@@ -77,6 +77,7 @@ Three entry points, each taking data + an options struct:
 
 ```zig
 viz.barChart(ctx, data: []const viz.Datum,  opts: viz.ChartOpts) *Node
+viz.stackedBarChart(ctx, categories: []const []const u8, series: []const viz.StackSeries, opts: viz.ChartOpts) *Node
 viz.lineChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
 viz.areaChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
 viz.scatterChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
@@ -122,6 +123,22 @@ const node = viz.barChart(ctx, &revenue, .{
     .color = "#1f6feb",
     .tick_count = 6,
 });
+```
+
+### Stacked bar chart
+
+Categories (x bands) with multiple series stacked bottom-to-top. Each
+`StackSeries` carries a `values` slice (one per category) and an optional color
+(defaults to the palette). A small legend (swatch + name) is drawn along the top.
+
+```zig
+const quarters = [_][]const u8{ "Q1", "Q2", "Q3", "Q4" };
+const series = [_]viz.StackSeries{
+    .{ .name = "web",  .values = &.{ 12, 19, 9, 22 }, .color = "#1f6feb" },
+    .{ .name = "api",  .values = &.{ 8, 11, 14, 7 } },
+    .{ .name = "jobs", .values = &.{ 4, 6, 5, 9 } },
+};
+const node = viz.stackedBarChart(ctx, &quarters, &series, .{ .width = 480, .height = 300 });
 ```
 
 ### Line chart
@@ -798,5 +815,5 @@ stay static. See [Not yet](#not-yet-phase-2).
   aren't done.
 - **Canvas draw-command path** for thousands-of-elements scale and smooth
   high-frequency animation.
-- **Stacked / candlestick** chart types — buildable today from the
-  [scene model](#the-scene-model); first-class helpers may follow.
+- **Grouped-bar / candlestick / box-plot** chart types — buildable today from
+  the [scene model](#the-scene-model); first-class helpers may follow.

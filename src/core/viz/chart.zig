@@ -93,6 +93,79 @@ pub fn bar(ctx: *const Context, data: []const Datum, opts: Opts) *Node {
     return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
 }
 
+/// One series in a stacked bar chart. `values[c]` is this series' contribution
+/// to category `c` (so `values.len` should equal `categories.len`). `color`
+/// defaults to the palette entry for the series' index.
+pub const StackSeries = struct {
+    name: []const u8,
+    values: []const f64,
+    color: ?[]const u8 = null,
+};
+
+/// Stacked bar chart: each category band stacks the series bottom-to-top. A
+/// small legend (swatch + name) is drawn along the top of the plot.
+pub fn stackedBar(ctx: *const Context, categories: []const []const u8, series: []const StackSeries, opts: Opts) *Node {
+    const a = ctx.allocator;
+    const plot = Plot.of(opts);
+    var shapes: std.ArrayList(scene.Shape) = .empty;
+
+    // Tallest stack sets the y domain.
+    var top: f64 = 0;
+    for (categories, 0..) |_, c| {
+        var sum: f64 = 0;
+        for (series) |s| if (c < s.values.len) {
+            sum += s.values[c];
+        };
+        top = @max(top, sum);
+    }
+    if (top == 0) top = 1;
+
+    const y = scale.Linear{ .domain = .{ 0, top }, .range = .{ plot.y0, plot.y1 } };
+    const band = scale.Band{ .count = categories.len, .range = .{ plot.x0, plot.x1 }, .padding = 0.2 };
+
+    appendAxis(&shapes, a, .{ .orient = .left, .scale = y, .cross = plot.x0, .tick_count = opts.tick_count, .color = opts.axis_color });
+
+    for (categories, 0..) |label, c| {
+        const bx = band.map(c);
+        var cum: f64 = 0;
+        for (series, 0..) |s, si| {
+            const v = if (c < s.values.len) s.values[c] else 0;
+            if (v <= 0) continue;
+            const y_top = y.map(cum + v);
+            const y_bot = y.map(cum);
+            shapes.append(a, .{ .rect = .{
+                .x = bx,
+                .y = y_top,
+                .w = band.bandwidth(),
+                .h = y_bot - y_top,
+                .style = .{ .fill = s.color orelse palette[si % palette.len] },
+            } }) catch return errNode(ctx);
+            cum += v;
+        }
+        shapes.append(a, .{ .text = .{
+            .x = band.center(c),
+            .y = plot.y0 + 16,
+            .content = label,
+            .anchor = .middle,
+            .font_size = 10,
+            .style = .{ .fill = opts.axis_color },
+        } }) catch return errNode(ctx);
+    }
+
+    // Legend: swatch + name per series, left-aligned along the top.
+    var lx: f64 = plot.x0;
+    const ly = opts.margin.top - 12;
+    for (series, 0..) |s, si| {
+        const color = s.color orelse palette[si % palette.len];
+        shapes.append(a, .{ .rect = .{ .x = lx, .y = ly, .w = 10, .h = 10, .rx = 2, .style = .{ .fill = color } } }) catch return errNode(ctx);
+        shapes.append(a, .{ .text = .{ .x = lx + 14, .y = ly + 9, .content = s.name, .font_size = 10, .style = .{ .fill = opts.axis_color } } }) catch return errNode(ctx);
+        // Advance by swatch + gap + an approximate text width (~6px/char).
+        lx += 24 + @as(f64, @floatFromInt(s.name.len)) * 6.0 + 16;
+    }
+
+    return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+}
+
 /// Line chart over continuous (x, y) points (drawn in given order).
 pub fn line(ctx: *const Context, data: []const Point, opts: Opts) *Node {
     const a = ctx.allocator;
@@ -280,6 +353,29 @@ test "bar chart renders rects, y-axis, and category labels" {
     try testing.expect(std.mem.indexOf(u8, out, "<rect") != null);
     try testing.expect(std.mem.indexOf(u8, out, ">Jan</text>") != null);
     try testing.expect(std.mem.indexOf(u8, out, ">Mar</text>") != null);
+}
+
+test "stacked bar renders a rect per non-zero segment, labels, and legend" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    var buf: [16384]u8 = undefined;
+    const cats = [_][]const u8{ "Q1", "Q2" };
+    const series = [_]StackSeries{
+        .{ .name = "web", .values = &.{ 5, 8 }, .color = "#1f6feb" },
+        .{ .name = "api", .values = &.{ 3, 0 }, .color = "#10b981" }, // Q2 api = 0 → no rect
+    };
+    const out = try renderToBuf(stackedBar(&ctx, &cats, &series, .{ .width = 480, .height = 300 }), &buf);
+    try testing.expect(std.mem.indexOf(u8, out, "<svg") != null);
+    // category labels + legend names
+    try testing.expect(std.mem.indexOf(u8, out, ">Q1</text>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ">web</text>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ">api</text>") != null);
+    // both series colors present
+    try testing.expect(std.mem.indexOf(u8, out, "fill=\"#1f6feb\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "fill=\"#10b981\"") != null);
+    // 3 stacked segments (web Q1, web Q2, api Q1) + 2 legend swatches = 5 rects.
+    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, out, "<rect"));
 }
 
 test "line chart renders a polyline" {

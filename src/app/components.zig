@@ -80,6 +80,13 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
     };
     const copts = verve.viz.ChartOpts{ .width = 420, .height = 260, .color = "#1f6feb", .axis_color = "#8b949e" };
 
+    const quarters = [_][]const u8{ "Q1", "Q2", "Q3", "Q4" };
+    const stack_series = [_]verve.viz.StackSeries{
+        .{ .name = "web", .values = &.{ 12, 19, 9, 22 }, .color = "#1f6feb" },
+        .{ .name = "api", .values = &.{ 8, 11, 14, 7 }, .color = "#10b981" },
+        .{ .name = "jobs", .values = &.{ 4, 6, 5, 9 }, .color = "#f59e0b" },
+    };
+
     // A directed pipeline with a skip edge (src→emit spans 3 layers) so the
     // long edge routes through virtual-node bends instead of cutting straight.
     const dag_nodes = [_]verve.viz.GraphNode{
@@ -117,6 +124,7 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — OFF"), ctx.p().class("hint").text("dag_crossing_iterations = 0 → A→Z, B→Y, C→X all cross (id-order)."), dag_off }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — ON"), ctx.p().class("hint").text("Default sweeps reorder the bottom layer to Z,Y,X → edges fan cleanly, zero crossings."), dag_on }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Bar chart"), verve.viz.barChart(ctx, &bars, copts) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Stacked bar chart"), verve.viz.stackedBarChart(ctx, &quarters, &stack_series, .{ .width = 480, .height = 300, .axis_color = "#8b949e" }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Line chart"), verve.viz.lineChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Area chart"), verve.viz.areaChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Scatter plot"), verve.viz.scatterChart(ctx, &cloud, copts) }),
