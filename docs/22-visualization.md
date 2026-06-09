@@ -85,6 +85,7 @@ viz.scatterChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
 viz.pieChart(ctx, data: []const viz.Datum,  opts: viz.PieOpts)   *Node
 viz.candlestickChart(ctx, data: []const viz.Candle, opts: viz.CandleOpts) *Node
 viz.boxPlotChart(ctx, data: []const viz.BoxStats, opts: viz.ChartOpts) *Node
+viz.heatmapChart(ctx, rows: []const []const u8, cols: []const []const u8, values: []const f64, opts: viz.HeatOpts) *Node
 ```
 
 Data shapes:
@@ -173,6 +174,19 @@ const boxes = [_]viz.BoxStats{
     .{ .label = "p95", .min = 20, .q1 = 32, .median = 41, .q3 = 55, .max = 72 },
 };
 const node = viz.boxPlotChart(ctx, &boxes, .{ .width = 480, .height = 300 });
+```
+
+### Heatmap
+
+A grid of cells colored by value, interpolated from `opts.low` to `opts.high`
+(RGB). `values` is row-major (`values[r*cols + c]`); row labels run down the
+left, column labels along the bottom. Set `show_values = true` to print numbers.
+
+```zig
+const rows = [_][]const u8{ "Mon", "Tue", "Wed" };
+const cols = [_][]const u8{ "00h", "12h", "18h" };
+const vals = [_]f64{ 2, 8, 5,  3, 12, 7,  4, 15, 9 }; // 3×3 row-major
+const node = viz.heatmapChart(ctx, &rows, &cols, &vals, .{ .width = 420, .height = 280 });
 ```
 
 ### Line chart
@@ -849,5 +863,5 @@ stay static. See [Not yet](#not-yet-phase-2).
   aren't done.
 - **Canvas draw-command path** for thousands-of-elements scale and smooth
   high-frequency animation.
-- **Heatmap / radar / violin** chart types — buildable today from the
+- **Radar / violin / sankey** chart types — buildable today from the
   [scene model](#the-scene-model); first-class helpers may follow.

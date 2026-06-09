@@ -385,6 +385,104 @@ pub fn boxPlot(ctx: *const Context, data: []const BoxStats, opts: Opts) *Node {
     return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
 }
 
+pub const Rgb = struct { r: u8, g: u8, b: u8 };
+
+pub const HeatOpts = struct {
+    width: f64 = 480,
+    height: f64 = 360,
+    margin: Margin = .{ .top = 20, .right = 20, .bottom = 36, .left = 72 },
+    low: Rgb = .{ .r = 15, .g = 23, .b = 42 }, // cold
+    high: Rgb = .{ .r = 31, .g = 111, .b = 235 }, // hot
+    axis_color: []const u8 = "#8b949e",
+    cell_gap: f64 = 2,
+    show_values: bool = false,
+};
+
+fn lerpU8(lo: u8, hi: u8, t: f64) u8 {
+    const v = @as(f64, @floatFromInt(lo)) + (@as(f64, @floatFromInt(hi)) - @as(f64, @floatFromInt(lo))) * t;
+    return @intFromFloat(@round(geom.clamp(v, 0, 255)));
+}
+
+/// Heatmap: a grid of cells colored by value, interpolated from `opts.low` to
+/// `opts.high`. `values` is row-major (`values[r*cols + c]`). Row labels run
+/// down the left, column labels along the bottom.
+pub fn heatmap(ctx: *const Context, row_labels: []const []const u8, col_labels: []const []const u8, values: []const f64, opts: HeatOpts) *Node {
+    const a = ctx.allocator;
+    const rows = row_labels.len;
+    const cols = col_labels.len;
+    var shapes: std.ArrayList(scene.Shape) = .empty;
+    if (rows == 0 or cols == 0) return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+
+    var lo = values[0];
+    var hi = values[0];
+    for (values) |v| {
+        lo = @min(lo, v);
+        hi = @max(hi, v);
+    }
+    const span = if (hi == lo) 1 else hi - lo;
+
+    const x0 = opts.margin.left;
+    const y0 = opts.margin.top;
+    const cw = (opts.width - opts.margin.left - opts.margin.right) / @as(f64, @floatFromInt(cols));
+    const ch = (opts.height - opts.margin.top - opts.margin.bottom) / @as(f64, @floatFromInt(rows));
+
+    for (0..rows) |r| {
+        for (0..cols) |c| {
+            const idx = r * cols + c;
+            const v = if (idx < values.len) values[idx] else lo;
+            const t = (v - lo) / span;
+            const fill = std.fmt.allocPrint(a, "rgb({d},{d},{d})", .{
+                lerpU8(opts.low.r, opts.high.r, t),
+                lerpU8(opts.low.g, opts.high.g, t),
+                lerpU8(opts.low.b, opts.high.b, t),
+            }) catch return errNode(ctx);
+            const cx = x0 + @as(f64, @floatFromInt(c)) * cw;
+            const cy = y0 + @as(f64, @floatFromInt(r)) * ch;
+            shapes.append(a, .{ .rect = .{
+                .x = cx,
+                .y = cy,
+                .w = cw - opts.cell_gap,
+                .h = ch - opts.cell_gap,
+                .rx = 2,
+                .style = .{ .fill = fill },
+            } }) catch return errNode(ctx);
+            if (opts.show_values) {
+                shapes.append(a, .{ .text = .{
+                    .x = cx + (cw - opts.cell_gap) / 2,
+                    .y = cy + (ch - opts.cell_gap) / 2 + 3,
+                    .content = std.fmt.allocPrint(a, "{d}", .{v}) catch return errNode(ctx),
+                    .anchor = .middle,
+                    .font_size = 9,
+                    .style = .{ .fill = "#fff" },
+                } }) catch return errNode(ctx);
+            }
+        }
+    }
+    // Column labels (bottom) + row labels (left).
+    for (col_labels, 0..) |label, c| {
+        shapes.append(a, .{ .text = .{
+            .x = x0 + (@as(f64, @floatFromInt(c)) + 0.5) * cw,
+            .y = opts.height - opts.margin.bottom + 16,
+            .content = label,
+            .anchor = .middle,
+            .font_size = 10,
+            .style = .{ .fill = opts.axis_color },
+        } }) catch return errNode(ctx);
+    }
+    for (row_labels, 0..) |label, r| {
+        shapes.append(a, .{ .text = .{
+            .x = x0 - 8,
+            .y = y0 + (@as(f64, @floatFromInt(r)) + 0.5) * ch + 3,
+            .content = label,
+            .anchor = .end,
+            .font_size = 10,
+            .style = .{ .fill = opts.axis_color },
+        } }) catch return errNode(ctx);
+    }
+
+    return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+}
+
 /// Line chart over continuous (x, y) points (drawn in given order).
 pub fn line(ctx: *const Context, data: []const Point, opts: Opts) *Node {
     const a = ctx.allocator;
@@ -658,6 +756,23 @@ test "box plot renders a box, median, whiskers, and label per category" {
     // one box rect per category (translucent fill)
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "<rect"));
     try testing.expect(std.mem.indexOf(u8, out, "opacity=\"0.3\"") != null);
+}
+
+test "heatmap renders a cell per value with interpolated colors + labels" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    var buf: [16384]u8 = undefined;
+    const rows = [_][]const u8{ "r0", "r1" };
+    const cols = [_][]const u8{ "c0", "c1" };
+    const vals = [_]f64{ 0, 5, 5, 10 }; // row-major 2x2
+    const out = try renderToBuf(heatmap(&ctx, &rows, &cols, &vals, .{ .low = .{ .r = 0, .g = 0, .b = 0 }, .high = .{ .r = 100, .g = 0, .b = 0 } }), &buf);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, out, "<rect"));
+    try testing.expect(std.mem.indexOf(u8, out, ">r0</text>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ">c1</text>") != null);
+    // min value → low color (black); max value → high color (rgb(100,0,0)).
+    try testing.expect(std.mem.indexOf(u8, out, "rgb(0,0,0)") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "rgb(100,0,0)") != null);
 }
 
 test "line chart renders a polyline" {
