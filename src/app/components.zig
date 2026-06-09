@@ -84,11 +84,27 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
     const dag = verve.viz.Graph{ .nodes = &nodes, .edges = &edges, .layout = .dag };
     const dag_svg = verve.viz.renderGraph(ctx, dag, .{ .width = 560, .height = 360, .node_color = "#8b5cf6", .edge_color = "#30363d", .label_color = "#f5f5f5" });
 
+    // Crossing-minimization A/B: a deliberately tangled DAG (A→Z, B→Y, C→X).
+    // Under id-order the three edges all cross; the sweep reorders the bottom
+    // layer to Z,Y,X so they fan cleanly.
+    const cross_nodes = [_]verve.viz.GraphNode{
+        .{ .id = "a", .label = "A" }, .{ .id = "b", .label = "B" }, .{ .id = "c", .label = "C" },
+        .{ .id = "x", .label = "X" }, .{ .id = "y", .label = "Y" }, .{ .id = "z", .label = "Z" },
+    };
+    const cross_edges = [_]verve.viz.GraphEdge{
+        .{ .from = "a", .to = "z" }, .{ .from = "b", .to = "y" }, .{ .from = "c", .to = "x" },
+    };
+    const cdag = verve.viz.Graph{ .nodes = &cross_nodes, .edges = &cross_edges, .layout = .dag };
+    const dag_off = verve.viz.renderGraph(ctx, cdag, .{ .width = 420, .height = 240, .node_color = "#8b5cf6", .edge_color = "#f87171", .label_color = "#f5f5f5", .dag_crossing_iterations = 0 });
+    const dag_on = verve.viz.renderGraph(ctx, cdag, .{ .width = 420, .height = 240, .node_color = "#8b5cf6", .edge_color = "#34d399", .label_color = "#f5f5f5" });
+
     return ctx.div().class("viz-page").children(.{
         ctx.h1("Visualizations"),
         ctx.p().text("Native verve.viz: SVG scene model, scales/axes, and tree/radial/force/dag layouts — computed in Zig, rendered server-side. The graph below is an island: nodes reveal on hydrate, yet the page is fully formed with JS off."),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Force-directed graph — interactive"), ctx.p().class("hint").text("Scroll to zoom, drag the background to pan, drag a node to move it, hover for a label, click to select."), graph_island }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Layered DAG"), dag_svg }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — OFF"), ctx.p().class("hint").text("dag_crossing_iterations = 0 → A→Z, B→Y, C→X all cross (id-order)."), dag_off }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — ON"), ctx.p().class("hint").text("Default sweeps reorder the bottom layer to Z,Y,X → edges fan cleanly, zero crossings."), dag_on }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Bar chart"), verve.viz.barChart(ctx, &bars, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Line chart"), verve.viz.lineChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Area chart"), verve.viz.areaChart(ctx, &cure, copts) }),

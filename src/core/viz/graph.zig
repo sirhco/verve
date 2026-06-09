@@ -40,6 +40,8 @@ pub const Opts = struct {
     /// `data-ref` prefix for node groups: "<prefix>-<index>".
     ref_prefix: []const u8 = "viz-node",
     force_iterations: usize = 300,
+    /// `.dag` only: crossing-minimization sweeps (0 = stable id-order).
+    dag_crossing_iterations: usize = 8,
     /// Hint that callers want the interactive scaffold. `renderGraph` ignores
     /// it (static); use `renderInteractive` (or the app-layer island wrapper).
     interactive: bool = false,
@@ -72,7 +74,7 @@ pub fn computePositions(ctx: *const Context, g: Graph, opts: Opts) ![]Vec2 {
         .tree => try tree_layout.layout(a, n, edges, .{}),
         .radial => try radial_layout.layout(a, n, edges, .{ .center = center }),
         .force => try force_layout.run(a, n, edges, .{ .iterations = opts.force_iterations, .center = center }),
-        .dag => try dag_layout.layout(a, n, edges, .{}),
+        .dag => try dag_layout.layout(a, n, edges, .{ .crossing_iterations = opts.dag_crossing_iterations }),
     };
     fitPositions(positions, opts);
     return positions;
