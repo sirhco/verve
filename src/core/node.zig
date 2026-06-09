@@ -86,6 +86,16 @@ pub const Node = struct {
     z_on_input_id: ?u32 = null,
     z_on_change_id: ?u32 = null,
     z_on_keydown_id: ?u32 = null,
+    /// Phase 2b — pointer/wheel event handlers (named-export form, like
+    /// `z_on_click_action`). Stamped as `z-on-<event>="<name>"`; the bridge's
+    /// delegated listeners dispatch them to the matching island chunk export.
+    /// Power the interactive viz island (zoom/pan/drag/hover).
+    z_on_wheel_action: ?[]const u8 = null,
+    z_on_pointerdown_action: ?[]const u8 = null,
+    z_on_pointermove_action: ?[]const u8 = null,
+    z_on_pointerup_action: ?[]const u8 = null,
+    z_on_pointerover_action: ?[]const u8 = null,
+    z_on_pointerout_action: ?[]const u8 = null,
     /// When set, the server short-circuits rendering and sends a
     /// redirect response (302/303) instead of HTML. Populated via
     /// `ctx.redirect("/login")`.
@@ -316,6 +326,45 @@ pub const Node = struct {
     pub fn onKeydownFn(self: *Node, slot_id: u32) *Node {
         if (self.err != null) return self;
         self.z_on_keydown_id = slot_id;
+        return self;
+    }
+
+    /// Pointer/wheel event handlers (named-export form). Each stamps
+    /// `z-on-<event>="<name>"`; the bridge dispatches the named export on the
+    /// island chunk. Used by the interactive viz graph.
+    pub fn onWheel(self: *Node, action: []const u8) *Node {
+        if (self.err != null) return self;
+        self.z_on_wheel_action = action;
+        return self;
+    }
+
+    pub fn onPointerDown(self: *Node, action: []const u8) *Node {
+        if (self.err != null) return self;
+        self.z_on_pointerdown_action = action;
+        return self;
+    }
+
+    pub fn onPointerMove(self: *Node, action: []const u8) *Node {
+        if (self.err != null) return self;
+        self.z_on_pointermove_action = action;
+        return self;
+    }
+
+    pub fn onPointerUp(self: *Node, action: []const u8) *Node {
+        if (self.err != null) return self;
+        self.z_on_pointerup_action = action;
+        return self;
+    }
+
+    pub fn onPointerOver(self: *Node, action: []const u8) *Node {
+        if (self.err != null) return self;
+        self.z_on_pointerover_action = action;
+        return self;
+    }
+
+    pub fn onPointerOut(self: *Node, action: []const u8) *Node {
+        if (self.err != null) return self;
+        self.z_on_pointerout_action = action;
         return self;
     }
 

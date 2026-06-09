@@ -207,6 +207,36 @@ pub const Renderer = struct {
         if (node.z_on_keydown_id) |id| {
             try w.print(" z-on-keydown-id=\"{d}\"", .{id});
         }
+        if (node.z_on_wheel_action) |action| {
+            try w.writeAll(" z-on-wheel=\"");
+            try escapeAttr(w, action);
+            try w.writeAll("\"");
+        }
+        if (node.z_on_pointerdown_action) |action| {
+            try w.writeAll(" z-on-pointerdown=\"");
+            try escapeAttr(w, action);
+            try w.writeAll("\"");
+        }
+        if (node.z_on_pointermove_action) |action| {
+            try w.writeAll(" z-on-pointermove=\"");
+            try escapeAttr(w, action);
+            try w.writeAll("\"");
+        }
+        if (node.z_on_pointerup_action) |action| {
+            try w.writeAll(" z-on-pointerup=\"");
+            try escapeAttr(w, action);
+            try w.writeAll("\"");
+        }
+        if (node.z_on_pointerover_action) |action| {
+            try w.writeAll(" z-on-pointerover=\"");
+            try escapeAttr(w, action);
+            try w.writeAll("\"");
+        }
+        if (node.z_on_pointerout_action) |action| {
+            try w.writeAll(" z-on-pointerout=\"");
+            try escapeAttr(w, action);
+            try w.writeAll("\"");
+        }
 
         if (node_mod.isVoidTag(node.tag)) {
             try w.writeAll(">");
@@ -324,6 +354,30 @@ test "renders basic element" {
     const node = try ctx.h1("hello").build();
     try Renderer.render(&w, node);
     try std.testing.expectEqualStrings("<h1>hello</h1>", w.buffered());
+}
+
+test "stamps wheel + pointer event attributes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    var buf: [512]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    const tree = try ctx.el("g")
+        .onWheel("viz_wheel")
+        .onPointerDown("viz_down")
+        .onPointerMove("viz_move")
+        .onPointerUp("viz_up")
+        .onPointerOver("viz_over")
+        .onPointerOut("viz_out")
+        .build();
+    try Renderer.render(&w, tree);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "z-on-wheel=\"viz_wheel\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "z-on-pointerdown=\"viz_down\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "z-on-pointermove=\"viz_move\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "z-on-pointerup=\"viz_up\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "z-on-pointerover=\"viz_over\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "z-on-pointerout=\"viz_out\"") != null);
 }
 
 test "renders nested element with attrs and z-bind" {
