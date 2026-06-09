@@ -292,6 +292,12 @@ export fn verve_event_set_coords(x: f64, y: f64) void {
 export fn verve_event_set_key(ptr: [*]const u8, len: u32) void {
     event_state.setKey(ptr[0..len]);
 }
+export fn verve_event_set_scroll(delta_y: f64) void {
+    event_state.setScroll(delta_y);
+}
+export fn verve_event_set_button(b: i32) void {
+    event_state.setButton(b);
+}
 export fn verve_event_set_dataset(ptr: [*]const u8, len: u32) void {
     event_state.setDataset(ptr[0..len]);
 }
@@ -303,6 +309,12 @@ export fn verve_event_coord_x() f64 {
 }
 export fn verve_event_coord_y() f64 {
     return event_state.coordY();
+}
+export fn verve_event_delta_y() f64 {
+    return event_state.scrollDeltaY();
+}
+export fn verve_event_button() i32 {
+    return event_state.buttonId();
 }
 export fn verve_event_key(buf_ptr: [*]u8, buf_cap: u32) u32 {
     const s = event_state.keySlice();

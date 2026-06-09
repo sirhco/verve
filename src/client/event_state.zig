@@ -28,6 +28,8 @@ const FLAG_STOP: u32 = 1 << 1;
 var mods: u32 = 0;
 var coord_x: f64 = 0;
 var coord_y: f64 = 0;
+var delta_y: f64 = 0;
+var button: i32 = -1;
 var key_buf: [64]u8 = undefined;
 var key_len: usize = 0;
 var dataset_doc: u32 = 0;
@@ -43,6 +45,8 @@ pub fn begin() void {
     mods = 0;
     coord_x = 0;
     coord_y = 0;
+    delta_y = 0;
+    button = -1;
     key_len = 0;
     flags = 0;
 }
@@ -54,6 +58,14 @@ pub fn setMods(m: u32) void {
 pub fn setCoords(x: f64, y: f64) void {
     coord_x = x;
     coord_y = y;
+}
+
+pub fn setScroll(d: f64) void {
+    delta_y = d;
+}
+
+pub fn setButton(b: i32) void {
+    button = b;
 }
 
 pub fn setKey(s: []const u8) void {
@@ -80,6 +92,14 @@ pub fn coordX() f64 {
 
 pub fn coordY() f64 {
     return coord_y;
+}
+
+pub fn scrollDeltaY() f64 {
+    return delta_y;
+}
+
+pub fn buttonId() i32 {
+    return button;
 }
 
 pub fn keySlice() []const u8 {
@@ -132,6 +152,18 @@ test "mods / coords / key round-trip" {
     try testing.expectEqual(@as(f64, 12.5), coordX());
     try testing.expectEqual(@as(f64, -3.0), coordY());
     try testing.expectEqualStrings("k", keySlice());
+}
+
+test "scroll delta + button round-trip and reset" {
+    begin();
+    defer end();
+    setScroll(-120.0);
+    setButton(2);
+    try testing.expectEqual(@as(f64, -120.0), scrollDeltaY());
+    try testing.expectEqual(@as(i32, 2), buttonId());
+    begin();
+    try testing.expectEqual(@as(f64, 0), scrollDeltaY());
+    try testing.expectEqual(@as(i32, -1), buttonId());
 }
 
 test "oversized key truncates to buffer" {
