@@ -856,19 +856,36 @@ background drag pans, node drag repositions a node and its incident edges follow
 hover shows a labeled tooltip, click toggles a highlight. With JS off the graph
 still renders fully — interaction is pure enhancement.
 
-**How it works (no new elements created):** SSR stamps a fixed element set —
-`viz-svg`, a `viz-root` group, `viz-edge-<i>` lines, `viz-node-<i>` groups with a
-`data-node` index, and a hidden tooltip. The client chunk mutates only
-*attributes/classes* of those elements via `setRefAttr` / `setRefClass`. The
-bridge layer adds six delegated events — `wheel`, `pointerdown`, `pointermove`,
-`pointerup`, `pointerover`, `pointerout` — plus `eventDeltaY()` / `eventButton()`
-accessors and `Node.onWheel` / `onPointer*` stamps; these are reusable by any
-island, not just viz.
+**How it works:** SSR stamps `viz-svg`, a `viz-root` zoom/pan group holding two
+keyed containers (`viz-edges`, `viz-nodes`), `viz-edge-<from>|<to>` lines and
+`viz-node-<id>` groups (keyed by stable **id**, with a `data-node` id), and a
+hidden tooltip. The client chunk mutates attributes/classes via `setRefAttr` /
+`setRefClass`. The bridge adds six delegated events — `wheel`, `pointerdown`,
+`pointermove`, `pointerup`, `pointerover`, `pointerout` — plus `eventDeltaY()` /
+`eventButton()` accessors and `Node.onWheel` / `onPointer*` stamps, reusable by
+any island.
+
+### Runtime mutation (add / remove nodes)
+
+The graph can change at runtime. The island exposes an imperative API
+(`viz_add_node` / `viz_remove_node` exports in the demo; a `reconcile` core that
+takes a new node/edge set) that:
+
+1. diffs the new graph vs current (keyed by node id / `from|to` edge key);
+2. keeps survivors' positions, seeds new nodes near the centroid, and relaxes
+   with a few force steps (existing nodes barely move);
+3. drives the framework's **keyed list reconciler** (`listDiff`) on the
+   `viz-nodes` / `viz-edges` containers to create / move / remove SVG elements.
+
+**Zoom/pan and selection are never touched during reconcile → preserved.** The
+one framework-core enabler: `create_keyed_child` parses fragments in the **SVG
+namespace** (so created `<g>`/`<line>` render as SVG, not HTML) — reusable by any
+SVG keyed list, not just viz.
 
 **Limitations (this phase):** one interactive graph per page (module-static
-state); drag/pan are bounded to pointer-over-svg (releasing past the edge ends
-the gesture); the client→svg mapping assumes the svg is not CSS-scaled; charts
-stay static. See [Not yet](#not-yet-phase-2).
+state); **force layout only** (tree/radial/dag mutation deferred); a full-snapshot
+diff per update; drag/pan bounded to pointer-over-svg; the client→svg mapping
+assumes the svg isn't CSS-scaled. See [Not yet](#not-yet-phase-2).
 
 ---
 
@@ -885,8 +902,9 @@ stay static. See [Not yet](#not-yet-phase-2).
 
 ### Not yet (phase 2+)
 
-- **Runtime graph mutation** — add/remove/expand-collapse nodes at runtime
-  (needs a dynamic `createElementNS`-by-ref bridge primitive).
+- **Expand/collapse + live-data streaming** — runtime add/remove ships (above);
+  subtree expand/collapse and granular wire deltas are the next layer.
+- **Mutation for non-force layouts** — runtime mutation is force-only so far.
 - **Pointer capture** — drag/pan are bounded to pointer-over-svg; dragging past
   the svg edge ends the gesture. Document-level capture is a later refinement.
 - **Orthogonal / curved edge routing** — routed DAG edges bend through virtual
