@@ -87,6 +87,11 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         .{ .label = "Thu", .open = 98, .high = 111, .low = 97, .close = 110 },
         .{ .label = "Fri", .open = 110, .high = 118, .low = 108, .close = 116 },
     };
+    const boxes = [_]verve.viz.BoxStats{
+        .{ .label = "p50", .min = 8, .q1 = 14, .median = 19, .q3 = 26, .max = 34 },
+        .{ .label = "p95", .min = 20, .q1 = 32, .median = 41, .q3 = 55, .max = 72 },
+        .{ .label = "p99", .min = 40, .q1 = 58, .median = 70, .q3 = 88, .max = 110 },
+    };
     const quarters = [_][]const u8{ "Q1", "Q2", "Q3", "Q4" };
     const stack_series = [_]verve.viz.StackSeries{
         .{ .name = "web", .values = &.{ 12, 19, 9, 22 }, .color = "#1f6feb" },
@@ -134,6 +139,7 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         ctx.section().class("card viz-card").children(.{ ctx.h2("Stacked bar chart"), verve.viz.stackedBarChart(ctx, &quarters, &stack_series, .{ .width = 480, .height = 300, .axis_color = "#8b949e" }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Grouped bar chart"), verve.viz.groupedBarChart(ctx, &quarters, &stack_series, .{ .width = 480, .height = 300, .axis_color = "#8b949e" }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Candlestick chart"), verve.viz.candlestickChart(ctx, &candles, .{ .width = 480, .height = 300, .axis_color = "#8b949e" }) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Box plot"), verve.viz.boxPlotChart(ctx, &boxes, .{ .width = 480, .height = 300, .color = "#1f6feb", .axis_color = "#8b949e" }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Line chart"), verve.viz.lineChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Area chart"), verve.viz.areaChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Scatter plot"), verve.viz.scatterChart(ctx, &cloud, copts) }),

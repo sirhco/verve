@@ -84,6 +84,7 @@ viz.areaChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
 viz.scatterChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
 viz.pieChart(ctx, data: []const viz.Datum,  opts: viz.PieOpts)   *Node
 viz.candlestickChart(ctx, data: []const viz.Candle, opts: viz.CandleOpts) *Node
+viz.boxPlotChart(ctx, data: []const viz.BoxStats, opts: viz.ChartOpts) *Node
 ```
 
 Data shapes:
@@ -158,6 +159,20 @@ const candles = [_]viz.Candle{
     .{ .label = "Tue", .open = 109, .high = 114, .low = 104, .close = 106 },
 };
 const node = viz.candlestickChart(ctx, &candles, .{ .width = 480, .height = 300 });
+```
+
+### Box plot
+
+A Q1–Q3 box with a median line and min/max whiskers per category. Pass a
+`BoxStats` five-number summary, or derive one from raw samples with
+`viz.boxStats(alloc, samples)` (interpolated quartiles).
+
+```zig
+const boxes = [_]viz.BoxStats{
+    .{ .label = "p50", .min = 8, .q1 = 14, .median = 19, .q3 = 26, .max = 34 },
+    .{ .label = "p95", .min = 20, .q1 = 32, .median = 41, .q3 = 55, .max = 72 },
+};
+const node = viz.boxPlotChart(ctx, &boxes, .{ .width = 480, .height = 300 });
 ```
 
 ### Line chart
@@ -834,5 +849,5 @@ stay static. See [Not yet](#not-yet-phase-2).
   aren't done.
 - **Canvas draw-command path** for thousands-of-elements scale and smooth
   high-frequency animation.
-- **Box-plot / heatmap / radar** chart types — buildable today from the
+- **Heatmap / radar / violin** chart types — buildable today from the
   [scene model](#the-scene-model); first-class helpers may follow.

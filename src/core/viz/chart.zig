@@ -301,6 +301,90 @@ pub fn candlestick(ctx: *const Context, data: []const Candle, opts: CandleOpts) 
     return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
 }
 
+/// Five-number summary for one box in a box plot.
+pub const BoxStats = struct {
+    label: []const u8,
+    min: f64,
+    q1: f64,
+    median: f64,
+    q3: f64,
+    max: f64,
+};
+
+/// Compute a `BoxStats` (sans label) from raw samples via linear-interpolation
+/// quartiles. Sorts a copy on `alloc`; caller fills `.label`. Empty input → all
+/// zeros.
+pub fn boxStats(alloc: std.mem.Allocator, samples: []const f64) !BoxStats {
+    if (samples.len == 0) return .{ .label = "", .min = 0, .q1 = 0, .median = 0, .q3 = 0, .max = 0 };
+    const sorted = try alloc.dupe(f64, samples);
+    defer alloc.free(sorted);
+    std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
+    const quantile = struct {
+        fn at(s: []const f64, q: f64) f64 {
+            const h = q * @as(f64, @floatFromInt(s.len - 1));
+            const lo: usize = @intFromFloat(@floor(h));
+            const hi: usize = @intFromFloat(@ceil(h));
+            const frac = h - @floor(h);
+            return s[lo] + (s[hi] - s[lo]) * frac;
+        }
+    }.at;
+    return .{
+        .label = "",
+        .min = sorted[0],
+        .q1 = quantile(sorted, 0.25),
+        .median = quantile(sorted, 0.5),
+        .q3 = quantile(sorted, 0.75),
+        .max = sorted[sorted.len - 1],
+    };
+}
+
+/// Box-and-whisker plot: a Q1–Q3 box with a median line and min/max whiskers per
+/// category. The y axis spans [min of mins, max of maxes].
+pub fn boxPlot(ctx: *const Context, data: []const BoxStats, opts: Opts) *Node {
+    const a = ctx.allocator;
+    const plot = Plot.of(opts);
+    var shapes: std.ArrayList(scene.Shape) = .empty;
+    if (data.len == 0) return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+
+    var lo = data[0].min;
+    var hi = data[0].max;
+    for (data) |d| {
+        lo = @min(lo, d.min);
+        hi = @max(hi, d.max);
+    }
+    if (hi == lo) hi = lo + 1;
+
+    const y = scale.Linear{ .domain = .{ lo, hi }, .range = .{ plot.y0, plot.y1 } };
+    const band = scale.Band{ .count = data.len, .range = .{ plot.x0, plot.x1 }, .padding = 0.2 };
+    appendAxis(&shapes, a, .{ .orient = .left, .scale = y, .cross = plot.x0, .tick_count = opts.tick_count, .color = opts.axis_color });
+
+    const line_style = scene.Style{ .stroke = opts.color, .stroke_width = 1.5 };
+    for (data, 0..) |d, i| {
+        const cx = band.center(i);
+        const bw = band.bandwidth();
+        const half = bw * 0.3;
+        // Whiskers: q3→max (top) and q1→min (bottom), with caps.
+        shapes.append(a, .{ .line = .{ .x1 = cx, .y1 = y.map(d.q3), .x2 = cx, .y2 = y.map(d.max), .style = line_style } }) catch return errNode(ctx);
+        shapes.append(a, .{ .line = .{ .x1 = cx, .y1 = y.map(d.q1), .x2 = cx, .y2 = y.map(d.min), .style = line_style } }) catch return errNode(ctx);
+        shapes.append(a, .{ .line = .{ .x1 = cx - half * 0.6, .y1 = y.map(d.max), .x2 = cx + half * 0.6, .y2 = y.map(d.max), .style = line_style } }) catch return errNode(ctx);
+        shapes.append(a, .{ .line = .{ .x1 = cx - half * 0.6, .y1 = y.map(d.min), .x2 = cx + half * 0.6, .y2 = y.map(d.min), .style = line_style } }) catch return errNode(ctx);
+        // Box: q1→q3, translucent fill + outline.
+        const y_q3 = y.map(d.q3);
+        shapes.append(a, .{ .rect = .{
+            .x = cx - half,
+            .y = y_q3,
+            .w = half * 2,
+            .h = y.map(d.q1) - y_q3,
+            .style = .{ .fill = opts.color, .opacity = 0.3, .stroke = opts.color, .stroke_width = 1.5 },
+        } }) catch return errNode(ctx);
+        // Median line across the box.
+        shapes.append(a, .{ .line = .{ .x1 = cx - half, .y1 = y.map(d.median), .x2 = cx + half, .y2 = y.map(d.median), .style = .{ .stroke = opts.color, .stroke_width = 2 } } }) catch return errNode(ctx);
+        shapes.append(a, .{ .text = .{ .x = cx, .y = plot.y0 + 16, .content = d.label, .anchor = .middle, .font_size = 10, .style = .{ .fill = opts.axis_color } } }) catch return errNode(ctx);
+    }
+
+    return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+}
+
 /// Line chart over continuous (x, y) points (drawn in given order).
 pub fn line(ctx: *const Context, data: []const Point, opts: Opts) *Node {
     const a = ctx.allocator;
@@ -547,6 +631,33 @@ test "candlestick renders up/down bodies, wicks, and labels" {
     try testing.expect(std.mem.indexOf(u8, out, "#ef4444") != null);
     // two bodies (no other rects on this chart)
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "<rect"));
+}
+
+test "boxStats computes quartiles from samples" {
+    const s = [_]f64{ 1, 2, 3, 4, 5 };
+    const b = try boxStats(testing.allocator, &s);
+    try testing.expectEqual(@as(f64, 1), b.min);
+    try testing.expectEqual(@as(f64, 5), b.max);
+    try testing.expectEqual(@as(f64, 3), b.median);
+    try testing.expectEqual(@as(f64, 2), b.q1);
+    try testing.expectEqual(@as(f64, 4), b.q3);
+}
+
+test "box plot renders a box, median, whiskers, and label per category" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    var buf: [16384]u8 = undefined;
+    const data = [_]BoxStats{
+        .{ .label = "A", .min = 1, .q1 = 3, .median = 5, .q3 = 7, .max = 9 },
+        .{ .label = "B", .min = 2, .q1 = 4, .median = 5, .q3 = 8, .max = 12 },
+    };
+    const out = try renderToBuf(boxPlot(&ctx, &data, .{ .width = 480, .height = 300, .color = "#1f6feb" }), &buf);
+    try testing.expect(std.mem.indexOf(u8, out, ">A</text>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ">B</text>") != null);
+    // one box rect per category (translucent fill)
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "<rect"));
+    try testing.expect(std.mem.indexOf(u8, out, "opacity=\"0.3\"") != null);
 }
 
 test "line chart renders a polyline" {
