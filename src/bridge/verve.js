@@ -739,6 +739,8 @@
     verve_event_mods: exp.verve_event_mods,
     verve_event_coord_x: exp.verve_event_coord_x,
     verve_event_coord_y: exp.verve_event_coord_y,
+    verve_event_delta_y: exp.verve_event_delta_y,
+    verve_event_button: exp.verve_event_button,
     verve_event_key: exp.verve_event_key,
     verve_event_target_attr: exp.verve_event_target_attr,
     verve_event_prevent_default: exp.verve_event_prevent_default,
