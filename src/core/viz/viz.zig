@@ -63,6 +63,7 @@ pub const palette = chart_mod.palette;
 pub const barChart = chart_mod.bar;
 pub const StackSeries = chart_mod.StackSeries;
 pub const stackedBarChart = chart_mod.stackedBar;
+pub const groupedBarChart = chart_mod.groupedBar;
 pub const lineChart = chart_mod.line;
 pub const scatterChart = chart_mod.scatter;
 pub const areaChart = chart_mod.area;

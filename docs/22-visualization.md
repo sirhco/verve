@@ -78,6 +78,7 @@ Three entry points, each taking data + an options struct:
 ```zig
 viz.barChart(ctx, data: []const viz.Datum,  opts: viz.ChartOpts) *Node
 viz.stackedBarChart(ctx, categories: []const []const u8, series: []const viz.StackSeries, opts: viz.ChartOpts) *Node
+viz.groupedBarChart(ctx, categories: []const []const u8, series: []const viz.StackSeries, opts: viz.ChartOpts) *Node
 viz.lineChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
 viz.areaChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
 viz.scatterChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
@@ -140,6 +141,9 @@ const series = [_]viz.StackSeries{
 };
 const node = viz.stackedBarChart(ctx, &quarters, &series, .{ .width = 480, .height = 300 });
 ```
+
+`viz.groupedBarChart` takes the same `(categories, series)` shape but places the
+series **side-by-side** within each band instead of stacking them.
 
 ### Line chart
 

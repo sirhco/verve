@@ -125,6 +125,7 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — ON"), ctx.p().class("hint").text("Default sweeps reorder the bottom layer to Z,Y,X → edges fan cleanly, zero crossings."), dag_on }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Bar chart"), verve.viz.barChart(ctx, &bars, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Stacked bar chart"), verve.viz.stackedBarChart(ctx, &quarters, &stack_series, .{ .width = 480, .height = 300, .axis_color = "#8b949e" }) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Grouped bar chart"), verve.viz.groupedBarChart(ctx, &quarters, &stack_series, .{ .width = 480, .height = 300, .axis_color = "#8b949e" }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Line chart"), verve.viz.lineChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Area chart"), verve.viz.areaChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Scatter plot"), verve.viz.scatterChart(ctx, &cloud, copts) }),
