@@ -583,6 +583,11 @@
           : undefined;
     if (typeof fn === "function") {
       e.preventDefault();
+      // Stage the event data (coords, modifiers, and the handler element's
+      // dataset) so the wasm handler can read it via `verve_event_*` —
+      // e.g. `eventTargetAttr("node")`. Pointer events stage via
+      // dispatchEventName; this named-click path must too.
+      stageEvent(e, target);
       const vid = islandEl ? parseInt(islandEl.getAttribute("data-vid"), 10) || 0 : 0;
       const scope = vid && typeof exp.verve_enter_island === "function";
       if (scope) exp.verve_enter_island(vid);
@@ -591,6 +596,7 @@
       } finally {
         if (scope && typeof exp.verve_exit_island === "function") exp.verve_exit_island();
       }
+      applyEventFlags(e);
     } else {
       console.warn("verve: no wasm export for action", action);
     }
