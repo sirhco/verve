@@ -77,6 +77,9 @@ pub const renderGraph = graph_mod.render;
 /// positions once, reuse them for both the SSR tree and the hydration props.
 pub const graphPositions = graph_mod.computePositions;
 pub const renderGraphWith = graph_mod.renderWithPositions;
+/// Interactive graph svg (zoom/pan/drag/hover/select). Wrap the returned svg in
+/// the `VizGraphInteractive` island with encoded props. See `docs/22`.
+pub const renderGraphInteractive = graph_mod.renderInteractive;
 
 // ---- layout algorithms (lower-level, index/edge-pair based) ----
 pub const treeLayout = tree_mod.layout;
