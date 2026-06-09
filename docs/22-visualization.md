@@ -86,6 +86,7 @@ viz.pieChart(ctx, data: []const viz.Datum,  opts: viz.PieOpts)   *Node
 viz.candlestickChart(ctx, data: []const viz.Candle, opts: viz.CandleOpts) *Node
 viz.boxPlotChart(ctx, data: []const viz.BoxStats, opts: viz.ChartOpts) *Node
 viz.heatmapChart(ctx, rows: []const []const u8, cols: []const []const u8, values: []const f64, opts: viz.HeatOpts) *Node
+viz.radarChart(ctx, axes: []const []const u8, series: []const viz.StackSeries, opts: viz.ChartOpts) *Node
 ```
 
 Data shapes:
@@ -187,6 +188,21 @@ const rows = [_][]const u8{ "Mon", "Tue", "Wed" };
 const cols = [_][]const u8{ "00h", "12h", "18h" };
 const vals = [_]f64{ 2, 8, 5,  3, 12, 7,  4, 15, 9 }; // 3×3 row-major
 const node = viz.heatmapChart(ctx, &rows, &cols, &vals, .{ .width = 420, .height = 280 });
+```
+
+### Radar (spider)
+
+One axis per dimension radiating from the center, a closed polygon per series.
+Reuses `StackSeries` (one value per axis); needs ≥3 axes. Grid rings + spokes use
+`opts.axis_color`; series cycle the palette.
+
+```zig
+const axes = [_][]const u8{ "speed", "power", "range", "safety", "cost" };
+const series = [_]viz.StackSeries{
+    .{ .name = "EV",  .values = &.{ 8, 6, 5, 9, 4 }, .color = "#1f6feb" },
+    .{ .name = "ICE", .values = &.{ 6, 8, 9, 6, 7 }, .color = "#f59e0b" },
+};
+const node = viz.radarChart(ctx, &axes, &series, .{ .width = 360, .height = 360 });
 ```
 
 ### Line chart
@@ -863,5 +879,5 @@ stay static. See [Not yet](#not-yet-phase-2).
   aren't done.
 - **Canvas draw-command path** for thousands-of-elements scale and smooth
   high-frequency animation.
-- **Radar / violin / sankey** chart types — buildable today from the
+- **Violin / sankey / treemap** chart types — buildable today from the
   [scene model](#the-scene-model); first-class helpers may follow.

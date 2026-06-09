@@ -483,6 +483,65 @@ pub fn heatmap(ctx: *const Context, row_labels: []const []const u8, col_labels: 
     return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
 }
 
+/// Radar (spider) chart: one axis per dimension radiating from the center, a
+/// closed polygon per series. Reuses `StackSeries` (one value per axis). Needs
+/// at least 3 axes. Grid rings + spokes use `opts.axis_color`; series cycle the
+/// palette.
+pub fn radar(ctx: *const Context, axes: []const []const u8, series: []const StackSeries, opts: Opts) *Node {
+    const a = ctx.allocator;
+    const n = axes.len;
+    var shapes: std.ArrayList(scene.Shape) = .empty;
+    if (n < 3) return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+
+    const cx = opts.width / 2.0;
+    const cy = opts.height / 2.0;
+    const radius = @min(opts.width, opts.height) / 2.0 - 48;
+
+    var max: f64 = 0;
+    for (series) |s| for (s.values) |v| {
+        max = @max(max, v);
+    };
+    if (max == 0) max = 1;
+
+    const ang = struct {
+        fn at(i: usize, total: usize) f64 {
+            return -std.math.pi / 2.0 + @as(f64, @floatFromInt(i)) * 2.0 * std.math.pi / @as(f64, @floatFromInt(total));
+        }
+    }.at;
+
+    // Concentric grid rings.
+    const fracs = [_]f64{ 0.25, 0.5, 0.75, 1.0 };
+    for (fracs) |frac| {
+        const pts = a.alloc(Vec2, n) catch return errNode(ctx);
+        for (0..n) |i| {
+            const t = ang(i, n);
+            pts[i] = .{ .x = cx + @cos(t) * radius * frac, .y = cy + @sin(t) * radius * frac };
+        }
+        shapes.append(a, .{ .polyline = .{ .points = pts, .closed = true, .style = .{ .stroke = opts.axis_color, .stroke_width = 1, .opacity = 0.3, .fill = "none" } } }) catch return errNode(ctx);
+    }
+    // Spokes + axis labels.
+    for (0..n) |i| {
+        const t = ang(i, n);
+        shapes.append(a, .{ .line = .{ .x1 = cx, .y1 = cy, .x2 = cx + @cos(t) * radius, .y2 = cy + @sin(t) * radius, .style = .{ .stroke = opts.axis_color, .stroke_width = 1, .opacity = 0.4 } } }) catch return errNode(ctx);
+        shapes.append(a, .{ .text = .{ .x = cx + @cos(t) * (radius + 16), .y = cy + @sin(t) * (radius + 16) + 3, .content = axes[i], .anchor = .middle, .font_size = 10, .style = .{ .fill = opts.axis_color } } }) catch return errNode(ctx);
+    }
+    // Series polygons.
+    for (series, 0..) |s, si| {
+        const color = s.color orelse palette[si % palette.len];
+        const pts = a.alloc(Vec2, n) catch return errNode(ctx);
+        for (0..n) |i| {
+            const v = if (i < s.values.len) s.values[i] else 0;
+            const rr = v / max * radius;
+            const t = ang(i, n);
+            pts[i] = .{ .x = cx + @cos(t) * rr, .y = cy + @sin(t) * rr };
+        }
+        shapes.append(a, .{ .polyline = .{ .points = pts, .closed = true, .style = .{ .fill = color, .opacity = 0.25, .stroke = color, .stroke_width = 2 } } }) catch return errNode(ctx);
+    }
+
+    appendLegend(&shapes, a, series, opts, Plot.of(opts)) catch return errNode(ctx);
+    return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+}
+
 /// Line chart over continuous (x, y) points (drawn in given order).
 pub fn line(ctx: *const Context, data: []const Point, opts: Opts) *Node {
     const a = ctx.allocator;
@@ -773,6 +832,23 @@ test "heatmap renders a cell per value with interpolated colors + labels" {
     // min value → low color (black); max value → high color (rgb(100,0,0)).
     try testing.expect(std.mem.indexOf(u8, out, "rgb(0,0,0)") != null);
     try testing.expect(std.mem.indexOf(u8, out, "rgb(100,0,0)") != null);
+}
+
+test "radar renders grid rings, axis labels, and a polygon per series" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    var buf: [16384]u8 = undefined;
+    const axes = [_][]const u8{ "speed", "power", "range" };
+    const series = [_]StackSeries{
+        .{ .name = "A", .values = &.{ 3, 5, 2 }, .color = "#1f6feb" },
+        .{ .name = "B", .values = &.{ 5, 2, 4 }, .color = "#10b981" },
+    };
+    const out = try renderToBuf(radar(&ctx, &axes, &series, .{ .width = 360, .height = 360 }), &buf);
+    try testing.expect(std.mem.indexOf(u8, out, ">speed</text>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ">A</text>") != null); // legend
+    // 4 grid rings + 2 series = 6 closed polygons.
+    try testing.expectEqual(@as(usize, 6), std.mem.count(u8, out, "<polygon"));
 }
 
 test "line chart renders a polyline" {

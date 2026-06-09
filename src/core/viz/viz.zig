@@ -73,6 +73,7 @@ pub const boxPlotChart = chart_mod.boxPlot;
 pub const Rgb = chart_mod.Rgb;
 pub const HeatOpts = chart_mod.HeatOpts;
 pub const heatmapChart = chart_mod.heatmap;
+pub const radarChart = chart_mod.radar;
 pub const lineChart = chart_mod.line;
 pub const scatterChart = chart_mod.scatter;
 pub const areaChart = chart_mod.area;

@@ -100,6 +100,11 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         4, 3, 15, 9,
         6, 5, 18, 11,
     };
+    const radar_axes = [_][]const u8{ "speed", "power", "range", "safety", "cost" };
+    const radar_series = [_]verve.viz.StackSeries{
+        .{ .name = "EV", .values = &.{ 8, 6, 5, 9, 4 }, .color = "#1f6feb" },
+        .{ .name = "ICE", .values = &.{ 6, 8, 9, 6, 7 }, .color = "#f59e0b" },
+    };
     const quarters = [_][]const u8{ "Q1", "Q2", "Q3", "Q4" };
     const stack_series = [_]verve.viz.StackSeries{
         .{ .name = "web", .values = &.{ 12, 19, 9, 22 }, .color = "#1f6feb" },
@@ -149,6 +154,7 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         ctx.section().class("card viz-card").children(.{ ctx.h2("Candlestick chart"), verve.viz.candlestickChart(ctx, &candles, .{ .width = 480, .height = 300, .axis_color = "#8b949e" }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Box plot"), verve.viz.boxPlotChart(ctx, &boxes, .{ .width = 480, .height = 300, .color = "#1f6feb", .axis_color = "#8b949e" }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Heatmap"), verve.viz.heatmapChart(ctx, &heat_rows, &heat_cols, &heat_vals, .{ .width = 420, .height = 280, .show_values = true }) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Radar chart"), verve.viz.radarChart(ctx, &radar_axes, &radar_series, .{ .width = 360, .height = 360, .axis_color = "#8b949e" }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Line chart"), verve.viz.lineChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Area chart"), verve.viz.areaChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Scatter plot"), verve.viz.scatterChart(ctx, &cloud, copts) }),
