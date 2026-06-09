@@ -110,6 +110,8 @@ extern "verve_runtime" fn verve_json_str(handle: u32, buf_ptr: [*]u8, buf_cap: u
 extern "verve_runtime" fn verve_event_mods() u32;
 extern "verve_runtime" fn verve_event_coord_x() f64;
 extern "verve_runtime" fn verve_event_coord_y() f64;
+extern "verve_runtime" fn verve_event_delta_y() f64;
+extern "verve_runtime" fn verve_event_button() i32;
 extern "verve_runtime" fn verve_event_key(buf_ptr: [*]u8, buf_cap: u32) u32;
 extern "verve_runtime" fn verve_event_target_attr(
     name_ptr: [*]const u8,
@@ -685,6 +687,16 @@ pub fn eventCoordX() f64 {
 
 pub fn eventCoordY() f64 {
     return verve_event_coord_y();
+}
+
+/// Wheel `deltaY` for the current event (valid inside a wheel handler).
+pub fn eventDeltaY() f64 {
+    return verve_event_delta_y();
+}
+
+/// Pointer `button` for the current event (-1 when none).
+pub fn eventButton() i32 {
+    return verve_event_button();
 }
 
 /// A `data-*` attribute of the element the handler was stamped on,
