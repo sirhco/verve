@@ -87,6 +87,7 @@ viz.candlestickChart(ctx, data: []const viz.Candle, opts: viz.CandleOpts) *Node
 viz.boxPlotChart(ctx, data: []const viz.BoxStats, opts: viz.ChartOpts) *Node
 viz.heatmapChart(ctx, rows: []const []const u8, cols: []const []const u8, values: []const f64, opts: viz.HeatOpts) *Node
 viz.radarChart(ctx, axes: []const []const u8, series: []const viz.StackSeries, opts: viz.ChartOpts) *Node
+viz.violinChart(ctx, data: []const viz.ViolinSeries, opts: viz.ChartOpts) *Node
 ```
 
 Data shapes:
@@ -203,6 +204,20 @@ const series = [_]viz.StackSeries{
     .{ .name = "ICE", .values = &.{ 6, 8, 9, 6, 7 }, .color = "#f59e0b" },
 };
 const node = viz.radarChart(ctx, &axes, &series, .{ .width = 360, .height = 360 });
+```
+
+### Violin plot
+
+A mirrored kernel-density shape per category (width ∝ sample density at each y)
+with a median tick. Pass raw `samples`; densities use a Gaussian kernel. The y
+axis spans `[min, max]` across all samples.
+
+```zig
+const data = [_]viz.ViolinSeries{
+    .{ .label = "ctrl", .samples = &.{ 18, 20, 21, 22, 23, 24, 25, 27, 30 } },
+    .{ .label = "new",  .samples = &.{ 8, 10, 11, 12, 13, 14, 16, 20 } },
+};
+const node = viz.violinChart(ctx, &data, .{ .width = 480, .height = 320 });
 ```
 
 ### Line chart
@@ -879,5 +894,5 @@ stay static. See [Not yet](#not-yet-phase-2).
   aren't done.
 - **Canvas draw-command path** for thousands-of-elements scale and smooth
   high-frequency animation.
-- **Violin / sankey / treemap** chart types — buildable today from the
+- **Sankey / treemap / chord** chart types — buildable today from the
   [scene model](#the-scene-model); first-class helpers may follow.

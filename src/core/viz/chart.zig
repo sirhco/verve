@@ -542,6 +542,78 @@ pub fn radar(ctx: *const Context, axes: []const []const u8, series: []const Stac
     return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
 }
 
+/// One distribution for a violin plot: a label + raw samples.
+pub const ViolinSeries = struct { label: []const u8, samples: []const f64 };
+
+/// Violin plot: a mirrored kernel-density shape per category (width ∝ sample
+/// density at each y) with a median tick. The y axis spans [min, max] across all
+/// samples. Densities use a Gaussian kernel.
+pub fn violin(ctx: *const Context, data: []const ViolinSeries, opts: Opts) *Node {
+    const a = ctx.allocator;
+    const plot = Plot.of(opts);
+    var shapes: std.ArrayList(scene.Shape) = .empty;
+    if (data.len == 0) return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+
+    var lo: f64 = std.math.inf(f64);
+    var hi: f64 = -std.math.inf(f64);
+    var any = false;
+    for (data) |d| for (d.samples) |s| {
+        lo = @min(lo, s);
+        hi = @max(hi, s);
+        any = true;
+    };
+    if (!any) return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+    if (hi == lo) hi = lo + 1;
+
+    const y = scale.Linear{ .domain = .{ lo, hi }, .range = .{ plot.y0, plot.y1 } };
+    const band = scale.Band{ .count = data.len, .range = .{ plot.x0, plot.x1 }, .padding = 0.3 };
+    appendAxis(&shapes, a, .{ .orient = .left, .scale = y, .cross = plot.x0, .tick_count = opts.tick_count, .color = opts.axis_color });
+
+    const grid = 40;
+    const bw = (hi - lo) / 12.0; // kernel bandwidth
+    const max_half = band.bandwidth() / 2.0 * 0.95;
+
+    for (data, 0..) |d, ci| {
+        if (d.samples.len == 0) continue;
+        const cx = band.center(ci);
+        const color = palette[ci % palette.len];
+
+        // Gaussian-kernel density on a y grid; track the peak to normalize width.
+        const dens = a.alloc(f64, grid) catch return errNode(ctx);
+        var maxd: f64 = 0;
+        for (0..grid) |g| {
+            const yg = lo + (hi - lo) * @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(grid - 1));
+            var sum: f64 = 0;
+            for (d.samples) |s| {
+                const z = (yg - s) / bw;
+                sum += @exp(-0.5 * z * z);
+            }
+            dens[g] = sum;
+            maxd = @max(maxd, sum);
+        }
+        if (maxd == 0) maxd = 1;
+
+        // Symmetric polygon: left edge up, right edge back down.
+        const pts = a.alloc(Vec2, grid * 2) catch return errNode(ctx);
+        for (0..grid) |g| {
+            const yg = lo + (hi - lo) * @as(f64, @floatFromInt(g)) / @as(f64, @floatFromInt(grid - 1));
+            const hw = dens[g] / maxd * max_half;
+            const py = y.map(yg);
+            pts[g] = .{ .x = cx - hw, .y = py };
+            pts[grid * 2 - 1 - g] = .{ .x = cx + hw, .y = py };
+        }
+        shapes.append(a, .{ .polyline = .{ .points = pts, .closed = true, .style = .{ .fill = color, .opacity = 0.3, .stroke = color, .stroke_width = 1.5 } } }) catch return errNode(ctx);
+
+        // Median tick.
+        const stats = boxStats(a, d.samples) catch return errNode(ctx);
+        const my = y.map(stats.median);
+        shapes.append(a, .{ .line = .{ .x1 = cx - max_half * 0.4, .y1 = my, .x2 = cx + max_half * 0.4, .y2 = my, .style = .{ .stroke = color, .stroke_width = 2 } } }) catch return errNode(ctx);
+        shapes.append(a, .{ .text = .{ .x = cx, .y = plot.y0 + 16, .content = d.label, .anchor = .middle, .font_size = 10, .style = .{ .fill = opts.axis_color } } }) catch return errNode(ctx);
+    }
+
+    return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+}
+
 /// Line chart over continuous (x, y) points (drawn in given order).
 pub fn line(ctx: *const Context, data: []const Point, opts: Opts) *Node {
     const a = ctx.allocator;
@@ -849,6 +921,22 @@ test "radar renders grid rings, axis labels, and a polygon per series" {
     try testing.expect(std.mem.indexOf(u8, out, ">A</text>") != null); // legend
     // 4 grid rings + 2 series = 6 closed polygons.
     try testing.expectEqual(@as(usize, 6), std.mem.count(u8, out, "<polygon"));
+}
+
+test "violin renders a density polygon + median per category" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    var buf: [32768]u8 = undefined;
+    const data = [_]ViolinSeries{
+        .{ .label = "A", .samples = &.{ 1, 2, 2, 3, 3, 3, 4, 4, 5 } },
+        .{ .label = "B", .samples = &.{ 2, 4, 4, 6, 6, 6, 8, 10 } },
+    };
+    const out = try renderToBuf(violin(&ctx, &data, .{ .width = 480, .height = 320 }), &buf);
+    try testing.expect(std.mem.indexOf(u8, out, ">A</text>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ">B</text>") != null);
+    // one mirrored density polygon per category
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "<polygon"));
 }
 
 test "line chart renders a polyline" {

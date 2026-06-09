@@ -105,6 +105,11 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         .{ .name = "EV", .values = &.{ 8, 6, 5, 9, 4 }, .color = "#1f6feb" },
         .{ .name = "ICE", .values = &.{ 6, 8, 9, 6, 7 }, .color = "#f59e0b" },
     };
+    const violin_data = [_]verve.viz.ViolinSeries{
+        .{ .label = "ctrl", .samples = &.{ 18, 20, 21, 22, 22, 23, 23, 24, 25, 27, 30 } },
+        .{ .label = "A/B", .samples = &.{ 12, 15, 16, 17, 18, 18, 19, 20, 22, 26 } },
+        .{ .label = "new", .samples = &.{ 8, 10, 11, 11, 12, 12, 13, 14, 16, 20 } },
+    };
     const quarters = [_][]const u8{ "Q1", "Q2", "Q3", "Q4" };
     const stack_series = [_]verve.viz.StackSeries{
         .{ .name = "web", .values = &.{ 12, 19, 9, 22 }, .color = "#1f6feb" },
@@ -155,6 +160,7 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         ctx.section().class("card viz-card").children(.{ ctx.h2("Box plot"), verve.viz.boxPlotChart(ctx, &boxes, .{ .width = 480, .height = 300, .color = "#1f6feb", .axis_color = "#8b949e" }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Heatmap"), verve.viz.heatmapChart(ctx, &heat_rows, &heat_cols, &heat_vals, .{ .width = 420, .height = 280, .show_values = true }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Radar chart"), verve.viz.radarChart(ctx, &radar_axes, &radar_series, .{ .width = 360, .height = 360, .axis_color = "#8b949e" }) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Violin plot"), verve.viz.violinChart(ctx, &violin_data, .{ .width = 480, .height = 320, .axis_color = "#8b949e" }) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Line chart"), verve.viz.lineChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Area chart"), verve.viz.areaChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Scatter plot"), verve.viz.scatterChart(ctx, &cloud, copts) }),
