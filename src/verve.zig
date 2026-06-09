@@ -186,6 +186,10 @@ pub const highlightThemeCss = @import("core/highlight_theme.zig").css;
 pub const island = @import("core/island.zig").island;
 pub const IslandOpts = @import("core/island.zig").IslandOpts;
 
+// Visualization — graphs, hierarchies, charts (SVG scene model + layouts).
+// Pure-Zig, target-agnostic; output is an SVG `*Node` tree.
+pub const viz = @import("core/viz/viz.zig");
+
 // Codec
 pub const encode = serialize_mod.encode;
 
@@ -268,4 +272,5 @@ test {
     _ = @import("core/markdown_inline.zig");
     _ = @import("core/island_state.zig");
     _ = @import("core/props.zig");
+    _ = @import("core/viz/viz.zig");
 }

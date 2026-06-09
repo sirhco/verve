@@ -26,6 +26,7 @@ you know what you need.
 19. [Desktop apps](19-desktop.md) — native window + system webview, SSR + WASM hydration under `verve://`, typed IPC, cookies, multi-window, `.app` bundle, dev loop, Level-3 smoke
 20. [Client runtime](20-client-runtime.md) — wasm-side app primitives: typed IPC replies + shared JSON service (shipped), then events-with-data, timers, storage, forms, JS interop
 21. [Markdown & syntax highlighting](21-markdown-and-highlighting.md) — pure-Zig server-side GFM markdown + code highlighting, safe-by-default, `ctx.markdown` / `ctx.codeBlock` / `verve.highlightThemeCss`
+22. [Visualization](22-visualization.md) — native `verve.viz` graphs/hierarchies/charts: SVG scene model, scales/axes, tree/radial/force/dag layouts, bar/line/area/scatter/pie charts, interactive island pattern
 
 ## Reference
 

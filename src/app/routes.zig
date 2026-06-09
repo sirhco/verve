@@ -9,6 +9,7 @@ const api = @import("api.zig");
 pub const routes: []const verve.Route = &.{
     verve.Route.init("/", renderHome),
     verve.Route.init("/counter", renderCounter),
+    verve.Route.init("/viz", renderViz),
     verve.Route.init("/todos", renderTodos),
     verve.Route.init("/work/:slug", renderWorkDetail),
     verve.Route.layout("/app", renderAppShell, &.{
@@ -25,6 +26,11 @@ fn renderHome(ctx: *verve.Context) !*verve.Node {
 
 fn renderCounter(ctx: *verve.Context) !*verve.Node {
     const body = try components.counter(ctx, api.currentCount());
+    return components.page(ctx, body);
+}
+
+fn renderViz(ctx: *verve.Context) !*verve.Node {
+    const body = try components.viz(ctx);
     return components.page(ctx, body);
 }
 
