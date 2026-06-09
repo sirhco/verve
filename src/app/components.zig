@@ -32,11 +32,15 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
     const xs = try ctx.alloc().alloc(f64, positions.len);
     const ys = try ctx.alloc().alloc(f64, positions.len);
     const node_labels = try ctx.alloc().alloc([]const u8, nodes.len);
+    const node_ids = try ctx.alloc().alloc([]const u8, nodes.len);
     for (positions, 0..) |p, i| {
         xs[i] = p.x;
         ys[i] = p.y;
     }
-    for (nodes, 0..) |nd, i| node_labels[i] = nd.label;
+    for (nodes, 0..) |nd, i| {
+        node_labels[i] = nd.label;
+        node_ids[i] = nd.id;
+    }
     var ef: std.ArrayList(u32) = .empty;
     var et: std.ArrayList(u32) = .empty;
     for (edges) |e| {
@@ -55,6 +59,7 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         .ef = ef.items,
         .et = et.items,
         .labels = node_labels,
+        .ids = node_ids,
     });
     const graph_svg = verve.viz.renderGraphInteractive(ctx, g, gopts);
     const graph_island = verve.island(ctx, .{ .name = "VizGraphInteractive", .props = props }, graph_svg);

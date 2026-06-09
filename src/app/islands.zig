@@ -58,5 +58,6 @@ pub const VizGraphInteractive = struct {
         ef: []const u32,
         et: []const u32,
         labels: []const []const u8,
+        ids: []const []const u8,
     };
 };
