@@ -220,6 +220,87 @@ fn appendLegend(shapes: *std.ArrayList(scene.Shape), a: std.mem.Allocator, serie
     }
 }
 
+/// One OHLC bar for a candlestick chart.
+pub const Candle = struct {
+    label: []const u8,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+};
+
+pub const CandleOpts = struct {
+    width: f64 = 600,
+    height: f64 = 400,
+    margin: Margin = .{},
+    up_color: []const u8 = "#10b981", // close ≥ open
+    down_color: []const u8 = "#ef4444", // close < open
+    axis_color: []const u8 = "#888",
+    tick_count: usize = 5,
+};
+
+/// Candlestick (OHLC) chart: a thin high–low wick with a thick open–close body
+/// per period, colored up/down by direction. The price axis spans [min low,
+/// max high] (not anchored at zero).
+pub fn candlestick(ctx: *const Context, data: []const Candle, opts: CandleOpts) *Node {
+    const a = ctx.allocator;
+    const plot = Plot{
+        .x0 = opts.margin.left,
+        .x1 = opts.width - opts.margin.right,
+        .y0 = opts.height - opts.margin.bottom,
+        .y1 = opts.margin.top,
+    };
+    var shapes: std.ArrayList(scene.Shape) = .empty;
+    if (data.len == 0) return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+
+    var lo = data[0].low;
+    var hi = data[0].high;
+    for (data) |d| {
+        lo = @min(lo, d.low);
+        hi = @max(hi, d.high);
+    }
+    if (hi == lo) hi = lo + 1;
+
+    const y = scale.Linear{ .domain = .{ lo, hi }, .range = .{ plot.y0, plot.y1 } };
+    const band = scale.Band{ .count = data.len, .range = .{ plot.x0, plot.x1 }, .padding = 0.2 };
+    appendAxis(&shapes, a, .{ .orient = .left, .scale = y, .cross = plot.x0, .tick_count = opts.tick_count, .color = opts.axis_color });
+
+    for (data, 0..) |d, i| {
+        const cx = band.center(i);
+        const bw = band.bandwidth();
+        const up = d.close >= d.open;
+        const color = if (up) opts.up_color else opts.down_color;
+        // Wick: high → low.
+        shapes.append(a, .{ .line = .{
+            .x1 = cx,
+            .y1 = y.map(d.high),
+            .x2 = cx,
+            .y2 = y.map(d.low),
+            .style = .{ .stroke = color, .stroke_width = 1.5 },
+        } }) catch return errNode(ctx);
+        // Body: open ↔ close (min 1px tall so dojis still show).
+        const y_hi = y.map(@max(d.open, d.close));
+        const y_lo = y.map(@min(d.open, d.close));
+        shapes.append(a, .{ .rect = .{
+            .x = cx - bw * 0.3,
+            .y = y_hi,
+            .w = bw * 0.6,
+            .h = @max(y_lo - y_hi, 1),
+            .style = .{ .fill = color },
+        } }) catch return errNode(ctx);
+        shapes.append(a, .{ .text = .{
+            .x = cx,
+            .y = plot.y0 + 16,
+            .content = d.label,
+            .anchor = .middle,
+            .font_size = 10,
+            .style = .{ .fill = opts.axis_color },
+        } }) catch return errNode(ctx);
+    }
+
+    return scene.toNode(ctx, .{ .width = opts.width, .height = opts.height, .shapes = shapes.items });
+}
+
 /// Line chart over continuous (x, y) points (drawn in given order).
 pub fn line(ctx: *const Context, data: []const Point, opts: Opts) *Node {
     const a = ctx.allocator;
@@ -447,6 +528,25 @@ test "grouped bar renders side-by-side bars per category + legend" {
     try testing.expect(std.mem.indexOf(u8, out, ">web</text>") != null);
     // 4 bars (2 cats × 2 series, all non-zero) + 2 legend swatches = 6 rects.
     try testing.expectEqual(@as(usize, 6), std.mem.count(u8, out, "<rect"));
+}
+
+test "candlestick renders up/down bodies, wicks, and labels" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    var buf: [16384]u8 = undefined;
+    const data = [_]Candle{
+        .{ .label = "Mon", .open = 10, .high = 14, .low = 9, .close = 13 }, // up
+        .{ .label = "Tue", .open = 13, .high = 13, .low = 8, .close = 9 }, // down
+    };
+    const out = try renderToBuf(candlestick(&ctx, &data, .{ .width = 480, .height = 300 }), &buf);
+    try testing.expect(std.mem.indexOf(u8, out, ">Mon</text>") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ">Tue</text>") != null);
+    // up color (green) + down color (red) both present
+    try testing.expect(std.mem.indexOf(u8, out, "#10b981") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "#ef4444") != null);
+    // two bodies (no other rects on this chart)
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "<rect"));
 }
 
 test "line chart renders a polyline" {

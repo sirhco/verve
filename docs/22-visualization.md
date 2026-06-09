@@ -83,6 +83,7 @@ viz.lineChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
 viz.areaChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
 viz.scatterChart(ctx, data: []const viz.Point, opts: viz.ChartOpts) *Node
 viz.pieChart(ctx, data: []const viz.Datum,  opts: viz.PieOpts)   *Node
+viz.candlestickChart(ctx, data: []const viz.Candle, opts: viz.CandleOpts) *Node
 ```
 
 Data shapes:
@@ -144,6 +145,20 @@ const node = viz.stackedBarChart(ctx, &quarters, &series, .{ .width = 480, .heig
 
 `viz.groupedBarChart` takes the same `(categories, series)` shape but places the
 series **side-by-side** within each band instead of stacking them.
+
+### Candlestick (OHLC)
+
+Financial candles: a thin high–low wick with a thick open–close body per period,
+colored up (`close ≥ open`) or down. The price axis spans `[min low, max high]`
+(not zero-anchored).
+
+```zig
+const candles = [_]viz.Candle{
+    .{ .label = "Mon", .open = 100, .high = 112, .low = 96, .close = 109 },
+    .{ .label = "Tue", .open = 109, .high = 114, .low = 104, .close = 106 },
+};
+const node = viz.candlestickChart(ctx, &candles, .{ .width = 480, .height = 300 });
+```
 
 ### Line chart
 
@@ -819,5 +834,5 @@ stay static. See [Not yet](#not-yet-phase-2).
   aren't done.
 - **Canvas draw-command path** for thousands-of-elements scale and smooth
   high-frequency animation.
-- **Grouped-bar / candlestick / box-plot** chart types — buildable today from
-  the [scene model](#the-scene-model); first-class helpers may follow.
+- **Box-plot / heatmap / radar** chart types — buildable today from the
+  [scene model](#the-scene-model); first-class helpers may follow.
