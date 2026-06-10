@@ -165,6 +165,8 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         vbw = r.w;
         vbh = r.h;
     }
+
+    verve.registerResponseHandler("vizGraph", &onGraph);
 }
 
 fn svgRect() verve.Rect {
@@ -467,6 +469,96 @@ fn reconcile(new_ids: []const []const u8, new_labels: []const []const u8, new_ed
     drag_node = null;
     panning = false;
     if (sel_len != 0 and slotOfId(sel_buf[0..sel_len]) == null) sel_len = 0;
+}
+
+// ---- live-data polling ------------------------------------------------------
+
+var live_timer: u32 = 0;
+var polling: bool = false;
+
+/// Mirror of core/viz/graph.zig mapSnapshotEdges (chunk can't import across the
+/// module boundary).
+fn mapSnapshotEdges(ids: []const []const u8, froms: []const []const u8, tos: []const []const u8, out: [][2]usize) usize {
+    const lookup = struct {
+        fn of(list: []const []const u8, id: []const u8) ?usize {
+            for (list, 0..) |x, i| if (std.mem.eql(u8, x, id)) return i;
+            return null;
+        }
+    }.of;
+    var k: usize = 0;
+    const m = @min(froms.len, tos.len);
+    for (0..m) |i| {
+        const f = lookup(ids, froms[i]) orelse continue;
+        const t = lookup(ids, tos[i]) orelse continue;
+        if (k >= out.len) break;
+        out[k] = .{ f, t };
+        k += 1;
+    }
+    return k;
+}
+
+/// Response handler for the `vizGraph` server-fn reply. Parses the
+/// `{"value":{"nodes":[{id,label}],"edges":[{from,to}]}}` snapshot and reconciles.
+fn onGraph(ptr: [*]const u8, len: u32) void {
+    const doc = verve.parseJson(ptr[0..len]) orelse return;
+    defer doc.free();
+    const value = doc.get("value") orelse return;
+    const nodes = value.get("nodes") orelse return;
+    const edges = value.get("edges") orelse return;
+    const node_n_i = nodes.len();
+    if (node_n_i <= 0) return;
+    const node_n: usize = @min(@as(usize, @intCast(node_n_i)), MAX_N);
+
+    const m = verve.chunkArenaMark();
+    defer verve.chunkArenaReset(m);
+    const a = verve.chunkArena();
+
+    const ids = a.alloc([]const u8, node_n) catch return;
+    const labels = a.alloc([]const u8, node_n) catch return;
+    for (0..node_n) |i| {
+        const nd = nodes.at(@intCast(i)) orelse return;
+        const id_j = nd.get("id") orelse return;
+        const lab_j = nd.get("label") orelse id_j;
+        const ib = a.alloc(u8, MAX_ID) catch return;
+        ids[i] = a.dupe(u8, id_j.str(ib)) catch return;
+        const lb = a.alloc(u8, MAX_LABEL) catch return;
+        labels[i] = a.dupe(u8, lab_j.str(lb)) catch return;
+    }
+
+    const edge_n_i = edges.len();
+    const ecap: usize = if (edge_n_i <= 0) 0 else @min(@as(usize, @intCast(edge_n_i)), MAX_E);
+    const froms = a.alloc([]const u8, ecap) catch return;
+    const tos = a.alloc([]const u8, ecap) catch return;
+    for (0..ecap) |i| {
+        const ed = edges.at(@intCast(i)) orelse return;
+        const fj = ed.get("from") orelse return;
+        const tj = ed.get("to") orelse return;
+        const fb = a.alloc(u8, MAX_ID) catch return;
+        const tb = a.alloc(u8, MAX_ID) catch return;
+        froms[i] = a.dupe(u8, fj.str(fb)) catch return;
+        tos[i] = a.dupe(u8, tj.str(tb)) catch return;
+    }
+    const pairs = a.alloc([2]usize, ecap) catch return;
+    const k = mapSnapshotEdges(ids, froms, tos, pairs);
+
+    reconcile(ids, labels, pairs[0..k]);
+}
+
+fn poll() void {
+    verve.serverFnPost("vizGraph", "{}");
+}
+
+/// Toggle the polling stream. Starts/stops a 2s interval; updates the button.
+export fn viz_toggle_live() void {
+    if (polling) {
+        verve.clearTimer(live_timer);
+        polling = false;
+    } else {
+        live_timer = verve.setInterval(2000, &poll);
+        polling = true;
+        poll();
+    }
+    if (verve.queryRef(@as([]const u8, "viz-live-btn"))) |h| verve.setRefClass(h, "live-on", polling);
 }
 
 var add_seq: u32 = 0;
