@@ -58,12 +58,18 @@ pub fn build(b: *std.Build) void {
     const viz_core_mod = b.createModule(.{
         .root_source_file = b.path("src/core/viz/client_core.zig"),
     });
+    // Pure anim builders (tween/timeline/easing/stagger + wire serializer)
+    // so chunks can construct descriptors for the verve.js interpreter.
+    const anim_core_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/anim/client_core.zig"),
+    });
     const verve_island_mod = b.addModule("verve_island", .{
         .root_source_file = b.path("src/client/island_runtime.zig"),
         .imports = &.{
             .{ .name = "serialize", .module = serialize_island_mod },
             .{ .name = "island_state", .module = island_state_island_mod },
             .{ .name = "viz_core", .module = viz_core_mod },
+            .{ .name = "anim_core", .module = anim_core_mod },
         },
     });
 

@@ -43,6 +43,13 @@ pub const VizGraph = struct {
     };
 };
 
+/// verve.anim demo — imperative timeline with staggered entrance, control
+/// API buttons, an onComplete-callback signal, and a dynamic-value +
+/// fn-modifier tween. Source: `src/client/islands/AnimDemo.zig`.
+pub const AnimDemo = struct {
+    pub const props_schema: []const u8 = "{}";
+};
+
 /// Interactive node-link graph: wheel-zoom, drag-to-pan, node drag (incident
 /// edges follow), hover tooltip, click-select. SSR renders the full static
 /// graph; the client chunk wires interaction over the fixed element set. No new

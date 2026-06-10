@@ -944,3 +944,43 @@ test "/push resumes after Last-Event-ID without replaying delivered frames" {
     try std.testing.expect(std.mem.indexOf(u8, second.items, "id: 2\nevent: viz\ndata: {\"seq\":2,\"ops\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, second.items, "id: 1\n") == null);
 }
+
+test "/anim serves data-anim descriptors and the AnimDemo island" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 14);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    var resp = try request(io, gpa, port, "GET", "/anim");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // Declarative SSR descriptors (Node.animate -> data-anim attribute,
+    // JSON quotes escaped by the renderer).
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-anim=\"{&quot;v&quot;:1") != null);
+    // Entrance from-tween keys and the keyframed pulse survive the round-trip.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;e&quot;:&quot;outCubic&quot;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;k&quot;:[{&quot;o&quot;:0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;rep&quot;:-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;rm&quot;:&quot;skip&quot;") != null);
+
+    // Imperative island marker + its control buttons.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-name=\"AnimDemo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "z-on-click=\"anim_pause\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "z-bind=") != null);
+
+    // The island chunk is built and served.
+    var chunk = try request(io, gpa, port, "GET", "/islands/AnimDemo.wasm");
+    defer chunk.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), chunk.status);
+
+    // The bridge ships the anim interpreter + SSR scanner.
+    var js = try request(io, gpa, port, "GET", "/verve.js");
+    defer js.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), js.status);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_anim_create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "data-anim-done") != null);
+}

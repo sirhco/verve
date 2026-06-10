@@ -190,6 +190,12 @@ pub const IslandOpts = @import("core/island.zig").IslandOpts;
 // Pure-Zig, target-agnostic; output is an SVG `*Node` tree.
 pub const viz = @import("core/viz/viz.zig");
 
+// Animation — tweens, timelines, easing, stagger (descriptor builders +
+// math utils). Zig builds and serializes; the verve.js interpreter
+// executes. SSR surface via `Node.animate(...)`, imperative island
+// surface via `verve.animPlay(...)` in the client runtime.
+pub const anim = @import("core/anim/anim.zig");
+
 // Codec
 pub const encode = serialize_mod.encode;
 
@@ -273,4 +279,5 @@ test {
     _ = @import("core/island_state.zig");
     _ = @import("core/props.zig");
     _ = @import("core/viz/viz.zig");
+    _ = @import("core/anim/anim.zig");
 }

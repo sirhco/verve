@@ -744,6 +744,784 @@
     }
   };
 
+  // ---- Verve Anim ------------------------------------------------------
+  // Descriptor interpreter for verve.anim ("v":1 wire format — the Zig
+  // serializer in src/core/anim/serialize.zig is the source of truth; its
+  // golden tests are this code's conformance fixtures). Zig builds and
+  // serializes tween/timeline descriptors; this section owns the rAF loop
+  // and style writes. Wasm is re-entered per frame only for dynamic
+  // values / fn modifiers (translated funcref slots called directly).
+
+  // Easing — constants match src/core/anim/ease.zig exactly.
+  const EASE = (() => {
+    const { pow, sin, cos, sqrt, PI } = Math;
+    const c1 = 1.70158;
+    const c2 = c1 * 1.525;
+    const c3 = c1 + 1;
+    const c4 = (2 * PI) / 3;
+    const c5 = (2 * PI) / 4.5;
+    const bOut = (t) => {
+      const n1 = 7.5625;
+      const d1 = 2.75;
+      if (t < 1 / d1) return n1 * t * t;
+      if (t < 2 / d1) return n1 * (t -= 1.5 / d1) * t + 0.75;
+      if (t < 2.5 / d1) return n1 * (t -= 2.25 / d1) * t + 0.9375;
+      return n1 * (t -= 2.625 / d1) * t + 0.984375;
+    };
+    return {
+      linear: (t) => t,
+      inSine: (t) => 1 - cos((t * PI) / 2),
+      outSine: (t) => sin((t * PI) / 2),
+      inOutSine: (t) => -(cos(PI * t) - 1) / 2,
+      inQuad: (t) => t * t,
+      outQuad: (t) => 1 - (1 - t) * (1 - t),
+      inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2),
+      inCubic: (t) => t * t * t,
+      outCubic: (t) => 1 - pow(1 - t, 3),
+      inOutCubic: (t) => (t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2),
+      inQuart: (t) => t * t * t * t,
+      outQuart: (t) => 1 - pow(1 - t, 4),
+      inOutQuart: (t) => (t < 0.5 ? 8 * t * t * t * t : 1 - pow(-2 * t + 2, 4) / 2),
+      inQuint: (t) => t * t * t * t * t,
+      outQuint: (t) => 1 - pow(1 - t, 5),
+      inOutQuint: (t) => (t < 0.5 ? 16 * t * t * t * t * t : 1 - pow(-2 * t + 2, 5) / 2),
+      inExpo: (t) => (t === 0 ? 0 : pow(2, 10 * t - 10)),
+      outExpo: (t) => (t === 1 ? 1 : 1 - pow(2, -10 * t)),
+      inOutExpo: (t) =>
+        t === 0 ? 0 : t === 1 ? 1 : t < 0.5 ? pow(2, 20 * t - 10) / 2 : (2 - pow(2, -20 * t + 10)) / 2,
+      inCirc: (t) => 1 - sqrt(1 - t * t),
+      outCirc: (t) => sqrt(1 - (t - 1) * (t - 1)),
+      inOutCirc: (t) =>
+        t < 0.5 ? (1 - sqrt(1 - pow(2 * t, 2))) / 2 : (sqrt(1 - pow(-2 * t + 2, 2)) + 1) / 2,
+      inBack: (t) => c3 * t * t * t - c1 * t * t,
+      outBack: (t) => 1 + c3 * pow(t - 1, 3) + c1 * pow(t - 1, 2),
+      inOutBack: (t) =>
+        t < 0.5
+          ? (pow(2 * t, 2) * ((c2 + 1) * 2 * t - c2)) / 2
+          : (pow(2 * t - 2, 2) * ((c2 + 1) * (t * 2 - 2) + c2) + 2) / 2,
+      inElastic: (t) =>
+        t === 0 ? 0 : t === 1 ? 1 : -pow(2, 10 * t - 10) * sin((t * 10 - 10.75) * c4),
+      outElastic: (t) =>
+        t === 0 ? 0 : t === 1 ? 1 : pow(2, -10 * t) * sin((t * 10 - 0.75) * c4) + 1,
+      inOutElastic: (t) =>
+        t === 0
+          ? 0
+          : t === 1
+            ? 1
+            : t < 0.5
+              ? -(pow(2, 20 * t - 10) * sin((20 * t - 11.125) * c5)) / 2
+              : (pow(2, -20 * t + 10) * sin((20 * t - 11.125) * c5)) / 2 + 1,
+      inBounce: (t) => 1 - bOut(1 - t),
+      outBounce: bOut,
+      inOutBounce: (t) => (t < 0.5 ? (1 - bOut(1 - 2 * t)) / 2 : (1 + bOut(2 * t - 1)) / 2),
+    };
+  })();
+  const easeFnOf = (name) => EASE[name] || EASE.linear;
+
+  // Value parsing — numbers with units and computed-style rgb()/rgba().
+  const ANIM_NUM_RE = /^(-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)(.*)$/i;
+  const animParseVal = (s) => {
+    if (typeof s === "number") return { n: s, u: null };
+    if (s == null) return null;
+    s = String(s).trim();
+    const cm = s.match(/^rgba?\(([^)]+)\)$/);
+    if (cm) {
+      const p = cm[1].split(",").map(parseFloat);
+      return { rgb: [p[0] || 0, p[1] || 0, p[2] || 0, p.length > 3 ? p[3] : 1] };
+    }
+    const m = s.match(ANIM_NUM_RE);
+    if (m) return { n: parseFloat(m[1]), u: m[2].trim() || null };
+    return null;
+  };
+
+  // Transform composition — the engine owns `style.transform` for any
+  // element it touches. x/y/scale/rotate/skew compose into ONE transform
+  // write per element per frame. Pre-existing transforms are absorbed via
+  // one-time 2D matrix decomposition (matrix3d → warn + identity).
+  const XFORM = new Set(["x", "y", "scale", "scaleX", "scaleY", "rotate", "skewX", "skewY"]);
+  const UNITLESS = new Set([
+    "opacity", "scale", "scaleX", "scaleY", "z-index", "flex-grow", "flex-shrink",
+    "font-weight", "order", "zoom",
+  ]);
+  const DEG_PROPS = new Set(["rotate", "skewX", "skewY"]);
+  const xformCache = new WeakMap();
+  const seedXform = (el) => {
+    const st = { x: 0, y: 0, sx: 1, sy: 1, r: 0, kx: 0, ky: 0 };
+    let tr = "";
+    try {
+      tr = getComputedStyle(el).transform || "";
+    } catch {}
+    if (tr && tr !== "none") {
+      if (tr.startsWith("matrix3d")) {
+        console.warn("verve anim: matrix3d transform absorbed as identity", el);
+      } else {
+        const m = tr.match(/matrix\(([^)]+)\)/);
+        if (m) {
+          const [a, b, c, d, e, f] = m[1].split(",").map(Number);
+          st.x = e;
+          st.y = f;
+          const sx = Math.hypot(a, b);
+          st.r = (Math.atan2(b, a) * 180) / Math.PI;
+          st.sx = sx;
+          st.sy = sx ? (a * d - b * c) / sx : 1;
+          st.kx = (Math.atan2(a * c + b * d, a * a + b * b) * 180) / Math.PI;
+        }
+      }
+    }
+    return st;
+  };
+  const getXform = (el) => {
+    let s = xformCache.get(el);
+    if (!s) {
+      s = seedXform(el);
+      xformCache.set(el, s);
+    }
+    return s;
+  };
+  const xformGet = (s, prop) =>
+    prop === "x" ? s.x
+    : prop === "y" ? s.y
+    : prop === "rotate" ? s.r
+    : prop === "skewX" ? s.kx
+    : prop === "skewY" ? s.ky
+    : prop === "scaleY" ? s.sy
+    : s.sx; // scale / scaleX
+  const xformSet = (s, prop, v) => {
+    if (prop === "x") s.x = v;
+    else if (prop === "y") s.y = v;
+    else if (prop === "rotate") s.r = v;
+    else if (prop === "skewX") s.kx = v;
+    else if (prop === "skewY") s.ky = v;
+    else if (prop === "scaleX") s.sx = v;
+    else if (prop === "scaleY") s.sy = v;
+    else {
+      s.sx = v;
+      s.sy = v;
+    }
+  };
+  const writeXform = (el) => {
+    const s = xformCache.get(el);
+    el.style.transform =
+      `translate(${s.x}px, ${s.y}px) rotate(${s.r}deg) ` +
+      `skew(${s.kx}deg, ${s.ky}deg) scale(${s.sx}, ${s.sy})`;
+  };
+
+  // Stagger delays — mirrors src/core/anim/stagger.zig.
+  const staggerDelays = (n, st) => {
+    const out = new Array(n).fill(0);
+    if (!st || n <= 1) return out;
+    const grid = st.grid || null;
+    const cols = grid ? Math.max(grid[0], 1) : 0;
+    const lastC = grid ? Math.max(grid[0], 1) - 1 : 0;
+    const lastR = grid ? Math.max(grid[1], 1) - 1 : 0;
+    const from = st.from == null ? "start" : st.from;
+    const focal = (() => {
+      if (grid) {
+        if (from === "start") return [0, 0];
+        if (from === "end") return [lastC, lastR];
+        if (from === "center" || from === "edges") return [lastC / 2, lastR / 2];
+        const k = Math.min(typeof from === "number" ? from : 0, n - 1);
+        return [k % cols, Math.floor(k / cols)];
+      }
+      if (from === "start") return 0;
+      if (from === "end") return n - 1;
+      if (from === "center" || from === "edges") return (n - 1) / 2;
+      return Math.min(typeof from === "number" ? from : 0, n - 1);
+    })();
+    const dist = (i) => {
+      if (grid) {
+        const dx = (i % cols) - focal[0];
+        const dy = Math.floor(i / cols) - focal[1];
+        if (st.axis === "x") return Math.abs(dx);
+        if (st.axis === "y") return Math.abs(dy);
+        return Math.hypot(dx, dy);
+      }
+      return Math.abs(i - focal);
+    };
+    let dmax = 0;
+    for (let i = 0; i < n; i++) dmax = Math.max(dmax, dist(i));
+    if (dmax === 0) return out;
+    const eFn = st.e ? easeFnOf(st.e) : null;
+    const spread = st.total != null ? st.total : (st.each || 0) * dmax;
+    for (let i = 0; i < n; i++) {
+      let d = dist(i);
+      if (from === "edges") d = dmax - d;
+      const norm = d / dmax;
+      out[i] = (eFn ? eFn(norm) : norm) * spread;
+    }
+    return out;
+  };
+
+  // Funcref calls for dynamic values / fn modifiers. Slots arrive already
+  // translated into the main table (verve_anim_register_dyn/_mod below).
+  const animCallDyn = (slot, i, n) => {
+    try {
+      const fn = indirectFunctionTable.get(slot >>> 0);
+      return typeof fn === "function" ? fn(i >>> 0, n >>> 0) : 0;
+    } catch (err) {
+      console.error("verve anim dyn failed:", err);
+      return 0;
+    }
+  };
+  const animCallMod = (slot, v) => {
+    try {
+      const fn = indirectFunctionTable.get(slot >>> 0);
+      return typeof fn === "function" ? fn(v) : v;
+    } catch (err) {
+      console.error("verve anim mod failed:", err);
+      return v;
+    }
+  };
+
+  const buildMods = (mods) => {
+    const byProp = {};
+    for (const m of mods || []) {
+      const fns = byProp[m.p] || (byProp[m.p] = []);
+      if (m.snap) fns.push((v) => Math.round(v / m.snap) * m.snap);
+      else if (m.clamp) fns.push((v) => Math.max(m.clamp[0], Math.min(m.clamp[1], v)));
+      else if (m.wrap)
+        fns.push((v) => {
+          const r = m.wrap[1] - m.wrap[0];
+          return r > 0 ? m.wrap[0] + ((((v - m.wrap[0]) % r) + r) % r) : m.wrap[0];
+        });
+      else if (m.dyn != null) fns.push((v) => animCallMod(m.dyn, v));
+    }
+    return byProp;
+  };
+
+  // Registry. Handle 0 = failure sentinel.
+  const anims = new Map();
+  const namedAnims = new Map();
+  let animSeq = 1;
+  let animTickerOn = false;
+  let animLast = 0;
+
+  let prefersReduced = false;
+  try {
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    prefersReduced = mq.matches;
+    const onChange = (ev) => {
+      prefersReduced = ev.matches;
+      if (ev.matches) {
+        for (const a of [...anims.values()]) {
+          if (a.rm !== "allow") animJumpToEnd(a);
+        }
+      }
+    };
+    if (typeof mq.addEventListener === "function") mq.addEventListener("change", onChange);
+    else if (typeof mq.addListener === "function") mq.addListener(onChange);
+  } catch {}
+
+  // One tween instance inside an animation (a bare tween is a single
+  // instance at start 0; timeline children carry their resolved starts).
+  const buildTweenInst = (c, selfEl, start) => {
+    let targets = [];
+    if (c.t && c.t.h != null) {
+      const el = refHandles[c.t.h];
+      if (el) targets = [el];
+    } else if (c.t && c.t.s) {
+      const scope = selfEl || document;
+      targets = Array.from(scope.querySelectorAll(c.t.s));
+    } else if (selfEl) {
+      targets = [selfEl];
+    }
+    const n = targets.length;
+    const dur = typeof c.d === "number" ? c.d : 0.5;
+    const del = c.del || 0;
+    const rep = c.rep || 0;
+    const rd = c.rd || 0;
+    const delays = staggerDelays(n, c.st);
+    const maxDelay = delays.reduce((m, v) => Math.max(m, v), 0);
+    const cycleEnd = rep < 0 ? Infinity : (rep + 1) * (dur + rd) - rd;
+    // from-tween (every prop authored as start-only): render its first
+    // frame immediately so SSR entrance staggers don't flash unanimated.
+    let immediate = false;
+    if (c.p) {
+      const specs = Object.values(c.p);
+      immediate = specs.length > 0 && specs.every((s) => s.f !== undefined && s.to === undefined);
+    }
+    return {
+      start, targets, n, dur, del, rep, rd, delays, maxDelay, immediate,
+      yo: !!c.yo,
+      easeFn: easeFnOf(c.e),
+      props: c.p || null,
+      kf: c.k || null,
+      mods: buildMods(c.mod),
+      cb: c.cb || null,
+      firstEnd: del + maxDelay + dur,
+      total: rep < 0 ? Infinity : del + maxDelay + cycleEnd,
+      resolved: false,
+      state: null,
+      firedS: false,
+      firedC: false,
+      lastCycle: 0,
+    };
+  };
+
+  const animCreate = (desc, selfEl) => {
+    if (!desc || desc.v !== 1) return 0;
+    const rm = desc.rm || "jump";
+    if (prefersReduced && rm === "skip") return 0;
+    const a = {
+      h: animSeq++,
+      name: desc.id || null,
+      rm,
+      pos: 0,
+      rate: 1,
+      paused: desc.auto === 0,
+      reversed: false,
+      done: false,
+      lab: desc.lab || null,
+      cb: desc.cb || null,
+      tweens: [],
+      delay: 0,
+      rep: 0,
+      yo: false,
+      content: 0,
+    };
+    if (desc.tl) {
+      a.delay = desc.del || 0;
+      a.rep = desc.rep || 0;
+      a.yo = !!desc.yo;
+      for (const c of desc.ch || []) {
+        a.tweens.push(buildTweenInst(c, selfEl, c.pos || 0));
+      }
+    } else {
+      a.tweens.push(buildTweenInst(desc, selfEl, 0));
+    }
+    if (!a.tweens.some((tw) => tw.n > 0)) return 0;
+    a.content = a.tweens.reduce((m, tw) => Math.max(m, tw.start + tw.total), 0);
+    a.total = a.rep < 0 || !isFinite(a.content)
+      ? Infinity
+      : a.delay + a.content * (a.rep + 1);
+    a.firstEnd = a.delay + a.tweens.reduce((m, tw) => Math.max(m, tw.start + tw.firstEnd), 0);
+    anims.set(a.h, a);
+    if (a.name) namedAnims.set(a.name, a.h);
+    if (prefersReduced && rm !== "allow") {
+      animJumpToEnd(a);
+      return a.h;
+    }
+    // Immediate first render for from-tweens (phase 0), even when delayed.
+    for (const tw of a.tweens) {
+      if (tw.immediate) {
+        animResolveTween(tw);
+        animWriteTween(tw, 0, new Set());
+      }
+    }
+    flushXform();
+    animStartTicker();
+    return a.h;
+  };
+
+  const animResolveTween = (tw) => {
+    if (tw.resolved) return;
+    tw.resolved = true;
+    const csCache = new Map();
+    const readCurrent = (el, prop) => {
+      if (XFORM.has(prop)) return { n: xformGet(getXform(el), prop) };
+      if (prop.startsWith("attr:")) {
+        return animParseVal(el.getAttribute(prop.slice(5))) || { n: 0 };
+      }
+      let cs = csCache.get(el);
+      if (!cs) {
+        try {
+          cs = getComputedStyle(el);
+        } catch {
+          cs = null;
+        }
+        csCache.set(el, cs);
+      }
+      return (cs && animParseVal(cs.getPropertyValue(prop))) || { n: 0 };
+    };
+    const authored = (v, i) => {
+      if (v === undefined || v === null) return null;
+      if (typeof v === "number") return { n: v, u: null };
+      if (typeof v === "string") return animParseVal(v);
+      if (v.c) return { rgb: v.c };
+      if (v.dyn != null) return { n: animCallDyn(v.dyn, i, tw.n) };
+      return null;
+    };
+    tw.state = tw.targets.map((el, i) => {
+      const per = {};
+      if (tw.kf) {
+        // keyframe mode: per-prop segment table across the steps
+        const segs = {};
+        for (const step of tw.kf) {
+          for (const [name, spec] of Object.entries(step.p || {})) {
+            const list = segs[name] || (segs[name] = { unit: null, pts: [] });
+            const v = authored(spec.v, i) || { n: 0 };
+            if (spec.u) list.unit = spec.u;
+            list.pts.push({ o: step.o || 0, v, easeFn: step.e ? easeFnOf(step.e) : null });
+          }
+        }
+        for (const [name, s] of Object.entries(segs)) {
+          per[name] = {
+            kind: "kf",
+            pts: s.pts,
+            unit: s.unit || (DEG_PROPS.has(name) ? "deg" : null),
+          };
+        }
+        return per;
+      }
+      for (const [name, spec] of Object.entries(tw.props || {})) {
+        let from = authored(spec.f, i);
+        let to = authored(spec.to, i);
+        if (!from) from = readCurrent(el, name);
+        if (!to) to = readCurrent(el, name);
+        const color = !!(from.rgb || to.rgb);
+        if (color) {
+          if (!from.rgb) from = { rgb: [0, 0, 0, 1] };
+          if (!to.rgb) to = { rgb: [0, 0, 0, 1] };
+        }
+        per[name] = {
+          kind: color ? "color" : "num",
+          from: color ? from.rgb : from.n,
+          to: color ? to.rgb : to.n,
+          unit: spec.u || from.u || to.u || (DEG_PROPS.has(name) ? "deg" : null),
+        };
+      }
+      return per;
+    });
+  };
+
+  const animDirty = new Set();
+  const flushXform = () => {
+    for (const el of animDirty) writeXform(el);
+    animDirty.clear();
+  };
+
+  const animWriteProp = (el, name, st, phase, easeFn, mods) => {
+    let out;
+    if (st.kind === "kf") {
+      const pts = st.pts;
+      if (!pts.length) return;
+      let v;
+      if (phase <= pts[0].o) v = pts[0].v;
+      else if (phase >= pts[pts.length - 1].o) v = pts[pts.length - 1].v;
+      else {
+        let j = 1;
+        while (j < pts.length && pts[j].o < phase) j++;
+        const a = pts[j - 1];
+        const b = pts[j];
+        const span = b.o - a.o;
+        const tt = span > 0 ? (phase - a.o) / span : 1;
+        const e = (b.easeFn || easeFn)(tt);
+        if (a.v.rgb && b.v.rgb) {
+          v = { rgb: a.v.rgb.map((c, k) => c + (b.v.rgb[k] - c) * e) };
+        } else {
+          v = { n: (a.v.n || 0) + ((b.v.n || 0) - (a.v.n || 0)) * e };
+        }
+      }
+      out = v.rgb ? v : { n: v.n };
+    } else {
+      const e = easeFn(phase);
+      if (st.kind === "color") {
+        out = { rgb: st.from.map((c, k) => c + (st.to[k] - c) * e) };
+      } else {
+        out = { n: st.from + (st.to - st.from) * e };
+      }
+    }
+    if (out.rgb) {
+      const [r, g, b, al] = out.rgb;
+      el.style.setProperty(name, `rgba(${r}, ${g}, ${b}, ${al == null ? 1 : al})`);
+      return;
+    }
+    let v = out.n;
+    const fns = mods[name];
+    if (fns) for (const f of fns) v = f(v);
+    if (XFORM.has(name)) {
+      xformSet(getXform(el), name, v);
+      animDirty.add(el);
+      return;
+    }
+    if (name.startsWith("attr:")) {
+      el.setAttribute(name.slice(5), String(v));
+      return;
+    }
+    const u = st.unit != null ? st.unit : UNITLESS.has(name) ? "" : "px";
+    el.style.setProperty(name, v + u);
+  };
+
+  // Time → phase fold for one tween at one target, honoring delay,
+  // stagger delay, repeat, repeatDelay, and yoyo. Returns null before
+  // start, {phase, cycle, done} otherwise.
+  const animFold = (tw, local, targetIdx) => {
+    let t = local - tw.del - tw.delays[targetIdx];
+    if (t < 0) return null;
+    const cd = tw.dur + tw.rd;
+    if (tw.dur <= 0) {
+      return { phase: 1, cycle: 0, done: tw.rep >= 0 };
+    }
+    let cycle = cd > 0 ? Math.floor(t / cd) : 0;
+    if (tw.rep >= 0 && cycle > tw.rep) {
+      const lastOdd = tw.yo && tw.rep % 2 === 1;
+      return { phase: lastOdd ? 0 : 1, cycle: tw.rep, done: true };
+    }
+    let lt = t - cycle * cd;
+    if (lt > tw.dur) lt = tw.dur; // inside the repeatDelay gap
+    let phase = lt / tw.dur;
+    if (tw.yo && cycle % 2 === 1) phase = 1 - phase;
+    return { phase, cycle, done: false };
+  };
+
+  const animWriteTween = (tw, local, completedSet) => {
+    let anyActive = false;
+    let allDone = tw.n > 0;
+    let maxCycle = 0;
+    for (let i = 0; i < tw.n; i++) {
+      const el = tw.targets[i];
+      if (!el || !el.isConnected) continue;
+      const f = animFold(tw, local, i);
+      if (!f) {
+        if (tw.immediate && tw.state) {
+          const per = tw.state[i];
+          for (const name of Object.keys(per)) {
+            animWriteProp(el, name, per[name], 0, tw.easeFn, tw.mods);
+          }
+        }
+        allDone = false;
+        continue;
+      }
+      anyActive = true;
+      if (!f.done) allDone = false;
+      if (f.cycle > maxCycle) maxCycle = f.cycle;
+      const per = tw.state ? tw.state[i] : null;
+      if (!per) continue;
+      for (const name of Object.keys(per)) {
+        animWriteProp(el, name, per[name], f.phase, tw.easeFn, tw.mods);
+      }
+    }
+    if (anyActive && !tw.firedS) {
+      tw.firedS = true;
+      if (tw.cb) animFireSlot(tw.cb.sS);
+    }
+    if (maxCycle > tw.lastCycle) {
+      tw.lastCycle = maxCycle;
+      if (tw.cb) animFireSlot(tw.cb.sR);
+    }
+    if (allDone && !tw.firedC) {
+      tw.firedC = true;
+      completedSet.add(tw);
+    }
+  };
+
+  const animFireSlot = (slot) => {
+    if (slot == null) return;
+    if (typeof exp.verve_dispatch_event !== "function") return;
+    try {
+      exp.verve_dispatch_event(slot >>> 0);
+    } catch (err) {
+      console.error("verve anim callback failed:", err);
+    }
+  };
+
+  const animFireCb = (a, cb) => {
+    if (!cb) return;
+    animFireSlot(cb.sC);
+    if (cb.isl && cb.nC) {
+      callIslandExport(cb.isl, cb.nC, JSON.stringify({ anim: a.name || a.h }));
+    }
+  };
+
+  // Root-level repeat/yoyo fold (timeline cycles), then per-tween render.
+  const animRenderAt = (a, pos) => {
+    let t = pos - a.delay;
+    if (t < 0) t = 0;
+    const content = a.content;
+    if (a.rep !== 0 && content > 0 && isFinite(content)) {
+      let cycle = Math.floor(t / content);
+      const maxC = a.rep < 0 ? Infinity : a.rep;
+      if (cycle > maxC) cycle = maxC;
+      let local = t - cycle * content;
+      if (local > content || cycle === maxC && t >= content * (maxC + 1)) local = content;
+      if (a.yo && cycle % 2 === 1) local = content - local;
+      t = local;
+    } else if (isFinite(content) && t > content) {
+      t = content;
+    }
+    // Resolve newly-activated tweens (batched reads) before any writes.
+    for (const tw of a.tweens) {
+      if (!tw.resolved && t >= tw.start) animResolveTween(tw);
+    }
+    const completed = new Set();
+    for (const tw of a.tweens) {
+      if (!tw.resolved) continue;
+      animWriteTween(tw, t - tw.start, completed);
+    }
+    flushXform();
+    // Child completion callbacks in start order.
+    for (const tw of [...completed].sort((x, y) => x.start - y.start)) {
+      if (tw.cb) {
+        animFireSlot(tw.cb.sC);
+        if (tw.cb.isl && tw.cb.nC) {
+          callIslandExport(tw.cb.isl, tw.cb.nC, JSON.stringify({ anim: a.name || a.h }));
+        }
+      }
+    }
+  };
+
+  const animFinish = (a) => {
+    a.pos = a.total;
+    animRenderAt(a, a.total);
+    a.done = true;
+    a.paused = true;
+    animFireCb(a, a.cb);
+  };
+
+  const animKill = (a) => {
+    anims.delete(a.h);
+    if (a.name && namedAnims.get(a.name) === a.h) namedAnims.delete(a.name);
+  };
+
+  const animJumpToEnd = (a) => {
+    const end = isFinite(a.total) ? a.total : a.firstEnd;
+    // Fire per-tween + root callbacks in order via a full seek render.
+    for (const tw of a.tweens) {
+      if (!tw.resolved) animResolveTween(tw);
+    }
+    animRenderAt(a, end);
+    a.pos = end;
+    a.done = true;
+    a.paused = true;
+    animFireCb(a, a.cb);
+    animKill(a);
+  };
+
+  const animTick = (now) => {
+    const dt = Math.min((now - animLast) / 1000, 0.1);
+    animLast = now;
+    for (const a of [...anims.values()]) {
+      if (a.paused || a.done) continue;
+      // Self-kill animations whose targets all left the document
+      // (SPA swaps, removed subtrees). Silent, like GSAP kill.
+      if (!a.tweens.some((tw) => tw.targets.some((el) => el && el.isConnected))) {
+        animKill(a);
+        continue;
+      }
+      a.pos += dt * a.rate * (a.reversed ? -1 : 1);
+      if (!a.reversed && a.pos >= a.total) {
+        animFinish(a);
+        continue;
+      }
+      if (a.reversed && a.pos <= 0) {
+        a.pos = 0;
+        a.paused = true;
+        animRenderAt(a, 0);
+        continue;
+      }
+      animRenderAt(a, a.pos);
+    }
+    if (anims.size && [...anims.values()].some((a) => !a.paused && !a.done)) {
+      requestAnimationFrame(animTick);
+    } else {
+      animTickerOn = false;
+    }
+  };
+
+  const animStartTicker = () => {
+    if (animTickerOn) return;
+    if (![...anims.values()].some((a) => !a.paused && !a.done)) return;
+    animTickerOn = true;
+    animLast = performance.now();
+    requestAnimationFrame(animTick);
+  };
+
+  // Control ops: 0=play 1=pause 2=reverse 3=restart 4=seek 5=timeScale 6=kill
+  const animCtrl = (h, op, v) => {
+    const a = anims.get(h);
+    if (!a) return;
+    switch (op) {
+      case 0:
+        if (a.done && a.pos >= a.total) break; // completed; use restart
+        a.paused = false;
+        a.done = false;
+        animStartTicker();
+        break;
+      case 1:
+        a.paused = true;
+        break;
+      case 2:
+        a.reversed = !a.reversed;
+        a.paused = false;
+        a.done = false;
+        if (a.reversed && !isFinite(a.total)) a.pos = Math.min(a.pos, a.firstEnd);
+        animStartTicker();
+        break;
+      case 3:
+        a.pos = 0;
+        a.reversed = false;
+        a.paused = false;
+        a.done = false;
+        for (const tw of a.tweens) {
+          tw.firedS = false;
+          tw.firedC = false;
+          tw.lastCycle = 0;
+        }
+        animRenderAt(a, 0);
+        animStartTicker();
+        break;
+      case 4: {
+        const end = isFinite(a.total) ? a.total : Number.MAX_VALUE;
+        a.pos = Math.max(0, Math.min(v, end));
+        animRenderAt(a, a.pos);
+        break;
+      }
+      case 5:
+        a.rate = v > 0 ? v : 0;
+        break;
+      case 6:
+        animKill(a);
+        break;
+    }
+  };
+
+  const animGet = (h, field) => {
+    const a = anims.get(h);
+    if (!a) return 0;
+    switch (field) {
+      case 0:
+        return a.pos;
+      case 1:
+        return isFinite(a.total) && a.total > 0 ? Math.max(0, Math.min(a.pos / a.total, 1)) : 0;
+      case 2:
+        return isFinite(a.total) ? a.total : -1;
+      case 3:
+        return !a.paused && !a.done ? 1 : 0;
+      case 4:
+        return a.rate;
+      case 5:
+        return a.reversed ? 1 : 0;
+      default:
+        return 0;
+    }
+  };
+
+  // Declarative SSR surface: scan `[data-anim]` stamped by Node.animate().
+  // Runs after the initial hydrate pass, on observer-added subtrees
+  // (Suspense swaps, template clones, SPA navigations), guarded by a
+  // `data-anim-done` stamp against re-registration.
+  const animScan = (root) => {
+    const list = [];
+    if (root instanceof Element) {
+      if (root.hasAttribute("data-anim")) list.push(root);
+      root.querySelectorAll("[data-anim]").forEach((el) => list.push(el));
+    } else if (root && root.querySelectorAll) {
+      root.querySelectorAll("[data-anim]").forEach((el) => list.push(el));
+    }
+    for (const el of list) {
+      if (el.hasAttribute("data-anim-done")) continue;
+      el.setAttribute("data-anim-done", "1");
+      let desc;
+      try {
+        desc = JSON.parse(el.getAttribute("data-anim"));
+      } catch (err) {
+        console.warn("verve anim: bad data-anim payload", el, err);
+        continue;
+      }
+      animCreate(desc, el);
+    }
+  };
+
   // Phase 13F — assemble the chunk-side reactive-runtime import object
   // from the main client's matching exports. Built once after main
   // instantiation; reused for every island chunk. Missing entries pass
@@ -1103,6 +1881,37 @@
     verve_event_slot_capacity: exp.verve_event_slot_capacity,
     verve_slot_name: exp.verve_slot_name,
     verve_slot_kind: exp.verve_slot_kind,
+    // ---- verve.anim ops (implemented JS-side, no main-client export) ----
+    verve_anim_create: (dp, dl) => {
+      let desc;
+      try {
+        desc = JSON.parse(readStr(dp, dl));
+      } catch (err) {
+        console.warn("verve anim: bad descriptor", err);
+        return 0;
+      }
+      return animCreate(desc, null) >>> 0;
+    },
+    verve_anim_ctrl: (h, op, v) => animCtrl(h >>> 0, op >>> 0, v),
+    verve_anim_get: (h, f) => animGet(h >>> 0, f >>> 0),
+    verve_anim_lookup: (np, nl) => (namedAnims.get(readStr(np, nl)) || 0) >>> 0,
+    verve_anim_seek_label: (h, np, nl) => {
+      const a = anims.get(h >>> 0);
+      if (!a || !a.lab) return;
+      const t = a.lab[readStr(np, nl)];
+      if (typeof t === "number") animCtrl(a.h, 4, a.delay + t);
+    },
+    // Dyn-value / fn-modifier slots: identity for the main client (its
+    // indices already live in the shared table); makeChunkRuntime wraps
+    // these with `translate` so chunk-private indices become main-table
+    // slots before they're embedded in descriptor JSON.
+    verve_anim_register_dyn: (idx) => idx >>> 0,
+    verve_anim_register_mod: (idx) => idx >>> 0,
+    // Generic per-handle style setter (gap-filler next to ref_set_attr).
+    verve_ref_set_style: (h, np, nl, vp, vl) => {
+      const el = refHandles[h];
+      if (el) el.style.setProperty(readStr(np, nl), readStr(vp, vl));
+    },
   };
 
   // Table isolation, chunk side: each island chunk instantiates against a
@@ -1151,6 +1960,8 @@
       verve_request_animation_frame: (idx) =>
         verveRuntime.verve_request_animation_frame(translate(idx)),
       verve_queue_microtask: (idx) => verveRuntime.verve_queue_microtask(translate(idx)),
+      verve_anim_register_dyn: (idx) => translate(idx),
+      verve_anim_register_mod: (idx) => translate(idx),
     };
   };
 
@@ -1515,11 +2326,18 @@
 
   parseIslandState();
   document.querySelectorAll("verve-island").forEach(hydrateIslandEl);
+  // Declarative entrance animations stamped by Node.animate().
+  animScan(document.body);
 
   new MutationObserver((records) => {
     for (const rec of records) {
       rec.removedNodes.forEach((n) => eachIslandIn(n, unmountIslandEl));
-      rec.addedNodes.forEach((n) => eachIslandIn(n, hydrateIslandEl));
+      rec.addedNodes.forEach((n) => {
+        eachIslandIn(n, hydrateIslandEl);
+        // New subtrees (Suspense swaps, SPA navigations, template
+        // clones) may carry their own [data-anim] markers.
+        if (n instanceof Element) animScan(n);
+      });
     }
   }).observe(document.body, { childList: true, subtree: true });
 

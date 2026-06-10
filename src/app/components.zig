@@ -260,7 +260,61 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
         ctx.p().text("Full-stack Zig web framework — fine-grained reactivity, no macros."),
         ctx.p().children(.{verve.link(ctx, "/counter", "Counter demo →", .{ .prefetch_on_hover = true })}),
         ctx.p().children(.{verve.link(ctx, "/todos", "Todo list (form fallback) →", .{})}),
+        ctx.p().children(.{verve.link(ctx, "/anim", "Animation engine (verve.anim) →", .{})}),
         ctx.p().children(.{verve.link(ctx, "/work/hello-world", "Path-param demo (/work/:slug) →", .{})}),
+    }).build();
+}
+
+/// verve.anim demo page: declarative SSR entrance animations via
+/// `Node.animate(...)` (no island) plus the `AnimDemo` island exercising
+/// the imperative control API.
+pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
+    // --- Imperative island: staggered deck + control buttons --------------
+    const controls = ctx.div().class("anim-controls").children(.{
+        ctx.el("button").attr("z-on-click", "anim_pause").text("pause"),
+        ctx.el("button").attr("z-on-click", "anim_play").text("play"),
+        ctx.el("button").attr("z-on-click", "anim_reverse").text("reverse"),
+        ctx.el("button").attr("z-on-click", "anim_restart").text("restart"),
+        ctx.el("button").attr("z-on-click", "anim_half_speed").text("0.5x"),
+        ctx.el("button").attr("z-on-click", "anim_full_speed").text("1x"),
+        ctx.el("button").attr("z-on-click", "anim_scatter").text("scatter"),
+    });
+    const deck = ctx.div().class("anim-deck");
+    var i: usize = 0;
+    while (i < 7) : (i += 1) {
+        _ = deck.children(.{ctx.div().class("anim-card").textInt(i + 1)});
+    }
+    const island_inner = ctx.div().children(.{
+        ctx.h2("Imperative timeline (island)").class("anim-title"),
+        ctx.p().class("hint").children(.{
+            ctx.span().text("status: "),
+            ctx.span().bind("anim_status").text("loading…"),
+        }),
+        controls,
+        deck,
+    });
+    const anim_island = verve.island(ctx, .{ .name = "AnimDemo" }, island_inner);
+
+    // --- Declarative SSR surface: data-anim attributes, no island ---------
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.anim").animate(anim.from(a, null)
+            .opacity(0).y(24)
+            .duration(0.6).ease(.out_cubic)),
+        ctx.p()
+            .text("Tweens, timelines, keyframes, stagger, and a control API. " ++
+                "Zig builds + serializes descriptors; the bridge interpreter runs them. " ++
+                "With prefers-reduced-motion set, entrances jump to their end state.")
+            .animate(anim.from(a, null).opacity(0).duration(0.8).delay(0.2)),
+        ctx.div().class("anim-pulse").ariaHidden(true).animate(anim.to(a, null)
+            .step(0).scale(1.0)
+            .step(50).stepEase(.in_out_sine).scale(1.3)
+            .step(100).scale(1.0)
+            .duration(1.4).repeat(-1).reducedMotion(.skip)),
+        anim_island,
+        ctx.p().children(.{ctx.a("/", "← Home")}),
     }).build();
 }
 
@@ -407,6 +461,11 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.todo-remove button{background:#3d1d1d;padding:.25rem .5rem}
                 \\.todo-remove button:hover{background:#5b2727}
                 \\.hint{color:#8b949e;font-size:.85rem;margin:.25rem 0 .75rem}
+                \\.anim-deck{display:flex;gap:.5rem;margin:1rem 0;flex-wrap:wrap}
+                \\.anim-card{width:3rem;height:3rem;display:flex;align-items:center;justify-content:center;background:#1f6feb;border-radius:8px;font-weight:600}
+                \\.anim-controls{display:flex;gap:.25rem;flex-wrap:wrap;margin:.5rem 0}
+                \\.anim-controls button{padding:.35rem .7rem}
+                \\.anim-pulse{width:.9rem;height:.9rem;border-radius:50%;background:#58a6ff;margin:.5rem 0}
                 \\.viz-card svg{touch-action:none;max-width:100%}
                 \\.viz-node{cursor:grab}
                 \\.viz-node.selected circle{stroke:#fff;stroke-width:3}

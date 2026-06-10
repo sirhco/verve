@@ -341,6 +341,20 @@ pub fn setRefValue(handle: i32, value: []const u8) void {
     verve_ref_set_value(handle, value.ptr, @intCast(value.len));
 }
 
+/// Set an inline style property (`el.style.setProperty(name, value)`).
+/// Use hyphenated CSS names ("background-color"). For transform pieces
+/// (x/y/scale/rotate) prefer the anim engine — it owns `style.transform`
+/// composition for elements it animates.
+pub fn setRefStyle(handle: i32, name: []const u8, value: []const u8) void {
+    verve_ref_set_style(
+        handle,
+        name.ptr,
+        @intCast(name.len),
+        value.ptr,
+        @intCast(value.len),
+    );
+}
+
 pub fn setRefClass(handle: i32, class: []const u8, on: bool) void {
     verve_ref_set_class(handle, class.ptr, @intCast(class.len), if (on) 1 else 0);
 }
@@ -731,6 +745,154 @@ pub fn eventCapturePointer() void {
 /// builders — the exact code SSR runs, so client recomputes reproduce server
 /// positions bit-for-bit.
 pub const viz_core = @import("viz_core");
+
+// ---- Animation (verve.anim) ----------------------------------------------
+//
+// Pure descriptor builders come from `anim_core` (src/core/anim/
+// client_core.zig); this section is the bridge glue. Build tweens /
+// timelines in the chunk arena, hand them to `animPlay`, control via the
+// returned `AnimHandle`. The JS interpreter copies the descriptor at the
+// `verve_anim_create` boundary, so the arena can be reset immediately
+// after — handles and callback slot ids are plain u32s, safe to stash in
+// chunk statics. Callback handlers must not capture arena pointers (they
+// fire after any reset).
+
+/// Tween/Timeline builders, easing, stagger math, and math utils
+/// (`anim.to`, `anim.from`, `anim.timeline`, `anim.clamp`, ...).
+pub const anim = @import("anim_core");
+
+extern "verve_runtime" fn verve_anim_create(desc_ptr: [*]const u8, desc_len: u32) u32;
+extern "verve_runtime" fn verve_anim_ctrl(handle: u32, op: u32, value: f64) void;
+extern "verve_runtime" fn verve_anim_get(handle: u32, field: u32) f64;
+extern "verve_runtime" fn verve_anim_lookup(name_ptr: [*]const u8, name_len: u32) u32;
+extern "verve_runtime" fn verve_anim_seek_label(handle: u32, name_ptr: [*]const u8, name_len: u32) void;
+// Dyn-value / fn-modifier registration: the chunk passes its PRIVATE-table
+// fn index; the bridge's makeChunkRuntime wrapper copies the funcref into
+// the main table and returns the slot — only translated slots are safe to
+// embed in descriptor JSON (same hazard as registerEvent).
+extern "verve_runtime" fn verve_anim_register_dyn(handler_idx: u32) u32;
+extern "verve_runtime" fn verve_anim_register_mod(handler_idx: u32) u32;
+extern "verve_runtime" fn verve_ref_set_style(handle: i32, name_ptr: [*]const u8, name_len: u32, val_ptr: [*]const u8, val_len: u32) void;
+
+/// Live animation handle. Plain u32 id into the bridge registry — copy
+/// freely, store in chunk statics across frames. All ops are no-ops on a
+/// killed/unknown handle.
+pub const AnimHandle = struct {
+    id: u32,
+
+    pub fn play(self: AnimHandle) void {
+        verve_anim_ctrl(self.id, 0, 0);
+    }
+    pub fn pause(self: AnimHandle) void {
+        verve_anim_ctrl(self.id, 1, 0);
+    }
+    pub fn reverse(self: AnimHandle) void {
+        verve_anim_ctrl(self.id, 2, 0);
+    }
+    pub fn restart(self: AnimHandle) void {
+        verve_anim_ctrl(self.id, 3, 0);
+    }
+    pub fn seek(self: AnimHandle, t_s: f64) void {
+        verve_anim_ctrl(self.id, 4, t_s);
+    }
+    pub fn seekLabel(self: AnimHandle, label: []const u8) void {
+        verve_anim_seek_label(self.id, label.ptr, @intCast(label.len));
+    }
+    pub fn timeScale(self: AnimHandle, factor: f64) void {
+        verve_anim_ctrl(self.id, 5, factor);
+    }
+    /// Remove from the registry; last-written styles stay in place
+    /// (GSAP semantics). Pending callbacks never fire.
+    pub fn kill(self: AnimHandle) void {
+        verve_anim_ctrl(self.id, 6, 0);
+    }
+
+    pub fn time(self: AnimHandle) f64 {
+        return verve_anim_get(self.id, 0);
+    }
+    /// 0..1 across the full duration. 0 for infinite animations.
+    pub fn progress(self: AnimHandle) f64 {
+        return verve_anim_get(self.id, 1);
+    }
+    /// Total seconds; -1 when infinite (repeat(-1)).
+    pub fn duration(self: AnimHandle) f64 {
+        return verve_anim_get(self.id, 2);
+    }
+    pub fn isActive(self: AnimHandle) bool {
+        return verve_anim_get(self.id, 3) != 0;
+    }
+    pub fn currentTimeScale(self: AnimHandle) f64 {
+        return verve_anim_get(self.id, 4);
+    }
+    pub fn isReversed(self: AnimHandle) bool {
+        return verve_anim_get(self.id, 5) != 0;
+    }
+};
+
+fn animSerialize(a: anytype) ?[]const u8 {
+    const T = @TypeOf(a.*);
+    const alloc = chunkArena();
+    if (T == anim.Tween) {
+        return anim.serialize.tweenToJson(alloc, a, .island) catch null;
+    } else if (T == anim.Timeline) {
+        return anim.serialize.timelineToJson(alloc, a, .island) catch null;
+    } else {
+        @compileError("animPlay/animPrepare expect *anim.Tween or *anim.Timeline, got *" ++ @typeName(T));
+    }
+}
+
+/// Serialize `a` (`*anim.Tween` or `*anim.Timeline`) and register it with
+/// the JS interpreter, autoplaying unless the builder was `.paused()`.
+/// Returns null on builder error, serialize failure, or zero matched
+/// targets. The descriptor is copied JS-side before this returns.
+pub fn animPlay(a: anytype) ?AnimHandle {
+    const json = animSerialize(a) orelse return null;
+    const h = verve_anim_create(json.ptr, @intCast(json.len));
+    if (h == 0) return null;
+    return .{ .id = h };
+}
+
+/// Like `animPlay` but constructed paused — call `.play()` on the handle.
+pub fn animPrepare(a: anytype) ?AnimHandle {
+    a.autoplay = false;
+    return animPlay(a);
+}
+
+/// Resolve a named animation (`.named("intro")` — including SSR-declared
+/// `data-anim` ones) to a control handle.
+pub fn animLookup(name: []const u8) ?AnimHandle {
+    const h = verve_anim_lookup(name.ptr, @intCast(name.len));
+    if (h == 0) return null;
+    return .{ .id = h };
+}
+
+/// Callback sugar: register `handler` as an event slot and stamp it on
+/// the builder. Works on `*anim.Tween` and (onComplete) `*anim.Timeline`.
+pub fn animOnStart(t: *anim.Tween, handler: *const fn () void) *anim.Tween {
+    return t.onStartSlot(registerEvent(handler));
+}
+
+pub fn animOnComplete(t: anytype, handler: *const fn () void) @TypeOf(t) {
+    return t.onCompleteSlot(registerEvent(handler));
+}
+
+pub fn animOnRepeat(t: *anim.Tween, handler: *const fn () void) *anim.Tween {
+    return t.onRepeatSlot(registerEvent(handler));
+}
+
+/// Dynamic end value: `f(target_index, target_count)` is evaluated
+/// per-target when the tween starts. Use as any prop value:
+/// `t.x(verve.animDyn(&cardX))`. Pure functions only — runs outside any
+/// island scope.
+pub fn animDyn(f: *const fn (u32, u32) f64) anim.Value {
+    return .{ .dyn = verve_anim_register_dyn(@intCast(@intFromPtr(f))) };
+}
+
+/// Per-frame fn modifier on `prop`: receives the interpolated value,
+/// returns the value to write. `t.modifier(verve.animModFn("y", &snapY))`.
+pub fn animModFn(prop: []const u8, f: *const fn (f64) f64) anim.Modifier {
+    return .{ .prop = prop, .op = .{ .dyn = verve_anim_register_mod(@intCast(@intFromPtr(f))) } };
+}
 
 // ---- Timers (Phase 19) --------------------------------------------------
 //

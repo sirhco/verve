@@ -398,6 +398,46 @@ pub const Node = struct {
         return self.attr("data-ref", noderef.id);
     }
 
+    // ---- animation ---------------------------------------------------------
+
+    /// Attach a declarative animation. `a` is any value exposing
+    /// `err: ?anyerror` and `toJson(alloc) ![]const u8` — i.e. a
+    /// `*verve.anim.Tween` or `*verve.anim.Timeline` (duck-typed so this
+    /// file stays decoupled from the anim module, same stance as
+    /// islands.zig vs `verve.island`). The descriptor is serialized into
+    /// the node arena and stamped as `data-anim`; the bridge JS scans
+    /// `[data-anim]` after hydrate and runs it — no island required.
+    /// JSON quoting is handled by the renderer's escapeAttr.
+    ///
+    /// A null tween target animates this element; a selector target is
+    /// scoped to this element's descendants. One animation per node —
+    /// compose with a Timeline for more.
+    pub fn animate(self: *Node, a: anytype) *Node {
+        if (self.err != null) return self;
+        if (a.err) |e| {
+            self.err = e;
+            return self;
+        }
+        const json = a.toJson(self.arena.?) catch |e| {
+            self.err = e;
+            return self;
+        };
+        return self.animateJson(json);
+    }
+
+    /// Escape hatch: attach a pre-serialized descriptor (cached or
+    /// hand-rolled wire JSON).
+    pub fn animateJson(self: *Node, json: []const u8) *Node {
+        if (self.err != null) return self;
+        for (self.attrs.items) |at| {
+            if (std.mem.eql(u8, at.key, "data-anim")) {
+                self.err = error.DuplicateAnimation;
+                return self;
+            }
+        }
+        return self.attr("data-anim", json);
+    }
+
     // ---- text ------------------------------------------------------------
 
     pub fn text(self: *Node, t: []const u8) *Node {
@@ -506,6 +546,37 @@ pub fn create(arena: std.mem.Allocator, tag: []const u8) *Node {
     const node = arena.create(Node) catch return &poison;
     node.* = .{ .arena = arena, .tag = tag };
     return node;
+}
+
+test "animate stamps data-anim and rejects duplicates" {
+    const anim = @import("anim/anim.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const n = create(a, "div").animate(anim.from(a, null).opacity(0).y(24).duration(0.6));
+    try std.testing.expect(n.err == null);
+    try std.testing.expectEqualStrings("data-anim", n.attrs.items[0].key);
+    try std.testing.expect(std.mem.startsWith(u8, n.attrs.items[0].value, "{\"v\":1"));
+
+    const dup = create(a, "div")
+        .animateJson("{\"v\":1}")
+        .animateJson("{\"v\":1}");
+    try std.testing.expectEqual(@as(?anyerror, error.DuplicateAnimation), dup.err);
+}
+
+test "animate surfaces builder and serialize errors" {
+    const anim = @import("anim/anim.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bad = create(a, "div").animate(anim.to(a, ".x").opacity(1).step(0));
+    try std.testing.expectEqual(@as(?anyerror, error.StepAfterProps), bad.err);
+
+    // dyn values are island-only — SSR serialize rejects them
+    const dyn = create(a, "div").animate(anim.to(a, ".x").x(anim.Value{ .dyn = 0 }));
+    try std.testing.expectEqual(@as(?anyerror, error.DynRequiresIsland), dyn.err);
 }
 
 /// Void elements per HTML spec — no closing tag, no content.
