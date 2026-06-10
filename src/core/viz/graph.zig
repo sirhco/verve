@@ -309,6 +309,28 @@ pub fn edgeFragment(buf: []u8, opts: Opts, key: []const u8, ref: []const u8, p0:
     return std.fmt.bufPrint(buf, "<line data-vkey=\"{s}\" data-ref=\"{s}\" x1=\"{d}\" y1=\"{d}\" x2=\"{d}\" y2=\"{d}\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, ref, p0.x, p0.y, p1.x, p1.y, opts.edge_color });
 }
 
+/// Map parallel edge id arrays to slot-index pairs against `ids`, writing valid
+/// pairs into `out` and returning the count. Edges with an unknown endpoint are
+/// dropped. Used to apply a live snapshot; the interactive island mirrors it.
+pub fn mapSnapshotEdges(ids: []const []const u8, froms: []const []const u8, tos: []const []const u8, out: [][2]usize) usize {
+    const lookup = struct {
+        fn of(list: []const []const u8, id: []const u8) ?usize {
+            for (list, 0..) |x, i| if (std.mem.eql(u8, x, id)) return i;
+            return null;
+        }
+    }.of;
+    var k: usize = 0;
+    const m = @min(froms.len, tos.len);
+    for (0..m) |i| {
+        const f = lookup(ids, froms[i]) orelse continue;
+        const t = lookup(ids, tos[i]) orelse continue;
+        if (k >= out.len) break;
+        out[k] = .{ f, t };
+        k += 1;
+    }
+    return k;
+}
+
 fn errNode(ctx: *const Context) *Node {
     const n = ctx.el("svg");
     n.err = error.OutOfMemory;
@@ -391,6 +413,18 @@ test "interactive graph uses keyed id-based containers" {
     try testing.expect(std.mem.indexOf(u8, out, "z-on-wheel=\"viz_wheel\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "z-on-pointerover=\"viz_node_over\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "data-ref=\"viz-tooltip\"") != null);
+}
+
+test "mapSnapshotEdges resolves id pairs to slots, dropping unknown endpoints" {
+    const ids = [_][]const u8{ "core", "io", "ui" };
+    const froms = [_][]const u8{ "core", "core", "core" };
+    const tos = [_][]const u8{ "io", "ui", "ghost" };
+    var out: [3][2]usize = undefined;
+    const k = mapSnapshotEdges(&ids, &froms, &tos, &out);
+    try testing.expectEqual(@as(usize, 2), k);
+    try testing.expectEqual(@as(usize, 0), out[0][0]);
+    try testing.expectEqual(@as(usize, 1), out[0][1]);
+    try testing.expectEqual(@as(usize, 2), out[1][1]);
 }
 
 test "node/edge fragment builders emit keyed id-based markup" {
