@@ -6,6 +6,134 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-10
+
+The visualization release: a complete pure-Zig chart + graph library
+(`verve.viz`), live data streaming over a new server-push hub, and a
+breaking rework of how island chunks share the wasm function table.
+Guide: `docs/22-visualization.md`; runnable demos: the `/viz` route and
+`examples/viz-live/`.
+
+### Added
+
+- **`verve.viz` — native visualization library** (new, `src/core/viz/`,
+  zero deps, SVG-as-`Node`-tree so every chart renders with JS off):
+  - **Scene model** — resolution-independent `Shape` union
+    (circle/rect/line/polyline/path/text/group) + `Style`, serialized
+    through the normal renderer (`viz.sceneToNode`). Scales (linear with
+    invert, band, log, time) with nice-tick generation and an axis builder.
+  - **15 chart types** — bar, stacked bar, grouped bar, line, area,
+    scatter, pie/donut, candlestick (OHLC), box plot (+ `boxStats`),
+    heatmap, radar, violin (Gaussian KDE), **sankey** (longest-path
+    layering + barycenter ordering, cubic ribbon links), **treemap**
+    (squarified, Bruls 2000, flat parent-index hierarchy), **chord**
+    (d3-convention group arcs + quadratic ribbons).
+  - **Graph layouts** — tidy tree, radial, deterministic force-directed,
+    and layered DAG with Sugiyama crossing minimization
+    (`dag_crossing_iterations`) and virtual-node routing for long edges
+    (`dagLayoutRouted`).
+  - **Edge routing** — `GraphOpts.edge_routing = .straight | .curved |
+    .orthogonal`: Catmull-Rom splines or Manhattan runs with rounded
+    corners through the reserved virtual-node channels; `viz.edgePathD`
+    is the low-level path builder.
+  - **Interactive graph island** (`VizGraphInteractive`) — wheel zoom
+    toward the cursor, pointer-captured pan + node drag (gestures survive
+    leaving the svg), hover tooltips, click select, **double-click
+    subtree collapse** (BFS visibility, `+N` hidden-descendant badge,
+    composes with live updates), and runtime add/remove of nodes under
+    **any layout**: force relaxes incrementally; tree/radial/dag
+    recompute client-side via the new `viz_core` chunk module
+    (`geom.fitBox`/`applyFit` keep SSR↔client positions bit-identical)
+    and tween survivors over 24 eased frames.
+  - **Live data over SSE push** — the server diffs its graph
+    (`viz.diffGraphs`) and broadcasts seq-ordered wire deltas
+    (`{"seq":N,"ops":[…]}` via `viz.writeDeltaJson`; canonical apply
+    semantics in `viz.applyDeltaOps`); the island applies frames in seq
+    order and resyncs from the seq-stamped pull snapshot on any gap.
+    Polling fallback when EventSource is unavailable.
+- **Server push hub** (`src/server/push.zig`) — `push.publish(channel,
+  bytes)` broadcasts to every subscriber of `GET /push?channel=<name>`
+  (SSE): 32-frame resume ring with `Last-Event-ID` replay, a resync
+  control frame when a subscriber falls out of the window, and
+  `push.subscriberCount` so publishers can idle. Transport-agnostic hub;
+  an app opts into the framework's once-per-second publisher thread by
+  declaring `pub fn vizAdvanceTick(buf: []u8) ?[]const u8`.
+- **Client runtime, phase 7** (`docs/20-client-runtime.md`):
+  - `pushSubscribe(channel, island, export)` / `pushUnsubscribe` —
+    deliver SSE frames to a NAMED chunk export; `fetchToExport(api,
+    island, export)` — one-shot POST→export (the resync hook).
+    Host-call based, zero function-table entries.
+  - **Pointer capture** — `eventCapturePointer()` flags the bridge to
+    `setPointerCapture` the handler's element; new delegated
+    `pointercancel` + `dblclick` events with `Node.onPointerCancel` /
+    `onDblClick` stamps; `eventDeltaY()` / `eventButton()` accessors and
+    `Node.onWheel` / `onPointer*` stamps (landed earlier in the cycle).
+  - `verveRafNamed` host fn — a JS `requestAnimationFrame` loop driving a
+    named chunk export (`fn () i32`, nonzero continues).
+  - `viz_core` chunk module — the pure-math slice of `verve.viz`
+    (geometry, layouts, interaction, edge paths) importable by chunks.
+- **`examples/viz-live/`** — minimal standalone app for the
+  push-streaming stack (push hub → wire deltas → seq-ordered apply →
+  snapshot resync), reusing the framework's interactive island chunk via
+  a build-time source-fallback chain.
+- **App test suite** — `src/app/api.zig` test blocks now actually run:
+  `zig build test` gained a dedicated app-module artifact (Zig collects
+  tests only from a compilation's root module, so the previous in-file
+  tests were silently dead).
+- Integration tests for `/push` (ordered delta stream, bad-channel 400,
+  `Last-Event-ID` resume without replay).
+
+### Changed
+
+- **BREAKING: wasm function-table isolation** (replaces the Phase 13G
+  shared table). The main client now **imports** a JS-owned growable
+  `__indirect_function_table` (`build.zig`: `import_table = true`, was
+  `export_table`); every island chunk instantiates against a **private**
+  table; the bridge's `makeChunkRuntime` translates each fn-pointer
+  index crossing into the main runtime (`registerEvent`, `cleanup`,
+  response/drop handlers, the four timer fns) into a freshly grown
+  main-table slot. Previously a chunk's element segment wrote into the
+  shared table at the same slots as the main client's own entries —
+  "function signature mismatch" crashes as soon as a chunk's
+  address-taken function set grew. **Anything that instantiates
+  `client.wasm` must now supply `env.__indirect_function_table`**: the
+  web bridge, the desktop template (`verve_desktop.js`), and all example
+  builds are updated; custom hosts must follow suit.
+- **BREAKING: `VizGraphInteractive.Props`** gained `ids`, `layout`, and
+  `margin` fields (the props codec is positional — chunk mirrors must
+  match field order).
+- The demo `vizGraph` server-fn snapshot is now seq-stamped
+  (`{seq, nodes, edges}`) and a pure read — the model only advances via
+  the publisher thread, so pull-only clients see a stable graph.
+- `/viz` demo expanded: edge-routing A/B/C cards, sankey/treemap/chord
+  cards, a "⟳ layout" cycle button, and SSE-push live streaming behind
+  the "● live" toggle.
+
+### Fixed
+
+- Drag/pan gestures no longer end when the pointer crosses the svg edge
+  — pointer capture keeps them alive; gestures end on `pointerup` /
+  `pointercancel`, never `pointerout`.
+- The framework server no longer hard-requires `app.vizAdvanceTick` —
+  the publisher thread is `@hasDecl`-gated, unbreaking downstream app
+  builds (islands-demo, client-runtime, showcase, scaffolds).
+- The latent function-table clobber affecting every chunk with
+  address-taken functions (e.g. JsonProbe's 14 element slots) is
+  eliminated by table isolation.
+
+### Upgrade notes
+
+- **Custom wasm hosts**: create a growable table and pass it at client
+  instantiation — `new WebAssembly.Table({ initial: 256, element:
+  "anyfunc" })` as `env.__indirect_function_table`. Apps using the stock
+  `verve.js` / `verve_desktop.js` bridges need no changes; re-vendor the
+  bridge + `build.zig` (or re-scaffold) to pick the rework up.
+- **Example-style builds**: flip the main client from
+  `wasm.export_table = true` to `wasm.import_table = true`; chunks keep
+  `import_table = true`.
+- **Apps with island chunks mirroring `VizGraphInteractive.Props`**:
+  append the new `ids` / `layout` / `margin` fields in order.
+
 ## [0.2.0] - 2026-06-07
 
 ### Changed
