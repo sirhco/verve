@@ -165,8 +165,6 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         vbw = r.w;
         vbh = r.h;
     }
-
-    verve.registerResponseHandler("vizGraph", &onGraph);
 }
 
 fn svgRect() verve.Rect {
@@ -473,7 +471,6 @@ fn reconcile(new_ids: []const []const u8, new_labels: []const []const u8, new_ed
 
 // ---- live-data polling ------------------------------------------------------
 
-var live_timer: u32 = 0;
 var polling: bool = false;
 
 /// Mirror of core/viz/graph.zig mapSnapshotEdges (chunk can't import across the
@@ -497,10 +494,14 @@ fn mapSnapshotEdges(ids: []const []const u8, froms: []const []const u8, tos: []c
     return k;
 }
 
-/// Response handler for the `vizGraph` server-fn reply. Parses the
-/// `{"value":{"nodes":[{id,label}],"edges":[{from,to}]}}` snapshot and reconciles.
-fn onGraph(ptr: [*]const u8, len: u32) void {
-    const doc = verve.parseJson(ptr[0..len]) orelse return;
+/// Apply a `{"value":{"nodes":[{id,label}],"edges":[{from,to}]}}` snapshot and
+/// reconcile. A NAMED export (not address-taken) called by the JS poll loop with
+/// the reply bytes staged in island scratch — so the chunk adds no entry to the
+/// shared indirect function table (a `&handler` would collide; see the table
+/// footprint note above).
+export fn viz_apply_snapshot(ptr: u32, len: u32) void {
+    const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
+    const doc = verve.parseJson(bytes) orelse return;
     defer doc.free();
     const value = doc.get("value") orelse return;
     const nodes = value.get("nodes") orelse return;
@@ -544,20 +545,15 @@ fn onGraph(ptr: [*]const u8, len: u32) void {
     reconcile(ids, labels, pairs[0..k]);
 }
 
-fn poll() void {
-    verve.serverFnPost("vizGraph", "{}");
-}
-
-/// Toggle the polling stream. Starts/stops a 2s interval; updates the button.
+/// Toggle the live stream. Delegates the timer + fetch to JS (`verveVizPoll`
+/// host fn) via a synchronous `host` call — no wasm timer/response callback, so
+/// no new indirect-function-table entry. The JS loop POSTs `vizGraph` and calls
+/// `viz_apply_snapshot` by name.
 export fn viz_toggle_live() void {
-    if (polling) {
-        verve.clearTimer(live_timer);
-        polling = false;
-    } else {
-        live_timer = verve.setInterval(2000, &poll);
-        polling = true;
-        poll();
-    }
+    polling = !polling;
+    var out: [16]u8 = undefined;
+    const args: []const u8 = if (polling) "{\"on\":1,\"interval\":2000}" else "{\"on\":0}";
+    _ = verve.host("verveVizPoll", args, &out);
     if (verve.queryRef(@as([]const u8, "viz-live-btn"))) |h| verve.setRefClass(h, "live-on", polling);
 }
 

@@ -1114,6 +1114,67 @@
   // different components that export the same handler name from colliding
   // (dispatch scopes the lookup to the click target's enclosing island).
   const chunkExports = {};
+
+  // Live-data poll loop for the viz interactive island, driven from JS so the
+  // chunk needs no timer/response-handler function pointer (those would add an
+  // entry to the shared indirect function table and collide with the main
+  // client). The chunk's `viz_toggle_live` calls this via `host("verveVizPoll")`;
+  // we POST `vizGraph` on an interval and hand the reply to the chunk's NAMED
+  // `viz_apply_snapshot` export (called by name, not via the table).
+  let vizPollTimer = null;
+  window.verveHost.verveVizPoll = (argsJson) => {
+    let a = {};
+    try {
+      a = JSON.parse(argsJson || "{}");
+    } catch {}
+    if (vizPollTimer) {
+      clearInterval(vizPollTimer);
+      vizPollTimer = null;
+    }
+    if (!a.on) return "{}";
+    const interval = a.interval || 2000;
+    const tick = async () => {
+      let text;
+      try {
+        const r = await fetch("/api/vizGraph", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        text = await r.text();
+      } catch {
+        return;
+      }
+      const chunk = chunkExports["VizGraphInteractive"];
+      if (
+        !chunk ||
+        typeof chunk.viz_apply_snapshot !== "function" ||
+        typeof exp.verve_island_scratch_ptr !== "function"
+      )
+        return;
+      const ptr = exp.verve_island_scratch_ptr();
+      const cap = exp.verve_island_scratch_capacity();
+      const bytes = new TextEncoder().encode(text);
+      if (bytes.length > cap) return;
+      new Uint8Array(memory.buffer, ptr, cap).set(bytes, 0);
+      const el = document.querySelector(
+        'verve-island[data-name="VizGraphInteractive"]',
+      );
+      const vid = el ? parseInt(el.getAttribute("data-vid"), 10) || 0 : 0;
+      if (vid && typeof exp.verve_enter_island === "function")
+        exp.verve_enter_island(vid);
+      try {
+        chunk.viz_apply_snapshot(ptr, bytes.length);
+      } finally {
+        if (vid && typeof exp.verve_exit_island === "function")
+          exp.verve_exit_island();
+      }
+    };
+    vizPollTimer = setInterval(tick, interval);
+    tick();
+    return "{}";
+  };
+
   const loadIslandChunk = async (el, instanceId) => {
     const name = el.getAttribute("data-name") || "";
     if (!name) return;
