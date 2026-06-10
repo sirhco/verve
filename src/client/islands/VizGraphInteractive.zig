@@ -115,6 +115,16 @@ fn scopedRef(buf: []u8, base: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}__v{d}", .{ base, vid }) catch null;
 }
 
+/// Arena-backed format via `bufPrint` (NOT `allocPrint`): the chunk shares the
+/// main client's indirect function table, and `allocPrint`'s Allocating writer
+/// would add a new address-taken `drain` fn that collides with main's table
+/// slots (call_indirect signature mismatch). `bufPrint`'s writer is already in
+/// the table, so this is safe.
+fn aprint(a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ?[]const u8 {
+    const buf = a.alloc(u8, 128) catch return null;
+    return std.fmt.bufPrint(buf, fmt, args) catch null;
+}
+
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     vid = root_id;
     if (props_len == 0) return;
@@ -389,7 +399,7 @@ fn reconcile(new_ids: []const []const u8, new_labels: []const []const u8, new_ed
     const old_nkeys = a.alloc([]const u8, n) catch return;
     for (0..n) |i| old_nkeys[i] = a.dupe(u8, idOf(i)) catch return;
     const old_ekeys = a.alloc([]const u8, edge_n) catch return;
-    for (0..edge_n) |e| old_ekeys[e] = std.fmt.allocPrint(a, "{s}|{s}", .{ idOf(ef[e]), idOf(et[e]) }) catch return;
+    for (0..edge_n) |e| old_ekeys[e] = aprint(a, "{s}|{s}", .{ idOf(ef[e]), idOf(et[e]) }) orelse return;
 
     // Commit new node state.
     var ioff: usize = 0;
@@ -422,7 +432,7 @@ fn reconcile(new_ids: []const []const u8, new_labels: []const []const u8, new_ed
     const nhtml = a.alloc([]const u8, n) catch return;
     for (0..n) |i| {
         nkeys[i] = idOf(i);
-        const base = std.fmt.allocPrint(a, "viz-node-{s}", .{idOf(i)}) catch return;
+        const base = aprint(a, "viz-node-{s}", .{idOf(i)}) orelse return;
         const sbuf = a.alloc(u8, 96) catch return;
         const sref = scopedRef(sbuf, base) orelse return;
         const hbuf = a.alloc(u8, 1024) catch return;
@@ -433,9 +443,9 @@ fn reconcile(new_ids: []const []const u8, new_labels: []const []const u8, new_ed
     const ekeys = a.alloc([]const u8, edge_n) catch return;
     const ehtml = a.alloc([]const u8, edge_n) catch return;
     for (0..edge_n) |e| {
-        const key = std.fmt.allocPrint(a, "{s}|{s}", .{ idOf(ef[e]), idOf(et[e]) }) catch return;
+        const key = aprint(a, "{s}|{s}", .{ idOf(ef[e]), idOf(et[e]) }) orelse return;
         ekeys[e] = key;
-        const base = std.fmt.allocPrint(a, "viz-edge-{s}", .{key}) catch return;
+        const base = aprint(a, "viz-edge-{s}", .{key}) orelse return;
         const sbuf = a.alloc(u8, 96) catch return;
         const sref = scopedRef(sbuf, base) orelse return;
         const hbuf = a.alloc(u8, 320) catch return;
@@ -468,7 +478,7 @@ export fn viz_add_node() void {
         ids[i] = a.dupe(u8, idOf(i)) catch return;
         labels[i] = a.dupe(u8, labelOf(i)) catch return;
     }
-    const new_id = std.fmt.allocPrint(a, "n{d}", .{add_seq}) catch return;
+    const new_id = aprint(a, "n{d}", .{add_seq}) orelse return;
     ids[n] = new_id;
     labels[n] = new_id;
     const edges = a.alloc([2]usize, edge_n + 1) catch return;
