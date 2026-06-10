@@ -65,6 +65,7 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
     const controls = ctx.div().class("viz-controls").children(.{
         ctx.el("button").attr("z-on-click", "viz_add_node").text("+ node"),
         ctx.el("button").attr("z-on-click", "viz_remove_node").text("− node"),
+        ctx.el("button").attr("z-on-click", "viz_toggle_live").attr("data-ref", "viz-live-btn").text("● live"),
     });
     const graph_inner = ctx.div().children(.{ controls, graph_svg });
     const graph_island = verve.island(ctx, .{ .name = "VizGraphInteractive", .props = props }, graph_inner);
@@ -159,7 +160,7 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
     return ctx.div().class("viz-page").children(.{
         ctx.h1("Visualizations"),
         ctx.p().text("Native verve.viz: SVG scene model, scales/axes, and tree/radial/force/dag layouts — computed in Zig, rendered server-side. The graph below is an island: nodes reveal on hydrate, yet the page is fully formed with JS off."),
-        ctx.section().class("card viz-card").children(.{ ctx.h2("Force-directed graph — interactive"), ctx.p().class("hint").text("Scroll to zoom, drag to pan, drag a node, hover for a label, click to select. +/− node mutate the graph at runtime — zoom + selection survive."), graph_island }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Force-directed graph — interactive"), ctx.p().class("hint").text("Scroll to zoom, drag to pan, drag a node, hover for a label, click to select. +/− mutate the graph; ● live streams an evolving graph from the server every 2s — zoom + selection survive."), graph_island }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Layered DAG"), ctx.p().class("hint").text("The src→emit skip edge spans 3 layers — it routes through virtual-node bends rather than cutting straight across."), dag_svg }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — OFF"), ctx.p().class("hint").text("dag_crossing_iterations = 0 → A→Z, B→Y, C→X all cross (id-order)."), dag_off }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — ON"), ctx.p().class("hint").text("Default sweeps reorder the bottom layer to Z,Y,X → edges fan cleanly, zero crossings."), dag_on }),
@@ -360,6 +361,7 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.viz-node{cursor:grab}
                 \\.viz-node.selected circle{stroke:#fff;stroke-width:3}
                 \\.viz-controls{display:flex;gap:.5rem;margin-bottom:.5rem}
+                \\.viz-controls .live-on{background:#10b981}
             ),
         }),
         ctx.el("body").children(.{

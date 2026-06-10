@@ -865,6 +865,21 @@ hidden tooltip. The client chunk mutates attributes/classes via `setRefAttr` /
 `eventButton()` accessors and `Node.onWheel` / `onPointer*` stamps, reusable by
 any island.
 
+### Live-data streaming (pull / polling)
+
+The graph can be **data-driven**: poll a server-fn for a full `{nodes, edges}`
+snapshot on an interval and reconcile to it. A `vizGraph` server-fn (`api.zig`)
+returns the current graph; the island registers a response handler
+(`registerResponseHandler("vizGraph", &onGraph)`), polls via `serverFnPost` on a
+`setInterval` behind a "● live" toggle, parses the snapshot (`parseJson` →
+`mapSnapshotEdges` id→slot), and calls the same `reconcile`. **No new bridge
+primitives** — it reuses the IPC reply path + the reconciler. Zoom/pan + selection
+persist across every tick.
+
+Limitations: **polling** (interval-bounded, not push); a **full snapshot** per
+tick (no deltas); single instance; one shared server-side demo graph. WebSocket
+push is the next phase.
+
 ### Runtime mutation (add / remove nodes)
 
 The graph can change at runtime. The island exposes an imperative API
@@ -902,8 +917,9 @@ assumes the svg isn't CSS-scaled. See [Not yet](#not-yet-phase-2).
 
 ### Not yet (phase 2+)
 
-- **Expand/collapse + live-data streaming** — runtime add/remove ships (above);
-  subtree expand/collapse and granular wire deltas are the next layer.
+- **WebSocket push + expand/collapse** — runtime add/remove and pull-based
+  live-data streaming ship (above); true push (WS/SSE), granular wire deltas, and
+  subtree expand/collapse are the next layer.
 - **Mutation for non-force layouts** — runtime mutation is force-only so far.
 - **Pointer capture** — drag/pan are bounded to pointer-over-svg; dragging past
   the svg edge ends the gesture. Document-level capture is a later refinement.
