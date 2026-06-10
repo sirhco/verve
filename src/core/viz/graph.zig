@@ -14,6 +14,7 @@ const radial_layout = @import("layout/radial.zig");
 const force_layout = @import("layout/force.zig");
 const dag_layout = @import("layout/dag.zig");
 const common = @import("layout/common.zig");
+const edge_path = @import("edge_path.zig");
 
 const Vec2 = geom.Vec2;
 
@@ -42,6 +43,11 @@ pub const Opts = struct {
     force_iterations: usize = 300,
     /// `.dag` only: crossing-minimization sweeps (0 = stable id-order).
     dag_crossing_iterations: usize = 8,
+    /// `.dag` only: how routed edges traverse their via-points — straight
+    /// polyline bends, a smooth spline, or orthogonal runs.
+    edge_routing: edge_path.Routing = .straight,
+    /// `.orthogonal` routing only: corner rounding radius.
+    edge_corner_radius: f64 = 8,
     /// Hint that callers want the interactive scaffold. `renderGraph` ignores
     /// it (static); use `renderInteractive` (or the app-layer island wrapper).
     interactive: bool = false,
@@ -110,10 +116,18 @@ fn renderDag(ctx: *const Context, g: Graph, opts: Opts) *Node {
     var shapes: std.ArrayList(scene.Shape) = .empty;
     for (routed.paths) |path| {
         if (path.len < 2) continue;
-        shapes.append(a, .{ .polyline = .{
-            .points = path,
-            .style = .{ .stroke = opts.edge_color, .stroke_width = 1.5, .fill = "none" },
-        } }) catch return errNode(ctx);
+        if (opts.edge_routing == .straight) {
+            shapes.append(a, .{ .polyline = .{
+                .points = path,
+                .style = .{ .stroke = opts.edge_color, .stroke_width = 1.5, .fill = "none" },
+            } }) catch return errNode(ctx);
+        } else {
+            const d = edge_path.pathD(a, path, opts.edge_routing, .{ .corner_radius = opts.edge_corner_radius }) catch return errNode(ctx);
+            shapes.append(a, .{ .path = .{
+                .d = d,
+                .style = .{ .stroke = opts.edge_color, .stroke_width = 1.5, .fill = "none" },
+            } }) catch return errNode(ctx);
+        }
     }
     for (g.nodes, 0..) |node, i| {
         const grp = nodeGroupShape(ctx, opts, node, routed.positions[i], i) catch return errNode(ctx);
@@ -221,7 +235,8 @@ pub fn renderInteractive(ctx: *const Context, g: Graph, opts: Opts) *Node {
             .onPointerDown("viz_pointerdown")
             .onPointerOver("viz_node_over")
             .onPointerOut("viz_node_out")
-            .onClick("viz_node_click");
+            .onClick("viz_node_click")
+            .onDblClick("viz_node_dblclick");
         _ = grp.children(.{ctx.el("circle").attr("cx", "0").attr("cy", "0").attrFmt("r", "{d}", .{opts.node_radius}).attr("fill", opts.node_color)});
         if (node.label.len != 0) {
             _ = grp.children(.{ctx.el("text")
@@ -258,32 +273,19 @@ pub fn renderInteractive(ctx: *const Context, g: Graph, opts: Opts) *Node {
         .onPointerDown("viz_pointerdown")
         .onPointerMove("viz_pointermove")
         .onPointerUp("viz_pointerup")
-        .onPointerOut("viz_pointerup")
+        .onPointerCancel("viz_pointerup")
         .children(.{root});
 }
 
-/// Uniform scale + translate that fits a point set into the margin box,
-/// centered. Computed from the real-node bbox so routed edge bends can reuse it.
-const Fit = struct { s: f64, cx: f64, cy: f64, bx: f64, by: f64 };
+// Fit math lives in geom.zig (`fitBox`/`applyFit`) — it is the SSR↔client
+// position contract, shared with chunks via the `viz_core` module.
+const Fit = geom.Fit;
 
 fn computeFit(positions: []const Vec2, opts: Opts) Fit {
-    const box = geom.Rect.bounds(positions);
-    const avail_w = opts.width - 2 * opts.margin;
-    const avail_h = opts.height - 2 * opts.margin;
-    var s: f64 = 1;
-    if (box.w > 1e-9 and box.h > 1e-9) {
-        s = @min(avail_w / box.w, avail_h / box.h);
-    } else if (box.w > 1e-9) {
-        s = avail_w / box.w;
-    } else if (box.h > 1e-9) {
-        s = avail_h / box.h;
-    }
-    return .{ .s = s, .cx = opts.width / 2.0, .cy = opts.height / 2.0, .bx = box.x + box.w / 2.0, .by = box.y + box.h / 2.0 };
+    return geom.fitBox(positions, opts.width, opts.height, opts.margin);
 }
 
-fn applyFit(p: Vec2, f: Fit) Vec2 {
-    return .{ .x = f.cx + (p.x - f.bx) * f.s, .y = f.cy + (p.y - f.by) * f.s };
-}
+const applyFit = geom.applyFit;
 
 /// Translate + uniformly scale positions in place to fit the margin box.
 fn fitPositions(positions: []Vec2, opts: Opts) void {
@@ -388,6 +390,25 @@ test "dag layout renders a layered graph" {
     try testing.expect(std.mem.indexOf(u8, out, "<polyline") != null);
 }
 
+test "dag edge routing emits paths instead of polylines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const nodes = [_]GraphNode{ .{ .id = "a", .label = "A" }, .{ .id = "b", .label = "B" }, .{ .id = "c", .label = "C" } };
+    const edges = [_]GraphEdge{ .{ .from = "a", .to = "b" }, .{ .from = "b", .to = "c" }, .{ .from = "a", .to = "c" } };
+    const g = Graph{ .nodes = &nodes, .edges = &edges, .layout = .dag };
+
+    var buf_c: [16384]u8 = undefined;
+    const curved = try renderGraph(&arena, g, .{ .width = 400, .height = 400, .edge_routing = .curved }, &buf_c);
+    try testing.expect(std.mem.indexOf(u8, curved, "<path") != null);
+    try testing.expect(std.mem.indexOf(u8, curved, "fill=\"none\"") != null);
+    try testing.expect(std.mem.indexOf(u8, curved, "<polyline") == null);
+
+    var buf_o: [16384]u8 = undefined;
+    const ortho = try renderGraph(&arena, g, .{ .width = 400, .height = 400, .edge_routing = .orthogonal }, &buf_o);
+    try testing.expect(std.mem.indexOf(u8, ortho, "<path") != null);
+    try testing.expect(std.mem.indexOf(u8, ortho, "<polyline") == null);
+}
+
 test "interactive graph uses keyed id-based containers" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -412,7 +433,40 @@ test "interactive graph uses keyed id-based containers" {
     try testing.expect(std.mem.indexOf(u8, out, "data-ref=\"viz-edge-a|b\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "z-on-wheel=\"viz_wheel\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "z-on-pointerover=\"viz_node_over\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "z-on-dblclick=\"viz_node_dblclick\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "data-ref=\"viz-tooltip\"") != null);
+    // gestures end on pointercancel (pointer capture keeps them alive past
+    // the svg edge); pointerout must no longer end them
+    try testing.expect(std.mem.indexOf(u8, out, "z-on-pointercancel=\"viz_pointerup\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "z-on-pointerout=\"viz_pointerup\"") == null);
+}
+
+test "computePositions equals layout + fitBox + applyFit (the SSR/client parity contract)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ctx = Context.init(&arena);
+    const nodes = [_]GraphNode{ .{ .id = "a" }, .{ .id = "b" }, .{ .id = "c" }, .{ .id = "d" } };
+    const gedges = [_]GraphEdge{ .{ .from = "a", .to = "b" }, .{ .from = "a", .to = "c" }, .{ .from = "b", .to = "d" } };
+    const pairs = [_]common.Edge{ .{ 0, 1 }, .{ 0, 2 }, .{ 1, 3 } };
+    const opts = Opts{ .width = 500, .height = 400, .margin = 30 };
+    const center = Vec2{ .x = opts.width / 2.0, .y = opts.height / 2.0 };
+
+    inline for (.{ Layout.tree, Layout.radial, Layout.dag }) |lay| {
+        const got = try computePositions(&ctx, .{ .nodes = &nodes, .edges = &gedges, .layout = lay }, opts);
+        const raw = switch (lay) {
+            .tree => try tree_layout.layout(a, nodes.len, &pairs, .{}),
+            .radial => try radial_layout.layout(a, nodes.len, &pairs, .{ .center = center }),
+            .dag => try dag_layout.layout(a, nodes.len, &pairs, .{}),
+            else => unreachable,
+        };
+        const f = geom.fitBox(raw, opts.width, opts.height, opts.margin);
+        for (got, raw) |g, r| {
+            const want = geom.applyFit(r, f);
+            try testing.expectEqual(want.x, g.x);
+            try testing.expectEqual(want.y, g.y);
+        }
+    }
 }
 
 test "mapSnapshotEdges resolves id pairs to slots, dropping unknown endpoints" {

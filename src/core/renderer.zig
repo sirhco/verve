@@ -237,6 +237,16 @@ pub const Renderer = struct {
             try escapeAttr(w, action);
             try w.writeAll("\"");
         }
+        if (node.z_on_pointercancel_action) |action| {
+            try w.writeAll(" z-on-pointercancel=\"");
+            try escapeAttr(w, action);
+            try w.writeAll("\"");
+        }
+        if (node.z_on_dblclick_action) |action| {
+            try w.writeAll(" z-on-dblclick=\"");
+            try escapeAttr(w, action);
+            try w.writeAll("\"");
+        }
 
         if (node_mod.isVoidTag(node.tag)) {
             try w.writeAll(">");

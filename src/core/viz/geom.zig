@@ -85,6 +85,31 @@ pub fn clamp(v: f64, lo: f64, hi: f64) f64 {
     return @max(lo, @min(hi, v));
 }
 
+/// Uniform scale + translate that centers a point set inside a `w`×`h`
+/// viewport with `margin` on every side. This is the SSR↔client position
+/// contract: a chunk recomputing a layout reproduces the server's pixel
+/// positions exactly by applying the same fit.
+pub const Fit = struct { s: f64, cx: f64, cy: f64, bx: f64, by: f64 };
+
+pub fn fitBox(positions: []const Vec2, w: f64, h: f64, margin: f64) Fit {
+    const box = Rect.bounds(positions);
+    const avail_w = w - 2 * margin;
+    const avail_h = h - 2 * margin;
+    var s: f64 = 1;
+    if (box.w > 1e-9 and box.h > 1e-9) {
+        s = @min(avail_w / box.w, avail_h / box.h);
+    } else if (box.w > 1e-9) {
+        s = avail_w / box.w;
+    } else if (box.h > 1e-9) {
+        s = avail_h / box.h;
+    }
+    return .{ .s = s, .cx = w / 2.0, .cy = h / 2.0, .bx = box.x + box.w / 2.0, .by = box.y + box.h / 2.0 };
+}
+
+pub fn applyFit(p: Vec2, f: Fit) Vec2 {
+    return .{ .x = f.cx + (p.x - f.bx) * f.s, .y = f.cy + (p.y - f.by) * f.s };
+}
+
 // ---- tests ----------------------------------------------------------------
 
 const testing = std.testing;
@@ -123,4 +148,27 @@ test "lerp and clamp" {
     try testing.expectEqual(@as(f64, 5), clamp(-3, 5, 9));
     try testing.expectEqual(@as(f64, 9), clamp(42, 5, 9));
     try testing.expectEqual(@as(f64, 7), clamp(7, 5, 9));
+}
+
+test "fitBox centers and uniformly scales into the margin box" {
+    const pts = [_]Vec2{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 5 } };
+    const f = fitBox(&pts, 220, 120, 10);
+    // 10×5 box into 200×100 avail → s limited by both = 20
+    try testing.expectApproxEqAbs(@as(f64, 20), f.s, 1e-9);
+    const a = applyFit(pts[0], f);
+    const b = applyFit(pts[1], f);
+    // Centered: midpoint of mapped points is the viewport center.
+    try testing.expectApproxEqAbs(@as(f64, 110), (a.x + b.x) / 2, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 60), (a.y + b.y) / 2, 1e-9);
+    // Uniform: aspect preserved (dx/dy ratio unchanged).
+    try testing.expectApproxEqAbs((b.x - a.x) / (b.y - a.y), 10.0 / 5.0, 1e-9);
+}
+
+test "fitBox degenerate point set keeps scale 1 and centers" {
+    const pts = [_]Vec2{.{ .x = 7, .y = 7 }};
+    const f = fitBox(&pts, 100, 80, 10);
+    try testing.expectEqual(@as(f64, 1), f.s);
+    const p = applyFit(pts[0], f);
+    try testing.expectApproxEqAbs(@as(f64, 50), p.x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 40), p.y, 1e-9);
 }

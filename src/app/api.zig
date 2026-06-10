@@ -3,6 +3,7 @@
 //! `/api/<fn_name>` routes.
 
 const std = @import("std");
+const verve = @import("verve");
 
 pub const components = @import("components.zig");
 pub const islands = @import("islands.zig");
@@ -50,12 +51,84 @@ pub fn copyTodosInto(arena: std.mem.Allocator) ![]const []const u8 {
 
 pub const VizNode = struct { id: []const u8, label: []const u8 };
 pub const VizEdge = struct { from: []const u8, to: []const u8 };
-pub const VizSnapshot = struct { nodes: []const VizNode, edges: []const VizEdge };
+/// Pull snapshot, now seq-stamped so push deltas and pull resyncs share one
+/// ordering domain: a client applies a delta only when `seq` is exactly one
+/// past its last-seen snapshot/delta.
+pub const VizSnapshot = struct { seq: u64, nodes: []const VizNode, edges: []const VizEdge };
 
-var viz_tick: std.atomic.Value(u32) = .init(0);
-/// Reset the evolving stream (tests).
-pub fn resetVizTick() void {
-    viz_tick.store(0, .monotonic);
+/// The live-graph demo model: 3 stable base nodes plus 0..3 ephemeral ones.
+/// `viz_extra` is the whole state; the server-side publisher loop advances it
+/// (cycling extra 0→3) and broadcasts the diff as a wire delta, bumping
+/// `viz_seq` in lockstep. `vizGraph` only snapshots — it never mutates.
+var viz_mu: std.atomic.Mutex = .unlocked;
+var viz_seq: u64 = 0;
+var viz_extra: u32 = 0;
+
+fn lockViz() void {
+    while (!viz_mu.tryLock()) std.atomic.spinLoopHint();
+}
+
+/// Reset the evolving model (tests).
+pub fn resetVizModel() void {
+    lockViz();
+    defer viz_mu.unlock();
+    viz_seq = 0;
+    viz_extra = 0;
+}
+
+const VIZ_EPH_IDS = [_][]const u8{ "e0", "e1", "e2" };
+
+/// Fill `nodes`/`edges` with the graph for `extra` ephemeral nodes. All
+/// strings are literals, so the filled slices are stable forever.
+fn vizBuild(extra: u32, nodes: *[8]verve.viz.GraphNode, edges: *[8]verve.viz.GraphEdge) struct { n: usize, e: usize } {
+    nodes[0] = .{ .id = "core", .label = "core" };
+    nodes[1] = .{ .id = "io", .label = "io" };
+    nodes[2] = .{ .id = "ui", .label = "ui" };
+    edges[0] = .{ .from = "core", .to = "io" };
+    edges[1] = .{ .from = "core", .to = "ui" };
+    var nc: usize = 3;
+    var ec: usize = 2;
+    var i: usize = 0;
+    while (i < extra) : (i += 1) {
+        nodes[nc] = .{ .id = VIZ_EPH_IDS[i], .label = VIZ_EPH_IDS[i] };
+        edges[ec] = .{ .from = "core", .to = VIZ_EPH_IDS[i] };
+        nc += 1;
+        ec += 1;
+    }
+    return .{ .n = nc, .e = ec };
+}
+
+/// Advance the demo model one step and serialize the resulting wire delta
+/// (`{"seq":N,"ops":[...]}`) into `buf`. The server's publisher loop calls
+/// this once per second while the `viz` push channel has subscribers, then
+/// publishes the frame. Null when serialization fails (frame > buf).
+pub fn vizAdvanceTick(buf: []u8) ?[]const u8 {
+    lockViz();
+    defer viz_mu.unlock();
+
+    var old_nodes: [8]verve.viz.GraphNode = undefined;
+    var old_edges: [8]verve.viz.GraphEdge = undefined;
+    const old = vizBuild(viz_extra, &old_nodes, &old_edges);
+
+    const next_extra = (viz_extra + 1) % 4;
+    var new_nodes: [8]verve.viz.GraphNode = undefined;
+    var new_edges: [8]verve.viz.GraphEdge = undefined;
+    const new = vizBuild(next_extra, &new_nodes, &new_edges);
+
+    var ops_buf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&ops_buf);
+    const ops = verve.viz.diffGraphs(
+        fba.allocator(),
+        old_nodes[0..old.n],
+        old_edges[0..old.e],
+        new_nodes[0..new.n],
+        new_edges[0..new.e],
+    ) catch return null;
+
+    const frame = verve.viz.writeDeltaJson(buf, viz_seq + 1, ops) catch return null;
+    viz_extra = next_extra;
+    viz_seq += 1;
+    return frame;
 }
 
 // Per-thread snapshot storage: `vizGraph` returns slices into these, serialized
@@ -64,28 +137,22 @@ threadlocal var tl_nodes: [8]VizNode = undefined;
 threadlocal var tl_edges: [8]VizEdge = undefined;
 
 pub const Actions = struct {
-    /// Evolving graph snapshot for the live-data demo: a stable base plus 0..3
-    /// ephemeral nodes selected by a tick counter, so successive polls show
-    /// nodes appearing/disappearing.
+    /// Current graph snapshot for the live-data demo, seq-stamped. Pure read:
+    /// the model only changes when the publisher loop ticks it (which it does
+    /// only while the `viz` push channel has subscribers), so pull-only
+    /// clients see a stable graph and push clients resync coherently.
     pub fn vizGraph(_: struct {}) VizSnapshot {
-        const t = viz_tick.fetchAdd(1, .monotonic);
-        const extra = t % 4;
-        tl_nodes[0] = .{ .id = "core", .label = "core" };
-        tl_nodes[1] = .{ .id = "io", .label = "io" };
-        tl_nodes[2] = .{ .id = "ui", .label = "ui" };
-        tl_edges[0] = .{ .from = "core", .to = "io" };
-        tl_edges[1] = .{ .from = "core", .to = "ui" };
-        var nc: usize = 3;
-        var ec: usize = 2;
-        const eph_ids = [_][]const u8{ "e0", "e1", "e2" };
-        var i: usize = 0;
-        while (i < extra) : (i += 1) {
-            tl_nodes[nc] = .{ .id = eph_ids[i], .label = eph_ids[i] };
-            tl_edges[ec] = .{ .from = "core", .to = eph_ids[i] };
-            nc += 1;
-            ec += 1;
-        }
-        return .{ .nodes = tl_nodes[0..nc], .edges = tl_edges[0..ec] };
+        lockViz();
+        const extra = viz_extra;
+        const seq = viz_seq;
+        viz_mu.unlock();
+
+        var nodes: [8]verve.viz.GraphNode = undefined;
+        var edges: [8]verve.viz.GraphEdge = undefined;
+        const counts = vizBuild(extra, &nodes, &edges);
+        for (nodes[0..counts.n], 0..) |nd, i| tl_nodes[i] = .{ .id = nd.id, .label = nd.label };
+        for (edges[0..counts.e], 0..) |e, i| tl_edges[i] = .{ .from = e.from, .to = e.to };
+        return .{ .seq = seq, .nodes = tl_nodes[0..counts.n], .edges = tl_edges[0..counts.e] };
     }
 
     pub fn updateDatabase(args: struct { new_count: i32 }) !void {
@@ -147,9 +214,10 @@ pub const Actions = struct {
     }
 };
 
-test "vizGraph returns a base graph that changes across ticks" {
-    resetVizTick();
+test "vizGraph snapshots are stable and edge endpoints resolve" {
+    resetVizModel();
     const a = Actions.vizGraph(.{});
+    try std.testing.expectEqual(@as(u64, 0), a.seq);
     try std.testing.expect(a.nodes.len >= 3);
     var has_core = false;
     for (a.nodes) |nd| {
@@ -165,7 +233,37 @@ test "vizGraph returns a base graph that changes across ticks" {
         }
         try std.testing.expect(ff and tt);
     }
+    // Pull is a pure read: repeated snapshots don't change the graph.
     const b = Actions.vizGraph(.{});
-    const c = Actions.vizGraph(.{});
-    try std.testing.expect(a.nodes.len != b.nodes.len or b.nodes.len != c.nodes.len);
+    try std.testing.expectEqual(a.nodes.len, b.nodes.len);
+    try std.testing.expectEqual(a.seq, b.seq);
+}
+
+test "vizAdvanceTick emits seq-ordered deltas that transform the snapshot" {
+    resetVizModel();
+    const before = Actions.vizGraph(.{});
+    const before_n = before.nodes.len;
+
+    var buf: [4096]u8 = undefined;
+    const f1 = vizAdvanceTick(&buf) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.startsWith(u8, f1, "{\"seq\":1,\"ops\":["));
+    // extra 0→1 adds one node + one edge
+    try std.testing.expect(std.mem.indexOf(u8, f1, "\"op\":\"+n\",\"id\":\"e0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f1, "\"op\":\"+e\"") != null);
+
+    const after = Actions.vizGraph(.{});
+    try std.testing.expectEqual(@as(u64, 1), after.seq);
+    try std.testing.expectEqual(before_n + 1, after.nodes.len);
+
+    var buf2: [4096]u8 = undefined;
+    const f2 = vizAdvanceTick(&buf2) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.startsWith(u8, f2, "{\"seq\":2,\"ops\":["));
+
+    // Cycle wraps: two more ticks reach extra=3, the next removes all three.
+    _ = vizAdvanceTick(&buf).?;
+    const wrap = vizAdvanceTick(&buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, wrap, "\"op\":\"-n\",\"id\":\"e0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wrap, "\"op\":\"-n\",\"id\":\"e2\"") != null);
+    const wrapped = Actions.vizGraph(.{});
+    try std.testing.expectEqual(before_n, wrapped.nodes.len);
 }

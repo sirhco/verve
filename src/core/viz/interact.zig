@@ -37,6 +37,65 @@ pub fn zoomToward(view: View, svg_cursor: Vec2, factor: f64, min_z: f64, max_z: 
     return .{ .z = new_z, .tx = svg_cursor.x - g.x * new_z, .ty = svg_cursor.y - g.y * new_z };
 }
 
+/// The easing used for layout-transition tweens (and the VizGraph reveal).
+pub fn easeOutCubic(t: f64) f64 {
+    const inv = 1.0 - t;
+    return 1.0 - inv * inv * inv;
+}
+
+/// One tween step: position at eased parameter `t` (0..1) between start and
+/// target.
+pub fn tweenPos(start: Vec2, target: Vec2, t: f64) Vec2 {
+    const s = easeOutCubic(t);
+    return .{ .x = geom.lerp(start.x, target.x, s), .y = geom.lerp(start.y, target.y, s) };
+}
+
+/// Subtree collapse visibility: recompute `hidden` from the `collapsed` flags.
+/// For every collapsed node, BFS the *directed* out-edges (`ef[i]` → `et[i]`)
+/// and hide everything reached except the collapsed root itself — the root
+/// stays visible as the re-expand handle. Cycles terminate via the visited
+/// set; a nested collapsed node's subtree hides with it.
+///
+/// Known v1 limitation (pinned by test): a node with a second parent outside
+/// the collapsed subtree still hides — visibility is reachability from each
+/// collapsed root, not reachability from visible roots.
+pub fn collapseHidden(
+    a: std.mem.Allocator,
+    node_count: usize,
+    ef: []const usize,
+    et: []const usize,
+    collapsed: []const bool,
+    hidden: []bool,
+) !void {
+    @memset(hidden[0..node_count], false);
+    if (node_count == 0) return;
+    const visited = try a.alloc(bool, node_count);
+    const queue = try a.alloc(usize, node_count);
+    for (0..node_count) |root| {
+        if (!collapsed[root]) continue;
+        @memset(visited, false);
+        visited[root] = true;
+        var head: usize = 0;
+        var tail: usize = 0;
+        queue[tail] = root;
+        tail += 1;
+        while (head < tail) {
+            const cur = queue[head];
+            head += 1;
+            for (ef, et) |f, t| {
+                if (f != cur or t >= node_count) continue;
+                if (visited[t]) continue;
+                visited[t] = true;
+                hidden[t] = true;
+                if (tail < node_count) {
+                    queue[tail] = t;
+                    tail += 1;
+                }
+            }
+        }
+    }
+}
+
 // ---- tests ----------------------------------------------------------------
 
 const testing = std.testing;
@@ -70,4 +129,76 @@ test "zoom clamps to max" {
     const v = View{ .z = 9, .tx = 0, .ty = 0 };
     const v2 = zoomToward(v, .{ .x = 0, .y = 0 }, 4, 0.1, 10);
     try testing.expectEqual(@as(f64, 10), v2.z);
+}
+
+test "tween eases from start to target, exact at the ends" {
+    const a = Vec2{ .x = 0, .y = 100 };
+    const b = Vec2{ .x = 200, .y = 0 };
+    const p0 = tweenPos(a, b, 0);
+    try testing.expectEqual(a.x, p0.x);
+    try testing.expectEqual(a.y, p0.y);
+    const p1 = tweenPos(a, b, 1);
+    try testing.expectEqual(b.x, p1.x);
+    try testing.expectEqual(b.y, p1.y);
+    // easeOutCubic front-loads motion: at t=0.5 we're past the midpoint.
+    const mid = tweenPos(a, b, 0.5);
+    try testing.expect(mid.x > 100);
+}
+
+fn collapseCase(collapsed: []const bool, ef: []const usize, et: []const usize, expect_hidden: []const bool) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var hidden: [8]bool = undefined;
+    try collapseHidden(arena.allocator(), collapsed.len, ef, et, collapsed, hidden[0..collapsed.len]);
+    for (expect_hidden, 0..) |want, i| try testing.expectEqual(want, hidden[i]);
+}
+
+test "collapse chain hides all descendants, root stays visible" {
+    // 0 → 1 → 2 → 3, collapse 1 → 2 and 3 hide
+    try collapseCase(
+        &.{ false, true, false, false },
+        &.{ 0, 1, 2 },
+        &.{ 1, 2, 3 },
+        &.{ false, false, true, true },
+    );
+}
+
+test "collapse diamond hides the join node once" {
+    // 0 → {1, 2} → 3, collapse 0 → everything but 0 hides
+    try collapseCase(
+        &.{ true, false, false, false },
+        &.{ 0, 0, 1, 2 },
+        &.{ 1, 2, 3, 3 },
+        &.{ false, true, true, true },
+    );
+}
+
+test "collapse terminates on cycles and never hides the root via its own cycle" {
+    // 0 → 1 → 2 → 0 (cycle), collapse 0 → 1, 2 hide; 0 stays visible
+    try collapseCase(
+        &.{ true, false, false },
+        &.{ 0, 1, 2 },
+        &.{ 1, 2, 0 },
+        &.{ false, true, true },
+    );
+}
+
+test "nested collapsed subtree hides with its collapsed ancestor" {
+    // 0 → 1 → 2, both 0 and 1 collapsed → 1 and 2 hide (1 reached from 0)
+    try collapseCase(
+        &.{ true, true, false },
+        &.{ 0, 1 },
+        &.{ 1, 2 },
+        &.{ false, true, true },
+    );
+}
+
+test "v1 limitation: multi-parent node hides even with a visible parent" {
+    // 0 → 2 and 1 → 2; collapsing 0 hides 2 although parent 1 is visible.
+    try collapseCase(
+        &.{ true, false, false },
+        &.{ 0, 1 },
+        &.{ 2, 2 },
+        &.{ false, false, true },
+    );
 }

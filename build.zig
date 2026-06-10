@@ -53,11 +53,17 @@ pub fn build(b: *std.Build) void {
     const island_state_island_mod = b.createModule(.{
         .root_source_file = b.path("src/core/island_state.zig"),
     });
+    // Pure viz math (geometry, layouts, interaction, edge paths) so chunks
+    // can recompute layouts client-side with the exact SSR algorithms.
+    const viz_core_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/viz/client_core.zig"),
+    });
     const verve_island_mod = b.addModule("verve_island", .{
         .root_source_file = b.path("src/client/island_runtime.zig"),
         .imports = &.{
             .{ .name = "serialize", .module = serialize_island_mod },
             .{ .name = "island_state", .module = island_state_island_mod },
+            .{ .name = "viz_core", .module = viz_core_mod },
         },
     });
 
@@ -78,12 +84,17 @@ pub fn build(b: *std.Build) void {
     });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
-    // Phase 13G — export the indirect function table so per-island
-    // chunks can import + share it. Once both modules see the same
-    // table, a fn pointer the chunk takes via `&handler` is a valid
-    // index into the main runtime's `event_slots` and `call_indirect`
-    // dispatches into the chunk's code without further indirection.
-    wasm.export_table = true;
+    // Table isolation — the main client IMPORTS its indirect function
+    // table from JS (`env.__indirect_function_table`), so the bridge owns
+    // a growable table. Island chunks instantiate against PRIVATE tables;
+    // any fn-pointer index a chunk hands the main runtime (registerEvent,
+    // timers, response/drop handlers) is translated by the bridge into a
+    // freshly grown slot of this table. Previously main exported its own
+    // fixed-size table and chunks imported it directly — but a chunk's
+    // element segment writes at slots 1..count, clobbering the main
+    // client's own entries ("function signature mismatch" once a chunk's
+    // address-taken set grew past the slots main happened not to call).
+    wasm.import_table = true;
 
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(wasm.getEmittedBin(), "client.wasm");
@@ -459,6 +470,19 @@ pub fn build(b: *std.Build) void {
         const client_tests = b.addTest(.{ .root_module = client_test_mod });
         const run_client_tests = b.addRunArtifact(client_tests);
 
+        // Demo-app action tests (api.zig test blocks). Tests only run from a
+        // compilation's root module, so the app gets its own artifact.
+        const app_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/app/api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "verve", .module = verve_mod },
+            },
+        });
+        const app_tests = b.addTest(.{ .root_module = app_test_mod });
+        const run_app_tests = b.addRunArtifact(app_tests);
+
         const integration_opts = b.addOptions();
         integration_opts.addOptionPath("server_exe", server.getEmittedBin());
         integration_opts.addOptionPath("embed_server_exe", embed_server.getEmittedBin());
@@ -522,6 +546,7 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_i18n_it_tests.step);
         test_step.dependOn(&run_server_tests.step);
         test_step.dependOn(&run_client_tests.step);
+        test_step.dependOn(&run_app_tests.step);
         test_step.dependOn(&run_integration_tests.step);
         test_step.dependOn(&run_desktop_tests.step);
     } // end if (tests_present)

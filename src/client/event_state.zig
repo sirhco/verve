@@ -24,6 +24,7 @@ pub const MOD_ALT: u32 = 1 << 3;
 
 const FLAG_PREVENT: u32 = 1 << 0;
 const FLAG_STOP: u32 = 1 << 1;
+const FLAG_CAPTURE: u32 = 1 << 2;
 
 var mods: u32 = 0;
 var coord_x: f64 = 0;
@@ -123,8 +124,15 @@ pub fn setStop() void {
     flags |= FLAG_STOP;
 }
 
+/// Capture the pointer to the event target so the gesture keeps
+/// receiving pointermove/up after the pointer leaves the element.
+/// Released implicitly on pointerup per the Pointer Events spec.
+pub fn setCapturePointer() void {
+    flags |= FLAG_CAPTURE;
+}
+
 /// Flag bitmask for JS to honor after dispatch (bit0 preventDefault,
-/// bit1 stopPropagation).
+/// bit1 stopPropagation, bit2 setPointerCapture).
 pub fn getFlags() u32 {
     return flags;
 }
@@ -187,11 +195,12 @@ test "target dataset attr lookup" {
     try testing.expectEqual(@as(u32, 0), targetAttr("nope", &buf, buf.len));
 }
 
-test "prevent / stop flags accumulate then reset on begin" {
+test "prevent / stop / capture flags accumulate then reset on begin" {
     begin();
     setPrevent();
     setStop();
-    try testing.expectEqual(FLAG_PREVENT | FLAG_STOP, getFlags());
+    setCapturePointer();
+    try testing.expectEqual(FLAG_PREVENT | FLAG_STOP | FLAG_CAPTURE, getFlags());
     begin();
     try testing.expectEqual(@as(u32, 0), getFlags());
     end();

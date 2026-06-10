@@ -32,6 +32,10 @@ pub fn build(b: *std.Build) void {
     });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
+    // Table isolation (matches the live bridge in ../../src/bridge/verve.js):
+    // the main client IMPORTS a JS-created growable table; chunks get private
+    // tables and the bridge translates `&handler` indices at the boundary.
+    wasm.import_table = true;
 
     const app_mod = b.createModule(.{
         .root_source_file = b.path("src/app/api.zig"),
@@ -114,6 +118,9 @@ pub fn build(b: *std.Build) void {
         exe.entry = .disabled;
         exe.rdynamic = true;
         exe.import_memory = true;
+        // Private per-chunk table supplied by the bridge (JS needs the handle
+        // to translate `&handler` indices into main-table slots).
+        exe.import_table = true;
         exe.stack_size = 4 * 1024;
 
         const out_name = b.fmt("island_{s}.wasm", .{name});

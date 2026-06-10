@@ -60,12 +60,15 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         .et = et.items,
         .labels = node_labels,
         .ids = node_ids,
+        .layout = @intFromEnum(g.layout),
+        .margin = gopts.margin,
     });
     const graph_svg = verve.viz.renderGraphInteractive(ctx, g, gopts);
     const controls = ctx.div().class("viz-controls").children(.{
         ctx.el("button").attr("z-on-click", "viz_add_node").text("+ node"),
         ctx.el("button").attr("z-on-click", "viz_remove_node").text("− node"),
         ctx.el("button").attr("z-on-click", "viz_toggle_live").attr("data-ref", "viz-live-btn").text("● live"),
+        ctx.el("button").attr("z-on-click", "viz_layout_cycle").attr("data-ref", "viz-layout-btn").text("⟳ force"),
     });
     const graph_inner = ctx.div().children(.{ controls, graph_svg });
     const graph_island = verve.island(ctx, .{ .name = "VizGraphInteractive", .props = props }, graph_inner);
@@ -128,6 +131,43 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         .{ .name = "jobs", .values = &.{ 4, 6, 5, 9 }, .color = "#f59e0b" },
     };
 
+    // Sankey: request flow through the stack.
+    const sankey_nodes = [_]verve.viz.SankeyNode{
+        .{ .id = "in", .label = "requests" },    .{ .id = "cache", .label = "cache" },
+        .{ .id = "app", .label = "app" },        .{ .id = "db", .label = "db" },
+        .{ .id = "resp", .label = "responses" },
+    };
+    const sankey_links = [_]verve.viz.SankeyLink{
+        .{ .from = "in", .to = "cache", .value = 60 },
+        .{ .from = "in", .to = "app", .value = 40 },
+        .{ .from = "cache", .to = "resp", .value = 45 },
+        .{ .from = "cache", .to = "app", .value = 15 },
+        .{ .from = "app", .to = "db", .value = 30 },
+        .{ .from = "app", .to = "resp", .value = 25 },
+        .{ .from = "db", .to = "resp", .value = 30 },
+    };
+
+    // Treemap: repo bytes by module (parent-index hierarchy, parents first).
+    const tm_items = [_]verve.viz.TreemapItem{
+        .{ .label = "core" }, // 0
+        .{ .label = "node", .value = 18, .parent = 0 },
+        .{ .label = "viz", .value = 31, .parent = 0 },
+        .{ .label = "signal", .value = 9, .parent = 0 },
+        .{ .label = "server" }, // 4
+        .{ .label = "http", .value = 14, .parent = 4 },
+        .{ .label = "push", .value = 4, .parent = 4 },
+        .{ .label = "client", .value = 16 },
+        .{ .label = "desktop", .value = 22 },
+    };
+
+    // Chord: traffic between regions (row-major flows).
+    const chord_labels = [_][]const u8{ "us", "eu", "apac" };
+    const chord_matrix = [_]f64{
+        0, 12, 5,
+        9, 0,  7,
+        4, 6,  0,
+    };
+
     // A directed pipeline with a skip edge (src→emit spans 3 layers) so the
     // long edge routes through virtual-node bends instead of cutting straight.
     const dag_nodes = [_]verve.viz.GraphNode{
@@ -142,6 +182,11 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
     };
     const dag = verve.viz.Graph{ .nodes = &dag_nodes, .edges = &dag_edges, .layout = .dag };
     const dag_svg = verve.viz.renderGraph(ctx, dag, .{ .width = 560, .height = 380, .node_color = "#8b5cf6", .edge_color = "#30363d", .label_color = "#f5f5f5" });
+
+    // Edge-routing A/B/C: the same pipeline drawn with straight polyline
+    // bends, Catmull-Rom splines, and orthogonal runs with rounded corners.
+    const dag_curved = verve.viz.renderGraph(ctx, dag, .{ .width = 420, .height = 300, .node_color = "#8b5cf6", .edge_color = "#fbbf24", .label_color = "#f5f5f5", .edge_routing = .curved });
+    const dag_ortho = verve.viz.renderGraph(ctx, dag, .{ .width = 420, .height = 300, .node_color = "#8b5cf6", .edge_color = "#38bdf8", .label_color = "#f5f5f5", .edge_routing = .orthogonal });
 
     // Crossing-minimization A/B: a deliberately tangled DAG (A→Z, B→Y, C→X).
     // Under id-order the three edges all cross; the sweep reorders the bottom
@@ -160,8 +205,10 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
     return ctx.div().class("viz-page").children(.{
         ctx.h1("Visualizations"),
         ctx.p().text("Native verve.viz: SVG scene model, scales/axes, and tree/radial/force/dag layouts — computed in Zig, rendered server-side. The graph below is an island: nodes reveal on hydrate, yet the page is fully formed with JS off."),
-        ctx.section().class("card viz-card").children(.{ ctx.h2("Force-directed graph — interactive"), ctx.p().class("hint").text("Scroll to zoom, drag to pan, drag a node, hover for a label, click to select. +/− mutate the graph; ● live streams an evolving graph from the server every 2s — zoom + selection survive."), graph_island }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Force-directed graph — interactive"), ctx.p().class("hint").text("Scroll to zoom, drag to pan, drag a node (works past the svg edge — pointer capture), hover for a label, click to select, double-click to collapse a subtree (+N badge; double-click again to expand). +/− mutate the graph; ⟳ cycles tree/radial/force/dag with a tween; ● live streams server-pushed wire deltas over SSE every second — zoom, selection, and collapse all survive."), graph_island }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Layered DAG"), ctx.p().class("hint").text("The src→emit skip edge spans 3 layers — it routes through virtual-node bends rather than cutting straight across."), dag_svg }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Edge routing — curved"), ctx.p().class("hint").text("edge_routing = .curved — the same DAG with Catmull-Rom splines through the via-points."), dag_curved }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Edge routing — orthogonal"), ctx.p().class("hint").text("edge_routing = .orthogonal — Manhattan runs through the reserved virtual-node channels, corners rounded."), dag_ortho }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — OFF"), ctx.p().class("hint").text("dag_crossing_iterations = 0 → A→Z, B→Y, C→X all cross (id-order)."), dag_off }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Crossing minimization — ON"), ctx.p().class("hint").text("Default sweeps reorder the bottom layer to Z,Y,X → edges fan cleanly, zero crossings."), dag_on }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Bar chart"), verve.viz.barChart(ctx, &bars, copts) }),
@@ -176,6 +223,9 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         ctx.section().class("card viz-card").children(.{ ctx.h2("Area chart"), verve.viz.areaChart(ctx, &cure, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Scatter plot"), verve.viz.scatterChart(ctx, &cloud, copts) }),
         ctx.section().class("card viz-card").children(.{ ctx.h2("Donut chart"), verve.viz.pieChart(ctx, &slices, .{ .width = 280, .height = 280, .inner_ratio = 0.55 }) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Sankey diagram"), ctx.p().class("hint").text("Weighted flows between columns — link width ∝ value, node height ∝ throughput."), verve.viz.sankeyChart(ctx, &sankey_nodes, &sankey_links, .{ .width = 560, .height = 320, .label_color = "#f5f5f5" }) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Treemap"), ctx.p().class("hint").text("Squarified: leaf area ∝ value, nested by parent, colored by root."), verve.viz.treemapChart(ctx, &tm_items, .{ .width = 560, .height = 320 }) }),
+        ctx.section().class("card viz-card").children(.{ ctx.h2("Chord diagram"), ctx.p().class("hint").text("Pairwise flows around a circle — arc span ∝ row sum, ribbons connect nonzero pairs."), verve.viz.chordChart(ctx, &chord_labels, &chord_matrix, .{ .width = 380, .height = 380, .label_color = "#f5f5f5" }) }),
         ctx.p().children(.{verve.link(ctx, "/", "← Home", .{})}),
     }).build();
 }
@@ -360,6 +410,7 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.viz-card svg{touch-action:none;max-width:100%}
                 \\.viz-node{cursor:grab}
                 \\.viz-node.selected circle{stroke:#fff;stroke-width:3}
+                \\.viz-node.collapsed circle{stroke:#f59e0b;stroke-width:3;stroke-dasharray:3 2}
                 \\.viz-controls{display:flex;gap:.5rem;margin-bottom:.5rem}
                 \\.viz-controls .live-on{background:#10b981}
             ),

@@ -32,7 +32,21 @@
       });
   };
 
+  // Table isolation: the main client IMPORTS its indirect function table
+  // from JS (build.zig sets `import_table` on the client) so JS owns a
+  // GROWABLE table. Island chunks no longer share it — each chunk gets a
+  // private table (see the chunk loader), and any fn-pointer index a chunk
+  // hands the main runtime is translated into a freshly grown slot here.
+  // Before this, chunk element segments wrote into the shared table at the
+  // same slots as the main client's own entries — "function signature
+  // mismatch" crashes whenever a chunk's address-taken set grew.
+  const indirectFunctionTable = new WebAssembly.Table({
+    initial: 256,
+    element: "anyfunc",
+  });
+
   const env = {
+    env: { __indirect_function_table: indirectFunctionTable },
     verve: {
       set_text_by_bind: (bp, bl, tp, tl) =>
         setTextByBind(readStr(bp, bl), readStr(tp, tl)),
@@ -528,6 +542,13 @@
     const f = exp.verve_event_flags();
     if (f & 1) e.preventDefault();
     if (f & 2) e.stopPropagation();
+    if (f & 4) {
+      // Pointer capture: keep routing move/up to this target after the
+      // pointer leaves it. Implicit release on pointerup per spec.
+      try {
+        e.target.setPointerCapture(e.pointerId);
+      } catch {}
+    }
     if (typeof exp.verve_event_end === "function") exp.verve_event_end();
   };
 
@@ -660,6 +681,8 @@
     ["pointerup", "z-on-pointerup"],
     ["pointerover", "z-on-pointerover"],
     ["pointerout", "z-on-pointerout"],
+    ["pointercancel", "z-on-pointercancel"],
+    ["dblclick", "z-on-dblclick"],
   ]) {
     document.addEventListener(type, (e) => {
       if (dispatchEventId(e, attr + "-id", false)) return;
@@ -700,14 +723,8 @@
   // the main runtime's island scratch buffer — JS writes them
   // there before calling the chunk's `hydrate(ptr, len, root_id)`,
   // which then reads the bytes directly from shared memory.
-  // Phase 13G — capture main runtime's exported indirect function
-  // table so per-island chunks can import it. Once both modules share
-  // the same table, a `*const fn () void` taken via `&handler` in a
-  // chunk lands at an index the main runtime's `event_slots` can also
-  // call via `verve_event_dispatch` / `call_indirect`. Without sharing
-  // the table, chunk fn pointers would refer to indices in the chunk's
-  // private table and crash when main dispatched them.
-  const indirectFunctionTable = exp.__indirect_function_table;
+  // (The shared `indirectFunctionTable` is the JS-created growable table
+  // the main client imported at instantiation — declared above `env`.)
 
   // Phase 19 — timer / storage / clipboard registry for chunk handlers.
   // Handlers cross as indirect-function-table indices (same convention
@@ -773,6 +790,7 @@
     verve_event_target_attr: exp.verve_event_target_attr,
     verve_event_prevent_default: exp.verve_event_prevent_default,
     verve_event_stop_propagation: exp.verve_event_stop_propagation,
+    verve_event_capture_pointer: exp.verve_event_capture_pointer,
     // Phase 19 — timers (handler crosses as a function-table index).
     verve_set_timeout: (ms, idx) => {
       const myId = verveTimerSeq++;
@@ -1087,6 +1105,55 @@
     verve_slot_kind: exp.verve_slot_kind,
   };
 
+  // Table isolation, chunk side: each island chunk instantiates against a
+  // PRIVATE function table, so its element segment (allocator vtables,
+  // writer drains, `&handler` fns) can never clobber the main client's
+  // entries. Chunk-internal `call_indirect` resolves through the private
+  // table automatically. The only thing that needs care is a fn-pointer
+  // index crossing INTO the main runtime (registerEvent, response/drop
+  // handlers, timers): `translate` copies the chunk's funcref into a
+  // freshly grown slot of the main table and forwards that index, so the
+  // main runtime's registries and `call_indirect`/`verveCallSlot` dispatch
+  // work unchanged. The chunk-idx → main-slot map is memoized so repeat
+  // registrations and `cleanup(handler)` resolve to the same identity.
+  const makeChunkRuntime = (chunkTable) => {
+    const slotMap = new Map();
+    const translate = (idx) => {
+      idx = idx >>> 0;
+      if (idx === 0) return 0;
+      let slot = slotMap.get(idx);
+      if (slot === undefined) {
+        let fnref = null;
+        try {
+          fnref = chunkTable.get(idx);
+        } catch {}
+        // A chunk built without `import_table` keeps a self-defined table we
+        // can't read — pass the index through untranslated (legacy behavior).
+        if (!fnref) return idx;
+        slot = indirectFunctionTable.grow(1);
+        indirectFunctionTable.set(slot, fnref);
+        slotMap.set(idx, slot);
+      }
+      return slot;
+    };
+    return {
+      ...verveRuntime,
+      verve_register_event: (idx) => exp.verve_register_event(translate(idx)),
+      verve_cleanup: (idx) => exp.verve_cleanup(translate(idx)),
+      verve_register_response_handler: (rp, rl, idx) =>
+        exp.verve_register_response_handler(rp, rl, translate(idx)),
+      verve_register_response_handler_once: (rp, rl, rid, idx) =>
+        exp.verve_register_response_handler_once(rp, rl, rid, translate(idx)),
+      verve_register_drop: (bp, bl, idx) =>
+        verveRuntime.verve_register_drop(bp, bl, translate(idx)),
+      verve_set_timeout: (ms, idx) => verveRuntime.verve_set_timeout(ms, translate(idx)),
+      verve_set_interval: (ms, idx) => verveRuntime.verve_set_interval(ms, translate(idx)),
+      verve_request_animation_frame: (idx) =>
+        verveRuntime.verve_request_animation_frame(translate(idx)),
+      verve_queue_microtask: (idx) => verveRuntime.verve_queue_microtask(translate(idx)),
+    };
+  };
+
   // Each `<verve-island>` carries a server-assigned `data-vid` — the
   // single per-instance id, passed to its chunk's
   // `hydrate(props_ptr, props_len, vid)` and used as the wasm per-island
@@ -1115,12 +1182,42 @@
   // (dispatch scopes the lookup to the click target's enclosing island).
   const chunkExports = {};
 
+  // Hand `text` to an island chunk's NAMED export `exportName(ptr, len)`:
+  // stage the bytes in the island scratch buffer, scope to the island's vid,
+  // call by name (never via the shared indirect function table — chunk fn
+  // pointers would collide with the main client's table entries).
+  const callIslandExport = (islandName, exportName, text) => {
+    const chunk = chunkExports[islandName];
+    if (
+      !chunk ||
+      typeof chunk[exportName] !== "function" ||
+      typeof exp.verve_island_scratch_ptr !== "function"
+    )
+      return;
+    const ptr = exp.verve_island_scratch_ptr();
+    const cap = exp.verve_island_scratch_capacity();
+    const bytes = new TextEncoder().encode(text);
+    if (bytes.length > cap) return;
+    new Uint8Array(memory.buffer, ptr, cap).set(bytes, 0);
+    const el = document.querySelector(
+      `verve-island[data-name="${islandName}"]`,
+    );
+    const vid = el ? parseInt(el.getAttribute("data-vid"), 10) || 0 : 0;
+    if (vid && typeof exp.verve_enter_island === "function")
+      exp.verve_enter_island(vid);
+    try {
+      chunk[exportName](ptr, bytes.length);
+    } finally {
+      if (vid && typeof exp.verve_exit_island === "function")
+        exp.verve_exit_island();
+    }
+  };
+
   // Live-data poll loop for the viz interactive island, driven from JS so the
-  // chunk needs no timer/response-handler function pointer (those would add an
-  // entry to the shared indirect function table and collide with the main
-  // client). The chunk's `viz_toggle_live` calls this via `host("verveVizPoll")`;
-  // we POST `vizGraph` on an interval and hand the reply to the chunk's NAMED
-  // `viz_apply_snapshot` export (called by name, not via the table).
+  // chunk needs no timer/response-handler function pointer. The chunk's
+  // `viz_toggle_live` falls back to this via `host("verveVizPoll")` when
+  // EventSource is unavailable; we POST `vizGraph` on an interval and hand the
+  // reply to the chunk's NAMED `viz_apply_snapshot` export.
   let vizPollTimer = null;
   window.verveHost.verveVizPoll = (argsJson) => {
     let a = {};
@@ -1145,33 +1242,114 @@
       } catch {
         return;
       }
-      const chunk = chunkExports["VizGraphInteractive"];
-      if (
-        !chunk ||
-        typeof chunk.viz_apply_snapshot !== "function" ||
-        typeof exp.verve_island_scratch_ptr !== "function"
-      )
+      callIslandExport("VizGraphInteractive", "viz_apply_snapshot", text);
+    };
+    vizPollTimer = setInterval(tick, interval);
+    tick();
+    return "{}";
+  };
+
+  // Generic server-push subscription: `{op:"sub"|"unsub", channel, island,
+  // export}`. One refcounted EventSource per channel (`/push?channel=<c>`);
+  // each SSE frame is delivered to the subscribed island's named export.
+  // EventSource handles retry/Last-Event-ID resume natively. Returns
+  // `{"err":"unsupported"}` when the host has no EventSource so the chunk can
+  // fall back to polling.
+  const pushChannels = new Map(); // channel → { es, subs: Map(island → export) }
+  window.verveHost.vervePush = (argsJson) => {
+    let a = {};
+    try {
+      a = JSON.parse(argsJson || "{}");
+    } catch {}
+    if (!a.channel || !a.island) return '{"err":"bad args"}';
+    if (a.op === "unsub") {
+      const entry = pushChannels.get(a.channel);
+      if (entry) {
+        entry.subs.delete(a.island);
+        if (entry.subs.size === 0) {
+          entry.es.close();
+          pushChannels.delete(a.channel);
+        }
+      }
+      return "{}";
+    }
+    if (typeof EventSource === "undefined") return '{"err":"unsupported"}';
+    let entry = pushChannels.get(a.channel);
+    if (!entry) {
+      const es = new EventSource(`/push?channel=${encodeURIComponent(a.channel)}`);
+      entry = { es, subs: new Map() };
+      es.addEventListener(a.channel, (e) => {
+        for (const [island, exportName] of entry.subs)
+          callIslandExport(island, exportName, e.data);
+      });
+      pushChannels.set(a.channel, entry);
+    }
+    entry.subs.set(a.island, a.export);
+    return "{}";
+  };
+
+  // Generic JS-driven animation loop for island chunks: `{island, export,
+  // on}`. Each frame calls the chunk's NAMED export `fn () i32` (vid-scoped)
+  // and continues while it returns nonzero — so a chunk can animate without
+  // taking a function pointer (no indirect-function-table entry). One loop
+  // per island|export key; re-calling with on:1 while running is a no-op;
+  // `{on:0}` cancels.
+  const rafLoops = new Set();
+  window.verveHost.verveRafNamed = (argsJson) => {
+    let a = {};
+    try {
+      a = JSON.parse(argsJson || "{}");
+    } catch {}
+    if (!a.island || !a.export) return '{"err":"bad args"}';
+    const key = `${a.island}|${a.export}`;
+    if (!a.on) {
+      rafLoops.delete(key);
+      return "{}";
+    }
+    if (rafLoops.has(key)) return "{}";
+    rafLoops.add(key);
+    const step = () => {
+      if (!rafLoops.has(key)) return;
+      const chunk = chunkExports[a.island];
+      if (!chunk || typeof chunk[a.export] !== "function") {
+        rafLoops.delete(key);
         return;
-      const ptr = exp.verve_island_scratch_ptr();
-      const cap = exp.verve_island_scratch_capacity();
-      const bytes = new TextEncoder().encode(text);
-      if (bytes.length > cap) return;
-      new Uint8Array(memory.buffer, ptr, cap).set(bytes, 0);
-      const el = document.querySelector(
-        'verve-island[data-name="VizGraphInteractive"]',
-      );
+      }
+      const el = document.querySelector(`verve-island[data-name="${a.island}"]`);
       const vid = el ? parseInt(el.getAttribute("data-vid"), 10) || 0 : 0;
       if (vid && typeof exp.verve_enter_island === "function")
         exp.verve_enter_island(vid);
+      let cont = 0;
       try {
-        chunk.viz_apply_snapshot(ptr, bytes.length);
+        cont = chunk[a.export]();
       } finally {
         if (vid && typeof exp.verve_exit_island === "function")
           exp.verve_exit_island();
       }
+      if (cont) requestAnimationFrame(step);
+      else rafLoops.delete(key);
     };
-    vizPollTimer = setInterval(tick, interval);
-    tick();
+    requestAnimationFrame(step);
+    return "{}";
+  };
+
+  // One-shot fetch routed to an island export: `{api, island, export}` POSTs
+  // `/api/<api>` and delivers the reply text to the named export. This is the
+  // push path's resync hook, reusable by any island.
+  window.verveHost.verveFetchExport = (argsJson) => {
+    let a = {};
+    try {
+      a = JSON.parse(argsJson || "{}");
+    } catch {}
+    if (!a.api || !a.island || !a.export) return '{"err":"bad args"}';
+    fetch(`/api/${a.api}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })
+      .then((r) => r.text())
+      .then((text) => callIslandExport(a.island, a.export, text))
+      .catch(() => {});
     return "{}";
   };
 
@@ -1180,14 +1358,20 @@
     if (!name) return;
     const url = `/islands/${name}.wasm`;
     if (!islandChunks.has(name)) {
+      // PRIVATE table per chunk — see makeChunkRuntime. The chunk's element
+      // segment writes here, never into the main client's table.
+      const chunkTable = new WebAssembly.Table({
+        initial: 256,
+        element: "anyfunc",
+      });
       islandChunks.set(
         name,
         WebAssembly.instantiateStreaming(fetch(url), {
           env: {
             memory,
-            __indirect_function_table: indirectFunctionTable,
+            __indirect_function_table: chunkTable,
           },
-          verve_runtime: verveRuntime,
+          verve_runtime: makeChunkRuntime(chunkTable),
         }).catch((err) => {
           islandChunks.delete(name);
           console.warn("verve: island chunk fetch failed", name, err);

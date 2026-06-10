@@ -14,6 +14,7 @@ const pool_mod = @import("pool.zig");
 const metrics = @import("metrics.zig");
 const gzip = @import("gzip.zig");
 const public_dir_mod = @import("public_dir.zig");
+const push = @import("push.zig");
 const components = app.components;
 
 const log = std.log.scoped(.verve);
@@ -100,6 +101,16 @@ pub fn main(init: std.process.Init) !void {
     const csrf_env = init.environ_map.get("VERVE_CSRF_KEY");
     verve.csrf.initFromEnvOrRandom(csrf_env, io);
     printStartupBanner(cli);
+
+    // Live-graph publisher (opt-in: only when the app declares
+    // `vizAdvanceTick` — see `app_has_viz_publisher`): ticks the evolving viz
+    // model once per second and broadcasts the wire delta, but only while
+    // someone is subscribed, so pull-only clients see a stable graph.
+    if (comptime app_has_viz_publisher) {
+        if (std.Thread.spawn(.{}, vizPublisherLoop, .{io})) |t| t.detach() else |err| {
+            log.err("viz publisher spawn: {s}", .{@errorName(err)});
+        }
+    }
 
     while (true) {
         const stream = server.accept(io) catch |err| {
@@ -302,6 +313,28 @@ fn handleRequest(
 
     if (std.mem.eql(u8, path, "/events")) {
         try streamEvents(io, request);
+        return;
+    }
+
+    if (std.mem.eql(u8, path, "/push")) {
+        const channel = queryParam(target, "channel") orelse "";
+        if (!push.validName(channel)) {
+            try renderError(gpa, io, request, .bad_request, "Missing or invalid ?channel= (1-32 chars, [A-Za-z0-9_-]).");
+            return;
+        }
+        // Last-Event-ID → resume point (0 = live tail). Headers are still
+        // valid here: no body has been read on this GET.
+        var resume_after: u64 = 0;
+        var hdr_it = request.iterateHeaders();
+        while (hdr_it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "last-event-id")) {
+                resume_after = std.fmt.parseInt(u64, h.value, 10) catch 0;
+            }
+        }
+        push.streamChannel(io, request, channel, resume_after) catch |err| switch (err) {
+            error.BadChannel => try renderError(gpa, io, request, .bad_request, "Unknown push channel."),
+            else => return err,
+        };
         return;
     }
 
@@ -670,6 +703,27 @@ fn renderError(
     try body_writer.writer.writeAll("<!DOCTYPE html>");
     try verve.Renderer.render(&body_writer.writer, node);
     try body_writer.end();
+}
+
+const VIZ_PUBLISH_TICK = std.Io.Duration.fromMilliseconds(1000);
+
+/// Whether the app module opts into the live-graph publisher: a
+/// `pub fn vizAdvanceTick(buf: []u8) ?[]const u8` advancing its model and
+/// serializing the wire delta. Apps without it just don't get the publisher
+/// thread — `/push` itself works for any app that calls `push.publish`.
+const app_has_viz_publisher = @hasDecl(app, "vizAdvanceTick");
+
+/// Once per second: advance the demo viz model and publish the delta to the
+/// `viz` push channel — skipped entirely while nobody subscribes.
+fn vizPublisherLoop(io: std.Io) void {
+    if (comptime !app_has_viz_publisher) return;
+    var buf: [push.MSG_MAX]u8 = undefined;
+    while (true) {
+        std.Io.sleep(io, VIZ_PUBLISH_TICK, .awake) catch return;
+        if (push.subscriberCount("viz") == 0) continue;
+        const frame = app.vizAdvanceTick(&buf) orelse continue;
+        _ = push.publish("viz", frame);
+    }
 }
 
 const SSE_TICK = std.Io.Duration.fromMilliseconds(1000);
@@ -1313,6 +1367,18 @@ fn onShutdownSignal(sig: std.posix.SIG) callconv(.c) void {
 fn pathOf(target: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, target, '?')) |q| return target[0..q];
     return target;
+}
+
+/// A single query parameter's raw value (no percent-decoding). Null when the
+/// target has no query string or the key is absent.
+fn queryParam(target: []const u8, key: []const u8) ?[]const u8 {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, target[q + 1 ..], '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+    }
+    return null;
 }
 
 fn printStartupBanner(cli: CliOptions) void {

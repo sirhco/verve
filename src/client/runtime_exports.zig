@@ -256,10 +256,11 @@ export fn verve_ref_get_value_f32(handle: i32) f32 {
 
 export fn verve_register_event(handler_idx: u32) u32 {
     // wasm MVP function ABI doesn't carry `*const fn () void`
-    // arguments across module boundaries; chunks pass the indirect-
+    // arguments across module boundaries; callers pass an indirect-
     // function-table index as a plain u32 and we cast it back here.
-    // Sharing the table via build.zig's `import_table` / `export_table`
-    // flags is what makes this index meaningful on both sides.
+    // For chunks, the bridge translates the chunk-private-table index
+    // into a main-table slot before this is called (table isolation),
+    // so the index is always valid in OUR table.
     const handler: *const fn () void = @ptrFromInt(@as(usize, handler_idx));
     return runtime.registerEvent(handler);
 }
@@ -335,6 +336,9 @@ export fn verve_event_prevent_default() void {
 }
 export fn verve_event_stop_propagation() void {
     event_state.setStop();
+}
+export fn verve_event_capture_pointer() void {
+    event_state.setCapturePointer();
 }
 export fn verve_event_flags() u32 {
     return event_state.getFlags();

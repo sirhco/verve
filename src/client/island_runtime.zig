@@ -55,11 +55,12 @@ extern "verve_runtime" fn verve_ref_remove(handle: i32) void;
 extern "verve_runtime" fn verve_ref_get_value_i32(handle: i32) i32;
 extern "verve_runtime" fn verve_ref_get_value_f32(handle: i32) f32;
 
-// Closure event registration. Requires the chunk's indirect function
-// table to be the same one the main runtime uses — build.zig sets
-// `import_table = true` on chunks + `export_table = true` on the main
-// client, and the bridge JS passes the table through as
-// `env.__indirect_function_table` at chunk instantiation.
+// Closure event registration. The chunk passes a fn-pointer index into its
+// own PRIVATE function table; the bridge's `makeChunkRuntime` wrapper copies
+// the funcref into a freshly grown slot of the main client's table and
+// forwards that slot index, so the main runtime's `event_slots` +
+// `call_indirect` dispatch works unchanged (table isolation — chunk element
+// segments can't clobber main's entries).
 extern "verve_runtime" fn verve_register_event(handler_idx: u32) u32;
 extern "verve_runtime" fn verve_dispatch_event(id: u32) void;
 extern "verve_runtime" fn verve_cleanup(handler_idx: u32) void;
@@ -121,6 +122,7 @@ extern "verve_runtime" fn verve_event_target_attr(
 ) u32;
 extern "verve_runtime" fn verve_event_prevent_default() void;
 extern "verve_runtime" fn verve_event_stop_propagation() void;
+extern "verve_runtime" fn verve_event_capture_pointer() void;
 
 // Phase 19 — timers, storage, clipboard. Timer handlers cross as
 // function-table indices (same ABI as registerEvent).
@@ -717,6 +719,19 @@ pub fn eventStopPropagation() void {
     verve_event_stop_propagation();
 }
 
+/// Capture the pointer to the handler's element so the gesture keeps
+/// receiving pointermove/up after the pointer leaves it (honored after
+/// the handler returns; released implicitly on pointerup).
+pub fn eventCapturePointer() void {
+    verve_event_capture_pointer();
+}
+
+/// Pure viz math for chunks: geometry (`fitBox`/`applyFit`), the layout
+/// algorithms (tree/radial/force/dag), interaction math, and edge-path
+/// builders — the exact code SSR runs, so client recomputes reproduce server
+/// positions bit-for-bit.
+pub const viz_core = @import("viz_core");
+
 // ---- Timers (Phase 19) --------------------------------------------------
 //
 // Handlers are `*const fn () void` taken via `&handler` — the same
@@ -862,6 +877,48 @@ pub fn host(name: []const u8, args_json: []const u8, out: []u8) []const u8 {
         @intCast(out.len),
     );
     return out[0..n];
+}
+
+/// Subscribe `island`'s named export to the server-push channel: every SSE
+/// frame on `/push?channel=<channel>` is staged in the island scratch buffer
+/// and delivered to `export fn <export_name>(ptr: u32, len: u32) void`
+/// (payload valid only for the call). Returns false when the host has no
+/// EventSource — fall back to polling.
+pub fn pushSubscribe(channel: []const u8, island: []const u8, export_name: []const u8) bool {
+    var args_buf: [192]u8 = undefined;
+    const args = std.fmt.bufPrint(
+        &args_buf,
+        "{{\"op\":\"sub\",\"channel\":\"{s}\",\"island\":\"{s}\",\"export\":\"{s}\"}}",
+        .{ channel, island, export_name },
+    ) catch return false;
+    var out: [64]u8 = undefined;
+    const reply = host("vervePush", args, &out);
+    return std.mem.indexOf(u8, reply, "\"err\"") == null;
+}
+
+pub fn pushUnsubscribe(channel: []const u8, island: []const u8) void {
+    var args_buf: [160]u8 = undefined;
+    const args = std.fmt.bufPrint(
+        &args_buf,
+        "{{\"op\":\"unsub\",\"channel\":\"{s}\",\"island\":\"{s}\"}}",
+        .{ channel, island },
+    ) catch return;
+    var out: [16]u8 = undefined;
+    _ = host("vervePush", args, &out);
+}
+
+/// One-shot POST `/api/<api_name>` whose reply text is delivered to
+/// `island`'s named export (same staging contract as `pushSubscribe`). The
+/// push path's resync hook.
+pub fn fetchToExport(api_name: []const u8, island: []const u8, export_name: []const u8) void {
+    var args_buf: [192]u8 = undefined;
+    const args = std.fmt.bufPrint(
+        &args_buf,
+        "{{\"api\":\"{s}\",\"island\":\"{s}\",\"export\":\"{s}\"}}",
+        .{ api_name, island, export_name },
+    ) catch return;
+    var out: [16]u8 = undefined;
+    _ = host("verveFetchExport", args, &out);
 }
 
 /// Asynchronous host call. The JSON result fans back to the handler

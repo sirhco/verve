@@ -820,3 +820,127 @@ test "/events emits initial count and live updates via SSE" {
     try std.testing.expect(std.mem.indexOf(u8, acc.items, "event: count") != null);
     try std.testing.expect(std.mem.indexOf(u8, acc.items, "data: 7") != null);
 }
+
+/// Open `/push?channel=<channel>` (optionally with a Last-Event-ID header) and
+/// accumulate the SSE stream until `needle` appears or `deadline_ms` passes.
+fn readPushStream(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    port: u16,
+    channel: []const u8,
+    last_event_id: ?u64,
+    needle: []const u8,
+    deadline_ms: i64,
+) !std.ArrayList(u8) {
+    const addr = loopback(port);
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var write_buf: [512]u8 = undefined;
+    var sw = stream.writer(io, &write_buf);
+    if (last_event_id) |lei| {
+        try sw.interface.print(
+            "GET /push?channel={s} HTTP/1.1\r\nHost: 127.0.0.1\r\nLast-Event-ID: {d}\r\nConnection: close\r\n\r\n",
+            .{ channel, lei },
+        );
+    } else {
+        try sw.interface.print(
+            "GET /push?channel={s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            .{channel},
+        );
+    }
+    try sw.interface.flush();
+
+    var read_buf: [8192]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    var acc: std.ArrayList(u8) = .empty;
+    errdefer acc.deinit(gpa);
+
+    const deadline = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(deadline_ms));
+    while (true) {
+        if (std.Io.Timestamp.now(io, .awake).durationTo(deadline).nanoseconds <= 0) break;
+        const slice = sr.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        try acc.appendSlice(gpa, slice);
+        sr.interface.toss(slice.len);
+        if (std.mem.indexOf(u8, acc.items, needle) != null) break;
+    }
+    return acc;
+}
+
+test "/push?channel=viz streams seq-ordered deltas coherent with the pull snapshot" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 11);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    // Fresh server → model at seq 0; the publisher only ticks while we're
+    // subscribed, so the first two frames are exactly seq 1 and 2 (1s apart).
+    var acc = try readPushStream(io, gpa, port, "viz", null, "data: {\"seq\":2,", 4000);
+    defer acc.deinit(gpa);
+
+    try std.testing.expect(std.mem.indexOf(u8, acc.items, " 200 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, acc.items, "text/event-stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, acc.items, "retry: 2000") != null);
+    // `id:` equals the frame's `seq`, ordered 1 then 2, each a delta op list.
+    const f1 = std.mem.indexOf(u8, acc.items, "id: 1\nevent: viz\ndata: {\"seq\":1,\"ops\":[") orelse return error.TestExpectedEqual;
+    const f2 = std.mem.indexOf(u8, acc.items, "id: 2\nevent: viz\ndata: {\"seq\":2,\"ops\":[") orelse return error.TestExpectedEqual;
+    try std.testing.expect(f1 < f2);
+    // First tick (extra 0→1) adds the e0 node.
+    try std.testing.expect(std.mem.indexOf(u8, acc.items, "{\"op\":\"+n\",\"id\":\"e0\",\"label\":\"e0\"}") != null);
+
+    // Pull snapshot shares the same seq domain and reflects the pushed state.
+    var resp = try requestWithBody(io, gpa, port, "POST", "/api/vizGraph", "application/json", "{}");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"seq\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"seq\":0") == null);
+}
+
+test "/push rejects a missing or invalid channel" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 12);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    {
+        var resp = try request(io, gpa, port, "GET", "/push");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 400), resp.status);
+    }
+    {
+        var resp = try request(io, gpa, port, "GET", "/push?channel=bad*name");
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 400), resp.status);
+    }
+}
+
+test "/push resumes after Last-Event-ID without replaying delivered frames" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 13);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    // First subscriber drives the publisher through seq 1 and 2, then drops.
+    var first = try readPushStream(io, gpa, port, "viz", null, "data: {\"seq\":2,", 4000);
+    defer first.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, first.items, "id: 2\n") != null);
+
+    // Reconnect resuming after seq 1: frame 2 replays from the ring
+    // immediately; frame 1 must not.
+    var second = try readPushStream(io, gpa, port, "viz", 1, "data: {\"seq\":2,", 4000);
+    defer second.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, second.items, "id: 2\nevent: viz\ndata: {\"seq\":2,\"ops\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.items, "id: 1\n") == null);
+}

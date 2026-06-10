@@ -96,6 +96,8 @@ pub const Node = struct {
     z_on_pointerup_action: ?[]const u8 = null,
     z_on_pointerover_action: ?[]const u8 = null,
     z_on_pointerout_action: ?[]const u8 = null,
+    z_on_pointercancel_action: ?[]const u8 = null,
+    z_on_dblclick_action: ?[]const u8 = null,
     /// When set, the server short-circuits rendering and sends a
     /// redirect response (302/303) instead of HTML. Populated via
     /// `ctx.redirect("/login")`.
@@ -365,6 +367,18 @@ pub const Node = struct {
     pub fn onPointerOut(self: *Node, action: []const u8) *Node {
         if (self.err != null) return self;
         self.z_on_pointerout_action = action;
+        return self;
+    }
+
+    pub fn onPointerCancel(self: *Node, action: []const u8) *Node {
+        if (self.err != null) return self;
+        self.z_on_pointercancel_action = action;
+        return self;
+    }
+
+    pub fn onDblClick(self: *Node, action: []const u8) *Node {
+        if (self.err != null) return self;
+        self.z_on_dblclick_action = action;
         return self;
     }
 

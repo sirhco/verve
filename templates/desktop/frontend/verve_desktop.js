@@ -28,7 +28,16 @@
       });
   };
 
+  // The client wasm IMPORTS its indirect function table (build.zig sets
+  // `import_table` — table isolation for island chunks on the web target).
+  // Desktop loads no chunks, but the import is mandatory either way.
+  const indirectFunctionTable = new WebAssembly.Table({
+    initial: 256,
+    element: "anyfunc",
+  });
+
   const env = {
+    env: { __indirect_function_table: indirectFunctionTable },
     verve: {
       set_text_by_bind: (bp, bl, tp, tl) =>
         setTextByBind(readStr(bp, bl), readStr(tp, tl)),

@@ -33,6 +33,11 @@ const radial_mod = @import("layout/radial.zig");
 const force_mod = @import("layout/force.zig");
 const dag_mod = @import("layout/dag.zig");
 const interact_mod = @import("interact.zig");
+const edge_path_mod = @import("edge_path.zig");
+const delta_mod = @import("delta.zig");
+const sankey_mod = @import("sankey.zig");
+const treemap_mod = @import("treemap.zig");
+const chord_mod = @import("chord.zig");
 
 // ---- geometry ----
 pub const Vec2 = geom.Vec2;
@@ -80,6 +85,17 @@ pub const lineChart = chart_mod.line;
 pub const scatterChart = chart_mod.scatter;
 pub const areaChart = chart_mod.area;
 pub const pieChart = chart_mod.pie;
+pub const SankeyNode = sankey_mod.SankeyNode;
+pub const SankeyLink = sankey_mod.SankeyLink;
+pub const SankeyOpts = sankey_mod.SankeyOpts;
+pub const sankeyChart = sankey_mod.sankey;
+pub const TreemapItem = treemap_mod.TreemapItem;
+pub const TreemapOpts = treemap_mod.TreemapOpts;
+pub const treemapChart = treemap_mod.treemap;
+pub const treemapLayout = treemap_mod.treemapLayout;
+pub const ChordOpts = chord_mod.ChordOpts;
+pub const chordChart = chord_mod.chord;
+pub const chordLayout = chord_mod.chordLayout;
 
 // ---- graphs ----
 pub const Graph = graph_mod.Graph;
@@ -95,6 +111,21 @@ pub const renderGraphWith = graph_mod.renderWithPositions;
 /// Interactive graph svg (zoom/pan/drag/hover/select). Wrap the returned svg in
 /// the `VizGraphInteractive` island with encoded props. See `docs/22`.
 pub const renderGraphInteractive = graph_mod.renderInteractive;
+
+// ---- edge routing ----
+/// How routed dag edges traverse their via-points: `.straight` polyline
+/// bends, `.curved` Catmull-Rom splines, or `.orthogonal` Manhattan runs.
+/// Set via `GraphOpts.edge_routing`; `edgePathD` is the low-level builder.
+pub const EdgeRouting = edge_path_mod.Routing;
+pub const EdgePathOpts = edge_path_mod.PathOpts;
+pub const edgePathD = edge_path_mod.pathD;
+
+// ---- live-streaming wire deltas ----
+/// Diff/serialize/apply for the `{"seq":N,"ops":[...]}` push-channel frames.
+pub const DeltaOp = delta_mod.Op;
+pub const diffGraphs = delta_mod.diffGraphs;
+pub const writeDeltaJson = delta_mod.writeDeltaJson;
+pub const applyDeltaOps = delta_mod.applyOps;
 
 // ---- layout algorithms (lower-level, index/edge-pair based) ----
 pub const treeLayout = tree_mod.layout;
@@ -124,5 +155,10 @@ test {
     _ = force_mod;
     _ = dag_mod;
     _ = interact_mod;
+    _ = edge_path_mod;
+    _ = delta_mod;
+    _ = sankey_mod;
+    _ = treemap_mod;
+    _ = chord_mod;
     _ = @import("layout/common.zig");
 }

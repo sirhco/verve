@@ -52,10 +52,10 @@ pub fn build(b: *std.Build) void {
     });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
-    // Export the indirect function table so per-island chunks can import +
-    // share it. `registerEvent` from a chunk takes a `&handler` fn pointer
-    // that must be a valid index into this shared table.
-    wasm.export_table = true;
+    // Table isolation (matches the live bridge in ../../src/bridge/verve.js):
+    // the main client IMPORTS a JS-created growable table; chunks get private
+    // tables and the bridge translates `&handler` indices at the boundary.
+    wasm.import_table = true;
 
     const app_mod = b.createModule(.{
         .root_source_file = b.path("src/app/api.zig"),
