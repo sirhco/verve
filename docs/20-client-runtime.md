@@ -231,12 +231,78 @@ fn onDrop() void {
 }
 ```
 
+## Phase 7 — Server push, pointer capture, named-export loops (shipped)
+
+Three additions that came out of the interactive-viz work, all reusable by
+any island.
+
+**Server push to a named export.** Subscribe a chunk export to a server push
+channel (see the `/push` hub in [06 — Realtime](06-realtime.md)): every SSE
+frame is staged in the island scratch buffer and delivered to
+`export fn <name>(ptr: u32, len: u32) void` — payload valid only for the
+call. `fetchToExport` is the matching one-shot POST→export, typically used to
+fetch a fresh snapshot when a stream gap is detected.
+
+```zig
+// returns false when the host has no EventSource — fall back to polling
+_ = verve.pushSubscribe("prices", "Ticker", "apply_frame");
+verve.pushUnsubscribe("prices", "Ticker");
+verve.fetchToExport("priceSnapshot", "Ticker", "apply_snapshot");
+```
+
+Both are host-call based: the handler is reached **by export name**, so the
+chunk takes no function pointer.
+
+**Pointer capture + the extended event set.** A pointer handler that calls
+`eventCapturePointer()` gets the pointer captured to its element after it
+returns — the gesture keeps receiving `pointermove` / `pointerup` after the
+pointer leaves the element (released implicitly on pointerup). The delegated
+event set covers `wheel`, `pointerdown/move/up/over/out/cancel`, and
+`dblclick`, each with a fluent stamp (`Node.onWheel`, `onPointer*`,
+`onPointerCancel`, `onDblClick`) and data accessors (`eventDeltaY()`,
+`eventButton()`). End gestures on `pointerup` / `pointercancel` — not
+`pointerout`, which still fires on child-element crossings.
+
+```zig
+export fn grab_start() void {
+    dragging = true;
+    verve.eventCapturePointer(); // drag survives leaving the element
+}
+```
+
+**Named-export animation loop.** The `verveRafNamed` host fn runs a JS
+`requestAnimationFrame` loop against a named chunk export returning `i32` —
+nonzero continues, zero stops; one loop per island|export key, `{"on":0}`
+cancels. Chunk animation with zero indirect-function-table entries (compare
+`requestAnimationFrame(&tick)`, which takes a pointer).
+
+```zig
+var out: [16]u8 = undefined;
+_ = verve.host("verveRafNamed", "{\"island\":\"Ticker\",\"export\":\"tick\",\"on\":1}", &out);
+
+export fn tick() i32 {
+    step();
+    return if (done()) 0 else 1;
+}
+```
+
+Chunks that recompute viz layouts client-side also get `verve.viz_core` —
+the pure math slice of `verve.viz` (geometry, `fitBox`/`applyFit`, the
+tree/radial/force/dag layout algorithms, interaction helpers, edge paths) —
+so a client relayout reproduces SSR positions exactly. See
+[22 — Visualization](22-visualization.md).
+
 ## Runnable demo
 
-`examples/client-runtime/` mounts the `JsonProbe` island and exercises every
-phase above from a single page — typed IPC (visible count round-trip),
+`examples/client-runtime/` mounts the `JsonProbe` island and exercises phases
+1–6 from a single page — typed IPC (visible count round-trip),
 events-with-data, timers/storage/clipboard, forms/measurement, JS interop, and
 the chunk arena + drag-drop. `cd examples/client-runtime && zig build run`.
+
+Phase 7 is exercised by the `/viz` route in the main demo app
+(`zig build run`, then <http://127.0.0.1:8080/viz>): "● live" drives
+`pushSubscribe` + `fetchToExport` resync, node/background drags exercise
+pointer capture, and "⟳ layout" runs a `verveRafNamed` tween.
 
 ## Next
 

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Full-stack **pure-Zig** framework (targets **Zig 0.16.0**, zero third-party deps) for both web apps and native desktop apps. Server-side rendering of `*Node` trees with fine-grained reactivity (`Signal`/`Effect`/`Owner`/`Resource`), a wasm32-freestanding client runtime that hosts that *same* reactive graph, per-island WASM code-splitting, and single-binary distribution. The same component tree + reactive runtime + asset pipeline drives an HTTP server **or** a native window backed by the OS webview (WKWebView / WebView2 / WebKitGTK) — target picked at `zig build` time. No VDOM, no macros, no Chromium, no Electron.
 
-Pre-1.0 (v0.1.x): public APIs break between minor versions. All three desktop backends (macOS, Windows, Linux GTK4) are verified on real hardware as of v0.2.0.
+Pre-1.0 (v0.3.x): public APIs break between minor versions. All three desktop backends (macOS, Windows, Linux GTK4) are verified on real hardware as of v0.2.0. `CHANGELOG.md` tracks releases.
 
 ## Commands
 
@@ -54,4 +54,4 @@ An island is declared as a `pub const <Name> = struct { pub const props_schema =
 
 ## Docs
 
-`docs/` holds 21 numbered topic guides (`01-getting-started` … `21-markdown-and-highlighting`); `docs/README.md` is the index. `examples/` has runnable apps including `examples/showcase/`. Note: counts/specs in older docs (e.g. getting-started's "37 tests") may lag the README — trust `build.zig` and the README.
+`docs/` holds 22 numbered topic guides (`01-getting-started` … `22-visualization`); `docs/README.md` is the index. `examples/` has runnable apps including `examples/showcase/`. Note: counts/specs in older docs (e.g. getting-started's "37 tests") may lag the README — trust `build.zig` and the README.

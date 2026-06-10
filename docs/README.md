@@ -10,7 +10,7 @@ you know what you need.
 3. [Actions / Server Functions](03-actions.md) — `/api/<fn>` dispatcher, `ctx.serverFn`, generated `app_client.zig` stubs, CSRF on forms
 4. [Routing](04-routing.md) — path params, nested layouts, Outlet, Redirect, ProtectedRoute, Link
 5. [Reactivity](05-reactivity.md) — Owner tree, Signal, Effect, Store, Resource, ErrorBoundary
-6. [Realtime: SSE + WebSocket](06-realtime.md) — push state to the browser
+6. [Realtime: SSE + WebSocket](06-realtime.md) — push state to the browser, plus the generic `/push?channel=` broadcast hub any island can subscribe to
 7. [Static assets](07-static-assets.md) — hashed URLs, public-dir LRU, precompressed brotli
 8. [Observability](08-observability.md) — `/health`, `/metrics`, logging
 9. [Performance & hardening](09-performance.md) — thread pool, admission cap, gzip
@@ -24,9 +24,9 @@ you know what you need.
 17. [Reconciler](17-reconciler.md) — keyed-list planner, `ForEachHandle`, reactive `bindForEach`
 18. [Streaming SSR](18-streaming.md) — `Suspense`, `withStreamRegistry`, `streamRender`, `verveSwap`
 19. [Desktop apps](19-desktop.md) — native window + system webview, SSR + WASM hydration under `verve://`, typed IPC, cookies, multi-window, `.app` bundle, dev loop, Level-3 smoke
-20. [Client runtime](20-client-runtime.md) — wasm-side app primitives: typed IPC replies + shared JSON service (shipped), then events-with-data, timers, storage, forms, JS interop
+20. [Client runtime](20-client-runtime.md) — wasm-side app primitives: typed IPC replies + shared JSON service, events-with-data + pointer capture, timers, storage, forms, JS interop, chunk arena, server push to named exports, named-export rAF loops
 21. [Markdown & syntax highlighting](21-markdown-and-highlighting.md) — pure-Zig server-side GFM markdown + code highlighting, safe-by-default, `ctx.markdown` / `ctx.codeBlock` / `verve.highlightThemeCss`
-22. [Visualization](22-visualization.md) — native `verve.viz` graphs/hierarchies/charts: SVG scene model, scales/axes, tree/radial/force/dag layouts, bar/line/area/scatter/pie charts, interactive island pattern
+22. [Visualization](22-visualization.md) — native `verve.viz` graphs/hierarchies/charts: SVG scene model, scales/axes, tree/radial/force/dag layouts with curved/orthogonal edge routing, 15 chart types (incl. sankey/treemap/chord), interactive islands with zoom/pan/drag/select, subtree collapse, runtime mutation under any layout, and live SSE wire-delta streaming
 
 ## Reference
 
@@ -114,10 +114,13 @@ you know what you need.
   import the bridge JS resolves against the main client's exports
   at instantiation. Chunks `@import("verve")` (chunk-side façade)
   and use `registerI32` / `signalSetI32` / `queryRef` / etc.
-- **Shared indirect function table (Phase 13G)** — main client
-  exports its `__indirect_function_table`; chunks import it. Lets
-  closure-style event handlers (`verve.registerEvent(&fn)`) cross
-  the chunk → main-runtime boundary without going through JS.
+- **Isolated function tables (Phase 13G, reworked)** — the main
+  client imports a JS-owned growable `__indirect_function_table`;
+  each chunk gets a private table, and the bridge translates
+  fn-pointer indices crossing the chunk → main-runtime boundary
+  (`registerEvent(&fn)`, timers, response/drop handlers) into
+  freshly grown main-table slots. Chunk element segments can no
+  longer clobber the main client's table entries.
 - **Cleanup hook** — `verve.cleanup(handler)` registers a
   `*const fn () void` against the enclosing Owner; runs LIFO on
   dispose. Fires on per-island unmount (`verve_unmount_island`) and on

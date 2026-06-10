@@ -14,20 +14,30 @@ const verve = @import("verve");
 const viz = verve.viz;
 ```
 
-Runnable demo: the `/viz` route in `src/app` renders an interactive force graph
-plus three charts. `zig build run`, then open <http://127.0.0.1:8080/viz>.
+Runnable demos: the `/viz` route in `src/app` exercises everything — the
+interactive graph island (zoom/pan/drag/select, dblclick collapse, +/− node
+mutation, "⟳ layout" cycling, "● live" SSE-push streaming), the DAG with all
+three edge routings, and every chart type. `zig build run`, then open
+<http://127.0.0.1:8080/viz>. For the live-streaming stack in isolation —
+push hub, wire deltas, resync — see the minimal standalone app at
+[`examples/viz-live/`](../examples/viz-live/README.md).
 
 ## Table of contents
 
 1. [Quick start](#quick-start)
-2. [Charts](#charts) — bar, line, scatter
+2. [Charts](#charts) — bar, line, area, scatter, pie, candlestick, box,
+   heatmap, radar, violin, sankey, treemap, chord
 3. [Scales](#scales) — linear, band, log, time
 4. [Axes](#axes)
-5. [Graphs](#graphs) — tree, radial, force
+5. [Graphs](#graphs) — tree, radial, force, dag (+ curved / orthogonal
+   [edge routing](#edge-routing))
 6. [Low-level layouts](#low-level-layouts)
 7. [The scene model](#the-scene-model) — build any custom SVG viz
 8. [Geometry helpers](#geometry-helpers)
-9. [Interactive islands](#interactive-islands) — the `VizGraph` pattern
+9. [Interactive islands](#interactive-islands) — zoom/pan/drag/select,
+   [live SSE push + wire deltas](#live-data-streaming-sse-push--wire-deltas),
+   [runtime mutation](#runtime-mutation-add--remove-nodes--all-layouts),
+   [subtree collapse](#subtree-expand--collapse)
 10. [Performance & limits](#performance--limits)
 
 ---
@@ -88,6 +98,9 @@ viz.boxPlotChart(ctx, data: []const viz.BoxStats, opts: viz.ChartOpts) *Node
 viz.heatmapChart(ctx, rows: []const []const u8, cols: []const []const u8, values: []const f64, opts: viz.HeatOpts) *Node
 viz.radarChart(ctx, axes: []const []const u8, series: []const viz.StackSeries, opts: viz.ChartOpts) *Node
 viz.violinChart(ctx, data: []const viz.ViolinSeries, opts: viz.ChartOpts) *Node
+viz.sankeyChart(ctx, nodes: []const viz.SankeyNode, links: []const viz.SankeyLink, opts: viz.SankeyOpts) *Node
+viz.treemapChart(ctx, items: []const viz.TreemapItem, opts: viz.TreemapOpts) *Node
+viz.chordChart(ctx, labels: []const []const u8, matrix: []const f64, opts: viz.ChordOpts) *Node
 ```
 
 Data shapes:
@@ -281,6 +294,61 @@ pub const PieOpts = struct {
 };
 ```
 
+### Sankey diagram
+
+Weighted directed flows between nodes arranged in columns (longest-path
+layering, like the DAG layout). Node height ∝ flow volume (`max(in, out)`),
+each link a cubic ribbon stroked at its value's thickness. Unknown link
+endpoints and non-positive values are dropped.
+
+```zig
+const nodes = [_]viz.SankeyNode{
+    .{ .id = "in", .label = "requests" }, .{ .id = "app" }, .{ .id = "out", .label = "responses" },
+};
+const links = [_]viz.SankeyLink{
+    .{ .from = "in", .to = "app", .value = 100 },
+    .{ .from = "app", .to = "out", .value = 100 },
+};
+const node = viz.sankeyChart(ctx, &nodes, &links, .{ .width = 560, .height = 320 });
+```
+
+### Treemap
+
+Squarified treemap (Bruls et al. 2000): a hierarchy of values tiled into
+nested rectangles, leaf area ∝ value, rows chosen greedily to keep cells
+near-square. The hierarchy is a flat parent-index array — **`parent` must be
+`null` (a root) or an index `< i`** (validated; `error.BadHierarchy`
+otherwise). Internal nodes sum their descendants; leaves are colored by their
+root ancestor. `viz.treemapLayout` exposes the raw rects for custom
+rendering.
+
+```zig
+const items = [_]viz.TreemapItem{
+    .{ .label = "core" }, // 0 — internal (has children below)
+    .{ .label = "node", .value = 18, .parent = 0 },
+    .{ .label = "viz", .value = 31, .parent = 0 },
+    .{ .label = "client", .value = 16 }, // a second root
+};
+const node = viz.treemapChart(ctx, &items, .{ .width = 560, .height = 320 });
+```
+
+### Chord diagram
+
+Pairwise flows from a row-major n×n matrix: one annular arc per group (span ∝
+row sum, d3 convention), a quadratic ribbon per nonzero unordered pair,
+colored by the heavier direction's source group. `viz.chordLayout` exposes
+the group/sub-arc angles.
+
+```zig
+const labels = [_][]const u8{ "us", "eu", "apac" };
+const matrix = [_]f64{
+    0, 12, 5,
+    9, 0,  7,
+    4, 6,  0,
+};
+const node = viz.chordChart(ctx, &labels, &matrix, .{ .width = 380, .height = 380 });
+```
+
 ### Multiple series
 
 The built-in chart helpers draw one series. For overlays (two lines, a line
@@ -412,6 +480,9 @@ pub const GraphOpts = struct {
     label_size: f64 = 11,
     ref_prefix: []const u8 = "viz-node", // data-ref="viz-node-<i>"
     force_iterations: usize = 300,
+    dag_crossing_iterations: usize = 8,  // .dag: crossing-minimization sweeps
+    edge_routing: EdgeRouting = .straight, // .dag: .straight | .curved | .orthogonal
+    edge_corner_radius: f64 = 8,         // .orthogonal corner rounding
 };
 ```
 
@@ -521,6 +592,27 @@ const pipeline = viz.Graph{
 };
 const svg = viz.renderGraph(ctx, pipeline, .{ .width = 560, .height = 360 });
 ```
+
+#### Edge routing
+
+Routed DAG edges default to **straight** polyline bends through their virtual
+nodes. `GraphOpts.edge_routing` upgrades them:
+
+- **`.curved`** — a Catmull-Rom spline through the via-points, converted
+  segment-wise to cubic Béziers. Deterministic; a 2-point edge degenerates to
+  a near-straight cubic.
+- **`.orthogonal`** — Manhattan runs: each layer hop descends to the
+  boundary midline, jogs horizontally through the virtual node's reserved
+  channel, and descends to the target, with corners rounded by
+  `edge_corner_radius` (clamped so short segments never overlap).
+
+```zig
+const svg = viz.renderGraph(ctx, pipeline, .{ .edge_routing = .orthogonal });
+```
+
+The low-level builder is exposed as `viz.edgePathD(alloc, points, routing,
+.{ .corner_radius = 8 })` — feed it any polyline (e.g. from
+`dagLayoutRouted`) and put the returned `d` into a scene `path` shape.
 
 ---
 
@@ -833,11 +925,14 @@ Declare the island (`src/app/islands.zig`):
 
 ```zig
 pub const VizGraphInteractive = struct {
-    pub const props_schema: []const u8 = "{\"xs\":\"f64[]\",\"ys\":\"f64[]\",\"ef\":\"u32[]\",\"et\":\"u32[]\",\"labels\":\"string[]\"}";
+    pub const props_schema: []const u8 = "{\"xs\":\"f64[]\",\"ys\":\"f64[]\",\"ef\":\"u32[]\",\"et\":\"u32[]\",\"labels\":\"string[]\",\"ids\":\"string[]\",\"layout\":\"u32\",\"margin\":\"f64\"}";
     pub const Props = struct {
         xs: []const f64, ys: []const f64,
         ef: []const u32, et: []const u32,
         labels: []const []const u8,
+        ids: []const []const u8,
+        layout: u32,  // @intFromEnum(viz.Layout) — lets the chunk recompute layouts
+        margin: f64,  // GraphOpts.margin — SSR-identical fitting client-side
     };
 };
 ```
@@ -853,54 +948,123 @@ svg{touch-action:none}
 
 **What you get:** wheel zooms toward the cursor (one `viz-root` group transform),
 background drag pans, node drag repositions a node and its incident edges follow,
-hover shows a labeled tooltip, click toggles a highlight. With JS off the graph
-still renders fully — interaction is pure enhancement.
+hover shows a labeled tooltip, click toggles a highlight, double-click collapses
+a subtree (below). Gestures are **pointer-captured**: dragging past the svg edge
+keeps the gesture alive until pointerup. With JS off the graph still renders
+fully — interaction is pure enhancement.
 
 **How it works:** SSR stamps `viz-svg`, a `viz-root` zoom/pan group holding two
 keyed containers (`viz-edges`, `viz-nodes`), `viz-edge-<from>|<to>` lines and
 `viz-node-<id>` groups (keyed by stable **id**, with a `data-node` id), and a
 hidden tooltip. The client chunk mutates attributes/classes via `setRefAttr` /
-`setRefClass`. The bridge adds six delegated events — `wheel`, `pointerdown`,
-`pointermove`, `pointerup`, `pointerover`, `pointerout` — plus `eventDeltaY()` /
-`eventButton()` accessors and `Node.onWheel` / `onPointer*` stamps, reusable by
-any island.
+`setRefClass`. The bridge delegates `wheel`, `pointerdown`, `pointermove`,
+`pointerup`, `pointerover`, `pointerout`, `pointercancel`, and `dblclick` —
+plus `eventDeltaY()` / `eventButton()` accessors and `Node.onWheel` /
+`onPointer*` / `onPointerCancel` / `onDblClick` stamps, reusable by any island.
+A handler that calls `verve.eventCapturePointer()` gets the pointer captured to
+its element after it returns (released implicitly on pointerup) — the generic
+primitive behind edge-proof dragging; gestures end on `pointerup` /
+`pointercancel`, never on `pointerout`.
 
-### Live-data streaming (pull / polling)
+### Live-data streaming (SSE push + wire deltas)
 
-The graph can be **data-driven**: poll a server-fn for a full `{nodes, edges}`
-snapshot on an interval and reconcile to it. A `vizGraph` server-fn (`api.zig`)
-returns the current graph; the island registers a response handler
-(`registerResponseHandler("vizGraph", &onGraph)`), polls via `serverFnPost` on a
-`setInterval` behind a "● live" toggle, parses the snapshot (`parseJson` →
-`mapSnapshotEdges` id→slot), and calls the same `reconcile`. **No new bridge
-primitives** — it reuses the IPC reply path + the reconciler. Zoom/pan + selection
-persist across every tick.
+The graph is **data-driven over true push**. The "● live" toggle subscribes the
+island to the server's `viz` push channel; the server diffs its model on every
+change and broadcasts a small **wire delta** instead of a full snapshot:
 
-Limitations: **polling** (interval-bounded, not push); a **full snapshot** per
-tick (no deltas); single instance; one shared server-side demo graph. WebSocket
-push is the next phase.
+```json
+{"seq":12,"ops":[
+  {"op":"+n","id":"e0","label":"e0"},
+  {"op":"+e","from":"core","to":"e0"},
+  {"op":"-n","id":"e2"},
+  {"op":"~n","id":"core","label":"core*"}
+]}
+```
 
-### Runtime mutation (add / remove nodes)
+Ops (`+n` add, `-n` remove, `~n` relabel node; `+e`/`-e` edges) are produced by
+`viz.diffGraphs` and serialized by `viz.writeDeltaJson`; the canonical apply
+semantics (`viz.applyDeltaOps`) are unit-tested natively and mirrored in the
+chunk. **Ordering is seq-based**: the pull snapshot (`/api/vizGraph`) now
+carries a `seq`, every push frame's SSE `id:` equals its `seq`, and the island
+applies a delta only when `seq == last_seq + 1` — a gap (missed frame, ring
+overrun, reconnect) triggers a one-shot snapshot **resync** via
+`fetchToExport`. Zoom/pan, selection, and collapse state persist across every
+update.
 
-The graph can change at runtime. The island exposes an imperative API
-(`viz_add_node` / `viz_remove_node` exports in the demo; a `reconcile` core that
-takes a new node/edge set) that:
+The plumbing is generic framework surface, not viz-specific:
+
+- **Server push hub** (`src/server/push.zig`): `push.publish(channel, bytes)`
+  broadcasts to every subscriber of `GET /push?channel=<name>` (SSE,
+  `Last-Event-ID` resume from a 32-frame ring, auto-resync when a subscriber
+  falls out of the window, `push.subscriberCount` so publishers can idle).
+  Transport-agnostic hub — a WebSocket binding can reuse it later.
+- **Chunk subscriptions** (`island_runtime`): `pushSubscribe(channel, island,
+  export_name)` delivers each frame to a NAMED chunk export
+  (`fn (ptr: u32, len: u32) void`, payload staged in island scratch);
+  `pushUnsubscribe` drops it; `fetchToExport(api, island, export_name)` is the
+  one-shot POST→export used for resync. All host-call based — zero
+  indirect-function-table entries.
+- **Fallback:** when the host has no `EventSource`, the toggle falls back to
+  the JS-driven `verveVizPoll` interval (full snapshot per tick).
+
+Limitations: single instance; one shared server-side demo graph; SSE is
+server→client only (a WS hub binding is future work).
+
+### Runtime mutation (add / remove nodes) — all layouts
+
+The graph can change at runtime under **any layout**. The island exposes an
+imperative API (`viz_add_node` / `viz_remove_node` exports in the demo; a
+`reconcile` core that takes a new node/edge set) that:
 
 1. diffs the new graph vs current (keyed by node id / `from|to` edge key);
-2. keeps survivors' positions, seeds new nodes near the centroid, and relaxes
-   with a few force steps (existing nodes barely move);
+2. computes new positions per layout:
+   - **force** — survivors keep their positions, new nodes seed near the
+     centroid, a few relax steps settle (existing nodes barely move);
+   - **tree / radial / dag** — the whole deterministic layout recomputes
+     **client-side** via the `viz_core` chunk module (the exact `treeLayout` /
+     `radialLayout` / `dagLayout` + `fitBox`/`applyFit` code SSR ran, with the
+     `layout`/`margin` props closing the loop), then new nodes appear at their
+     final positions while survivors **tween** there over 24 eased frames;
 3. drives the framework's **keyed list reconciler** (`listDiff`) on the
    `viz-nodes` / `viz-edges` containers to create / move / remove SVG elements.
 
-**Zoom/pan and selection are never touched during reconcile → preserved.** The
-one framework-core enabler: `create_keyed_child` parses fragments in the **SVG
-namespace** (so created `<g>`/`<line>` render as SVG, not HTML) — reusable by any
-SVG keyed list, not just viz.
+**Zoom/pan, selection, and collapse are never touched during reconcile →
+preserved.** A node drag cancels a running tween (drag wins). Two framework
+enablers are reusable beyond viz: `create_keyed_child` parses fragments in the
+**SVG namespace**, and the `verveRafNamed` host fn runs a JS
+`requestAnimationFrame` loop against a NAMED chunk export (`fn () i32`,
+nonzero = keep going) — chunk animation with zero indirect-function-table
+entries. The `/viz` demo's "⟳ layout" button cycles tree → radial → force →
+dag with a full-graph tween.
 
 **Limitations (this phase):** one interactive graph per page (module-static
-state); **force layout only** (tree/radial/dag mutation deferred); a full-snapshot
-diff per update; drag/pan bounded to pointer-over-svg; the client→svg mapping
-assumes the svg isn't CSS-scaled. See [Not yet](#not-yet-phase-2).
+state); a full-snapshot diff per update; the client→svg mapping assumes the
+svg isn't CSS-scaled; a barycenter flip can globally reorder a dag layer when
+one node is added — the tween absorbs it, but the jump is real. See
+[Not yet](#not-yet-phase-3).
+
+### Subtree expand / collapse
+
+**Double-click a node** to collapse its subtree; double-click again to expand.
+Semantics are a **model/DOM split**: the chunk's model always holds the full
+graph — `collapsed` flags (per node, carried across rebuilds by id) derive a
+`hidden` set by BFS over the *directed* out-edges from each collapsed root
+(everything reached except the root hides; cycles terminate via the visited
+set). Visibility only filters what reaches the DOM: `syncDom` feeds the keyed
+reconciler just the visible nodes and the edges whose **both endpoints** are
+visible, diffing against the previous *visible* key set.
+
+Because deltas mutate the model unconditionally and visibility recomputes
+afterward, **collapse composes with live streaming**: a pushed node under a
+collapsed parent updates the badge without creating DOM. The collapsed node
+stays visible with a `collapsed` class (style it — the demo uses a dashed
+amber ring) and a `+N` hidden-descendant count baked into its label.
+Selection clears if the selected node hides. The pure BFS
+(`viz.interact.collapseHidden`) is unit-tested natively, including the pinned
+v1 limitation: **a node with a second parent outside the collapsed subtree
+still hides** (visibility is per-root reachability, not
+reachable-from-visible-roots). `dblclick` is awkward on touch — long-press is
+a later refinement.
 
 ---
 
@@ -915,18 +1079,19 @@ assumes the svg isn't CSS-scaled. See [Not yet](#not-yet-phase-2).
   with no JavaScript — ideal for SSR, email, print, and SEO. Add an island only
   where you want motion or interaction.
 
-### Not yet (phase 2+)
+### Not yet (phase 3+)
 
-- **WebSocket push + expand/collapse** — runtime add/remove and pull-based
-  live-data streaming ship (above); true push (WS/SSE), granular wire deltas, and
-  subtree expand/collapse are the next layer.
-- **Mutation for non-force layouts** — runtime mutation is force-only so far.
-- **Pointer capture** — drag/pan are bounded to pointer-over-svg; dragging past
-  the svg edge ends the gesture. Document-level capture is a later refinement.
-- **Orthogonal / curved edge routing** — routed DAG edges bend through virtual
-  nodes as straight polyline segments; smooth splines or orthogonal routing
-  aren't done.
+- **WebSocket binding for the push hub** — the hub
+  (`push.publish` / `/push?channel=`) is transport-agnostic but only SSE is
+  wired; bidirectional cases (client commands over the same socket) need a WS
+  binding.
+- **Multi-parent-aware collapse visibility** — a hidden node with a second
+  visible parent should arguably stay visible
+  (reachable-from-visible-roots); v1 hides it.
+- **Multiple interactive graphs per page** — the island is module-static,
+  single-instance.
+- **Smooth routed-edge interactivity** — the interactive island draws straight
+  `<line>` edges; curved/orthogonal `<path>` edges that re-route during drag
+  are static-render-only so far.
 - **Canvas draw-command path** for thousands-of-elements scale and smooth
   high-frequency animation.
-- **Sankey / treemap / chord** chart types — buildable today from the
-  [scene model](#the-scene-model); first-class helpers may follow.

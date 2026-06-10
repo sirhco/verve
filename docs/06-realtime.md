@@ -202,6 +202,37 @@ one of the counter actions), the bridge falls through to wasm
 exports — which fall through to native `<form>` submission via the
 form fallback wrapper.
 
+## `/push` — generic push channels
+
+The counter endpoints above are bespoke. For app-defined streams there is a
+**generic broadcast hub** (`src/server/push.zig`): any server code publishes
+bytes into a named channel and every subscriber of that channel's SSE stream
+receives them.
+
+```zig
+const push = @import("push.zig"); // server-side
+_ = push.publish("viz", payload_bytes); // returns the assigned seq (or null)
+if (push.subscriberCount("viz") == 0) return; // idle when nobody listens
+```
+
+- `GET /push?channel=<name>` (name: 1–32 chars of `[A-Za-z0-9_-]`, else 400)
+  streams `id: <seq>` / `event: <channel>` / `data: <payload>` frames.
+- Each channel retains a **32-frame ring**; a reconnecting `EventSource` sends
+  `Last-Event-ID` and replays only what it missed. A subscriber that falls out
+  of the window gets a `{"resync":true,"seq":N}` control frame — its cue to
+  re-fetch a full snapshot over the normal pull path.
+- Island chunks subscribe with `pushSubscribe(channel, island, export_name)`
+  (`island_runtime`): every frame lands in a NAMED chunk export
+  (`fn (ptr: u32, len: u32) void`) with the payload staged in island scratch.
+  `fetchToExport(api, island, export_name)` is the matching one-shot
+  POST-to-export, typically used for resync.
+- The hub itself is transport-agnostic — a WebSocket binding can reuse it.
+
+The flagship consumer is the live graph in
+[22 — Visualization](22-visualization.md) (seq-ordered wire deltas + snapshot
+resync); [`examples/viz-live/`](../examples/viz-live/README.md) is the
+minimal standalone app wiring the whole stack.
+
 ## Choosing between SSE and WS
 
 | | SSE | WebSocket |

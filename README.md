@@ -1,6 +1,6 @@
 # Verve
 
-> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.2.x. Public
+> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.3.x. Public
 > APIs are not stable and **will** break between minor versions.
 > All three desktop backends (macOS, Windows, Linux GTK4) are validated
 > on real hardware as of v0.2.0. Known limitations: desktop auto-updater
@@ -113,7 +113,7 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - **Shared linear memory** — chunks import their memory from the main `client.wasm` via `env.memory`, dropping per-chunk size to **~73 bytes** for stubs (~290 B for chunks that ship real logic) vs. ~180 B standalone. Total bytes-on-wire stays flat as you add more islands.
 - **Lazy dispatch** — JS bridge fetches each chunk on first encounter, caches the instantiation, copies props through shared scratch, and calls `hydrate(ptr, len, vid)`.
 - **Chunk-side reactive runtime** (Phase 13F) — chunks `@import("verve")` (the chunk-side façade) and call `registerI32` / `signalSetI32` / `signalGetI32` / `queryRef` / `setRefText` / `cleanup` / etc. via a `verve_runtime` import the bridge JS resolves against the main client's exports at instantiation. Per-island Signal registration without bouncing through the main client.
-- **Closure-style events from chunks** (Phase 13G) — `verve.registerEvent(&handler)` from a chunk lands in the main runtime's event-slot table; `call_indirect` dispatches via a **shared `__indirect_function_table`** (the main client exports it; chunks import it). No JS hops, no per-chunk handler-name registries.
+- **Closure-style events from chunks** (Phase 13G, table-isolated) — `verve.registerEvent(&handler)` from a chunk lands in the main runtime's event-slot table and `call_indirect` dispatches it. Function tables are **isolated**: the main client imports a JS-owned growable `__indirect_function_table`, each chunk instantiates against a private table, and the bridge translates fn-pointer indices crossing the boundary (registerEvent, timers, response/drop handlers) into freshly grown main-table slots — a chunk's element segment can never clobber the main client's entries.
 - **Multi-instance islands** — the framework auto-namespaces every `z-bind` / `data-ref` inside an island as `name__v{vid}` at SSR time. Two instances of the same component are fully independent with no author burden; `hydrate(props_ptr, props_len, vid)` receives the document-order `vid` assigned by the bridge.
 - **Typed props** — `verve.encodeProps(ctx, Props{...})` serializes a typed struct to base64 (binary codec in `src/core/props.zig`) for the server; `verve.decodeProps(Props, bytes, alloc)` reconstructs it chunk-side from `data-props`. `props_schema` is optional documentation, not the wire contract.
 - **Island resource-state hydration** — `ctx.islandState(fields)` / `ctx.islandStateStruct(key, value)` server-side embed state in `<script type="application/verve-state">`; chunks read it back with `verve.resourceFromState(T, owner, key)` (returns a `.ready` Resource, no re-fetch) or `verve.islandStateValue(T, key)` (raw primitive).
@@ -127,11 +127,20 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 ### Client runtime (wasm app primitives)
 Wasm-side primitives so app logic lives in Zig instead of an inline `<script>` blob. All chunk-callable; one shared `std.json` parser in the main client keeps chunks tiny. Guide: [`docs/20-client-runtime.md`](docs/20-client-runtime.md).
 - **Typed IPC replies** — `verve.serverFnPost(route, body)` + `verve.parseJson` / `verve.readStruct(Reply, doc, alloc)`. One parser in the main client (`verve_json_*`); chunks read typed replies without a per-chunk JSON scanner. Server-side `app_client.<name>_call(arena, args, on_reply)` mirrors the shape.
-- **Events with data** — handlers read `eventMods()`, `eventKey(buf)`, `eventTargetAttr(name, buf)` (the element's `data-*`), `eventCoordX/Y()`, and call `eventPreventDefault()` / `eventStopPropagation()`.
+- **Events with data** — handlers read `eventMods()`, `eventKey(buf)`, `eventTargetAttr(name, buf)` (the element's `data-*`), `eventCoordX/Y()`, `eventDeltaY()` / `eventButton()`, and call `eventPreventDefault()` / `eventStopPropagation()` / `eventCapturePointer()` (pointer capture: the gesture keeps receiving move/up after leaving the element). Delegated event set includes `wheel`, the full `pointer*` family (incl. `pointercancel`), and `dblclick`, each with a fluent `Node.on*` stamp.
+- **Server push to chunks** — `pushSubscribe(channel, island, export_name)` delivers every SSE frame from `/push?channel=…` to a NAMED chunk export (payload staged in island scratch); `pushUnsubscribe` drops it; `fetchToExport(api, island, export_name)` is the one-shot POST→export resync hook. All host-call based — zero indirect-function-table entries.
+- **Named-export animation loop** — the `verveRafNamed` host fn drives a JS `requestAnimationFrame` loop against a named chunk export (`fn () i32`, nonzero = continue); chunk animation without taking a function pointer.
 - **Timers / storage / clipboard** — `setTimeout` / `setInterval` / `requestAnimationFrame` / `queueMicrotask` / `clearTimer`, `storage.{get,set,remove,len}` over `localStorage`, `clipboardWrite`.
 - **Forms + DOM measurement** — `refValueStr`, `refRequestSubmit`, `refSelect`, `refBlur`, `refScrollIntoView`, `refRect()`, `viewport()`, `matchMedia(query)`, `formCollect(bind, buf)` → JSON for `readStruct`.
 - **Generic JS interop** — `host(name, args, out)` (sync) + `hostAsync(name, args, route)` (replies via the response-handler path). Apps register functions in `window.verveHost` — the supported hook for browser APIs Verve doesn't own (Intl, canvas).
 - **Chunk-local arena** — `chunkArena()` is a real `std.mem.Allocator` over a main-client bump region; `chunkArenaMark` / `chunkArenaReset` recycle per dispatch instead of pre-sizing static buffers. `registerDrop(bind, handler)` + `currentDrop(buf)` deliver dropped-file bytes to wasm.
+
+### Visualization (`verve.viz`)
+Native, pure-Zig, declarative graphs + charts — no d3, no cytoscape, no canvas. Layout computed in Zig (server-side or in wasm), output is an SVG `Node` tree through the normal renderer, so every chart works with JS off. Guide: [`docs/22-visualization.md`](docs/22-visualization.md). Demos: the `/viz` route (`zig build run`) and the standalone live-streaming app [`examples/viz-live/`](examples/viz-live/README.md).
+- **15 chart types** — bar (plain/stacked/grouped), line, area, scatter, pie/donut, candlestick, box plot, heatmap, radar, violin, **sankey**, **treemap** (squarified), **chord** — plus scales (linear/band/log/time), axes with nice ticks, and a resolution-independent scene model for custom SVG viz.
+- **Node-link graphs** — tree, radial, force-directed, and layered DAG layouts (Sugiyama crossing minimization, virtual-node edge routing with **straight / curved / orthogonal** edge styles via `GraphOpts.edge_routing`).
+- **Interactive graph island** — wheel zoom, pointer-captured pan/drag (gestures survive leaving the svg), hover tooltips, click select, **double-click subtree collapse** (`+N` badge), runtime add/remove of nodes under **any layout** (deterministic layouts recompute client-side via the `viz_core` chunk module and tween to their new positions).
+- **Live data over SSE push** — the server diffs its graph and broadcasts seq-ordered **wire deltas** (`viz.diffGraphs` / `writeDeltaJson` / `applyDeltaOps`) on a push channel; the island applies them in order and resyncs via a snapshot on any gap. Polling fallback when EventSource is unavailable.
 
 ### Markdown & syntax highlighting
 Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed at SSR time into the `Node` tree; no client wasm, no JavaScript. Guide: [`docs/21-markdown-and-highlighting.md`](docs/21-markdown-and-highlighting.md). Demo: [`examples/markdown/`](examples/markdown/README.md).
@@ -142,7 +151,7 @@ Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed
 ### Dev + ops
 - **`--dev`** auto-reload: injects a WS-disconnect-reconnect script. Pair with `zig build --watch run -- --dev`.
 - **`--csrf=enforce|disable`** flag (default enforce).
-- `/events` SSE + `/ws` bidirectional WebSocket.
+- `/events` SSE + `/ws` bidirectional WebSocket + `/push?channel=…` generic SSE broadcast hub (`push.publish(channel, bytes)`, 32-frame resume ring, `Last-Event-ID` replay).
 - `/health` (uptime + request count) + `/metrics` (per-route latency JSON).
 - Per-connection worker pool with bounded admission (`--workers N`).
 - LISTEN_FDS env-var support for systemd socket activation.
@@ -207,7 +216,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.1.37
+zig fetch --save git+https://github.com/sirhco/verve#v0.3.0
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -267,7 +276,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.1.37 \
+verve-cli new ~/my-app --release v0.3.0 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 
@@ -472,6 +481,7 @@ try verve.Renderer.streamRender(writer, io, root, &reg);
 | GET  | `/islands/<Name>.wasm`             | Per-island WASM chunk (one per `app.islands` decl) |
 | GET  | `/public/<path>`                   | Static assets (hashed URL → immutable cache, plain → max-age=300) |
 | GET  | `/events`                          | Server-Sent Events (text/event-stream) |
+| GET  | `/push?channel=<name>`             | Generic SSE broadcast channel (`push.publish`; `Last-Event-ID` resume) |
 | GET  | `/ws`                              | WebSocket upgrade |
 | GET  | `/__verve/dev_ws`                  | Dev auto-reload (only with `--dev`) |
 | GET  | `/health`                          | JSON: `{status, uptime_sec, requests}` |

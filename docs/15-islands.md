@@ -146,13 +146,18 @@ export fn hydrate(props_ptr: u32, props_len: u32, vid: u32) void {
 The SSR'd content stamps `[z-on-click-id="<id>"]` (via
 `Node.onClickFn(id)` at render time) and the bridge JS click
 delegate routes through `verve_event_dispatch(id)` — same path the
-main client uses. The chunk's `&handleBump` is a fn pointer into
-the shared `__indirect_function_table` (build.zig wires
-`export_table = true` on the main client + `import_table = true`
-on each chunk, and the bridge passes the table through as
-`env.__indirect_function_table` at chunk instantiation). The main
-runtime stores the same index in `event_slots` and `call_indirect`
-dispatches into chunk code without further JS hops.
+main client uses. Function tables are **isolated**: the main client
+*imports* a JS-created growable `__indirect_function_table`
+(build.zig wires `import_table = true` on the client), and each
+chunk instantiates against its own **private** table — a chunk's
+element segment (its `&fn` pointers, allocator vtables, writer
+drains) can never overwrite the main client's entries. When a chunk
+hands the main runtime a fn-pointer index (`registerEvent`,
+response/drop handlers, timers), the bridge's `makeChunkRuntime`
+wrapper copies the chunk's funcref into a freshly grown slot of the
+main table and forwards that index — so `event_slots` +
+`call_indirect` dispatch into chunk code exactly as before, with one
+JS hop only at registration time.
 
 Chunks that prefer the simpler string-name path still work — export
 a named handler and stamp `z-on-click="<exportName>"`. The bridge
