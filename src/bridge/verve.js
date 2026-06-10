@@ -93,7 +93,7 @@
             );
             const first =
               doc.documentElement && doc.documentElement.firstElementChild;
-            if (!first) return null;
+            if (!first || doc.querySelector("parsererror")) return null;
             node = document.importNode(first, true);
           } else {
             const tpl = document.createElement("template");

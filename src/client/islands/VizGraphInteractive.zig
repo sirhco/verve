@@ -438,7 +438,11 @@ fn reconcile(new_ids: []const []const u8, new_labels: []const []const u8, new_ed
         const hbuf = a.alloc(u8, 1024) catch return;
         nhtml[i] = nodeFragment(hbuf, idOf(i), sref, labelOf(i), gx[i], gy[i]) catch return;
     }
-    verve.listDiff("viz-nodes", old_nkeys, nkeys, nhtml);
+    // `verve_list_diff` does NOT vid-scope the parent bind (unlike queryRef) —
+    // pass the already-scoped container name.
+    var npbuf: [48]u8 = undefined;
+    const nodes_parent = scopedRef(&npbuf, "viz-nodes") orelse return;
+    verve.listDiff(nodes_parent, old_nkeys, nkeys, nhtml);
 
     const ekeys = a.alloc([]const u8, edge_n) catch return;
     const ehtml = a.alloc([]const u8, edge_n) catch return;
@@ -451,7 +455,9 @@ fn reconcile(new_ids: []const []const u8, new_labels: []const []const u8, new_ed
         const hbuf = a.alloc(u8, 320) catch return;
         ehtml[e] = edgeFragment(hbuf, key, sref, gx[ef[e]], gy[ef[e]], gx[et[e]], gy[et[e]]) catch return;
     }
-    verve.listDiff("viz-edges", old_ekeys, ekeys, ehtml);
+    var epbuf: [48]u8 = undefined;
+    const edges_parent = scopedRef(&epbuf, "viz-edges") orelse return;
+    verve.listDiff(edges_parent, old_ekeys, ekeys, ehtml);
 
     // Snap survivors to exact final positions (created elements already carry
     // them, but moved survivors need updating).
