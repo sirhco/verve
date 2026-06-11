@@ -206,7 +206,7 @@ pub const Reader = struct {
     /// Caller must ensure `i < self.submesh_count`.
     pub fn submesh(self: *const Reader, i: u32) Submesh {
         std.debug.assert(i < self.submesh_count);
-        const off = i * submesh_size;
+        const off = @as(usize, i) * submesh_size; // usize: u32 product could wrap
         const raw = self.submeshes[off..][0..submesh_size];
         return .{
             .index_byte_off = std.mem.readInt(u32, raw[0..4], .little),
@@ -226,7 +226,7 @@ pub const Reader = struct {
         std.debug.assert(i < self.tex_count);
         const tex_table_off = std.mem.readInt(u32, self.bytes[32..36], .little);
         const tex_data_off = std.mem.readInt(u32, self.bytes[36..40], .little);
-        const entry_off = tex_table_off + i * tex_entry_size;
+        const entry_off = @as(usize, tex_table_off) + @as(usize, i) * tex_entry_size;
         const raw = self.bytes[entry_off..][0..tex_entry_size];
         const width = std.mem.readInt(u32, raw[0..4], .little);
         const height = std.mem.readInt(u32, raw[4..8], .little);
@@ -235,7 +235,7 @@ pub const Reader = struct {
         return .{
             .width = width,
             .height = height,
-            .rgba = self.bytes[tex_data_off + data_off ..][0..data_len],
+            .rgba = self.bytes[@as(usize, tex_data_off) + data_off ..][0..data_len],
         };
     }
 };
@@ -294,6 +294,11 @@ test "reader rejects hostile counts (u32 overflow)" {
 
     std.mem.writeInt(u32, buf[16..20], 0, .little);
     std.mem.writeInt(u32, buf[20..24], 0xFFFF_FFFF, .little); // texture_count: *16 wraps
+    try testing.expectError(error.Truncated, Reader.init(&buf));
+
+    std.mem.writeInt(u32, buf[20..24], 0, .little);
+    std.mem.writeInt(u32, buf[12..16], 0x8000_0000, .little); // index_count: *2 wraps to 0
+    std.mem.writeInt(u32, buf[28..32], 48, .little); // index_off
     try testing.expectError(error.Truncated, Reader.init(&buf));
 }
 
