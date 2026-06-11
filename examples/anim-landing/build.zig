@@ -1,9 +1,8 @@
-//! Build wiring for the `viz-live` example. Mirrors the framework's own
-//! `build.zig` (and the islands-demo example) with two twists: the chunk
-//! runtime gets the `viz_core` module (the interactive viz chunk recomputes
-//! layouts client-side), and island chunk sources fall back to the
-//! FRAMEWORK's implementation before the `_default` stub — this example
-//! reuses `src/client/islands/VizGraphInteractive.zig` verbatim.
+//! Build wiring for the `anim-landing` example. Mirrors the framework's
+//! own `build.zig` (and the viz-live example): the chunk runtime gets the
+//! `viz_core` + `anim_core` modules (island_runtime imports both), and
+//! island chunk sources resolve example-local first — this example ships
+//! its own `src/client/islands/Gallery.zig` FLIP island.
 
 const std = @import("std");
 
@@ -21,8 +20,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Chunk runtime + the core modules it imports: the typed-props codec,
-    // island state, and the pure viz math (`viz_core`) the interactive graph
-    // chunk uses for client-side relayout.
+    // island state, and the pure client-side math cores.
     const serialize_island_mod = b.createModule(.{
         .root_source_file = b.path("../../src/core/serialize.zig"),
     });
@@ -228,7 +226,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const server = b.addExecutable(.{
-        .name = "viz-live-server",
+        .name = "anim-landing-server",
         .root_module = server_mod,
     });
     b.installArtifact(server);
@@ -236,7 +234,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(server);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Run the viz-live server");
+    const run_step = b.step("run", "Run the anim-landing server");
     run_step.dependOn(&run_cmd.step);
 }
 

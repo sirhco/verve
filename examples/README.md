@@ -38,6 +38,7 @@ generate a scaffolded variant.
 | [`client-runtime/`](client-runtime/README.md) | All v0.1.30 primitives in one island — typed IPC, events-with-data, timers/storage/clipboard, forms/measurement, JS interop, chunk arena + drag-drop | ~3.6 KB |
 | [`islands-demo/`](islands-demo/README.md) | Island stack end-to-end — `encodeProps`/`decodeProps` typed props, `ctx.islandState`/`islandStateValue` resource-state, per-island lifecycle, chunk-side click handler, **two** independent Counter islands (shared component, independent state via per-vid namespacing) | ~3 KB |
 | [`viz-live/`](viz-live/README.md) | Live `verve.viz` graph over **SSE push** — `/push?channel=viz` broadcast hub, seq-ordered wire deltas (`diffGraphs`/`writeDeltaJson`), snapshot resync on gaps, plus the full interactive island (pointer-captured drag, dblclick collapse, layout-cycle tweens) reused from the framework | ~107 KB |
+| [`anim-landing/`](anim-landing/README.md) | A `verve.anim` **landing page** — the whole plugin set composed like a real site: ScrollSmoother + parallax, SplitText hero, scroll-gated staggers, scrubbed MotionPath + MorphSVG, transform-pinned panel with points snap, zero-wasm Draggable with inertia + drop zones, and one FLIP gallery island (shuffle + enter/leave). Everything but the gallery is declarative SSR | ~10 KB |
 
 The wasm-driven examples each ship their own `src/client/main.zig`
 overriding the framework's default client. The framework's server,
