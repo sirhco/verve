@@ -196,6 +196,10 @@ pub const viz = @import("core/viz/viz.zig");
 // surface via `verve.animPlay(...)` in the client runtime.
 pub const anim = @import("core/anim/anim.zig");
 
+// 3D engine — scene graph + binary command stream (WebGL2 interpreter
+// in the bridge). Pre-1.0, surface will grow through P2-P5.
+pub const gl = @import("core/gl/gl.zig");
+
 // Codec
 pub const encode = serialize_mod.encode;
 
@@ -280,4 +284,5 @@ test {
     _ = @import("core/props.zig");
     _ = @import("core/viz/viz.zig");
     _ = @import("core/anim/anim.zig");
+    _ = @import("core/gl/gl.zig");
 }

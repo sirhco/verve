@@ -63,6 +63,11 @@ pub fn build(b: *std.Build) void {
     const anim_core_mod = b.createModule(.{
         .root_source_file = b.path("src/core/anim/client_core.zig"),
     });
+    // Pure gl engine (math/scene/command/mesh) so island chunks can
+    // build scenes + encode command streams without the full verve module.
+    const gl_core_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/gl/gl.zig"),
+    });
     const verve_island_mod = b.addModule("verve_island", .{
         .root_source_file = b.path("src/client/island_runtime.zig"),
         .imports = &.{
@@ -70,6 +75,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "island_state", .module = island_state_island_mod },
             .{ .name = "viz_core", .module = viz_core_mod },
             .{ .name = "anim_core", .module = anim_core_mod },
+            .{ .name = "gl_core", .module = gl_core_mod },
         },
     });
 
