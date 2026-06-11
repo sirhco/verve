@@ -27,7 +27,7 @@ you know what you need.
 20. [Client runtime](20-client-runtime.md) — wasm-side app primitives: typed IPC replies + shared JSON service, events-with-data + pointer capture, timers, storage, forms, JS interop, chunk arena, server push to named exports, named-export rAF loops
 21. [Markdown & syntax highlighting](21-markdown-and-highlighting.md) — pure-Zig server-side GFM markdown + code highlighting, safe-by-default, `ctx.markdown` / `ctx.codeBlock` / `verve.highlightThemeCss`
 22. [Visualization](22-visualization.md) — native `verve.viz` graphs/hierarchies/charts: SVG scene model, scales/axes, tree/radial/force/dag layouts with curved/orthogonal edge routing, 15 chart types (incl. sankey/treemap/chord), interactive islands with zoom/pan/drag/select, subtree collapse, runtime mutation under any layout, and live SSE wire-delta streaming
-23. [Animation](23-animation.md) — `verve.anim` tweens/timelines/keyframes with 31 easings, stagger (grid + distribution), dynamic values, modifiers, control API (pause/reverse/seek/timeScale), declarative SSR `Node.animate(...)` + imperative island `animPlay`/`AnimHandle`, and built-in prefers-reduced-motion handling
+23. [Animation](23-animation.md) — `verve.anim` GSAP-class engine: tweens/timelines/keyframes with 31 easings, stagger, dynamic values, modifiers, control API; ScrollTrigger (toggle actions, scrub, pins, snap, markers, zero-wasm reveals) + Observer; ScrollSmoother (native-scroll-preserving, parallax); MotionPath + MorphSVG (full SVG `d` parser, morph-from-current on islands); Draggable (bounds/snap/inertia/drop zones); SplitText (server-side splitting) + FLIP (enter/leave callbacks); built-in prefers-reduced-motion handling throughout
 
 ## Reference
 

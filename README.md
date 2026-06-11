@@ -19,13 +19,13 @@ No Chromium. No Electron. No third-party dependencies.
 
 Targets **Zig 0.16.0**.
 
-📚 **[Documentation](docs/README.md)** — 21 topic guides covering every feature.
+📚 **[Documentation](docs/README.md)** — 23 topic guides covering every feature.
 🧪 **[Examples](examples/README.md)** — runnable sample apps including a full [showcase](examples/showcase/).
 
 ```sh
 # Web app — HTTP server + wasm hydration
 zig build                           # native server + wasm client + per-island chunks
-zig build test --summary all        # 336 tests across core + server + client + desktop + integration
+zig build test --summary all        # 568 tests across core + server + client + desktop + integration
 zig build docs                      # zig-out/docs/api/index.html — Zig autodoc for the public verve module
 ./zig-out/bin/verve-server          # open http://127.0.0.1:8080
 
@@ -141,6 +141,15 @@ Native, pure-Zig, declarative graphs + charts — no d3, no cytoscape, no canvas
 - **Node-link graphs** — tree, radial, force-directed, and layered DAG layouts (Sugiyama crossing minimization, virtual-node edge routing with **straight / curved / orthogonal** edge styles via `GraphOpts.edge_routing`).
 - **Interactive graph island** — wheel zoom, pointer-captured pan/drag (gestures survive leaving the svg), hover tooltips, click select, **double-click subtree collapse** (`+N` badge), runtime add/remove of nodes under **any layout** (deterministic layouts recompute client-side via the `viz_core` chunk module and tween to their new positions).
 - **Live data over SSE push** — the server diffs its graph and broadcasts seq-ordered **wire deltas** (`viz.diffGraphs` / `writeDeltaJson` / `applyDeltaOps`) on a push channel; the island applies them in order and resyncs via a snapshot on any gap. Polling fallback when EventSource is unavailable.
+
+### Animation (`verve.anim`)
+GSAP-class animation engine, pure Zig + one hand-written JS interpreter — no GSAP, no Framer Motion. Zig builds and serializes versioned JSON descriptors (declarative SSR `Node.animate(...)` or imperative island `verve.animPlay`); the bridge owns the rAF loop and style writes. Frozen wire contract via serializer goldens + node conformance tests. Guide: [`docs/23-animation.md`](docs/23-animation.md). Demos: the `/anim` and `/smooth` routes (`zig build run`).
+- **Core engine** — tweens, timelines (labels + position arithmetic), keyframes, 31 easings, grid/distribution stagger, dynamic per-target values, wasm fn modifiers, control API (pause/reverse/seek/timeScale/progress), and built-in `prefers-reduced-motion` handling (jump-to-end, overridable per tween).
+- **ScrollTrigger + Observer** — enter/leave toggle actions, scrub (exact or smoothed), pins with layout-preserving spacers, viewport-relative start/end specs, markers, zero-wasm class reveals (`anim.reveal`), **snap-to-progress** (step or points; idle-detected native-scroll glide), and a normalized wheel/touch/pointer Observer with velocity.
+- **ScrollSmoother** — native-scroll-preserving smoothing (fixed wrapper + translated content + height spacer — scrollbar, keyboard, anchors, and a11y stay native while the visual eases), `data-speed`/`data-lag` parallax, transform pins, touch-native by default.
+- **MotionPath + MorphSVG** — full SVG `d` parser (arcs, reflections, relative commands) → arc-length-uniform sampling with tangent rotation and `.align_to = .start` re-basing; shape morphing with subpath matching, de Casteljau equalization, and cyclic start alignment; islands can morph **from the live shape** (`verve.refGetAttrArena`).
+- **Draggable** — axis locks, bounds (selector or rect), grid/point snap, **analytic inertia throws** (velocity-continuous endpoint projection), drop zones with hover class + `on_drop`, pointer-capture gestures that keep inner clicks working.
+- **SplitText + FLIP** — chars/words split **server-side** (zero JS, two a11y attributes); line grouping at hydrate; FLIP layout animation over the keyed reconciler (identity + `data-vkey` matching, synchronous invert, enter/leave callbacks, entered-element fade-in).
 
 ### Markdown & syntax highlighting
 Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed at SSR time into the `Node` tree; no client wasm, no JavaScript. Guide: [`docs/21-markdown-and-highlighting.md`](docs/21-markdown-and-highlighting.md). Demo: [`examples/markdown/`](examples/markdown/README.md).

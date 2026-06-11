@@ -1,10 +1,12 @@
 # Animation (`verve.anim`)
 
-GSAP-class core animation engine: tweens, timelines, keyframes, an easing
+GSAP-class animation engine: tweens, timelines, keyframes, an easing
 library (31 curves), stagger with grid/distribution patterns, dynamic
 values, per-frame modifiers, a full control API
 (pause/play/reverse/restart/seek/timeScale), math utilities, and built-in
-`prefers-reduced-motion` handling.
+`prefers-reduced-motion` handling — plus the plugin set documented below:
+ScrollTrigger (with snap), Observer, ScrollSmoother, MotionPath,
+MorphSVG, Draggable (with drop zones), SplitText, and FLIP.
 
 **Architecture — hybrid execution.** Zig builds tween/timeline descriptors
 and serializes them to a compact JSON wire format (`"v":1`); a small
@@ -631,17 +633,25 @@ bridge's lerp/string-building halves against the same fixtures.
 
 ## Demo
 
-`zig build run` → <http://127.0.0.1:8080/anim> exercises both surfaces:
-declarative entrance + infinite keyframe pulse (`.skip` under reduced
-motion), and the `AnimDemo` island (`src/client/islands/AnimDemo.zig`)
-with pause/play/reverse/restart/timeScale buttons, an onComplete signal,
-and a dynamic-value + snap-modifier tween.
+`zig build run` →
+
+- <http://127.0.0.1:8080/anim> exercises both surfaces plus most
+  plugins: declarative entrance + infinite keyframe pulse, the
+  `AnimDemo` island (`src/client/islands/AnimDemo.zig`) with full
+  control-API buttons, a scroll-gated SplitText headline and
+  line-reveal paragraph, motion-path orbit with scrubbed variant,
+  morph-from-current SVG toggle, an inertia draggable card with drop
+  zones, scrubbed/pinned scroll sections, and a FLIP grid (shuffle +
+  remove/restore card).
+- <http://127.0.0.1:8080/smooth> is the ScrollSmoother page: parallax
+  hero, snapping section deck, transform-pinned panel, and a probe
+  island showing native vs smoothed scroll diverge live.
 
 ## Not yet
 
-The original GSAP-class spec is complete. Tracked follow-ups: horizontal
-/ container scrollers, configurable snap ease + inertia-aware
-directional snap, grapheme-aware/RTL splitting + split revert, FLIP
-onEnter/onLeave callbacks + nested counter-scale, drag bounce /
-drop-zones / sortable lists, GSAP-style `align`/`alignOrigin` for
-MotionPath, island morph-from-current-d.
+The original GSAP-class spec is complete. Tracked follow-ups:
+horizontal / container scrollers, configurable snap ease +
+inertia-aware directional snap, grapheme-aware/RTL splitting + split
+revert, FLIP nested counter-scale, drag bounce / sortable lists,
+MotionPath `align` to another element (`.align_to = .start`
+self-alignment shipped).

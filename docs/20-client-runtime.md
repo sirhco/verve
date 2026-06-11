@@ -175,7 +175,10 @@ defer doc.free();
 const form = try verve.readStruct(NoteForm, doc, gpa);
 ```
 
-Accessors: `refValueStr`, `refRequestSubmit`, `refSelect`, `refBlur`,
+Accessors: `refValueStr`, `refAttrLen` / `refGetAttr` /
+`refGetAttrArena` (read any live attribute; the arena variant
+probes-then-copies at exact size — feeds `verve.anim`
+morph-from-current), `refRequestSubmit`, `refSelect`, `refBlur`,
 `refScrollIntoView`, `refRect() Rect`, `viewport() Viewport`,
 `matchMedia(query)`, `formCollect(bind, buf)`.
 

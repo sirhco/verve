@@ -54,4 +54,4 @@ An island is declared as a `pub const <Name> = struct { pub const props_schema =
 
 ## Docs
 
-`docs/` holds 22 numbered topic guides (`01-getting-started` … `22-visualization`); `docs/README.md` is the index. `examples/` has runnable apps including `examples/showcase/`. Note: counts/specs in older docs (e.g. getting-started's "37 tests") may lag the README — trust `build.zig` and the README.
+`docs/` holds 23 numbered topic guides (`01-getting-started` … `23-animation`); `docs/README.md` is the index. `examples/` has runnable apps including `examples/showcase/`. Note: counts/specs in older docs (e.g. getting-started's "37 tests") may lag the README — trust `build.zig` and the README.

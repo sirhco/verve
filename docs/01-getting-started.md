@@ -56,6 +56,9 @@ Open the browser at:
 - <http://127.0.0.1:8080/> — landing page
 - <http://127.0.0.1:8080/counter> — live counter, updates over WebSocket
 - <http://127.0.0.1:8080/todos> — server-rendered todo list
+- <http://127.0.0.1:8080/viz> — interactive graph + chart gallery (`verve.viz`)
+- <http://127.0.0.1:8080/anim> — animation engine demo (`verve.anim`)
+- <http://127.0.0.1:8080/smooth> — ScrollSmoother + scroll-snap page
 - <http://127.0.0.1:8080/health> — JSON liveness probe
 - <http://127.0.0.1:8080/metrics> — JSON per-route latency
 
@@ -66,15 +69,18 @@ trigger a clean shutdown.
 
 ```sh
 zig build test --summary all
-# Build Summary: 16/16 steps succeeded; 37/37 tests passed
+# Build Summary: 36/36 steps succeeded; 568/568 tests passed
 ```
 
-The suite covers:
+The suite groups five sub-suites (exact counts grow with the framework
+— trust the build output):
 
-- **Core** — node tree, signal, context, renderer (9 tests)
-- **Server** — api_handler dispatch, pool admission, metrics, gzip (12 tests)
-- **Client** — wasm allocator, escape helpers on native target (5 tests)
-- **Integration** — spawns `verve-server` and hits every endpoint (11 tests)
+- **Core** — node tree, reactive graph, renderer, routes, i18n,
+  markdown/highlight, viz, anim (incl. the wire-format golden tests)
+- **Server** — api_handler dispatch, pool admission, metrics, gzip
+- **Client** — wasm data structures, run on the native target
+- **Integration** — spawns `verve-server` and hits every endpoint
+- **Desktop** — the pure-Zig pieces (native backends aren't exercised)
 
 Format check:
 
