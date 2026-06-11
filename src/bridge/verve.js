@@ -4145,6 +4145,166 @@
     return "{}";
   };
 
+  // ---- verve.gl: binary command-stream interpreter (WebGL2 backend) ----
+  // Zig encodes a length-prefixed tagged stream (layout frozen by the
+  // golden tests in src/core/gl/command.zig); this walks it and issues
+  // GL calls. Stream: [len u32 LE][records]. Record: [tag u16][size u16]
+  // [payload]. Unknown tags skip via size. Bulk data arrives as
+  // (ptr, len) into wasm memory — typed-array views, zero copies.
+  let glActiveChunkExports = null;
+  const glSetActiveChunk = (exports) => {
+    glActiveChunkExports = exports;
+  };
+
+  const glCompile = (gl, vsSrc, fsSrc) => {
+    const mk = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+        console.error("verve.gl shader:", gl.getShaderInfoLog(s));
+      return s;
+    };
+    const p = gl.createProgram();
+    gl.attachShader(p, mk(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fsSrc));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+      console.error("verve.gl link:", gl.getProgramInfoLog(p));
+    return p;
+  };
+
+  const glInterpret = (st, ptr) => {
+    // Fresh DataView every frame: memory.buffer detaches on wasm growth.
+    const dv = new DataView(memory.buffer);
+    const total = dv.getUint32(ptr, true);
+    let off = ptr + 4;
+    const end = off + total;
+    const gl = st.gl;
+    while (off < end) {
+      const tag = dv.getUint16(off, true);
+      const size = dv.getUint16(off + 2, true);
+      off += 4;
+      switch (tag) {
+        case 1: { // BEGIN_FRAME
+          gl.viewport(0, 0, dv.getUint32(off + 16, true), dv.getUint32(off + 20, true));
+          gl.clearColor(
+            dv.getFloat32(off, true),
+            dv.getFloat32(off + 4, true),
+            dv.getFloat32(off + 8, true),
+            dv.getFloat32(off + 12, true),
+          );
+          gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+          break;
+        }
+        case 2: { // CREATE_BUFFER
+          const handle = dv.getUint32(off, true);
+          const kind = dv.getUint32(off + 4, true);
+          const p = dv.getUint32(off + 8, true);
+          const len = dv.getUint32(off + 12, true);
+          const target = kind === 1 ? gl.ELEMENT_ARRAY_BUFFER : gl.ARRAY_BUFFER;
+          const buf = gl.createBuffer();
+          gl.bindBuffer(target, buf);
+          gl.bufferData(target, new Uint8Array(memory.buffer, p, len), gl.STATIC_DRAW);
+          st.buffers[handle] = { buf, target };
+          break;
+        }
+        case 3: { // CREATE_SHADER — variant flags (word 1) fix the v1
+          // vertex layout: pos f32x3 @0, color f32x3 @12, stride 24.
+          const handle = dv.getUint32(off, true);
+          const vs = readStr(dv.getUint32(off + 8, true), dv.getUint32(off + 12, true));
+          const fs = readStr(dv.getUint32(off + 16, true), dv.getUint32(off + 20, true));
+          const prog = glCompile(gl, vs, fs);
+          st.shaders[handle] = { prog, mvp: gl.getUniformLocation(prog, "u_mvp") };
+          break;
+        }
+        case 4: { // SET_PIPELINE
+          const sh = st.shaders[dv.getUint32(off, true)];
+          if (!sh) break;
+          const state = dv.getUint32(off + 4, true);
+          gl.useProgram(sh.prog);
+          st.active = sh;
+          if (state & 1) gl.enable(gl.DEPTH_TEST);
+          else gl.disable(gl.DEPTH_TEST);
+          if (state & 2) {
+            gl.enable(gl.CULL_FACE);
+            gl.cullFace(gl.BACK);
+          } else gl.disable(gl.CULL_FACE);
+          break;
+        }
+        case 5: { // DRAW
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const count = dv.getUint32(off + 8, true);
+          const mvpPtr = dv.getUint32(off + 12, true);
+          const vb = st.buffers[vh];
+          const ib = st.buffers[ih];
+          if (!vb || !ib || !st.active) break;
+          const key = vh + ":" + ih;
+          let vao = st.vaos.get(key);
+          if (!vao) {
+            vao = gl.createVertexArray();
+            gl.bindVertexArray(vao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+            gl.enableVertexAttribArray(1);
+            gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
+            st.vaos.set(key, vao);
+          }
+          gl.bindVertexArray(vao);
+          gl.uniformMatrix4fv(st.active.mvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
+          gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, 0);
+          break;
+        }
+        case 6: // END_FRAME
+          break;
+        default:
+          break; // unknown tag: size-skip = forward compatible
+      }
+      off += size;
+    }
+  };
+
+  const glStart = (refHandle, exportName) => {
+    const canvas = refHandles[refHandle];
+    const exports = glActiveChunkExports;
+    if (!canvas || !exports || typeof exports[exportName] !== "function") {
+      console.error("verve.gl: glStart cannot resolve canvas/export:", exportName);
+      return;
+    }
+    const ctx = canvas.getContext("webgl2", { antialias: true });
+    if (!ctx) {
+      console.error("verve.gl: WebGL2 unavailable; canvas left inert");
+      return;
+    }
+    const st = {
+      gl: ctx,
+      exports,
+      exportName,
+      buffers: [],
+      shaders: [],
+      vaos: new Map(),
+      active: null,
+      last: 0,
+    };
+    const step = (now) => {
+      const dt = st.last ? now - st.last : 16.7;
+      st.last = now;
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+      const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+      const ptr = st.exports[st.exportName](dt, w, h) >>> 0;
+      if (!ptr) return; // wasm asked to stop (island unmount path, P4)
+      glInterpret(st, ptr);
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  };
+
   // One-shot fetch routed to an island export: `{api, island, export}` POSTs
   // `/api/<api>` and delivers the reply text to the named export. This is the
   // push path's resync hook, reusable by any island.
@@ -4184,6 +4344,10 @@
             __indirect_function_table: chunkTable,
           },
           verve_runtime: makeChunkRuntime(chunkTable),
+          verve: {
+            gl_start: (refHandle, namePtr, nameLen) =>
+              glStart(refHandle, readStr(namePtr, nameLen)),
+          },
         }).catch((err) => {
           islandChunks.delete(name);
           console.warn("verve: island chunk fetch failed", name, err);
@@ -4225,8 +4389,10 @@
           return;
         }
         new Uint8Array(memory.buffer, ptr, cap).set(propsBytes, 0);
+        glSetActiveChunk(cexp);
         cexp.hydrate(ptr, propsBytes.length, instanceId);
       } else {
+        glSetActiveChunk(cexp);
         cexp.hydrate(0, 0, instanceId);
       }
     } finally {
