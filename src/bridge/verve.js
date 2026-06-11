@@ -4299,7 +4299,13 @@
       if (canvas.height !== h) canvas.height = h;
       const ptr = st.exports[st.exportName](dt, w, h) >>> 0;
       if (!ptr) return; // wasm asked to stop (island unmount path, P4)
-      glInterpret(st, ptr);
+      try {
+        glInterpret(st, ptr);
+      } catch (err) {
+        // A corrupt stream/pointer must not kill the loop silently.
+        console.error("verve.gl: interpreter fault, loop stopped:", err);
+        return;
+      }
       requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
