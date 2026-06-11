@@ -4174,6 +4174,42 @@
     return p;
   };
 
+  // Bind (or create+cache) the VAO for a given vbuf/ibuf pair, using the
+  // active shader's variant to select the correct attribute layout.
+  // variant & 1 (variant_vertex_color): loc0 vec3 s24 o0, loc1 vec3 s24 o12
+  // variant & 2 (variant_lit_uv):       loc0 vec3 s32 o0, loc1 vec3 s32 o12, loc2 vec2 s32 o24
+  const bindVaoFor = (st, vh, ih) => {
+    const gl = st.gl;
+    const vb = st.buffers[vh];
+    const ib = st.buffers[ih];
+    const variant = st.active ? st.active.variant : 1;
+    const key = `${vh}:${ih}:${variant}`;
+    let vao = st.vaos.get(key);
+    if (!vao) {
+      vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
+      if (variant & 2) {
+        // lit/textured: pos f32x3 @0, normal f32x3 @12, uv f32x2 @24, stride 32
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 32, 0);
+        gl.enableVertexAttribArray(1);
+        gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 32, 12);
+        gl.enableVertexAttribArray(2);
+        gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 32, 24);
+      } else {
+        // unlit/vertex-color: pos f32x3 @0, color f32x3 @12, stride 24
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+        gl.enableVertexAttribArray(1);
+        gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+      }
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
+      st.vaos.set(key, vao);
+    }
+    gl.bindVertexArray(vao);
+  };
+
   const glInterpret = (st, ptr) => {
     // Fresh DataView every frame: memory.buffer detaches on wasm growth.
     const dv = new DataView(memory.buffer);
@@ -4209,13 +4245,19 @@
           st.buffers[handle] = { buf, target };
           break;
         }
-        case 3: { // CREATE_SHADER — variant flags (word 1) fix the v1
-          // vertex layout: pos f32x3 @0, color f32x3 @12, stride 24.
+        case 3: { // CREATE_SHADER — variant (word 1) selects layout + uniforms
           const handle = dv.getUint32(off, true);
+          const variant = dv.getUint32(off + 4, true);
           const vs = readStr(dv.getUint32(off + 8, true), dv.getUint32(off + 12, true));
           const fs = readStr(dv.getUint32(off + 16, true), dv.getUint32(off + 20, true));
           const prog = glCompile(gl, vs, fs);
-          st.shaders[handle] = { prog, mvp: gl.getUniformLocation(prog, "u_mvp") };
+          st.shaders[handle] = {
+            prog,
+            variant,
+            mvp: gl.getUniformLocation(prog, "u_mvp"),
+            color: (variant & 2) ? gl.getUniformLocation(prog, "u_color") : null,
+            tex: (variant & 2) ? gl.getUniformLocation(prog, "u_tex") : null,
+          };
           break;
         }
         case 4: { // SET_PIPELINE
@@ -4232,34 +4274,58 @@
           } else gl.disable(gl.CULL_FACE);
           break;
         }
-        case 5: { // DRAW
+        case 5: { // DRAW — P1 unlit path; byte offset always 0, no color uniform
           const vh = dv.getUint32(off, true);
           const ih = dv.getUint32(off + 4, true);
           const count = dv.getUint32(off + 8, true);
           const mvpPtr = dv.getUint32(off + 12, true);
-          const vb = st.buffers[vh];
-          const ib = st.buffers[ih];
-          if (!vb || !ib || !st.active) break;
-          const key = vh + ":" + ih;
-          let vao = st.vaos.get(key);
-          if (!vao) {
-            vao = gl.createVertexArray();
-            gl.bindVertexArray(vao);
-            gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
-            gl.enableVertexAttribArray(0);
-            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
-            gl.enableVertexAttribArray(1);
-            gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
-            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
-            st.vaos.set(key, vao);
-          }
-          gl.bindVertexArray(vao);
+          if (!st.buffers[vh] || !st.buffers[ih] || !st.active) break;
+          bindVaoFor(st, vh, ih);
           gl.uniformMatrix4fv(st.active.mvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, 0);
           break;
         }
         case 6: // END_FRAME
           break;
+        case 7: { // CREATE_TEXTURE — raw RGBA8 + generated mips
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          const p = dv.getUint32(off + 12, true);
+          const len = dv.getUint32(off + 16, true);
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA,
+            gl.UNSIGNED_BYTE, new Uint8Array(memory.buffer, p, len));
+          gl.generateMipmap(gl.TEXTURE_2D);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+          st.textures[handle] = tex;
+          break;
+        }
+        case 8: { // BIND_TEXTURE
+          const slot = dv.getUint32(off, true);
+          const tex = st.textures[dv.getUint32(off + 4, true)];
+          if (!tex) break;
+          gl.activeTexture(gl.TEXTURE0 + slot);
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          if (st.active && st.active.tex) gl.uniform1i(st.active.tex, slot);
+          break;
+        }
+        case 9: { // DRAW_SUB — byte-offset submesh draw with color uniform
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const mvpPtr = dv.getUint32(off + 16, true);
+          const colorPtr = dv.getUint32(off + 20, true);
+          if (!st.buffers[vh] || !st.buffers[ih] || !st.active) break;
+          bindVaoFor(st, vh, ih);
+          gl.uniformMatrix4fv(st.active.mvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
+          if (st.active.color)
+            gl.uniform4fv(st.active.color, new Float32Array(memory.buffer, colorPtr, 4));
+          gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
         default:
           break; // unknown tag: size-skip = forward compatible
       }
@@ -4285,6 +4351,7 @@
       exportName,
       buffers: [],
       shaders: [],
+      textures: [],
       vaos: new Map(),
       active: null,
       last: 0,
@@ -4353,6 +4420,39 @@
           verve: {
             gl_start: (refHandle, namePtr, nameLen) =>
               glStart(refHandle, readStr(namePtr, nameLen)),
+            gl_load: (urlPtr, urlLen, cbPtr, cbLen) => {
+              const url = readStr(urlPtr, urlLen);
+              const cb = readStr(cbPtr, cbLen);
+              const exports = glActiveChunkExports;
+              if (!exports || typeof exports[cb] !== "function") {
+                console.error("verve.gl: gl_load callback missing:", cb);
+                return;
+              }
+              fetch(url)
+                .then((r) => {
+                  if (!r.ok) throw new Error("HTTP " + r.status);
+                  return r.arrayBuffer();
+                })
+                .then((ab) => {
+                  const bytes = new Uint8Array(ab);
+                  // verve_chunk_alloc lives on the MAIN client (exp), not the chunk.
+                  // Same pattern as the drag-drop path (verve.js:3665).
+                  const ptr = typeof exp.verve_chunk_alloc === "function"
+                    ? exp.verve_chunk_alloc(bytes.length >>> 0, 16)
+                    : 0;
+                  if (!ptr) {
+                    console.error("verve.gl: chunk arena full for", url);
+                    exports[cb](0, 0);
+                    return;
+                  }
+                  new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
+                  exports[cb](ptr, bytes.length >>> 0);
+                })
+                .catch((err) => {
+                  console.error("verve.gl: asset fetch failed:", url, err);
+                  exports[cb](0, 0);
+                });
+            },
           },
         }).catch((err) => {
           islandChunks.delete(name);
