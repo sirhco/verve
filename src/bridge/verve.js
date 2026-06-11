@@ -1015,6 +1015,12 @@
         for (const a of [...anims.values()]) {
           if (a.rm !== "allow") animJumpToEnd(a);
         }
+        // finalize active FLIPs: snap to identity, fire callbacks
+        for (const f of [...flips.values()]) {
+          const cb = f.cb;
+          flipKill(f, true);
+          if (cb) animFireSlot(cb.sC);
+        }
       }
     };
     if (typeof mq.addEventListener === "function") mq.addEventListener("change", onChange);
@@ -1498,9 +1504,10 @@
     const dt = Math.min((now - animLast) / 1000, 0.1);
     animLast = now;
     // Scroll triggers first: edge actions / scrub seeks land before this
-    // frame's time integration. Then inertia throws.
+    // frame's time integration. Then inertia throws and FLIP plays.
     if (stTriggers.size) stUpdate(dt);
     if (dragThrowing > 0) dragUpdate(dt);
+    if (flipActive > 0) flipUpdate(dt);
     for (const a of [...anims.values()]) {
       if (a.paused || a.done) continue;
       // Self-kill animations whose targets all left the document
@@ -1525,7 +1532,7 @@
     // Keep ticking while time-driven anims run, scroll work remains
     // (fresh scroll events / unsettled scrub smoothing set stDirty), or
     // inertia throws are in flight.
-    if (stDirty || dragThrowing > 0 || (anims.size && [...anims.values()].some((a) => !a.paused && !a.done))) {
+    if (stDirty || dragThrowing > 0 || flipActive > 0 || (anims.size && [...anims.values()].some((a) => !a.paused && !a.done))) {
       requestAnimationFrame(animTick);
     } else {
       animTickerOn = false;
@@ -1640,6 +1647,76 @@
         continue;
       }
       animCreate(desc, el);
+    }
+  };
+
+  // ---- SplitText lines grouping ----------------------------------------
+  // SSR emits word spans + data-split-lines (src/core/anim/split.zig);
+  // line wrap depends on layout, so grouping happens here: consecutive
+  // word spans sharing an offsetTop wrap into line elements. Runs ONCE at
+  // scan (late fonts / resize can stale lines — documented, GSAP-parity).
+  // MUST run BEFORE animScan on the same root: animations targeting
+  // .st-line resolve their targets at create time.
+
+  // Pure: offsetTop array -> [start, end) index runs (0.5px jitter).
+  // @verve-extract splitLineRuns
+  const splitLineRuns = (tops) => {
+    const runs = [];
+    let s = 0;
+    for (let i = 1; i <= tops.length; i++) {
+      if (i === tops.length || Math.abs(tops[i] - tops[s]) > 0.5) {
+        runs.push([s, i]);
+        s = i;
+      }
+    }
+    return runs;
+  };
+  // @verve-extract-end
+
+  const splitLinesApply = (el) => {
+    const cls = el.getAttribute("data-split-lines") || "st-line";
+    const wrap = el.querySelector("[data-split-wrap]");
+    if (!wrap) return;
+    const words = Array.from(wrap.children);
+    if (!words.length) return;
+    const tops = words.map((w) => w.offsetTop); // measure ALL before mutating
+    const runs = splitLineRuns(tops);
+    const nodes = Array.from(wrap.childNodes); // spans + whitespace text
+    const frag = document.createDocumentFragment();
+    let line = null;
+    let run = 0;
+    let wi = 0;
+    for (const n of nodes) {
+      if (n.nodeType === 1) {
+        if (!line || wi === runs[run][1]) {
+          if (line) run++;
+          line = document.createElement("span");
+          line.className = cls;
+          line.style.display = "block"; // can't assume the stylesheet
+          frag.appendChild(line);
+        }
+        line.appendChild(n);
+        wi++;
+      } else if (line) {
+        line.appendChild(n); // whitespace rides its line
+      }
+    }
+    wrap.textContent = "";
+    wrap.appendChild(frag);
+  };
+
+  const splitLinesScan = (root) => {
+    const list = [];
+    if (root instanceof Element) {
+      if (root.hasAttribute("data-split-lines")) list.push(root);
+      root.querySelectorAll("[data-split-lines]").forEach((el) => list.push(el));
+    } else if (root && root.querySelectorAll) {
+      root.querySelectorAll("[data-split-lines]").forEach((el) => list.push(el));
+    }
+    for (const el of list) {
+      if (el.hasAttribute("data-split-lines-done")) continue;
+      el.setAttribute("data-split-lines-done", "1");
+      splitLinesApply(el);
     }
   };
 
@@ -2568,6 +2645,234 @@
     }
   };
 
+  // ---- Verve Flip --------------------------------------------------------
+  // FLIP layout animation (island-only, ops crossing — no wire root; play
+  // options JSON from src/core/anim/flip.zig optsToJson). Capture stores
+  // VISUAL doc-space rects; play matches by element identity (reorders)
+  // then data-vkey (reconciler-recreated nodes), inverts via the shared
+  // transform composer, and eases to identity in the ticker.
+
+  const flipStates = new Map(); // capture handle -> { entries }
+  const flips = new Map(); // flip handle -> active flip
+  const flipByEl = new Map(); // el -> owning active flip (last-writer claim)
+  let flipStateSeq = 1;
+  let flipSeq = 1;
+  let flipActive = 0;
+  const FLIP_STATE_CAP = 16; // entries hold strong element refs
+
+  // Visual rect minus the composer's translate, size divided by its
+  // scale -> the element's natural (untransformed) center + size.
+  // Assumes translate+scale only (rotate/skew callers fall back to
+  // position-only).
+  // @verve-extract flipNatural
+  const flipNatural = (r, s) => ({
+    cx: r.left + r.width / 2 - s.x,
+    cy: r.top + r.height / 2 - s.y,
+    w: s.sx ? r.width / s.sx : r.width,
+    h: s.sy ? r.height / s.sy : r.height,
+  });
+  // @verve-extract-end
+
+  // Center-based first-minus-last deltas; scale ratios pinned to 1 when
+  // disabled or degenerate.
+  // @verve-extract flipDelta
+  const flipDelta = (first, last, useScale) => ({
+    dx: first.cx - last.cx,
+    dy: first.cy - last.cy,
+    rx: useScale && last.w > 0 ? first.w / last.w : 1,
+    ry: useScale && last.h > 0 ? first.h / last.h : 1,
+  });
+  // @verve-extract-end
+
+  const flipCaptureImpl = (sel) => {
+    let els;
+    try {
+      els = Array.from(document.querySelectorAll(sel));
+    } catch {
+      return 0;
+    }
+    if (!els.length) return 0;
+    const sx = window.scrollX || 0;
+    const sy = window.scrollY || 0;
+    const entries = els.map((el) => {
+      const r = el.getBoundingClientRect();
+      return {
+        el,
+        vkey: el.getAttribute("data-vkey"),
+        rect: { left: r.left + sx, top: r.top + sy, width: r.width, height: r.height },
+        claimed: false,
+      };
+    });
+    if (flipStates.size >= FLIP_STATE_CAP) {
+      const oldest = flipStates.keys().next().value;
+      flipStates.delete(oldest);
+      console.warn("verve flip: state cap reached, evicting oldest capture", oldest);
+    }
+    const h = flipStateSeq++;
+    flipStates.set(h, { sel, entries });
+    return h;
+  };
+
+  const flipFinishItem = (it) => {
+    it.done = true;
+    if (it.fade) it.el.style.opacity = "";
+    flipByEl.delete(it.el);
+  };
+
+  const flipKill = (f, snap) => {
+    for (const it of f.items) {
+      if (it.done) continue;
+      if (snap && it.el.isConnected) {
+        if (it.fade) {
+          it.el.style.opacity = "";
+        } else {
+          const s = getXform(it.el);
+          xformSet(s, "x", 0);
+          xformSet(s, "y", 0);
+          if (f.useScale) {
+            xformSet(s, "scaleX", 1);
+            xformSet(s, "scaleY", 1);
+          }
+          animDirty.add(it.el);
+        }
+      }
+      flipFinishItem(it);
+    }
+    flushXform();
+    if (flips.delete(f.h)) flipActive--;
+  };
+
+  const flipPlayImpl = (stateH, desc) => {
+    const state = flipStates.get(stateH);
+    flipStates.delete(stateH); // play ALWAYS consumes the state
+    if (!state) return 0;
+    const cb = desc.cb || null;
+    if (prefersReduced) {
+      // layout already final; FLIP is purely decorative transition
+      if (cb) animFireSlot(cb.sC);
+      return 0;
+    }
+    let els;
+    try {
+      els = Array.from(document.querySelectorAll(state.sel));
+    } catch {
+      els = [];
+    }
+    const useScale = desc.sc === 1;
+    const fadeIn = desc.fade !== 0;
+    const sx = window.scrollX || 0;
+    const sy = window.scrollY || 0;
+    const items = [];
+    for (const el of els) {
+      // identity first, then unclaimed vkey (reconciler re-created node)
+      let entry = state.entries.find((e) => !e.claimed && e.el === el);
+      if (!entry) {
+        const vk = el.getAttribute("data-vkey");
+        if (vk) entry = state.entries.find((e) => !e.claimed && e.vkey === vk);
+      }
+      if (!entry) {
+        if (fadeIn) {
+          el.style.opacity = "0";
+          items.push({ el, fade: true, dx: 0, dy: 0, rx: 1, ry: 1, done: false, delay: 0 });
+        }
+        continue;
+      }
+      entry.claimed = true;
+      const r = el.getBoundingClientRect();
+      const s = getXform(el);
+      const rotated = s.r !== 0 || s.kx !== 0 || s.ky !== 0;
+      const last = flipNatural(
+        { left: r.left + sx, top: r.top + sy, width: r.width, height: r.height },
+        rotated ? { x: s.x, y: s.y, sx: 1, sy: 1 } : s,
+      );
+      const first = {
+        cx: entry.rect.left + entry.rect.width / 2,
+        cy: entry.rect.top + entry.rect.height / 2,
+        w: entry.rect.width,
+        h: entry.rect.height,
+      };
+      const d = flipDelta(first, last, useScale && !rotated);
+      const moved = Math.abs(d.dx) > 0.5 || Math.abs(d.dy) > 0.5 ||
+        Math.abs(d.rx - 1) > 0.001 || Math.abs(d.ry - 1) > 0.001;
+      if (!moved) continue;
+      items.push({ el, fade: false, dx: d.dx, dy: d.dy, rx: d.rx, ry: d.ry, done: false, delay: 0 });
+    }
+    if (!items.length) {
+      if (cb) animFireSlot(cb.sC);
+      return 0;
+    }
+    // invert synchronously — same task as the layout change, no flash
+    const stagger = desc.st || 0;
+    items.forEach((it, i) => {
+      it.delay = i * stagger;
+      const prior = flipByEl.get(it.el);
+      if (prior) prior.items = prior.items.filter((p) => p.el !== it.el); // steal
+      flipByEl.set(it.el, null); // claimed below
+      if (!it.fade) {
+        const s = getXform(it.el);
+        xformSet(s, "x", it.dx);
+        xformSet(s, "y", it.dy);
+        if (useScale) {
+          xformSet(s, "scaleX", it.rx);
+          xformSet(s, "scaleY", it.ry);
+        }
+        animDirty.add(it.el);
+      }
+    });
+    flushXform();
+    const f = {
+      h: flipSeq++,
+      items,
+      t: 0,
+      dur: typeof desc.d === "number" ? desc.d : 0.4,
+      easeFn: easeFnOf(desc.e),
+      cb,
+      useScale,
+    };
+    for (const it of items) flipByEl.set(it.el, f);
+    flips.set(f.h, f);
+    flipActive++;
+    tickerKick();
+    return f.h;
+  };
+
+  // Per-frame integrator (dragUpdate model) — lerps inverted -> identity.
+  const flipUpdate = (dt) => {
+    for (const f of [...flips.values()]) {
+      f.t += dt;
+      let live = 0;
+      for (const it of f.items) {
+        if (it.done) continue;
+        if (!it.el.isConnected) {
+          flipFinishItem(it);
+          continue;
+        }
+        const p = Math.max(0, Math.min((f.t - it.delay) / f.dur, 1));
+        const e = f.easeFn(p);
+        if (it.fade) {
+          it.el.style.opacity = String(e);
+        } else {
+          const s = getXform(it.el);
+          xformSet(s, "x", it.dx * (1 - e));
+          xformSet(s, "y", it.dy * (1 - e));
+          if (f.useScale) {
+            xformSet(s, "scaleX", it.rx + (1 - it.rx) * e);
+            xformSet(s, "scaleY", it.ry + (1 - it.ry) * e);
+          }
+          animDirty.add(it.el);
+        }
+        if (p >= 1) flipFinishItem(it);
+        else live++;
+      }
+      if (!live) {
+        flips.delete(f.h);
+        flipActive--;
+        if (f.cb) animFireSlot(f.cb.sC);
+      }
+    }
+    flushXform();
+  };
+
   // Phase 13F — assemble the chunk-side reactive-runtime import object
   // from the main client's matching exports. Built once after main
   // instantiation; reused for every island chunk. Missing entries pass
@@ -3103,6 +3408,28 @@
           return 0;
       }
     },
+    // ---- FLIP ops ----------------------------------------------------------
+    verve_flip_capture: (sp, sl) => flipCaptureImpl(readStr(sp, sl)) >>> 0,
+    verve_flip_play: (state, dp, dl) => {
+      let desc;
+      try {
+        desc = JSON.parse(readStr(dp, dl));
+      } catch (err) {
+        console.warn("verve flip: bad opts", err);
+        flipStates.delete(state >>> 0); // play always consumes
+        return 0;
+      }
+      return flipPlayImpl(state >>> 0, desc) >>> 0;
+    },
+    verve_flip_discard: (state) => {
+      flipStates.delete(state >>> 0);
+    },
+    // op: 0 kill (snap to identity, NO callback)
+    verve_flip_ctrl: (h, op) => {
+      const f = flips.get(h >>> 0);
+      if (!f) return;
+      if ((op >>> 0) === 0) flipKill(f, true);
+    },
   };
 
   // Table isolation, chunk side: each island chunk instantiates against a
@@ -3521,8 +3848,9 @@
 
   parseIslandState();
   document.querySelectorAll("verve-island").forEach(hydrateIslandEl);
-  // Declarative entrance animations stamped by Node.animate(), and
-  // draggables stamped by Node.draggable().
+  // SplitText line grouping FIRST (animations targeting .st-line resolve
+  // targets at create), then declarative animations and draggables.
+  splitLinesScan(document.body);
   animScan(document.body);
   dragScan(document.body);
 
@@ -3532,8 +3860,10 @@
       rec.addedNodes.forEach((n) => {
         eachIslandIn(n, hydrateIslandEl);
         // New subtrees (Suspense swaps, SPA navigations, template
-        // clones) may carry their own [data-anim]/[data-drag] markers.
+        // clones) may carry their own [data-split-lines]/[data-anim]/
+        // [data-drag] markers. Lines group BEFORE animations resolve.
         if (n instanceof Element) {
+          splitLinesScan(n);
           animScan(n);
           dragScan(n);
         }

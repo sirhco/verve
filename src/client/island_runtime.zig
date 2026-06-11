@@ -1194,6 +1194,67 @@ pub fn draggable(cfg: anim.Draggable, cbs: DragCallbacks) ?DragHandle {
     return .{ .id = h };
 }
 
+// ---- FLIP (verve.anim phase 5) ----------------------------------------------
+//
+// First-Last-Invert-Play layout animation. Island-only — capture rects,
+// mutate the DOM (listDiff, signals, manual moves), then play; the JS
+// engine matches elements (identity, then data-vkey), inverts via the
+// shared transform composer, and eases to identity in the ticker.
+// Under prefers-reduced-motion, play is a no-op that fires on_complete.
+
+extern "verve_runtime" fn verve_flip_capture(sel_ptr: [*]const u8, sel_len: u32) u32;
+extern "verve_runtime" fn verve_flip_play(state: u32, desc_ptr: [*]const u8, desc_len: u32) u32;
+extern "verve_runtime" fn verve_flip_discard(state: u32) void;
+// op: 0 kill (snap to identity, no callback)
+extern "verve_runtime" fn verve_flip_ctrl(handle: u32, op: u32) void;
+
+/// One-shot layout snapshot. Consumed by `flipPlay`; `discard()` when
+/// abandoned (entries hold element refs JS-side).
+pub const FlipState = struct {
+    id: u32,
+
+    pub fn discard(self: FlipState) void {
+        verve_flip_discard(self.id);
+    }
+};
+
+/// Live flip handle. Ops no-op once settled.
+pub const FlipHandle = struct {
+    id: u32,
+
+    /// Snap remaining elements to identity; callbacks do NOT fire.
+    pub fn kill(self: FlipHandle) void {
+        verve_flip_ctrl(self.id, 0);
+    }
+};
+
+pub const FlipCallbacks = struct {
+    /// Fires once when every element (including stagger tails) settles —
+    /// also fires immediately under reduced motion or when nothing moved.
+    on_complete: ?*const fn () void = null,
+};
+
+/// Snapshot the current layout of every element matching `selector`.
+pub fn flipCapture(selector: []const u8) ?FlipState {
+    const h = verve_flip_capture(selector.ptr, @intCast(selector.len));
+    if (h == 0) return null;
+    return .{ .id = h };
+}
+
+/// Animate from the captured layout to the current one. Always consumes
+/// `state`. Returns null when nothing animates (callback still fired).
+pub fn flipPlay(state: FlipState, opts: anim.FlipOpts, cbs: FlipCallbacks) ?FlipHandle {
+    var buf: [160]u8 = undefined;
+    const slot: ?u32 = if (cbs.on_complete) |f| registerEvent(f) else null;
+    const json = anim.flip.optsToJson(&buf, opts, slot) catch {
+        verve_flip_discard(state.id);
+        return null;
+    };
+    const h = verve_flip_play(state.id, json.ptr, @intCast(json.len));
+    if (h == 0) return null;
+    return .{ .id = h };
+}
+
 // ---- Timers (Phase 19) --------------------------------------------------
 //
 // Handlers are `*const fn () void` taken via `&handler` — the same
@@ -1503,6 +1564,11 @@ pub fn appendToBind(parent_bind: []const u8, child_handle: i32) void {
 /// Callers typically render `new_html[i]` for each `new_keys[i]` into
 /// their own buffer before this call. `new_keys.len` must equal
 /// `new_html.len` (mismatched lengths short-circuit to a no-op).
+///
+/// NOTE: unlike signals, `parent_bind` is NOT vid-scoped automatically.
+/// For binds inside this island's own markup, suffix the name yourself
+/// (`"<bind>__v{d}"` with the `root_id` from hydrate) — the SSR's
+/// rewriteBindings stamped the suffixed form on the DOM.
 pub fn listDiff(
     parent_bind: []const u8,
     old_keys: []const []const u8,

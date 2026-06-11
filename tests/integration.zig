@@ -1076,3 +1076,31 @@ test "/anim carries Draggable descriptors" {
     try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_drag_create") != null);
     try std.testing.expect(std.mem.indexOf(u8, js.body, "data-drag-done") != null);
 }
+
+test "/anim carries SplitText markup and FLIP machinery ships" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 18);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    var resp = try request(io, gpa, port, "GET", "/anim");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // SplitText: char spans inside one aria-hidden wrapper, label intact.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "class=\"st-char\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-split-wrap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "aria-label=\"Split, stagger, scroll\"") != null);
+    // lines mode marker for the bridge's offsetTop grouping
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-split-lines=\"st-line\"") != null);
+    // FLIP demo grid keyed for identity-preserving reorders
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-vkey=\"c8\"") != null);
+
+    var js = try request(io, gpa, port, "GET", "/verve.js");
+    defer js.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "data-split-lines-done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_flip_capture") != null);
+}

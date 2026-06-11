@@ -31,6 +31,9 @@ pub const path = @import("path.zig");
 pub const MotionPath = types.MotionPath;
 pub const Morph = types.Morph;
 
+pub const flip = @import("flip.zig");
+pub const FlipOpts = flip.FlipOpts;
+
 pub const drag = @import("drag.zig");
 pub const Draggable = drag.Draggable;
 pub const DragAxis = drag.Axis;

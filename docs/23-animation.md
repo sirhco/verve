@@ -318,6 +318,73 @@ that ScrollTriggers depend on), `lock_axis`, `tolerance`. Handle:
 `kill/disable/enable` + delta/velocity/direction getters. Touch deltas
 use wheel polarity (finger up = positive deltaY).
 
+## SplitText
+
+Break text into animatable spans for typographic reveals — split
+server-side (the SSR knows the text), so chars and words cost zero JS.
+
+```zig
+ctx.h2("Split, stagger, scroll")
+    .splitText(.{ .by = .chars })          // .words / .words_and_chars / .lines
+    .animate(anim.from(a, ".st-char")
+        .opacity(0).y(18).duration(0.45).ease(.out_cubic)
+        .stagger(.{ .each = 0.025 })
+        .scrollTrigger(.{ .start = .{ .viewport = .{ .pct = 85 } } }))
+```
+
+Output: the original text becomes spans inside ONE
+`<span aria-hidden="true" data-split-wrap>`, and the parent gets
+`aria-label` with the original text — screen readers hear the sentence,
+not the soup. Whitespace runs are preserved verbatim as plain text
+between spans, so wrapping and collapsing behave exactly like the
+unsplit text. `words_and_chars` nests char spans inside word spans
+(chars animate, line wrap stays stable); `index_attr` stamps
+`data-st-i` for CSS counters.
+
+`lines` can't be split on the server (wrap depends on layout): it emits
+word spans plus `data-split-lines`, and the bridge groups them into
+`.st-line` blocks by offsetTop once at hydrate — before animations
+resolve their targets, so `.animate(anim.from(a, ".st-line")...)` just
+works. Lines are measured once; late webfonts or resizes can stale them
+(prefer chars/words for resize-critical UI).
+
+Requirements + caveats: spans need `display:inline-block` CSS for
+transforms (`.st-char,.st-word{display:inline-block}`); kerning and
+ligatures break across char spans (prefer `.words` for typographic
+fidelity); splitting is per UTF-8 codepoint — grapheme clusters
+(emoji/ZWJ/combining marks) and bidi/RTL text are unsupported v1.
+Splitting requires a plain leaf text node (no children, no raw HTML, no
+reactive bind — deferred errors otherwise).
+
+## FLIP
+
+Animate layout changes — reorders, DOM moves — as transforms
+(First-Last-Invert-Play). Island-only: capture, mutate the DOM, play.
+
+```zig
+const state = verve.flipCapture(".flip-grid .fcard") orelse return;
+verve.listDiff("flip_list", &old_keys, &new_keys, &html);  // or any DOM mutation
+_ = verve.flipPlay(state, .{
+    .duration = 0.45,
+    .ease = .out_cubic,
+    .scale = false,      // width/height ratios as scaleX/Y (distorts children)
+    .stagger = 0.015,    // per play-time DOM order
+    .fade_in = true,     // elements that appeared since capture fade 0->1
+}, .{ .on_complete = &onDone });
+```
+
+Matching: element identity first (covers `move_keyed_child` reorders —
+the keyed reconciler is the FLIP fast path), then `data-vkey` for
+reconciler-recreated nodes. Elements that left are ignored. The invert
+lands synchronously in the same task as the layout change (no flash),
+then everything eases to identity through the shared transform composer.
+`flipPlay` always consumes the state (`state.discard()` for abandoned
+captures); `FlipHandle.kill()` snaps to identity without callbacks.
+Re-flipping mid-flight steals elements cleanly. Under reduced motion,
+play is a no-op that fires `on_complete` immediately. Caveats: assumes
+translate+scale-only transforms at play (rotate/skew → position-only),
+default `transform-origin`, and unpinned elements.
+
 ## Draggable
 
 Pointer drag with grip handles, axis lock, bounds, snap, and inertia
@@ -499,6 +566,7 @@ and a dynamic-value + snap-modifier tween.
 ## Not yet (planned plugins)
 
 ScrollSmoother (Observer + scroller-proxy), scroll snap, horizontal /
-container scrollers, FLIP layout animation, SplitText, drag bounce /
+container scrollers, grapheme-aware/RTL splitting + split revert, FLIP
+onEnter/onLeave callbacks + nested counter-scale, drag bounce /
 drop-zones / sortable lists, GSAP-style `align`/`alignOrigin` for
 MotionPath, island morph-from-current-d — tracked as follow-up phases.

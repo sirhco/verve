@@ -460,6 +460,16 @@ pub const Node = struct {
         return self.draggableJson(json);
     }
 
+    /// Split this node's text_content into animatable spans (verve.anim
+    /// SplitText — chars/words/lines for typographic reveals). Pure
+    /// node-tree surgery; semantics, a11y, and errors live in
+    /// anim/split.zig. Spans need `display:inline-block` CSS for
+    /// transforms to apply.
+    pub fn splitText(self: *Node, opts: @import("anim/split.zig").Options) *Node {
+        @import("anim/split.zig").apply(self, opts);
+        return self;
+    }
+
     /// Escape hatch: attach a pre-serialized drag descriptor.
     pub fn draggableJson(self: *Node, json: []const u8) *Node {
         if (self.err != null) return self;

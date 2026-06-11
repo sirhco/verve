@@ -37,6 +37,15 @@ pub const path = @import("path.zig");
 pub const MotionPath = types.MotionPath;
 pub const Morph = types.Morph;
 
+// SplitText (phase 5): server-side text splitting into animatable spans.
+// (SSR-only — operates on *Node; not re-exported from client_core.)
+pub const split = @import("split.zig");
+
+// FLIP (phase 5): play-options for layout-change animation (island-only;
+// capture/play via verve.flipCapture/flipPlay in the client runtime).
+pub const flip = @import("flip.zig");
+pub const FlipOpts = flip.FlipOpts;
+
 // Draggable (phase 4): pointer drag with grip/axis/bounds/snap/inertia.
 pub const drag = @import("drag.zig");
 pub const Draggable = drag.Draggable;
@@ -82,4 +91,6 @@ test {
     _ = @import("scroll.zig");
     _ = @import("path.zig");
     _ = @import("drag.zig");
+    _ = @import("split.zig");
+    _ = @import("flip.zig");
 }

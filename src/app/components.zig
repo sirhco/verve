@@ -329,6 +329,11 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
                 ctx.span().text(" · vel "),
                 ctx.span().bind("drag_vel").text("0 px/s"),
             }),
+            // FLIP shuffle: capture -> listDiff reorder -> play. The grid
+            // is a keyed bind so move_keyed_child preserves element
+            // identity (the FLIP fast path).
+            ctx.el("button").attr("z-on-click", "anim_shuffle").text("shuffle"),
+            flipGrid(ctx),
         }),
     });
     const anim_island = verve.island(ctx, .{ .name = "AnimDemo" }, island_inner);
@@ -349,6 +354,7 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
             .step(100).scale(1.0)
             .duration(1.4).repeat(-1).reducedMotion(.skip)),
         anim_island,
+        splitSection(ctx),
         pathSection(ctx),
         dragSection(ctx),
         scrollSection(ctx),
@@ -419,6 +425,53 @@ fn pathSection(ctx: *const verve.Context) *verve.Node {
             .start = .{ .viewport = .{ .pct = 90 } },
             .end = .{ .at = .{ .trigger = .bottom, .viewport = .{ .pct = 40 } } },
             .scrub = .{ .smooth = 0.3 },
+        })),
+    });
+}
+
+/// Eight keyed cards for the FLIP shuffle (data-vkey "c1".."c8" — the
+/// chunk's anim_shuffle reorders these keys via listDiff).
+fn flipGrid(ctx: *const verve.Context) *verve.Node {
+    const grid = ctx.div().class("flip-grid").bind("flip_list");
+    const keys = [_][]const u8{ "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8" };
+    for (keys, 0..) |k, i| {
+        _ = grid.children(.{
+            ctx.div().class("anim-card fcard").attr("data-vkey", k).textInt(i + 1),
+        });
+    }
+    return grid;
+}
+
+/// SplitText demo (phase 5): server-side text splitting — chars stagger
+/// in on scroll, paragraph reveals by line (lines grouped client-side
+/// by offsetTop since wrap depends on layout).
+fn splitSection(ctx: *const verve.Context) *verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
+    return ctx.el("section").class("anim-split").children(.{
+        ctx.h2("Split, stagger, scroll")
+            .splitText(.{ .by = .chars })
+            .animate(anim.from(a, ".st-char")
+            .opacity(0).y(18)
+            .duration(0.45).ease(.out_cubic)
+            .stagger(.{ .each = 0.025 })
+            .scrollTrigger(.{
+            .start = .{ .viewport = .{ .pct = 85 } },
+            .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
+        })),
+        ctx.p()
+            .text("Each line of this paragraph reveals on its own as you scroll. " ++
+                "The server splits the text into word spans; the bridge groups " ++
+                "them into lines once it knows where the browser wrapped them.")
+            .splitText(.{ .by = .lines })
+            .animate(anim.from(a, ".st-line")
+            .opacity(0).y(24)
+            .duration(0.5).ease(.out_cubic)
+            .stagger(.{ .each = 0.12 })
+            .scrollTrigger(.{
+            .start = .{ .viewport = .{ .pct = 85 } },
+            .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
         })),
     });
 }
@@ -653,6 +706,9 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.drag-pen{position:relative;height:200px;border:1px dashed #444;border-radius:8px;margin:1rem 0;overflow:hidden}
                 \\.drag-card{cursor:grab;width:4rem;height:4rem}
                 \\.drag-card.dragging{box-shadow:0 0 0 2px #58a6ff;opacity:.9}
+                \\.st-char,.st-word{display:inline-block;will-change:transform}
+                \\.flip-grid{display:flex;gap:.5rem;flex-wrap:wrap;margin:.75rem 0;max-width:18rem}
+                \\.fcard{width:3.5rem;height:3.5rem}
                 \\.viz-card svg{touch-action:none;max-width:100%}
                 \\.viz-node{cursor:grab}
                 \\.viz-node.selected circle{stroke:#fff;stroke-width:3}

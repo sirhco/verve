@@ -19,6 +19,9 @@ var intro_id: u32 = 0;
 /// Standalone scroll-trigger + observer handle ids (phase 2 demo).
 var probe_id: u32 = 0;
 var obs_id: u32 = 0;
+/// Island vid from hydrate — needed to vid-suffix bind names for
+/// listDiff (signals auto-scope; the keyed reconciler does NOT).
+var island_vid: u32 = 0;
 
 fn introHandle() verve.AnimHandle {
     return .{ .id = intro_id };
@@ -31,7 +34,7 @@ fn onIntroDone() void {
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     _ = props_ptr;
     _ = props_len;
-    _ = root_id;
+    island_vid = root_id;
     verve.registerStr(STATUS, "playing intro");
 
     const mark = verve.chunkArenaMark();
@@ -144,6 +147,58 @@ fn onDragEnd() void {
 
 fn onThrowDone() void {
     verve.signalSetStr("drag_state", "settled");
+}
+
+// FLIP shuffle (phase 5): capture the grid, reorder it through the keyed
+// reconciler (all keys persist => moves only, so the html slices are
+// never read — the listDiff invariant this demo relies on), then play.
+
+var flip_keys = [8][]const u8{ "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8" };
+var rng_state: u32 = 0x9e3779b9;
+
+fn xorshift() u32 {
+    var x = rng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    rng_state = x;
+    return x;
+}
+
+fn onFlipDone() void {
+    verve.signalSetStr(STATUS, "shuffle settled");
+}
+
+export fn anim_shuffle() void {
+    const state = verve.flipCapture(".flip-grid .fcard") orelse return;
+
+    var old: [8][]const u8 = undefined;
+    @memcpy(&old, &flip_keys);
+    // Fisher-Yates over the chunk-static key order
+    var i: usize = flip_keys.len - 1;
+    while (i > 0) : (i -= 1) {
+        const j = xorshift() % @as(u32, @intCast(i + 1));
+        const tmp = flip_keys[i];
+        flip_keys[i] = flip_keys[j];
+        flip_keys[j] = tmp;
+    }
+    const empty_html = [8][]const u8{ "", "", "", "", "", "", "", "" };
+    // listDiff bind names are NOT vid-scoped automatically — the SSR
+    // rewrote this island's z-bind to "flip_list__v<vid>", so suffix it
+    // ourselves (VizGraphInteractive's vidName precedent).
+    var bind_buf: [48]u8 = undefined;
+    const bind: []const u8 = if (island_vid == 0)
+        "flip_list"
+    else
+        std.fmt.bufPrint(&bind_buf, "flip_list__v{d}", .{island_vid}) catch return;
+    verve.listDiff(bind, &old, &flip_keys, &empty_html);
+
+    if (verve.flipPlay(state, .{
+        .duration = 0.45,
+        .ease = .out_cubic,
+        .stagger = 0.015,
+    }, .{ .on_complete = &onFlipDone }) == null) return;
+    verve.signalSetStr(STATUS, "shuffling…");
 }
 
 export fn anim_morph_toggle() void {

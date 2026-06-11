@@ -48,6 +48,21 @@ versions follow [Semantic Versioning](https://semver.org/).
   `"mo"`; both compose with timelines, stagger, and ScrollTrigger scrub
   as pure phase functions. Conformance: serializer goldens +
   `node tests/js/anim_conformance.mjs`.
+- **`verve.anim` SplitText** (`src/core/anim/split.zig` +
+  `Node.splitText(.{ .by = .chars })`): server-side text splitting into
+  animatable spans — chars/words/words_and_chars cost zero JS; `lines`
+  emits word spans the bridge groups by offsetTop at hydrate (before
+  animations resolve targets). One `aria-hidden` wrapper + parent
+  `aria-label` keep screen readers reading the original sentence;
+  whitespace preserved verbatim so wrapping is unchanged. Composes with
+  stagger + ScrollTrigger for typographic reveals.
+- **`verve.anim` FLIP** (`verve.flipCapture`/`flipPlay`, island-only):
+  First-Last-Invert-Play layout animation — capture rects, mutate the
+  DOM (the keyed reconciler's identity-preserving moves are the fast
+  path; `data-vkey` matching covers recreated nodes), invert
+  synchronously through the shared transform composer, ease to identity
+  in the ticker. Entered elements fade in; per-element stagger; single
+  on_complete; reduced motion = instant no-op with callback.
 - **`verve.anim` Draggable** (`src/core/anim/drag.zig`, wire root
   `"dr"` / `data-drag` attribute): pointer drag with grip handles, axis
   lock, per-gesture bounds (selector or translate-space rect), grid /

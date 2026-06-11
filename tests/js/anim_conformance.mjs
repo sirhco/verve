@@ -25,9 +25,14 @@ const extract = (name) => {
 const fns = new Function(
   extract("mpSample") + extract("buildMorphD") + extract("animIsTriggerOnly") +
     extract("dragProject") + extract("dragSnapResolve") +
-    "return { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve };",
+    extract("splitLineRuns") + extract("flipNatural") + extract("flipDelta") +
+    "return { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve, " +
+    "splitLineRuns, flipNatural, flipDelta };",
 )();
-const { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve } = fns;
+const {
+  mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve,
+  splitLineRuns, flipNatural, flipDelta,
+} = fns;
 
 let fails = 0;
 const check = (name, cond) => {
@@ -147,8 +152,50 @@ const approx = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
     animIsTriggerOnly({ v: 1, sc: {}, dr: {} }) === true);
 }
 
+// ---- SplitText: offsetTop -> line runs ----
+{
+  check("runs empty", JSON.stringify(splitLineRuns([])) === "[]");
+  check("runs single", JSON.stringify(splitLineRuns([0])) === "[[0,1]]");
+  check("runs three lines",
+    JSON.stringify(splitLineRuns([0, 0, 20, 20, 20, 40])) === "[[0,2],[2,5],[5,6]]");
+  check("runs sub-0.5px jitter stays one line",
+    JSON.stringify(splitLineRuns([0, 0.3, 0.4])) === "[[0,3]]");
+}
+
+// ---- FLIP: natural-rect recovery + center deltas ----
+{
+  const sId = { x: 0, y: 0, sx: 1, sy: 1 };
+  // identity: equal rects, zero xform -> zero deltas, unit ratios
+  let n1 = flipNatural({ left: 100, top: 50, width: 80, height: 40 }, sId);
+  check("natural identity", n1.cx === 140 && n1.cy === 70 && n1.w === 80 && n1.h === 40);
+  let d = flipDelta(n1, n1, true);
+  check("delta identity", d.dx === 0 && d.dy === 0 && d.rx === 1 && d.ry === 1);
+
+  // xform subtraction recovers natural center/size
+  const sX = { x: 10, y: -5, sx: 2, sy: 2 };
+  const n2 = flipNatural({ left: 60, top: 25, width: 160, height: 80 }, sX);
+  check("natural subtracts translate", approx(n2.cx, 60 + 80 - 10) && approx(n2.cy, 25 + 40 + 5));
+  check("natural divides scale", n2.w === 80 && n2.h === 40);
+
+  // pure move
+  const a2 = { cx: 0, cy: 0, w: 50, h: 50 };
+  const b2 = { cx: 30, cy: -10, w: 50, h: 50 };
+  d = flipDelta(a2, b2, true);
+  check("delta move", d.dx === -30 && d.dy === 10 && d.rx === 1);
+
+  // 2:1 scale ratio
+  d = flipDelta({ cx: 0, cy: 0, w: 100, h: 60 }, { cx: 0, cy: 0, w: 50, h: 30 }, true);
+  check("delta scale 2:1", d.rx === 2 && d.ry === 2);
+  // useScale=false pins ratios
+  d = flipDelta({ cx: 0, cy: 0, w: 100, h: 60 }, { cx: 0, cy: 0, w: 50, h: 30 }, false);
+  check("delta scale pinned", d.rx === 1 && d.ry === 1);
+  // degenerate last width -> ratio 1
+  d = flipDelta({ cx: 0, cy: 0, w: 100, h: 60 }, { cx: 0, cy: 0, w: 0, h: 30 }, true);
+  check("delta degenerate", d.rx === 1);
+}
+
 if (fails === 0) {
-  console.log("anim conformance: ALL PASS (mpSample + buildMorphD + routing + drag)");
+  console.log("anim conformance: ALL PASS (mp + morph + routing + drag + split + flip)");
 } else {
   console.log(`anim conformance: ${fails} FAILURES`);
   process.exit(1);
