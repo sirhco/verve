@@ -4182,6 +4182,7 @@
     const gl = st.gl;
     const vb = st.buffers[vh];
     const ib = st.buffers[ih];
+    if (!vb || !ib) return false; // defense-in-depth; callers also guard
     const variant = st.active ? st.active.variant : 1;
     const key = `${vh}:${ih}:${variant}`;
     let vao = st.vaos.get(key);
@@ -4208,6 +4209,7 @@
       st.vaos.set(key, vao);
     }
     gl.bindVertexArray(vao);
+    return true;
   };
 
   const glInterpret = (st, ptr) => {
@@ -4425,6 +4427,10 @@
               const cb = readStr(cbPtr, cbLen);
               const exports = glActiveChunkExports;
               if (!exports || typeof exports[cb] !== "function") {
+                // No callback to deliver failure to — the callback IS what's
+                // missing (typo'd export name = programmer error). The chunk
+                // degrades to its no-asset frames, per the spec's poster
+                // fallback policy.
                 console.error("verve.gl: gl_load callback missing:", cb);
                 return;
               }
