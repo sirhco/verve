@@ -318,6 +318,47 @@ that ScrollTriggers depend on), `lock_axis`, `tolerance`. Handle:
 `kill/disable/enable` + delta/velocity/direction getters. Touch deltas
 use wheel polarity (finger up = positive deltaY).
 
+## Draggable
+
+Pointer drag with grip handles, axis lock, bounds, snap, and inertia
+throw — verve's drag engine, not the native HTML5 `draggable="true"`
+attribute. Position writes go through the shared transform composer, so
+rotate/scale/opacity tweens compose with an active drag (don't tween
+x/y mid-drag — last writer wins).
+
+```zig
+// SSR, zero-wasm: bounded card that coasts onto a 40px grid
+ctx.div().class("card")
+    .draggable(anim.draggable(a, .{
+        .axis = .both,                       // .x / .y lock
+        .handle = ".titlebar",               // grip sub-selector
+        .bounds = .{ .selector = ".pen" },   // or .{ .rect = .{...} } translate-space px
+        .inertia = .on,                      // or .{ .retention = 0.3 } (velocity kept/sec)
+        .snap = .{ .grid = .{ .x = 40, .y = 40 } },  // or .{ .points = &.{...} }
+        .toggle_class = "dragging",
+    }))
+```
+
+```zig
+// Island: callbacks + live position/velocity through a DragHandle
+if (verve.draggable(.{ .target = "#card", .inertia = .on }, .{
+    .on_start = &onStart, .on_drag = &onMove,
+    .on_end = &onEnd, .on_throw_complete = &onSettle,
+})) |dh| drag_id = dh.id;
+// dh.x()/.y()/.velocityX()/.isDragging()/.isThrowing()
+// dh.kill()/.disable()/.enable()/.setPos(x, y)
+```
+
+Semantics: a 3px engage threshold keeps clicks inside draggables working
+(configurable `threshold_px`); after a real drag the synthetic click is
+suppressed. Bounds re-measure at the start of every gesture. Throws
+project the rest point analytically from release velocity (exponential
+friction), clamp it to bounds, snap it, then decelerate exactly onto it —
+no bounce. `touch-action` is set per axis at create so touch drags don't
+scroll the page along the drag axis. Reduced motion: dragging itself
+stays (direct manipulation), but releases land instantly on the
+projected, snapped rest point.
+
 ## MotionPath
 
 Animate any element along an SVG path. Zig parses the `d` string,
@@ -427,6 +468,22 @@ animation):
 otherwise — uniform arc-length spacing, already windowed to
 [start, end]. `mo` is flat per-subpath runs of `2 + 6k` floats; `z` only
 when any subpath is closed. Coordinates are rounded to 0.01 Zig-side.
+
+Draggables use their own attribute (`data-drag`) and descriptor root —
+not an animation, independent lifecycle:
+
+```json
+{"v":1,"dr":{"t":{"s":".card"},"hd":".grip","ax":1,
+ "b":{"s":"#pen"} ,"in":1,"sn":{"g":[40,40]},
+ "th":6,"cur":0,"cls":"dragging","dis":1,
+ "cb":{"sS":21,"sD":22,"sE":23,"sT":24}}}
+```
+
+`ax`: 1 x, 2 y (omitted = both). `b`: selector object or
+`[minX,maxX,minY,maxY]` translate-space rect. `in`: 1 = default
+retention 0.05/s, else retention in (0,1). `sn`: `{"g":[gx,gy]}` grid or
+`{"p":[x,y,...]}` nearest point. Ctrl ops: 0 kill, 1 disable, 2 enable,
+3 setPos; get fields: 0 x, 1 y, 2 vx, 3 vy, 4 dragging, 5 throwing.
 The serializer's golden tests (`zig test src/core/anim/serialize.zig`)
 freeze this contract; `node tests/js/anim_conformance.mjs` checks the
 bridge's lerp/string-building halves against the same fixtures.
@@ -442,6 +499,6 @@ and a dynamic-value + snap-modifier tween.
 ## Not yet (planned plugins)
 
 ScrollSmoother (Observer + scroller-proxy), scroll snap, horizontal /
-container scrollers, FLIP layout animation, SplitText, Draggable (will
-reuse Observer), GSAP-style `align`/`alignOrigin` for MotionPath, island
-morph-from-current-d — tracked as follow-up phases.
+container scrollers, FLIP layout animation, SplitText, drag bounce /
+drop-zones / sortable lists, GSAP-style `align`/`alignOrigin` for
+MotionPath, island morph-from-current-d — tracked as follow-up phases.

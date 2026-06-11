@@ -318,6 +318,17 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
                 ctx.el("path").id("morph-island").attr("d", "M50,5 L61,38 L95,38 L67,58 L78,91 L50,71 L22,91 L33,58 L5,38 L39,38 Z").attr("fill", "#10b981"),
             }),
             ctx.el("button").attr("z-on-click", "anim_morph_toggle").text("morph"),
+            // imperative Draggable: the chunk wires callbacks + reads
+            // position/velocity through a DragHandle
+            ctx.div().id("drag-probe").class("anim-card drag-card").text("drag"),
+            ctx.p().class("hint").children(.{
+                ctx.span().text("drag: "),
+                ctx.span().bind("drag_state").text("idle"),
+                ctx.span().text(" · pos "),
+                ctx.span().bind("drag_pos").text("0, 0"),
+                ctx.span().text(" · vel "),
+                ctx.span().bind("drag_vel").text("0 px/s"),
+            }),
         }),
     });
     const anim_island = verve.island(ctx, .{ .name = "AnimDemo" }, island_inner);
@@ -339,6 +350,7 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
             .duration(1.4).repeat(-1).reducedMotion(.skip)),
         anim_island,
         pathSection(ctx),
+        dragSection(ctx),
         scrollSection(ctx),
         ctx.p().children(.{ctx.a("/", "← Home")}),
     }).build();
@@ -408,6 +420,27 @@ fn pathSection(ctx: *const verve.Context) *verve.Node {
             .end = .{ .at = .{ .trigger = .bottom, .viewport = .{ .pct = 40 } } },
             .scrub = .{ .smooth = 0.3 },
         })),
+    });
+}
+
+/// Draggable demo (phase 4): a zero-wasm bounded drag card with inertia
+/// + grid snap — pure data-drag, no island.
+fn dragSection(ctx: *const verve.Context) *verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
+    return ctx.el("section").class("anim-drag").children(.{
+        ctx.h2("Draggable: bounds + inertia + grid snap"),
+        ctx.p().class("hint").text("Pure data-drag — no island, no wasm. Flick the card; it coasts and settles on the 40px grid inside the pen."),
+        ctx.div().class("drag-pen").children(.{
+            ctx.div().class("anim-card drag-card").text("drag")
+                .draggable(anim.draggable(a, .{
+                .bounds = .{ .selector = ".drag-pen" },
+                .inertia = .on,
+                .snap = .{ .grid = .{ .x = 40, .y = 40 } },
+                .toggle_class = "dragging",
+            })),
+        }),
     });
 }
 
@@ -617,6 +650,9 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.anim-orbit-wrap{position:relative;margin:1rem 0}
                 \\.anim-orbiter{position:absolute;top:-6px;left:-6px;width:12px;height:12px;background:#f59e0b;clip-path:polygon(0 0,100% 50%,0 100%)}
                 \\.anim-scrub-dot{position:absolute;top:-5px;left:-5px;width:10px;height:10px;border-radius:50%;background:#58a6ff}
+                \\.drag-pen{position:relative;height:200px;border:1px dashed #444;border-radius:8px;margin:1rem 0;overflow:hidden}
+                \\.drag-card{cursor:grab;width:4rem;height:4rem}
+                \\.drag-card.dragging{box-shadow:0 0 0 2px #58a6ff;opacity:.9}
                 \\.viz-card svg{touch-action:none;max-width:100%}
                 \\.viz-node{cursor:grab}
                 \\.viz-node.selected circle{stroke:#fff;stroke-width:3}

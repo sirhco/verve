@@ -67,6 +67,19 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         .on_update = &onProbeUpdate,
     })) |st| probe_id = st.id;
     if (verve.observe(.{ .wheel = true, .touch = true }, &onObserved)) |ob| obs_id = ob.id;
+
+    verve.registerStr("drag_state", "idle");
+    verve.registerStr("drag_pos", "0, 0");
+    verve.registerStr("drag_vel", "0 px/s");
+    if (verve.draggable(.{
+        .target = "#drag-probe",
+        .inertia = .on,
+    }, .{
+        .on_start = &onDragStart,
+        .on_drag = &onDragMove,
+        .on_end = &onDragEnd,
+        .on_throw_complete = &onThrowDone,
+    })) |dh| drag_id = dh.id;
 }
 
 fn onProbeEnter() void {
@@ -101,6 +114,37 @@ const BLOB: []const u8 =
     "M10,50 A40,40 0 0 1 90,50 A40,40 0 0 1 10,50 Z";
 
 var island_morphed = false;
+
+// Imperative Draggable (phase 4): callbacks stream state into signals;
+// position/velocity read through the DragHandle.
+
+var drag_id: u32 = 0;
+
+fn dragHandle() verve.DragHandle {
+    return .{ .id = drag_id };
+}
+
+fn onDragStart() void {
+    verve.signalSetStr("drag_state", "dragging");
+}
+
+fn onDragMove() void {
+    const dh = dragHandle();
+    var buf: [48]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d:.0}, {d:.0}", .{ dh.x(), dh.y() }) catch return;
+    verve.signalSetStr("drag_pos", s);
+    var vbuf: [48]u8 = undefined;
+    const v = std.fmt.bufPrint(&vbuf, "{d:.0} px/s", .{dh.velocityX()}) catch return;
+    verve.signalSetStr("drag_vel", v);
+}
+
+fn onDragEnd() void {
+    verve.signalSetStr("drag_state", "released");
+}
+
+fn onThrowDone() void {
+    verve.signalSetStr("drag_state", "settled");
+}
 
 export fn anim_morph_toggle() void {
     const mark = verve.chunkArenaMark();

@@ -1050,3 +1050,29 @@ test "/anim carries MotionPath and MorphSVG descriptors" {
     try std.testing.expect(std.mem.indexOf(u8, js.body, "mpSample") != null);
     try std.testing.expect(std.mem.indexOf(u8, js.body, "buildMorphD") != null);
 }
+
+test "/anim carries Draggable descriptors" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 17);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    var resp = try request(io, gpa, port, "GET", "/anim");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // SSR data-drag descriptor (renderer-escaped JSON).
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-drag=\"{&quot;v&quot;:1,&quot;dr&quot;:{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;b&quot;:{&quot;s&quot;:&quot;.drag-pen&quot;}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;sn&quot;:{&quot;g&quot;:[40,40]}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;in&quot;:1") != null);
+
+    // The bridge ships the drag engine + scanner.
+    var js = try request(io, gpa, port, "GET", "/verve.js");
+    defer js.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_drag_create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "data-drag-done") != null);
+}

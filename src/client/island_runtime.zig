@@ -1102,6 +1102,98 @@ pub fn observe(cfg: ObserverConfig, handler: *const fn () void) ?ObserverHandle 
     return .{ .id = h };
 }
 
+// ---- Draggable (verve.anim phase 4) ----------------------------------------
+//
+// Drag config rides its own descriptor ("dr" key; `data-drag` on SSR).
+// The JS engine owns pointer capture, the state machine, inertia
+// integration, and snap resolution; read live position/velocity via
+// verve_drag_get. NOT the Phase-22 file-drop machinery (registerDrop).
+
+extern "verve_runtime" fn verve_drag_create(desc_ptr: [*]const u8, desc_len: u32) u32;
+// op: 0 kill, 1 disable (cancels active drag/throw), 2 enable,
+//     3 setPos (x/y args; unclamped — bounds resolve per-gesture)
+extern "verve_runtime" fn verve_drag_ctrl(handle: u32, op: u32, x: f64, y: f64) void;
+// field: 0 x, 1 y, 2 vx, 3 vy, 4 dragging, 5 throwing
+extern "verve_runtime" fn verve_drag_get(handle: u32, field: u32) f64;
+
+/// Live draggable handle. Plain u32 id — safe in chunk statics; all ops
+/// no-op on a killed/unknown handle.
+pub const DragHandle = struct {
+    id: u32,
+
+    pub fn kill(self: DragHandle) void {
+        verve_drag_ctrl(self.id, 0, 0, 0);
+    }
+    /// Cancels any active drag/throw and ignores pointers until enable.
+    pub fn disable(self: DragHandle) void {
+        verve_drag_ctrl(self.id, 1, 0, 0);
+    }
+    pub fn enable(self: DragHandle) void {
+        verve_drag_ctrl(self.id, 2, 0, 0);
+    }
+    /// Programmatic position (translate-space px). Unclamped — bounds
+    /// only constrain pointer gestures and throws.
+    pub fn setPos(self: DragHandle, px: f64, py: f64) void {
+        verve_drag_ctrl(self.id, 3, px, py);
+    }
+
+    /// Current translate offset, px.
+    pub fn x(self: DragHandle) f64 {
+        return verve_drag_get(self.id, 0);
+    }
+    pub fn y(self: DragHandle) f64 {
+        return verve_drag_get(self.id, 1);
+    }
+    /// Pointer/throw velocity, px/s.
+    pub fn velocityX(self: DragHandle) f64 {
+        return verve_drag_get(self.id, 2);
+    }
+    pub fn velocityY(self: DragHandle) f64 {
+        return verve_drag_get(self.id, 3);
+    }
+    pub fn isDragging(self: DragHandle) bool {
+        return verve_drag_get(self.id, 4) != 0;
+    }
+    pub fn isThrowing(self: DragHandle) bool {
+        return verve_drag_get(self.id, 5) != 0;
+    }
+};
+
+/// Drag lifecycle callbacks. Registered as event slots (same translation
+/// as registerEvent); handlers must not capture chunk-arena pointers.
+pub const DragCallbacks = struct {
+    on_start: ?*const fn () void = null,
+    /// Fires per move tick; read position/velocity via the handle.
+    on_drag: ?*const fn () void = null,
+    on_end: ?*const fn () void = null,
+    /// Fires when an inertia throw settles (requires .inertia).
+    on_throw_complete: ?*const fn () void = null,
+};
+
+fn stampDragSlots(dr: *anim.Draggable, cbs: DragCallbacks) void {
+    if (cbs.on_start) |f| dr.on_start_slot = registerEvent(f);
+    if (cbs.on_drag) |f| dr.on_drag_slot = registerEvent(f);
+    if (cbs.on_end) |f| dr.on_end_slot = registerEvent(f);
+    if (cbs.on_throw_complete) |f| dr.on_throw_complete_slot = registerEvent(f);
+}
+
+/// Imperative draggable:
+/// `verve.draggable(.{ .target = "#card", .inertia = .on }, .{ .on_end = &f })`.
+/// The island surface requires an explicit target (selector or ref
+/// handle) — there is no carrying node. Returns null on validation /
+/// serialize failure or zero matched elements.
+pub fn draggable(cfg: anim.Draggable, cbs: DragCallbacks) ?DragHandle {
+    if (cfg.target == null and cfg.target_handle == null) return null;
+    var c = cfg;
+    stampDragSlots(&c, cbs);
+    const a = chunkArena();
+    const d = anim.drag.draggable(a, c);
+    const json = anim.serialize.dragToJson(a, d, .island) catch return null;
+    const h = verve_drag_create(json.ptr, @intCast(json.len));
+    if (h == 0) return null;
+    return .{ .id = h };
+}
+
 // ---- Timers (Phase 19) --------------------------------------------------
 //
 // Handlers are `*const fn () void` taken via `&handler` — the same

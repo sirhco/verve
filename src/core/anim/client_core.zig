@@ -31,6 +31,14 @@ pub const path = @import("path.zig");
 pub const MotionPath = types.MotionPath;
 pub const Morph = types.Morph;
 
+pub const drag = @import("drag.zig");
+pub const Draggable = drag.Draggable;
+pub const DragAxis = drag.Axis;
+pub const DragBounds = drag.Bounds;
+pub const DragInertia = drag.Inertia;
+pub const DragSnap = drag.Snap;
+pub const draggable = drag.draggable;
+
 pub const scroll = @import("scroll.zig");
 pub const ScrollTrigger = scroll.ScrollTrigger;
 pub const ScrollSpec = scroll.ScrollSpec;

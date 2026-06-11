@@ -48,6 +48,18 @@ versions follow [Semantic Versioning](https://semver.org/).
   `"mo"`; both compose with timelines, stagger, and ScrollTrigger scrub
   as pure phase functions. Conformance: serializer goldens +
   `node tests/js/anim_conformance.mjs`.
+- **`verve.anim` Draggable** (`src/core/anim/drag.zig`, wire root
+  `"dr"` / `data-drag` attribute): pointer drag with grip handles, axis
+  lock, per-gesture bounds (selector or translate-space rect), grid /
+  nearest-point snap, and inertia throws (analytic endpoint projection —
+  exponential friction integrated in closed form, endpoint clamped and
+  snapped, so flicks decelerate exactly onto the grid; no bounce). 3px
+  engage threshold keeps inner clicks alive; touch-action set per axis
+  at create; reduced motion keeps dragging but lands releases instantly.
+  SSR `node.draggable(anim.draggable(a, .{...}))` (zero-wasm) and island
+  `verve.draggable(cfg, cbs)` → `DragHandle` (kill/disable/enable/setPos
+  + x/y/velocity/isDragging/isThrowing). Position writes share the anim
+  transform composer, so rotate/scale tweens compose with an active drag.
 
 ## [0.3.0] - 2026-06-10
 

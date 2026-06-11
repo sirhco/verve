@@ -37,6 +37,15 @@ pub const path = @import("path.zig");
 pub const MotionPath = types.MotionPath;
 pub const Morph = types.Morph;
 
+// Draggable (phase 4): pointer drag with grip/axis/bounds/snap/inertia.
+pub const drag = @import("drag.zig");
+pub const Draggable = drag.Draggable;
+pub const DragAxis = drag.Axis;
+pub const DragBounds = drag.Bounds;
+pub const DragInertia = drag.Inertia;
+pub const DragSnap = drag.Snap;
+pub const draggable = drag.draggable;
+
 // ScrollTrigger (phase 2): gate/scrub/pin animations by scroll position.
 pub const scroll = @import("scroll.zig");
 pub const ScrollTrigger = scroll.ScrollTrigger;
@@ -72,4 +81,5 @@ test {
     _ = @import("serialize.zig");
     _ = @import("scroll.zig");
     _ = @import("path.zig");
+    _ = @import("drag.zig");
 }

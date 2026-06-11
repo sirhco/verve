@@ -14,6 +14,7 @@ const tween_mod = @import("tween.zig");
 const timeline_mod = @import("timeline.zig");
 const scroll = @import("scroll.zig");
 const path_mod = @import("path.zig");
+const drag_mod = @import("drag.zig");
 
 /// Which authoring surface is serializing. SSR rejects island-only
 /// constructs (dynamic values, fn modifiers, ref-handle targets, callback
@@ -99,6 +100,116 @@ pub fn triggerToJson(alloc: std.mem.Allocator, t: *const scroll.Trigger, surface
 fn writeTriggerRoot(w: *std.Io.Writer, t: *const scroll.Trigger, surface: Surface) anyerror!void {
     try w.writeAll("{\"v\":1");
     try writeScrollTrigger(w, t.config, surface);
+    try w.writeAll("}");
+}
+
+/// Drag descriptor: `{"v":1,"dr":{...}}` — stamped as `data-drag` on SSR,
+/// handed to `verve_drag_create` on islands. Separate root from anim
+/// descriptors (a draggable is not an animation; a node carries both).
+pub fn dragToJson(alloc: std.mem.Allocator, d: *const drag_mod.Drag, surface: Surface) ![]const u8 {
+    if (d.err) |e| return e;
+    return grow(alloc, d, surface, writeDragRoot);
+}
+
+fn writeDragRoot(w: *std.Io.Writer, d: *const drag_mod.Drag, surface: Surface) anyerror!void {
+    try w.writeAll("{\"v\":1");
+    try writeDraggable(w, d.config, surface);
+    try w.writeAll("}");
+}
+
+/// Emit the `,"dr":{...}` object. Defaults omitted: axis both, no
+/// bounds/inertia/snap, threshold 3, cursor managed.
+fn writeDraggable(w: *std.Io.Writer, dr: drag_mod.Draggable, surface: Surface) anyerror!void {
+    try w.writeAll(",\"dr\":{");
+    var first = true;
+    if (dr.target_handle) |h| {
+        if (surface == .ssr) return error.HandleRequiresIsland;
+        try w.print("\"t\":{{\"h\":{d}}}", .{h});
+        first = false;
+    } else if (dr.target) |sel| {
+        try w.writeAll("\"t\":{\"s\":");
+        try writeJsonString(w, sel);
+        try w.writeAll("}");
+        first = false;
+    }
+    if (dr.handle) |sel| {
+        try comma(w, &first);
+        try w.writeAll("\"hd\":");
+        try writeJsonString(w, sel);
+    }
+    if (dr.axis != .both) {
+        try comma(w, &first);
+        try w.print("\"ax\":{d}", .{@intFromEnum(dr.axis)});
+    }
+    switch (dr.bounds) {
+        .none => {},
+        .selector => |sel| {
+            try comma(w, &first);
+            try w.writeAll("\"b\":{\"s\":");
+            try writeJsonString(w, sel);
+            try w.writeAll("}");
+        },
+        .rect => |r| {
+            try comma(w, &first);
+            try w.print("\"b\":[{d},{d},{d},{d}]", .{ r.min_x, r.max_x, r.min_y, r.max_y });
+        },
+    }
+    switch (dr.inertia) {
+        .off => {},
+        .on => {
+            try comma(w, &first);
+            try w.writeAll("\"in\":1");
+        },
+        // retention < 1 by validation, so "in":1 is unambiguously default
+        .retention => |r| {
+            try comma(w, &first);
+            try w.print("\"in\":{d}", .{r});
+        },
+    }
+    switch (dr.snap) {
+        .none => {},
+        .grid => |g| {
+            try comma(w, &first);
+            try w.print("\"sn\":{{\"g\":[{d},{d}]}}", .{ g.x, g.y });
+        },
+        .points => |pts| {
+            try comma(w, &first);
+            try w.writeAll("\"sn\":{\"p\":[");
+            for (pts, 0..) |p, i| {
+                if (i != 0) try w.writeAll(",");
+                try w.print("{d},{d}", .{ p[0], p[1] });
+            }
+            try w.writeAll("]}");
+        },
+    }
+    if (dr.threshold_px != 3) {
+        try comma(w, &first);
+        try w.print("\"th\":{d}", .{dr.threshold_px});
+    }
+    if (!dr.manage_cursor) {
+        try comma(w, &first);
+        try w.writeAll("\"cur\":0");
+    }
+    if (dr.toggle_class) |c| {
+        try comma(w, &first);
+        try w.writeAll("\"cls\":");
+        try writeJsonString(w, c);
+    }
+    if (dr.disabled) {
+        try comma(w, &first);
+        try w.writeAll("\"dis\":1");
+    }
+    if (dr.hasSlots()) {
+        if (surface == .ssr) return error.CallbackSlotRequiresIsland;
+        try comma(w, &first);
+        try w.writeAll("\"cb\":{");
+        var cb_first = true;
+        if (dr.on_start_slot) |s| try slotField(w, &cb_first, "sS", s);
+        if (dr.on_drag_slot) |s| try slotField(w, &cb_first, "sD", s);
+        if (dr.on_end_slot) |s| try slotField(w, &cb_first, "sE", s);
+        if (dr.on_throw_complete_slot) |s| try slotField(w, &cb_first, "sT", s);
+        try w.writeAll("}");
+    }
     try w.writeAll("}");
 }
 
@@ -877,6 +988,97 @@ test "golden: motion path inside a timeline child" {
         .add(tween_mod.to(a, ".dot").motionPath(.{ .path = "M0,0 L10,0", .samples = 2 }).duration(1), .end);
     const json = try timelineToJson(a, tl, .ssr);
     try testing.expect(std.mem.indexOf(u8, json, "\"ch\":[{\"pos\":0,\"t\":{\"s\":\".dot\"},\"d\":1,\"e\":\"outQuad\",\"mp\":{\"pts\":[0,0,10,0]}}]") != null);
+}
+
+test "golden: minimal drag (carrying element, all defaults)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = drag_mod.draggable(a, .{});
+    try testing.expectEqualStrings("{\"v\":1,\"dr\":{}}", try dragToJson(a, d, .ssr));
+}
+
+test "golden: drag axis lock + bounds rect" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = drag_mod.draggable(a, .{
+        .axis = .x,
+        .bounds = .{ .rect = .{ .min_x = 0, .max_x = 600 } },
+    });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"dr\":{\"ax\":1,\"b\":[0,600,0,0]}}",
+        try dragToJson(a, d, .ssr),
+    );
+}
+
+test "golden: drag bounds selector + inertia + grid snap + class" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = drag_mod.draggable(a, .{
+        .bounds = .{ .selector = ".pen" },
+        .inertia = .on,
+        .snap = .{ .grid = .{ .x = 40, .y = 40 } },
+        .toggle_class = "dragging",
+    });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"dr\":{\"b\":{\"s\":\".pen\"},\"in\":1,\"sn\":{\"g\":[40,40]},\"cls\":\"dragging\"}}",
+        try dragToJson(a, d, .ssr),
+    );
+}
+
+test "golden: drag target + grip + retention + snap points + threshold" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pts = [_][2]f64{ .{ 0, 0 }, .{ 120, 80 } };
+    const d = drag_mod.draggable(a, .{
+        .target = ".card",
+        .handle = ".grip",
+        .inertia = .{ .retention = 0.3 },
+        .snap = .{ .points = &pts },
+        .threshold_px = 6,
+        .manage_cursor = false,
+    });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"dr\":{\"t\":{\"s\":\".card\"},\"hd\":\".grip\",\"in\":0.3," ++
+            "\"sn\":{\"p\":[0,0,120,80]},\"th\":6,\"cur\":0}}",
+        try dragToJson(a, d, .ssr),
+    );
+}
+
+test "golden: drag island callback slots + handle target" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = drag_mod.draggable(a, .{
+        .target_handle = 7,
+        .inertia = .on,
+        .on_start_slot = 21,
+        .on_drag_slot = 22,
+        .on_end_slot = 23,
+        .on_throw_complete_slot = 24,
+    });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"dr\":{\"t\":{\"h\":7},\"in\":1,\"cb\":{\"sS\":21,\"sD\":22,\"sE\":23,\"sT\":24}}}",
+        try dragToJson(a, d, .island),
+    );
+}
+
+test "ssr rejects dr island-only constructs; validate propagates" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const slots = drag_mod.draggable(a, .{ .inertia = .on, .on_end_slot = 5 });
+    try testing.expectError(error.CallbackSlotRequiresIsland, dragToJson(a, slots, .ssr));
+
+    const handle = drag_mod.draggable(a, .{ .target_handle = 3 });
+    try testing.expectError(error.HandleRequiresIsland, dragToJson(a, handle, .ssr));
+
+    const bad = drag_mod.draggable(a, .{ .bounds = .{ .rect = .{ .min_x = 9, .max_x = 1 } } });
+    try testing.expectError(error.InvertedBounds, dragToJson(a, bad, .ssr));
 }
 
 test "builder error propagates through toJson" {

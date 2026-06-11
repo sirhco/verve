@@ -438,6 +438,40 @@ pub const Node = struct {
         return self.attr("data-anim", json);
     }
 
+    /// Attach a declarative draggable (verve's pointer-drag engine — NOT
+    /// the native HTML5 `draggable="true"` attribute; use
+    /// `.attr("draggable","true")` for that). `d` is any value exposing
+    /// `err: ?anyerror` and `toJson(alloc) ![]const u8` — i.e. a
+    /// `*verve.anim.drag.Drag` (duck-typed like `animate`). Serialized
+    /// into the node arena and stamped as `data-drag`; the bridge scans
+    /// `[data-drag]` after hydrate — no island required. A null config
+    /// target drags this element; a selector target is scoped to this
+    /// element's descendants. One draggable per node.
+    pub fn draggable(self: *Node, d: anytype) *Node {
+        if (self.err != null) return self;
+        if (d.err) |e| {
+            self.err = e;
+            return self;
+        }
+        const json = d.toJson(self.arena.?) catch |e| {
+            self.err = e;
+            return self;
+        };
+        return self.draggableJson(json);
+    }
+
+    /// Escape hatch: attach a pre-serialized drag descriptor.
+    pub fn draggableJson(self: *Node, json: []const u8) *Node {
+        if (self.err != null) return self;
+        for (self.attrs.items) |at| {
+            if (std.mem.eql(u8, at.key, "data-drag")) {
+                self.err = error.DuplicateDraggable;
+                return self;
+            }
+        }
+        return self.attr("data-drag", json);
+    }
+
     // ---- text ------------------------------------------------------------
 
     pub fn text(self: *Node, t: []const u8) *Node {
@@ -577,6 +611,25 @@ test "animate surfaces builder and serialize errors" {
     // dyn values are island-only — SSR serialize rejects them
     const dyn = create(a, "div").animate(anim.to(a, ".x").x(anim.Value{ .dyn = 0 }));
     try std.testing.expectEqual(@as(?anyerror, error.DynRequiresIsland), dyn.err);
+}
+
+test "draggable stamps data-drag and rejects duplicates" {
+    const anim = @import("anim/anim.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const n = create(a, "div").draggable(anim.draggable(a, .{ .inertia = .on }));
+    try std.testing.expect(n.err == null);
+    try std.testing.expectEqualStrings("data-drag", n.attrs.items[0].key);
+    try std.testing.expect(std.mem.startsWith(u8, n.attrs.items[0].value, "{\"v\":1,\"dr\":{"));
+
+    const dup = create(a, "div").draggableJson("{\"v\":1}").draggableJson("{\"v\":1}");
+    try std.testing.expectEqual(@as(?anyerror, error.DuplicateDraggable), dup.err);
+
+    // validate + SSR-strict errors propagate through the chain
+    const bad = create(a, "div").draggable(anim.draggable(a, .{ .on_end_slot = 5, .inertia = .on }));
+    try std.testing.expectEqual(@as(?anyerror, error.CallbackSlotRequiresIsland), bad.err);
 }
 
 /// Void elements per HTML spec — no closing tag, no content.

@@ -24,9 +24,10 @@ const extract = (name) => {
 
 const fns = new Function(
   extract("mpSample") + extract("buildMorphD") + extract("animIsTriggerOnly") +
-    "return { mpSample, buildMorphD, animIsTriggerOnly };",
+    extract("dragProject") + extract("dragSnapResolve") +
+    "return { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve };",
 )();
-const { mpSample, buildMorphD, animIsTriggerOnly } = fns;
+const { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve } = fns;
 
 let fails = 0;
 const check = (name, cond) => {
@@ -116,8 +117,38 @@ const approx = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
     animIsTriggerOnly({ v: 1, mp: { pts: [] } }) === false);
 }
 
+// ---- Draggable: inertia endpoint projection + snap resolution ----
+{
+  // total remaining travel of v(t) = v * r^t is v / ln(1/r)
+  check("project 1000 @ r=0.05", approx(dragProject(1000, 0.05), 1000 / Math.log(20), 1e-9));
+  check("project zero v", dragProject(0, 0.05) === 0);
+  check("project negative v", dragProject(-500, 0.05) < 0);
+  // higher retention coasts further
+  check("retention ordering", dragProject(1000, 0.3) > dragProject(1000, 0.05));
+
+  // grid snap: golden config "sn":{"g":[40,40]}
+  let s = dragSnapResolve({ g: [40, 40] }, 37, 81);
+  check("grid snap", s[0] === 40 && s[1] === 80);
+  s = dragSnapResolve({ g: [40, 40] }, -19, -21);
+  check("grid snap negative", s[0] === -0 + 0 || s[0] === 0);
+  check("grid snap negative y", dragSnapResolve({ g: [40, 40] }, -19, -21)[1] === -40);
+  // points: golden config "sn":{"p":[0,0,120,80]}
+  s = dragSnapResolve({ p: [0, 0, 120, 80] }, 100, 70);
+  check("points nearest", s[0] === 120 && s[1] === 80);
+  s = dragSnapResolve({ p: [0, 0, 120, 80] }, 10, 10);
+  check("points nearest origin", s[0] === 0 && s[1] === 0);
+  // none = passthrough
+  s = dragSnapResolve(null, 13.5, -2);
+  check("snap none passthrough", s[0] === 13.5 && s[1] === -2);
+
+  // routing: data-drag has its own attribute/scanner — the anim routing
+  // predicate must not care about a "dr" key
+  check("animIsTriggerOnly ignores dr",
+    animIsTriggerOnly({ v: 1, sc: {}, dr: {} }) === true);
+}
+
 if (fails === 0) {
-  console.log("anim conformance: ALL PASS (mpSample + buildMorphD)");
+  console.log("anim conformance: ALL PASS (mpSample + buildMorphD + routing + drag)");
 } else {
   console.log(`anim conformance: ${fails} FAILURES`);
   process.exit(1);

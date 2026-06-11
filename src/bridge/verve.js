@@ -1498,8 +1498,9 @@
     const dt = Math.min((now - animLast) / 1000, 0.1);
     animLast = now;
     // Scroll triggers first: edge actions / scrub seeks land before this
-    // frame's time integration.
+    // frame's time integration. Then inertia throws.
     if (stTriggers.size) stUpdate(dt);
+    if (dragThrowing > 0) dragUpdate(dt);
     for (const a of [...anims.values()]) {
       if (a.paused || a.done) continue;
       // Self-kill animations whose targets all left the document
@@ -1521,9 +1522,10 @@
       }
       animRenderAt(a, a.pos);
     }
-    // Keep ticking while time-driven anims run OR scroll work remains
-    // (fresh scroll events / unsettled scrub smoothing set stDirty).
-    if (stDirty || (anims.size && [...anims.values()].some((a) => !a.paused && !a.done))) {
+    // Keep ticking while time-driven anims run, scroll work remains
+    // (fresh scroll events / unsettled scrub smoothing set stDirty), or
+    // inertia throws are in flight.
+    if (stDirty || dragThrowing > 0 || (anims.size && [...anims.values()].some((a) => !a.paused && !a.done))) {
       requestAnimationFrame(animTick);
     } else {
       animTickerOn = false;
@@ -2058,6 +2060,28 @@
     stDirty = unsettled;
   };
 
+  // Shared velocity tracker: ~6-sample / 100ms ring buffer over any
+  // record carrying { samples, vx, vy }. Used by Observer and Drag.
+  const velPush = (o, x, y) => {
+    const now = performance.now();
+    o.samples.push({ t: now, x, y });
+    while (
+      o.samples.length > 6 ||
+      (o.samples.length > 1 && now - o.samples[0].t > 100)
+    ) {
+      o.samples.shift();
+    }
+    if (o.samples.length > 1) {
+      const s0 = o.samples[0];
+      const s1 = o.samples[o.samples.length - 1];
+      const sdt = (s1.t - s0.t) / 1000;
+      if (sdt > 0) {
+        o.vx = (s1.x - s0.x) / sdt;
+        o.vy = (s1.y - s0.y) / sdt;
+      }
+    }
+  };
+
   // ---- Observer: unified wheel/touch/pointer/scroll input + velocity --
   // flags: 1 wheel, 2 touch, 4 pointer-drag, 8 window scroll,
   //        16 preventDefault, 32 lock dominant axis.
@@ -2092,25 +2116,7 @@
       enabled: true,
       fns: [],
     };
-    const pushSample = (x, y) => {
-      const now = performance.now();
-      o.samples.push({ t: now, x, y });
-      while (
-        o.samples.length > 6 ||
-        (o.samples.length > 1 && now - o.samples[0].t > 100)
-      ) {
-        o.samples.shift();
-      }
-      if (o.samples.length > 1) {
-        const s0 = o.samples[0];
-        const s1 = o.samples[o.samples.length - 1];
-        const sdt = (s1.t - s0.t) / 1000;
-        if (sdt > 0) {
-          o.vx = (s1.x - s0.x) / sdt;
-          o.vy = (s1.y - s0.y) / sdt;
-        }
-      }
-    };
+    const pushSample = (x, y) => velPush(o, x, y);
     const move = (dx, dy, kind, ev) => {
       if (!o.enabled) return;
       if (o.pd && ev && ev.cancelable) ev.preventDefault();
@@ -2221,6 +2227,345 @@
   const obsKill = (o) => {
     for (const [tgt, type, fn, opts] of o.fns) tgt.removeEventListener(type, fn, opts);
     observers.delete(o.h);
+  };
+
+  // ---- Verve Drag ------------------------------------------------------
+  // Draggable engine ("dr" wire key — src/core/anim/drag.zig +
+  // serialize.zig goldens are the contract). Pointer capture + state
+  // machine + analytic inertia. Position writes go through xformCache
+  // (engine owns style.transform), so rotate/scale/opacity tweens compose
+  // with an active drag; tweening x/y mid-drag is last-writer (documented).
+
+  const drags = new Map();
+  let dragSeq = 1;
+  let dragThrowing = 0;
+  const DRAG_DEFAULT_RETENTION = 0.05; // velocity kept per second
+  const DRAG_MIN_THROW = 50; // px/s
+
+  const dclamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  // Remaining travel of exponential friction v(t) = v * r^t, integrated
+  // to rest: v / ln(1/r).
+  // @verve-extract dragProject
+  const dragProject = (v, r) => v / Math.log(1 / r);
+  // @verve-extract-end
+
+  // @verve-extract dragSnapResolve
+  const dragSnapResolve = (sn, x, y) => {
+    if (!sn) return [x, y];
+    if (sn.g) {
+      return [Math.round(x / sn.g[0]) * sn.g[0], Math.round(y / sn.g[1]) * sn.g[1]];
+    }
+    if (sn.p) {
+      let bi = 0;
+      let bd = Infinity;
+      for (let i = 0; i < sn.p.length; i += 2) {
+        const ddx = sn.p[i] - x;
+        const ddy = sn.p[i + 1] - y;
+        const d2 = ddx * ddx + ddy * ddy;
+        if (d2 < bd) {
+          bd = d2;
+          bi = i;
+        }
+      }
+      return [sn.p[bi], sn.p[bi + 1]];
+    }
+    return [x, y];
+  };
+  // @verve-extract-end
+
+  // Convert a bounds spec into translate-space limits, measured ONCE per
+  // gesture (both rects read in the same scroll context — the range is
+  // scroll-invariant for the rest of the gesture).
+  const dragResolveBounds = (d, s) => {
+    d.minX = d.minY = -Infinity;
+    d.maxX = d.maxY = Infinity;
+    const b = d.boundsSpec;
+    if (!b) return;
+    if (Array.isArray(b)) {
+      [d.minX, d.maxX, d.minY, d.maxY] = b;
+      return;
+    }
+    const bel = b.h != null ? refHandles[b.h] : document.querySelector(b.s);
+    if (!bel) return;
+    const br = bel.getBoundingClientRect();
+    const r = d.el.getBoundingClientRect(); // includes current translate
+    d.minX = br.left - (r.left - s.x);
+    d.maxX = br.right - (r.right - s.x);
+    d.minY = br.top - (r.top - s.y);
+    d.maxY = br.bottom - (r.bottom - s.y);
+    if (d.maxX < d.minX) d.maxX = d.minX; // target wider than bounds
+    if (d.maxY < d.minY) d.maxY = d.minY;
+  };
+
+  const dragStopThrow = (d) => {
+    if (d.throwing) {
+      d.throwing = false;
+      dragThrowing--;
+    }
+  };
+
+  const dragKill = (d) => {
+    drags.delete(d.h);
+    dragStopThrow(d);
+    for (const [tgt, type, fn, opts] of d.fns) tgt.removeEventListener(type, fn, opts);
+    if (d.cls && d.el) d.el.classList.remove(d.cls);
+  };
+
+  const dragDisable = (d) => {
+    d.enabled = false;
+    d.pid = null;
+    dragStopThrow(d);
+    if (d.engaged) {
+      d.engaged = false;
+      if (d.cls) d.el.classList.remove(d.cls);
+      if (d.cur) d.grip.style.cursor = "grab";
+    }
+  };
+
+  // Release: project the inertia endpoint analytically (clamp + snap the
+  // ENDPOINT — the element decelerates into walls and lands exactly on
+  // snap), then exponential-approach in the ticker. Velocity-continuous
+  // at release; the same integrator handles zero-velocity snap-settles.
+  const dragRelease = (d) => {
+    const s = getXform(d.el);
+    const r = d.hasInertia ? d.retention : DRAG_DEFAULT_RETENTION;
+    d.k = Math.log(1 / r);
+    const speed = Math.hypot(d.vx, d.vy);
+    let ex = s.x;
+    let ey = s.y;
+    if (d.hasInertia && speed >= DRAG_MIN_THROW) {
+      ex += dragProject(d.vx, r);
+      ey += dragProject(d.vy, r);
+    }
+    ex = dclamp(ex, d.minX, d.maxX);
+    ey = dclamp(ey, d.minY, d.maxY);
+    const snapped = dragSnapResolve(d.snap, ex, ey);
+    // axis lock LAST: a locked axis never moves, even to snap
+    ex = d.ax === 2 ? s.x : snapped[0];
+    ey = d.ax === 1 ? s.y : snapped[1];
+    if (ex === s.x && ey === s.y) {
+      d.vx = d.vy = 0;
+      return;
+    }
+    if (prefersReduced) {
+      // direct manipulation stays; post-release coasting is decorative —
+      // jump straight to the rest point
+      xformSet(s, "x", ex);
+      xformSet(s, "y", ey);
+      animDirty.add(d.el);
+      flushXform();
+      d.vx = d.vy = 0;
+      if (d.hasInertia && d.cb) animFireSlot(d.cb.sT);
+      return;
+    }
+    d.ex = ex;
+    d.ey = ey;
+    if (!d.throwing) {
+      d.throwing = true;
+      dragThrowing++;
+    }
+    tickerKick();
+  };
+
+  // Per-frame throw integrator — called from animTick while
+  // dragThrowing > 0. Exponential approach toward the projected endpoint.
+  const dragUpdate = (dt) => {
+    for (const d of [...drags.values()]) {
+      if (!d.el.isConnected) {
+        dragKill(d);
+        continue;
+      }
+      if (!d.throwing) continue;
+      const s = getXform(d.el);
+      const r = d.hasInertia ? d.retention : DRAG_DEFAULT_RETENTION;
+      const f = 1 - Math.pow(r, dt);
+      let nx = s.x + (d.ex - s.x) * f;
+      let ny = s.y + (d.ey - s.y) * f;
+      d.vx = (d.ex - nx) * d.k;
+      d.vy = (d.ey - ny) * d.k;
+      if (Math.abs(d.ex - nx) < 0.1 && Math.abs(d.ey - ny) < 0.1) {
+        nx = d.ex;
+        ny = d.ey;
+        dragStopThrow(d);
+        d.vx = d.vy = 0;
+        if (d.hasInertia && d.cb) animFireSlot(d.cb.sT);
+      }
+      xformSet(s, "x", nx);
+      xformSet(s, "y", ny);
+      animDirty.add(d.el);
+    }
+    flushXform();
+  };
+
+  const dragAttach = (cfg, el) => {
+    const grip = (cfg.hd ? el.querySelector(cfg.hd) : null) || el;
+    const ax = cfg.ax || 0;
+    const d = {
+      h: dragSeq++,
+      el,
+      grip,
+      ax,
+      boundsSpec: cfg.b || null,
+      hasInertia: cfg.in != null,
+      retention: cfg.in == null || cfg.in === 1 ? DRAG_DEFAULT_RETENTION : cfg.in,
+      snap: cfg.sn || null,
+      th: cfg.th == null ? 3 : cfg.th,
+      cur: cfg.cur !== 0,
+      cls: cfg.cls || null,
+      cb: cfg.cb || null,
+      enabled: cfg.dis !== 1,
+      pid: null,
+      engaged: false,
+      sx: 0,
+      sy: 0,
+      bx: 0,
+      by: 0,
+      minX: -Infinity,
+      maxX: Infinity,
+      minY: -Infinity,
+      maxY: Infinity,
+      samples: [],
+      vx: 0,
+      vy: 0,
+      lastT: 0,
+      throwing: false,
+      ex: 0,
+      ey: 0,
+      k: Math.log(1 / DRAG_DEFAULT_RETENTION),
+      fns: [],
+    };
+    // touch-action/user-select MUST land at create — late assignment
+    // causes iOS pointercancel mid-gesture.
+    grip.style.touchAction = ax === 1 ? "pan-y" : ax === 2 ? "pan-x" : "none";
+    grip.style.userSelect = "none";
+    if (d.cur) grip.style.cursor = "grab";
+
+    const on = (tgt, type, fn, opts) => {
+      tgt.addEventListener(type, fn, opts);
+      d.fns.push([tgt, type, fn, opts]);
+    };
+    on(grip, "pointerdown", (e) => {
+      if (!d.enabled || d.pid != null) return;
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      e.stopPropagation(); // nested draggables: innermost wins
+      dragStopThrow(d); // grabbing mid-throw takes over
+      d.pid = e.pointerId;
+      d.engaged = false;
+      d.sx = e.clientX;
+      d.sy = e.clientY;
+      const s = getXform(d.el);
+      d.bx = s.x;
+      d.by = s.y;
+      dragResolveBounds(d, s);
+      d.samples.length = 0;
+      d.vx = d.vy = 0;
+      velPush(d, s.x, s.y);
+      d.lastT = performance.now();
+      try {
+        grip.setPointerCapture(e.pointerId);
+      } catch {}
+    });
+    on(grip, "pointermove", (e) => {
+      if (e.pointerId !== d.pid) return;
+      let dx = e.clientX - d.sx;
+      let dy = e.clientY - d.sy;
+      if (!d.engaged) {
+        if (Math.hypot(dx, dy) < d.th) return; // clicks survive below threshold
+        d.engaged = true;
+        if (d.cls) d.el.classList.add(d.cls);
+        if (d.cur) grip.style.cursor = "grabbing";
+        if (d.cb) animFireSlot(d.cb.sS);
+      }
+      if (d.ax === 1) dy = 0;
+      else if (d.ax === 2) dx = 0;
+      const s = getXform(d.el);
+      xformSet(s, "x", dclamp(d.bx + dx, d.minX, d.maxX));
+      xformSet(s, "y", dclamp(d.by + dy, d.minY, d.maxY));
+      animDirty.add(d.el);
+      flushXform(); // sync — rAF-deferred position lags the pointer
+      d.lastT = performance.now();
+      velPush(d, s.x, s.y);
+      if (d.cb) animFireSlot(d.cb.sD);
+    });
+    const endGesture = (e, cancelled) => {
+      if (e.pointerId !== d.pid) return;
+      d.pid = null;
+      if (!d.engaged) return; // plain click
+      d.engaged = false;
+      if (cancelled || performance.now() - d.lastT > 80) {
+        d.vx = d.vy = 0; // browser stole the gesture / held still
+      }
+      if (d.cls) d.el.classList.remove(d.cls);
+      if (d.cur) grip.style.cursor = "grab";
+      if (d.cb) animFireSlot(d.cb.sE);
+      // a real drag happened — swallow the synthetic click before the
+      // document-level bubble delegates see it
+      grip.addEventListener(
+        "click",
+        (ce) => {
+          ce.stopPropagation();
+          ce.preventDefault();
+        },
+        { capture: true, once: true },
+      );
+      dragRelease(d);
+    };
+    on(grip, "pointerup", (e) => endGesture(e, false));
+    on(grip, "pointercancel", (e) => endGesture(e, true));
+
+    drags.set(d.h, d);
+    return d.h;
+  };
+
+  const dragCreate = (desc, selfEl) => {
+    if (!desc || desc.v !== 1 || !desc.dr) return 0;
+    const cfg = desc.dr;
+    let els = [];
+    if (cfg.t && cfg.t.h != null) {
+      const el = refHandles[cfg.t.h];
+      if (el) els = [el];
+    } else if (cfg.t && cfg.t.s) {
+      els = Array.from((selfEl || document).querySelectorAll(cfg.t.s));
+    } else if (selfEl) {
+      els = [selfEl];
+    }
+    let first = 0;
+    for (const el of els) {
+      const h = dragAttach(cfg, el);
+      if (!first) first = h;
+    }
+    return first;
+  };
+
+  // Declarative SSR surface: scan `[data-drag]` stamped by
+  // Node.draggable(). Separate scanner from animScan — an element can
+  // carry both attributes. Also sweeps disconnected records (SPA swaps).
+  const dragScan = (root) => {
+    if (drags.size) {
+      for (const d of [...drags.values()]) {
+        if (!d.el.isConnected) dragKill(d);
+      }
+    }
+    const list = [];
+    if (root instanceof Element) {
+      if (root.hasAttribute("data-drag")) list.push(root);
+      root.querySelectorAll("[data-drag]").forEach((el) => list.push(el));
+    } else if (root && root.querySelectorAll) {
+      root.querySelectorAll("[data-drag]").forEach((el) => list.push(el));
+    }
+    for (const el of list) {
+      if (el.hasAttribute("data-drag-done")) continue;
+      el.setAttribute("data-drag-done", "1");
+      let desc;
+      try {
+        desc = JSON.parse(el.getAttribute("data-drag"));
+      } catch (err) {
+        console.warn("verve drag: bad data-drag payload", el, err);
+        continue;
+      }
+      dragCreate(desc, el);
+    }
   };
 
   // Phase 13F — assemble the chunk-side reactive-runtime import object
@@ -2707,6 +3052,57 @@
           return 0;
       }
     },
+    // ---- Draggable ops ---------------------------------------------------
+    verve_drag_create: (dp, dl) => {
+      let desc;
+      try {
+        desc = JSON.parse(readStr(dp, dl));
+      } catch (err) {
+        console.warn("verve drag: bad descriptor", err);
+        return 0;
+      }
+      return dragCreate(desc, null) >>> 0;
+    },
+    // op: 0 kill, 1 disable (cancels active drag/throw), 2 enable,
+    //     3 setPos (x/y args; unclamped — bounds resolve per-gesture;
+    //     kills any throw first)
+    verve_drag_ctrl: (h, op, x, y) => {
+      const d = drags.get(h >>> 0);
+      if (!d) return;
+      op >>>= 0;
+      if (op === 0) dragKill(d);
+      else if (op === 1) dragDisable(d);
+      else if (op === 2) d.enabled = true;
+      else if (op === 3) {
+        dragStopThrow(d);
+        const s = getXform(d.el);
+        xformSet(s, "x", x);
+        xformSet(s, "y", y);
+        animDirty.add(d.el);
+        flushXform();
+      }
+    },
+    // field: 0 x, 1 y, 2 vx, 3 vy, 4 dragging, 5 throwing
+    verve_drag_get: (h, f) => {
+      const d = drags.get(h >>> 0);
+      if (!d) return 0;
+      switch (f >>> 0) {
+        case 0:
+          return getXform(d.el).x;
+        case 1:
+          return getXform(d.el).y;
+        case 2:
+          return d.vx;
+        case 3:
+          return d.vy;
+        case 4:
+          return d.engaged ? 1 : 0;
+        case 5:
+          return d.throwing ? 1 : 0;
+        default:
+          return 0;
+      }
+    },
   };
 
   // Table isolation, chunk side: each island chunk instantiates against a
@@ -3125,8 +3521,10 @@
 
   parseIslandState();
   document.querySelectorAll("verve-island").forEach(hydrateIslandEl);
-  // Declarative entrance animations stamped by Node.animate().
+  // Declarative entrance animations stamped by Node.animate(), and
+  // draggables stamped by Node.draggable().
   animScan(document.body);
+  dragScan(document.body);
 
   new MutationObserver((records) => {
     for (const rec of records) {
@@ -3134,8 +3532,11 @@
       rec.addedNodes.forEach((n) => {
         eachIslandIn(n, hydrateIslandEl);
         // New subtrees (Suspense swaps, SPA navigations, template
-        // clones) may carry their own [data-anim] markers.
-        if (n instanceof Element) animScan(n);
+        // clones) may carry their own [data-anim]/[data-drag] markers.
+        if (n instanceof Element) {
+          animScan(n);
+          dragScan(n);
+        }
       });
     }
   }).observe(document.body, { childList: true, subtree: true });
