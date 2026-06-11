@@ -213,7 +213,7 @@ pub fn texturedCubeGlb(alloc: Allocator) ![]u8 {
     try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"DemoCube\"}],");
     try w.writeAll("\"meshes\":[{\"primitives\":[{\"attributes\":{");
     try w.print("\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}", .{ acc_pos, acc_nrm, acc_uv });
-    try w.print("}},\"indices\":{d},\"material\":0}}]}},", .{acc_idx});
+    try w.print("}},\"indices\":{d},\"material\":0}}]}}],", .{acc_idx});
 
     // accessors
     try w.writeAll("\"accessors\":[");
@@ -307,4 +307,19 @@ test "glb container shape" {
     // chunks 4-aligned
     const json_len = std.mem.readInt(u32, glb[12..16], .little);
     try testing.expectEqual(@as(u32, 0), json_len % 4);
+}
+
+test "json chunk parses as valid JSON with required arrays" {
+    const glb = try texturedCubeGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    const json_len = std.mem.readInt(u32, glb[12..16], .little);
+    const json = glb[20 .. 20 + json_len];
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqual(@as(usize, 1), root.get("meshes").?.array.items.len);
+    try testing.expectEqual(@as(usize, 4), root.get("accessors").?.array.items.len);
+    try testing.expectEqual(@as(usize, 5), root.get("bufferViews").?.array.items.len);
+    try testing.expectEqual(@as(usize, 1), root.get("materials").?.array.items.len);
+    try testing.expectEqual(@as(usize, 1), root.get("images").?.array.items.len);
 }
