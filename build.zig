@@ -400,9 +400,12 @@ pub fn build(b: *std.Build) void {
     // gated to its own step so the default build never touches it. The GUI is
     // only runnable on Windows (human operator's job) — this gate just proves
     // the cross-compile + link is clean.
-    {
+    inline for (.{
+        .{ .arch = .x86_64, .step = "win-native", .name = "verve-win-native", .desc = "Build the WebView2 native-host smoke exe (Windows x86-64)" },
+        .{ .arch = .aarch64, .step = "win-native-arm64", .name = "verve-win-native-arm64", .desc = "Build the WebView2 native-host smoke exe (Windows ARM64)" },
+    }) |cfg| {
         const win_target = b.resolveTargetQuery(.{
-            .cpu_arch = .x86_64,
+            .cpu_arch = cfg.arch,
             .os_tag = .windows,
             .abi = .gnu,
         });
@@ -424,19 +427,25 @@ pub fn build(b: *std.Build) void {
         linkWinNative(b, smoke_mod);
 
         const smoke_exe = b.addExecutable(.{
-            .name = "verve-win-native",
+            .name = cfg.name,
             .root_module = smoke_mod,
         });
         const smoke_install = b.addInstallArtifact(smoke_exe, .{});
-        // The exe resolves WebView2Loader.dll at runtime; ship it alongside so
-        // zig-out/bin/ is runnable as-is.
-        const loader_install = b.addInstallBinFile(
-            b.path("src/desktop/win_native/include/WebView2Loader.dll"),
-            "WebView2Loader.dll",
-        );
-        const native_step = b.step("win-native", "Build the WebView2 native-host smoke exe (Windows)");
+        const native_step = b.step(cfg.step, cfg.desc);
         native_step.dependOn(&smoke_install.step);
-        native_step.dependOn(&loader_install.step);
+        // The exe resolves WebView2Loader.dll at runtime; ship it alongside so
+        // zig-out/bin/ is runnable as-is. The checked-in loader is x86-64
+        // ONLY — installing it next to the ARM64 exe would be a runtime trap
+        // (a native ARM64 process cannot load an x64 DLL). For ARM64 runs the
+        // operator supplies the arm64 loader from the Microsoft.Web.WebView2
+        // NuGet package (runtimes/win-arm64/native/WebView2Loader.dll).
+        if (cfg.arch == .x86_64) {
+            const loader_install = b.addInstallBinFile(
+                b.path("src/desktop/win_native/include/WebView2Loader.dll"),
+                "WebView2Loader.dll",
+            );
+            native_step.dependOn(&loader_install.step);
+        }
     }
 
     // Dedicated server executable for the embed integration test, with

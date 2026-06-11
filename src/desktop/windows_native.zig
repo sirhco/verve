@@ -1261,7 +1261,7 @@ const PKEY_AppUserModel_ID: PROPERTYKEY = .{
 /// Fetch vtable slot `slot` from `lpVtbl` as a typed fn pointer.
 fn vtSlot(comptime Fn: type, lpVtbl: *const anyopaque, slot: usize) Fn {
     const arr: [*]const *const anyopaque = @ptrCast(@alignCast(lpVtbl));
-    return @ptrCast(arr[slot]);
+    return @ptrCast(@alignCast(arr[slot]));
 }
 
 /// IUnknown::Release at slot 2.
