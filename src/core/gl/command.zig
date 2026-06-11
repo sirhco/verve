@@ -67,6 +67,7 @@ pub const Encoder = struct {
     }
 
     fn header(self: *Encoder, tag: Tag, payload_size: u16) void {
+        std.debug.assert(payload_size % 4 == 0); // keep every record u32-aligned
         std.debug.assert(self.len + 4 + payload_size <= self.buf.len);
         std.mem.writeInt(u16, self.buf[self.len..][0..2], @intFromEnum(tag), .little);
         std.mem.writeInt(u16, self.buf[self.len + 2 ..][0..2], payload_size, .little);
