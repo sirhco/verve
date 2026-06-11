@@ -27,6 +27,9 @@ pub const Tag = enum(u16) {
     set_pipeline = 4,
     draw = 5,
     end_frame = 6,
+    create_texture = 7, // {handle, width, height, ptr, len} raw RGBA8
+    bind_texture = 8, // {slot, handle}
+    draw_sub = 9, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr, color_ptr}
 };
 
 pub const BufferKind = enum(u32) { vertex = 0, index = 1 };
@@ -37,6 +40,10 @@ pub const state_cull_back: u32 = 1 << 1;
 
 /// CREATE_SHADER variant bits.
 pub const variant_vertex_color: u32 = 1 << 0;
+
+/// CREATE_SHADER variant bit 1: lit/textured layout —
+/// pos f32x3 @0 loc0, normal f32x3 @12 loc1, uv f32x2 @24 loc2, stride 32.
+pub const variant_lit_uv: u32 = 1 << 1;
 
 pub const unlit_vs: []const u8 =
     \\#version 300 es
@@ -56,6 +63,39 @@ pub const unlit_fs: []const u8 =
     \\in vec3 v_color;
     \\out vec4 o_frag;
     \\void main() { o_frag = vec4(v_color, 1.0); }
+;
+
+// Lit/textured shader pair for variant_lit_uv.
+// Normals are transformed in model space (valid for rotation + uniform scale only).
+// u_normal_matrix arrives with P3.
+pub const lit_vs: []const u8 =
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\layout(location = 1) in vec3 a_normal;
+    \\layout(location = 2) in vec2 a_uv;
+    \\uniform mat4 u_mvp;
+    \\out vec3 v_normal;
+    \\out vec2 v_uv;
+    \\void main() {
+    \\  v_normal = a_normal;
+    \\  v_uv = a_uv;
+    \\  gl_Position = u_mvp * vec4(a_pos, 1.0);
+    \\}
+;
+
+pub const lit_fs: []const u8 =
+    \\#version 300 es
+    \\precision mediump float;
+    \\in vec3 v_normal;
+    \\in vec2 v_uv;
+    \\uniform vec4 u_color;
+    \\uniform sampler2D u_tex;
+    \\out vec4 o_frag;
+    \\void main() {
+    \\  vec3 l = normalize(vec3(0.4, 0.8, 0.6));
+    \\  float lum = 0.25 + 0.75 * max(dot(normalize(v_normal), l), 0.0);
+    \\  o_frag = texture(u_tex, v_uv) * u_color * vec4(vec3(lum), 1.0);
+    \\}
 ;
 
 pub const Encoder = struct {
@@ -120,6 +160,31 @@ pub const Encoder = struct {
         self.putU32(ibuf);
         self.putU32(index_count);
         self.putU32(mvp_ptr);
+    }
+
+    pub fn createTexture(self: *Encoder, handle: u32, width: u32, height: u32, ptr: u32, byte_len: u32) void {
+        self.header(.create_texture, 20);
+        self.putU32(handle);
+        self.putU32(width);
+        self.putU32(height);
+        self.putU32(ptr);
+        self.putU32(byte_len);
+    }
+
+    pub fn bindTexture(self: *Encoder, slot: u32, handle: u32) void {
+        self.header(.bind_texture, 8);
+        self.putU32(slot);
+        self.putU32(handle);
+    }
+
+    pub fn drawSub(self: *Encoder, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, mvp_ptr: u32, color_ptr: u32) void {
+        self.header(.draw_sub, 24);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(mvp_ptr);
+        self.putU32(color_ptr);
     }
 
     pub fn endFrame(self: *Encoder) void {
@@ -204,4 +269,33 @@ test "encoder asserts on overflow" {
     var enc = Encoder.init(&buf);
     enc.beginFrame(.{ 0, 0, 0, 1 }, 1, 1);
     try testing.expectEqual(@as(usize, 32), enc.finish().len);
+}
+
+test "golden: texture + lit submesh draw" {
+    var buf: [512]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createTexture(1, 8, 8, 0x6000, 256);
+    enc.bindTexture(0, 1);
+    enc.drawSub(1, 2, 12, 36, 0x3000, 0x7000);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "44000000" ++ // 68 record bytes
+            // CREATE_TEXTURE handle=1 w=8 h=8 ptr=0x6000 len=256
+            "0700" ++ "1400" ++ "01000000" ++ "08000000" ++ "08000000" ++ "00600000" ++ "00010000" ++
+            // BIND_TEXTURE slot=0 handle=1
+            "0800" ++ "0800" ++ "00000000" ++ "01000000" ++
+            // DRAW_SUB vbuf=1 ibuf=2 index_byte_off=12 count=36 mvp=0x3000 color=0x7000
+            "0900" ++ "1800" ++ "01000000" ++ "02000000" ++ "0c000000" ++ "24000000" ++ "00300000" ++ "00700000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "P1 goldens unchanged" {
+    // No code — this is a reminder marker. The two existing P1 golden
+    // tests above must still pass byte-identical; CI proves it.
 }
