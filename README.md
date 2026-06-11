@@ -1,6 +1,6 @@
 # Verve
 
-> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.3.x. Public
+> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.4.x. Public
 > APIs are not stable and **will** break between minor versions.
 > All three desktop backends (macOS, Windows, Linux GTK4) are validated
 > on real hardware as of v0.2.0. Known limitations: desktop auto-updater
@@ -225,7 +225,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.3.0
+zig fetch --save git+https://github.com/sirhco/verve#v0.4.0
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -285,7 +285,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.3.0 \
+verve-cli new ~/my-app --release v0.4.0 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 

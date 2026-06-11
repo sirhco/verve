@@ -6,19 +6,18 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-11
+
+The animation release: a complete GSAP-class animation engine
+(`verve.anim`) — core tweens/timelines plus the full plugin set
+(ScrollTrigger with snap, Observer, ScrollSmoother, MotionPath,
+MorphSVG, Draggable with drop zones, SplitText, FLIP) — pure Zig with
+one hand-written JS interpreter, wire format frozen by golden +
+conformance tests. Guide: `docs/23-animation.md`; runnable demos: the
+`/anim` and `/smooth` routes.
+
 ### Added
 
-- **`verve.anim` polish batch**: islands can morph FROM a live shape —
-  new `verve_ref_attr_len`/`verve_ref_get_attr` ops +
-  `verve.refGetAttrArena(handle, "d")` (probe-then-copy, never
-  truncates); MotionPath `.align_to = .start` re-bases the polyline on
-  its first sample (motion starts at the element's current position —
-  fixes the raw-absolute-coordinates footgun); Draggable drop zones
-  (`.zones` selector + `.zone_class` hover styling + `on_drop` with
-  `DragHandle.dropZone()/hoverZone()`, page-coord per-gesture
-  hit-testing, drop decided at release before any throw); FLIP
-  `on_enter`/`on_leave` callbacks (fire synchronously inside play, also
-  under reduced motion, before `on_complete`).
 - **`verve.anim` — core animation engine** (new, `src/core/anim/`):
   tweens, timelines (labels + position arithmetic), keyframes-in-tween,
   31 easings, grid/distribution stagger, snap/clamp/wrap + wasm fn
@@ -59,23 +58,6 @@ versions follow [Semantic Versioning](https://semver.org/).
   `"mo"`; both compose with timelines, stagger, and ScrollTrigger scrub
   as pure phase functions. Conformance: serializer goldens +
   `node tests/js/anim_conformance.mjs`.
-- **`verve.anim` ScrollSmoother** (`src/core/anim/smoother.zig` +
-  `Node.smoothScroll(.{ .smooth = 1.2 })`, completing the GSAP-class
-  spec): native-scroll-preserving inertia — a viewport-fixed wrapper +
-  content translated by the smoothed scroll + a body-height spacer keep
-  the scrollbar, keyboard, anchors, and a11y fully native while the
-  visual eases. ScrollTrigger math switches to the smoothed position;
-  pins become transform counter-translations (fixed breaks inside
-  transformed content); `data-speed`/`data-lag` parallax
-  (`Node.parallaxSpeed`/`parallaxLag`); touch native by default;
-  reduced motion fully disables. Island getters `verve.smootherY` /
-  `smootherVelocity` / `smootherActive`. Demo: the `/smooth` route.
-- **`verve.anim` ScrollTrigger snap** (`.snap = .{ .step = 1.0/3.0 }`
-  or `.{ .points = &.{...} }` + `.snap_duration`): when input goes idle
-  inside a trigger's span, the NATIVE scroll glides (outCubic) to the
-  nearest progress point — nearest candidate across triggers,
-  direction-biased ties, user input cancels; composes with the smoother
-  by construction. Wire keys `"snap"`/`"snapd"`.
 - **`verve.anim` SplitText** (`src/core/anim/split.zig` +
   `Node.splitText(.{ .by = .chars })`): server-side text splitting into
   animatable spans — chars/words/words_and_chars cost zero JS; `lines`
@@ -103,6 +85,34 @@ versions follow [Semantic Versioning](https://semver.org/).
   `verve.draggable(cfg, cbs)` → `DragHandle` (kill/disable/enable/setPos
   + x/y/velocity/isDragging/isThrowing). Position writes share the anim
   transform composer, so rotate/scale tweens compose with an active drag.
+- **`verve.anim` ScrollSmoother** (`src/core/anim/smoother.zig` +
+  `Node.smoothScroll(.{ .smooth = 1.2 })`, completing the GSAP-class
+  spec): native-scroll-preserving inertia — a viewport-fixed wrapper +
+  content translated by the smoothed scroll + a body-height spacer keep
+  the scrollbar, keyboard, anchors, and a11y fully native while the
+  visual eases. ScrollTrigger math switches to the smoothed position;
+  pins become transform counter-translations (fixed breaks inside
+  transformed content); `data-speed`/`data-lag` parallax
+  (`Node.parallaxSpeed`/`parallaxLag`); touch native by default;
+  reduced motion fully disables. Island getters `verve.smootherY` /
+  `smootherVelocity` / `smootherActive`. Demo: the `/smooth` route.
+- **`verve.anim` ScrollTrigger snap** (`.snap = .{ .step = 1.0/3.0 }`
+  or `.{ .points = &.{...} }` + `.snap_duration`): when input goes idle
+  inside a trigger's span, the NATIVE scroll glides (outCubic) to the
+  nearest progress point — nearest candidate across triggers,
+  direction-biased ties, user input cancels; composes with the smoother
+  by construction. Wire keys `"snap"`/`"snapd"`.
+- **`verve.anim` polish batch**: islands can morph FROM a live shape —
+  new `verve_ref_attr_len`/`verve_ref_get_attr` ops +
+  `verve.refGetAttrArena(handle, "d")` (probe-then-copy, never
+  truncates); MotionPath `.align_to = .start` re-bases the polyline on
+  its first sample (motion starts at the element's current position —
+  fixes the raw-absolute-coordinates footgun); Draggable drop zones
+  (`.zones` selector + `.zone_class` hover styling + `on_drop` with
+  `DragHandle.dropZone()/hoverZone()`, page-coord per-gesture
+  hit-testing, drop decided at release before any throw); FLIP
+  `on_enter`/`on_leave` callbacks (fire synchronously inside play, also
+  under reduced motion, before `on_complete`).
 
 ## [0.3.0] - 2026-06-10
 
