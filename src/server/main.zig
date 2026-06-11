@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const Writer = std.Io.Writer;
 const verve = @import("verve");
 const assets = @import("assets");
+const gl_assets = @import("gl_assets");
 const public_assets = @import("public_assets");
 const app = @import("app");
 const router = @import("router.zig");
@@ -302,6 +303,15 @@ fn handleRequest(
         const name = path[ISLAND_PREFIX.len .. path.len - ISLAND_SUFFIX.len];
         if (assets.lookupIslandChunk(name)) |chunk| {
             try respondBuffered(gpa, request, .ok, "application/wasm", "public, max-age=300", meta.accept_gzip, chunk.bytes);
+            return;
+        }
+    }
+
+    const GL_PREFIX = "/gl/";
+    if (std.mem.startsWith(u8, path, GL_PREFIX)) {
+        const name = path[GL_PREFIX.len..];
+        if (gl_assets.lookupGlAsset(name)) |asset| {
+            try respondBuffered(gpa, request, .ok, "application/octet-stream", "public, max-age=300", meta.accept_gzip, asset.bytes);
             return;
         }
     }
