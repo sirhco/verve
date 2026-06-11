@@ -1,0 +1,279 @@
+//! .vmesh packed asset format — writer + freestanding reader.
+//! Header layout (40 bytes, all integers little-endian u32):
+//!   [0..4]   magic "VMSH"
+//!   [4..8]   version u32 = 1
+//!   [8..12]  vertex_count
+//!   [12..16] index_count
+//!   [16..20] submesh_count
+//!   [20..24] texture_count
+//!   [24..28] vertex_off  (16-aligned, from file start)
+//!   [28..32] index_off   (4-aligned)
+//!   [32..36] tex_table_off
+//!   [36..40] tex_data_off (4-aligned)
+//! submesh table @40, submesh_count × 28 bytes:
+//!   index_byte_off u32, index_count u32, base_color f32×4, tex_index i32
+//! texture table @tex_table_off, texture_count × 16 bytes:
+//!   width u32, height u32, data_off u32 (into tex blob), data_len u32
+
+const std = @import("std");
+
+pub const magic = "VMSH";
+pub const version: u32 = 1;
+pub const vertex_stride: u32 = 32; // pos f32x3 @0, normal f32x3 @12, uv f32x2 @24
+pub const header_size: u32 = 40;
+pub const submesh_size: u32 = 28;
+pub const tex_entry_size: u32 = 16;
+
+pub const Submesh = struct {
+    index_byte_off: u32,
+    index_count: u32,
+    base_color: [4]f32,
+    tex_index: i32,
+};
+
+pub const Texture = struct {
+    width: u32,
+    height: u32,
+    rgba: []const u8, // width*height*4
+};
+
+/// Native-side packer. Caller supplies all arrays; `pack` computes
+/// aligned offsets and returns the complete file bytes (alloc-owned).
+pub fn pack(
+    alloc: std.mem.Allocator,
+    vertices: []const f32, // len % 8 == 0 (stride 32 / 4)
+    indices: []const u16,
+    submeshes: []const Submesh,
+    textures: []const Texture,
+) ![]u8 {
+    const vertex_count: u32 = @intCast(vertices.len / 8);
+    const index_count: u32 = @intCast(indices.len);
+    const submesh_count: u32 = @intCast(submeshes.len);
+    const texture_count: u32 = @intCast(textures.len);
+
+    // Layout: header(40) → submesh_table → tex_table → [align16] → vertices → [align4] → indices → [align4] → tex_blob
+    const submesh_table_off: u32 = header_size;
+    const tex_table_off: u32 = submesh_table_off + submesh_count * submesh_size;
+    const after_tex_table: u32 = tex_table_off + texture_count * tex_entry_size;
+    const vertex_off: u32 = alignUp(after_tex_table, 16);
+    const vertex_bytes: u32 = vertex_count * vertex_stride;
+    const after_vertices: u32 = vertex_off + vertex_bytes;
+    const index_off: u32 = alignUp(after_vertices, 4);
+    const index_bytes: u32 = index_count * 2;
+    const after_indices: u32 = index_off + index_bytes;
+    const tex_data_off: u32 = alignUp(after_indices, 4);
+
+    // Compute total texture blob size
+    var tex_blob_size: u32 = 0;
+    for (textures) |t| {
+        tex_blob_size += @intCast(t.rgba.len);
+    }
+
+    const total_size: u32 = tex_data_off + tex_blob_size;
+    const buf = try alloc.alloc(u8, total_size);
+    @memset(buf, 0);
+
+    // Write header
+    @memcpy(buf[0..4], magic);
+    std.mem.writeInt(u32, buf[4..8], version, .little);
+    std.mem.writeInt(u32, buf[8..12], vertex_count, .little);
+    std.mem.writeInt(u32, buf[12..16], index_count, .little);
+    std.mem.writeInt(u32, buf[16..20], submesh_count, .little);
+    std.mem.writeInt(u32, buf[20..24], texture_count, .little);
+    std.mem.writeInt(u32, buf[24..28], vertex_off, .little);
+    std.mem.writeInt(u32, buf[28..32], index_off, .little);
+    std.mem.writeInt(u32, buf[32..36], tex_table_off, .little);
+    std.mem.writeInt(u32, buf[36..40], tex_data_off, .little);
+
+    // Write submesh table @40
+    for (submeshes, 0..) |s, i| {
+        const off: u32 = submesh_table_off + @as(u32, @intCast(i)) * submesh_size;
+        std.mem.writeInt(u32, buf[off..][0..4], s.index_byte_off, .little);
+        std.mem.writeInt(u32, buf[off + 4 ..][0..4], s.index_count, .little);
+        std.mem.writeInt(u32, buf[off + 8 ..][0..4], @bitCast(s.base_color[0]), .little);
+        std.mem.writeInt(u32, buf[off + 12 ..][0..4], @bitCast(s.base_color[1]), .little);
+        std.mem.writeInt(u32, buf[off + 16 ..][0..4], @bitCast(s.base_color[2]), .little);
+        std.mem.writeInt(u32, buf[off + 20 ..][0..4], @bitCast(s.base_color[3]), .little);
+        std.mem.writeInt(i32, buf[off + 24 ..][0..4], s.tex_index, .little);
+    }
+
+    // Write texture table
+    var tex_blob_cursor: u32 = 0;
+    for (textures, 0..) |t, i| {
+        const off: u32 = tex_table_off + @as(u32, @intCast(i)) * tex_entry_size;
+        const data_len: u32 = @intCast(t.rgba.len);
+        std.mem.writeInt(u32, buf[off..][0..4], t.width, .little);
+        std.mem.writeInt(u32, buf[off + 4 ..][0..4], t.height, .little);
+        std.mem.writeInt(u32, buf[off + 8 ..][0..4], tex_blob_cursor, .little);
+        std.mem.writeInt(u32, buf[off + 12 ..][0..4], data_len, .little);
+        tex_blob_cursor += data_len;
+    }
+
+    // Write vertex data
+    const verts_bytes = std.mem.sliceAsBytes(vertices);
+    @memcpy(buf[vertex_off..][0..verts_bytes.len], verts_bytes);
+
+    // Write index data
+    const idx_bytes = std.mem.sliceAsBytes(indices);
+    @memcpy(buf[index_off..][0..idx_bytes.len], idx_bytes);
+
+    // Write texture blob
+    var blob_off: u32 = tex_data_off;
+    for (textures) |t| {
+        @memcpy(buf[blob_off..][0..t.rgba.len], t.rgba);
+        blob_off += @intCast(t.rgba.len);
+    }
+
+    return buf;
+}
+
+fn alignUp(x: u32, alignment: u32) u32 {
+    return (x + alignment - 1) & ~(alignment - 1);
+}
+
+/// Freestanding-safe zero-copy view over a .vmesh byte buffer.
+/// Validates magic/version/bounds; all slices point into `bytes`.
+pub const Reader = struct {
+    vertex_count: u32,
+    index_count: u32,
+    vertices: []const u8, // raw, GPU-uploadable
+    indices: []const u8,
+    submeshes: []const u8, // raw table; use submesh(i)
+    submesh_count: u32,
+    tex_count: u32,
+    bytes: []const u8,
+
+    pub fn init(bytes: []const u8) error{ BadMagic, BadVersion, Truncated }!Reader {
+        if (bytes.len < header_size) return error.Truncated;
+        if (!std.mem.eql(u8, bytes[0..4], magic)) return error.BadMagic;
+        const ver = std.mem.readInt(u32, bytes[4..8], .little);
+        if (ver != version) return error.BadVersion;
+
+        const vertex_count = std.mem.readInt(u32, bytes[8..12], .little);
+        const index_count = std.mem.readInt(u32, bytes[12..16], .little);
+        const sub_count = std.mem.readInt(u32, bytes[16..20], .little);
+        const tex_count = std.mem.readInt(u32, bytes[20..24], .little);
+        const vertex_off = std.mem.readInt(u32, bytes[24..28], .little);
+        const index_off = std.mem.readInt(u32, bytes[28..32], .little);
+        const tex_table_off = std.mem.readInt(u32, bytes[32..36], .little);
+        const tex_data_off = std.mem.readInt(u32, bytes[36..40], .little);
+
+        // Bounds-check vertex data
+        const vertex_bytes = vertex_count * vertex_stride;
+        if (vertex_off > bytes.len or vertex_bytes > bytes.len - vertex_off) return error.Truncated;
+
+        // Bounds-check index data
+        const index_bytes = index_count * 2;
+        if (index_off > bytes.len or index_bytes > bytes.len - index_off) return error.Truncated;
+
+        // Bounds-check submesh table
+        const sub_table_bytes = sub_count * submesh_size;
+        const sub_table_off: u32 = header_size;
+        if (sub_table_off > bytes.len or sub_table_bytes > bytes.len - sub_table_off) return error.Truncated;
+
+        // Bounds-check texture table
+        const tex_table_bytes = tex_count * tex_entry_size;
+        if (tex_table_off > bytes.len or tex_table_bytes > bytes.len - tex_table_off) return error.Truncated;
+
+        // Bounds-check each texture's data in the blob
+        for (0..tex_count) |i| {
+            const entry_off = tex_table_off + @as(u32, @intCast(i)) * tex_entry_size;
+            const data_off = std.mem.readInt(u32, bytes[entry_off + 8 ..][0..4], .little);
+            const data_len = std.mem.readInt(u32, bytes[entry_off + 12 ..][0..4], .little);
+            const abs_off = tex_data_off + data_off;
+            if (abs_off > bytes.len or data_len > bytes.len - abs_off) return error.Truncated;
+        }
+
+        return Reader{
+            .vertex_count = vertex_count,
+            .index_count = index_count,
+            .vertices = bytes[vertex_off..][0..vertex_bytes],
+            .indices = bytes[index_off..][0..index_bytes],
+            .submeshes = bytes[sub_table_off..][0..sub_table_bytes],
+            .submesh_count = sub_count,
+            .tex_count = tex_count,
+            .bytes = bytes,
+        };
+    }
+
+    pub fn submesh(self: *const Reader, i: u32) Submesh {
+        const off = i * submesh_size;
+        const raw = self.submeshes[off..][0..submesh_size];
+        return .{
+            .index_byte_off = std.mem.readInt(u32, raw[0..4], .little),
+            .index_count = std.mem.readInt(u32, raw[4..8], .little),
+            .base_color = .{
+                @bitCast(std.mem.readInt(u32, raw[8..12], .little)),
+                @bitCast(std.mem.readInt(u32, raw[12..16], .little)),
+                @bitCast(std.mem.readInt(u32, raw[16..20], .little)),
+                @bitCast(std.mem.readInt(u32, raw[20..24], .little)),
+            },
+            .tex_index = std.mem.readInt(i32, raw[24..28], .little),
+        };
+    }
+
+    pub fn texture(self: *const Reader, i: u32) struct { width: u32, height: u32, rgba: []const u8 } {
+        const tex_table_off = std.mem.readInt(u32, self.bytes[32..36], .little);
+        const tex_data_off = std.mem.readInt(u32, self.bytes[36..40], .little);
+        const entry_off = tex_table_off + i * tex_entry_size;
+        const raw = self.bytes[entry_off..][0..tex_entry_size];
+        const width = std.mem.readInt(u32, raw[0..4], .little);
+        const height = std.mem.readInt(u32, raw[4..8], .little);
+        const data_off = std.mem.readInt(u32, raw[8..12], .little);
+        const data_len = std.mem.readInt(u32, raw[12..16], .little);
+        return .{
+            .width = width,
+            .height = height,
+            .rgba = self.bytes[tex_data_off + data_off ..][0..data_len],
+        };
+    }
+};
+
+// --- Tests ---
+
+const testing = std.testing;
+
+test "round-trip: one submesh, one texture" {
+    const verts = [_]f32{ 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0 }; // 2 vertices
+    const idx = [_]u16{ 0, 1, 0 };
+    const texels = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255 };
+    const subs = [_]Submesh{.{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 0.5, 0.25, 1 }, .tex_index = 0 }};
+    const texs = [_]Texture{.{ .width = 2, .height = 2, .rgba = &texels }};
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &texs);
+    defer testing.allocator.free(bytes);
+
+    const r = try Reader.init(bytes);
+    try testing.expectEqual(@as(u32, 2), r.vertex_count);
+    try testing.expectEqual(@as(u32, 3), r.index_count);
+    try testing.expectEqual(@as(u32, 1), r.submesh_count);
+    const s = r.submesh(0);
+    try testing.expectEqual(@as(u32, 3), s.index_count);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), s.base_color[2], 1e-6);
+    try testing.expectEqual(@as(i32, 0), s.tex_index);
+    const t = r.texture(0);
+    try testing.expectEqual(@as(u32, 2), t.width);
+    try testing.expectEqualSlices(u8, &texels, t.rgba);
+    // raw views byte-identical to the inputs
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&verts), r.vertices);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&idx), r.indices);
+}
+
+test "alignment: vertex_off 16-aligned, index/tex 4-aligned" {
+    const verts = [_]f32{0} ** 8;
+    const idx = [_]u16{0};
+    const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{});
+    defer testing.allocator.free(bytes);
+    const vo = std.mem.readInt(u32, bytes[24..28], .little);
+    const io = std.mem.readInt(u32, bytes[28..32], .little);
+    try testing.expectEqual(@as(u32, 0), vo % 16);
+    try testing.expectEqual(@as(u32, 0), io % 4);
+}
+
+test "reader rejects bad magic and truncation" {
+    var junk = [_]u8{0} ** 64;
+    try testing.expectError(error.BadMagic, Reader.init(&junk));
+    @memcpy(junk[0..4], magic);
+    std.mem.writeInt(u32, junk[4..8], 99, .little);
+    try testing.expectError(error.BadVersion, Reader.init(&junk));
+    try testing.expectError(error.Truncated, Reader.init(junk[0..10]));
+}
