@@ -62,6 +62,8 @@ pub fn Scene(comptime capacity: usize) type {
         /// One linear pass. A node recomputes when itself or its parent
         /// recomputed this pass; clean subtrees are untouched.
         pub fn updateWorld(self: *Self) void {
+            // undefined is safe: pre-order (asserted in addNode) means every
+            // parent index is lower, so recomputed[p] is written before read.
             var recomputed: [capacity]bool = undefined;
             for (0..self.count) |i| {
                 const p = self.parent[i];
