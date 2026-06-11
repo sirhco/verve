@@ -758,6 +758,27 @@ pub fn errorPage(
     }).build();
 }
 
+/// verve.gl P1 demo: a canvas island. Zig computes the scene + binary
+/// command stream in wasm; the bridge's WebGL2 interpreter draws it.
+/// With JS off the page still renders shell + copy (canvas stays blank).
+pub fn glDemo(ctx: *const verve.Context) !*verve.Node {
+    const inner = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "glcube-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;"),
+    });
+    const cube_island = verve.island(ctx, .{ .name = "GlCube" }, inner);
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl"),
+        ctx.p().text("Rotating unlit cube — scene graph, culling state, and a " ++
+            "binary draw-command stream all computed in Zig/wasm; JS is a " ++
+            "dumb WebGL2 interpreter over linear memory."),
+        cube_island,
+    });
+}
+
 pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
     // Provide a default title only if the page didn't set one of its own.
     try ctx.setTitleIfUnset("Verve");

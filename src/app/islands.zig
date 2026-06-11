@@ -79,3 +79,10 @@ pub const VizGraphInteractive = struct {
         margin: f64,
     };
 };
+
+/// verve.gl P1 — rotating unlit cube. The chunk builds the scene and
+/// encodes a binary command stream each frame; the bridge's WebGL2
+/// interpreter draws it. Source: `src/client/islands/GlCube.zig`.
+pub const GlCube = struct {
+    pub const props_schema: []const u8 = "{}";
+};

@@ -768,6 +768,15 @@ pub const viz_core = @import("viz_core");
 /// (`anim.to`, `anim.from`, `anim.timeline`, `anim.clamp`, ...).
 pub const anim = @import("anim_core");
 
+// ---- 3D / GL (verve.gl) --------------------------------------------------
+//
+// Pure math/scene/command/mesh engine. Island chunks import it as
+// `const gl = verve.gl;` and use it to build scenes + encode binary
+// command streams that the bridge's WebGL2 interpreter executes.
+
+/// Math (Vec3/Quat/Mat4), scene graph, binary command encoder, unit cube.
+pub const gl = @import("gl_core");
+
 extern "verve_runtime" fn verve_anim_create(desc_ptr: [*]const u8, desc_len: u32) u32;
 extern "verve_runtime" fn verve_anim_ctrl(handle: u32, op: u32, value: f64) void;
 extern "verve_runtime" fn verve_anim_get(handle: u32, field: u32) f64;

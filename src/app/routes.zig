@@ -12,6 +12,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/viz", renderViz),
     verve.Route.init("/anim", renderAnim),
     verve.Route.init("/smooth", renderSmooth),
+    verve.Route.init("/gl", renderGl),
     verve.Route.init("/todos", renderTodos),
     verve.Route.init("/work/:slug", renderWorkDetail),
     verve.Route.layout("/app", renderAppShell, &.{
@@ -43,6 +44,11 @@ fn renderAnim(ctx: *verve.Context) !*verve.Node {
 
 fn renderSmooth(ctx: *verve.Context) !*verve.Node {
     const body = try components.smoothDemo(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderGl(ctx: *verve.Context) !*verve.Node {
+    const body = try components.glDemo(ctx);
     return components.page(ctx, body);
 }
 
