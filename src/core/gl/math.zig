@@ -36,6 +36,8 @@ pub const Vec3 = struct {
     pub fn length(v: Vec3) f32 {
         return @sqrt(v.dot(v));
     }
+    /// Zero-length input returns the zero vector unchanged — callers
+    /// (lookAt, fromAxisAngle) must ensure non-degenerate input.
     pub fn normalize(v: Vec3) Vec3 {
         const len = v.length();
         return if (len == 0) v else v.scale(1.0 / len);
@@ -103,6 +105,7 @@ pub const Mat4 = struct {
         return out;
     }
 
+    /// `up` must not be parallel to `eye - target` (degenerate basis).
     pub fn lookAt(eye: Vec3, target: Vec3, up: Vec3) Mat4 {
         const zaxis = eye.sub(target).normalize();
         const xaxis = up.cross(zaxis).normalize();
@@ -199,4 +202,42 @@ test "fromTrs: scale applies per-axis" {
     try testing.expectApproxEqAbs(@as(f32, 2), m.m[0], eps);
     try testing.expectApproxEqAbs(@as(f32, 3), m.m[5], eps);
     try testing.expectApproxEqAbs(@as(f32, 4), m.m[10], eps);
+}
+
+test "quat mul: two 90deg Y rotations compose to 180deg" {
+    const q = Quat.fromAxisAngle(Vec3.init(0, 1, 0), std.math.pi / 2.0);
+    const q2 = q.mul(q);
+    try testing.expectApproxEqAbs(@as(f32, 0), q2.x, eps);
+    try testing.expectApproxEqAbs(@as(f32, 1), q2.y, eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), q2.z, eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), q2.w, eps);
+}
+
+test "lookAt off-axis eye maps eye to origin" {
+    const eye = Vec3.init(1, 2, 5);
+    const v = Mat4.lookAt(eye, Vec3.init(0, 0, 0), Vec3.init(0, 1, 0));
+    // bottom row of the rotation columns stays homogeneous
+    try testing.expectApproxEqAbs(@as(f32, 0), v.m[3], eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), v.m[7], eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), v.m[11], eps);
+    try testing.expectApproxEqAbs(@as(f32, 1), v.m[15], eps);
+    // V * (eye, 1) = origin — the defining invariant of a view matrix
+    var r: usize = 0;
+    while (r < 3) : (r += 1) {
+        const out = v.m[r] * eye.x + v.m[4 + r] * eye.y + v.m[8 + r] * eye.z + v.m[12 + r];
+        try testing.expectApproxEqAbs(@as(f32, 0), out, eps);
+    }
+}
+
+test "fromTrs: +90deg about Y, all three basis columns" {
+    const q = Quat.fromAxisAngle(Vec3.init(0, 1, 0), std.math.pi / 2.0);
+    const m = Mat4.fromTrs(Vec3.init(0, 0, 0), q, Vec3.init(1, 1, 1));
+    // +Y stays +Y
+    try testing.expectApproxEqAbs(@as(f32, 0), m.m[4], eps);
+    try testing.expectApproxEqAbs(@as(f32, 1), m.m[5], eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), m.m[6], eps);
+    // +Z maps to +X
+    try testing.expectApproxEqAbs(@as(f32, 1), m.m[8], eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), m.m[9], eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), m.m[10], eps);
 }
