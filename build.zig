@@ -430,22 +430,28 @@ pub fn build(b: *std.Build) void {
             .name = cfg.name,
             .root_module = smoke_mod,
         });
-        const smoke_install = b.addInstallArtifact(smoke_exe, .{});
+        // The exe LoadLibrary's WebView2Loader.dll at runtime, so each arch
+        // needs ITS OWN loader sitting beside ITS exe — both vendored from the
+        // same SDK (include/VERSION.txt). The arm64 pair installs under
+        // bin/arm64/ because two same-named DLLs can't share one directory.
+        const is_arm = cfg.arch == .aarch64;
+        const smoke_install = b.addInstallArtifact(smoke_exe, .{
+            .dest_dir = if (is_arm)
+                .{ .override = .{ .custom = "bin/arm64" } }
+            else
+                .default,
+        });
+        const loader_src = if (is_arm)
+            b.path("src/desktop/win_native/include/arm64/WebView2Loader.dll")
+        else
+            b.path("src/desktop/win_native/include/WebView2Loader.dll");
+        const loader_install = if (is_arm)
+            b.addInstallFileWithDir(loader_src, .{ .custom = "bin/arm64" }, "WebView2Loader.dll")
+        else
+            b.addInstallBinFile(loader_src, "WebView2Loader.dll");
         const native_step = b.step(cfg.step, cfg.desc);
         native_step.dependOn(&smoke_install.step);
-        // The exe resolves WebView2Loader.dll at runtime; ship it alongside so
-        // zig-out/bin/ is runnable as-is. The checked-in loader is x86-64
-        // ONLY — installing it next to the ARM64 exe would be a runtime trap
-        // (a native ARM64 process cannot load an x64 DLL). For ARM64 runs the
-        // operator supplies the arm64 loader from the Microsoft.Web.WebView2
-        // NuGet package (runtimes/win-arm64/native/WebView2Loader.dll).
-        if (cfg.arch == .x86_64) {
-            const loader_install = b.addInstallBinFile(
-                b.path("src/desktop/win_native/include/WebView2Loader.dll"),
-                "WebView2Loader.dll",
-            );
-            native_step.dependOn(&loader_install.step);
-        }
+        native_step.dependOn(&loader_install.step);
     }
 
     // Dedicated server executable for the embed integration test, with
