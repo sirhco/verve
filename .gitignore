@@ -3,6 +3,10 @@ zig-out/
 *.o
 *.obj
 *.dll
+# …except the vendored MS-redistributable WebView2 loader: the win-native
+# gate, both desktop templates, and the scaffold embed need it present in
+# a fresh clone (the build is offline — no NuGet fetch at build time).
+!src/desktop/win_native/include/WebView2Loader.dll
 .DS_Store
 
 # Local-dev superpowers artifacts (specs/plans) — never committed
