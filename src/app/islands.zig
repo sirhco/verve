@@ -86,3 +86,9 @@ pub const VizGraphInteractive = struct {
 pub const GlCube = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// verve.gl P2 — textured model loaded from /gl/demo.vmesh through the
+/// asset pipeline. Source: `src/client/islands/GlModel.zig`.
+pub const GlModel = struct {
+    pub const props_schema: []const u8 = "{}";
+};
