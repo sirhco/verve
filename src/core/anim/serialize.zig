@@ -40,10 +40,12 @@ fn resolveExtras(alloc: std.mem.Allocator, t: *const tween_mod.Tween) !Extras {
             else => return error.BadPath,
         };
         const n: usize = if (mp.samples == 0) 128 else @min(@max(@as(usize, mp.samples), 2), 512);
-        ex.mp = path_mod.motionSamples(alloc, &pd, n, mp.start, mp.end) catch |e| switch (e) {
+        const samples = path_mod.motionSamples(alloc, &pd, n, mp.start, mp.end) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.BadPath,
         };
+        if (mp.align_to == .start) path_mod.alignSamplesToStart(samples);
+        ex.mp = samples;
         ex.mp_rotate = mp.rotate;
         ex.mp_ro = mp.rotate_offset_deg;
     }
@@ -195,6 +197,16 @@ fn writeDraggable(w: *std.Io.Writer, dr: drag_mod.Draggable, surface: Surface) a
         try w.writeAll("\"cls\":");
         try writeJsonString(w, c);
     }
+    if (dr.zones) |sel| {
+        try comma(w, &first);
+        try w.writeAll("\"zn\":");
+        try writeJsonString(w, sel);
+    }
+    if (dr.zone_class) |c| {
+        try comma(w, &first);
+        try w.writeAll("\"znc\":");
+        try writeJsonString(w, c);
+    }
     if (dr.disabled) {
         try comma(w, &first);
         try w.writeAll("\"dis\":1");
@@ -208,6 +220,7 @@ fn writeDraggable(w: *std.Io.Writer, dr: drag_mod.Draggable, surface: Surface) a
         if (dr.on_drag_slot) |s| try slotField(w, &cb_first, "sD", s);
         if (dr.on_end_slot) |s| try slotField(w, &cb_first, "sE", s);
         if (dr.on_throw_complete_slot) |s| try slotField(w, &cb_first, "sT", s);
+        if (dr.on_drop_slot) |s| try slotField(w, &cb_first, "sZ", s);
         try w.writeAll("}");
     }
     try w.writeAll("}");
@@ -997,6 +1010,19 @@ test "golden: motion path with rotate + offset on a corner path" {
     try testing.expect(std.mem.indexOf(u8, json, ",10,10,90]") != null);
 }
 
+test "golden: motion path align start re-bases on first sample" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".dot").motionPath(.{
+        .path = "M100,50 L110,50",
+        .align_to = .start,
+        .samples = 3,
+    });
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expect(std.mem.indexOf(u8, json, "\"mp\":{\"pts\":[0,0,5,0,10,0]}") != null);
+}
+
 test "golden: morph of two lines (1/3-2/3 control contract)" {
     var arena = testArena();
     defer arena.deinit();
@@ -1127,6 +1153,34 @@ test "golden: drag island callback slots + handle target" {
         "{\"v\":1,\"dr\":{\"t\":{\"h\":7},\"in\":1,\"cb\":{\"sS\":21,\"sD\":22,\"sE\":23,\"sT\":24}}}",
         try dragToJson(a, d, .island),
     );
+}
+
+test "golden: drag drop zones + hover class (SSR-legal)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = drag_mod.draggable(a, .{
+        .zones = ".dz",
+        .zone_class = "drop-hover",
+    });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"dr\":{\"zn\":\".dz\",\"znc\":\"drop-hover\"}}",
+        try dragToJson(a, d, .ssr),
+    );
+}
+
+test "golden: drag on_drop slot (island) + SSR rejection" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = drag_mod.draggable(a, .{ .zones = ".dz", .on_drop_slot = 31 });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"dr\":{\"zn\":\".dz\",\"cb\":{\"sZ\":31}}}",
+        try dragToJson(a, d, .island),
+    );
+
+    const ssr = drag_mod.draggable(a, .{ .zones = ".dz", .on_drop_slot = 31 });
+    try testing.expectError(error.CallbackSlotRequiresIsland, dragToJson(a, ssr, .ssr));
 }
 
 test "ssr rejects dr island-only constructs; validate propagates" {

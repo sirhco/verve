@@ -74,6 +74,13 @@ pub const Draggable = struct {
     /// Class applied to the target while dragging or throwing.
     /// SSR-legal, zero-wasm.
     toggle_class: ?[]const u8 = null,
+    /// Drop-zone selector. Zone rects resolve at the start of every
+    /// gesture (page coordinates); the pointer is hit-tested against
+    /// them while dragging and at release.
+    zones: ?[]const u8 = null,
+    /// Class toggled on the zone under the pointer while dragging.
+    /// SSR-legal, zero-wasm hover styling.
+    zone_class: ?[]const u8 = null,
     /// Pixels of pointer travel before the drag engages — clicks inside
     /// draggables survive below this. Must be > 0.
     threshold_px: f64 = 3,
@@ -90,10 +97,14 @@ pub const Draggable = struct {
     on_end_slot: ?u32 = null,
     /// Fires when an inertia throw settles. Requires inertia.
     on_throw_complete_slot: ?u32 = null,
+    /// Fires on release over a drop zone (read the index via
+    /// `DragHandle.dropZone()`). Requires `zones`.
+    on_drop_slot: ?u32 = null,
 
     pub fn hasSlots(self: *const Draggable) bool {
         return self.on_start_slot != null or self.on_drag_slot != null or
-            self.on_end_slot != null or self.on_throw_complete_slot != null;
+            self.on_end_slot != null or self.on_throw_complete_slot != null or
+            self.on_drop_slot != null;
     }
 
     /// Deferred-error validation, run by the `draggable` builder /
@@ -128,6 +139,8 @@ pub const Draggable = struct {
             return error.BadThreshold;
         if (self.on_throw_complete_slot != null and self.inertia == .off)
             return error.ThrowCallbackWithoutInertia;
+        if ((self.zone_class != null or self.on_drop_slot != null) and self.zones == null)
+            return error.ZoneConfigWithoutZones;
         return null;
     }
 };
@@ -197,6 +210,16 @@ test "validate matrix" {
     try std.testing.expectEqual(@as(?anyerror, error.ThrowCallbackWithoutInertia), orphan_throw.validate());
     const throw_ok: Draggable = .{ .inertia = .on, .on_throw_complete_slot = 5 };
     try std.testing.expectEqual(@as(?anyerror, null), throw_ok.validate());
+
+    const orphan_cls: Draggable = .{ .zone_class = "hov" };
+    try std.testing.expectEqual(@as(?anyerror, error.ZoneConfigWithoutZones), orphan_cls.validate());
+    const orphan_drop: Draggable = .{ .on_drop_slot = 5 };
+    try std.testing.expectEqual(@as(?anyerror, error.ZoneConfigWithoutZones), orphan_drop.validate());
+    const zones_ok: Draggable = .{ .zones = ".dz", .zone_class = "hov", .on_drop_slot = 5 };
+    try std.testing.expectEqual(@as(?anyerror, null), zones_ok.validate());
+    // on_drop alone counts as a slot (SSR guard + cb emission)
+    const drop_only: Draggable = .{ .zones = ".dz", .on_drop_slot = 5 };
+    try std.testing.expect(drop_only.hasSlots());
 
     // axis lock + degenerate other-axis rect is legal
     const locked: Draggable = .{ .axis = .x, .bounds = .{ .rect = .{ .min_x = 0, .max_x = 600 } } };

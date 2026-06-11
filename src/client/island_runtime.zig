@@ -151,6 +151,8 @@ extern "verve_runtime" fn verve_clipboard_write(text_ptr: [*]const u8, text_len:
 // handle; `verve_ref_rect` / `verve_viewport` write f64s into a
 // caller-provided buffer (8-byte aligned).
 extern "verve_runtime" fn verve_ref_get_value_str(handle: i32, buf_ptr: [*]u8, buf_cap: u32) u32;
+extern "verve_runtime" fn verve_ref_attr_len(handle: i32, name_ptr: [*]const u8, name_len: u32) u32;
+extern "verve_runtime" fn verve_ref_get_attr(handle: i32, name_ptr: [*]const u8, name_len: u32, buf_ptr: [*]u8, buf_cap: u32) u32;
 extern "verve_runtime" fn verve_ref_request_submit(handle: i32) void;
 extern "verve_runtime" fn verve_ref_select(handle: i32) void;
 extern "verve_runtime" fn verve_ref_blur(handle: i32) void;
@@ -313,6 +315,11 @@ pub fn signalGetStrLen(name: []const u8) u32 {
 /// null when the bridge can't find a matching element. Accepts any
 /// value exposing `.id: []const u8` — typically a `verve.NodeRef(.tag)`
 /// instance — or a raw `[]const u8`.
+/// Resolve a `data-ref` to a live element handle. Pass the RAW id —
+/// the runtime auto-scopes it to the current island's vid (matching
+/// the SSR's rewriteBindings suffix). Do NOT suffix `__v{vid}` yourself;
+/// that double-suffixes and misses. (Contrast: `listDiff` bind names
+/// are NOT auto-scoped.)
 pub fn queryRef(ref: anytype) ?i32 {
     const id: []const u8 = if (@TypeOf(ref) == []const u8) ref else ref.id;
     const handle = verve_query_ref(id.ptr, @intCast(id.len));
@@ -1157,6 +1164,15 @@ pub const DragHandle = struct {
     pub fn isThrowing(self: DragHandle) bool {
         return verve_drag_get(self.id, 5) != 0;
     }
+    /// Zone index from the last release (-1 = none). Note: a dead handle
+    /// also reads 0, ambiguous with zone 0 (getter ABI wart).
+    pub fn dropZone(self: DragHandle) i32 {
+        return @intFromFloat(verve_drag_get(self.id, 6));
+    }
+    /// Zone index under the pointer while dragging (-1 = none).
+    pub fn hoverZone(self: DragHandle) i32 {
+        return @intFromFloat(verve_drag_get(self.id, 7));
+    }
 };
 
 /// Drag lifecycle callbacks. Registered as event slots (same translation
@@ -1168,6 +1184,9 @@ pub const DragCallbacks = struct {
     on_end: ?*const fn () void = null,
     /// Fires when an inertia throw settles (requires .inertia).
     on_throw_complete: ?*const fn () void = null,
+    /// Fires on release over a drop zone (requires .zones); read the
+    /// index via `DragHandle.dropZone()`.
+    on_drop: ?*const fn () void = null,
 };
 
 fn stampDragSlots(dr: *anim.Draggable, cbs: DragCallbacks) void {
@@ -1175,6 +1194,7 @@ fn stampDragSlots(dr: *anim.Draggable, cbs: DragCallbacks) void {
     if (cbs.on_drag) |f| dr.on_drag_slot = registerEvent(f);
     if (cbs.on_end) |f| dr.on_end_slot = registerEvent(f);
     if (cbs.on_throw_complete) |f| dr.on_throw_complete_slot = registerEvent(f);
+    if (cbs.on_drop) |f| dr.on_drop_slot = registerEvent(f);
 }
 
 /// Imperative draggable:
@@ -1256,6 +1276,14 @@ pub const FlipCallbacks = struct {
     /// Fires once when every element (including stagger tails) settles —
     /// also fires immediately under reduced motion or when nothing moved.
     on_complete: ?*const fn () void = null,
+    /// Fires once per play when elements exist that weren't captured
+    /// (they also fade in when fade_in is set). Runs synchronously
+    /// BEFORE flipPlay returns — don't depend on the handle or capture
+    /// arena pointers.
+    on_enter: ?*const fn () void = null,
+    /// Fires once per play when captured elements are gone. Same
+    /// synchronous-before-return contract as on_enter.
+    on_leave: ?*const fn () void = null,
 };
 
 /// Snapshot the current layout of every element matching `selector`.
@@ -1266,11 +1294,15 @@ pub fn flipCapture(selector: []const u8) ?FlipState {
 }
 
 /// Animate from the captured layout to the current one. Always consumes
-/// `state`. Returns null when nothing animates (callback still fired).
+/// `state`. Returns null when nothing animates (callbacks still fire).
 pub fn flipPlay(state: FlipState, opts: anim.FlipOpts, cbs: FlipCallbacks) ?FlipHandle {
-    var buf: [160]u8 = undefined;
-    const slot: ?u32 = if (cbs.on_complete) |f| registerEvent(f) else null;
-    const json = anim.flip.optsToJson(&buf, opts, slot) catch {
+    var buf: [192]u8 = undefined;
+    const slots: anim.flip.FlipSlots = .{
+        .complete = if (cbs.on_complete) |f| registerEvent(f) else null,
+        .enter = if (cbs.on_enter) |f| registerEvent(f) else null,
+        .leave = if (cbs.on_leave) |f| registerEvent(f) else null,
+    };
+    const json = anim.flip.optsToJson(&buf, opts, slots) catch {
         verve_flip_discard(state.id);
         return null;
     };
@@ -1350,6 +1382,33 @@ pub fn clipboardWrite(text: []const u8) void {
 /// `query_ref` handle. Complements the numeric `refValueI32`/`F32`.
 pub fn refValueStr(handle: i32, buf: []u8) []const u8 {
     const n = verve_ref_get_value_str(handle, buf.ptr, @intCast(buf.len));
+    return buf[0..n];
+}
+
+/// Byte length of an attribute value. 0 = missing attribute, stale
+/// handle, OR empty value (the storage contract's ambiguity — probe
+/// before sizing a buffer, don't treat 0 as proof of absence).
+pub fn refAttrLen(handle: i32, name: []const u8) u32 {
+    return verve_ref_attr_len(handle, name.ptr, @intCast(name.len));
+}
+
+/// Copy an attribute value into `buf` (truncated at capacity); returns
+/// the filled slice. Prefer `refGetAttrArena` for unbounded values like
+/// SVG path `d` strings — silent truncation corrupts them.
+pub fn refGetAttr(handle: i32, name: []const u8, buf: []u8) []const u8 {
+    const n = verve_ref_get_attr(handle, name.ptr, @intCast(name.len), buf.ptr, @intCast(buf.len));
+    return buf[0..n];
+}
+
+/// Probe-then-copy an attribute into an exact-size chunk-arena slice —
+/// null when missing/empty. The bytes live until the next arena reset,
+/// which is exactly long enough to feed `.morph(.{ .from = current, ... })`
+/// through `animPlay` (the bridge copies the descriptor at the boundary).
+pub fn refGetAttrArena(handle: i32, name: []const u8) ?[]const u8 {
+    const len = refAttrLen(handle, name);
+    if (len == 0) return null;
+    const buf = chunkArena().alloc(u8, len) catch return null;
+    const n = verve_ref_get_attr(handle, name.ptr, @intCast(name.len), buf.ptr, @intCast(buf.len));
     return buf[0..n];
 }
 

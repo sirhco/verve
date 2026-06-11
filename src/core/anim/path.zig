@@ -516,6 +516,21 @@ pub fn motionSamples(
     return out;
 }
 
+/// Re-base a sampled polyline on its first sample (MotionPath
+/// `.align = .start`): every position shifts by -samples[0], so the
+/// motion starts at the element's current spot and follows the path's
+/// SHAPE. Works for windowed and reversed sample runs alike — index 0
+/// is always the motion's starting point. Angles untouched.
+pub fn alignSamplesToStart(samples: []Sample) void {
+    if (samples.len == 0) return;
+    const ox = samples[0].x;
+    const oy = samples[0].y;
+    for (samples) |*s| {
+        s.x -= ox;
+        s.y -= oy;
+    }
+}
+
 pub fn totalLength(alloc: std.mem.Allocator, path: *const PathData) !f64 {
     const lut = try buildLut(alloc, path);
     return lut.total;
@@ -1028,6 +1043,32 @@ test "sampling: degenerates" {
     }
     var empty = PathData{ .subpaths = &.{} };
     try testing.expectError(error.EmptyPath, motionSamples(a, &empty, 4, 0, 1));
+}
+
+test "alignSamplesToStart: plain, windowed, reversed" {
+    var arena = ta();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var pd = try parse(a, "M 100 50 L 200 50");
+    const plain = try motionSamples(a, &pd, 3, 0, 1);
+    alignSamplesToStart(plain);
+    try testing.expectApproxEqAbs(@as(f64, 0), plain[0].x, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0), plain[0].y, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 100), plain[2].x, 1e-12);
+
+    const windowed = try motionSamples(a, &pd, 3, 0.25, 0.75);
+    alignSamplesToStart(windowed);
+    try testing.expectApproxEqAbs(@as(f64, 0), windowed[0].x, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 50), windowed[2].x, 1e-12);
+
+    const reversed = try motionSamples(a, &pd, 3, 1, 0);
+    alignSamplesToStart(reversed);
+    try testing.expectApproxEqAbs(@as(f64, 0), reversed[0].x, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, -100), reversed[2].x, 1e-12);
+
+    var empty: [0]Sample = .{};
+    alignSamplesToStart(&empty); // empty: no crash
 }
 
 test "morph: de Casteljau split preserves shape" {

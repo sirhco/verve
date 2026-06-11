@@ -26,13 +26,13 @@ const fns = new Function(
   extract("mpSample") + extract("buildMorphD") + extract("animIsTriggerOnly") +
     extract("dragProject") + extract("dragSnapResolve") +
     extract("splitLineRuns") + extract("flipNatural") + extract("flipDelta") +
-    extract("stSnapResolve") +
+    extract("stSnapResolve") + extract("dragZoneHit") +
     "return { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve, " +
-    "splitLineRuns, flipNatural, flipDelta, stSnapResolve };",
+    "splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit };",
 )();
 const {
   mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve,
-  splitLineRuns, flipNatural, flipDelta, stSnapResolve,
+  splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit,
 } = fns;
 
 let fails = 0;
@@ -211,6 +211,20 @@ const approx = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
   check("snap points nearest mid", stSnapResolve([0, 0.5, 1], 0.6, 1) === 0.5);
   check("snap points tie dir+", stSnapResolve([0, 0.5], 0.25, 1) === 0.5);
   check("snap points tie dir-", stSnapResolve([0, 0.5], 0.25, -1) === 0);
+}
+
+// ---- Drag drop-zone hit testing ----
+{
+  const rects = [
+    [0, 0, 100, 100],
+    [50, 50, 150, 150], // overlaps zone 0
+    [200, 0, 300, 100],
+  ];
+  check("zone inside", dragZoneHit(rects, 250, 50) === 2);
+  check("zone boundary inclusive", dragZoneHit(rects, 100, 100) === 0);
+  check("zone overlap first wins", dragZoneHit(rects, 75, 75) === 0);
+  check("zone miss", dragZoneHit(rects, 175, 50) === -1);
+  check("zone empty", dragZoneHit([], 10, 10) === -1);
 }
 
 if (fails === 0) {

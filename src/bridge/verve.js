@@ -2669,6 +2669,18 @@
   const dragProject = (v, r) => v / Math.log(1 / r);
   // @verve-extract-end
 
+  // Drop-zone hit test: rects as [l, t, r, b] in page coords; first
+  // match in DOM order wins on overlap; -1 on miss.
+  // @verve-extract dragZoneHit
+  const dragZoneHit = (rects, x, y) => {
+    for (let i = 0; i < rects.length; i++) {
+      const r = rects[i];
+      if (x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3]) return i;
+    }
+    return -1;
+  };
+  // @verve-extract-end
+
   // @verve-extract dragSnapResolve
   const dragSnapResolve = (sn, x, y) => {
     if (!sn) return [x, y];
@@ -2724,9 +2736,17 @@
     }
   };
 
+  const dragClearZoneHover = (d) => {
+    if (d.zoneCls && d.hover >= 0 && d.zoneEls[d.hover]) {
+      d.zoneEls[d.hover].classList.remove(d.zoneCls);
+    }
+    d.hover = -1;
+  };
+
   const dragKill = (d) => {
     drags.delete(d.h);
     dragStopThrow(d);
+    dragClearZoneHover(d);
     for (const [tgt, type, fn, opts] of d.fns) tgt.removeEventListener(type, fn, opts);
     if (d.cls && d.el) d.el.classList.remove(d.cls);
   };
@@ -2735,6 +2755,7 @@
     d.enabled = false;
     d.pid = null;
     dragStopThrow(d);
+    dragClearZoneHover(d);
     if (d.engaged) {
       d.engaged = false;
       if (d.cls) d.el.classList.remove(d.cls);
@@ -2832,6 +2853,12 @@
       th: cfg.th == null ? 3 : cfg.th,
       cur: cfg.cur !== 0,
       cls: cfg.cls || null,
+      zoneSel: cfg.zn || null,
+      zoneCls: cfg.znc || null,
+      zoneEls: [],
+      zoneRects: [],
+      hover: -1,
+      drop: -1, // persists from the last gesture until a new one starts
       cb: cfg.cb || null,
       enabled: cfg.dis !== 1,
       pid: null,
@@ -2877,6 +2904,23 @@
       d.bx = s.x;
       d.by = s.y;
       dragResolveBounds(d, s);
+      // drop zones: PAGE-coord rects per gesture (mouse drags don't
+      // block wheel scroll, so viewport coords would go stale; under a
+      // smoother both the rects and the normalized pointer shift
+      // identically, so the math cancels)
+      d.hover = -1;
+      d.drop = -1;
+      d.zoneEls = [];
+      d.zoneRects = [];
+      if (d.zoneSel) {
+        const zsx = window.scrollX || 0;
+        const zsy = window.scrollY || 0;
+        document.querySelectorAll(d.zoneSel).forEach((z) => {
+          const zr = z.getBoundingClientRect();
+          d.zoneEls.push(z);
+          d.zoneRects.push([zr.left + zsx, zr.top + zsy, zr.right + zsx, zr.bottom + zsy]);
+        });
+      }
       d.samples.length = 0;
       d.vx = d.vy = 0;
       velPush(d, s.x, s.y);
@@ -2903,6 +2947,20 @@
       xformSet(s, "y", dclamp(d.by + dy, d.minY, d.maxY));
       animDirty.add(d.el);
       flushXform(); // sync — rAF-deferred position lags the pointer
+      if (d.zoneRects.length) {
+        const hit = dragZoneHit(
+          d.zoneRects,
+          e.clientX + (window.scrollX || 0),
+          e.clientY + (window.scrollY || 0),
+        );
+        if (hit !== d.hover) {
+          if (d.zoneCls) {
+            if (d.hover >= 0) d.zoneEls[d.hover].classList.remove(d.zoneCls);
+            if (hit >= 0) d.zoneEls[hit].classList.add(d.zoneCls);
+          }
+          d.hover = hit;
+        }
+      }
       d.lastT = performance.now();
       velPush(d, s.x, s.y);
       if (d.cb) animFireSlot(d.cb.sD);
@@ -2917,7 +2975,21 @@
       }
       if (d.cls) d.el.classList.remove(d.cls);
       if (d.cur) grip.style.cursor = "grab";
+      // drop decision at the RELEASE point, before any throw
+      if (d.zoneRects.length) {
+        const hit = cancelled
+          ? -1
+          : dragZoneHit(
+              d.zoneRects,
+              e.clientX + (window.scrollX || 0),
+              e.clientY + (window.scrollY || 0),
+            );
+        if (d.zoneCls && d.hover >= 0) d.zoneEls[d.hover].classList.remove(d.zoneCls);
+        d.hover = -1;
+        d.drop = hit;
+      }
       if (d.cb) animFireSlot(d.cb.sE);
+      if (d.drop >= 0 && d.cb) animFireSlot(d.cb.sZ);
       // a real drag happened — swallow the synthetic click before the
       // document-level bubble delegates see it
       grip.addEventListener(
@@ -3089,30 +3161,52 @@
     flipStates.delete(stateH); // play ALWAYS consumes the state
     if (!state) return 0;
     const cb = desc.cb || null;
-    if (prefersReduced) {
-      // layout already final; FLIP is purely decorative transition
-      if (cb) animFireSlot(cb.sC);
-      return 0;
-    }
+    // matcher shared by the live and reduced-motion paths (cheap; no gBCR)
+    const matchEntry = (el) => {
+      let entry = state.entries.find((e) => !e.claimed && e.el === el);
+      if (!entry) {
+        const vk = el.getAttribute("data-vkey");
+        if (vk) entry = state.entries.find((e) => !e.claimed && e.vkey === vk);
+      }
+      return entry || null;
+    };
+    const fireEnterLeave = (enteredCount) => {
+      if (!cb) return;
+      // enter/leave fire synchronously inside the op (sC-on-RM precedent)
+      if (enteredCount > 0) animFireSlot(cb.sE);
+      if (state.entries.some((e) => !e.claimed)) animFireSlot(cb.sL);
+    };
     let els;
     try {
       els = Array.from(document.querySelectorAll(state.sel));
     } catch {
       els = [];
     }
+    if (prefersReduced) {
+      // layout already final; FLIP motion is decorative — but enter/leave
+      // are structural facts, so match cheaply and fire callbacks in the
+      // jump-to-end order: sE/sL then sC.
+      let entered = 0;
+      for (const el of els) {
+        const entry = matchEntry(el);
+        if (entry) entry.claimed = true;
+        else entered++;
+      }
+      fireEnterLeave(entered);
+      if (cb) animFireSlot(cb.sC);
+      return 0;
+    }
     const useScale = desc.sc === 1;
     const fadeIn = desc.fade !== 0;
     const sx = window.scrollX || 0;
     const sy = window.scrollY || 0;
     const items = [];
+    let entered = 0;
     for (const el of els) {
       // identity first, then unclaimed vkey (reconciler re-created node)
-      let entry = state.entries.find((e) => !e.claimed && e.el === el);
+      const entry = matchEntry(el);
       if (!entry) {
-        const vk = el.getAttribute("data-vkey");
-        if (vk) entry = state.entries.find((e) => !e.claimed && e.vkey === vk);
-      }
-      if (!entry) {
+        entered++;
         if (fadeIn) {
           el.style.opacity = "0";
           items.push({ el, fade: true, dx: 0, dy: 0, rx: 1, ry: 1, done: false, delay: 0 });
@@ -3139,6 +3233,8 @@
       if (!moved) continue;
       items.push({ el, fade: false, dx: d.dx, dy: d.dy, rx: d.rx, ry: d.ry, done: false, delay: 0 });
     }
+    // structural callbacks fire even when nothing ends up animating
+    fireEnterLeave(entered);
     if (!items.length) {
       if (cb) animFireSlot(cb.sC);
       return 0;
@@ -3341,6 +3437,25 @@
       const el = refHandles[h];
       if (!el) return 0;
       const b = new TextEncoder().encode(String(el.value ?? ""));
+      const n = Math.min(b.length, bc >>> 0);
+      new Uint8Array(memory.buffer, bp, n).set(b.subarray(0, n));
+      return n;
+    },
+    // Phase 7 polish — read a live attribute (probe-then-copy pair, the
+    // storage_len/get contract: 0 = missing attr | stale handle | empty).
+    // Unlocks morph-from-current: read a <path>'s d, morph FROM it.
+    verve_ref_attr_len: (h, np, nl) => {
+      const el = refHandles[h];
+      if (!el) return 0;
+      const v = el.getAttribute(readStr(np, nl));
+      return v == null ? 0 : new TextEncoder().encode(v).length;
+    },
+    verve_ref_get_attr: (h, np, nl, bp, bc) => {
+      const el = refHandles[h];
+      if (!el) return 0;
+      const v = el.getAttribute(readStr(np, nl));
+      if (v == null) return 0;
+      const b = new TextEncoder().encode(v);
       const n = Math.min(b.length, bc >>> 0);
       new Uint8Array(memory.buffer, bp, n).set(b.subarray(0, n));
       return n;
@@ -3745,7 +3860,9 @@
         flushXform();
       }
     },
-    // field: 0 x, 1 y, 2 vx, 3 vy, 4 dragging, 5 throwing
+    // field: 0 x, 1 y, 2 vx, 3 vy, 4 dragging, 5 throwing,
+    //        6 last drop zone index (-1 none), 7 hover zone index (-1 none)
+    // (dead-handle returns 0, ambiguous with zone 0 — existing ABI wart)
     verve_drag_get: (h, f) => {
       const d = drags.get(h >>> 0);
       if (!d) return 0;
@@ -3762,6 +3879,10 @@
           return d.engaged ? 1 : 0;
         case 5:
           return d.throwing ? 1 : 0;
+        case 6:
+          return d.drop;
+        case 7:
+          return d.hover;
         default:
           return 0;
       }

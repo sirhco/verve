@@ -8,6 +8,17 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`verve.anim` polish batch**: islands can morph FROM a live shape —
+  new `verve_ref_attr_len`/`verve_ref_get_attr` ops +
+  `verve.refGetAttrArena(handle, "d")` (probe-then-copy, never
+  truncates); MotionPath `.align_to = .start` re-bases the polyline on
+  its first sample (motion starts at the element's current position —
+  fixes the raw-absolute-coordinates footgun); Draggable drop zones
+  (`.zones` selector + `.zone_class` hover styling + `on_drop` with
+  `DragHandle.dropZone()/hoverZone()`, page-coord per-gesture
+  hit-testing, drop decided at release before any throw); FLIP
+  `on_enter`/`on_leave` callbacks (fire synchronously inside play, also
+  under reduced motion, before `on_complete`).
 - **`verve.anim` — core animation engine** (new, `src/core/anim/`):
   tweens, timelines (labels + position arithmetic), keyframes-in-tween,
   31 easings, grid/distribution stagger, snap/clamp/wrap + wasm fn

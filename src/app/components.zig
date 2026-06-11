@@ -316,9 +316,17 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
             // imperative MorphSVG: the chunk's anim_morph_toggle export
             // animPlay()s a morph tween on this shape per click
             ctx.el("svg").attr("viewBox", "0 0 100 100").attr("width", "80").attr("height", "80").children(.{
-                ctx.el("path").id("morph-island").attr("d", "M50,5 L61,38 L95,38 L67,58 L78,91 L50,71 L22,91 L33,58 L5,38 L39,38 Z").attr("fill", "#10b981"),
+                // data-ref lets the chunk read the LIVE d (morph-from-current)
+                ctx.el("path").id("morph-island").attr("data-ref", "morph-path").attr("d", "M50,5 L61,38 L95,38 L67,58 L78,91 L50,71 L22,91 L33,58 L5,38 L39,38 Z").attr("fill", "#10b981"),
             }),
             ctx.el("button").attr("z-on-click", "anim_morph_toggle").text("morph"),
+            // drop zones for the drag probe (zone hover class is zero-wasm;
+            // the on_drop callback reports the index)
+            ctx.div().class("drop-row").children(.{
+                ctx.div().class("drop-zone").text("zone 0"),
+                ctx.div().class("drop-zone").text("zone 1"),
+            }),
+            ctx.el("button").attr("z-on-click", "anim_flip_card_toggle").text("remove/restore card"),
             // imperative Draggable: the chunk wires callbacks + reads
             // position/velocity through a DragHandle
             ctx.div().id("drag-probe").class("anim-card drag-card").text("drag"),
@@ -801,6 +809,9 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.st-char,.st-word{display:inline-block;will-change:transform}
                 \\.flip-grid{display:flex;gap:.5rem;flex-wrap:wrap;margin:.75rem 0;max-width:18rem}
                 \\.fcard{width:3.5rem;height:3.5rem}
+                \\.drop-row{display:flex;gap:.5rem;margin:.75rem 0}
+                \\.drop-zone{flex:1;min-height:4rem;display:flex;align-items:center;justify-content:center;border:1px dashed #444;border-radius:8px;color:#8b949e}
+                \\.drop-zone.drop-hover{border-color:#58a6ff;color:#58a6ff;background:#11161f}
                 \\.smooth-page{max-width:none}
                 \\.smooth-hero{position:relative;min-height:100vh;display:flex;flex-direction:column;justify-content:center;overflow:hidden}
                 \\.smooth-bg,.smooth-mid{position:absolute;inset:-20% 0;pointer-events:none;will-change:transform}

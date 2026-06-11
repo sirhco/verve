@@ -1143,3 +1143,33 @@ test "/smooth serves the ScrollSmoother page" {
     defer home.deinit(gpa);
     try std.testing.expect(std.mem.indexOf(u8, home.body, "href=\"/smooth\"") != null);
 }
+
+test "phase 7 polish: drop zones, morph-from-current ref, flip toggle, attr ops" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 20);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    var resp = try request(io, gpa, port, "GET", "/anim");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // drop zones in the SSR markup + drag descriptor
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "class=\"drop-zone\"") != null);
+    // the island's drag config is built wasm-side, so the SSR data-drag
+    // (pen demo) stays zone-free — assert the zones markup + flip button
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "z-on-click=\"anim_flip_card_toggle\"") != null);
+    // morph path carries the data-ref for live-d reads (vid-rewritten
+    // inside the island, hence the prefix match)
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-ref=\"morph-path__v") != null);
+
+    var js = try request(io, gpa, port, "GET", "/verve.js");
+    defer js.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_ref_attr_len") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_ref_get_attr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "dragZoneHit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "sE") != null);
+}

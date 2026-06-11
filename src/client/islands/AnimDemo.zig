@@ -77,11 +77,14 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     if (verve.draggable(.{
         .target = "#drag-probe",
         .inertia = .on,
+        .zones = ".drop-zone",
+        .zone_class = "drop-hover",
     }, .{
         .on_start = &onDragStart,
         .on_drag = &onDragMove,
         .on_end = &onDragEnd,
         .on_throw_complete = &onThrowDone,
+        .on_drop = &onDrop,
     })) |dh| drag_id = dh.id;
 }
 
@@ -107,9 +110,10 @@ fn onObserved() void {
     verve.signalSetStr("obs_vel", s);
 }
 
-// Imperative MorphSVG (phase 3): build a morph tween in the chunk arena
-// per click, alternating direction. Demonstrates path math running
-// wasm-side — prepareMorph executes in the chunk at animPlay.
+// Imperative MorphSVG (phase 3 + phase 7 morph-from-current): read the
+// path's LIVE d via refGetAttrArena and morph FROM it — no authored
+// from-string bookkeeping. prepareMorph executes in the chunk at
+// animPlay.
 
 const STAR: []const u8 =
     "M50,5 L61,38 L95,38 L67,58 L78,91 L50,71 L22,91 L33,58 L5,38 L39,38 Z";
@@ -149,11 +153,21 @@ fn onThrowDone() void {
     verve.signalSetStr("drag_state", "settled");
 }
 
+fn onDrop() void {
+    const dh = dragHandle();
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "dropped in zone {d}", .{dh.dropZone()}) catch return;
+    verve.signalSetStr("drag_state", s);
+}
+
 // FLIP shuffle (phase 5): capture the grid, reorder it through the keyed
 // reconciler (all keys persist => moves only, so the html slices are
 // never read — the listDiff invariant this demo relies on), then play.
 
 var flip_keys = [8][]const u8{ "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8" };
+/// How many of flip_keys are currently in the DOM (the remove/restore
+/// toggle drops/re-adds the last one).
+var flip_count: usize = 8;
 var rng_state: u32 = 0x9e3779b9;
 
 fn xorshift() u32 {
@@ -169,13 +183,21 @@ fn onFlipDone() void {
     verve.signalSetStr(STATUS, "shuffle settled");
 }
 
+/// listDiff bind names are NOT vid-scoped automatically — the SSR
+/// rewrote this island's z-bind to "flip_list__v<vid>", so suffix it
+/// ourselves (VizGraphInteractive's vidName precedent).
+fn flipBind(buf: []u8) ?[]const u8 {
+    if (island_vid == 0) return "flip_list";
+    return std.fmt.bufPrint(buf, "flip_list__v{d}", .{island_vid}) catch null;
+}
+
 export fn anim_shuffle() void {
     const state = verve.flipCapture(".flip-grid .fcard") orelse return;
 
     var old: [8][]const u8 = undefined;
-    @memcpy(&old, &flip_keys);
-    // Fisher-Yates over the chunk-static key order
-    var i: usize = flip_keys.len - 1;
+    @memcpy(old[0..flip_count], flip_keys[0..flip_count]);
+    // Fisher-Yates over the present keys
+    var i: usize = flip_count - 1;
     while (i > 0) : (i -= 1) {
         const j = xorshift() % @as(u32, @intCast(i + 1));
         const tmp = flip_keys[i];
@@ -183,15 +205,9 @@ export fn anim_shuffle() void {
         flip_keys[j] = tmp;
     }
     const empty_html = [8][]const u8{ "", "", "", "", "", "", "", "" };
-    // listDiff bind names are NOT vid-scoped automatically — the SSR
-    // rewrote this island's z-bind to "flip_list__v<vid>", so suffix it
-    // ourselves (VizGraphInteractive's vidName precedent).
     var bind_buf: [48]u8 = undefined;
-    const bind: []const u8 = if (island_vid == 0)
-        "flip_list"
-    else
-        std.fmt.bufPrint(&bind_buf, "flip_list__v{d}", .{island_vid}) catch return;
-    verve.listDiff(bind, &old, &flip_keys, &empty_html);
+    const bind = flipBind(&bind_buf) orelse return;
+    verve.listDiff(bind, old[0..flip_count], flip_keys[0..flip_count], empty_html[0..flip_count]);
 
     if (verve.flipPlay(state, .{
         .duration = 0.45,
@@ -201,20 +217,70 @@ export fn anim_shuffle() void {
     verve.signalSetStr(STATUS, "shuffling…");
 }
 
+// Remove/restore the last card through the keyed reconciler — exercises
+// the FLIP enter/leave callbacks and the entered-element fade-in path
+// the shuffle never hits.
+
+fn onCardLeft() void {
+    verve.signalSetStr(STATUS, "card left");
+}
+
+fn onCardEntered() void {
+    verve.signalSetStr(STATUS, "card entered (fading in)");
+}
+
+export fn anim_flip_card_toggle() void {
+    const state = verve.flipCapture(".flip-grid .fcard") orelse return;
+
+    var old: [8][]const u8 = undefined;
+    @memcpy(old[0..flip_count], flip_keys[0..flip_count]);
+    var html = [8][]const u8{ "", "", "", "", "", "", "", "" };
+
+    if (flip_count == 8) {
+        // remove the last present key
+        flip_count = 7;
+    } else {
+        // restore: re-create needs the card's HTML (insert op)
+        flip_count = 8;
+        var hbuf: [96]u8 = undefined;
+        const k = flip_keys[7];
+        html[7] = std.fmt.bufPrint(
+            &hbuf,
+            "<div class=\"anim-card fcard\" data-vkey=\"{s}\">{s}</div>",
+            .{ k, k[1..] },
+        ) catch return;
+    }
+
+    var bind_buf: [48]u8 = undefined;
+    const bind = flipBind(&bind_buf) orelse return;
+    const old_count: usize = if (flip_count == 7) 8 else 7;
+    verve.listDiff(bind, old[0..old_count], flip_keys[0..flip_count], html[0..flip_count]);
+
+    _ = verve.flipPlay(state, .{
+        .duration = 0.4,
+        .ease = .out_cubic,
+        .stagger = 0.01,
+    }, .{ .on_enter = &onCardEntered, .on_leave = &onCardLeft });
+}
+
 export fn anim_morph_toggle() void {
     const mark = verve.chunkArenaMark();
     defer verve.chunkArenaReset(mark);
     const a = verve.chunkArena();
 
+    // morph-from-current: the FROM is whatever the path looks like NOW
+    // (mid-morph clicks morph from the in-flight shape). Pass the RAW
+    // data-ref id — verve.queryRef auto-scopes it to this island's vid
+    // (unlike listDiff, which needs manual suffixing).
+    const h = verve.queryRef(@as([]const u8, "morph-path")) orelse return;
+    const current = verve.refGetAttrArena(h, "d") orelse return;
+    const target: []const u8 = if (island_morphed) STAR else BLOB;
     const t = anim.to(a, "#morph-island")
-        .morph(if (island_morphed)
-            .{ .from = BLOB, .to = STAR }
-        else
-            .{ .from = STAR, .to = BLOB })
+        .morph(.{ .from = current, .to = target })
         .duration(0.8).ease(.in_out_sine);
     if (verve.animPlay(t) == null) return;
     island_morphed = !island_morphed;
-    verve.signalSetStr(STATUS, if (island_morphed) "morphed to circle" else "morphed to star");
+    verve.signalSetStr(STATUS, if (island_morphed) "morphing to circle" else "morphing to star");
 }
 
 // Control buttons — stamped via `z-on-click="<export>"` in the SSR'd

@@ -21,30 +21,61 @@ pub const FlipOpts = struct {
     fade_in: bool = true,
 };
 
-/// `{"d":0.4,"e":"outCubic","sc":0,"st":0,"fade":1[,"cb":{"sC":N}]}`
-pub fn optsToJson(buf: []u8, o: FlipOpts, complete_slot: ?u32) ![]const u8 {
-    if (complete_slot) |s| {
-        return std.fmt.bufPrint(
-            buf,
-            "{{\"d\":{d},\"e\":\"{s}\",\"sc\":{d},\"st\":{d},\"fade\":{d},\"cb\":{{\"sC\":{d}}}}}",
-            .{ o.duration, o.ease.wireName(), @intFromBool(o.scale), o.stagger, @intFromBool(o.fade_in), s },
-        );
+/// Lifecycle callback slot ids (registerEvent — chunk-table-translated).
+/// enter/leave fire synchronously INSIDE the play op, before flipPlay
+/// returns; complete fires from the ticker when everything settles.
+pub const FlipSlots = struct {
+    complete: ?u32 = null,
+    /// Fires once per play when >= 1 element exists that wasn't captured.
+    enter: ?u32 = null,
+    /// Fires once per play when >= 1 captured element is gone.
+    leave: ?u32 = null,
+
+    fn any(self: FlipSlots) bool {
+        return self.complete != null or self.enter != null or self.leave != null;
     }
-    return std.fmt.bufPrint(
-        buf,
-        "{{\"d\":{d},\"e\":\"{s}\",\"sc\":{d},\"st\":{d},\"fade\":{d}}}",
-        .{ o.duration, o.ease.wireName(), @intFromBool(o.scale), o.stagger, @intFromBool(o.fade_in) },
-    );
+};
+
+/// `{"d":0.4,"e":"outCubic","sc":0,"st":0,"fade":1[,"cb":{"sC":N,"sE":N,"sL":N}]}`
+pub fn optsToJson(buf: []u8, o: FlipOpts, slots: FlipSlots) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.print("{{\"d\":{d},\"e\":\"{s}\",\"sc\":{d},\"st\":{d},\"fade\":{d}", .{
+        o.duration,
+        o.ease.wireName(),
+        @intFromBool(o.scale),
+        o.stagger,
+        @intFromBool(o.fade_in),
+    });
+    if (slots.any()) {
+        try w.writeAll(",\"cb\":{");
+        var first = true;
+        if (slots.complete) |s| {
+            try w.print("\"sC\":{d}", .{s});
+            first = false;
+        }
+        if (slots.enter) |s| {
+            if (!first) try w.writeAll(",");
+            try w.print("\"sE\":{d}", .{s});
+            first = false;
+        }
+        if (slots.leave) |s| {
+            if (!first) try w.writeAll(",");
+            try w.print("\"sL\":{d}", .{s});
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("}");
+    return w.buffered();
 }
 
 test "optsToJson goldens" {
-    var buf: [160]u8 = undefined;
+    var buf: [192]u8 = undefined;
 
+    // frozen strings from phase 5 — byte-identical under the new signature
     try std.testing.expectEqualStrings(
         "{\"d\":0.4,\"e\":\"outCubic\",\"sc\":0,\"st\":0,\"fade\":1}",
-        try optsToJson(&buf, .{}, null),
+        try optsToJson(&buf, .{}, .{}),
     );
-
     try std.testing.expectEqualStrings(
         "{\"d\":0.45,\"e\":\"inOutSine\",\"sc\":1,\"st\":0.015,\"fade\":0,\"cb\":{\"sC\":12}}",
         try optsToJson(&buf, .{
@@ -53,6 +84,17 @@ test "optsToJson goldens" {
             .scale = true,
             .stagger = 0.015,
             .fade_in = false,
-        }, 12),
+        }, .{ .complete = 12 }),
+    );
+
+    // new: all three slots, fixed key order sC,sE,sL
+    try std.testing.expectEqualStrings(
+        "{\"d\":0.4,\"e\":\"outCubic\",\"sc\":0,\"st\":0,\"fade\":1,\"cb\":{\"sC\":1,\"sE\":2,\"sL\":3}}",
+        try optsToJson(&buf, .{}, .{ .complete = 1, .enter = 2, .leave = 3 }),
+    );
+    // new: enter-only
+    try std.testing.expectEqualStrings(
+        "{\"d\":0.4,\"e\":\"outCubic\",\"sc\":0,\"st\":0,\"fade\":1,\"cb\":{\"sE\":7}}",
+        try optsToJson(&buf, .{}, .{ .enter = 7 }),
     );
 }

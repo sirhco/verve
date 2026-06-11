@@ -170,9 +170,21 @@ pub const Modifier = struct {
 /// (for SVG children, CSS px == user units, so a viz `pathD` in the same
 /// viewBox traces exactly).
 pub const MotionPath = struct {
+    pub const Align = enum {
+        /// Raw path coordinates written into the translate slots — use
+        /// when the path is authored relative to the element.
+        none,
+        /// Re-base the polyline on its first sample so the motion starts
+        /// at the element's current rendered position — use for paths
+        /// authored in absolute coordinates.
+        start,
+    };
+
     /// SVG path data ("M0,0 C ..."). `verve.viz` edge-path output plugs
     /// in directly.
     path: []const u8,
+    /// (`align` is a Zig keyword, hence the name.)
+    align_to: Align = .none,
     /// Auto-orient along the tangent (drives the rotate xform channel).
     rotate: bool = false,
     /// Added to the tangent angle when `rotate` is on.

@@ -420,7 +420,12 @@ _ = verve.flipPlay(state, .{
 
 Matching: element identity first (covers `move_keyed_child` reorders —
 the keyed reconciler is the FLIP fast path), then `data-vkey` for
-reconciler-recreated nodes. Elements that left are ignored. The invert
+reconciler-recreated nodes. `on_enter` fires once per play when
+uncaptured elements exist (they also fade in under `fade_in`);
+`on_leave` fires once when captured elements are gone — both run
+synchronously BEFORE `flipPlay` returns (don't depend on the handle),
+and both still fire under reduced motion (structural facts, fired in
+jump-to-end order before `on_complete`). The invert
 lands synchronously in the same task as the layout change (no flash),
 then everything eases to identity through the shared transform composer.
 `flipPlay` always consumes the state (`state.discard()` for abandoned
@@ -461,6 +466,13 @@ if (verve.draggable(.{ .target = "#card", .inertia = .on }, .{
 // dh.kill()/.disable()/.enable()/.setPos(x, y)
 ```
 
+Drop zones: `.zones = ".drop-zone"` hit-tests the pointer against zone
+rects (resolved per gesture, page coordinates); `.zone_class` toggles a
+hover class on the zone under the pointer (SSR-legal, zero-wasm);
+`on_drop` fires on release over a zone, with the index via
+`DragHandle.dropZone()` (`hoverZone()` reads live during the drag; −1 =
+none). The drop is decided at the release point, before any throw.
+
 Semantics: a 3px engage threshold keeps clicks inside draggables working
 (configurable `threshold_px`); after a real drag the synthetic click is
 suppressed. Bounds re-measure at the start of every gesture. Throws
@@ -497,6 +509,9 @@ node.animate(anim.to(a, ".marker")
 Path coordinates are written verbatim into the x/y translate slots — px
 offsets in the same space as `.x()`/`.y()` (for SVG children, CSS px ≡
 user units, so a path in the element's own viewBox traces exactly).
+`.align_to = .start` re-bases the polyline on its first sample, so the
+motion starts at the element's current rendered position and follows the
+path's shape — use it for paths authored in absolute coordinates.
 Conflicts are deferred errors: explicit `.x()`/`.y()` props
 (`MotionPathConflict`), `.rotate()` when `rotate = true`, keyframe steps,
 `anim.from`. Parser supports the full SVG grammar (relative commands,
@@ -518,7 +533,17 @@ node.animate(anim.to(a, "#shape")
     .duration(1.4).ease(.in_out_sine).repeat(-1).yoyo(true))
 ```
 
-Both `d` strings must be authored (SSR cannot read live DOM attributes).
+Both `d` strings must be authored on the SSR surface (the server cannot
+read live DOM attributes). Islands can morph FROM the current shape:
+`verve.refGetAttrArena(handle, "d")` reads the live attribute into the
+chunk arena (probe-then-copy — never truncates), so mid-morph clicks
+morph from the in-flight shape:
+
+```zig
+const h = verve.queryRef(@as([]const u8, "morph-path")) orelse return;
+const current = verve.refGetAttrArena(h, "d") orelse return;
+_ = verve.animPlay(anim.to(a, "#shape").morph(.{ .from = current, .to = target }));
+```
 Subpath counts must match (`error.SubpathCountMismatch`) — pre-split
 compound paths. Composes with other props on the same tween (fill color,
 opacity, transforms). Keep segment counts in the low hundreds — the
