@@ -984,3 +984,38 @@ test "/anim serves data-anim descriptors and the AnimDemo island" {
     try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_anim_create") != null);
     try std.testing.expect(std.mem.indexOf(u8, js.body, "data-anim-done") != null);
 }
+
+test "/anim carries ScrollTrigger descriptors and the reveal-only form" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 15);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    var resp = try request(io, gpa, port, "GET", "/anim");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // sc key present inside data-anim payloads (renderer-escaped JSON).
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;sc&quot;:{") != null);
+    // gated entrance: toggle actions [play,none,none,reverse]
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;act&quot;:[1,0,0,4]") != null);
+    // scrubbed + pinned panel with markers
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;scr&quot;:0.3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;pin&quot;:1") != null);
+    // tween-less reveal: sc-only descriptor with class toggle
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        resp.body,
+        "{&quot;v&quot;:1,&quot;sc&quot;:{&quot;s&quot;:[0,0.85],&quot;once&quot;:1,&quot;cls&quot;:&quot;in-view&quot;}}",
+    ) != null);
+
+    // The bridge ships the scroll engine + observer ops.
+    var js = try request(io, gpa, port, "GET", "/verve.js");
+    defer js.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_sc_create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_obs_create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "data-verve-pin-spacer") != null);
+}

@@ -8,6 +8,7 @@
 //! the arena resets immediately after. Only the plain-u32 handle id
 //! survives in chunk static state.
 
+const std = @import("std");
 const verve = @import("verve");
 const anim = verve.anim;
 
@@ -15,6 +16,9 @@ const STATUS: []const u8 = "anim_status";
 
 /// Live timeline handle id (0 = none yet). Plain u32 — safe across frames.
 var intro_id: u32 = 0;
+/// Standalone scroll-trigger + observer handle ids (phase 2 demo).
+var probe_id: u32 = 0;
+var obs_id: u32 = 0;
 
 fn introHandle() verve.AnimHandle {
     return .{ .id = intro_id };
@@ -50,6 +54,41 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
 
     const h = verve.animPlay(tl) orelse return;
     intro_id = h.id;
+
+    // Phase 2: standalone scroll trigger with wasm callbacks on the
+    // #scroll-probe block, plus a wheel/touch Observer velocity readout.
+    verve.registerStr("scroll_state", "scroll down…");
+    verve.registerStr("scroll_prog", "0%");
+    verve.registerStr("obs_vel", "0 px/s");
+    if (verve.scrollTrigger(.{ .trigger = "#scroll-probe" }, .{
+        .on_enter = &onProbeEnter,
+        .on_leave = &onProbeLeave,
+        .on_leave_back = &onProbeLeave,
+        .on_update = &onProbeUpdate,
+    })) |st| probe_id = st.id;
+    if (verve.observe(.{ .wheel = true, .touch = true }, &onObserved)) |ob| obs_id = ob.id;
+}
+
+fn onProbeEnter() void {
+    verve.signalSetStr("scroll_state", "probe in view");
+}
+
+fn onProbeLeave() void {
+    verve.signalSetStr("scroll_state", "probe out of view");
+}
+
+fn onProbeUpdate() void {
+    const st: verve.ScrollTriggerHandle = .{ .id = probe_id };
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d:.0}%", .{st.progress() * 100.0}) catch return;
+    verve.signalSetStr("scroll_prog", s);
+}
+
+fn onObserved() void {
+    const ob: verve.ObserverHandle = .{ .id = obs_id };
+    var buf: [48]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d:.0} px/s", .{ob.velocityY()}) catch return;
+    verve.signalSetStr("obs_vel", s);
 }
 
 // Control buttons — stamped via `z-on-click="<export>"` in the SSR'd

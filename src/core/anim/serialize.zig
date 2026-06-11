@@ -12,6 +12,7 @@ const types = @import("types.zig");
 const util = @import("util.zig");
 const tween_mod = @import("tween.zig");
 const timeline_mod = @import("timeline.zig");
+const scroll = @import("scroll.zig");
 
 /// Which authoring surface is serializing. SSR rejects island-only
 /// constructs (dynamic values, fn modifiers, ref-handle targets, callback
@@ -27,6 +28,20 @@ pub fn tweenToJson(alloc: std.mem.Allocator, t: *const tween_mod.Tween, surface:
 pub fn timelineToJson(alloc: std.mem.Allocator, tl: *const timeline_mod.Timeline, surface: Surface) ![]const u8 {
     if (tl.err) |e| return e;
     return grow(alloc, tl, surface, writeTimelineRoot);
+}
+
+/// Tween-less trigger (`anim.reveal` / standalone island trigger):
+/// `{"v":1,"sc":{...}}`. Routed by the JS interpreter straight to
+/// trigger registration (no `p`/`k`/`ch` keys present).
+pub fn triggerToJson(alloc: std.mem.Allocator, t: *const scroll.Trigger, surface: Surface) ![]const u8 {
+    if (t.err) |e| return e;
+    return grow(alloc, t, surface, writeTriggerRoot);
+}
+
+fn writeTriggerRoot(w: *std.Io.Writer, t: *const scroll.Trigger, surface: Surface) anyerror!void {
+    try w.writeAll("{\"v\":1");
+    try writeScrollTrigger(w, t.config, surface);
+    try w.writeAll("}");
 }
 
 /// Retry-on-overflow sizing: serialize into a fixed buffer, quadrupling on
@@ -81,6 +96,7 @@ fn writeTimelineRoot(w: *std.Io.Writer, tl: *const timeline_mod.Timeline, surfac
         try w.writeAll("}");
     }
     try writeCallbacks(w, tl.on_complete_slot, null, null, tl.cb_island, tl.cb_complete_export, surface);
+    if (tl.scroll_trigger) |sc| try writeScrollTrigger(w, sc, surface);
     try w.writeAll(",\"ch\":[");
     for (tl.entries.items, 0..) |e, i| {
         if (i != 0) try w.writeAll(",");
@@ -123,6 +139,7 @@ fn writeTweenBody(w: *std.Io.Writer, t: *const tween_mod.Tween, surface: Surface
     if (t.stagger_opts) |s| try writeStagger(w, s);
     if (t.modifiers.items.len > 0) try writeModifiers(w, t.modifiers.items, surface);
     try writeCallbacks(w, t.on_complete_slot, t.on_start_slot, t.on_repeat_slot, t.cb_island, t.cb_complete_export, surface);
+    if (t.scroll_trigger) |sc| try writeScrollTrigger(w, sc, surface);
     try writeReducedMotion(w, t.reduced);
     if (!t.autoplay) try w.writeAll(",\"auto\":0");
 }
@@ -291,6 +308,143 @@ fn writeCallbacks(
     try w.writeAll("}");
 }
 
+/// Emit the "sc" scroll-trigger object. Numeric encoding throughout —
+/// the JS interpreter parses no position strings. Defaults are omitted:
+/// start [0,1] ("top bottom"), end [1,0] ("bottom top"), actions
+/// [1,0,0,0] ("play none none none").
+fn writeScrollTrigger(w: *std.Io.Writer, sc: scroll.ScrollTrigger, surface: Surface) anyerror!void {
+    try w.writeAll(",\"sc\":{");
+    var first = true;
+    if (sc.trigger_handle) |h| {
+        if (surface == .ssr) return error.HandleRequiresIsland;
+        try w.print("\"t\":{{\"h\":{d}}}", .{h});
+        first = false;
+    } else if (sc.trigger) |sel| {
+        try w.writeAll("\"t\":{\"s\":");
+        try writeJsonString(w, sel);
+        try w.writeAll("}");
+        first = false;
+    }
+    const sv = sc.start;
+    if (sv.trigger.value() != 0 or sv.viewport.value() != 1 or sv.offset_px != 0) {
+        try comma(w, &first);
+        try writeSpecPair(w, "s", sv);
+    }
+    switch (sc.end) {
+        .at => |e| {
+            if (e.trigger.value() != 1 or e.viewport.value() != 0 or e.offset_px != 0) {
+                try comma(w, &first);
+                try writeSpecPair(w, "e", e);
+            }
+        },
+        .rel_px => |px| {
+            try comma(w, &first);
+            try w.print("\"e\":{{\"r\":{d}}}", .{px});
+        },
+        .rel_vh => |vh| {
+            try comma(w, &first);
+            try w.print("\"e\":{{\"rv\":{d}}}", .{vh});
+        },
+    }
+    switch (sc.scrub) {
+        .off => {},
+        .exact => {
+            try comma(w, &first);
+            try w.writeAll("\"scr\":true");
+        },
+        .smooth => |s| {
+            try comma(w, &first);
+            try w.print("\"scr\":{d}", .{s});
+        },
+    }
+    switch (sc.pin) {
+        .off => {},
+        .self => {
+            try comma(w, &first);
+            try w.writeAll("\"pin\":1");
+        },
+        .selector => |s| {
+            try comma(w, &first);
+            try w.writeAll("\"pin\":{\"s\":");
+            try writeJsonString(w, s);
+            try w.writeAll("}");
+        },
+    }
+    if (!sc.actions.isDefault()) {
+        try comma(w, &first);
+        try w.print("\"act\":[{d},{d},{d},{d}]", .{
+            @intFromEnum(sc.actions.on_enter),
+            @intFromEnum(sc.actions.on_leave),
+            @intFromEnum(sc.actions.on_enter_back),
+            @intFromEnum(sc.actions.on_leave_back),
+        });
+    }
+    if (sc.once) {
+        try comma(w, &first);
+        try w.writeAll("\"once\":1");
+    }
+    if (sc.markers) {
+        try comma(w, &first);
+        try w.writeAll("\"mk\":1");
+    }
+    if (sc.toggle_class) |c| {
+        try comma(w, &first);
+        try w.writeAll("\"cls\":");
+        try writeJsonString(w, c);
+    }
+    if (sc.class_target) |c| {
+        try comma(w, &first);
+        try w.writeAll("\"ct\":");
+        try writeJsonString(w, c);
+    }
+    if (sc.hasSlots() or sc.hasExports()) {
+        if (sc.hasSlots() and surface == .ssr) return error.CallbackSlotRequiresIsland;
+        try comma(w, &first);
+        try w.writeAll("\"cb\":{");
+        var cb_first = true;
+        if (sc.on_enter_slot) |s| try slotField(w, &cb_first, "sE", s);
+        if (sc.on_leave_slot) |s| try slotField(w, &cb_first, "sL", s);
+        if (sc.on_enter_back_slot) |s| try slotField(w, &cb_first, "sEB", s);
+        if (sc.on_leave_back_slot) |s| try slotField(w, &cb_first, "sLB", s);
+        if (sc.on_update_slot) |s| try slotField(w, &cb_first, "sU", s);
+        if (sc.hasExports()) {
+            if (!cb_first) try w.writeAll(",");
+            cb_first = false;
+            try w.writeAll("\"isl\":");
+            try writeJsonString(w, sc.cb_island.?);
+            if (sc.cb_enter_export) |e| {
+                try w.writeAll(",\"nE\":");
+                try writeJsonString(w, e);
+            }
+            if (sc.cb_leave_export) |e| {
+                try w.writeAll(",\"nL\":");
+                try writeJsonString(w, e);
+            }
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("}");
+}
+
+fn comma(w: *std.Io.Writer, first: *bool) anyerror!void {
+    if (!first.*) try w.writeAll(",");
+    first.* = false;
+}
+
+fn slotField(w: *std.Io.Writer, first: *bool, key: []const u8, slot: u32) anyerror!void {
+    if (!first.*) try w.writeAll(",");
+    first.* = false;
+    try w.print("\"{s}\":{d}", .{ key, slot });
+}
+
+fn writeSpecPair(w: *std.Io.Writer, key: []const u8, s: scroll.ScrollSpec) anyerror!void {
+    if (s.offset_px != 0) {
+        try w.print("\"{s}\":[{d},{d},{d}]", .{ key, s.trigger.value(), s.viewport.value(), s.offset_px });
+    } else {
+        try w.print("\"{s}\":[{d},{d}]", .{ key, s.trigger.value(), s.viewport.value() });
+    }
+}
+
 fn writeReducedMotion(w: *std.Io.Writer, rm: types.ReducedMotion) anyerror!void {
     switch (rm) {
         .jump_to_end => {}, // wire default — omitted
@@ -453,6 +607,127 @@ test "ssr rejects island-only constructs" {
 
     const mod_dyn = tween_mod.to(a, ".x").x(1).modifier(.{ .prop = "x", .op = .{ .dyn = 2 } });
     try testing.expectError(error.DynRequiresIsland, tweenToJson(a, mod_dyn, .ssr));
+}
+
+test "golden: scroll-gated tween with class toggle and actions" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.from(a, ".card").opacity(0).y(40).duration(0.6).ease(.out_cubic)
+        .scrollTrigger(.{
+        .start = .{ .trigger = .top, .viewport = .{ .pct = 80 } },
+        .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
+        .toggle_class = "in-view",
+    });
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"t\":{\"s\":\".card\"},\"d\":0.6,\"e\":\"outCubic\"," ++
+            "\"p\":{\"opacity\":{\"f\":0},\"y\":{\"f\":40}}," ++
+            "\"sc\":{\"s\":[0,0.8],\"act\":[1,0,0,4],\"cls\":\"in-view\"}}",
+        json,
+    );
+}
+
+test "golden: scrub + pin + rel_vh end" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".progress").scaleX(1).duration(1)
+        .scrollTrigger(.{
+        .start = .{ .viewport = .top },
+        .end = .{ .rel_vh = 2 },
+        .scrub = .{ .smooth = 0.4 },
+        .pin = .self,
+        .markers = true,
+    });
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"t\":{\"s\":\".progress\"},\"d\":1,\"e\":\"outQuad\"," ++
+            "\"p\":{\"scaleX\":{\"to\":1}}," ++
+            "\"sc\":{\"s\":[0,0],\"e\":{\"rv\":2},\"scr\":0.4,\"pin\":1,\"mk\":1}}",
+        json,
+    );
+}
+
+test "golden: timeline-level exact scrub" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tl = timeline_mod.timeline(a)
+        .add(tween_mod.to(a, ".panel").x(-400).duration(1), .end)
+        .scrollTrigger(.{ .trigger = ".story", .scrub = .exact });
+    const json = try timelineToJson(a, tl, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"tl\":1,\"sc\":{\"t\":{\"s\":\".story\"},\"scr\":true}," ++
+            "\"ch\":[{\"pos\":0,\"t\":{\"s\":\".panel\"},\"d\":1,\"e\":\"outQuad\"," ++
+            "\"p\":{\"x\":{\"to\":-400}}}]}",
+        json,
+    );
+}
+
+test "golden: standalone reveal trigger (anim-less)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tr = scroll.reveal(a, "in-view", .{
+        .start = .{ .viewport = .{ .pct = 85 } },
+        .once = true,
+    });
+    const json = try triggerToJson(a, tr, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"sc\":{\"s\":[0,0.85],\"once\":1,\"cls\":\"in-view\"}}",
+        json,
+    );
+}
+
+test "golden: island sc callback slots + handle trigger" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tr = scroll.trigger(a, .{
+        .trigger = "#sec",
+        .on_enter_slot = 21,
+        .on_leave_slot = 22,
+        .on_update_slot = 23,
+    });
+    const json = try triggerToJson(a, tr, .island);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"sc\":{\"t\":{\"s\":\"#sec\"},\"cb\":{\"sE\":21,\"sL\":22,\"sU\":23}}}",
+        json,
+    );
+
+    const handle_t = tween_mod.to(a, ".x").x(1)
+        .scrollTrigger(.{ .trigger_handle = 12 });
+    const hj = try tweenToJson(a, handle_t, .island);
+    try testing.expect(std.mem.indexOf(u8, hj, "\"sc\":{\"t\":{\"h\":12}}") != null);
+}
+
+test "golden: sc named-export callbacks on SSR" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tr = scroll.trigger(a, .{
+        .trigger = "#hero",
+        .cb_island = "Hero",
+        .cb_enter_export = "hero_enter",
+    });
+    const json = try triggerToJson(a, tr, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"sc\":{\"t\":{\"s\":\"#hero\"},\"cb\":{\"isl\":\"Hero\",\"nE\":\"hero_enter\"}}}",
+        json,
+    );
+}
+
+test "ssr rejects sc island-only constructs" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const slot_t = tween_mod.to(a, ".x").x(1).scrollTrigger(.{ .on_enter_slot = 5 });
+    try testing.expectError(error.CallbackSlotRequiresIsland, tweenToJson(a, slot_t, .ssr));
+
+    const handle_t = tween_mod.to(a, ".x").x(1).scrollTrigger(.{ .trigger_handle = 3 });
+    try testing.expectError(error.HandleRequiresIsland, tweenToJson(a, handle_t, .ssr));
 }
 
 test "builder error propagates through toJson" {

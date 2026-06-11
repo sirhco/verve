@@ -27,6 +27,17 @@ pub const serialize = @import("serialize.zig");
 pub const ease = @import("ease.zig");
 pub const staggerDelay = @import("stagger.zig").delayFor;
 
+pub const scroll = @import("scroll.zig");
+pub const ScrollTrigger = scroll.ScrollTrigger;
+pub const ScrollSpec = scroll.ScrollSpec;
+pub const Frac = scroll.Frac;
+pub const EndSpec = scroll.EndSpec;
+pub const Scrub = scroll.Scrub;
+pub const Pin = scroll.Pin;
+pub const Action = scroll.Action;
+pub const ToggleActions = scroll.ToggleActions;
+pub const reveal = scroll.reveal;
+
 pub const util = @import("util.zig");
 pub const clamp = util.clamp;
 pub const lerp = util.lerp;

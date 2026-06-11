@@ -6,6 +6,37 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.anim` — core animation engine** (new, `src/core/anim/`):
+  tweens, timelines (labels + position arithmetic), keyframes-in-tween,
+  31 easings, grid/distribution stagger, snap/clamp/wrap + wasm fn
+  modifiers, dynamic per-target end values, and a control API
+  (pause/play/reverse/restart/seek/seekLabel/timeScale/kill). Hybrid
+  execution: Zig builds + serializes `"v":1` descriptors
+  (`serialize.zig` golden tests are the wire contract); a verve.js
+  interpreter owns the rAF loop and composes one `style.transform`
+  write per element per frame. Two surfaces: declarative SSR
+  `Node.animate(...)` (`data-anim`, no island needed) and imperative
+  island `verve.animPlay(...)` → `AnimHandle`. Built-in
+  `prefers-reduced-motion` handling (jump-to-end default, `.play` /
+  `.skip` overrides, live media-query flips). Guide:
+  `docs/23-animation.md`; demo: the `/anim` route.
+- **`verve.anim` ScrollTrigger** (`src/core/anim/scroll.zig`, wire key
+  `"sc"`): gate tweens/timelines with GSAP-style toggle actions, scrub
+  progress to the scrollbar (exact or smoothed), pin elements with
+  layout-preserving spacers, zero-wasm class-toggle reveals
+  (`anim.reveal`), debug markers, and island callbacks
+  (`verve.scrollCallbacks` / standalone `verve.scrollTrigger` →
+  `ScrollTriggerHandle`). Vertical window scroll in v1; geometry cached
+  as document-space pixels, re-measured on resize/load/fonts.
+- **`verve.observe` Observer** (islands): unified wheel/touch/
+  pointer-drag/scroll input with ring-buffer velocity tracking, axis
+  lock, tolerance, and preventDefault control — substrate for future
+  ScrollSmoother/Draggable.
+- **`verve.setRefStyle`** — per-handle inline style setter
+  (`el.style.setProperty`) alongside `setRefAttr`.
+
 ## [0.3.0] - 2026-06-10
 
 The visualization release: a complete pure-Zig chart + graph library

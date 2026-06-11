@@ -6,6 +6,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const tween_mod = @import("tween.zig");
+const scroll = @import("scroll.zig");
 
 pub const Timeline = struct {
     alloc: std.mem.Allocator,
@@ -18,6 +19,9 @@ pub const Timeline = struct {
     delay_s: f64 = 0,
     reduced: types.ReducedMotion = .jump_to_end,
     autoplay: bool = true,
+    /// Scroll trigger on the WHOLE timeline (wire key "sc"). Children
+    /// may not carry their own — see `add`.
+    scroll_trigger: ?scroll.ScrollTrigger = null,
     on_complete_slot: ?u32 = null,
     cb_island: ?[]const u8 = null,
     cb_complete_export: ?[]const u8 = null,
@@ -34,10 +38,16 @@ pub const Timeline = struct {
     };
 
     /// Append a tween at `at`. Absorbs the tween's deferred error.
+    /// A child carrying its own scroll trigger is rejected — set the
+    /// trigger on the timeline instead.
     pub fn add(self: *Timeline, t: *tween_mod.Tween, at: types.Position) *Timeline {
         if (self.err != null) return self;
         if (t.err) |e| {
             self.err = e;
+            return self;
+        }
+        if (t.scroll_trigger != null) {
+            self.err = error.NestedScrollTrigger;
             return self;
         }
         const start = self.resolve(at) catch |e| {
@@ -97,6 +107,21 @@ pub const Timeline = struct {
     pub fn paused(self: *Timeline) *Timeline {
         if (self.err != null) return self;
         self.autoplay = false;
+        return self;
+    }
+
+    /// Gate or scrub the whole timeline by scroll position.
+    pub fn scrollTrigger(self: *Timeline, sc: scroll.ScrollTrigger) *Timeline {
+        if (self.err != null) return self;
+        if (self.scroll_trigger != null) {
+            self.err = error.DuplicateScrollTrigger;
+            return self;
+        }
+        if (sc.validate()) |e| {
+            self.err = e;
+            return self;
+        }
+        self.scroll_trigger = sc;
         return self;
     }
 
@@ -223,6 +248,22 @@ test "tween error propagates through add" {
     const bad = tween_mod.to(a, ".x").opacity(1).step(0); // StepAfterProps
     const tl = timeline(a).add(bad, .end);
     try std.testing.expectEqual(@as(?anyerror, error.StepAfterProps), tl.err);
+}
+
+test "child with its own scroll trigger is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const child = tween_mod.to(a, ".x").x(1).scrollTrigger(.{});
+    const tl = timeline(a).add(child, .end);
+    try std.testing.expectEqual(@as(?anyerror, error.NestedScrollTrigger), tl.err);
+
+    // trigger on the timeline itself is fine
+    const ok = timeline(a)
+        .add(testTween(a, 1.0), .end)
+        .scrollTrigger(.{ .scrub = .{ .smooth = 0.4 } });
+    try std.testing.expect(ok.err == null);
 }
 
 test "totalDuration with repeat and infinite child" {

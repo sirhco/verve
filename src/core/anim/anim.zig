@@ -31,6 +31,18 @@ pub const serialize = @import("serialize.zig");
 pub const ease = @import("ease.zig");
 pub const staggerDelay = @import("stagger.zig").delayFor;
 
+// ScrollTrigger (phase 2): gate/scrub/pin animations by scroll position.
+pub const scroll = @import("scroll.zig");
+pub const ScrollTrigger = scroll.ScrollTrigger;
+pub const ScrollSpec = scroll.ScrollSpec;
+pub const Frac = scroll.Frac;
+pub const EndSpec = scroll.EndSpec;
+pub const Scrub = scroll.Scrub;
+pub const Pin = scroll.Pin;
+pub const Action = scroll.Action;
+pub const ToggleActions = scroll.ToggleActions;
+pub const reveal = scroll.reveal;
+
 // Math utilities (also re-exported flat for ergonomics).
 pub const util = @import("util.zig");
 pub const clamp = util.clamp;
@@ -52,4 +64,5 @@ test {
     _ = @import("tween.zig");
     _ = @import("timeline.zig");
     _ = @import("serialize.zig");
+    _ = @import("scroll.zig");
 }

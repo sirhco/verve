@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const scroll = @import("scroll.zig");
 
 pub const PropEntry = struct {
     /// Wire prop name: "x", "opacity", "background-color", "attr:cx", ...
@@ -53,7 +54,10 @@ pub const Tween = struct {
     modifiers: std.ArrayList(types.Modifier) = .empty,
     reduced: types.ReducedMotion = .jump_to_end,
     /// false = constructed paused (`animPrepare`); wire "auto":0.
+    /// Ignored when a scroll trigger is set — the trigger owns play-state.
     autoplay: bool = true,
+    /// Scroll-position gating/scrubbing (wire key "sc"). One per tween.
+    scroll_trigger: ?scroll.ScrollTrigger = null,
 
     /// Lifecycle callbacks as event-slot ids (`verve.registerEvent`,
     /// already chunk-table-translated — raw fn-table indices would dangle).
@@ -137,6 +141,24 @@ pub const Tween = struct {
     pub fn paused(self: *Tween) *Tween {
         if (self.err != null) return self;
         self.autoplay = false;
+        return self;
+    }
+
+    /// Gate or scrub this tween by scroll position. Validates eagerly;
+    /// one trigger per tween. Scrub and non-default toggle actions are
+    /// mutually exclusive. Island callback slots ride the config (see
+    /// `verve.scrollCallbacks`).
+    pub fn scrollTrigger(self: *Tween, sc: scroll.ScrollTrigger) *Tween {
+        if (self.err != null) return self;
+        if (self.scroll_trigger != null) {
+            self.err = error.DuplicateScrollTrigger;
+            return self;
+        }
+        if (sc.validate()) |e| {
+            self.err = e;
+            return self;
+        }
+        self.scroll_trigger = sc;
         return self;
     }
 
@@ -365,6 +387,30 @@ test "poison chain survives" {
     const t = to(failing.allocator(), ".x").x(1).duration(2).step(0).yoyo(true);
     try std.testing.expectEqual(@as(?anyerror, error.OutOfMemory), t.err);
     try std.testing.expect(t == &poison);
+}
+
+test "scrollTrigger validates and rejects duplicates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const t = to(a, ".card").opacity(1).scrollTrigger(.{
+        .start = .{ .viewport = .{ .pct = 80 } },
+        .actions = .{ .on_leave_back = .reverse },
+    });
+    try std.testing.expect(t.err == null);
+    try std.testing.expect(t.scroll_trigger != null);
+
+    const dup = to(a, ".x").x(1)
+        .scrollTrigger(.{})
+        .scrollTrigger(.{});
+    try std.testing.expectEqual(@as(?anyerror, error.DuplicateScrollTrigger), dup.err);
+
+    const conflict = to(a, ".x").x(1).scrollTrigger(.{
+        .scrub = .exact,
+        .actions = .{ .on_leave = .pause },
+    });
+    try std.testing.expectEqual(@as(?anyerror, error.ScrubWithToggleActions), conflict.err);
 }
 
 test "totalDuration with repeat and repeatDelay" {

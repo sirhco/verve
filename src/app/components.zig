@@ -295,6 +295,24 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
         }),
         controls,
         deck,
+        // Standalone-trigger + Observer probe. Lives INSIDE the island so
+        // its z-binds get vid-rewritten consistently with the chunk's
+        // scoped registerStr/signalSetStr calls.
+        ctx.div().class("anim-spacer").ariaHidden(true),
+        ctx.div().id("scroll-probe").class("anim-probe").children(.{
+            ctx.p().children(.{
+                ctx.span().text("island trigger: "),
+                ctx.span().bind("scroll_state").text("scroll down…"),
+            }),
+            ctx.p().children(.{
+                ctx.span().text("trigger progress: "),
+                ctx.span().bind("scroll_prog").text("0%"),
+            }),
+            ctx.p().children(.{
+                ctx.span().text("wheel/touch velocity: "),
+                ctx.span().bind("obs_vel").text("0 px/s"),
+            }),
+        }),
     });
     const anim_island = verve.island(ctx, .{ .name = "AnimDemo" }, island_inner);
 
@@ -314,8 +332,59 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
             .step(100).scale(1.0)
             .duration(1.4).repeat(-1).reducedMotion(.skip)),
         anim_island,
+        scrollSection(ctx),
         ctx.p().children(.{ctx.a("/", "← Home")}),
     }).build();
+}
+
+/// ScrollTrigger demo (phase 2): scroll-gated stagger, zero-wasm class
+/// reveal, and a pinned scrubbed panel (markers on for DX show-off).
+fn scrollSection(ctx: *const verve.Context) *verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
+    const deck = ctx.div().class("anim-deck");
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        _ = deck.children(.{ctx.div().class("anim-card scard").textInt(i + 1)});
+    }
+
+    return ctx.el("section").class("anim-scroll").children(.{
+        ctx.div().class("anim-spacer").ariaHidden(true),
+        ctx.h2("ScrollTrigger: gated entrance")
+            .animate(anim.reveal(a, "in-view", .{
+            .start = .{ .viewport = .{ .pct = 85 } },
+            .once = true,
+        })),
+        ctx.p().class("hint").text("Cards play in at 80% viewport, reverse when you scroll back above them. The heading gets a zero-wasm class toggle."),
+        deck.animate(anim.from(a, ".scard")
+            .opacity(0).y(40)
+            .duration(0.5).ease(.out_back)
+            .stagger(.{ .each = 0.07 })
+            .scrollTrigger(.{
+            .start = .{ .viewport = .{ .pct = 80 } },
+            .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
+        })),
+        ctx.div().class("anim-spacer").ariaHidden(true),
+        ctx.h2("Scrub + pin"),
+        ctx.p().class("hint").text("The panel pins for 150vh while the bar scrubs scroll progress (smoothed, 0.3s). Dashed lines are debug markers."),
+        ctx.div().class("anim-pin-panel")
+            .children(.{
+                ctx.div().class("anim-scrub-bar").ariaHidden(true),
+                ctx.p().text("This panel is pinned while the bar scrubs."),
+            })
+            .animate(anim.to(a, ".anim-scrub-bar")
+            .scaleX(1).propFrom("scaleX", 0)
+            .duration(1).ease(.linear)
+            .scrollTrigger(.{
+            .start = .{ .trigger = .top, .viewport = .{ .pct = 20 } },
+            .end = .{ .rel_vh = 1.5 },
+            .scrub = .{ .smooth = 0.3 },
+            .pin = .self,
+            .markers = true,
+        })),
+        ctx.div().class("anim-spacer").ariaHidden(true),
+    });
 }
 
 pub fn workDetail(ctx: *const verve.Context, slug: []const u8) !*verve.Node {
@@ -466,6 +535,11 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.anim-controls{display:flex;gap:.25rem;flex-wrap:wrap;margin:.5rem 0}
                 \\.anim-controls button{padding:.35rem .7rem}
                 \\.anim-pulse{width:.9rem;height:.9rem;border-radius:50%;background:#58a6ff;margin:.5rem 0}
+                \\.anim-spacer{height:60vh}
+                \\.anim-scroll h2.in-view{color:#58a6ff}
+                \\.anim-pin-panel{padding:1rem;border:1px solid #333;border-radius:8px;background:#16161a}
+                \\.anim-scrub-bar{height:.5rem;border-radius:4px;background:#1f6feb;transform-origin:left center;margin-bottom:.75rem}
+                \\.anim-probe{padding:1rem;border:1px dashed #444;border-radius:8px}
                 \\.viz-card svg{touch-action:none;max-width:100%}
                 \\.viz-node{cursor:grab}
                 \\.viz-node.selected circle{stroke:#fff;stroke-width:3}

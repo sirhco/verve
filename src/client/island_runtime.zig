@@ -894,6 +894,214 @@ pub fn animModFn(prop: []const u8, f: *const fn (f64) f64) anim.Modifier {
     return .{ .prop = prop, .op = .{ .dyn = verve_anim_register_mod(@intCast(@intFromPtr(f))) } };
 }
 
+// ---- ScrollTrigger / Observer (verve.anim phase 2) -------------------------
+//
+// ScrollTrigger config rides the animation descriptor ("sc" key) for
+// tweens/timelines played via `animPlay` — the AnimHandle controls both,
+// and killing the animation kills its trigger. The standalone form below
+// is for triggers with no animation (callbacks / class toggles).
+
+extern "verve_runtime" fn verve_sc_create(desc_ptr: [*]const u8, desc_len: u32) u32;
+// op: 0 kill, 1 refresh (handle 0 = refresh ALL), 2 disable, 3 enable
+extern "verve_runtime" fn verve_sc_ctrl(handle: u32, op: u32) void;
+// field: 0 progress, 1 active, 2 direction, 3 scroll velocity (px/s)
+extern "verve_runtime" fn verve_sc_get(handle: u32, field: u32) f64;
+extern "verve_runtime" fn verve_scroll_pos(axis: u32) f64; // 0 x, 1 y
+// Observer handler crosses as a chunk-private fn-table index; the
+// bridge's makeChunkRuntime wrapper copies the funcref into the main
+// table (timers precedent).
+extern "verve_runtime" fn verve_obs_create(flags: u32, tolerance: f64, sel_ptr: [*]const u8, sel_len: u32, handler_idx: u32) u32;
+// op: 0 kill, 1 disable, 2 enable
+extern "verve_runtime" fn verve_obs_ctrl(handle: u32, op: u32) void;
+// field: 0 dx, 1 dy, 2 vx, 3 vy, 4 dirX, 5 dirY, 6 dragging,
+//        7 kind (0 wheel, 1 touch, 2 pointer, 3 scroll)
+extern "verve_runtime" fn verve_obs_get(handle: u32, field: u32) f64;
+
+/// Live standalone scroll-trigger handle. Plain u32 id — safe in chunk
+/// statics; all ops no-op on a killed/unknown handle.
+pub const ScrollTriggerHandle = struct {
+    id: u32,
+
+    pub fn kill(self: ScrollTriggerHandle) void {
+        verve_sc_ctrl(self.id, 0);
+    }
+    /// Re-measure this trigger's geometry (after layout-changing DOM work).
+    pub fn refresh(self: ScrollTriggerHandle) void {
+        verve_sc_ctrl(self.id, 1);
+    }
+    pub fn disable(self: ScrollTriggerHandle) void {
+        verve_sc_ctrl(self.id, 2);
+    }
+    pub fn enable(self: ScrollTriggerHandle) void {
+        verve_sc_ctrl(self.id, 3);
+    }
+    /// 0..1 through the start..end range (clamped).
+    pub fn progress(self: ScrollTriggerHandle) f64 {
+        return verve_sc_get(self.id, 0);
+    }
+    pub fn isActive(self: ScrollTriggerHandle) bool {
+        return verve_sc_get(self.id, 1) != 0;
+    }
+    /// +1 scrolling down, -1 scrolling up.
+    pub fn direction(self: ScrollTriggerHandle) f64 {
+        return verve_sc_get(self.id, 2);
+    }
+    /// Page scroll velocity, px/s (decays after scrolling stops).
+    pub fn velocity(self: ScrollTriggerHandle) f64 {
+        return verve_sc_get(self.id, 3);
+    }
+};
+
+/// Lifecycle callbacks for scroll triggers. Registered as event slots
+/// (same translation as `registerEvent`); handlers must not capture
+/// chunk-arena pointers.
+pub const ScrollCallbacks = struct {
+    on_enter: ?*const fn () void = null,
+    on_leave: ?*const fn () void = null,
+    on_enter_back: ?*const fn () void = null,
+    on_leave_back: ?*const fn () void = null,
+    /// Fires each scroll tick while inside the range; read progress /
+    /// velocity via the handle.
+    on_update: ?*const fn () void = null,
+};
+
+fn stampScrollSlots(sc: *anim.ScrollTrigger, cbs: ScrollCallbacks) void {
+    if (cbs.on_enter) |f| sc.on_enter_slot = registerEvent(f);
+    if (cbs.on_leave) |f| sc.on_leave_slot = registerEvent(f);
+    if (cbs.on_enter_back) |f| sc.on_enter_back_slot = registerEvent(f);
+    if (cbs.on_leave_back) |f| sc.on_leave_back_slot = registerEvent(f);
+    if (cbs.on_update) |f| sc.on_update_slot = registerEvent(f);
+}
+
+/// Stamp scroll callbacks onto a builder's existing `.scrollTrigger(...)`
+/// config. Works on `*anim.Tween` and `*anim.Timeline`. Deferred
+/// `error.ScrollTriggerNotSet` when no trigger was configured.
+pub fn scrollCallbacks(t: anytype, cbs: ScrollCallbacks) @TypeOf(t) {
+    if (t.err != null) return t;
+    if (t.scroll_trigger == null) {
+        t.err = error.ScrollTriggerNotSet;
+        return t;
+    }
+    stampScrollSlots(&t.scroll_trigger.?, cbs);
+    return t;
+}
+
+/// Standalone scroll trigger with no animation attached:
+/// `verve.scrollTrigger(.{ .trigger = "#sec" }, .{ .on_enter = &onEnter })`.
+/// Returns null on validation/serialize failure or missing trigger element.
+pub fn scrollTrigger(cfg: anim.ScrollTrigger, cbs: ScrollCallbacks) ?ScrollTriggerHandle {
+    var c = cfg;
+    stampScrollSlots(&c, cbs);
+    const a = chunkArena();
+    const trig = anim.scroll.trigger(a, c);
+    const json = anim.serialize.triggerToJson(a, trig, .island) catch return null;
+    const h = verve_sc_create(json.ptr, @intCast(json.len));
+    if (h == 0) return null;
+    return .{ .id = h };
+}
+
+/// Re-measure ALL trigger geometry (after layout-changing DOM work).
+pub fn scrollRefresh() void {
+    verve_sc_ctrl(0, 1);
+}
+
+/// Current page scroll position, px.
+pub fn scrollPos() f64 {
+    return verve_scroll_pos(1);
+}
+
+pub fn scrollPosX() f64 {
+    return verve_scroll_pos(0);
+}
+
+/// Observer config — unified wheel/touch/pointer/scroll input detection
+/// with velocity tracking. One onChange handler; read values via
+/// `ObserverHandle` getters.
+pub const ObserverConfig = struct {
+    /// CSS selector to observe; null = the whole window.
+    target: ?[]const u8 = null,
+    wheel: bool = false,
+    touch: bool = false,
+    pointer: bool = false,
+    scroll: bool = false,
+    /// Force non-passive listeners and call preventDefault — suppresses
+    /// native scrolling (the future ScrollSmoother path). Careful: this
+    /// also suppresses the page scroll ScrollTriggers depend on.
+    prevent_default: bool = false,
+    /// Restrict deltas to the dominant axis once a gesture commits.
+    lock_axis: bool = false,
+    /// Minimum accumulated px before the handler starts firing.
+    tolerance: f64 = 0,
+
+    fn flags(self: ObserverConfig) u32 {
+        var f: u32 = 0;
+        if (self.wheel) f |= 1;
+        if (self.touch) f |= 2;
+        if (self.pointer) f |= 4;
+        if (self.scroll) f |= 8;
+        if (self.prevent_default) f |= 16;
+        if (self.lock_axis) f |= 32;
+        return f;
+    }
+};
+
+pub const ObserverHandle = struct {
+    id: u32,
+
+    pub fn kill(self: ObserverHandle) void {
+        verve_obs_ctrl(self.id, 0);
+    }
+    pub fn disable(self: ObserverHandle) void {
+        verve_obs_ctrl(self.id, 1);
+    }
+    pub fn enable(self: ObserverHandle) void {
+        verve_obs_ctrl(self.id, 2);
+    }
+    pub fn deltaX(self: ObserverHandle) f64 {
+        return verve_obs_get(self.id, 0);
+    }
+    pub fn deltaY(self: ObserverHandle) f64 {
+        return verve_obs_get(self.id, 1);
+    }
+    pub fn velocityX(self: ObserverHandle) f64 {
+        return verve_obs_get(self.id, 2);
+    }
+    pub fn velocityY(self: ObserverHandle) f64 {
+        return verve_obs_get(self.id, 3);
+    }
+    /// +1 / -1 / 0 (no horizontal movement yet).
+    pub fn dirX(self: ObserverHandle) f64 {
+        return verve_obs_get(self.id, 4);
+    }
+    pub fn dirY(self: ObserverHandle) f64 {
+        return verve_obs_get(self.id, 5);
+    }
+    pub fn isDragging(self: ObserverHandle) bool {
+        return verve_obs_get(self.id, 6) != 0;
+    }
+    pub const Kind = enum(u32) { wheel = 0, touch = 1, pointer = 2, scroll = 3 };
+    /// Input kind of the most recent delta.
+    pub fn kind(self: ObserverHandle) Kind {
+        return @enumFromInt(@as(u32, @intFromFloat(verve_obs_get(self.id, 7))));
+    }
+};
+
+/// Unified input observer. `handler` fires on every accepted delta; read
+/// the values through the returned handle. Returns null when the target
+/// selector matches nothing.
+pub fn observe(cfg: ObserverConfig, handler: *const fn () void) ?ObserverHandle {
+    const sel = cfg.target orelse "";
+    const h = verve_obs_create(
+        cfg.flags(),
+        cfg.tolerance,
+        sel.ptr,
+        @intCast(sel.len),
+        @intCast(@intFromPtr(handler)),
+    );
+    if (h == 0) return null;
+    return .{ .id = h };
+}
+
 // ---- Timers (Phase 19) --------------------------------------------------
 //
 // Handlers are `*const fn () void` taken via `&handler` — the same

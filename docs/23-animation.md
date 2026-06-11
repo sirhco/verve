@@ -228,6 +228,96 @@ GSAP-compatible), `interpolate`, `snap`, `wrap`, `pipe` (comptime fn
 composition), `parseColor` / `interpolateColor` / `Color`, and
 `staggerDelay(i, n, spec)`.
 
+## ScrollTrigger
+
+Gate, scrub, or pin any tween/timeline by scroll position. v1 scope:
+vertical window scroll. Config rides the same descriptor (wire key
+`"sc"`); the bridge caches trigger ranges as document-space pixels (no
+IntersectionObserver — exact and cheap) and re-measures on resize, load,
+and font-ready.
+
+```zig
+// Scroll-gated entrance: play at 80% viewport, reverse scrolling back up
+ctx.div().class("cards").animate(anim.from(a, ".card")
+    .opacity(0).y(40).duration(0.5).ease(.out_back)
+    .stagger(.{ .each = 0.07 })
+    .scrollTrigger(.{
+        .start = .{ .viewport = .{ .pct = 80 } },   // "top 80%"
+        .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
+    }))
+
+// Scrubbed + pinned: progress locked to the scrollbar (smoothed 0.3s),
+// panel pinned for 1.5 viewport-heights; markers = debug lines
+.animate(anim.to(a, ".bar").scaleX(1).propFrom("scaleX", 0).duration(1)
+    .scrollTrigger(.{
+        .start = .{ .trigger = .top, .viewport = .{ .pct = 20 } },
+        .end = .{ .rel_vh = 1.5 },
+        .scrub = .{ .smooth = 0.3 },   // or .exact, hard-bound
+        .pin = .self,                  // or .{ .selector = ".panel" }
+        .markers = true,
+    }))
+
+// Zero-wasm reveal: class toggle only, no tween, no rAF — pair with CSS
+ctx.h2("Pricing").animate(anim.reveal(a, "in-view", .{
+    .start = .{ .viewport = .{ .pct = 85 } },
+    .once = true,
+}))
+```
+
+- **Position specs** are Zig-native, GSAP-readable: `.{ .trigger = .top,
+  .viewport = .{ .pct = 80 } }` is "top 80%". `Frac` accepts
+  `.top/.center/.bottom/.pct/.frac`; specs take an `offset_px`. End:
+  absolute spec, `.{ .rel_px = 500 }` ("+=500"), or `.{ .rel_vh = 1.5 }`.
+  Defaults match GSAP: start "top bottom", end "bottom top".
+- **Toggle actions** (4 slots: enter/leave/enterBack/leaveBack, each
+  `none|play|pause|@"resume"|reverse|restart|complete|reset`) gate
+  playback. Mutually exclusive with **scrub**
+  (`error.ScrubWithToggleActions`). Infinite-repeat tweens can't scrub
+  (warn + fallback to toggle-play).
+- **Pin** wraps the element in a spacer (`data-verve-pin-spacer`) so the
+  page doesn't collapse; pinned elements shouldn't also be x/y tween
+  targets. One trigger per tween/timeline; timeline children can't carry
+  their own (`error.NestedScrollTrigger`).
+- **`toggle_class`** (`class_target` to redirect it) is SSR-legal and
+  needs no wasm. Careful: CSS that hides content pending the class blanks
+  no-JS users — prefer `.from` tweens for essential content.
+- **Reduced motion**: anim-bearing triggers jump to their end state on
+  registration (scrub included — content stays readable); pins are
+  disabled; class toggles and callback triggers still run.
+- **Island surface**: `verve.scrollCallbacks(t, .{ .on_enter = &f, ... })`
+  stamps wasm callbacks onto a builder's trigger;
+  `verve.scrollTrigger(cfg, cbs)` creates a standalone trigger (no
+  animation) returning a `ScrollTriggerHandle` with
+  `kill/refresh/disable/enable` + `progress/isActive/direction/velocity`.
+  `verve.scrollRefresh()` re-measures everything after layout-changing
+  DOM work; `verve.scrollPos()` reads the page scroll position. SSR
+  named-export callbacks: `cb_island` + `cb_enter_export`/`cb_leave_export`.
+
+## Observer (islands)
+
+Unified wheel / touch / pointer-drag / scroll input detection with
+velocity tracking — the substrate for flick/inertia UI (and the future
+ScrollSmoother/Draggable plugins). Island-only.
+
+```zig
+var obs_id: u32 = 0;
+
+fn onInput() void {
+    const ob: verve.ObserverHandle = .{ .id = obs_id };
+    // ob.deltaY(), ob.velocityY() (px/s), ob.dirY(), ob.isDragging(), ob.kind()
+}
+
+if (verve.observe(.{ .wheel = true, .touch = true, .tolerance = 4 }, &onInput)) |ob|
+    obs_id = ob.id;
+```
+
+`ObserverConfig`: `target` selector (null = window), input flags
+(`wheel/touch/pointer/scroll`), `prevent_default` (suppresses native
+scrolling — required for smoothers, but it also suppresses the scroll
+that ScrollTriggers depend on), `lock_axis`, `tolerance`. Handle:
+`kill/disable/enable` + delta/velocity/direction getters. Touch deltas
+use wheel polarity (finger up = positive deltaY).
+
 ## Wire format (reference)
 
 `data-anim` / `verve_anim_create` carry the same JSON:
@@ -246,8 +336,25 @@ Keyframes replace `p` with
 offset 0..1). Timelines: `"tl":1` with `"ch":[{"pos":<seconds>,...}]` and
 `"lab":{"name":<seconds>}`. Targets: `{"s":selector}` (SSR: scoped to the
 carrying element), `{"h":refHandle}` (island), omitted = the carrying
-element. Colors normalize to `{"c":[r,g,b,a]}`. The serializer's golden
-tests (`zig test src/core/anim/serialize.zig`) freeze this contract.
+element. Colors normalize to `{"c":[r,g,b,a]}`.
+
+ScrollTrigger rides as a root-level `"sc"` object (all numeric; `"auto"`
+is ignored when present — the trigger owns play-state):
+
+```json
+"sc":{"t":{"s":"#sec"},"s":[0,0.8],"e":{"rv":1.5},"scr":0.3,"pin":1,
+      "act":[1,0,0,4],"once":1,"mk":1,"cls":"in-view","ct":".headline",
+      "cb":{"sE":12,"sL":13,"sEB":14,"sLB":15,"sU":16,
+            "isl":"Hero","nE":"hero_enter","nL":"hero_leave"}}
+```
+
+`s`/`e` = `[triggerFrac, viewportFrac, offsetPx?]` (defaults `[0,1]` /
+`[1,0]` omitted); `e` alternatives `{"r":px}` / `{"rv":viewportHeights}`;
+`scr` `true` = exact, number = smoothing seconds; action ints: 0 none,
+1 play, 2 pause, 3 resume, 4 reverse, 5 restart, 6 complete, 7 reset.
+A descriptor with `sc` and no `p`/`k`/`ch` is a tween-less trigger
+(`anim.reveal`). The serializer's golden tests
+(`zig test src/core/anim/serialize.zig`) freeze this contract.
 
 ## Demo
 
@@ -259,6 +366,6 @@ and a dynamic-value + snap-modifier tween.
 
 ## Not yet (planned plugins)
 
-ScrollTrigger/Observer, ScrollSmoother, FLIP layout animation, SplitText,
-Draggable, MotionPath, MorphSVG — tracked as follow-up phases; the core
-engine above is their substrate.
+ScrollSmoother (Observer + scroller-proxy), scroll snap, horizontal /
+container scrollers, FLIP layout animation, SplitText, Draggable (will
+reuse Observer), MotionPath, MorphSVG — tracked as follow-up phases.

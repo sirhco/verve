@@ -1003,6 +1003,15 @@
     const onChange = (ev) => {
       prefersReduced = ev.matches;
       if (ev.matches) {
+        // Scroll triggers first: kill anim-bearing / pinned ones (their
+        // anims jump below or here); class-toggle-only triggers stay.
+        for (const t of [...stTriggers.values()]) {
+          if (t.anim || t.pinEl) {
+            const a = t.anim ? anims.get(t.anim) : null;
+            stKill(t);
+            if (a && a.rm !== "allow") animJumpToEnd(a);
+          }
+        }
         for (const a of [...anims.values()]) {
           if (a.rm !== "allow") animJumpToEnd(a);
         }
@@ -1060,6 +1069,11 @@
 
   const animCreate = (desc, selfEl) => {
     if (!desc || desc.v !== 1) return 0;
+    // Tween-less descriptor (anim.reveal / standalone trigger): just a
+    // scroll trigger, no animation, no rAF.
+    if (desc.sc && !desc.p && !desc.k && !desc.ch) {
+      return stRegister(desc.sc, null, selfEl);
+    }
     const rm = desc.rm || "jump";
     if (prefersReduced && rm === "skip") return 0;
     const a = {
@@ -1097,6 +1111,21 @@
     a.firstEnd = a.delay + a.tweens.reduce((m, tw) => Math.max(m, tw.start + tw.firstEnd), 0);
     anims.set(a.h, a);
     if (a.name) namedAnims.set(a.name, a.h);
+    if (desc.sc) {
+      // Scroll-triggered: the trigger owns play-state ("auto" ignored).
+      // Paint from-tween first frames so entrances don't flash, then
+      // hand off; stRegister handles reduced motion (jump-to-end).
+      a.paused = true;
+      for (const tw of a.tweens) {
+        if (tw.immediate) {
+          animResolveTween(tw);
+          animWriteTween(tw, 0, new Set());
+        }
+      }
+      flushXform();
+      stRegister(desc.sc, a, selfEl);
+      return a.h;
+    }
     if (prefersReduced && rm !== "allow") {
       animJumpToEnd(a);
       return a.h;
@@ -1390,6 +1419,9 @@
   const animTick = (now) => {
     const dt = Math.min((now - animLast) / 1000, 0.1);
     animLast = now;
+    // Scroll triggers first: edge actions / scrub seeks land before this
+    // frame's time integration.
+    if (stTriggers.size) stUpdate(dt);
     for (const a of [...anims.values()]) {
       if (a.paused || a.done) continue;
       // Self-kill animations whose targets all left the document
@@ -1411,19 +1443,28 @@
       }
       animRenderAt(a, a.pos);
     }
-    if (anims.size && [...anims.values()].some((a) => !a.paused && !a.done)) {
+    // Keep ticking while time-driven anims run OR scroll work remains
+    // (fresh scroll events / unsettled scrub smoothing set stDirty).
+    if (stDirty || (anims.size && [...anims.values()].some((a) => !a.paused && !a.done))) {
       requestAnimationFrame(animTick);
     } else {
       animTickerOn = false;
     }
   };
 
-  const animStartTicker = () => {
+  // Unconditional ticker start — the scroll listener must wake the loop
+  // even when every animation is paused (scrub-driven seeks).
+  const tickerKick = () => {
     if (animTickerOn) return;
-    if (![...anims.values()].some((a) => !a.paused && !a.done)) return;
     animTickerOn = true;
     animLast = performance.now();
     requestAnimationFrame(animTick);
+  };
+
+  const animStartTicker = () => {
+    if (animTickerOn) return;
+    if (![...anims.values()].some((a) => !a.paused && !a.done)) return;
+    tickerKick();
   };
 
   // Control ops: 0=play 1=pause 2=reverse 3=restart 4=seek 5=timeScale 6=kill
@@ -1520,6 +1561,588 @@
       }
       animCreate(desc, el);
     }
+  };
+
+  // ---- Verve Scroll ----------------------------------------------------
+  // ScrollTrigger + Observer runtime ("sc" wire key — see
+  // src/core/anim/scroll.zig + serialize.zig goldens for the contract).
+  // Geometry model: trigger ranges cached as document-space startY/endY
+  // px (no IntersectionObserver — async delivery is too sloppy for
+  // scrub; two float compares per trigger per frame is exact and cheap).
+  // v1 scope: vertical window scroll only.
+
+  const stTriggers = new Map();
+  let stSeq = 1;
+  let stScrollY = 0;
+  let stDir = 1;
+  let stVel = 0;
+  let stVelT = 0;
+  let stDirty = false;
+  let stListening = false;
+
+  // Scroll velocity decays lazily on read — no ticker dependency.
+  const stVelocity = () => {
+    const dt = (performance.now() - stVelT) / 1000;
+    return stVel * Math.pow(0.001, Math.max(0, dt));
+  };
+
+  const stInstall = () => {
+    if (stListening) return;
+    stListening = true;
+    stScrollY = window.scrollY || 0;
+    window.addEventListener(
+      "scroll",
+      () => {
+        const y = window.scrollY || 0;
+        const now = performance.now();
+        if (stVelT) {
+          const dt = (now - stVelT) / 1000;
+          if (dt > 0) stVel = (y - stScrollY) / dt;
+        }
+        stVelT = now;
+        if (y !== stScrollY) stDir = y > stScrollY ? 1 : -1;
+        stScrollY = y;
+        stDirty = true;
+        // Pins applied synchronously here — rAF-applied position:fixed
+        // lags scrolling by a frame and jitters visibly.
+        for (const t of stTriggers.values()) if (t.pinEl) stApplyPin(t);
+        tickerKick();
+      },
+      { passive: true },
+    );
+    let resizeRaf = 0;
+    window.addEventListener("resize", () => {
+      if (resizeRaf) return;
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = 0;
+        stRefreshAll();
+        stDirty = true;
+        tickerKick();
+      });
+    });
+    // Late images / webfonts shift layout — re-measure once each.
+    window.addEventListener("load", () => {
+      stRefreshAll();
+      stDirty = true;
+      tickerKick();
+    });
+    try {
+      if (document.fonts && document.fonts.ready) {
+        document.fonts.ready.then(() => {
+          stRefreshAll();
+          stDirty = true;
+          tickerKick();
+        });
+      }
+    } catch {}
+  };
+
+  // Register a trigger. `sc` = parsed wire object; `a` = owning anim
+  // record or null (standalone reveal/callback trigger); `selfEl` = the
+  // data-anim carrying element (selector scope + default trigger).
+  // Returns the trigger handle (0 = nothing registered).
+  const stRegister = (sc, a, selfEl) => {
+    let el = null;
+    if (sc.t && sc.t.h != null) el = refHandles[sc.t.h];
+    else if (sc.t && sc.t.s) el = (selfEl || document).querySelector(sc.t.s);
+    else if (selfEl) el = selfEl;
+    else if (a) {
+      const tw = a.tweens.find((x) => x.targets.length > 0);
+      el = tw ? tw.targets[0] : null;
+    }
+    if (!el) {
+      // No trigger element: degrade to plain playback so content isn't lost.
+      if (a) {
+        a.paused = false;
+        animStartTicker();
+      }
+      return 0;
+    }
+    // Reduced motion: anim-bearing triggers jump to their end state
+    // (content stays readable, incl. scrub); class toggles and
+    // callback-only triggers remain (motion-free); pins disabled.
+    if (prefersReduced && a && a.rm !== "allow") {
+      animJumpToEnd(a);
+      if (!sc.cls && !sc.cb) return 0;
+      a = null;
+    }
+    let scrub = sc.scr === true ? 0 : typeof sc.scr === "number" ? sc.scr : null;
+    if (scrub != null && a && !isFinite(a.total)) {
+      console.warn("verve scroll: cannot scrub an infinite animation; falling back to toggle");
+      scrub = null;
+    }
+    const t = {
+      h: stSeq++,
+      el,
+      anim: a ? a.h : 0,
+      s: sc.s || [0, 1],
+      e: sc.e != null ? sc.e : null,
+      scrub,
+      smooth: scrub || 0,
+      cur: 0,
+      target: 0,
+      ps: sc.ps !== 0,
+      pinEl: null,
+      spacer: null,
+      pinState: -1,
+      pinTop: 0,
+      pinLeft: 0,
+      pinW: 0,
+      pinH: 0,
+      pinSpan: 0,
+      act: sc.act || [1, 0, 0, 0],
+      once: !!sc.once,
+      keepClsOnKill: false,
+      cls: sc.cls || null,
+      ct: sc.ct || null,
+      cb: sc.cb || null,
+      markers: null,
+      mk: !!sc.mk,
+      active: false,
+      enabled: true,
+      startY: 0,
+      endY: 1,
+    };
+    if (sc.pin && !prefersReduced) {
+      t.pinEl = sc.pin === 1 ? el : sc.pin.s ? (selfEl || document).querySelector(sc.pin.s) : null;
+    }
+    if (a) a.paused = true; // trigger owns play-state from here
+    stTriggers.set(t.h, t);
+    stInstall();
+    stRefresh(t);
+    if (t.mk) stMakeMarkers(t);
+    stDirty = true;
+    tickerKick();
+    return t.h;
+  };
+
+  // Recompute one trigger's document-space range (and pin geometry) from
+  // the element's UNPINNED layout state.
+  const stRefresh = (t) => {
+    const el = t.el;
+    if (!el || !el.isConnected) return;
+    if (t.pinEl) stClearPin(t);
+    const r = el.getBoundingClientRect();
+    const y0 = window.scrollY || 0;
+    const absTop = r.top + y0;
+    const vh = window.innerHeight || 0;
+    const s = t.s;
+    t.startY = absTop + s[0] * r.height - s[1] * vh + (s[2] || 0);
+    const e = t.e;
+    if (e == null) t.endY = absTop + r.height; // default "bottom top"
+    else if (Array.isArray(e)) t.endY = absTop + e[0] * r.height - e[1] * vh + (e[2] || 0);
+    else if (e.r != null) t.endY = t.startY + e.r;
+    else if (e.rv != null) t.endY = t.startY + e.rv * vh;
+    if (t.endY <= t.startY) t.endY = t.startY + 1;
+    if (t.pinEl) {
+      const pr = t.pinEl.getBoundingClientRect();
+      t.pinTop = pr.top + y0 - t.startY; // fixed top = viewport y at engage
+      t.pinLeft = pr.left;
+      t.pinW = pr.width;
+      t.pinH = pr.height;
+      t.pinSpan = t.endY - t.startY;
+      stEnsureSpacer(t);
+      t.pinState = -1;
+      stApplyPin(t);
+    }
+    if (t.markers) stPlaceMarkers(t);
+  };
+
+  // Document-order refresh: pin spacers pad layout, so triggers below a
+  // pin must measure AFTER its spacer is sized.
+  const stRefreshAll = () => {
+    const list = [...stTriggers.values()].filter((t) => t.el && t.el.isConnected);
+    list.sort((x, y) =>
+      x.el === y.el
+        ? 0
+        : x.el.compareDocumentPosition(y.el) & Node.DOCUMENT_POSITION_FOLLOWING
+          ? -1
+          : 1,
+    );
+    for (const t of list) stRefresh(t);
+  };
+
+  const stEnsureSpacer = (t) => {
+    if (!t.spacer) {
+      const sp = document.createElement("div");
+      sp.setAttribute("data-verve-pin-spacer", "");
+      sp.style.position = "relative";
+      t.pinEl.parentNode.insertBefore(sp, t.pinEl);
+      sp.appendChild(t.pinEl);
+      t.spacer = sp;
+    }
+    t.spacer.style.width = t.pinW + "px";
+    t.spacer.style.height = t.pinH + (t.ps ? t.pinSpan : 0) + "px";
+  };
+
+  // 3-state pin: natural (before) / fixed (active) / absolute parked at
+  // the bottom of the spacer's padded span (after). Clamped scrollY so
+  // iOS rubber-banding doesn't wiggle the state machine at page edges.
+  const stApplyPin = (t) => {
+    if (!t.pinEl || !t.enabled) return;
+    const y = Math.max(0, stScrollY);
+    const state = y < t.startY ? 0 : y < t.endY ? 1 : 2;
+    if (state === t.pinState) return;
+    t.pinState = state;
+    const st = t.pinEl.style;
+    if (state === 0) {
+      st.position = "";
+      st.top = "";
+      st.left = "";
+      st.width = "";
+    } else if (state === 1) {
+      st.position = "fixed";
+      st.top = t.pinTop + "px";
+      st.left = t.pinLeft + "px";
+      st.width = t.pinW + "px";
+    } else {
+      st.position = "absolute";
+      st.top = t.pinSpan + "px";
+      st.left = "0";
+      st.width = t.pinW + "px";
+    }
+  };
+
+  const stClearPin = (t) => {
+    const st = t.pinEl.style;
+    st.position = "";
+    st.top = "";
+    st.left = "";
+    st.width = "";
+    t.pinState = -1;
+  };
+
+  const stMakeMarkers = (t) => {
+    const make = (label, color) => {
+      const d = document.createElement("div");
+      d.setAttribute("data-verve-marker", "");
+      d.style.cssText =
+        "position:absolute;left:0;right:0;height:0;border-top:1px dashed " +
+        color +
+        ";z-index:99999;pointer-events:none;font:10px monospace;color:" +
+        color;
+      d.textContent = label;
+      document.body.appendChild(d);
+      return d;
+    };
+    t.markers = {
+      s: make("start " + t.h, "#0c6"),
+      e: make("end " + t.h, "#e33"),
+    };
+    stPlaceMarkers(t);
+  };
+
+  const stPlaceMarkers = (t) => {
+    if (!t.markers) return;
+    t.markers.s.style.top = t.startY + "px";
+    t.markers.e.style.top = t.endY + "px";
+  };
+
+  // Toggle actions poke the anim record directly — animCtrl's public op
+  // semantics (toggle-reverse, refuse-play-when-done) don't fit boundary
+  // actions, which need explicit direction.
+  // 0 none 1 play 2 pause 3 resume 4 reverse 5 restart 6 complete 7 reset
+  const stApplyAction = (a, act) => {
+    if (!a || !act) return;
+    switch (act) {
+      case 1:
+        a.reversed = false;
+        a.paused = false;
+        a.done = false;
+        tickerKick();
+        break;
+      case 2:
+        a.paused = true;
+        break;
+      case 3:
+        a.paused = false;
+        a.done = false;
+        tickerKick();
+        break;
+      case 4:
+        a.reversed = true;
+        a.paused = false;
+        a.done = false;
+        tickerKick();
+        break;
+      case 5:
+        animCtrl(a.h, 3, 0);
+        break;
+      case 6:
+        animFinish(a);
+        break;
+      case 7:
+        a.pos = 0;
+        a.paused = true;
+        a.done = false;
+        a.reversed = false;
+        animRenderAt(a, 0);
+        break;
+    }
+  };
+
+  const stFireScCb = (t, slotKey, exportKey) => {
+    if (!t.cb) return;
+    if (t.cb[slotKey] != null) animFireSlot(t.cb[slotKey]);
+    if (exportKey && t.cb.isl && t.cb[exportKey]) {
+      callIslandExport(
+        t.cb.isl,
+        t.cb[exportKey],
+        JSON.stringify({ h: t.h, progress: t.target || 0, dir: stDir }),
+      );
+    }
+  };
+
+  const stKill = (t) => {
+    stTriggers.delete(t.h);
+    if (t.pinEl) {
+      stClearPin(t);
+      if (t.spacer) {
+        if (t.spacer.contains(t.pinEl)) {
+          try {
+            t.spacer.replaceWith(t.pinEl);
+          } catch {}
+        } else {
+          t.spacer.remove();
+        }
+      }
+    }
+    if (t.cls && !t.keepClsOnKill && t.el) {
+      const targets = t.ct ? document.querySelectorAll(t.ct) : [t.el];
+      targets.forEach((el2) => el2.classList.remove(t.cls));
+    }
+    if (t.markers) {
+      t.markers.s.remove();
+      t.markers.e.remove();
+    }
+  };
+
+  // Per-frame trigger pass: boundary edges -> actions/class/callbacks,
+  // scrub -> seek. Clears stDirty unless scrub smoothing is unsettled.
+  const stUpdate = (dt) => {
+    const y = stScrollY;
+    let unsettled = false;
+    for (const t of [...stTriggers.values()]) {
+      const a = t.anim ? anims.get(t.anim) : null;
+      if (t.anim && !a) {
+        stKill(t); // owning animation was killed
+        continue;
+      }
+      if (!t.el || !t.el.isConnected || (t.pinEl && !t.pinEl.isConnected)) {
+        stKill(t);
+        continue;
+      }
+      if (!t.enabled) continue;
+      const wasActive = t.active;
+      const active = y >= t.startY && y < t.endY;
+      t.active = active;
+      if (active !== wasActive) {
+        if (active) {
+          if (stDir >= 0) {
+            stApplyAction(a, t.act[0]);
+            stFireScCb(t, "sE", "nE");
+          } else {
+            stApplyAction(a, t.act[2]);
+            stFireScCb(t, "sEB", null);
+          }
+        } else if (y >= t.endY) {
+          stApplyAction(a, t.act[1]);
+          stFireScCb(t, "sL", "nL");
+        } else {
+          stApplyAction(a, t.act[3]);
+          stFireScCb(t, "sLB", null);
+        }
+        if (t.cls) {
+          const targets = t.ct ? document.querySelectorAll(t.ct) : [t.el];
+          targets.forEach((el2) => el2.classList.toggle(t.cls, active));
+        }
+        if (t.once && active) {
+          t.keepClsOnKill = true;
+          stKill(t);
+          continue;
+        }
+      }
+      if (t.scrub != null && a) {
+        const raw = Math.max(0, Math.min((y - t.startY) / (t.endY - t.startY), 1));
+        t.target = raw;
+        if (t.smooth > 0) {
+          t.cur += (t.target - t.cur) * Math.min(1, dt / t.smooth);
+          if (Math.abs(t.target - t.cur) < 0.0005) t.cur = t.target;
+          if (t.cur !== t.target) unsettled = true;
+        } else {
+          t.cur = t.target;
+        }
+        a.pos = t.cur * a.total;
+        animRenderAt(a, a.pos);
+      }
+      if (active && t.cb && t.cb.sU != null) animFireSlot(t.cb.sU);
+    }
+    stDirty = unsettled;
+  };
+
+  // ---- Observer: unified wheel/touch/pointer/scroll input + velocity --
+  // flags: 1 wheel, 2 touch, 4 pointer-drag, 8 window scroll,
+  //        16 preventDefault, 32 lock dominant axis.
+  const observers = new Map();
+  let obsSeq = 1;
+
+  const obsCreate = (flags, tol, sel, handlerSlot) => {
+    const target = sel ? document.querySelector(sel) : null;
+    if (sel && !target) return 0;
+    const el = target || window;
+    const o = {
+      h: obsSeq++,
+      el: target,
+      pd: !!(flags & 16),
+      lock: !!(flags & 32),
+      slot: handlerSlot >>> 0,
+      tol: tol || 0,
+      dx: 0,
+      dy: 0,
+      vx: 0,
+      vy: 0,
+      dirX: 0,
+      dirY: 0,
+      dragging: false,
+      kind: 0,
+      accX: 0,
+      accY: 0,
+      axis: 0,
+      sx: 0,
+      sy: 0,
+      samples: [],
+      enabled: true,
+      fns: [],
+    };
+    const pushSample = (x, y) => {
+      const now = performance.now();
+      o.samples.push({ t: now, x, y });
+      while (
+        o.samples.length > 6 ||
+        (o.samples.length > 1 && now - o.samples[0].t > 100)
+      ) {
+        o.samples.shift();
+      }
+      if (o.samples.length > 1) {
+        const s0 = o.samples[0];
+        const s1 = o.samples[o.samples.length - 1];
+        const sdt = (s1.t - s0.t) / 1000;
+        if (sdt > 0) {
+          o.vx = (s1.x - s0.x) / sdt;
+          o.vy = (s1.y - s0.y) / sdt;
+        }
+      }
+    };
+    const move = (dx, dy, kind, ev) => {
+      if (!o.enabled) return;
+      if (o.pd && ev && ev.cancelable) ev.preventDefault();
+      if (o.lock) {
+        if (!o.axis && (dx || dy)) o.axis = Math.abs(dx) > Math.abs(dy) ? 1 : 2;
+        if (o.axis === 1) dy = 0;
+        else if (o.axis === 2) dx = 0;
+      }
+      o.accX += dx;
+      o.accY += dy;
+      if (Math.abs(o.accX) < o.tol && Math.abs(o.accY) < o.tol) return;
+      o.dx = dx;
+      o.dy = dy;
+      if (dx) o.dirX = dx > 0 ? 1 : -1;
+      if (dy) o.dirY = dy > 0 ? 1 : -1;
+      o.kind = kind;
+      o.sx += dx;
+      o.sy += dy;
+      pushSample(o.sx, o.sy);
+      verveCallSlot(o.slot);
+    };
+    const on = (tgt, type, fn, opts) => {
+      tgt.addEventListener(type, fn, opts);
+      o.fns.push([tgt, type, fn, opts]);
+    };
+    if (flags & 1) {
+      on(el, "wheel", (e) => move(e.deltaX, e.deltaY, 0, e), { passive: !o.pd });
+    }
+    if (flags & 2) {
+      let tx = 0;
+      let ty = 0;
+      let touching = false;
+      on(
+        el,
+        "touchstart",
+        (e) => {
+          const t0 = e.touches[0];
+          if (!t0) return;
+          touching = true;
+          tx = t0.clientX;
+          ty = t0.clientY;
+          o.axis = 0;
+          o.samples.length = 0;
+        },
+        { passive: true },
+      );
+      on(
+        el,
+        "touchmove",
+        (e) => {
+          const t0 = e.touches[0];
+          if (!touching || !t0) return;
+          // finger up = content scrolls down = positive deltaY (wheel parity)
+          move(tx - t0.clientX, ty - t0.clientY, 1, e);
+          tx = t0.clientX;
+          ty = t0.clientY;
+        },
+        { passive: !o.pd },
+      );
+      on(el, "touchend", () => {
+        touching = false;
+      }, { passive: true });
+    }
+    if (flags & 4) {
+      let px = 0;
+      let py = 0;
+      on(el, "pointerdown", (e) => {
+        if (e.pointerType === "touch") return; // touch path handles it
+        o.dragging = true;
+        px = e.clientX;
+        py = e.clientY;
+        o.axis = 0;
+        o.samples.length = 0;
+        try {
+          e.target.setPointerCapture(e.pointerId);
+        } catch {}
+      });
+      on(el, "pointermove", (e) => {
+        if (!o.dragging) return;
+        move(px - e.clientX, py - e.clientY, 2, e);
+        px = e.clientX;
+        py = e.clientY;
+      });
+      on(el, "pointerup", () => {
+        o.dragging = false;
+      });
+      on(el, "pointercancel", () => {
+        o.dragging = false;
+      });
+    }
+    if (flags & 8) {
+      let ly = null;
+      on(
+        window,
+        "scroll",
+        () => {
+          const y = window.scrollY || 0;
+          move(0, ly == null ? 0 : y - ly, 3, null);
+          ly = y;
+        },
+        { passive: true },
+      );
+    }
+    observers.set(o.h, o);
+    return o.h;
+  };
+
+  const obsKill = (o) => {
+    for (const [tgt, type, fn, opts] of o.fns) tgt.removeEventListener(type, fn, opts);
+    observers.delete(o.h);
   };
 
   // Phase 13F — assemble the chunk-side reactive-runtime import object
@@ -1912,6 +2535,100 @@
       const el = refHandles[h];
       if (el) el.style.setProperty(readStr(np, nl), readStr(vp, vl));
     },
+    // ---- ScrollTrigger / Observer ops -----------------------------------
+    verve_sc_create: (dp, dl) => {
+      let desc;
+      try {
+        desc = JSON.parse(readStr(dp, dl));
+      } catch (err) {
+        console.warn("verve scroll: bad trigger descriptor", err);
+        return 0;
+      }
+      const sc = desc && desc.sc ? desc.sc : desc;
+      return sc ? stRegister(sc, null, null) >>> 0 : 0;
+    },
+    // op: 0 kill, 1 refresh (handle 0 = refresh ALL), 2 disable, 3 enable
+    verve_sc_ctrl: (h, op) => {
+      h >>>= 0;
+      op >>>= 0;
+      if (h === 0 && op === 1) {
+        stRefreshAll();
+        stDirty = true;
+        tickerKick();
+        return;
+      }
+      const t = stTriggers.get(h);
+      if (!t) return;
+      if (op === 0) stKill(t);
+      else if (op === 1) {
+        stRefresh(t);
+        stDirty = true;
+        tickerKick();
+      } else if (op === 2) t.enabled = false;
+      else if (op === 3) {
+        t.enabled = true;
+        stDirty = true;
+        tickerKick();
+      }
+    },
+    // field: 0 progress, 1 active, 2 direction, 3 scroll velocity (px/s)
+    verve_sc_get: (h, f) => {
+      const t = stTriggers.get(h >>> 0);
+      if (!t) return 0;
+      switch (f >>> 0) {
+        case 0: {
+          const raw = (stScrollY - t.startY) / (t.endY - t.startY);
+          return Math.max(0, Math.min(raw, 1));
+        }
+        case 1:
+          return t.active ? 1 : 0;
+        case 2:
+          return stDir;
+        case 3:
+          return stVelocity();
+        default:
+          return 0;
+      }
+    },
+    verve_scroll_pos: (axis) =>
+      (axis >>> 0) === 0 ? window.scrollX || 0 : window.scrollY || 0,
+    verve_obs_create: (flags, tol, sp, sl, handlerIdx) =>
+      obsCreate(flags >>> 0, tol, sl ? readStr(sp, sl) : "", handlerIdx >>> 0) >>> 0,
+    // op: 0 kill, 1 disable, 2 enable
+    verve_obs_ctrl: (h, op) => {
+      const o = observers.get(h >>> 0);
+      if (!o) return;
+      op >>>= 0;
+      if (op === 0) obsKill(o);
+      else if (op === 1) o.enabled = false;
+      else o.enabled = true;
+    },
+    // field: 0 dx, 1 dy, 2 vx, 3 vy, 4 dirX, 5 dirY, 6 dragging,
+    //        7 kind (0 wheel, 1 touch, 2 pointer, 3 scroll)
+    verve_obs_get: (h, f) => {
+      const o = observers.get(h >>> 0);
+      if (!o) return 0;
+      switch (f >>> 0) {
+        case 0:
+          return o.dx;
+        case 1:
+          return o.dy;
+        case 2:
+          return o.vx;
+        case 3:
+          return o.vy;
+        case 4:
+          return o.dirX;
+        case 5:
+          return o.dirY;
+        case 6:
+          return o.dragging ? 1 : 0;
+        case 7:
+          return o.kind;
+        default:
+          return 0;
+      }
+    },
   };
 
   // Table isolation, chunk side: each island chunk instantiates against a
@@ -1962,6 +2679,10 @@
       verve_queue_microtask: (idx) => verveRuntime.verve_queue_microtask(translate(idx)),
       verve_anim_register_dyn: (idx) => translate(idx),
       verve_anim_register_mod: (idx) => translate(idx),
+      // Observer handler crosses as a chunk-private fn-table index —
+      // copy the funcref into the main table (timers precedent).
+      verve_obs_create: (flags, tol, sp, sl, idx) =>
+        verveRuntime.verve_obs_create(flags, tol, sp, sl, translate(idx)),
     };
   };
 
