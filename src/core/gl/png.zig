@@ -1,0 +1,410 @@
+//! Pure-Zig PNG decode + store-mode encode.
+//!
+//! Decode: 8-bit-depth, color type 2 (RGB) or 6 (RGBA), non-interlaced,
+//! filter types 0-4 per scanline → RGBA8 output.
+//!
+//! Encode: RGBA8 → valid PNG using filter 0 + zlib stored (uncompressed)
+//! deflate blocks.  Fixture/demo use only — not size-optimized.
+//!
+//! Errors: `error.Unsupported`, `error.BadSignature`, `error.Corrupt`.
+
+const std = @import("std");
+const mem = std.mem;
+const Allocator = mem.Allocator;
+
+// ── public surface ────────────────────────────────────────────────────────────
+
+pub const Image = struct {
+    width: u32,
+    height: u32,
+    rgba: []u8,
+
+    pub fn deinit(self: *Image, alloc: Allocator) void {
+        alloc.free(self.rgba);
+        self.* = undefined;
+    }
+};
+
+/// Decode a PNG file (bytes) → RGBA8 Image.  Caller owns Image.rgba via alloc.
+pub fn decode(alloc: Allocator, bytes: []const u8) !Image {
+    return decodePng(alloc, bytes);
+}
+
+/// Encode RGBA8 pixels (w × h) → PNG bytes (alloc-owned).
+/// Uses filter 0 (None) per scanline, zlib stored-block deflate.
+pub fn encodeRgba(alloc: Allocator, rgba: []const u8, w: u32, h: u32) ![]u8 {
+    const stride: usize = @as(usize, w) * 4;
+    // filtered stream: 1 filter-byte (0) + stride bytes per row
+    const filtered_len = @as(usize, h) * (1 + stride);
+    const filtered = try alloc.alloc(u8, filtered_len);
+    defer alloc.free(filtered);
+    var fi: usize = 0;
+    for (0..@as(usize, h)) |row| {
+        filtered[fi] = 0; // filter None
+        fi += 1;
+        const src = rgba[row * stride .. row * stride + stride];
+        @memcpy(filtered[fi .. fi + stride], src);
+        fi += stride;
+    }
+    return buildPng(alloc, filtered, w, h, 6); // color type 6 = RGBA
+}
+
+/// Test/fixture helper: wrap pre-filtered RGB scanlines in a valid PNG.
+/// `filtered` must be exactly `h * (1 + w*3)` bytes (filter byte + RGB data
+/// per row — no expansion, caller supplies filter bytes).
+pub fn rawPngRgb(alloc: Allocator, filtered: []const u8, w: u32, h: u32) ![]u8 {
+    return buildPng(alloc, filtered, w, h, 2); // color type 2 = RGB
+}
+
+// ── internal constants ────────────────────────────────────────────────────────
+
+const png_signature = [8]u8{ 137, 80, 78, 71, 13, 10, 26, 10 };
+const max_alloc_bytes: usize = 64 * 1024 * 1024; // 64 MB sanity cap
+
+// ── decode ────────────────────────────────────────────────────────────────────
+
+fn decodePng(alloc: Allocator, bytes: []const u8) !Image {
+    if (bytes.len < 8) return error.BadSignature;
+    if (!mem.eql(u8, bytes[0..8], &png_signature)) return error.BadSignature;
+
+    var pos: usize = 8;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var bit_depth: u8 = 0;
+    var color_type: u8 = 0;
+    var interlace: u8 = 0;
+    var bpp: u32 = 0;
+    var got_ihdr = false;
+
+    // Accumulate IDAT payloads using Io.Writer.Allocating
+    var idat_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer idat_aw.deinit();
+
+    while (pos + 12 <= bytes.len) {
+        if (pos + 4 > bytes.len) return error.Corrupt;
+        const chunk_len = mem.readInt(u32, bytes[pos..][0..4], .big);
+        pos += 4;
+        // bounds check: type(4) + data(chunk_len) + crc(4) must fit
+        if (chunk_len > bytes.len or pos + 4 + @as(usize, chunk_len) + 4 > bytes.len) return error.Corrupt;
+        const chunk_type = bytes[pos .. pos + 4];
+        pos += 4;
+        const chunk_data = bytes[pos .. pos + chunk_len];
+        pos += chunk_len;
+        const stored_crc = mem.readInt(u32, bytes[pos..][0..4], .big);
+        pos += 4;
+
+        // Verify CRC32 over type + data
+        var crc = std.hash.Crc32.init();
+        crc.update(chunk_type);
+        crc.update(chunk_data);
+        if (crc.final() != stored_crc) return error.Corrupt;
+
+        if (mem.eql(u8, chunk_type, "IHDR")) {
+            if (chunk_len != 13) return error.Corrupt;
+            width = mem.readInt(u32, chunk_data[0..4], .big);
+            height = mem.readInt(u32, chunk_data[4..8], .big);
+            bit_depth = chunk_data[8];
+            color_type = chunk_data[9];
+            const compression = chunk_data[10];
+            const filter_method = chunk_data[11];
+            interlace = chunk_data[12];
+            if (bit_depth != 8) return error.Unsupported;
+            if (color_type != 2 and color_type != 6) return error.Unsupported;
+            if (compression != 0 or filter_method != 0) return error.Unsupported;
+            if (interlace != 0) return error.Unsupported;
+            bpp = if (color_type == 6) 4 else 3;
+            got_ihdr = true;
+        } else if (mem.eql(u8, chunk_type, "IDAT")) {
+            if (!got_ihdr) return error.Corrupt;
+            _ = idat_aw.writer.writeAll(chunk_data) catch return error.Corrupt;
+        } else if (mem.eql(u8, chunk_type, "IEND")) {
+            break;
+        }
+        // ancillary chunks silently skipped
+    }
+
+    if (!got_ihdr) return error.Corrupt;
+    if (width == 0 or height == 0) return error.Corrupt;
+
+    // Sanity-cap: reject images that would need >64 MB RGBA
+    const rgba_size = @as(u64, width) * @as(u64, height) * 4;
+    if (rgba_size > max_alloc_bytes) return error.Unsupported;
+
+    // Inflate IDAT (zlib container)
+    // API (Zig 0.16): std.compress.flate.Decompress.init(*std.Io.Reader, Container, []u8)
+    // Decompress via decomp.reader.streamRemaining(&writer)
+    const idat_bytes = idat_aw.written();
+    var in: std.Io.Reader = .fixed(idat_bytes);
+    var decomp_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decomp = std.compress.flate.Decompress.init(&in, .zlib, &decomp_buf);
+
+    // Expected raw size: height * (1 + width * bpp)
+    const expected_raw: usize = @as(usize, height) * (1 + @as(usize, width) * @as(usize, bpp));
+    var raw_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer raw_aw.deinit();
+    _ = decomp.reader.streamRemaining(&raw_aw.writer) catch return error.Corrupt;
+    const raw = raw_aw.written();
+    if (raw.len != expected_raw) return error.Corrupt;
+
+    // Allocate RGBA output
+    const rgba = try alloc.alloc(u8, @intCast(rgba_size));
+    errdefer alloc.free(rgba);
+
+    // Unfilter scanlines: reconstruct each pixel channel
+    // bpp_uz = bytes per pixel in source (3 for RGB, 4 for RGBA)
+    const bpp_uz: usize = @as(usize, bpp);
+    const src_stride: usize = 1 + @as(usize, width) * bpp_uz;
+    const dst_stride: usize = @as(usize, width) * 4;
+
+    for (0..@as(usize, height)) |row| {
+        const filter_byte = raw[row * src_stride];
+        const filt_data = raw[row * src_stride + 1 .. row * src_stride + 1 + @as(usize, width) * bpp_uz];
+
+        var col: usize = 0;
+        while (col < @as(usize, width)) : (col += 1) {
+            for (0..bpp_uz) |c| {
+                const fi = col * bpp_uz + c; // index in filtered data
+                const x = filt_data[fi];
+
+                // left reconstructed value (same row, previous pixel)
+                const left: u8 = if (col == 0) 0 else blk: {
+                    const prev_off = row * dst_stride + (col - 1) * 4 + c;
+                    break :blk rgba[prev_off];
+                };
+                // above reconstructed value (row above, same column)
+                const above: u8 = if (row == 0) 0 else blk: {
+                    const up_off = (row - 1) * dst_stride + col * 4 + c;
+                    break :blk rgba[up_off];
+                };
+                // upper-left
+                const upleft: u8 = if (row == 0 or col == 0) 0 else blk: {
+                    const ul_off = (row - 1) * dst_stride + (col - 1) * 4 + c;
+                    break :blk rgba[ul_off];
+                };
+
+                const recon: u8 = switch (filter_byte) {
+                    0 => x, // None
+                    1 => x +% left, // Sub
+                    2 => x +% above, // Up
+                    3 => x +% @as(u8, @intCast((@as(u16, left) + @as(u16, above)) / 2)), // Average
+                    4 => x +% paethPredictor(left, above, upleft), // Paeth
+                    else => return error.Corrupt,
+                };
+
+                rgba[row * dst_stride + col * 4 + c] = recon;
+            }
+            // For RGB source, fill alpha = 255
+            if (bpp_uz == 3) {
+                rgba[row * dst_stride + col * 4 + 3] = 255;
+            }
+        }
+    }
+
+    return Image{ .width = width, .height = height, .rgba = rgba };
+}
+
+fn paethPredictor(a: u8, b: u8, c: u8) u8 {
+    // PNG spec §9.4 Paeth predictor
+    const ia = @as(i16, a);
+    const ib = @as(i16, b);
+    const ic = @as(i16, c);
+    const p = ia + ib - ic;
+    const pa = @abs(p - ia);
+    const pb = @abs(p - ib);
+    const pc = @abs(p - ic);
+    if (pa <= pb and pa <= pc) return a;
+    if (pb <= pc) return b;
+    return c;
+}
+
+// ── encode ────────────────────────────────────────────────────────────────────
+
+/// Build a PNG from pre-filtered scanline data.
+/// `filtered`: h rows of (1 filter-byte + row-bytes), ready for zlib.
+/// `color_type`: 2=RGB, 6=RGBA.
+fn buildPng(alloc: Allocator, filtered: []const u8, w: u32, h: u32, color_type: u8) ![]u8 {
+    // zlib-wrap the filtered data using stored (uncompressed) deflate blocks
+    const compressed = try zlibStored(alloc, filtered);
+    defer alloc.free(compressed);
+
+    // Build PNG using Io.Writer.Allocating
+    var out_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer out_aw.deinit();
+    const w_out = &out_aw.writer;
+
+    // PNG signature
+    try w_out.writeAll(&png_signature);
+
+    // IHDR chunk
+    {
+        var ihdr_data: [13]u8 = undefined;
+        mem.writeInt(u32, ihdr_data[0..4], w, .big);
+        mem.writeInt(u32, ihdr_data[4..8], h, .big);
+        ihdr_data[8] = 8; // bit depth
+        ihdr_data[9] = color_type;
+        ihdr_data[10] = 0; // compression
+        ihdr_data[11] = 0; // filter method
+        ihdr_data[12] = 0; // interlace
+        try writeChunk(w_out, "IHDR", &ihdr_data);
+    }
+
+    // IDAT chunk
+    try writeChunk(w_out, "IDAT", compressed);
+
+    // IEND chunk
+    try writeChunk(w_out, "IEND", &.{});
+
+    return out_aw.toOwnedSlice();
+}
+
+fn writeChunk(w: *std.Io.Writer, chunk_type: *const [4]u8, data: []const u8) !void {
+    const len: u32 = @intCast(data.len);
+    try w.writeInt(u32, len, .big);
+    try w.writeAll(chunk_type);
+    try w.writeAll(data);
+    // CRC over type + data
+    var crc = std.hash.Crc32.init();
+    crc.update(chunk_type);
+    crc.update(data);
+    try w.writeInt(u32, crc.final(), .big);
+}
+
+/// Compress `data` using zlib format with stored (uncompressed) deflate blocks.
+/// Format: zlib 2-byte header | stored deflate blocks | 4-byte adler32 footer.
+/// Each stored block: BFINAL+BTYPE byte (1B) | LEN (2B LE) | NLEN (2B LE) | data.
+fn zlibStored(alloc: Allocator, data: []const u8) ![]u8 {
+    const max_block: usize = 65535;
+    // Number of blocks: at least 1 (for empty input), else ceil(len / max_block)
+    const num_blocks: usize = if (data.len == 0)
+        1
+    else
+        (data.len + max_block - 1) / max_block;
+    // Each stored block overhead: 5 bytes (header byte + LEN 2B + NLEN 2B)
+    const out_len = 2 + num_blocks * 5 + data.len + 4;
+    const out = try alloc.alloc(u8, out_len);
+    var pos: usize = 0;
+
+    // Zlib header: CMF=0x78 (CM=8 deflate, CINFO=7), FLG=0x01
+    // Validity: (CMF * 256 + FLG) must be divisible by 31.
+    // 0x78 * 256 + 0x01 = 30721 = 991 * 31 ✓
+    out[pos] = 0x78;
+    pos += 1;
+    out[pos] = 0x01;
+    pos += 1;
+
+    // Adler32 over uncompressed data (for footer)
+    var adler = std.hash.Adler32{};
+    adler.update(data);
+
+    // Stored deflate blocks
+    var src_off: usize = 0;
+    var blocks_written: usize = 0;
+    while (src_off < data.len or blocks_written == 0) {
+        const remaining = data.len - src_off;
+        const block_len: usize = @min(remaining, max_block);
+        const is_last = (src_off + block_len >= data.len);
+
+        // BFINAL (bit 0) = 1 if last block; BTYPE = 00 (stored) in bits 1-2
+        out[pos] = if (is_last) 0x01 else 0x00;
+        pos += 1;
+
+        // LEN (2 bytes LE)
+        mem.writeInt(u16, out[pos..][0..2], @intCast(block_len), .little);
+        pos += 2;
+        // NLEN = one's complement of LEN (2 bytes LE)
+        mem.writeInt(u16, out[pos..][0..2], @as(u16, @intCast(block_len)) ^ 0xFFFF, .little);
+        pos += 2;
+
+        // Data payload
+        @memcpy(out[pos .. pos + block_len], data[src_off .. src_off + block_len]);
+        pos += block_len;
+        src_off += block_len;
+        blocks_written += 1;
+    }
+
+    // Adler32 footer (big-endian per RFC 1950)
+    mem.writeInt(u32, out[pos..][0..4], adler.adler, .big);
+    pos += 4;
+
+    std.debug.assert(pos == out_len);
+    return out;
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "round-trip 4x3 RGBA through store-mode encode" {
+    var pixels: [4 * 3 * 4]u8 = undefined;
+    for (&pixels, 0..) |*p, i| p.* = @intCast((i * 7) % 256);
+    const png_bytes = try encodeRgba(testing.allocator, &pixels, 4, 3);
+    defer testing.allocator.free(png_bytes);
+    var img = try decode(testing.allocator, png_bytes);
+    defer img.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 4), img.width);
+    try testing.expectEqual(@as(u32, 3), img.height);
+    try testing.expectEqualSlices(u8, &pixels, img.rgba);
+}
+
+test "decode applies sub/up/average/paeth filters" {
+    // 2x4 RGB image, one scanline per filter type 1..4. Build the raw
+    // (filtered) stream by hand, wrap in a valid PNG via rawPngRgb helper
+    // (same chunk plumbing as encodeRgba but accepts pre-filtered bytes).
+    // Expected unfiltered pixels computed per the PNG spec (bpp=3, 2 pixels/row):
+    //
+    //   line0 filter=1 (Sub):    filtered=[10,20,30, 5,5,5]
+    //     px0: (0+10, 0+20, 0+30) = (10,20,30)
+    //     px1: (10+5, 20+5, 30+5) = (15,25,35)
+    //
+    //   line1 filter=2 (Up):     filtered=[1,1,1, 1,1,1], above=(10,20,30,15,25,35)
+    //     px0: (1+10, 1+20, 1+30) = (11,21,31)
+    //     px1: (1+15, 1+25, 1+35) = (16,26,36)
+    //
+    //   line2 filter=3 (Average): filtered=[0,0,0, 0,0,0], above=(11,21,31,16,26,36)
+    //     px0 R: 0 + floor((left=0 + above=11)/2) = 5
+    //     px0 G: 0 + floor((0+21)/2)              = 10
+    //     px0 B: 0 + floor((0+31)/2)              = 15
+    //     px1 R: 0 + floor((left=5 + above=16)/2) = 10
+    //     px1 G: 0 + floor((10+26)/2)             = 18
+    //     px1 B: 0 + floor((15+36)/2)             = 25
+    //
+    //   line3 filter=4 (Paeth):   filtered=[0,0,0, 0,0,0], above=(5,10,15,10,18,25)
+    //     px0 R: paeth(a=0,b=5,c=0): pa=5,pb=0,pc=5 → b=5;    0+5  = 5
+    //     px0 G: paeth(a=0,b=10,c=0): pa=10,pb=0,pc=10 → b=10; 0+10 = 10
+    //     px0 B: paeth(a=0,b=15,c=0): pa=15,pb=0,pc=15 → b=15; 0+15 = 15
+    //     px1 R: paeth(a=5,b=10,c=5): pa=5,pb=0,pc=10 → b=10;  0+10 = 10
+    //     px1 G: paeth(a=10,b=18,c=10): pa=8,pb=0,pc=18 → b=18; 0+18 = 18
+    //     px1 B: paeth(a=15,b=25,c=15): pa=10,pb=0,pc=25 → b=25; 0+25 = 25
+    //
+    // RGBA layout: 2 pixels/row × 4 bytes/pixel = 8 bytes/row.
+    //   row 0 starts at byte 0,   row 1 at byte 8,
+    //   row 2 at byte 16,         row 3 at byte 24.
+    //
+    // NOTE: the spec draft had `img.rgba[2 * 4 * 4 / 2]` for row-1 px-0 R.
+    // That evaluates to 16 (row 2 start), not 8 (row 1 start).
+    // Corrected to `img.rgba[1 * 2 * 4 + 0]` = img.rgba[8] per derivation above.
+    const filtered = [_]u8{
+        1, 10, 20, 30, 5, 5, 5,
+        2, 1,  1,  1,  1, 1, 1,
+        3, 0,  0,  0,  0, 0, 0,
+        4, 0,  0,  0,  0, 0, 0,
+    };
+    const png_bytes = try rawPngRgb(testing.allocator, &filtered, 2, 4);
+    defer testing.allocator.free(png_bytes);
+    var img = try decode(testing.allocator, png_bytes);
+    defer img.deinit(testing.allocator);
+    // row 0, px 0, R = 10
+    try testing.expectEqual(@as(u8, 10), img.rgba[0]);
+    // row 0, px 1, R = 15  (offset = 1*4 = 4)
+    try testing.expectEqual(@as(u8, 15), img.rgba[4]);
+    // row 1, px 0, R = 11  (offset = 1 * 2 * 4 + 0 = 8)
+    // spec draft had `img.rgba[2 * 4 * 4 / 2 + 0]` = img.rgba[16] which is row 2;
+    // fixed to img.rgba[8] per the PNG spec derivation above.
+    try testing.expectEqual(@as(u8, 11), img.rgba[1 * 2 * 4 + 0]);
+    // row 0, px 0, A = 255 (RGB expanded to RGBA)
+    try testing.expectEqual(@as(u8, 255), img.rgba[3]);
+}
+
+test "decode rejects garbage" {
+    try testing.expectError(error.BadSignature, decode(testing.allocator, "notapng"));
+}
