@@ -470,6 +470,26 @@ pub const Node = struct {
         return self;
     }
 
+    /// Wrap this node in a ScrollSmoother wrapper (verve.anim — native
+    /// scrolling preserved; the visual position eases). Returns the
+    /// WRAPPER — render the return value, not this node. SSR-only, one
+    /// per page. See anim/smoother.zig.
+    pub fn smoothScroll(self: *Node, opts: @import("anim/smoother.zig").Smoother) *Node {
+        return @import("anim/smoother.zig").apply(self, opts);
+    }
+
+    /// Parallax sugar under a ScrollSmoother: scroll at `v`× speed
+    /// (0.5 = half speed, GSAP parity). Stamps `data-speed`.
+    pub fn parallaxSpeed(self: *Node, v: f64) *Node {
+        return self.attrFmt("data-speed", "{d}", .{v});
+    }
+
+    /// Parallax sugar: extra smoothing lag in seconds for this element.
+    /// Stamps `data-lag`.
+    pub fn parallaxLag(self: *Node, v: f64) *Node {
+        return self.attrFmt("data-lag", "{d}", .{v});
+    }
+
     /// Escape hatch: attach a pre-serialized drag descriptor.
     pub fn draggableJson(self: *Node, json: []const u8) *Node {
         if (self.err != null) return self;

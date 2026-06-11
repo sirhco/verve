@@ -1003,6 +1003,8 @@
     const onChange = (ev) => {
       prefersReduced = ev.matches;
       if (ev.matches) {
+        // smoother off first — page returns to native scrolling
+        smootherKill();
         // Scroll triggers first: kill anim-bearing / pinned ones (their
         // anims jump below or here); class-toggle-only triggers stay.
         for (const t of [...stTriggers.values()]) {
@@ -1503,8 +1505,10 @@
   const animTick = (now) => {
     const dt = Math.min((now - animLast) / 1000, 0.1);
     animLast = now;
-    // Scroll triggers first: edge actions / scrub seeks land before this
-    // frame's time integration. Then inertia throws and FLIP plays.
+    // Smoother first (triggers must see this frame's smoothed Y), then
+    // scroll triggers, inertia throws, and FLIP plays — all before time
+    // integration.
+    if (smoother) smootherUpdate(dt);
     if (stTriggers.size) stUpdate(dt);
     if (dragThrowing > 0) dragUpdate(dt);
     if (flipActive > 0) flipUpdate(dt);
@@ -1532,7 +1536,7 @@
     // Keep ticking while time-driven anims run, scroll work remains
     // (fresh scroll events / unsettled scrub smoothing set stDirty), or
     // inertia throws are in flight.
-    if (stDirty || dragThrowing > 0 || flipActive > 0 || (anims.size && [...anims.values()].some((a) => !a.paused && !a.done))) {
+    if (stDirty || smActive || dragThrowing > 0 || flipActive > 0 || (anims.size && [...anims.values()].some((a) => !a.paused && !a.done))) {
       requestAnimationFrame(animTick);
     } else {
       animTickerOn = false;
@@ -1736,6 +1740,13 @@
   let stVelT = 0;
   let stDirty = false;
   let stListening = false;
+  // ScrollSmoother singleton (installed by smootherScan; null = native).
+  let smoother = null;
+  let smActive = false; // smoother/lag unsettled — ticker keep-alive
+  // Effective scroll for trigger/pin math: the SMOOTHED value when a
+  // smoother is installed (visual sync), native scrollY otherwise. Snap
+  // deliberately stays in native-Y space.
+  const stEffY = () => (smoother ? smoother.y : stScrollY);
 
   // Scroll velocity decays lazily on read — no ticker dependency.
   const stVelocity = () => {
@@ -1762,7 +1773,11 @@
         stDirty = true;
         // Pins applied synchronously here — rAF-applied position:fixed
         // lags scrolling by a frame and jitters visibly.
-        for (const t of stTriggers.values()) if (t.pinEl) stApplyPin(t);
+        // Under a smoother, pins follow the smoothed Y in the ticker —
+        // sync-in-listener writes would lead the visual.
+        if (!smoother) {
+          for (const t of stTriggers.values()) if (t.pinEl) stApplyPin(t);
+        }
         tickerKick();
       },
       { passive: true },
@@ -1848,6 +1863,9 @@
       pinH: 0,
       pinSpan: 0,
       act: sc.act || [1, 0, 0, 0],
+      // snap is programmatic motion — disabled under reduced motion
+      snap: prefersReduced ? null : sc.snap != null ? sc.snap : null,
+      snapd: sc.snapd || 0.4,
       once: !!sc.once,
       keepClsOnKill: false,
       cls: sc.cls || null,
@@ -1880,7 +1898,11 @@
     if (!el || !el.isConnected) return;
     if (t.pinEl) stClearPin(t);
     const r = el.getBoundingClientRect();
-    const y0 = window.scrollY || 0;
+    // Under a smoother, native scroll doesn't move the fixed subtree —
+    // only the content translate does, so gBCR.top = naturalTop - sm.y
+    // ALWAYS and adding stEffY() recovers the document offset EXACTLY
+    // (even mid-settle). Without a smoother this is the classic formula.
+    const y0 = stEffY();
     const absTop = r.top + y0;
     const vh = window.innerHeight || 0;
     const s = t.s;
@@ -1898,6 +1920,9 @@
       t.pinW = pr.width;
       t.pinH = pr.height;
       t.pinSpan = t.endY - t.startY;
+      // transform-pin base: any pre-existing/tweened translate on the
+      // pinned element, captured in the unpinned state (post-clear)
+      t.pinBaseY = getXform(t.pinEl).y;
       stEnsureSpacer(t);
       t.pinState = -1;
       stApplyPin(t);
@@ -1908,6 +1933,8 @@
   // Document-order refresh: pin spacers pad layout, so triggers below a
   // pin must measure AFTER its spacer is sized.
   const stRefreshAll = () => {
+    // spacer/body height first — trigger geometry below depends on it
+    if (smoother) smootherRefresh();
     const list = [...stTriggers.values()].filter((t) => t.el && t.el.isConnected);
     list.sort((x, y) =>
       x.el === y.el
@@ -1937,6 +1964,21 @@
   // iOS rubber-banding doesn't wiggle the state machine at page edges.
   const stApplyPin = (t) => {
     if (!t.pinEl || !t.enabled) return;
+    if (smoother) {
+      // Transform-pin: position:fixed breaks inside the smoother's
+      // transformed content (the transform makes it the containing
+      // block). Counter-translate instead — composes with scale/rotate
+      // tweens via the shared composer. Before/active/after collapse
+      // into one clamp.
+      const off = Math.min(Math.max(stEffY() - t.startY, 0), t.pinSpan);
+      const s = getXform(t.pinEl);
+      const want = (t.pinBaseY || 0) + off;
+      if (s.y !== want) {
+        s.y = want;
+        writeXform(t.pinEl);
+      }
+      return;
+    }
     const y = Math.max(0, stScrollY);
     const state = y < t.startY ? 0 : y < t.endY ? 1 : 2;
     if (state === t.pinState) return;
@@ -1961,6 +2003,13 @@
   };
 
   const stClearPin = (t) => {
+    if (smoother) {
+      const s = getXform(t.pinEl);
+      s.y = t.pinBaseY || 0;
+      writeXform(t.pinEl);
+      t.pinState = -1;
+      return;
+    }
     const st = t.pinEl.style;
     st.position = "";
     st.top = "";
@@ -1979,7 +2028,8 @@
         ";z-index:99999;pointer-events:none;font:10px monospace;color:" +
         color;
       d.textContent = label;
-      document.body.appendChild(d);
+      // markers must live in the visually-moving space under a smoother
+      (smoother ? smoother.content : document.body).appendChild(d);
       return d;
     };
     t.markers = {
@@ -2074,10 +2124,88 @@
     }
   };
 
+  // ---- ScrollTrigger snap ------------------------------------------------
+  // When input goes idle near/inside a snap-enabled trigger's span, glide
+  // the NATIVE scrollY so progress lands on the nearest snap point. All
+  // snap math stays in native-Y space — under a smoother the visual
+  // trails the glide and settles after (GSAP-like).
+
+  let snapGlide = null; // { from, to, t, dur, lastY }
+  let snapPending = false; // off-point candidate exists; keeps ticker alive
+  const SNAP_VEL = 20; // px/s — "scrolling has stopped"
+  const SNAP_IDLE_MS = 120;
+  const SNAP_EPS = 2; // px — already on a point
+
+  // Snap target in progress space. cfg = step (number) or sorted points
+  // (array). dir breaks exact ties: >= 0 picks the higher point.
+  // @verve-extract stSnapResolve
+  const stSnapResolve = (cfg, p, dir) => {
+    if (typeof cfg === "number") {
+      const lo = Math.max(0, Math.min(1, Math.floor(p / cfg) * cfg));
+      const hi = Math.min(1, lo + cfg);
+      const dLo = p - lo;
+      const dHi = hi - p;
+      if (dLo === dHi) return dir >= 0 ? hi : lo;
+      return dLo < dHi ? lo : hi;
+    }
+    let best = cfg[0];
+    let bd = Math.abs(p - cfg[0]);
+    for (let i = 1; i < cfg.length; i++) {
+      const d = Math.abs(p - cfg[i]);
+      if (d < bd || (d === bd && dir >= 0)) {
+        best = cfg[i];
+        bd = d;
+      }
+    }
+    return best;
+  };
+  // @verve-extract-end
+
+  const stSnapCheck = (now) => {
+    snapPending = false;
+    if (snapGlide) return;
+    let best = null;
+    for (const t of stTriggers.values()) {
+      if (t.snap == null || !t.enabled || !t.el || !t.el.isConnected) continue;
+      const span = t.endY - t.startY;
+      const margin = Math.min(span * 0.25, (window.innerHeight || 0) * 0.25);
+      if (stScrollY < t.startY - margin || stScrollY > t.endY + margin) continue;
+      const p = Math.max(0, Math.min((stScrollY - t.startY) / span, 1));
+      const target = t.startY + stSnapResolve(t.snap, p, stDir) * span;
+      const dist = Math.abs(target - stScrollY);
+      if (dist <= SNAP_EPS) continue;
+      snapPending = true; // keep ticker alive through the idle window
+      if (!best || dist < best.dist) best = { y: target, dist, dur: t.snapd };
+    }
+    if (!best) return;
+    if (Math.abs(stVelocity()) > SNAP_VEL) return;
+    if (!stVelT || now - stVelT < SNAP_IDLE_MS) return;
+    snapGlide = { from: stScrollY, to: best.y, t: 0, dur: best.dur, lastY: stScrollY };
+  };
+
+  const stSnapGlide = (dt) => {
+    const g = snapGlide;
+    // User intervened (wheel, touch momentum, anchor jump): native
+    // scrollY deviated from our last write -> cancel. No extra listeners.
+    if (Math.abs((window.scrollY || 0) - g.lastY) > SNAP_EPS) {
+      snapGlide = null;
+      return;
+    }
+    g.t += dt;
+    const k = Math.min(1, g.t / g.dur);
+    const e = 1 - Math.pow(1 - k, 3); // outCubic, fixed v1
+    // behavior:"instant" defeats CSS scroll-behavior:smooth, which would
+    // turn each per-frame write into its own competing animation.
+    window.scrollTo({ top: g.from + (g.to - g.from) * e, behavior: "instant" });
+    g.lastY = window.scrollY || 0; // browser may clamp/round
+    if (k >= 1) snapGlide = null;
+  };
+
   // Per-frame trigger pass: boundary edges -> actions/class/callbacks,
-  // scrub -> seek. Clears stDirty unless scrub smoothing is unsettled.
+  // scrub -> seek. Clears stDirty unless scrub smoothing, a snap glide,
+  // or a pending snap candidate remains.
   const stUpdate = (dt) => {
-    const y = stScrollY;
+    const y = stEffY();
     let unsettled = false;
     for (const t of [...stTriggers.values()]) {
       const a = t.anim ? anims.get(t.anim) : null;
@@ -2090,6 +2218,9 @@
         continue;
       }
       if (!t.enabled) continue;
+      // transform-pins follow the smoothed Y per frame (listener path
+      // skips pins when a smoother is installed)
+      if (t.pinEl && smoother) stApplyPin(t);
       const wasActive = t.active;
       const active = y >= t.startY && y < t.endY;
       t.active = active;
@@ -2134,7 +2265,218 @@
       }
       if (active && t.cb && t.cb.sU != null) animFireSlot(t.cb.sU);
     }
-    stDirty = unsettled;
+    if (snapGlide) stSnapGlide(dt);
+    else stSnapCheck(performance.now());
+    stDirty = unsettled || !!snapGlide || snapPending;
+  };
+
+  // ---- ScrollSmoother (phase 6) ------------------------------------------
+  // Native-scroll-preserving smoothing: viewport-fixed wrapper + content
+  // translated by -smoothedY + a body-height spacer keep the scrollbar,
+  // keyboard, anchors, find-in-page, and a11y fully native — only the
+  // visual position eases. One per page; config rides the
+  // data-smooth-wrapper attribute (src/core/anim/smoother.zig).
+
+  const smootherFx = (dt) => {
+    const sm = smoother;
+    if (!sm.fx.length) return false;
+    const vh = window.innerHeight || 0;
+    const effY = sm.y;
+    let busy = false;
+    for (const e of sm.fx) {
+      if (!e.el.isConnected) continue;
+      const targetOff = e.sp != null ? (effY + vh / 2 - e.center) * (1 - e.sp) : 0;
+      // activity clamp: skip work beyond one viewport outside the band
+      const visualTop = e.center - e.h / 2 - effY + e.cur;
+      const active = visualTop < 2 * vh && visualTop + e.h > -vh;
+      if (!active) {
+        if (e.cur !== targetOff) {
+          e.cur = targetOff; // snap so re-entry is seamless
+          const s = getXform(e.el);
+          s.y = e.base + e.cur;
+          animDirty.add(e.el);
+        }
+        continue;
+      }
+      if (e.lag > 0) {
+        e.cur += (targetOff - e.cur) * Math.min(1, dt / e.lag);
+        if (Math.abs(targetOff - e.cur) < 0.05) e.cur = targetOff;
+        if (e.cur !== targetOff) busy = true;
+      } else {
+        e.cur = targetOff;
+      }
+      const s = getXform(e.el);
+      if (s.y !== e.base + e.cur) {
+        s.y = e.base + e.cur;
+        animDirty.add(e.el);
+      }
+    }
+    flushXform(); // fx writes flush here — flushXform only auto-runs in animRenderAt
+    return busy;
+  };
+
+  const smootherUpdate = (dt) => {
+    const sm = smoother;
+    if (!sm.content.isConnected) {
+      smootherKill();
+      return;
+    }
+    const target = Math.max(0, Math.min(stScrollY, sm.max));
+    const prev = sm.y;
+    if (sm.smooth > 0) {
+      sm.y += (target - sm.y) * Math.min(1, dt / sm.smooth);
+      if (Math.abs(target - sm.y) < 0.05) sm.y = target;
+    } else {
+      sm.y = target;
+    }
+    sm.vel = dt > 0 ? (sm.y - prev) / dt : 0;
+    if (sm.y !== sm.lastWrite) {
+      sm.content.style.transform = `translate3d(0px,${-sm.y}px,0px)`;
+      sm.lastWrite = sm.y;
+    }
+    const lagBusy = smootherFx(dt);
+    smActive = sm.y !== target || lagBusy;
+  };
+
+  const smootherRefresh = () => {
+    const sm = smoother;
+    if (!sm || !sm.content.isConnected) return;
+    // revert fx so measurements see natural layout
+    for (const e of sm.fx) {
+      if (!e.el.isConnected) continue;
+      const s = getXform(e.el);
+      s.y = e.base;
+      writeXform(e.el);
+    }
+    const h = sm.content.offsetHeight; // transform-immune
+    sm.spacer.style.height = h + "px";
+    sm.max = Math.max(0, h - (window.innerHeight || 0));
+    if (sm.y > sm.max) sm.y = sm.max;
+    for (const e of sm.fx) {
+      if (!e.el.isConnected) continue;
+      const r = e.el.getBoundingClientRect();
+      e.center = r.top + r.height / 2 + sm.y;
+      e.h = r.height;
+      e.base = getXform(e.el).y;
+      const s = getXform(e.el);
+      s.y = e.base + e.cur;
+      writeXform(e.el);
+    }
+  };
+
+  const smootherKill = () => {
+    const sm = smoother;
+    if (!sm) return;
+    smoother = null; // null FIRST so stClearPin/stRefresh take native paths
+    smActive = false;
+    if (sm.ro) sm.ro.disconnect();
+    if (sm.spacer) sm.spacer.remove();
+    if (sm.content.isConnected) {
+      sm.content.style.transform = "";
+      const ws = sm.wrap.style;
+      ws.position = "";
+      ws.top = "";
+      ws.left = "";
+      ws.width = "";
+      ws.height = "";
+      ws.overflow = "";
+      for (const e of sm.fx) {
+        if (!e.el.isConnected) continue;
+        const s = getXform(e.el);
+        s.y = e.base;
+        writeXform(e.el);
+      }
+    }
+    stRefreshAll();
+  };
+
+  const smootherScan = (root) => {
+    // defensive: SPA swap followed by scan before any tick ran
+    if (smoother && !smoother.content.isConnected) smootherKill();
+    const list = [];
+    if (root instanceof Element) {
+      if (root.hasAttribute("data-smooth-wrapper")) list.push(root);
+      root.querySelectorAll("[data-smooth-wrapper]").forEach((el) => list.push(el));
+    } else if (root && root.querySelectorAll) {
+      root.querySelectorAll("[data-smooth-wrapper]").forEach((el) => list.push(el));
+    }
+    for (const wrap of list) {
+      if (wrap.hasAttribute("data-smooth-done")) continue;
+      wrap.setAttribute("data-smooth-done", "1");
+      if (smoother) {
+        console.warn("verve smooth: one smoother per page");
+        continue;
+      }
+      let cfg = {};
+      try {
+        cfg = JSON.parse(wrap.getAttribute("data-smooth-wrapper") || "{}") || {};
+      } catch {}
+      const content = wrap.querySelector("[data-smooth-content]");
+      if (!content) continue;
+      const isTouch = (() => {
+        try {
+          return window.matchMedia("(hover: none) and (pointer: coarse)").matches;
+        } catch {
+          return false;
+        }
+      })();
+      const smooth = isTouch ? cfg.tch || 0 : cfg.sm != null ? cfg.sm : 1;
+      const wantFx = cfg.px !== 0;
+      const fxEls = wantFx
+        ? Array.from(content.querySelectorAll("[data-speed],[data-lag]"))
+        : [];
+      // reduced motion, or nothing to smooth and no effects: stay native
+      if (prefersReduced || (smooth === 0 && fxEls.length === 0)) continue;
+
+      const ws = wrap.style;
+      ws.position = "fixed";
+      ws.top = "0";
+      ws.left = "0";
+      ws.width = "100%";
+      ws.height = "100%";
+      ws.overflow = "hidden";
+      const spacer = document.createElement("div");
+      spacer.setAttribute("data-verve-smooth-spacer", "");
+      document.body.appendChild(spacer);
+
+      smoother = {
+        wrap,
+        content,
+        spacer,
+        ro: null,
+        smooth,
+        y: window.scrollY || 0,
+        lastWrite: -1,
+        vel: 0,
+        max: 0,
+        fx: fxEls.map((el) => ({
+          el,
+          sp: el.hasAttribute("data-speed") ? parseFloat(el.getAttribute("data-speed")) : null,
+          lag: el.hasAttribute("data-lag") ? parseFloat(el.getAttribute("data-lag")) || 0 : 0,
+          center: 0,
+          h: 0,
+          base: 0,
+          cur: 0,
+        })),
+      };
+      // content growth (islands, images) without window events
+      try {
+        let roRaf = 0;
+        smoother.ro = new ResizeObserver(() => {
+          if (roRaf) return;
+          roRaf = requestAnimationFrame(() => {
+            roRaf = 0;
+            stRefreshAll();
+            stDirty = true;
+            tickerKick();
+          });
+        });
+        smoother.ro.observe(content);
+      } catch {}
+      smootherRefresh();
+      smActive = true;
+      tickerKick();
+    }
   };
 
   // Shared velocity tracker: ~6-sample / 100ms ring buffer over any
@@ -3320,6 +3662,22 @@
     },
     verve_scroll_pos: (axis) =>
       (axis >>> 0) === 0 ? window.scrollX || 0 : window.scrollY || 0,
+    // ScrollSmoother read-only access (page singleton — no create/kill
+    // ops; lifecycle belongs to the page markup).
+    // field: 0 smoothed y (native fallback), 1 smoothed velocity px/s,
+    //        2 active (1 = smoother installed)
+    verve_sm_get: (f) => {
+      switch (f >>> 0) {
+        case 0:
+          return smoother ? smoother.y : window.scrollY || 0;
+        case 1:
+          return smoother ? smoother.vel : 0;
+        case 2:
+          return smoother ? 1 : 0;
+        default:
+          return 0;
+      }
+    },
     verve_obs_create: (flags, tol, sp, sl, handlerIdx) =>
       obsCreate(flags >>> 0, tol, sl ? readStr(sp, sl) : "", handlerIdx >>> 0) >>> 0,
     // op: 0 kill, 1 disable, 2 enable
@@ -3848,8 +4206,11 @@
 
   parseIslandState();
   document.querySelectorAll("verve-island").forEach(hydrateIslandEl);
-  // SplitText line grouping FIRST (animations targeting .st-line resolve
-  // targets at create), then declarative animations and draggables.
+  // Smoother FIRST (wrapper must be fixed + spacer sized before trigger
+  // geometry measures), then SplitText line grouping (animations
+  // targeting .st-line resolve targets at create), then declarative
+  // animations and draggables.
+  smootherScan(document.body);
   splitLinesScan(document.body);
   animScan(document.body);
   dragScan(document.body);
@@ -3863,6 +4224,7 @@
         // clones) may carry their own [data-split-lines]/[data-anim]/
         // [data-drag] markers. Lines group BEFORE animations resolve.
         if (n instanceof Element) {
+          smootherScan(n);
           splitLinesScan(n);
           animScan(n);
           dragScan(n);

@@ -1104,3 +1104,42 @@ test "/anim carries SplitText markup and FLIP machinery ships" {
     try std.testing.expect(std.mem.indexOf(u8, js.body, "data-split-lines-done") != null);
     try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_flip_capture") != null);
 }
+
+test "/smooth serves the ScrollSmoother page" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 19);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    var resp = try request(io, gpa, port, "GET", "/smooth");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // Smoother wrapper structure + config (defaults omitted => {"sm":1.2}).
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-smooth-wrapper=\"{&quot;sm&quot;:1.2}\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-smooth-content") != null);
+    // Parallax attrs.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-speed=\"0.5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-lag=\"0.4\"") != null);
+    // Snap rides the sc descriptor: step form on the deck.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;snap&quot;:0.33") != null);
+    // Points form on the pinned panel.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;snap&quot;:[0,0.5,1]") != null);
+    // Probe island present.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-name=\"SmoothDemo\"") != null);
+
+    // The bridge ships the smoother + snap machinery.
+    var js = try request(io, gpa, port, "GET", "/verve.js");
+    defer js.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "data-smooth-wrapper") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "stSnapResolve") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_sm_get") != null);
+
+    // Home links the demo.
+    var home = try request(io, gpa, port, "GET", "/");
+    defer home.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, home.body, "href=\"/smooth\"") != null);
+}

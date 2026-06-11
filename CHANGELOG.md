@@ -48,6 +48,23 @@ versions follow [Semantic Versioning](https://semver.org/).
   `"mo"`; both compose with timelines, stagger, and ScrollTrigger scrub
   as pure phase functions. Conformance: serializer goldens +
   `node tests/js/anim_conformance.mjs`.
+- **`verve.anim` ScrollSmoother** (`src/core/anim/smoother.zig` +
+  `Node.smoothScroll(.{ .smooth = 1.2 })`, completing the GSAP-class
+  spec): native-scroll-preserving inertia — a viewport-fixed wrapper +
+  content translated by the smoothed scroll + a body-height spacer keep
+  the scrollbar, keyboard, anchors, and a11y fully native while the
+  visual eases. ScrollTrigger math switches to the smoothed position;
+  pins become transform counter-translations (fixed breaks inside
+  transformed content); `data-speed`/`data-lag` parallax
+  (`Node.parallaxSpeed`/`parallaxLag`); touch native by default;
+  reduced motion fully disables. Island getters `verve.smootherY` /
+  `smootherVelocity` / `smootherActive`. Demo: the `/smooth` route.
+- **`verve.anim` ScrollTrigger snap** (`.snap = .{ .step = 1.0/3.0 }`
+  or `.{ .points = &.{...} }` + `.snap_duration`): when input goes idle
+  inside a trigger's span, the NATIVE scroll glides (outCubic) to the
+  nearest progress point — nearest candidate across triggers,
+  direction-biased ties, user input cancels; composes with the smoother
+  by construction. Wire keys `"snap"`/`"snapd"`.
 - **`verve.anim` SplitText** (`src/core/anim/split.zig` +
   `Node.splitText(.{ .by = .chars })`): server-side text splitting into
   animatable spans — chars/words/words_and_chars cost zero JS; `lines`

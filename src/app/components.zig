@@ -261,6 +261,7 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
         ctx.p().children(.{verve.link(ctx, "/counter", "Counter demo →", .{ .prefetch_on_hover = true })}),
         ctx.p().children(.{verve.link(ctx, "/todos", "Todo list (form fallback) →", .{})}),
         ctx.p().children(.{verve.link(ctx, "/anim", "Animation engine (verve.anim) →", .{})}),
+        ctx.p().children(.{verve.link(ctx, "/smooth", "ScrollSmoother + snap →", .{})}),
         ctx.p().children(.{verve.link(ctx, "/work/hello-world", "Path-param demo (/work/:slug) →", .{})}),
     }).build();
 }
@@ -427,6 +428,97 @@ fn pathSection(ctx: *const verve.Context) *verve.Node {
             .scrub = .{ .smooth = 0.3 },
         })),
     });
+}
+
+/// ScrollSmoother + snap demo (phase 6): the whole page content rides a
+/// smoother (native scrolling preserved — the visual eases behind the
+/// scrollbar), with parallax layers, a snapping section deck, and a
+/// transform-pinned panel. Render the smoothScroll() RETURN VALUE.
+pub fn smoothDemo(ctx: *const verve.Context) !*verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
+    // 4-section deck: container-scrubbed progress bar + step snap —
+    // idle always settles on a section boundary.
+    const deck = ctx.el("section").id("snap-deck").children(.{
+        ctx.div().class("smooth-deck-bar").ariaHidden(true),
+        smoothSection(ctx, "One", "#1f6feb"),
+        smoothSection(ctx, "Two", "#10b981"),
+        smoothSection(ctx, "Three", "#f59e0b"),
+        smoothSection(ctx, "Four", "#e3506f"),
+    }).animate(anim.to(a, ".smooth-deck-bar")
+        .scaleX(1).propFrom("scaleX", 0)
+        .duration(1).ease(.linear)
+        .scrollTrigger(.{
+        .start = .{ .trigger = .top, .viewport = .top },
+        .end = .{ .at = .{ .trigger = .bottom, .viewport = .bottom } },
+        .scrub = .exact,
+        .snap = .{ .step = 1.0 / 3.0 },
+    }));
+
+    const content = ctx.main_().class("home smooth-page").children(.{
+        ctx.el("section").class("smooth-hero").children(.{
+            ctx.div().class("smooth-bg").ariaHidden(true).parallaxSpeed(0.5),
+            ctx.div().class("smooth-mid").ariaHidden(true).parallaxSpeed(0.8),
+            ctx.h1("ScrollSmoother").splitText(.{ .by = .chars })
+                .animate(anim.from(a, ".st-char")
+                .opacity(0).y(18)
+                .duration(0.5).ease(.out_cubic)
+                .stagger(.{ .each = 0.03 })),
+            ctx.p().class("hint").text("Native scrolling, eased visuals. The scrollbar, keyboard, and anchors all work — the content glides to catch up."),
+            ctx.div().class("smooth-badge").text("lag 0.4").parallaxLag(0.4),
+        }),
+        ctx.h2("Snapping deck").animate(anim.reveal(a, "in-view", .{
+            .start = .{ .viewport = .{ .pct = 85 } },
+            .once = true,
+        })),
+        ctx.p().class("hint").text("Scroll into the deck and let go — it settles on a section boundary."),
+        deck,
+        ctx.h2("Pinned under the smoother"),
+        ctx.p().class("hint").text("position:fixed breaks inside transformed content, so this pin counter-translates instead."),
+        ctx.div().class("anim-pin-panel")
+            .children(.{
+                ctx.div().class("anim-scrub-bar").ariaHidden(true),
+                ctx.p().text("Transform-pinned while the bar scrubs (smoothed)."),
+            })
+            .animate(anim.to(a, ".anim-scrub-bar")
+            .scaleX(1).propFrom("scaleX", 0)
+            .duration(1).ease(.linear)
+            .scrollTrigger(.{
+            .start = .{ .trigger = .top, .viewport = .{ .pct = 20 } },
+            .end = .{ .rel_vh = 1.5 },
+            .scrub = .{ .smooth = 0.3 },
+            .pin = .self,
+            .snap = .{ .points = &.{ 0, 0.5, 1 } },
+        })),
+        smoothProbe(ctx),
+        ctx.div().class("anim-spacer").ariaHidden(true),
+        ctx.p().children(.{ctx.a("/", "← Home")}),
+    });
+
+    return content.smoothScroll(.{ .smooth = 1.2 }).build();
+}
+
+fn smoothSection(ctx: *const verve.Context, label: []const u8, color: []const u8) *verve.Node {
+    return ctx.el("section").class("smooth-section").children(.{
+        ctx.h2(label).attrFmt("style", "color:{s}", .{color}),
+    });
+}
+
+/// Island probe: native vs smoothed scroll side by side (visualizes the
+/// lag; exercises verve_sm_get end-to-end).
+fn smoothProbe(ctx: *const verve.Context) *verve.Node {
+    const inner = ctx.div().class("anim-probe").children(.{
+        ctx.p().children(.{
+            ctx.span().text("native: "),
+            ctx.span().bind("sm_native").text("0"),
+            ctx.span().text(" px · smoothed: "),
+            ctx.span().bind("sm_smooth").text("0"),
+            ctx.span().text(" px · vel: "),
+            ctx.span().bind("sm_vel").text("0 px/s"),
+        }),
+    });
+    return verve.island(ctx, .{ .name = "SmoothDemo" }, inner);
 }
 
 /// Eight keyed cards for the FLIP shuffle (data-vkey "c1".."c8" — the
@@ -709,6 +801,16 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.st-char,.st-word{display:inline-block;will-change:transform}
                 \\.flip-grid{display:flex;gap:.5rem;flex-wrap:wrap;margin:.75rem 0;max-width:18rem}
                 \\.fcard{width:3.5rem;height:3.5rem}
+                \\.smooth-page{max-width:none}
+                \\.smooth-hero{position:relative;min-height:100vh;display:flex;flex-direction:column;justify-content:center;overflow:hidden}
+                \\.smooth-bg,.smooth-mid{position:absolute;inset:-20% 0;pointer-events:none;will-change:transform}
+                \\.smooth-bg{background:radial-gradient(circle at 30% 40%,#16233a 0,transparent 60%)}
+                \\.smooth-mid{background:radial-gradient(circle at 70% 60%,#1b2a1f 0,transparent 50%)}
+                \\.smooth-badge{display:inline-block;align-self:flex-start;padding:.4rem .8rem;border:1px solid #444;border-radius:999px;background:#16161a;will-change:transform}
+                \\.smooth-section{min-height:100vh;display:flex;align-items:center;justify-content:center;border-top:1px dashed #2a2a2e}
+                \\.smooth-section h2{font-size:3rem}
+                \\#snap-deck{position:relative}
+                \\.smooth-deck-bar{position:absolute;top:0;left:0;right:0;height:.4rem;background:#58a6ff;transform-origin:left center;z-index:5}
                 \\.viz-card svg{touch-action:none;max-width:100%}
                 \\.viz-node{cursor:grab}
                 \\.viz-node.selected circle{stroke:#fff;stroke-width:3}

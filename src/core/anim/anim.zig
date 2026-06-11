@@ -46,6 +46,12 @@ pub const split = @import("split.zig");
 pub const flip = @import("flip.zig");
 pub const FlipOpts = flip.FlipOpts;
 
+// ScrollSmoother (phase 6): native-scroll-preserving smooth scrolling.
+// (SSR-only — operates on *Node via Node.smoothScroll; not re-exported
+// from client_core.)
+pub const smoother = @import("smoother.zig");
+pub const Smoother = smoother.Smoother;
+
 // Draggable (phase 4): pointer drag with grip/axis/bounds/snap/inertia.
 pub const drag = @import("drag.zig");
 pub const Draggable = drag.Draggable;
@@ -65,6 +71,7 @@ pub const Scrub = scroll.Scrub;
 pub const Pin = scroll.Pin;
 pub const Action = scroll.Action;
 pub const ToggleActions = scroll.ToggleActions;
+pub const ScrollSnap = scroll.Snap;
 pub const reveal = scroll.reveal;
 
 // Math utilities (also re-exported flat for ergonomics).
@@ -93,4 +100,5 @@ test {
     _ = @import("drag.zig");
     _ = @import("split.zig");
     _ = @import("flip.zig");
+    _ = @import("smoother.zig");
 }

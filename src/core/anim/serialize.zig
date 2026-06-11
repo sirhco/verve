@@ -560,6 +560,26 @@ fn writeScrollTrigger(w: *std.Io.Writer, sc: scroll.ScrollTrigger, surface: Surf
         try comma(w, &first);
         try w.writeAll("\"mk\":1");
     }
+    switch (sc.snap) {
+        .none => {},
+        .step => |s| {
+            try comma(w, &first);
+            try w.print("\"snap\":{d}", .{s});
+        },
+        .points => |pts| {
+            try comma(w, &first);
+            try w.writeAll("\"snap\":[");
+            for (pts, 0..) |p, i| {
+                if (i != 0) try w.writeAll(",");
+                try w.print("{d}", .{p});
+            }
+            try w.writeAll("]");
+        },
+    }
+    if (sc.snap != .none and sc.snap_duration != 0.4) {
+        try comma(w, &first);
+        try w.print("\"snapd\":{d}", .{sc.snap_duration});
+    }
     if (sc.toggle_class) |c| {
         try comma(w, &first);
         try w.writeAll("\"cls\":");
@@ -889,6 +909,49 @@ test "golden: sc named-export callbacks on SSR" {
         "{\"v\":1,\"sc\":{\"t\":{\"s\":\"#hero\"},\"cb\":{\"isl\":\"Hero\",\"nE\":\"hero_enter\"}}}",
         json,
     );
+}
+
+test "golden: scrub with full-step snap" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".bar").scaleX(1).duration(1)
+        .scrollTrigger(.{ .scrub = .exact, .snap = .{ .step = 1 } });
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expect(std.mem.indexOf(u8, json, "\"sc\":{\"scr\":true,\"snap\":1}") != null);
+}
+
+test "golden: snap points + non-default duration" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".bar").scaleX(1).duration(1)
+        .scrollTrigger(.{
+        .scrub = .{ .smooth = 0.3 },
+        .snap = .{ .points = &.{ 0, 0.25, 0.5, 1 } },
+        .snap_duration = 0.6,
+    });
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expect(std.mem.indexOf(u8, json, "\"snap\":[0,0.25,0.5,1],\"snapd\":0.6") != null);
+}
+
+test "golden: snap on anim-less reveal trigger" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tr = scroll.reveal(a, "in-view", .{ .snap = .{ .step = 1 } });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"sc\":{\"snap\":1,\"cls\":\"in-view\"}}",
+        try triggerToJson(a, tr, .ssr),
+    );
+}
+
+test "snap validation defers through builder" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".x").x(1).scrollTrigger(.{ .snap = .{ .step = 2 } });
+    try testing.expectEqual(@as(?anyerror, error.SnapStepOutOfRange), t.err);
 }
 
 test "ssr rejects sc island-only constructs" {

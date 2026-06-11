@@ -26,12 +26,13 @@ const fns = new Function(
   extract("mpSample") + extract("buildMorphD") + extract("animIsTriggerOnly") +
     extract("dragProject") + extract("dragSnapResolve") +
     extract("splitLineRuns") + extract("flipNatural") + extract("flipDelta") +
+    extract("stSnapResolve") +
     "return { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve, " +
-    "splitLineRuns, flipNatural, flipDelta };",
+    "splitLineRuns, flipNatural, flipDelta, stSnapResolve };",
 )();
 const {
   mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve,
-  splitLineRuns, flipNatural, flipDelta,
+  splitLineRuns, flipNatural, flipDelta, stSnapResolve,
 } = fns;
 
 let fails = 0;
@@ -194,8 +195,26 @@ const approx = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
   check("delta degenerate", d.rx === 1);
 }
 
+// ---- ScrollTrigger snap: progress-space resolution ----
+{
+  // step form
+  check("snap step nearest down", stSnapResolve(0.25, 0.3, 1) === 0.25);
+  check("snap step nearest up", stSnapResolve(0.25, 0.45, 1) === 0.5);
+  check("snap step tie dir+", stSnapResolve(0.25, 0.375, 1) === 0.5);
+  check("snap step tie dir-", stSnapResolve(0.25, 0.375, -1) === 0.25);
+  check("snap step 1 rounds to end", stSnapResolve(1, 0.6, 1) === 1);
+  check("snap step 1 rounds to start", stSnapResolve(1, 0.4, 1) === 0);
+  check("snap step clamp at 1", stSnapResolve(0.25, 1, 1) === 1);
+  check("snap step clamp at 0", stSnapResolve(0.25, 0, -1) === 0);
+  // points form
+  check("snap points nearest", stSnapResolve([0, 0.5, 1], 0.2, 1) === 0);
+  check("snap points nearest mid", stSnapResolve([0, 0.5, 1], 0.6, 1) === 0.5);
+  check("snap points tie dir+", stSnapResolve([0, 0.5], 0.25, 1) === 0.5);
+  check("snap points tie dir-", stSnapResolve([0, 0.5], 0.25, -1) === 0);
+}
+
 if (fails === 0) {
-  console.log("anim conformance: ALL PASS (mp + morph + routing + drag + split + flip)");
+  console.log("anim conformance: ALL PASS (mp + morph + routing + drag + split + flip + snap)");
 } else {
   console.log(`anim conformance: ${fails} FAILURES`);
   process.exit(1);

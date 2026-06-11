@@ -51,6 +51,7 @@ pub const Scrub = scroll.Scrub;
 pub const Pin = scroll.Pin;
 pub const Action = scroll.Action;
 pub const ToggleActions = scroll.ToggleActions;
+pub const ScrollSnap = scroll.Snap;
 pub const reveal = scroll.reveal;
 
 pub const util = @import("util.zig");

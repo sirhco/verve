@@ -99,6 +99,19 @@ pub const ToggleActions = struct {
     }
 };
 
+/// Snap targets in progress space (0..1) over the trigger's start..end
+/// span. After scrolling goes idle inside (or near) the span, the engine
+/// glides the NATIVE scroll position so progress lands on the nearest
+/// point. Disabled entirely under prefers-reduced-motion.
+pub const Snap = union(enum) {
+    none,
+    /// Snap to multiples of `step` (0 < step <= 1). 1.0 = start/end only
+    /// — full-section snapping on a viewport-per-section trigger.
+    step: f64,
+    /// Explicit progress points: strictly ascending, each in [0, 1].
+    points: []const f64,
+};
+
 /// ScrollTrigger config — the option struct for `.scrollTrigger(.{...})`
 /// on tweens/timelines and for `reveal`/`verve.scrollTrigger`.
 /// v1 scope: vertical window scroll only.
@@ -116,6 +129,11 @@ pub const ScrollTrigger = struct {
 
     scrub: Scrub = .off,
     pin: Pin = .off,
+    /// Settle the native scroll on progress points when input goes idle.
+    /// Legal on any trigger (not just scrubbed ones).
+    snap: Snap = .none,
+    /// Snap glide duration, seconds. Ease is outCubic (fixed in v1).
+    snap_duration: f64 = 0.4,
     actions: ToggleActions = .{},
     /// Fire on_enter once, then self-kill (toggle class stays applied).
     once: bool = false,
@@ -163,6 +181,22 @@ pub const ScrollTrigger = struct {
                 return error.SpecOutOfRange,
             .rel_px, .rel_vh => {},
         }
+        switch (self.snap) {
+            .none => {},
+            .step => |s| if (!(s > 0 and s <= 1)) return error.SnapStepOutOfRange,
+            .points => |pts| {
+                if (pts.len == 0) return error.SnapPointsEmpty;
+                var prev: f64 = -1;
+                for (pts) |p| {
+                    if (!(p >= 0 and p <= 1)) return error.SnapPointOutOfRange;
+                    if (p <= prev) return error.SnapPointsUnsorted;
+                    prev = p;
+                }
+            },
+        }
+        if (self.snap != .none and
+            !(self.snap_duration > 0 and std.math.isFinite(self.snap_duration)))
+            return error.SnapDurationOutOfRange;
         return null;
     }
 
@@ -269,6 +303,32 @@ test "validate matrix" {
     try std.testing.expectEqual(@as(?anyerror, null), cls.validateStandalone());
     const slot: ScrollTrigger = .{ .on_enter_slot = 4 };
     try std.testing.expectEqual(@as(?anyerror, null), slot.validateStandalone());
+}
+
+test "snap validate matrix" {
+    const ok_step: ScrollTrigger = .{ .scrub = .exact, .snap = .{ .step = 1 } };
+    try std.testing.expectEqual(@as(?anyerror, null), ok_step.validate());
+    // snap legal without scrub (toggle trigger snapping to its start)
+    const ok_toggle: ScrollTrigger = .{ .snap = .{ .step = 0.5 } };
+    try std.testing.expectEqual(@as(?anyerror, null), ok_toggle.validate());
+
+    const big: ScrollTrigger = .{ .snap = .{ .step = 1.5 } };
+    try std.testing.expectEqual(@as(?anyerror, error.SnapStepOutOfRange), big.validate());
+    const zero: ScrollTrigger = .{ .snap = .{ .step = 0 } };
+    try std.testing.expectEqual(@as(?anyerror, error.SnapStepOutOfRange), zero.validate());
+
+    const empty: ScrollTrigger = .{ .snap = .{ .points = &.{} } };
+    try std.testing.expectEqual(@as(?anyerror, error.SnapPointsEmpty), empty.validate());
+    const oor: ScrollTrigger = .{ .snap = .{ .points = &.{ 0, 1.2 } } };
+    try std.testing.expectEqual(@as(?anyerror, error.SnapPointOutOfRange), oor.validate());
+    const unsorted: ScrollTrigger = .{ .snap = .{ .points = &.{ 0.5, 0.25 } } };
+    try std.testing.expectEqual(@as(?anyerror, error.SnapPointsUnsorted), unsorted.validate());
+
+    const bad_dur: ScrollTrigger = .{ .snap = .{ .step = 1 }, .snap_duration = 0 };
+    try std.testing.expectEqual(@as(?anyerror, error.SnapDurationOutOfRange), bad_dur.validate());
+    // duration ignored when snap off
+    const off: ScrollTrigger = .{ .snap_duration = 0 };
+    try std.testing.expectEqual(@as(?anyerror, null), off.validate());
 }
 
 test "reveal builder fills class and validates" {

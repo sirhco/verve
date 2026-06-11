@@ -1194,6 +1194,30 @@ pub fn draggable(cfg: anim.Draggable, cbs: DragCallbacks) ?DragHandle {
     return .{ .id = h };
 }
 
+// ---- ScrollSmoother (verve.anim phase 6) -----------------------------------
+//
+// The smoother is a page singleton authored via Node.smoothScroll();
+// islands get read-only access. No create/kill ops — lifecycle belongs
+// to the page markup; geometry refresh rides scrollRefresh().
+// field: 0 smoothed y (native scrollY fallback when no smoother),
+//        1 smoothed velocity px/s, 2 active (1 = installed)
+extern "verve_runtime" fn verve_sm_get(field: u32) f64;
+
+/// Smoothed scroll position, px (== native scrollY when no smoother).
+pub fn smootherY() f64 {
+    return verve_sm_get(0);
+}
+
+/// Smoothed scroll velocity, px/s.
+pub fn smootherVelocity() f64 {
+    return verve_sm_get(1);
+}
+
+/// True when a ScrollSmoother is installed on this page.
+pub fn smootherActive() bool {
+    return verve_sm_get(2) != 0;
+}
+
 // ---- FLIP (verve.anim phase 5) ----------------------------------------------
 //
 // First-Last-Invert-Play layout animation. Island-only — capture rects,

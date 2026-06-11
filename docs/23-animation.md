@@ -284,6 +284,14 @@ ctx.h2("Pricing").animate(anim.reveal(a, "in-view", .{
 - **Reduced motion**: anim-bearing triggers jump to their end state on
   registration (scrub included — content stays readable); pins are
   disabled; class toggles and callback triggers still run.
+- **Snap**: `.snap = .{ .step = 0.25 }` (progress multiples; `1` =
+  start/end — full-section snapping) or `.{ .points = &.{ 0, 0.5, 1 } }`
+  (sorted, 0..1), plus `.snap_duration` (default 0.4s, outCubic). When
+  input goes idle (~120ms under 20px/s) inside the trigger's span ±25%,
+  the NATIVE scroll glides to the nearest point — nearest candidate wins
+  across snap-enabled triggers, exact ties break in the last scroll
+  direction, and any user input cancels the glide. Legal on any trigger
+  (not just scrubbed). Disabled under reduced motion.
 - **Island surface**: `verve.scrollCallbacks(t, .{ .on_enter = &f, ... })`
   stamps wasm callbacks onto a builder's trigger;
   `verve.scrollTrigger(cfg, cbs)` creates a standalone trigger (no
@@ -317,6 +325,43 @@ scrolling — required for smoothers, but it also suppresses the scroll
 that ScrollTriggers depend on), `lock_axis`, `tolerance`. Handle:
 `kill/disable/enable` + delta/velocity/direction getters. Touch deltas
 use wheel polarity (finger up = positive deltaY).
+
+## ScrollSmoother
+
+Buttery inertia scrolling that keeps native scrolling intact: the
+scrollbar, keyboard, anchors, find-in-page, and assistive tech all work —
+only the *visual* position eases. A viewport-fixed wrapper holds the
+content, which translates by a smoothed copy of the native scroll; a
+spacer preserves the body's scroll range.
+
+```zig
+pub fn smoothPage(ctx: *verve.Context) !*verve.Node {
+    const content = ctx.main_().children(.{
+        ctx.div().class("hero-bg").parallaxSpeed(0.5),   // half scroll speed
+        ctx.div().class("badge").parallaxLag(0.4),       // 0.4s extra easing
+        // ... the whole page ...
+    });
+    // returns the WRAPPER — render the return value
+    return content.smoothScroll(.{
+        .smooth = 1.2,    // seconds to catch up (default 1)
+        .touch = 0,       // touch smoothing; 0 (default) = native touch
+        .parallax = true, // honor data-speed / data-lag
+    }).build();
+}
+```
+
+One smoother per page. ScrollTrigger math automatically switches to the
+smoothed position (scrub, reveals, and markers track what the eye sees),
+pins switch from `position:fixed` to transform counter-translation
+(fixed breaks inside transformed content), and snap keeps driving the
+native scroll — the smoother glides after it. `verve.smootherY()` /
+`smootherVelocity()` / `smootherActive()` give islands read-only access.
+Reduced motion disables the smoother entirely (fully native page).
+
+Caveats: `position:fixed`/`sticky` descendants and CSS scroll-snap are
+dead inside the content — portal modals/banners OUTSIDE the wrapper;
+zero out body margin on smoothed pages; anchor/keyboard jumps land
+natively while the visual eases in.
 
 ## SplitText
 
@@ -518,6 +563,10 @@ is ignored when present — the trigger owns play-state):
 `[1,0]` omitted); `e` alternatives `{"r":px}` / `{"rv":viewportHeights}`;
 `scr` `true` = exact, number = smoothing seconds; action ints: 0 none,
 1 play, 2 pause, 3 resume, 4 reverse, 5 restart, 6 complete, 7 reset.
+Snap: `"snap":0.25` (step) or `"snap":[0,0.5,1]` (points) +
+`"snapd":0.6` (omitted at default 0.4). The smoother config rides its
+own attribute: `data-smooth-wrapper='{"sm":1.5,"tch":0.8,"px":0}'`
+(defaults omitted) around a `data-smooth-content` child.
 A descriptor with `sc` and no `p`/`k`/`ch` is a tween-less trigger
 (`anim.reveal`).
 
@@ -563,10 +612,11 @@ motion), and the `AnimDemo` island (`src/client/islands/AnimDemo.zig`)
 with pause/play/reverse/restart/timeScale buttons, an onComplete signal,
 and a dynamic-value + snap-modifier tween.
 
-## Not yet (planned plugins)
+## Not yet
 
-ScrollSmoother (Observer + scroller-proxy), scroll snap, horizontal /
-container scrollers, grapheme-aware/RTL splitting + split revert, FLIP
+The original GSAP-class spec is complete. Tracked follow-ups: horizontal
+/ container scrollers, configurable snap ease + inertia-aware
+directional snap, grapheme-aware/RTL splitting + split revert, FLIP
 onEnter/onLeave callbacks + nested counter-scale, drag bounce /
 drop-zones / sortable lists, GSAP-style `align`/`alignOrigin` for
-MotionPath, island morph-from-current-d — tracked as follow-up phases.
+MotionPath, island morph-from-current-d.

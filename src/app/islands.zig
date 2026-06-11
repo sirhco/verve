@@ -43,6 +43,12 @@ pub const VizGraph = struct {
     };
 };
 
+/// ScrollSmoother probe — streams native vs smoothed scroll position into
+/// signals (verve_sm_get end-to-end). Source: `src/client/islands/SmoothDemo.zig`.
+pub const SmoothDemo = struct {
+    pub const props_schema: []const u8 = "{}";
+};
+
 /// verve.anim demo — imperative timeline with staggered entrance, control
 /// API buttons, an onComplete-callback signal, and a dynamic-value +
 /// fn-modifier tween. Source: `src/client/islands/AnimDemo.zig`.
