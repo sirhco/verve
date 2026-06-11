@@ -5,9 +5,14 @@
 //! start a rAF loop driving `glcube_frame`. Each call returns a pointer
 //! to a length-prefixed command stream (core/gl/command.zig layout);
 //! the bridge walks it and issues WebGL2 calls. Returning 0 stops the
-//! loop. First frame carries the CREATE_* resource commands; vertex
-//! bytes and GLSL travel as (ptr, len) into this module's statics —
-//! zero copies.
+//! loop per the protocol — this demo never stops, so no path returns 0.
+//! First frame carries the CREATE_* resource commands; vertex bytes and
+//! GLSL travel as (ptr, len) into this module's statics — zero copies.
+//!
+//! Multi-instance: all state below is file-scope statics, so two
+//! `<verve-island data-name="GlCube">` markers on one page would share
+//! one scene/buffer (same singleton choice Counter.zig documents).
+//! Namespace by `root_id` if a page ever needs two cubes.
 
 const verve = @import("verve");
 const gl = verve.gl;
