@@ -294,12 +294,17 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
             const raw_indices = try readAccessorU16(accessors, buffer_views, bin, idx_acc_idx, aa);
 
             // Submesh index_byte_off is byte offset into the index buffer
-            const index_byte_off: u32 = @intCast(idx_list.items.len * 2);
+            const index_byte_off = std.math.cast(u32, idx_list.items.len * 2) orelse
+                return error.Malformed;
 
-            // Rebase indices by vert_base
+            // Rebase indices by vert_base. u16 indices cap the flat pool
+            // at 65535 vertices — hostile counts must error, not panic.
+            const base_u16 = std.math.cast(u16, vert_base) orelse return error.Malformed;
             try idx_list.ensureUnusedCapacity(aa, raw_indices.len);
             for (raw_indices) |raw_idx| {
-                idx_list.appendAssumeCapacity(raw_idx + @as(u16, @intCast(vert_base)));
+                const rebased = std.math.add(u16, raw_idx, base_u16) catch
+                    return error.Malformed;
+                idx_list.appendAssumeCapacity(rebased);
             }
 
             // ── Material ──────────────────────────────────────────────────────
