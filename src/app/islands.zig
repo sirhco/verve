@@ -80,15 +80,12 @@ pub const VizGraphInteractive = struct {
     };
 };
 
-/// verve.gl P1 — rotating unlit cube. The chunk builds the scene and
-/// encodes a binary command stream each frame; the bridge's WebGL2
-/// interpreter draws it. Source: `src/client/islands/GlCube.zig`.
-pub const GlCube = struct {
-    pub const props_schema: []const u8 = "{}";
-};
-
-/// verve.gl P2 — textured model loaded from /gl/demo.vmesh through the
-/// asset pipeline. Source: `src/client/islands/GlModel.zig`.
-pub const GlModel = struct {
+/// verve.gl demo — single chunk hosting BOTH /gl canvases (unlit cube +
+/// textured model). Two separate stateful chunks on one page would overlap
+/// in shared linear memory (each chunk links static data at the same 0x1000
+/// base), clobbering each other's scene/cmd_buf/rodata. Merging them into
+/// one chunk satisfies the framework invariant (at most ONE stateful chunk
+/// per page). Source: `src/client/islands/GlDemo.zig`.
+pub const GlDemo = struct {
     pub const props_schema: []const u8 = "{}";
 };
