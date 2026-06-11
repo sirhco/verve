@@ -158,30 +158,37 @@ pub const Reader = struct {
         const tex_table_off = std.mem.readInt(u32, bytes[32..36], .little);
         const tex_data_off = std.mem.readInt(u32, bytes[36..40], .little);
 
-        // Bounds-check vertex data
-        const vertex_bytes = vertex_count * vertex_stride;
-        if (vertex_off > bytes.len or vertex_bytes > bytes.len - vertex_off) return error.Truncated;
+        const blen: u64 = bytes.len;
 
-        // Bounds-check index data
-        const index_bytes = index_count * 2;
-        if (index_off > bytes.len or index_bytes > bytes.len - index_off) return error.Truncated;
+        // Bounds-check vertex data (u64 to prevent u32 multiply wrap)
+        const need_verts: u64 = @as(u64, vertex_count) * @as(u64, vertex_stride);
+        if (@as(u64, vertex_off) > blen or need_verts > blen - @as(u64, vertex_off)) return error.Truncated;
+        const vertex_bytes: usize = @intCast(need_verts);
 
-        // Bounds-check submesh table
-        const sub_table_bytes = sub_count * submesh_size;
+        // Bounds-check index data (u64 to prevent u32 multiply wrap)
+        const need_idx: u64 = @as(u64, index_count) * 2;
+        if (@as(u64, index_off) > blen or need_idx > blen - @as(u64, index_off)) return error.Truncated;
+        const index_bytes: usize = @intCast(need_idx);
+
+        // Bounds-check submesh table (u64 to prevent u32 multiply wrap)
+        const need_subs: u64 = @as(u64, sub_count) * @as(u64, submesh_size);
         const sub_table_off: u32 = header_size;
-        if (sub_table_off > bytes.len or sub_table_bytes > bytes.len - sub_table_off) return error.Truncated;
+        if (@as(u64, sub_table_off) > blen or need_subs > blen - @as(u64, sub_table_off)) return error.Truncated;
+        const sub_table_bytes: usize = @intCast(need_subs);
 
-        // Bounds-check texture table
-        const tex_table_bytes = tex_count * tex_entry_size;
-        if (tex_table_off > bytes.len or tex_table_bytes > bytes.len - tex_table_off) return error.Truncated;
+        // Bounds-check texture table (u64 to prevent u32 multiply wrap)
+        const need_tex_table: u64 = @as(u64, tex_count) * @as(u64, tex_entry_size);
+        if (@as(u64, tex_table_off) > blen or need_tex_table > blen - @as(u64, tex_table_off)) return error.Truncated;
 
-        // Bounds-check each texture's data in the blob
+        // Bounds-check each texture entry's header range and blob data (u64 to prevent wrap)
         for (0..tex_count) |i| {
-            const entry_off = tex_table_off + @as(u32, @intCast(i)) * tex_entry_size;
+            const entry_off_u64: u64 = @as(u64, tex_table_off) + @as(u64, i) * @as(u64, tex_entry_size);
+            if (entry_off_u64 + @as(u64, tex_entry_size) > blen) return error.Truncated;
+            const entry_off: usize = @intCast(entry_off_u64);
             const data_off = std.mem.readInt(u32, bytes[entry_off + 8 ..][0..4], .little);
             const data_len = std.mem.readInt(u32, bytes[entry_off + 12 ..][0..4], .little);
-            const abs_off = tex_data_off + data_off;
-            if (abs_off > bytes.len or data_len > bytes.len - abs_off) return error.Truncated;
+            const abs_off_u64: u64 = @as(u64, tex_data_off) + @as(u64, data_off);
+            if (abs_off_u64 > blen or @as(u64, data_len) > blen - abs_off_u64) return error.Truncated;
         }
 
         return Reader{
@@ -196,7 +203,9 @@ pub const Reader = struct {
         };
     }
 
+    /// Caller must ensure `i < self.submesh_count`.
     pub fn submesh(self: *const Reader, i: u32) Submesh {
+        std.debug.assert(i < self.submesh_count);
         const off = i * submesh_size;
         const raw = self.submeshes[off..][0..submesh_size];
         return .{
@@ -212,7 +221,9 @@ pub const Reader = struct {
         };
     }
 
+    /// Caller must ensure `i < self.tex_count`.
     pub fn texture(self: *const Reader, i: u32) struct { width: u32, height: u32, rgba: []const u8 } {
+        std.debug.assert(i < self.tex_count);
         const tex_table_off = std.mem.readInt(u32, self.bytes[32..36], .little);
         const tex_data_off = std.mem.readInt(u32, self.bytes[36..40], .little);
         const entry_off = tex_table_off + i * tex_entry_size;
@@ -267,6 +278,23 @@ test "alignment: vertex_off 16-aligned, index/tex 4-aligned" {
     const io = std.mem.readInt(u32, bytes[28..32], .little);
     try testing.expectEqual(@as(u32, 0), vo % 16);
     try testing.expectEqual(@as(u32, 0), io % 4);
+}
+
+test "reader rejects hostile counts (u32 overflow)" {
+    var buf = [_]u8{0} ** 64;
+    @memcpy(buf[0..4], magic);
+    std.mem.writeInt(u32, buf[4..8], version, .little);
+    std.mem.writeInt(u32, buf[8..12], 0x8000_0000, .little); // vertex_count: *32 wraps to 0
+    std.mem.writeInt(u32, buf[24..28], 48, .little); // vertex_off
+    try testing.expectError(error.Truncated, Reader.init(&buf));
+
+    std.mem.writeInt(u32, buf[8..12], 0, .little);
+    std.mem.writeInt(u32, buf[16..20], 0xFFFF_FFFF, .little); // submesh_count: *28 wraps
+    try testing.expectError(error.Truncated, Reader.init(&buf));
+
+    std.mem.writeInt(u32, buf[16..20], 0, .little);
+    std.mem.writeInt(u32, buf[20..24], 0xFFFF_FFFF, .little); // texture_count: *16 wraps
+    try testing.expectError(error.Truncated, Reader.init(&buf));
 }
 
 test "reader rejects bad magic and truncation" {
