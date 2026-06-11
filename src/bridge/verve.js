@@ -4372,7 +4372,7 @@
         glInterpret(st, ptr);
       } catch (err) {
         // A corrupt stream/pointer must not kill the loop silently.
-        console.error("verve.gl: interpreter fault, loop stopped:", err);
+        console.error("verve.gl: interpreter fault, loop stopped:", err, err && err.stack);
         return;
       }
       requestAnimationFrame(step);
