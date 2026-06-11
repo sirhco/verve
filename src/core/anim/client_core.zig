@@ -27,6 +27,10 @@ pub const serialize = @import("serialize.zig");
 pub const ease = @import("ease.zig");
 pub const staggerDelay = @import("stagger.zig").delayFor;
 
+pub const path = @import("path.zig");
+pub const MotionPath = types.MotionPath;
+pub const Morph = types.Morph;
+
 pub const scroll = @import("scroll.zig");
 pub const ScrollTrigger = scroll.ScrollTrigger;
 pub const ScrollSpec = scroll.ScrollSpec;

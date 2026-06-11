@@ -163,6 +163,35 @@ pub const Modifier = struct {
     };
 };
 
+/// Move a tween's targets along an SVG path (wire key "mp"). Zig samples
+/// the path into a uniform-arc-length polyline at serialize time; the JS
+/// interpreter only lerps. Path coordinates are written verbatim into the
+/// x/y translate slots — px offsets in the same space as `.x()`/`.y()`
+/// (for SVG children, CSS px == user units, so a viz `pathD` in the same
+/// viewBox traces exactly).
+pub const MotionPath = struct {
+    /// SVG path data ("M0,0 C ..."). `verve.viz` edge-path output plugs
+    /// in directly.
+    path: []const u8,
+    /// Auto-orient along the tangent (drives the rotate xform channel).
+    rotate: bool = false,
+    /// Added to the tangent angle when `rotate` is on.
+    rotate_offset_deg: f64 = 0,
+    /// Fraction of the path to traverse. start > end runs backward.
+    start: f64 = 0.0,
+    end: f64 = 1.0,
+    /// Polyline sample count. 0 = auto (128). Clamped to [2, 512].
+    samples: u16 = 0,
+};
+
+/// Morph a <path> element's `d` between two authored path strings (wire
+/// key "mo"). Both strings are required — SSR cannot read a live DOM
+/// attribute, and Zig owns the matching math.
+pub const Morph = struct {
+    from: []const u8,
+    to: []const u8,
+};
+
 /// Timeline insertion point (GSAP's position parameter, Zig-shaped).
 /// Resolved eagerly at `.add()` time — the wire format carries only
 /// absolute start seconds.

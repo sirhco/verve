@@ -1019,3 +1019,34 @@ test "/anim carries ScrollTrigger descriptors and the reveal-only form" {
     try std.testing.expect(std.mem.indexOf(u8, js.body, "verve_obs_create") != null);
     try std.testing.expect(std.mem.indexOf(u8, js.body, "data-verve-pin-spacer") != null);
 }
+
+test "/anim carries MotionPath and MorphSVG descriptors" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 16);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    var resp = try request(io, gpa, port, "GET", "/anim");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // MotionPath polyline rides the descriptor (renderer-escaped JSON).
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;mp&quot;:{&quot;pts&quot;:[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;rot&quot;:1") != null);
+    // Morph point arrays + segment counts.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;mo&quot;:{&quot;a&quot;:[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;sp&quot;:[") != null);
+    // Scrubbed motion path composes mp + sc in one descriptor.
+    const mp_idx = std.mem.indexOf(u8, resp.body, "&quot;mp&quot;:{&quot;pts&quot;:[").?;
+    _ = mp_idx;
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "&quot;scr&quot;:0.3") != null);
+
+    // The bridge ships the lerp-side interpreters.
+    var js = try request(io, gpa, port, "GET", "/verve.js");
+    defer js.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "mpSample") != null);
+    try std.testing.expect(std.mem.indexOf(u8, js.body, "buildMorphD") != null);
+}

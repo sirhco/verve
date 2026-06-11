@@ -312,6 +312,12 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
                 ctx.span().text("wheel/touch velocity: "),
                 ctx.span().bind("obs_vel").text("0 px/s"),
             }),
+            // imperative MorphSVG: the chunk's anim_morph_toggle export
+            // animPlay()s a morph tween on this shape per click
+            ctx.el("svg").attr("viewBox", "0 0 100 100").attr("width", "80").attr("height", "80").children(.{
+                ctx.el("path").id("morph-island").attr("d", "M50,5 L61,38 L95,38 L67,58 L78,91 L50,71 L22,91 L33,58 L5,38 L39,38 Z").attr("fill", "#10b981"),
+            }),
+            ctx.el("button").attr("z-on-click", "anim_morph_toggle").text("morph"),
         }),
     });
     const anim_island = verve.island(ctx, .{ .name = "AnimDemo" }, island_inner);
@@ -332,9 +338,77 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
             .step(100).scale(1.0)
             .duration(1.4).repeat(-1).reducedMotion(.skip)),
         anim_island,
+        pathSection(ctx),
         scrollSection(ctx),
         ctx.p().children(.{ctx.a("/", "← Home")}),
     }).build();
+}
+
+const star_d: []const u8 =
+    "M50,5 L61,38 L95,38 L67,58 L78,91 L50,71 L22,91 L33,58 L5,38 L39,38 Z";
+const blob_d: []const u8 =
+    "M10,50 A40,40 0 0 1 90,50 A40,40 0 0 1 10,50 Z";
+
+/// MotionPath + MorphSVG demo (phase 3): a marker orbiting a
+/// viz-generated curved edge with tangent rotation, and an infinite
+/// star <-> circle morph. Both are pure phase functions, so the third
+/// block scrubs a motion path with ScrollTrigger.
+fn pathSection(ctx: *const verve.Context) *verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
+    // viz edge-path output plugs straight into .motionPath
+    const orbit_pts = [_]verve.viz.Vec2{
+        .{ .x = 20, .y = 90 },   .{ .x = 90, .y = 20 },
+        .{ .x = 170, .y = 110 }, .{ .x = 250, .y = 30 },
+        .{ .x = 300, .y = 80 },
+    };
+    const orbit_d = verve.viz.edgePathD(a, &orbit_pts, .curved, .{}) catch "M0,0 L10,0";
+
+    return ctx.el("section").class("anim-path").children(.{
+        ctx.h2("MotionPath: orbit a viz edge"),
+        ctx.p().class("hint").text("The marker follows a verve.viz curved edge path with tangent auto-rotation."),
+        ctx.div().class("anim-orbit-wrap")
+            .children(.{
+                ctx.el("svg").attr("viewBox", "0 0 320 130").attr("width", "320").attr("height", "130").children(.{
+                    ctx.el("path").attr("d", orbit_d).attr("fill", "none").attr("stroke", "#30363d").attr("stroke-width", "1.5"),
+                }),
+                ctx.div().class("anim-orbiter").ariaHidden(true),
+            })
+            .animate(anim.to(a, ".anim-orbiter")
+            .motionPath(.{ .path = orbit_d, .rotate = true })
+            .duration(4).ease(.linear).repeat(-1)
+            .reducedMotion(.skip)),
+        ctx.h2("MorphSVG: star ↔ circle"),
+        ctx.div()
+            .children(.{
+                ctx.el("svg").attr("viewBox", "0 0 100 100").attr("width", "120").attr("height", "120").children(.{
+                    ctx.el("path").id("morph-shape").attr("d", star_d).attr("fill", "#1f6feb"),
+                }),
+            })
+            .animate(anim.to(a, "#morph-shape")
+            .morph(.{ .from = star_d, .to = blob_d })
+            .duration(1.4).ease(.in_out_sine)
+            .repeat(-1).yoyo(true)
+            .reducedMotion(.skip)),
+        ctx.h2("Scrubbed motion path"),
+        ctx.p().class("hint").text("Scroll drives the dot along the S-curve (smoothed scrub)."),
+        ctx.div().class("anim-orbit-wrap")
+            .children(.{
+                ctx.el("svg").attr("viewBox", "0 0 320 100").attr("width", "320").attr("height", "100").children(.{
+                    ctx.el("path").attr("d", "M10,80 C90,80 90,20 160,20 C230,20 230,80 310,80").attr("fill", "none").attr("stroke", "#30363d").attr("stroke-width", "1.5"),
+                }),
+                ctx.div().class("anim-scrub-dot").ariaHidden(true),
+            })
+            .animate(anim.to(a, ".anim-scrub-dot")
+            .motionPath(.{ .path = "M10,80 C90,80 90,20 160,20 C230,20 230,80 310,80" })
+            .duration(1).ease(.linear)
+            .scrollTrigger(.{
+            .start = .{ .viewport = .{ .pct = 90 } },
+            .end = .{ .at = .{ .trigger = .bottom, .viewport = .{ .pct = 40 } } },
+            .scrub = .{ .smooth = 0.3 },
+        })),
+    });
 }
 
 /// ScrollTrigger demo (phase 2): scroll-gated stagger, zero-wasm class
@@ -540,6 +614,9 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.anim-pin-panel{padding:1rem;border:1px solid #333;border-radius:8px;background:#16161a}
                 \\.anim-scrub-bar{height:.5rem;border-radius:4px;background:#1f6feb;transform-origin:left center;margin-bottom:.75rem}
                 \\.anim-probe{padding:1rem;border:1px dashed #444;border-radius:8px}
+                \\.anim-orbit-wrap{position:relative;margin:1rem 0}
+                \\.anim-orbiter{position:absolute;top:-6px;left:-6px;width:12px;height:12px;background:#f59e0b;clip-path:polygon(0 0,100% 50%,0 100%)}
+                \\.anim-scrub-dot{position:absolute;top:-5px;left:-5px;width:10px;height:10px;border-radius:50%;background:#58a6ff}
                 \\.viz-card svg{touch-action:none;max-width:100%}
                 \\.viz-node{cursor:grab}
                 \\.viz-node.selected circle{stroke:#fff;stroke-width:3}

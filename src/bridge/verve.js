@@ -1057,6 +1057,10 @@
       kf: c.k || null,
       mods: buildMods(c.mod),
       cb: c.cb || null,
+      // MotionPath polyline / morph point arrays (Zig pre-computed; mp
+      // alongside keyframes is Zig-rejected — JS defends anyway).
+      mp: c.k ? null : c.mp || null,
+      mo: c.mo || null,
       firstEnd: del + maxDelay + dur,
       total: rep < 0 ? Infinity : del + maxDelay + cycleEnd,
       resolved: false,
@@ -1067,11 +1071,18 @@
     };
   };
 
+  // Tween-less descriptor (anim.reveal / standalone trigger): a scroll
+  // trigger with NO animation carrier — no props, no keyframes, no
+  // timeline children, no motion path, no morph. Anything carrying an
+  // animation must build it (scrub needs a record to drive).
+  // @verve-extract animIsTriggerOnly
+  const animIsTriggerOnly = (desc) =>
+    !!desc.sc && !desc.p && !desc.k && !desc.ch && !desc.mp && !desc.mo;
+  // @verve-extract-end
+
   const animCreate = (desc, selfEl) => {
     if (!desc || desc.v !== 1) return 0;
-    // Tween-less descriptor (anim.reveal / standalone trigger): just a
-    // scroll trigger, no animation, no rAF.
-    if (desc.sc && !desc.p && !desc.k && !desc.ch) {
+    if (animIsTriggerOnly(desc)) {
       return stRegister(desc.sc, null, selfEl);
     }
     const rm = desc.rm || "jump";
@@ -1209,6 +1220,10 @@
           unit: spec.u || from.u || to.u || (DEG_PROPS.has(name) ? "deg" : null),
         };
       }
+      if (tw.mo) {
+        // reserved name — can never collide with a CSS prop or attr: name
+        per["@morph"] = { kind: "morph", a: tw.mo.a, b: tw.mo.b, sp: tw.mo.sp, z: tw.mo.z || null };
+      }
       return per;
     });
   };
@@ -1219,7 +1234,69 @@
     animDirty.clear();
   };
 
+  // ---- MotionPath / MorphSVG (Zig pre-computed; JS lerps only) ---------
+
+  // Lerp along the uniform-arc-length polyline. Index clamped, t NOT
+  // clamped — back/elastic overshoot extrapolates along the end tangent
+  // (intended). Angles arrive unwrapped from Zig so raw lerp is safe.
+  // @verve-extract mpSample
+  const mpSample = (pts, stride, e) => {
+    const N = pts.length / stride;
+    const f = e * (N - 1);
+    let i = Math.floor(f);
+    if (i < 0) i = 0;
+    else if (i > N - 2) i = N - 2;
+    const t = f - i;
+    const k = i * stride;
+    const lp = (o) => pts[k + o] + (pts[k + stride + o] - pts[k + o]) * t;
+    return stride === 3 ? [lp(0), lp(1), lp(2)] : [lp(0), lp(1)];
+  };
+  // @verve-extract-end
+
+  const animWriteMotionPath = (el, mp, phase, easeFn, mods) => {
+    const rot = !!mp.rot;
+    const v = mpSample(mp.pts, rot ? 3 : 2, easeFn(phase));
+    let xv = v[0];
+    let yv = v[1];
+    const fx = mods["x"];
+    if (fx) for (const f of fx) xv = f(xv);
+    const fy = mods["y"];
+    if (fy) for (const f of fy) yv = f(yv);
+    const s = getXform(el);
+    xformSet(s, "x", xv);
+    xformSet(s, "y", yv);
+    if (rot) xformSet(s, "rotate", v[2] + (mp.ro || 0));
+    animDirty.add(el);
+  };
+
+  // Build the lerped d string. Math.round concat (no toFixed allocs);
+  // M + C runs + Z per closed flag — mirrors path.zig's flat encoding.
+  // @verve-extract buildMorphD
+  const buildMorphD = (st, e) => {
+    const a = st.a;
+    const b = st.b;
+    const L = (i) => Math.round((a[i] + (b[i] - a[i]) * e) * 100) / 100;
+    let s = "";
+    let p = 0;
+    for (let si = 0; si < st.sp.length; si++) {
+      s += "M" + L(p) + "," + L(p + 1);
+      p += 2;
+      for (let seg = 0; seg < st.sp[si]; seg++) {
+        s += "C" + L(p) + "," + L(p + 1) + " " + L(p + 2) + "," + L(p + 3) +
+          " " + L(p + 4) + "," + L(p + 5);
+        p += 6;
+      }
+      if (st.z && st.z[si]) s += "Z";
+    }
+    return s;
+  };
+  // @verve-extract-end
+
   const animWriteProp = (el, name, st, phase, easeFn, mods) => {
+    if (st.kind === "morph") {
+      el.setAttribute("d", buildMorphD(st, easeFn(phase)));
+      return;
+    }
     let out;
     if (st.kind === "kf") {
       const pts = st.pts;
@@ -1319,6 +1396,7 @@
       for (const name of Object.keys(per)) {
         animWriteProp(el, name, per[name], f.phase, tw.easeFn, tw.mods);
       }
+      if (tw.mp) animWriteMotionPath(el, tw.mp, f.phase, tw.easeFn, tw.mods);
     }
     if (anyActive && !tw.firedS) {
       tw.firedS = true;

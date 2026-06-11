@@ -318,6 +318,64 @@ that ScrollTriggers depend on), `lock_axis`, `tolerance`. Handle:
 `kill/disable/enable` + delta/velocity/direction getters. Touch deltas
 use wheel polarity (finger up = positive deltaY).
 
+## MotionPath
+
+Animate any element along an SVG path. Zig parses the `d` string,
+normalizes everything to cubic Béziers, and samples a uniform-arc-length
+polyline at serialize time — the bridge only lerps it into the shared
+transform composer (x/y + optional tangent rotation), so motion paths
+compose with scale/skew tweens, timelines, stagger, and ScrollTrigger
+scrub for free.
+
+```zig
+// verve.viz edge-path output plugs straight in
+const d = try verve.viz.edgePathD(a, &pts, .curved, .{});
+node.animate(anim.to(a, ".marker")
+    .motionPath(.{
+        .path = d,
+        .rotate = true,           // auto-orient along the tangent
+        .rotate_offset_deg = 90,  // for glyphs drawn pointing up
+        .start = 0.0, .end = 1.0, // path window; start > end runs backward
+        .samples = 0,             // 0 = auto (128), clamped [2, 512]
+    })
+    .duration(4).ease(.linear).repeat(-1))
+```
+
+Path coordinates are written verbatim into the x/y translate slots — px
+offsets in the same space as `.x()`/`.y()` (for SVG children, CSS px ≡
+user units, so a path in the element's own viewBox traces exactly).
+Conflicts are deferred errors: explicit `.x()`/`.y()` props
+(`MotionPathConflict`), `.rotate()` when `rotate = true`, keyframe steps,
+`anim.from`. Parser supports the full SVG grammar (relative commands,
+S/T reflection, arcs incl. compressed flags); bad strings surface as
+`error.BadPath` at serialize. Overshooting eases (back/elastic)
+extrapolate along the end tangent.
+
+## MorphSVG
+
+Morph a `<path>`'s `d` between two authored strings. Zig matches the
+shapes at serialize time — winding auto-reverse, segment-count
+equalization by de Casteljau splitting, cyclic start-point alignment for
+closed pairs — and ships two equal-length control-point arrays; the
+bridge lerps points and rebuilds the `d` string per frame.
+
+```zig
+node.animate(anim.to(a, "#shape")
+    .morph(.{ .from = star_d, .to = circle_d })
+    .duration(1.4).ease(.in_out_sine).repeat(-1).yoyo(true))
+```
+
+Both `d` strings must be authored (SSR cannot read live DOM attributes).
+Subpath counts must match (`error.SubpathCountMismatch`) — pre-split
+compound paths. Composes with other props on the same tween (fill color,
+opacity, transforms). Keep segment counts in the low hundreds — the
+bridge builds a fresh `d` string per target per frame. Line segments
+normalize with controls at exactly 1/3 and 2/3 (the frozen contract the
+goldens and `buildMorphD` share).
+
+Math utilities are exposed under `verve.anim.path`: `parse`,
+`motionSamples`, `sampleAt`, `totalLength`, `prepareMorph`.
+
 ## Wire format (reference)
 
 `data-anim` / `verve_anim_create` carry the same JSON:
@@ -353,8 +411,25 @@ is ignored when present — the trigger owns play-state):
 `scr` `true` = exact, number = smoothing seconds; action ints: 0 none,
 1 play, 2 pause, 3 resume, 4 reverse, 5 restart, 6 complete, 7 reset.
 A descriptor with `sc` and no `p`/`k`/`ch` is a tween-less trigger
-(`anim.reveal`). The serializer's golden tests
-(`zig test src/core/anim/serialize.zig`) freeze this contract.
+(`anim.reveal`).
+
+MotionPath and MorphSVG ride as root-level keys (pure pre-computed data,
+legal on both surfaces; `"p":{}` is suppressed when they carry the
+animation):
+
+```json
+"mp":{"pts":[x,y,a, x,y,a, ...],"rot":1,"ro":90}
+"mo":{"a":[Mx,My, c1x,c1y,c2x,c2y,x,y, ...],"b":[...same length...],
+      "sp":[segsPerSubpath],"z":[closedFlags]}
+```
+
+`mp.pts` is stride 3 (x, y, unwrapped angle°) with `rot:1`, stride 2
+otherwise — uniform arc-length spacing, already windowed to
+[start, end]. `mo` is flat per-subpath runs of `2 + 6k` floats; `z` only
+when any subpath is closed. Coordinates are rounded to 0.01 Zig-side.
+The serializer's golden tests (`zig test src/core/anim/serialize.zig`)
+freeze this contract; `node tests/js/anim_conformance.mjs` checks the
+bridge's lerp/string-building halves against the same fixtures.
 
 ## Demo
 
@@ -368,4 +443,5 @@ and a dynamic-value + snap-modifier tween.
 
 ScrollSmoother (Observer + scroller-proxy), scroll snap, horizontal /
 container scrollers, FLIP layout animation, SplitText, Draggable (will
-reuse Observer), MotionPath, MorphSVG — tracked as follow-up phases.
+reuse Observer), GSAP-style `align`/`alignOrigin` for MotionPath, island
+morph-from-current-d — tracked as follow-up phases.

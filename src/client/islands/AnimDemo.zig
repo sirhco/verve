@@ -91,6 +91,33 @@ fn onObserved() void {
     verve.signalSetStr("obs_vel", s);
 }
 
+// Imperative MorphSVG (phase 3): build a morph tween in the chunk arena
+// per click, alternating direction. Demonstrates path math running
+// wasm-side — prepareMorph executes in the chunk at animPlay.
+
+const STAR: []const u8 =
+    "M50,5 L61,38 L95,38 L67,58 L78,91 L50,71 L22,91 L33,58 L5,38 L39,38 Z";
+const BLOB: []const u8 =
+    "M10,50 A40,40 0 0 1 90,50 A40,40 0 0 1 10,50 Z";
+
+var island_morphed = false;
+
+export fn anim_morph_toggle() void {
+    const mark = verve.chunkArenaMark();
+    defer verve.chunkArenaReset(mark);
+    const a = verve.chunkArena();
+
+    const t = anim.to(a, "#morph-island")
+        .morph(if (island_morphed)
+            .{ .from = BLOB, .to = STAR }
+        else
+            .{ .from = STAR, .to = BLOB })
+        .duration(0.8).ease(.in_out_sine);
+    if (verve.animPlay(t) == null) return;
+    island_morphed = !island_morphed;
+    verve.signalSetStr(STATUS, if (island_morphed) "morphed to circle" else "morphed to star");
+}
+
 // Control buttons — stamped via `z-on-click="<export>"` in the SSR'd
 // island content; the bridge dispatches them to this chunk directly.
 

@@ -31,6 +31,12 @@ pub const serialize = @import("serialize.zig");
 pub const ease = @import("ease.zig");
 pub const staggerDelay = @import("stagger.zig").delayFor;
 
+// MotionPath + MorphSVG (phase 3): SVG path math (parser, cubic
+// normalization, arc-length sampling, morph matching) — all Zig-side.
+pub const path = @import("path.zig");
+pub const MotionPath = types.MotionPath;
+pub const Morph = types.Morph;
+
 // ScrollTrigger (phase 2): gate/scrub/pin animations by scroll position.
 pub const scroll = @import("scroll.zig");
 pub const ScrollTrigger = scroll.ScrollTrigger;
@@ -65,4 +71,5 @@ test {
     _ = @import("timeline.zig");
     _ = @import("serialize.zig");
     _ = @import("scroll.zig");
+    _ = @import("path.zig");
 }

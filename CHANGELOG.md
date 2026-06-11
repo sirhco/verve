@@ -36,6 +36,18 @@ versions follow [Semantic Versioning](https://semver.org/).
   ScrollSmoother/Draggable.
 - **`verve.setRefStyle`** — per-handle inline style setter
   (`el.style.setProperty`) alongside `setRefAttr`.
+- **`verve.anim` MotionPath + MorphSVG** (`src/core/anim/path.zig`):
+  full SVG path parser (relative commands, S/T reflection, arcs with
+  compressed flags) normalizing to cubic Béziers, arc-length sampling,
+  and morph matching (winding auto-reverse, de Casteljau count
+  equalization, cyclic alignment) — all Zig-side, freestanding-safe.
+  `.motionPath(.{ .path = d, .rotate = true })` animates along any path
+  (viz `edgePathD` output plugs in directly) through the shared
+  transform composer; `.morph(.{ .from, .to })` lerps matched
+  control-point arrays into per-frame `d` rebuilds. Wire keys `"mp"` /
+  `"mo"`; both compose with timelines, stagger, and ScrollTrigger scrub
+  as pure phase functions. Conformance: serializer goldens +
+  `node tests/js/anim_conformance.mjs`.
 
 ## [0.3.0] - 2026-06-10
 

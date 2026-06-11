@@ -58,6 +58,11 @@ pub const Tween = struct {
     autoplay: bool = true,
     /// Scroll-position gating/scrubbing (wire key "sc"). One per tween.
     scroll_trigger: ?scroll.ScrollTrigger = null,
+    /// Animate along an SVG path (wire key "mp"). One per tween; drives
+    /// the x/y (+rotate) transform channels.
+    motion_path: ?types.MotionPath = null,
+    /// Morph the target's `d` attribute (wire key "mo"). One per tween.
+    morph_opts: ?types.Morph = null,
 
     /// Lifecycle callbacks as event-slot ids (`verve.registerEvent`,
     /// already chunk-table-translated — raw fn-table indices would dangle).
@@ -144,6 +149,81 @@ pub const Tween = struct {
         return self;
     }
 
+    fn hasPropNamed(self: *const Tween, name_s: []const u8) bool {
+        for (self.props.items) |p| {
+            if (std.mem.eql(u8, p.name, name_s)) return true;
+        }
+        return false;
+    }
+
+    /// Animate along an SVG path. Drives x+y (+rotate when enabled)
+    /// through the shared transform composer — explicit `.x()`/`.y()`
+    /// props on the same tween conflict; `.rotate()` conflicts only when
+    /// `rotate = true`. Path math runs at serialize time (`error.BadPath`
+    /// deferred). Stagger offsets targets in time along the SAME path.
+    pub fn motionPath(self: *Tween, mp: types.MotionPath) *Tween {
+        if (self.err != null) return self;
+        if (self.motion_path != null) {
+            self.err = error.DuplicateMotionPath;
+            return self;
+        }
+        if (self.kind == .from) {
+            self.err = error.MotionPathOnFromTween;
+            return self;
+        }
+        if (self.steps.items.len > 0) {
+            self.err = error.MotionPathWithKeyframes;
+            return self;
+        }
+        if (self.morph_opts != null) {
+            self.err = error.MorphWithMotionPath;
+            return self;
+        }
+        if (mp.start < 0 or mp.start > 1 or mp.end < 0 or mp.end > 1 or mp.start == mp.end) {
+            self.err = error.BadPathRange;
+            return self;
+        }
+        if (self.hasPropNamed("x") or self.hasPropNamed("y") or
+            (mp.rotate and self.hasPropNamed("rotate")))
+        {
+            self.err = error.MotionPathConflict;
+            return self;
+        }
+        self.motion_path = mp;
+        return self;
+    }
+
+    /// Morph the target <path>'s `d` between two authored strings
+    /// (`anim.from` doesn't apply — swap the strings instead). Matching
+    /// math runs at serialize time (`error.BadPath` /
+    /// `error.SubpathCountMismatch` deferred). Composes freely with
+    /// other props (opacity, fill, x...).
+    pub fn morph(self: *Tween, m: types.Morph) *Tween {
+        if (self.err != null) return self;
+        if (self.morph_opts != null) {
+            self.err = error.DuplicateMorph;
+            return self;
+        }
+        if (self.kind == .from) {
+            self.err = error.MorphOnFromTween;
+            return self;
+        }
+        if (self.steps.items.len > 0) {
+            self.err = error.MorphWithKeyframes;
+            return self;
+        }
+        if (self.motion_path != null) {
+            self.err = error.MorphWithMotionPath;
+            return self;
+        }
+        if (self.hasPropNamed("attr:d")) {
+            self.err = error.MorphConflict;
+            return self;
+        }
+        self.morph_opts = m;
+        return self;
+    }
+
     /// Gate or scrub this tween by scroll position. Validates eagerly;
     /// one trigger per tween. Scrub and non-default toggle actions are
     /// mutually exclusive. Island callback slots ride the config (see
@@ -169,6 +249,18 @@ pub const Tween = struct {
     /// the prop lands in the last opened step.
     pub fn prop(self: *Tween, prop_name: []const u8, v: anytype) *Tween {
         if (self.err != null) return self;
+        if (self.motion_path) |mp| {
+            if (std.mem.eql(u8, prop_name, "x") or std.mem.eql(u8, prop_name, "y") or
+                (mp.rotate and std.mem.eql(u8, prop_name, "rotate")))
+            {
+                self.err = error.MotionPathConflict;
+                return self;
+            }
+        }
+        if (self.morph_opts != null and std.mem.eql(u8, prop_name, "attr:d")) {
+            self.err = error.MorphConflict;
+            return self;
+        }
         const entry: PropEntry = .{ .name = prop_name, .to = types.value(v) };
         if (self.steps.items.len > 0) {
             const last = &self.steps.items[self.steps.items.len - 1];
@@ -245,6 +337,14 @@ pub const Tween = struct {
     /// `.step` after plain props is a deferred error.
     pub fn step(self: *Tween, at_pct: f64) *Tween {
         if (self.err != null) return self;
+        if (self.motion_path != null) {
+            self.err = error.MotionPathWithKeyframes;
+            return self;
+        }
+        if (self.morph_opts != null) {
+            self.err = error.MorphWithKeyframes;
+            return self;
+        }
         if (self.props.items.len > 0) {
             self.err = error.StepAfterProps;
             return self;
@@ -411,6 +511,68 @@ test "scrollTrigger validates and rejects duplicates" {
         .actions = .{ .on_leave = .pause },
     });
     try std.testing.expectEqual(@as(?anyerror, error.ScrubWithToggleActions), conflict.err);
+}
+
+test "motionPath validation matrix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ok = to(a, ".dot").motionPath(.{ .path = "M0,0 L10,0", .rotate = true });
+    try std.testing.expect(ok.err == null);
+
+    const dup = to(a, ".x").motionPath(.{ .path = "M0,0 L1,1" }).motionPath(.{ .path = "M0,0 L1,1" });
+    try std.testing.expectEqual(@as(?anyerror, error.DuplicateMotionPath), dup.err);
+
+    const on_from = from(a, ".x").motionPath(.{ .path = "M0,0 L1,1" });
+    try std.testing.expectEqual(@as(?anyerror, error.MotionPathOnFromTween), on_from.err);
+
+    const kf = to(a, ".x").step(0).scale(1).motionPath(.{ .path = "M0,0 L1,1" });
+    try std.testing.expectEqual(@as(?anyerror, error.MotionPathWithKeyframes), kf.err);
+
+    const kf_after = to(a, ".x").motionPath(.{ .path = "M0,0 L1,1" }).step(0);
+    try std.testing.expectEqual(@as(?anyerror, error.MotionPathWithKeyframes), kf_after.err);
+
+    const x_before = to(a, ".x").x(5).motionPath(.{ .path = "M0,0 L1,1" });
+    try std.testing.expectEqual(@as(?anyerror, error.MotionPathConflict), x_before.err);
+
+    const x_after = to(a, ".x").motionPath(.{ .path = "M0,0 L1,1" }).y(5);
+    try std.testing.expectEqual(@as(?anyerror, error.MotionPathConflict), x_after.err);
+
+    // rotate=false leaves the rotate channel to the user
+    const rot_ok = to(a, ".x").motionPath(.{ .path = "M0,0 L1,1" }).rotate(45);
+    try std.testing.expect(rot_ok.err == null);
+    const rot_bad = to(a, ".x").motionPath(.{ .path = "M0,0 L1,1", .rotate = true }).rotate(45);
+    try std.testing.expectEqual(@as(?anyerror, error.MotionPathConflict), rot_bad.err);
+
+    const range = to(a, ".x").motionPath(.{ .path = "M0,0 L1,1", .start = 0.5, .end = 0.5 });
+    try std.testing.expectEqual(@as(?anyerror, error.BadPathRange), range.err);
+}
+
+test "morph validation matrix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ok = to(a, "#shape").morph(.{ .from = "M0,0 L10,0", .to = "M0,0 L0,10" }).opacity(0.5);
+    try std.testing.expect(ok.err == null);
+
+    const dup = to(a, "#s").morph(.{ .from = "M0,0 L1,0", .to = "M0,0 L0,1" })
+        .morph(.{ .from = "M0,0 L1,0", .to = "M0,0 L0,1" });
+    try std.testing.expectEqual(@as(?anyerror, error.DuplicateMorph), dup.err);
+
+    const with_mp = to(a, "#s").motionPath(.{ .path = "M0,0 L1,1" })
+        .morph(.{ .from = "M0,0 L1,0", .to = "M0,0 L0,1" });
+    try std.testing.expectEqual(@as(?anyerror, error.MorphWithMotionPath), with_mp.err);
+
+    const on_from = from(a, "#s").morph(.{ .from = "M0,0 L1,0", .to = "M0,0 L0,1" });
+    try std.testing.expectEqual(@as(?anyerror, error.MorphOnFromTween), on_from.err);
+
+    const attr_d = to(a, "#s").prop("attr:d", "M0,0").morph(.{ .from = "M0,0 L1,0", .to = "M0,0 L0,1" });
+    try std.testing.expectEqual(@as(?anyerror, error.MorphConflict), attr_d.err);
+
+    const attr_after = to(a, "#s").morph(.{ .from = "M0,0 L1,0", .to = "M0,0 L0,1" }).prop("attr:d", "M0,0");
+    try std.testing.expectEqual(@as(?anyerror, error.MorphConflict), attr_after.err);
 }
 
 test "totalDuration with repeat and repeatDelay" {

@@ -13,6 +13,7 @@ const util = @import("util.zig");
 const tween_mod = @import("tween.zig");
 const timeline_mod = @import("timeline.zig");
 const scroll = @import("scroll.zig");
+const path_mod = @import("path.zig");
 
 /// Which authoring surface is serializing. SSR rejects island-only
 /// constructs (dynamic values, fn modifiers, ref-handle targets, callback
@@ -20,14 +21,71 @@ const scroll = @import("scroll.zig");
 /// server-rendered descriptor.
 pub const Surface = enum { ssr, island };
 
+/// Derived wire data (path sampling / morph matching) resolved ONCE per
+/// serialization, outside the grow() retry loop — buffer growth must not
+/// re-run path math. Arena-owned.
+const Extras = struct {
+    mp: ?[]const path_mod.Sample = null,
+    mp_rotate: bool = false,
+    mp_ro: f64 = 0,
+    mo: ?path_mod.MorphPair = null,
+};
+
+fn resolveExtras(alloc: std.mem.Allocator, t: *const tween_mod.Tween) !Extras {
+    var ex: Extras = .{};
+    if (t.motion_path) |mp| {
+        var pd = path_mod.parse(alloc, mp.path) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.BadPath,
+        };
+        const n: usize = if (mp.samples == 0) 128 else @min(@max(@as(usize, mp.samples), 2), 512);
+        ex.mp = path_mod.motionSamples(alloc, &pd, n, mp.start, mp.end) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.BadPath,
+        };
+        ex.mp_rotate = mp.rotate;
+        ex.mp_ro = mp.rotate_offset_deg;
+    }
+    if (t.morph_opts) |m| {
+        var pa = path_mod.parse(alloc, m.from) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.BadPath,
+        };
+        var pb = path_mod.parse(alloc, m.to) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.BadPath,
+        };
+        ex.mo = path_mod.prepareMorph(alloc, &pa, &pb, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.SubpathCountMismatch => return error.SubpathCountMismatch,
+            error.EmptyPath => return error.BadPath,
+        };
+    }
+    return ex;
+}
+
+const TweenCtx = struct {
+    t: *const tween_mod.Tween,
+    ex: Extras,
+};
+
+const TimelineCtx = struct {
+    tl: *const timeline_mod.Timeline,
+    exs: []const Extras,
+};
+
 pub fn tweenToJson(alloc: std.mem.Allocator, t: *const tween_mod.Tween, surface: Surface) ![]const u8 {
     if (t.err) |e| return e;
-    return grow(alloc, t, surface, writeTweenRoot);
+    const ctx = TweenCtx{ .t = t, .ex = try resolveExtras(alloc, t) };
+    return grow(alloc, ctx, surface, writeTweenRoot);
 }
 
 pub fn timelineToJson(alloc: std.mem.Allocator, tl: *const timeline_mod.Timeline, surface: Surface) ![]const u8 {
     if (tl.err) |e| return e;
-    return grow(alloc, tl, surface, writeTimelineRoot);
+    const exs = try alloc.alloc(Extras, tl.entries.items.len);
+    for (tl.entries.items, 0..) |e, i| exs[i] = try resolveExtras(alloc, e.tween);
+    const ctx = TimelineCtx{ .tl = tl, .exs = exs };
+    return grow(alloc, ctx, surface, writeTimelineRoot);
 }
 
 /// Tween-less trigger (`anim.reveal` / standalone island trigger):
@@ -69,13 +127,14 @@ fn grow(
     }
 }
 
-fn writeTweenRoot(w: *std.Io.Writer, t: *const tween_mod.Tween, surface: Surface) anyerror!void {
+fn writeTweenRoot(w: *std.Io.Writer, ctx: TweenCtx, surface: Surface) anyerror!void {
     try w.writeAll("{\"v\":1");
-    try writeTweenBody(w, t, surface, null);
+    try writeTweenBody(w, ctx.t, ctx.ex, surface);
     try w.writeAll("}");
 }
 
-fn writeTimelineRoot(w: *std.Io.Writer, tl: *const timeline_mod.Timeline, surface: Surface) anyerror!void {
+fn writeTimelineRoot(w: *std.Io.Writer, ctx: TimelineCtx, surface: Surface) anyerror!void {
+    const tl = ctx.tl;
     try w.writeAll("{\"v\":1,\"tl\":1");
     if (tl.id_name) |n| {
         try w.writeAll(",\"id\":");
@@ -102,14 +161,13 @@ fn writeTimelineRoot(w: *std.Io.Writer, tl: *const timeline_mod.Timeline, surfac
         if (i != 0) try w.writeAll(",");
         if (!std.math.isFinite(e.start_s)) return error.InfinitePosition;
         try w.print("{{\"pos\":{d}", .{e.start_s});
-        try writeTweenBody(w, e.tween, surface, e.start_s);
+        try writeTweenBody(w, e.tween, ctx.exs[i], surface);
         try w.writeAll("}");
     }
     try w.writeAll("]}");
 }
 
-fn writeTweenBody(w: *std.Io.Writer, t: *const tween_mod.Tween, surface: Surface, pos: ?f64) anyerror!void {
-    _ = pos;
+fn writeTweenBody(w: *std.Io.Writer, t: *const tween_mod.Tween, ex: Extras, surface: Surface) anyerror!void {
     if (t.id_name) |n| {
         try w.writeAll(",\"id\":");
         try writeJsonString(w, n);
@@ -132,9 +190,13 @@ fn writeTweenBody(w: *std.Io.Writer, t: *const tween_mod.Tween, surface: Surface
 
     if (t.steps.items.len > 0) {
         try writeSteps(w, t, surface);
-    } else {
+    } else if (t.props.items.len > 0 or (ex.mp == null and ex.mo == null)) {
+        // "p":{} suppressed when empty and a motion path / morph carries
+        // the animation instead.
         try writeProps(w, t, surface);
     }
+    if (ex.mp) |samples| try path_mod.writeMotionPath(w, samples, ex.mp_rotate, ex.mp_ro);
+    if (ex.mo) |*pair| try path_mod.writeMorph(w, pair);
 
     if (t.stagger_opts) |s| try writeStagger(w, s);
     if (t.modifiers.items.len > 0) try writeModifiers(w, t.modifiers.items, surface);
@@ -728,6 +790,93 @@ test "ssr rejects sc island-only constructs" {
 
     const handle_t = tween_mod.to(a, ".x").x(1).scrollTrigger(.{ .trigger_handle = 3 });
     try testing.expectError(error.HandleRequiresIsland, tweenToJson(a, handle_t, .ssr));
+}
+
+test "golden: motion path straight line, no rotate" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".dot").motionPath(.{ .path = "M0,0 L10,0", .samples = 3 });
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"t\":{\"s\":\".dot\"},\"d\":0.5,\"e\":\"outQuad\"," ++
+            "\"mp\":{\"pts\":[0,0,5,0,10,0]}}",
+        json,
+    );
+}
+
+test "golden: motion path with rotate + offset on a corner path" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".dot").motionPath(.{
+        .path = "M0,0 L10,0 L10,10",
+        .rotate = true,
+        .rotate_offset_deg = 90,
+        .samples = 3,
+    });
+    const json = try tweenToJson(a, t, .ssr);
+    // u=0 on the horizontal leg (angle 0), u=0.5 at the corner, u=1 on
+    // the vertical leg (angle 90, SVG y-down)
+    try testing.expect(std.mem.indexOf(u8, json, "\"rot\":1,\"ro\":90}") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"mp\":{\"pts\":[0,0,0,") != null);
+    try testing.expect(std.mem.indexOf(u8, json, ",10,10,90]") != null);
+}
+
+test "golden: morph of two lines (1/3-2/3 control contract)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, "#shape").morph(.{ .from = "M0,0 L10,0", .to = "M0,0 L0,10" });
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"t\":{\"s\":\"#shape\"},\"d\":0.5,\"e\":\"outQuad\"," ++
+            "\"mo\":{\"a\":[0,0,3.33,0,6.67,0,10,0],\"b\":[0,0,0,3.33,0,6.67,0,10],\"sp\":[1]}}",
+        json,
+    );
+}
+
+test "golden: closed morph emits z; props alongside morph" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, "#shape")
+        .morph(.{ .from = "M0,0 L10,0 L5,10 Z", .to = "M0,0 L10,0 L5,-10 Z" })
+        .opacity(0.5);
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expect(std.mem.indexOf(u8, json, "\"p\":{\"opacity\":{\"to\":0.5}}") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"z\":[1]") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"sp\":[3]") != null);
+}
+
+test "mp/mo legal on both surfaces; bad d deferred to serialize" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const t = tween_mod.to(a, ".dot").motionPath(.{ .path = "M0,0 L10,0", .samples = 2 });
+    _ = try tweenToJson(a, t, .island);
+
+    const bad = tween_mod.to(a, ".dot").motionPath(.{ .path = "garbage" });
+    try testing.expectError(error.BadPath, tweenToJson(a, bad, .ssr));
+    const bad2 = tween_mod.to(a, ".dot").motionPath(.{ .path = "garbage" });
+    try testing.expectError(error.BadPath, tweenToJson(a, bad2, .island));
+
+    const mismatch = tween_mod.to(a, "#s").morph(.{
+        .from = "M0,0 L1,0",
+        .to = "M0,0 L1,0 M2,0 L3,0",
+    });
+    try testing.expectError(error.SubpathCountMismatch, tweenToJson(a, mismatch, .ssr));
+}
+
+test "golden: motion path inside a timeline child" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tl = timeline_mod.timeline(a)
+        .add(tween_mod.to(a, ".dot").motionPath(.{ .path = "M0,0 L10,0", .samples = 2 }).duration(1), .end);
+    const json = try timelineToJson(a, tl, .ssr);
+    try testing.expect(std.mem.indexOf(u8, json, "\"ch\":[{\"pos\":0,\"t\":{\"s\":\".dot\"},\"d\":1,\"e\":\"outQuad\",\"mp\":{\"pts\":[0,0,10,0]}}]") != null);
 }
 
 test "builder error propagates through toJson" {
