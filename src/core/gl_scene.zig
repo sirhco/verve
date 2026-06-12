@@ -34,6 +34,7 @@ pub const Props = struct {
     light_intensity: f32,
     pick_names: []const []const u8,
     pick_event_ids: []const u32, // parallel closure ids (0 = none)
+    scrub: bool, // scroll-scrub mode (Task 9); when true auto_rotate is forced 0
 };
 
 /// Max number of `.onPick(...)` registrations accumulated per scene.
@@ -69,6 +70,7 @@ pub const GlSceneBuilder = struct {
     cam: CameraOpts = .{},
     lgt: LightOpts = .{},
     auto_rotate_rad: f32 = 0,
+    scrub_on: bool = false,
     pick_names_buf: [max_picks][]const u8 = undefined,
     pick_ids_buf: [max_picks]u32 = undefined,
     pick_count: usize = 0,
@@ -89,6 +91,13 @@ pub const GlSceneBuilder = struct {
         return self;
     }
 
+    /// Enable scroll-scrub mode (Task 9 timeline). When true, scroll owns yaw
+    /// so auto_rotate is forced to 0 at build() to avoid conflicting drives.
+    pub fn scrub(self: *GlSceneBuilder, on: bool) *GlSceneBuilder {
+        self.scrub_on = on;
+        return self;
+    }
+
     /// Register a pickable mesh by name → closure event id. Repeatable up to
     /// `max_picks`; extra registrations past the cap are dropped.
     pub fn onPick(self: *GlSceneBuilder, name: []const u8, event_id: u32) *GlSceneBuilder {
@@ -103,19 +112,22 @@ pub const GlSceneBuilder = struct {
     /// and wrap it in the GlScene island marker.
     pub fn build(self: *GlSceneBuilder) *Node {
         const dir = normalize3(self.lgt.dir);
+        // scrub=true means scroll owns yaw; auto_rotate would conflict — zero it.
+        const effective_rotate: f32 = if (self.scrub_on) 0 else self.auto_rotate_rad;
         const props = encodeProps(self.ctx, Props{
             .src = self.opts.src,
             .env = self.opts.env,
             .orbit_distance = self.cam.distance,
             .orbit_pitch = self.cam.pitch,
             .orbit_yaw = self.cam.yaw,
-            .auto_rotate = self.auto_rotate_rad,
+            .auto_rotate = effective_rotate,
             .light_dir_x = dir[0],
             .light_dir_y = dir[1],
             .light_dir_z = dir[2],
             .light_intensity = self.lgt.intensity,
             .pick_names = self.pick_names_buf[0..self.pick_count],
             .pick_event_ids = self.pick_ids_buf[0..self.pick_count],
+            .scrub = self.scrub_on,
         }) catch |e| {
             const poison = self.ctx.el("verve-island");
             poison.err = e;
@@ -312,4 +324,33 @@ test "glScene onPick caps at max_picks" {
     const raw = try rawProps(attrVal(scene, "data-props").?, arena.allocator());
     const p = try decodeProps(Props, raw, arena.allocator());
     try testing.expectEqual(@as(usize, max_picks), p.pick_names.len);
+}
+
+test "glScene scrub defaults to false" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
+    const raw = try rawProps(attrVal(scene, "data-props").?, arena.allocator());
+    const p = try decodeProps(Props, raw, arena.allocator());
+    try testing.expectEqual(false, p.scrub);
+}
+
+test "glScene scrub(true) round-trips and forces auto_rotate to 0" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .autoRotate(0.2)
+        .scrub(true)
+        .build();
+    const raw = try rawProps(attrVal(scene, "data-props").?, arena.allocator());
+    const p = try decodeProps(Props, raw, arena.allocator());
+    try testing.expectEqual(true, p.scrub);
+    // scrub owns yaw — auto_rotate must be zeroed out
+    try testing.expectEqual(@as(f32, 0), p.auto_rotate);
 }

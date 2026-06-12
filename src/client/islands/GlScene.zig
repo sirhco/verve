@@ -91,6 +91,7 @@ const Props = struct {
     light_intensity: f32,
     pick_names: []const []const u8,
     pick_event_ids: []const u32,
+    scrub: bool, // scroll-scrub mode (Task 9); wired to timeline in Task 9
 };
 
 // URL buffers — asset paths copied out of the arena. 128 matches the asset-URL
@@ -108,6 +109,7 @@ var pick_ids: [max_picks]u32 = undefined;
 var pick_count: usize = 0;
 
 var auto_rotate: f32 = 0;
+var scrub_enabled: bool = false; // Task 9 scroll-scrub timeline; wired there
 var model_yaw: f32 = 0; // model Y-rotation (radians); set via glscene_anim_set
 
 // ── Camera + input ───────────────────────────────────────────────────────────
@@ -247,6 +249,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     src_len = 0;
     env_len = 0;
     auto_rotate = 0;
+    scrub_enabled = false;
     orbit = .{};
 
     if (props_len != 0) {
@@ -266,6 +269,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
                 .yaw = p.orbit_yaw,
             };
             auto_rotate = p.auto_rotate;
+            scrub_enabled = p.scrub;
 
             lights = .{
                 0, // type = directional
