@@ -26,8 +26,8 @@
 //!    transforms, three paths: (1) fast — no rotation anywhere, one walk with
 //!    the raw ray; (2) root-only — model_yaw set but all node_rot zero, one
 //!    walk with the ray moved by invert(world[0]); (3) slow — any per-node
-//!    rotation, per-submesh walk with invert(world[s+1]), keeping hits owned
-//!    by that submesh, global nearest t wins. All transforms are rigid
+//!    rotation, per-submesh range-walk (walkRange over s's index range) with
+//!    invert(world[s+1]), global nearest t wins. All transforms are rigid
 //!    (scale ≡ 1) so t stays comparable across spaces.
 //!  • autoRotate BYPASSES the orbit damping: `orbit.yaw += auto_rotate*dt_s`
 //!    applied before tick(), giving a constant angular rate (rad/s) rather than
@@ -498,7 +498,9 @@ fn nodeRotIdentity() bool {
 ///   2. Root-only — model_yaw != 0, all node_rot zero: one walk with the ray
 ///      moved into model space by invert(world[0]).
 ///   3. Slow — any node_rot nonzero: per submesh s, move the ray into node
-///      s+1's space, walk, keep hits owned by submesh s, global nearest t.
+///      s+1's space and range-walk ONLY s's triangles (walkRange); a
+///      whole-mesh walk here would let a foreign, wrong-space triangle
+///      shadow the real hit on s. Global nearest t wins.
 /// t comparability: every ray derives from the same world-space ray under
 /// rigid transforms (scale ≡ 1 in GlScene) with no renormalization, so
 /// nearest-t comparison across submeshes is valid.
@@ -526,17 +528,20 @@ fn raycastSubmesh(a: *const gl.vmesh.Reader, aspect: f32, ndc_x: f32, ndc_y: f32
         const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, 12, indices_u16, tr) orelse return null;
         return submeshOfTri(a, hit.tri_index);
     }
-    // Slow path: per-submesh inverse transform; the walk covers the WHOLE mesh
-    // so only hits owned by submesh s are valid in node s+1's space.
+    // Slow path: per-submesh inverse transform. The ray is only meaningful in
+    // node s+1's space for submesh s's OWN triangles — a whole-mesh walk would
+    // let a foreign triangle (geometrically meaningless in this space) sit
+    // nearer and shadow the genuine hit on s, which would then be discarded
+    // (missed pick). walkRange restricts leaf testing to s's contiguous index
+    // range, so every returned hit is owned by s by construction.
     var best_t: f32 = std.math.inf(f32);
     var best_s: ?u32 = null;
     const n: u32 = @min(a.submesh_count, max_submesh);
     var s: u32 = 0;
     while (s < n) : (s += 1) {
+        const sub = a.submesh(s);
         const tr = gl.ray.transformRay(r, gl.math.invert(scene.world[s + 1]));
-        const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, 12, indices_u16, tr) orelse continue;
-        const owner = submeshOfTri(a, hit.tri_index) orelse continue;
-        if (owner != s) continue;
+        const hit = gl.bvh.walkRange(nodes, tri_perm, verts_f32, 12, indices_u16, tr, sub.index_byte_off / 2, sub.index_count) orelse continue;
         if (hit.t < best_t) {
             best_t = hit.t;
             best_s = s;

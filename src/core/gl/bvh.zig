@@ -1,8 +1,8 @@
 //! verve.gl per-mesh BVH — build-time builder + freestanding raycast walk.
 //!
 //! Same dual-target pattern as `vmesh.zig`: `build` is native-only (allocates,
-//! sorts a triangle permutation); `walk`, `nodesFromBytes`, `triPermFromBytes`
-//! are freestanding-safe (no alloc, fixed stack). Task 4 serializes the FROZEN
+//! sorts a triangle permutation); `walk`/`walkRange`, `nodesFromBytes`,
+//! `triPermFromBytes` are freestanding-safe (no alloc, fixed stack). Task 4 serializes the FROZEN
 //! 32-byte node format below into the .vmesh container.
 //!
 //! ## Node format (FROZEN, 32 bytes, little-endian)
@@ -348,6 +348,49 @@ pub fn walk(
     indices: []const u16,
     r: ray.Ray,
 ) ?Hit {
+    return walkImpl(nodes, tri_perm, positions, stride_f32, indices, r, null);
+}
+
+/// Element range restricting a walk to one submesh: triangle `tri` owns index
+/// elements [tri*3, tri*3+3) and participates iff that first element lies in
+/// [first, first+count).
+const ElementRange = struct {
+    first: u32,
+    count: u32,
+};
+
+/// Like `walk`, but only triangles whose first index element lies in
+/// [first_element, first_element + element_count) participate — i.e. one
+/// submesh's contiguous index range. Out-of-range triangles are skipped
+/// during leaf testing (the BVH itself is whole-mesh).
+pub fn walkRange(
+    nodes: []const Node,
+    tri_perm: []const u32,
+    positions: []const f32,
+    stride_f32: u32,
+    indices: []const u16,
+    r: ray.Ray,
+    first_element: u32,
+    element_count: u32,
+) ?Hit {
+    return walkImpl(nodes, tri_perm, positions, stride_f32, indices, r, .{
+        .first = first_element,
+        .count = element_count,
+    });
+}
+
+/// Shared traversal core for `walk` / `walkRange`. `range == null` tests every
+/// triangle; otherwise out-of-range triangles are skipped at the leaf test
+/// (overflow-safe: `e < first` checked before the subtraction).
+fn walkImpl(
+    nodes: []const Node,
+    tri_perm: []const u32,
+    positions: []const f32,
+    stride_f32: u32,
+    indices: []const u16,
+    r: ray.Ray,
+    range: ?ElementRange,
+) ?Hit {
     if (nodes.len == 0) return null;
 
     // A node-cap of `max_depth` means leaves sit at most at tree depth
@@ -375,6 +418,10 @@ pub fn walk(
             var i: u32 = 0;
             while (i < node.count) : (i += 1) {
                 const tri = tri_perm[node.left_or_first + i];
+                if (range) |rg| {
+                    const e = tri * 3; // triangle's first index element
+                    if (e < rg.first or e - rg.first >= rg.count) continue;
+                }
                 const v = triVerts(positions, stride_f32, indices, tri);
                 if (ray.intersectTriangle(r, v[0], v[1], v[2])) |t| {
                     if (t < best_t) {
@@ -655,6 +702,48 @@ test "(g) bytes round-trip: views feed walk identically to (c)" {
     const hit = walk(nodes_view, perm_view, &pos, 3, &idx, r) orelse return error.NoHit;
     try testing.expectEqual(@as(u32, 0), hit.tri_index);
     try testing.expectApproxEqAbs(@as(f32, 3), hit.t, eps5);
+}
+
+test "(i) walkRange: out-of-range nearer tri no longer shadows in-range hit" {
+    // Same fixture as (c): tri 0 (elements 0..3) at z=2 is NEARER along the
+    // ray than tri 1 (elements 3..6) at z=0.
+    const pos = [_]f32{
+        // tri 0 @ z=2 (elements 0..3)
+        0, 0, 2,
+        1, 0, 2,
+        0, 1, 2,
+        // tri 1 @ z=0 (elements 3..6)
+        0, 0, 0,
+        1, 0, 0,
+        0, 1, 0,
+    };
+    const idx = [_]u16{ 0, 1, 2, 3, 4, 5 };
+    var res = try build(testing.allocator, &pos, 3, &idx);
+    defer res.deinit(testing.allocator);
+
+    const r = ray.Ray{
+        .origin = math.Vec3.init(0.25, 0.25, 5),
+        .dir = math.Vec3.init(0, 0, -1),
+    };
+
+    // Unrestricted walk: nearer tri 0 wins.
+    const h_all = walk(res.nodes, res.tri_perm, &pos, 3, &idx, r) orelse return error.NoHit;
+    try testing.expectEqual(@as(u32, 0), h_all.tri_index);
+
+    // Range over tri 1 only: the NEARER tri 0 is out of range and must not
+    // shadow — tri 1 (farther, t=5) is returned.
+    const h1 = walkRange(res.nodes, res.tri_perm, &pos, 3, &idx, r, 3, 3) orelse return error.NoHit;
+    try testing.expectEqual(@as(u32, 1), h1.tri_index);
+    try testing.expectApproxEqAbs(@as(f32, 5), h1.t, eps5);
+
+    // Range over tri 0 only: tri 0, t=3.
+    const h0 = walkRange(res.nodes, res.tri_perm, &pos, 3, &idx, r, 0, 3) orelse return error.NoHit;
+    try testing.expectEqual(@as(u32, 0), h0.tri_index);
+    try testing.expectApproxEqAbs(@as(f32, 3), h0.t, eps5);
+
+    // Empty range and a range past every triangle: null.
+    try testing.expect(walkRange(res.nodes, res.tri_perm, &pos, 3, &idx, r, 0, 0) == null);
+    try testing.expect(walkRange(res.nodes, res.tri_perm, &pos, 3, &idx, r, 6, 3) == null);
 }
 
 test "(h) stride 12 parity: same quad, pos@0 + garbage padding" {
