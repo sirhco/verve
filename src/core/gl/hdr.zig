@@ -87,7 +87,9 @@ inline fn rgbToRgbe(r: f32, g: f32, b: f32) [4]u8 {
     // Simpler: scale = 256.0 * 2^(-exp) = ldexp(256.0, -exp)
     const e_byte = exp + 128;
     if (e_byte <= 0) return .{ 0, 0, 0, 0 }; // underflow
-    if (e_byte > 255) return .{ 255, 255, 255, 255 }; // overflow clamp
+    // Inputs needing e_byte > 255 exceed RGBE's max (~1.7e38) — saturate to the
+    // brightest representable white; per-channel ratios are deliberately dropped.
+    if (e_byte > 255) return .{ 255, 255, 255, 255 };
     const scale = math.ldexp(@as(f32, 256.0), -exp);
     return .{
         @intFromFloat(@min(@as(f32, 255.0), r * scale)),
