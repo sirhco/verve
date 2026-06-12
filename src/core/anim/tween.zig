@@ -8,13 +8,26 @@ const std = @import("std");
 const types = @import("types.zig");
 const scroll = @import("scroll.zig");
 
+/// GL engine target descriptor, set on PropEntry when the prop was added via
+/// glTarget / glTargetFrom. The JS engine calls the setter per frame instead
+/// of writing DOM.
+pub const GlTarget = struct {
+    /// From `gl.anim_target.encode` / `gl.anim_target.resolvePath`.
+    target_id: u32,
+    /// Translated indirect-table slot from `verve.animGlSetter`.
+    setter_slot: u32,
+};
+
 pub const PropEntry = struct {
     /// Wire prop name: "x", "opacity", "background-color", "attr:cx", ...
+    /// GL entries always use the reserved name "@gl".
     name: []const u8,
     /// Primary value (the start value when `kind == .from`).
     to: types.Value,
     /// Explicit start -> per-prop fromTo.
     from: ?types.Value = null,
+    /// Present only for GL engine props (name == "@gl").
+    gl: ?GlTarget = null,
 };
 
 pub const Step = struct {
@@ -249,6 +262,10 @@ pub const Tween = struct {
     /// the prop lands in the last opened step.
     pub fn prop(self: *Tween, prop_name: []const u8, v: anytype) *Tween {
         if (self.err != null) return self;
+        if (std.mem.eql(u8, prop_name, "@gl")) {
+            self.err = error.ReservedPropName;
+            return self;
+        }
         if (self.motion_path) |mp| {
             if (std.mem.eql(u8, prop_name, "x") or std.mem.eql(u8, prop_name, "y") or
                 (mp.rotate and std.mem.eql(u8, prop_name, "rotate")))
@@ -291,6 +308,56 @@ pub const Tween = struct {
             }
         }
         self.err = error.UnknownProp;
+        return self;
+    }
+
+    /// Tween a verve.gl engine value (camera/material/model — see
+    /// `gl.anim_target`). `setter_slot` is the translated indirect-table slot
+    /// from `verve.animGlSetter`; `target_id` from
+    /// `gl.anim_target.encode`/`resolvePath`. Island-only (like dyn values);
+    /// the JS engine calls the setter per frame instead of writing DOM.
+    /// Multiple glTarget calls on one tween are allowed — they are appended
+    /// as separate "@gl" entries distinguished by target_id.
+    pub fn glTarget(self: *Tween, target_id: u32, setter_slot: u32, to_val: f64) *Tween {
+        if (self.err != null) return self;
+        const entry: PropEntry = .{
+            .name = "@gl",
+            .to = .{ .num = to_val },
+            .gl = .{ .target_id = target_id, .setter_slot = setter_slot },
+        };
+        if (self.steps.items.len > 0) {
+            const last = &self.steps.items[self.steps.items.len - 1];
+            last.props.append(self.alloc, entry) catch |e| {
+                self.err = e;
+            };
+            return self;
+        }
+        self.props.append(self.alloc, entry) catch |e| {
+            self.err = e;
+        };
+        return self;
+    }
+
+    /// Explicit start value for a GL engine target (per-prop fromTo).
+    /// Appends a new "@gl" entry with the `from` field set.
+    pub fn glTargetFrom(self: *Tween, target_id: u32, setter_slot: u32, from_val: f64) *Tween {
+        if (self.err != null) return self;
+        const entry: PropEntry = .{
+            .name = "@gl",
+            .to = .{ .num = 0 },
+            .from = .{ .num = from_val },
+            .gl = .{ .target_id = target_id, .setter_slot = setter_slot },
+        };
+        if (self.steps.items.len > 0) {
+            const last = &self.steps.items[self.steps.items.len - 1];
+            last.props.append(self.alloc, entry) catch |e| {
+                self.err = e;
+            };
+            return self;
+        }
+        self.props.append(self.alloc, entry) catch |e| {
+            self.err = e;
+        };
         return self;
     }
 
@@ -587,4 +654,63 @@ test "totalDuration with repeat and repeatDelay" {
 
     const st = to(arena.allocator(), ".x").duration(1.0).stagger(.{ .total = 0.6 });
     try std.testing.expectApproxEqAbs(@as(f64, 1.6), st.totalDuration(), 1e-12);
+}
+
+test "glTarget appends @gl entry with gl fields and to set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const t = to(arena.allocator(), null).glTarget(7, 3, 1.5);
+    try std.testing.expect(t.err == null);
+    try std.testing.expectEqual(@as(usize, 1), t.props.items.len);
+    const p = t.props.items[0];
+    try std.testing.expectEqualStrings("@gl", p.name);
+    try std.testing.expectEqual(@as(f64, 1.5), p.to.num);
+    try std.testing.expect(p.gl != null);
+    try std.testing.expectEqual(@as(u32, 7), p.gl.?.target_id);
+    try std.testing.expectEqual(@as(u32, 3), p.gl.?.setter_slot);
+}
+
+test "glTargetFrom sets from field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const t = to(arena.allocator(), null).glTargetFrom(2, 9, 0.25);
+    try std.testing.expect(t.err == null);
+    try std.testing.expectEqual(@as(usize, 1), t.props.items.len);
+    const p = t.props.items[0];
+    try std.testing.expectEqualStrings("@gl", p.name);
+    try std.testing.expect(p.from != null);
+    try std.testing.expectEqual(@as(f64, 0.25), p.from.?.num);
+    try std.testing.expectEqual(@as(u32, 2), p.gl.?.target_id);
+    try std.testing.expectEqual(@as(u32, 9), p.gl.?.setter_slot);
+}
+
+test "two glTargets coexist with distinct ids" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const t = to(arena.allocator(), null).glTarget(1, 0, 1.0).glTarget(2, 1, 2.0);
+    try std.testing.expect(t.err == null);
+    try std.testing.expectEqual(@as(usize, 2), t.props.items.len);
+    try std.testing.expectEqual(@as(u32, 1), t.props.items[0].gl.?.target_id);
+    try std.testing.expectEqual(@as(u32, 2), t.props.items[1].gl.?.target_id);
+}
+
+test "prop with reserved name @gl surfaces deferred error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const t = to(arena.allocator(), null).prop("@gl", 1.0);
+    try std.testing.expectEqual(@as(?anyerror, error.ReservedPropName), t.err);
+}
+
+test "normal props unaffected by gl additions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const t = to(arena.allocator(), ".card").opacity(0.5).x(100).glTarget(5, 2, 0.8);
+    try std.testing.expect(t.err == null);
+    try std.testing.expectEqual(@as(usize, 3), t.props.items.len);
+    try std.testing.expectEqualStrings("opacity", t.props.items[0].name);
+    try std.testing.expect(t.props.items[0].gl == null);
+    try std.testing.expectEqualStrings("x", t.props.items[1].name);
+    try std.testing.expect(t.props.items[1].gl == null);
+    try std.testing.expectEqualStrings("@gl", t.props.items[2].name);
+    try std.testing.expect(t.props.items[2].gl != null);
 }
