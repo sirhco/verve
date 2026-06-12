@@ -193,7 +193,7 @@ fn decodeHdr(alloc: Allocator, bytes: []const u8) !Image {
             if (b0 == 0x02 and b1 == 0x02 and rle_width == width) {
                 // New-RLE scanline
                 data_pos += 4;
-                data_pos = try decodeRleScanline(bytes, data_pos, rgb[out_base..], width);
+                data_pos = try decodeRleScanline(alloc, bytes, data_pos, rgb[out_base..], width);
                 continue;
             }
         }
@@ -219,7 +219,7 @@ fn decodeHdr(alloc: Allocator, bytes: []const u8) !Image {
 
 /// Decode one new-RLE scanline (4 channels, each run-length encoded).
 /// Returns updated data_pos.
-fn decodeRleScanline(bytes: []const u8, start: usize, rgb_row: []f32, width: u32) !usize {
+fn decodeRleScanline(alloc: Allocator, bytes: []const u8, start: usize, rgb_row: []f32, width: u32) !usize {
     // Allocate a stack buffer for 4 channels. Max width = 0x7fff = 32767 bytes per channel.
     // Use a fixed buffer on stack for reasonable widths, heap for large.
     var pos = start;
@@ -227,8 +227,8 @@ fn decodeRleScanline(bytes: []const u8, start: usize, rgb_row: []f32, width: u32
     // Decode each of 4 channels into a temp flat buffer [R0..Rn, G0..Gn, B0..Bn, E0..En]
     // We decode channel by channel into a local slice, then interleave into rgb_row.
     // Max stack: 4 * 32767 = 128 KB — use heap to be safe.
-    const chan_buf = try std.heap.page_allocator.alloc(u8, @as(usize, width) * 4);
-    defer std.heap.page_allocator.free(chan_buf);
+    const chan_buf = try alloc.alloc(u8, @as(usize, width) * 4);
+    defer alloc.free(chan_buf);
 
     var ch: u32 = 0;
     while (ch < 4) : (ch += 1) {
