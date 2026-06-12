@@ -202,7 +202,7 @@ export fn glmodel_frame(dt_ms: f32, width: u32, height: u32) u32 {
             if (s >= 8) break;
             const sub = a.submesh(s);
             model_colors[s] = sub.base_color; // each slot is stable for the frame
-            if (sub.tex_index >= 0) enc.bindTexture(0, @intCast(sub.tex_index + 1));
+            if (sub.tex_base >= 0) enc.bindTexture(0, @intCast(sub.tex_base + 1));
             enc.drawSub(model_vbuf, model_ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&model_mvp)), @intCast(@intFromPtr(&model_colors[s])));
         }
         enc.endFrame();

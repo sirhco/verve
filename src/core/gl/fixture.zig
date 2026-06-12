@@ -8,6 +8,7 @@
 ///   [840..)    PNG image  checkerboard 8×8 RGBA
 const std = @import("std");
 const png = @import("png.zig");
+const hdr = @import("hdr.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -292,6 +293,371 @@ pub fn texturedCubeGlb(alloc: Allocator) ![]u8 {
     return glb;
 }
 
+// ── full-PBR cube fixture ───────────────────────────────────────────────────────
+
+// Per-face world-space tangents (xyz) for the cube above, consistent with the
+// per-face uv layout (uv (0,0)→(1,0) is the +u direction). w=+1 for all faces.
+// Derived: +u = corner1 − corner0, normalized.
+//   +X→(0,0,-1)  -X→(0,0,1)  +Y→(1,0,0)  -Y→(1,0,0)  +Z→(1,0,0)  -Z→(-1,0,0)
+const face_tangents = [6][3]f32{
+    .{ 0, 0, -1 }, // +X
+    .{ 0, 0, 1 }, // -X
+    .{ 1, 0, 0 }, // +Y
+    .{ 1, 0, 0 }, // -Y
+    .{ 1, 0, 0 }, // +Z
+    .{ -1, 0, 0 }, // -Z
+};
+
+/// Full-PBR cube glb: baseColor checkerboard (8x8), metallicRoughness map
+/// (8x8: G ramps roughness across x, B ramps metallic across y),
+/// normal map (8x8 diagonal-groove pattern around (128,128,255)),
+/// emissive map (8x8, bright 2x2 patch) + emissiveFactor (1,1,1),
+/// occlusion map (8x8 corner-darkened) with strength 0.8,
+/// metallicFactor 1.0, roughnessFactor 1.0, normalTexture.scale 1.0.
+/// with_tangents=true emits a TANGENT VEC4 accessor; false omits it
+/// (exercises build-side generation).
+///
+/// Same 24-vertex cube geometry as texturedCubeGlb. Five embedded PNGs
+/// (base/MR/normal/emissive/occlusion) each 8x8 RGBA.
+pub fn pbrCubeGlb(alloc: Allocator, opts: struct { with_tangents: bool = true }) ![]u8 {
+    // ── 1. Build the five 8x8 RGBA maps ───────────────────────────────────────
+    var base_map: [8 * 8 * 4]u8 = undefined; // checkerboard
+    var mr_map: [8 * 8 * 4]u8 = undefined; // G=roughness ramp(x), B=metallic ramp(y)
+    var nrm_map: [8 * 8 * 4]u8 = undefined; // diagonal groove around (128,128,255)
+    var emi_map: [8 * 8 * 4]u8 = undefined; // bright 2x2 patch
+    var occ_map: [8 * 8 * 4]u8 = undefined; // corner-darkened
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            // base: checkerboard
+            const light = (row + col) % 2 == 0;
+            if (light) {
+                base_map[idx + 0] = 230;
+                base_map[idx + 1] = 230;
+                base_map[idx + 2] = 230;
+            } else {
+                base_map[idx + 0] = 60;
+                base_map[idx + 1] = 60;
+                base_map[idx + 2] = 200;
+            }
+            base_map[idx + 3] = 255;
+            // metallicRoughness: G ramps roughness across x, B ramps metallic across y
+            mr_map[idx + 0] = 0;
+            mr_map[idx + 1] = @intCast(col * 255 / 7); // roughness across x
+            mr_map[idx + 2] = @intCast(row * 255 / 7); // metallic across y
+            mr_map[idx + 3] = 255;
+            // normal: diagonal-groove pattern around (128,128,255)
+            const groove: bool = ((row + col) % 4) < 2;
+            nrm_map[idx + 0] = if (groove) 160 else 96;
+            nrm_map[idx + 1] = if (groove) 96 else 160;
+            nrm_map[idx + 2] = 255;
+            nrm_map[idx + 3] = 255;
+            // emissive: bright 2x2 patch near center, else black
+            const bright = (row >= 3 and row <= 4 and col >= 3 and col <= 4);
+            emi_map[idx + 0] = if (bright) 255 else 0;
+            emi_map[idx + 1] = if (bright) 255 else 0;
+            emi_map[idx + 2] = if (bright) 255 else 0;
+            emi_map[idx + 3] = 255;
+            // occlusion: corner-darkened (darker toward (0,0))
+            const oc: u8 = @intCast(128 + (row + col) * 127 / 14);
+            occ_map[idx + 0] = oc;
+            occ_map[idx + 1] = oc;
+            occ_map[idx + 2] = oc;
+            occ_map[idx + 3] = 255;
+        }
+    }
+
+    const base_png = try png.encodeRgba(alloc, &base_map, 8, 8);
+    defer alloc.free(base_png);
+    const mr_png = try png.encodeRgba(alloc, &mr_map, 8, 8);
+    defer alloc.free(mr_png);
+    const nrm_png = try png.encodeRgba(alloc, &nrm_map, 8, 8);
+    defer alloc.free(nrm_png);
+    const emi_png = try png.encodeRgba(alloc, &emi_map, 8, 8);
+    defer alloc.free(emi_png);
+    const occ_png = try png.encodeRgba(alloc, &occ_map, 8, 8);
+    defer alloc.free(occ_png);
+
+    const pngs = [5][]const u8{ base_png, mr_png, nrm_png, emi_png, occ_png };
+
+    // ── 2. Compute BIN layout ─────────────────────────────────────────────────
+    // POSITION(288) NORMAL(288) [TANGENT(384)] TEXCOORD_0(192) indices(72) 5×PNG.
+    const p_pos_off: u32 = 0;
+    const p_pos_len: u32 = 24 * 3 * 4; // 288
+    const p_nrm_off: u32 = p_pos_off + p_pos_len; // 288
+    const p_nrm_len: u32 = 24 * 3 * 4; // 288
+    const has_tan = opts.with_tangents;
+    const p_tan_off: u32 = p_nrm_off + p_nrm_len; // 576
+    const p_tan_len: u32 = if (has_tan) 24 * 4 * 4 else 0; // 384 or 0
+    const p_uv_off: u32 = p_tan_off + p_tan_len;
+    const p_uv_len: u32 = 24 * 2 * 4; // 192
+    const p_idx_off: u32 = p_uv_off + p_uv_len;
+    const p_idx_len: u32 = 36 * 2; // 72
+    // PNGs each 4-aligned after indices.
+    var png_offs: [5]u32 = undefined;
+    var cursor: u32 = (p_idx_off + p_idx_len + 3) & ~@as(u32, 3);
+    for (pngs, 0..) |p, i| {
+        png_offs[i] = cursor;
+        cursor += @intCast(p.len);
+        cursor = (cursor + 3) & ~@as(u32, 3);
+    }
+    const bin_total: u32 = cursor;
+    const bin_padded = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // positions
+    var off: usize = p_pos_off;
+    for (faces) |face| {
+        for (face.v) |v| {
+            std.mem.writeInt(u32, bin[off..][0..4], @bitCast(v[0]), .little);
+            std.mem.writeInt(u32, bin[off + 4 ..][0..4], @bitCast(v[1]), .little);
+            std.mem.writeInt(u32, bin[off + 8 ..][0..4], @bitCast(v[2]), .little);
+            off += 12;
+        }
+    }
+    // normals
+    off = p_nrm_off;
+    for (faces) |face| {
+        for (0..4) |_| {
+            std.mem.writeInt(u32, bin[off..][0..4], @bitCast(face.nx), .little);
+            std.mem.writeInt(u32, bin[off + 4 ..][0..4], @bitCast(face.ny), .little);
+            std.mem.writeInt(u32, bin[off + 8 ..][0..4], @bitCast(face.nz), .little);
+            off += 12;
+        }
+    }
+    // tangents (VEC4, w=+1) if requested
+    if (has_tan) {
+        off = p_tan_off;
+        for (face_tangents) |t| {
+            for (0..4) |_| {
+                std.mem.writeInt(u32, bin[off..][0..4], @bitCast(t[0]), .little);
+                std.mem.writeInt(u32, bin[off + 4 ..][0..4], @bitCast(t[1]), .little);
+                std.mem.writeInt(u32, bin[off + 8 ..][0..4], @bitCast(t[2]), .little);
+                std.mem.writeInt(u32, bin[off + 12 ..][0..4], @bitCast(@as(f32, 1.0)), .little);
+                off += 16;
+            }
+        }
+    }
+    // uvs
+    off = p_uv_off;
+    for (faces) |_| {
+        for (face_uvs) |uv| {
+            std.mem.writeInt(u32, bin[off..][0..4], @bitCast(uv[0]), .little);
+            std.mem.writeInt(u32, bin[off + 4 ..][0..4], @bitCast(uv[1]), .little);
+            off += 8;
+        }
+    }
+    // indices
+    off = p_idx_off;
+    for (0..6) |face_i| {
+        const base: u16 = @intCast(face_i * 4);
+        const tri_offsets = [6]u16{ 0, 1, 2, 0, 2, 3 };
+        for (tri_offsets) |o| {
+            std.mem.writeInt(u16, bin[off..][0..2], base + o, .little);
+            off += 2;
+        }
+    }
+    // PNGs
+    for (pngs, 0..) |p, i| {
+        @memcpy(bin[png_offs[i]..][0..p.len], p);
+    }
+
+    // ── 3. Build JSON ─────────────────────────────────────────────────────────
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    // accessor / bufferView index layout depends on whether tangents are present.
+    // accessors: 0=POSITION 1=NORMAL [2=TANGENT] then UV, indices.
+    // bufferViews mirror accessors then 5 PNG bufferViews.
+    const acc_p_pos: u32 = 0;
+    const acc_p_nrm: u32 = 1;
+    const acc_p_tan: u32 = 2;
+    const acc_p_uv: u32 = if (has_tan) 3 else 2;
+    const acc_p_idx: u32 = if (has_tan) 4 else 3;
+    const bv_count_geom: u32 = if (has_tan) 5 else 4;
+    const bv_p_pos: u32 = 0;
+    const bv_p_nrm: u32 = 1;
+    const bv_p_tan: u32 = 2;
+    const bv_p_uv: u32 = if (has_tan) 3 else 2;
+    const bv_p_idx: u32 = if (has_tan) 4 else 3;
+
+    try w.writeAll("{");
+    try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0]}],");
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"PbrCube\"}],");
+    try w.writeAll("\"meshes\":[{\"primitives\":[{\"attributes\":{");
+    try w.print("\"POSITION\":{d},\"NORMAL\":{d}", .{ acc_p_pos, acc_p_nrm });
+    if (has_tan) try w.print(",\"TANGENT\":{d}", .{acc_p_tan});
+    try w.print(",\"TEXCOORD_0\":{d}", .{acc_p_uv});
+    try w.print("}},\"indices\":{d},\"material\":0}}]}}],", .{acc_p_idx});
+
+    // accessors
+    try w.writeAll("\"accessors\":[");
+    try w.print("{{\"bufferView\":{d},\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[-1.0,-1.0,-1.0],\"max\":[1.0,1.0,1.0]}},", .{bv_p_pos});
+    try w.print("{{\"bufferView\":{d},\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"}},", .{bv_p_nrm});
+    if (has_tan) {
+        try w.print("{{\"bufferView\":{d},\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC4\"}},", .{bv_p_tan});
+    }
+    try w.print("{{\"bufferView\":{d},\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"}},", .{bv_p_uv});
+    try w.print("{{\"bufferView\":{d},\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"}}", .{bv_p_idx});
+    try w.writeAll("],");
+
+    // bufferViews (geometry, then 5 PNG)
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ p_pos_off, p_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ p_nrm_off, p_nrm_len });
+    if (has_tan) {
+        try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ p_tan_off, p_tan_len });
+    }
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ p_uv_off, p_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ p_idx_off, p_idx_len });
+    for (pngs, 0..) |p, i| {
+        try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ png_offs[i], p.len });
+        if (i + 1 < pngs.len) try w.writeAll(",");
+    }
+    try w.writeAll("],");
+
+    // buffer, material (full PBR), textures, images
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+    try w.writeAll("\"materials\":[{");
+    try w.writeAll("\"pbrMetallicRoughness\":{");
+    try w.writeAll("\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
+    try w.writeAll("\"baseColorTexture\":{\"index\":0},");
+    try w.writeAll("\"metallicFactor\":1.0,\"roughnessFactor\":1.0,");
+    try w.writeAll("\"metallicRoughnessTexture\":{\"index\":1}");
+    try w.writeAll("},");
+    try w.writeAll("\"normalTexture\":{\"index\":2,\"scale\":1.0},");
+    try w.writeAll("\"emissiveTexture\":{\"index\":3},");
+    try w.writeAll("\"emissiveFactor\":[1.0,1.0,1.0],");
+    try w.writeAll("\"occlusionTexture\":{\"index\":4,\"strength\":0.8}");
+    try w.writeAll("}],");
+    // textures point at image i (source); image i points at bufferView bv_count_geom+i
+    try w.writeAll("\"textures\":[");
+    for (0..5) |i| {
+        try w.print("{{\"source\":{d}}}", .{i});
+        if (i + 1 < 5) try w.writeAll(",");
+    }
+    try w.writeAll("],");
+    try w.writeAll("\"images\":[");
+    for (0..5) |i| {
+        try w.print("{{\"bufferView\":{d},\"mimeType\":\"image/png\"}}", .{bv_count_geom + @as(u32, @intCast(i))});
+        if (i + 1 < 5) try w.writeAll(",");
+    }
+    try w.writeAll("]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) {
+        try w.writeByte(0x20);
+    }
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── 4. Assemble GLB ───────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42; // B
+    glb[goff + 1] = 0x49; // I
+    glb[goff + 2] = 0x4E; // N
+    glb[goff + 3] = 0x00; // \0
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    return glb;
+}
+
+// ── studio HDR environment fixture ──────────────────────────────────────────────
+
+/// Procedural studio environment as a complete .hdr file (flat RGBE):
+/// vertical gradient (zenith (0.4,0.6,1.2) -> horizon (1.0,0.8,0.6) ->
+/// ground (0.15,0.12,0.1)) plus a sun disk (~12 deg diameter) at
+/// direction ~(+0.5,+0.6,-0.6) normalized, radiance (60,55,45).
+/// Defaults used by the demo: w=256, h=128.
+///
+/// Equirect convention matches ibl.zig (inverse mapping):
+///   φ = (u − 0.5)·2π, θ = v·π,
+///   d = (sinθ·sinφ, cosθ, −sinθ·cosφ).
+pub fn studioHdr(alloc: Allocator, w: u32, h: u32) ![]u8 {
+    const zenith = [3]f32{ 0.4, 0.6, 1.2 };
+    const horizon = [3]f32{ 1.0, 0.8, 0.6 };
+    const ground = [3]f32{ 0.15, 0.12, 0.1 };
+    const sun_rad = [3]f32{ 60.0, 55.0, 45.0 };
+
+    // Normalize sun direction (0.5,0.6,-0.6).
+    const sx: f32 = 0.5;
+    const sy: f32 = 0.6;
+    const sz: f32 = -0.6;
+    const slen = @sqrt(sx * sx + sy * sy + sz * sz);
+    const sun = [3]f32{ sx / slen, sy / slen, sz / slen };
+
+    // ~12° diameter → 6° angular radius.
+    const cos_radius = @cos(6.0 * std.math.pi / 180.0);
+
+    const npix = @as(usize, w) * @as(usize, h);
+    const rgb = try alloc.alloc(f32, npix * 3);
+    defer alloc.free(rgb);
+
+    var py: u32 = 0;
+    while (py < h) : (py += 1) {
+        const v = (@as(f32, @floatFromInt(py)) + 0.5) / @as(f32, @floatFromInt(h));
+        // Gradient: zenith@v=0 → horizon@v=0.5 → ground@v=1.
+        var g: [3]f32 = undefined;
+        if (v < 0.5) {
+            const t = v / 0.5;
+            for (0..3) |c| g[c] = zenith[c] + (horizon[c] - zenith[c]) * t;
+        } else {
+            const t = (v - 0.5) / 0.5;
+            for (0..3) |c| g[c] = horizon[c] + (ground[c] - horizon[c]) * t;
+        }
+        const theta = v * std.math.pi;
+        const sin_t = @sin(theta);
+        const cos_t = @cos(theta);
+
+        var px: u32 = 0;
+        while (px < w) : (px += 1) {
+            const u = (@as(f32, @floatFromInt(px)) + 0.5) / @as(f32, @floatFromInt(w));
+            const phi = (u - 0.5) * 2.0 * std.math.pi;
+            const dx = sin_t * @sin(phi);
+            const dy = cos_t;
+            const dz = -sin_t * @cos(phi);
+            // d is unit (sin²+cos² over the sphere); sun is unit → dot = cos(angle).
+            const cd = dx * sun[0] + dy * sun[1] + dz * sun[2];
+
+            var col = g;
+            if (cd > cos_radius) {
+                for (0..3) |c| col[c] += sun_rad[c];
+            }
+            const idx = (@as(usize, py) * w + px) * 3;
+            rgb[idx + 0] = col[0];
+            rgb[idx + 1] = col[1];
+            rgb[idx + 2] = col[2];
+        }
+    }
+
+    return hdr.encode(alloc, rgb, w, h);
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -322,4 +688,73 @@ test "json chunk parses as valid JSON with required arrays" {
     try testing.expectEqual(@as(usize, 5), root.get("bufferViews").?.array.items.len);
     try testing.expectEqual(@as(usize, 1), root.get("materials").?.array.items.len);
     try testing.expectEqual(@as(usize, 1), root.get("images").?.array.items.len);
+}
+
+// ── pbrCubeGlb fixture tests ────────────────────────────────────────────────────
+
+fn pbrGlbInvariants(glb: []const u8) !void {
+    try testing.expectEqualSlices(u8, "glTF", glb[0..4]);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, glb[4..8], .little));
+    try testing.expectEqual(@as(u32, @intCast(glb.len)), std.mem.readInt(u32, glb[8..12], .little));
+    try testing.expectEqualSlices(u8, "JSON", glb[16..20]);
+    const json_len = std.mem.readInt(u32, glb[12..16], .little);
+    try testing.expectEqual(@as(u32, 0), json_len % 4);
+    // JSON parses + has the 5 PBR maps (images/textures).
+    const json = glb[20 .. 20 + json_len];
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqual(@as(usize, 5), root.get("images").?.array.items.len);
+    try testing.expectEqual(@as(usize, 5), root.get("textures").?.array.items.len);
+    try testing.expectEqual(@as(usize, 1), root.get("materials").?.array.items.len);
+}
+
+test "pbrCubeGlb with_tangents=true: container + JSON invariants" {
+    const glb = try pbrCubeGlb(testing.allocator, .{ .with_tangents = true });
+    defer testing.allocator.free(glb);
+    try pbrGlbInvariants(glb);
+    // accessor count: pos,normal,tangent,uv,indices = 5
+    const json_len = std.mem.readInt(u32, glb[12..16], .little);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len], .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 5), parsed.value.object.get("accessors").?.array.items.len);
+}
+
+test "pbrCubeGlb with_tangents=false: no TANGENT accessor" {
+    const glb = try pbrCubeGlb(testing.allocator, .{ .with_tangents = false });
+    defer testing.allocator.free(glb);
+    try pbrGlbInvariants(glb);
+    // accessor count: pos,normal,uv,indices = 4 (no tangent)
+    const json_len = std.mem.readInt(u32, glb[12..16], .little);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len], .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 4), parsed.value.object.get("accessors").?.array.items.len);
+}
+
+// ── studioHdr fixture tests ─────────────────────────────────────────────────────
+
+test "studioHdr round-trips: sun texel > 10x zenith texel" {
+    const alloc = testing.allocator;
+    const w: u32 = 256;
+    const h: u32 = 128;
+    const bytes = try studioHdr(alloc, w, h);
+    defer alloc.free(bytes);
+
+    var img = try hdr.decode(alloc, bytes);
+    defer img.deinit(alloc);
+    try testing.expectEqual(w, img.width);
+    try testing.expectEqual(h, img.height);
+
+    // Zenith texel: top row, any column (gradient near zenith color).
+    const zen_idx: usize = (0 * @as(usize, w) + 0) * 3;
+    const zen_lum = img.rgb[zen_idx + 0] + img.rgb[zen_idx + 1] + img.rgb[zen_idx + 2];
+
+    // Find the brightest texel (the sun disk).
+    var max_lum: f32 = 0;
+    var i: usize = 0;
+    while (i < @as(usize, w) * h) : (i += 1) {
+        const lum = img.rgb[i * 3 + 0] + img.rgb[i * 3 + 1] + img.rgb[i * 3 + 2];
+        if (lum > max_lum) max_lum = lum;
+    }
+    try testing.expect(max_lum > zen_lum * 10.0);
 }
