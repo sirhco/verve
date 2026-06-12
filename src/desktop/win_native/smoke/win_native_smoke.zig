@@ -399,10 +399,11 @@ fn runCookieSet(win: *wn.Window) void {
     win.cookies().set(.{
         .name = COOKIE_NAME,
         .value = "hello-from-zig",
-        // Concrete domain so WebView2 actually stores it: the smoke page is a
-        // NavigateToString opaque origin, so an empty/origin-derived domain has
-        // nothing to bind to. GetCookies(null) is profile-wide, so a real
-        // domain round-trips through set -> get -> delete regardless of origin.
+        // Concrete domain so WebView2 actually stores it: the smoke page now
+        // loads over verve://, whose custom-scheme origin still doesn't bind
+        // an empty/origin-derived cookie domain. GetCookies(null) is
+        // profile-wide, so a real domain round-trips through
+        // set -> get -> delete regardless of origin.
         .domain = "verve.local",
         .path = "/",
         .same_site = .lax,
@@ -752,14 +753,15 @@ pub fn main() void {
         .title = "Verve win-native",
         .width = 900,
         .height = 640,
-        // Window.init always navigates verve://app/index.html before the
-        // loadHtml below replaces the page. Without an asset entry that
-        // boot request logs a scheme-handler "not found" — give it a real
-        // page so startup resolves cleanly (and the embedded asset router
-        // gets exercised on hardware as a side effect).
+        // Window.init always navigates verve://app/index.html at boot. Serve
+        // the smoke page itself through that nav: the embedded asset router
+        // gets real-hardware coverage, the page gets a real (non-opaque)
+        // verve:// origin, and there is no boot-nav/loadHtml race — the
+        // earlier placeholder-asset attempt lost that race and left
+        // "booting…" on screen instead of the smoke UI.
         .assets = &.{.{
             .path = "index.html",
-            .bytes = "<!doctype html><title>verve smoke</title>booting…",
+            .bytes = page,
             .content_type = "text/html",
         }},
     }) catch {
@@ -776,7 +778,8 @@ pub fn main() void {
     win.setCloseHandler(onClose, null);
     win.setDragDropHandler(onDragDrop, null);
     win.setUrlOpenHandler(onUrlOpen, null);
-    win.loadHtml(page, null) catch {};
+    // No loadHtml: the boot navigation already serves `page` from the
+    // embedded asset table (see Window.init above).
     win.run();
 
     // Clean up the child window if one was opened.
