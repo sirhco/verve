@@ -14,6 +14,7 @@ pub const venv = @import("venv.zig");
 pub const tangent = @import("tangent.zig");
 pub const orbit = @import("orbit.zig");
 pub const ray = @import("ray.zig");
+pub const bvh = @import("bvh.zig");
 // Native-side asset pipeline (std.json / decoder allocations). Island
 // chunks must not reference these — Zig's lazy analysis makes the bare
 // import free; only actual references would pull them into wasm.
@@ -39,6 +40,7 @@ test {
     _ = tangent;
     _ = orbit;
     _ = ray;
+    _ = bvh;
     _ = png;
     _ = gltf;
     _ = hdr;
