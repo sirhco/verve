@@ -13,10 +13,11 @@
 //! would need namespacing.
 //!
 //! ── DESIGN CHOICES (see Task 12 spec) ───────────────────────────────────────
-//!  • Model matrix = IDENTITY; the CAMERA orbits. mvp = proj · view · identity,
-//!    so the normal matrix is identity-9 and the pick ray operates directly in
-//!    world == model space (no world→local inverse). autoRotate spins the
-//!    camera, not the mesh — picking stays coherent at every yaw.
+//!  • Model matrix = rotateY(model_yaw); the CAMERA also orbits. mvp = proj ·
+//!    view · model. normal9 = upper-3x3 of model (pure rotation = orthonormal,
+//!    so normalMatrix(model) == upper-3x3). Pick ray is transformed into model
+//!    space by rotating both origin and direction by -model_yaw about Y (inverse
+//!    of a pure Y-rotation is rotation by the negated angle — cheap, exact).
 //!  • autoRotate BYPASSES the orbit damping: `orbit.yaw += auto_rotate*dt_s`
 //!    applied before tick(), giving a constant angular rate (rad/s) rather than
 //!    an impulse that decays. User drag impulses still flow through tick().
@@ -107,6 +108,7 @@ var pick_ids: [max_picks]u32 = undefined;
 var pick_count: usize = 0;
 
 var auto_rotate: f32 = 0;
+var model_yaw: f32 = 0; // model Y-rotation (radians); set via glscene_anim_set
 
 // ── Camera + input ───────────────────────────────────────────────────────────
 
@@ -237,6 +239,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     hover_name_hash = no_hover_hash;
     input = .{};
     pick_count = 0;
+    model_yaw = 0;
     model_mat = identity4;
     normal9 = identity3;
 
@@ -370,11 +373,30 @@ export fn glscene_frame_restore() void {
 
 // ── pick raycast ──────────────────────────────────────────────────────────────
 
+/// Rotate a Vec3 about the Y axis by `angle` radians (right-hand, column-major).
+/// x' = x·cos - z·sin,  y' = y,  z' = x·sin + z·cos
+fn rotateYVec3(v: gl.math.Vec3, angle: f32) gl.math.Vec3 {
+    const c = @cos(angle);
+    const s = @sin(angle);
+    return gl.math.Vec3.init(v.x * c - v.z * s, v.y, v.x * s + v.z * c);
+}
+
 /// Build a pick ray for `(ndc_x, ndc_y)` and walk the mesh BVH. Returns the
 /// picked submesh index, or null on miss / no BVH data.
+///
+/// When model_yaw != 0 the model matrix is rotateY(model_yaw), so world space
+/// and model space differ. Transform the ray into model space by applying the
+/// inverse rotation (rotateY(-model_yaw)) to both the ray origin and direction.
+/// The model rotates about the world origin, so the origin IS already relative
+/// to the rotation pivot — no extra translation needed.
 fn raycastSubmesh(a: *const gl.vmesh.Reader, aspect: f32, ndc_x: f32, ndc_y: f32) ?u32 {
     if (a.bvh_node_count == 0) return null;
-    const r = gl.ray.rayFromCamera(orbit.eye(), orbit.target, up_vec, fov_y, aspect, ndc_x, ndc_y);
+    var r = gl.ray.rayFromCamera(orbit.eye(), orbit.target, up_vec, fov_y, aspect, ndc_x, ndc_y);
+    // Transform ray into model space (inverse Y-rotation = negate angle).
+    if (model_yaw != 0) {
+        r.origin = rotateYVec3(r.origin, -model_yaw);
+        r.dir = rotateYVec3(r.dir, -model_yaw);
+    }
     const nodes = gl.bvh.nodesFromBytes(a.bvh_nodes);
     const tri_perm = gl.bvh.triPermFromBytes(a.tri_perm);
     // Vertices: vmesh stride 48 bytes = 12 f32; position xyz at offset 0.
@@ -412,8 +434,14 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
     const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(@max(height, 1)));
     const proj = gl.math.Mat4.perspective(fov_y, aspect, 0.1, 100.0);
-    // mvp = proj · view · identity. model_mat stays identity, so normal9 too.
-    mvp = proj.mul(orbit.viewMatrix(up_vec)).m;
+    // Build model matrix from model_yaw (pure Y-rotation; scale/translate = identity).
+    const model_q = gl.math.Quat.fromAxisAngle(up_vec, model_yaw);
+    const world = gl.math.Mat4.fromTrs(gl.math.Vec3.init(0, 0, 0), model_q, gl.math.Vec3.init(1, 1, 1));
+    model_mat = world.m;
+    // For a pure rotation, normalMatrix == upper-3x3 (orthonormal: R^{-T} = R).
+    normal9 = gl.math.normalMatrix(world);
+    // mvp = proj · view · model.
+    mvp = proj.mul(orbit.viewMatrix(up_vec)).mul(world).m;
     const eye = orbit.eye();
     camera_pos = .{ eye.x, eye.y, eye.z };
 
@@ -454,8 +482,6 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 if (canvasRef()) |h| verve.setRefAttr(h, "data-gl-hover", "");
             }
         }
-
-        normal9 = identity3; // model is identity; restate for clarity/stability
 
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
         enc.setPipeline(shader, gl.command.state_depth_test | gl.command.state_cull_back);
@@ -543,4 +569,54 @@ fn eql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;
     return true;
+}
+
+// ── animation setter ─────────────────────────────────────────────────────────
+
+/// Write one tweened engine value. Decodes the target id (gl.anim_target) and
+/// stores into the matching static. Unknown/invalid ids are silently ignored.
+///
+/// Camera writes seek absolute values (scrub semantics) — written directly to
+/// orbit.yaw/pitch/distance with pitch/distance clamped to the orbit's own
+/// constraints. tick() is NOT called; the next frame integrates normally.
+///
+/// Material writes go to mats[submesh][4] (metallic) or [5] (roughness). Guard:
+/// submesh must be < max_submesh AND < the loaded asset's submesh_count (if any).
+///
+/// Model yaw sets model_yaw directly.
+fn applyAnimTarget(id: u32, value: f32) void {
+    const d = gl.anim_target.decode(id) orelse return;
+    switch (d.kind) {
+        .camera => switch (@as(gl.anim_target.CameraField, @enumFromInt(d.field))) {
+            .yaw => orbit.yaw = value,
+            .pitch => {
+                const lo = orbit.min_pitch;
+                const hi = orbit.max_pitch;
+                orbit.pitch = if (value < lo) lo else if (value > hi) hi else value;
+            },
+            .distance => {
+                const lo = orbit.min_distance;
+                const hi = orbit.max_distance;
+                orbit.distance = if (value < lo) lo else if (value > hi) hi else value;
+            },
+        },
+        .material => {
+            const s: usize = d.submesh;
+            const cap = if (asset) |*a| @as(usize, a.submesh_count) else @as(usize, 0);
+            if (s >= max_submesh or s >= cap) return;
+            switch (@as(gl.anim_target.MaterialField, @enumFromInt(d.field))) {
+                .metallic => mats[s][4] = value,
+                .roughness => mats[s][5] = value,
+            }
+        },
+        .model => switch (@as(gl.anim_target.ModelField, @enumFromInt(d.field))) {
+            .yaw => model_yaw = value,
+        },
+    }
+}
+
+/// Exported entry point called by the animation runtime (island_runtime.animGlSetter).
+/// Signature matches fn(u32, f64) void as required by animGlSetter registration.
+pub export fn glscene_anim_set(target_id: u32, value: f64) void {
+    applyAnimTarget(target_id, @floatCast(value));
 }
