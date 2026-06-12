@@ -190,6 +190,9 @@ extern "verve_runtime" fn verve_host_call_async(
 extern "verve_runtime" fn verve_chunk_alloc(len: u32, alignment: u32) u32;
 extern "verve_runtime" fn verve_chunk_arena_mark() u32;
 extern "verve_runtime" fn verve_chunk_arena_reset(m: u32) void;
+
+// gl asset region — page-scoped bump region for fetched GPU assets.
+extern "verve_runtime" fn verve_asset_reset() void;
 extern "verve_runtime" fn verve_register_drop(
     bind_ptr: [*]const u8,
     bind_len: u32,
@@ -1582,6 +1585,14 @@ pub fn chunkArenaMark() u32 {
 
 pub fn chunkArenaReset(m: u32) void {
     verve_chunk_arena_reset(m);
+}
+
+// ---- Asset region (gl GPU assets — page-scoped) -------------------------
+
+/// Frees every fetched gl asset. Call ONLY from the page's single stateful
+/// gl island's hydrate() — it owns the page's asset lifetime.
+pub fn assetReset() void {
+    verve_asset_reset();
 }
 
 // ---- Drag-drop (Phase 22) -----------------------------------------------

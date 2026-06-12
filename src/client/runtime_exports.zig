@@ -27,6 +27,7 @@ const client_alloc = @import("allocator.zig");
 const json_service = @import("json_service.zig");
 const event_state = @import("event_state.zig");
 const chunk_arena = @import("chunk_arena.zig");
+const asset_region = @import("asset_region.zig");
 const island = @import("island.zig");
 const island_state_client = @import("island_state_client.zig");
 
@@ -374,6 +375,18 @@ export fn verve_drop_ptr() u32 {
 }
 export fn verve_drop_len() u32 {
     return chunk_arena.dropLen();
+}
+
+// ---- Asset region (gl GPU assets — page-scoped) --------------------------
+
+export fn verve_asset_alloc(len: u32, alignment: u32) u32 {
+    return @intCast(asset_region.alloc(len, alignment));
+}
+export fn verve_asset_reset() void {
+    asset_region.reset();
+}
+export fn verve_asset_used() u32 {
+    return @intCast(asset_region.used());
 }
 
 /// Register a cleanup handler on the runtime's root Owner. Same

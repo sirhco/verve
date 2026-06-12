@@ -15,4 +15,5 @@ test {
     _ = @import("json_service.zig");
     _ = @import("event_state.zig");
     _ = @import("chunk_arena.zig");
+    _ = @import("asset_region.zig");
 }
