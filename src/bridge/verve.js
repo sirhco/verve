@@ -1591,10 +1591,14 @@
       }
       animRenderAt(a, a.pos);
     }
+    // gl canvases render AFTER the anim engine so gl-setter writes made
+    // this frame are visible to the chunk's frame export this frame.
+    // Iterate a copy: sinks delete themselves on stop paths mid-iteration.
+    for (const s of [...glSinks]) s(now);
     // Keep ticking while time-driven anims run, scroll work remains
     // (fresh scroll events / unsettled scrub smoothing set stDirty), or
-    // inertia throws are in flight.
-    if (stDirty || smActive || dragThrowing > 0 || flipActive > 0 || (anims.size && [...anims.values()].some((a) => !a.paused && !a.done))) {
+    // inertia throws are in flight — or any gl canvas loop is live.
+    if (stDirty || smActive || dragThrowing > 0 || flipActive > 0 || glSinks.size > 0 || (anims.size && [...anims.values()].some((a) => !a.paused && !a.done))) {
       requestAnimationFrame(animTick);
     } else {
       animTickerOn = false;
@@ -4225,6 +4229,13 @@
     glActiveChunkExports = exports;
   };
 
+  // Per-canvas frame callbacks driven by the master anim rAF (animTick).
+  // Membership == "this canvas's loop is running": sinks delete themselves
+  // on stop paths instead of skipping a self-reschedule. Shared tick means
+  // anim gl-setter writes land the SAME frame the canvas renders (no 1-frame
+  // lag — closes the P5 deviation).
+  const glSinks = new Set();
+
   const glCompile = (gl, vsSrc, fsSrc) => {
     const mk = (type, src) => {
       const s = gl.createShader(type);
@@ -4626,15 +4637,22 @@
       // restored handler resets resource state and restarts it.
       lost: false,
     };
-    const step = (now) => {
+    // Sink driven by the master anim rAF (animTick) — see glSinks. Same body
+    // as the old self-rescheduling step(), except stop paths remove the sink
+    // from glSinks instead of skipping a requestAnimationFrame(step) self-call.
+    const sink = (now) => {
       // Context lost: the GL objects are gone and any GL call would error.
       // Stop the loop entirely; webglcontextrestored restarts it. (Chosen over
-      // idle rAF polling: zero work while suspended, single clear resume point.)
-      if (st.lost) return;
+      // idle polling: zero work while suspended, single clear resume point.)
+      if (st.lost) {
+        glSinks.delete(sink);
+        return;
+      }
       // Island unmounted: canvas detached from the DOM. Free GPU objects and
       // stop without rescheduling, instead of leaking the whole resource set.
       if (!canvas.isConnected) {
         disposeGlState(st);
+        glSinks.delete(sink);
         return;
       }
       const dt = st.last ? now - st.last : 16.7;
@@ -4654,6 +4672,7 @@
         // halting and leaking. Frame exports that always return a pointer are
         // unaffected.
         disposeGlState(st);
+        glSinks.delete(sink);
         return;
       }
       try {
@@ -4671,15 +4690,18 @@
       } catch (err) {
         // A corrupt stream/pointer must not kill the loop silently.
         console.error("verve.gl: interpreter fault, loop stopped:", err, err && err.stack);
+        glSinks.delete(sink);
         return;
       }
-      requestAnimationFrame(step);
     };
     // preventDefault is REQUIRED — without it the browser never fires
     // webglcontextrestored, leaving the canvas permanently dead.
     canvas.addEventListener("webglcontextlost", (e) => {
       e.preventDefault();
       st.lost = true;
+      // Drop the sink immediately (the st.lost bail also self-removes, but
+      // only if the master tick happens to run before restore).
+      glSinks.delete(sink);
       // Bring the static poster back while the GPU recovers.
       if (st.poster) {
         st.poster.style.display = "";
@@ -4703,9 +4725,13 @@
       // exports a restore hook. Convention: "<frame_export>_restore" (Task 10/12).
       const restoreFn = st.exports[st.exportName + "_restore"];
       if (typeof restoreFn === "function") restoreFn();
-      requestAnimationFrame(step);
+      // st.last was reset to 0 above, so the first resumed frame uses the
+      // fixed 16.7 ms dt instead of the whole lost-context gap.
+      glSinks.add(sink);
+      tickerKick();
     });
-    requestAnimationFrame(step);
+    glSinks.add(sink);
+    tickerKick();
   };
 
   // One-shot fetch routed to an island export: `{api, island, export}` POSTs
