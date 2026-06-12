@@ -983,6 +983,9 @@
       console.error("verve: anim gl setter failed:", e);
     }
   };
+  // Page-default gl setter slot: last island to call verve_anim_register_setter wins.
+  // Timelines parsed before the gl island hydrates use this at write time (P7: per-island).
+  let defaultGlSlot = 0;
 
   const buildMods = (mods) => {
     const byProp = {};
@@ -1343,10 +1346,17 @@
     // before any DOM write — `el` is the inert selfEl fallback (the island
     // host) and has no styles/attrs to touch for a gl tween.
     if (st.kind === "gl") {
+      // Slot 0 = "page default" (SSR tweens). Unresolved (gl island not yet
+      // hydrated) → drop the write; later ticks retry. A default slot that
+      // outlives its island is benign: chunk instances and their statics
+      // persist for the page life, and unmount stops the gl frame loop, so
+      // a stale setter writes inert statics, never the GPU (P7: per-island).
+      const slot = st.gls || defaultGlSlot;
+      if (!slot) return;
       let v = st.from + (st.to - st.from) * easeFn(phase);
       const fns = mods[name];
       if (fns) for (const f of fns) v = f(v);
-      animCallGlSetter(st.gls, st.gl, v);
+      animCallGlSetter(slot, st.gl, v);
       return;
     }
     if (st.kind === "morph") {
@@ -4012,7 +4022,12 @@
       verve_queue_microtask: (idx) => verveRuntime.verve_queue_microtask(translate(idx)),
       verve_anim_register_dyn: (idx) => translate(idx),
       verve_anim_register_mod: (idx) => translate(idx),
-      verve_anim_register_setter: (idx) => translate(idx),
+      verve_anim_register_setter: (idx) => {
+        const slot = translate(idx);
+        // last-registered gl setter is the page default for SSR gl tweens (P7: per-island)
+        defaultGlSlot = slot;
+        return slot;
+      },
       // Observer handler crosses as a chunk-private fn-table index —
       // copy the funcref into the main table (timers precedent).
       verve_obs_create: (flags, tol, sp, sl, idx) =>
