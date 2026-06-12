@@ -1,5 +1,7 @@
-//! Build-time fixture generator. Writes the procedural textured-cube GLB
-//! produced by gl.fixture.texturedCubeGlb to the path supplied as argv[1].
+//! Build-time fixture generator. Writes the procedural PBR-cube GLB
+//! produced by gl.fixture.pbrCubeGlb (no pre-baked tangents) to the path
+//! supplied as argv[1].  Omitting tangents exercises the build-side
+//! tangent-generation pass inside gl_asset_gen.
 //!
 //! Invoked by build.zig via addRunArtifact; the output LazyPath is fed as
 //! the input file argument to gl_asset_gen.
@@ -18,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
 
     const alloc = init.gpa;
 
-    const glb = try gl.fixture.texturedCubeGlb(alloc);
+    const glb = try gl.fixture.pbrCubeGlb(alloc, .{ .with_tangents = false });
     defer alloc.free(glb);
 
     const cwd = std.Io.Dir.cwd();
