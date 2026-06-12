@@ -334,6 +334,30 @@ fn writeProps(w: *std.Io.Writer, t: *const tween_mod.Tween, surface: Surface) an
     try w.writeAll(",\"p\":{");
     for (t.props.items, 0..) |p, i| {
         if (i != 0) try w.writeAll(",");
+        // GL-engine entries carry the reserved Zig-side name "@gl"; the
+        // serialized KEY is suffixed with the decimal target_id
+        // ("@gl:<id>") so two gl targets on one tween don't collide into a
+        // single JSON key (JSON.parse would keep only the last, silently
+        // dropping the first gl tween). The JS interpreter matches on the
+        // "@gl" prefix. The value object emits the gl keys FIRST
+        // ("gl":<target_id>,"gls":<setter_slot>) then to/f — gl == null
+        // entries stay byte-identical to the pre-gl wire format.
+        if (p.gl) |g| {
+            try w.print("\"@gl:{d}\":{{\"gl\":{d},\"gls\":{d}", .{ g.target_id, g.target_id, g.setter_slot });
+            var gl_first = false; // gl/gls already written, so to/f gets a comma
+            switch (t.kind) {
+                .to => {
+                    try writeValueField(w, "to", p.to, surface, &gl_first);
+                    if (p.from) |f| try writeValueField(w, "f", f, surface, &gl_first);
+                },
+                .from => {
+                    try writeValueField(w, "f", p.to, surface, &gl_first);
+                    if (p.from) |f| try writeValueField(w, "to", f, surface, &gl_first);
+                },
+            }
+            try w.writeAll("}");
+            continue;
+        }
         try writeJsonString(w, p.name);
         try w.writeAll(":{");
         var first = true;
@@ -1213,4 +1237,83 @@ test "selector with quotes serialized safely" {
     const t = tween_mod.to(a, "[data-name=\"a\"]").x(1);
     const json = try tweenToJson(a, t, .ssr);
     try testing.expect(std.mem.indexOf(u8, json, "[data-name=\\\"a\\\"]") != null);
+}
+
+// ---- gl-target wire format (gl/gls keys) ----------------------------------
+// The serialized KEY is "@gl:<target_id-decimal>" (the PropEntry name stays
+// "@gl" Zig-side); the value object emits gl keys FIRST then to/f. The JS
+// interpreter (next task) matches on the "@gl" prefix.
+
+test "golden: gl-target tween emits gl/gls/to" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 0x01000101 = 16777473 (1<<24 | 1<<8 | 1)
+    const t = tween_mod.to(a, null).glTarget(0x01000101, 7, 0.8);
+    const json = try tweenToJson(a, t, .island);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"d\":0.5,\"e\":\"outQuad\"," ++
+            "\"p\":{\"@gl:16777473\":{\"gl\":16777473,\"gls\":7,\"to\":0.8}}}",
+        json,
+    );
+}
+
+test "golden: gl-target-from emits f alongside to" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // glTargetFrom sets to=0 (placeholder), from=0.25 -> .to kind emits
+    // "to":0 then "f":0.25.
+    const t = tween_mod.to(a, null).glTargetFrom(3, 4, 0.25);
+    const json = try tweenToJson(a, t, .island);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"d\":0.5,\"e\":\"outQuad\"," ++
+            "\"p\":{\"@gl:3\":{\"gl\":3,\"gls\":4,\"to\":0,\"f\":0.25}}}",
+        json,
+    );
+    try testing.expect(std.mem.indexOf(u8, json, "\"f\":0.25") != null);
+}
+
+test "golden: two gl-targets get distinct @gl:<id> keys" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, null).glTarget(1, 0, 1.0).glTarget(2, 1, 2.0);
+    const json = try tweenToJson(a, t, .island);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"d\":0.5,\"e\":\"outQuad\"," ++
+            "\"p\":{\"@gl:1\":{\"gl\":1,\"gls\":0,\"to\":1}," ++
+            "\"@gl:2\":{\"gl\":2,\"gls\":1,\"to\":2}}}",
+        json,
+    );
+    // both keys present, neither dropped
+    try testing.expect(std.mem.indexOf(u8, json, "\"@gl:1\":") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"@gl:2\":") != null);
+}
+
+test "golden: gl props compose with normal props" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".card").opacity(0.5).glTarget(5, 2, 0.8);
+    const json = try tweenToJson(a, t, .island);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"t\":{\"s\":\".card\"},\"d\":0.5,\"e\":\"outQuad\"," ++
+            "\"p\":{\"opacity\":{\"to\":0.5},\"@gl:5\":{\"gl\":5,\"gls\":2,\"to\":0.8}}}",
+        json,
+    );
+}
+
+test "frozen: non-gl tween serializes byte-identically (regression guard)" {
+    // Belt-and-braces copy of "golden: minimal to-tween" — proves the gl
+    // additive path left the gl == null wire format untouched.
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".box").x(120);
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"t\":{\"s\":\".box\"},\"d\":0.5,\"e\":\"outQuad\",\"p\":{\"x\":{\"to\":120}}}",
+        json,
+    );
 }

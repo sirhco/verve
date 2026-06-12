@@ -20,7 +20,9 @@ pub const GlTarget = struct {
 
 pub const PropEntry = struct {
     /// Wire prop name: "x", "opacity", "background-color", "attr:cx", ...
-    /// GL entries always use the reserved name "@gl".
+    /// GL entries always use the reserved Zig-side name "@gl"; the
+    /// SERIALIZED key gains a "@gl:<target_id>" suffix (see serialize.zig
+    /// writeProps) so multiple gl targets on one tween don't collide.
     name: []const u8,
     /// Primary value (the start value when `kind == .from`).
     to: types.Value,
