@@ -16,6 +16,7 @@ pub const orbit = @import("orbit.zig");
 pub const ray = @import("ray.zig");
 pub const bvh = @import("bvh.zig");
 pub const registry = @import("registry.zig");
+pub const anim_target = @import("anim_target.zig");
 // Native-side asset pipeline (std.json / decoder allocations). Island
 // chunks must not reference these — Zig's lazy analysis makes the bare
 // import free; only actual references would pull them into wasm.
@@ -44,6 +45,7 @@ test {
     _ = ray;
     _ = bvh;
     _ = registry;
+    _ = anim_target;
     _ = png;
     _ = gltf;
     _ = hdr;
