@@ -140,6 +140,51 @@ pub const Mat4 = struct {
     }
 };
 
+/// Inverse-transpose of the upper 3×3 of `m`, column-major [9]f32
+/// (col*3+row). Shipped per-draw to PBR shaders as 9 f32.
+/// Asserts non-singular (|det| > 1e-12) in debug builds.
+pub fn normalMatrix(m: Mat4) [9]f32 {
+    // Extract upper 3×3 in row,col notation (column-major storage: m[col*4+row]).
+    const a00 = m.m[0]; // [row0,col0]
+    const a10 = m.m[1]; // [row1,col0]
+    const a20 = m.m[2]; // [row2,col0]
+    const a01 = m.m[4]; // [row0,col1]
+    const a11 = m.m[5]; // [row1,col1]
+    const a21 = m.m[6]; // [row2,col1]
+    const a02 = m.m[8]; // [row0,col2]
+    const a12 = m.m[9]; // [row1,col2]
+    const a22 = m.m[10]; // [row2,col2]
+
+    // Cofactors C[i,j] = (-1)^(i+j) * det(minor removing row i, col j).
+    const c00 = a11 * a22 - a21 * a12;
+    const c10 = -(a01 * a22 - a21 * a02);
+    const c20 = a01 * a12 - a11 * a02;
+    const c01 = -(a10 * a22 - a20 * a12);
+    const c11 = a00 * a22 - a20 * a02;
+    const c21 = -(a00 * a12 - a10 * a02);
+    const c02 = a10 * a21 - a20 * a11;
+    const c12 = -(a00 * a21 - a20 * a01);
+    const c22 = a00 * a11 - a10 * a01;
+
+    // det = first row dotted with its cofactors.
+    const det = a00 * c00 + a01 * c01 + a02 * c02;
+    std.debug.assert(@abs(det) > 1e-12); // non-singular guard
+
+    const inv_det = 1.0 / det;
+
+    // normalMatrix = A^{-T} = (adj/det)^T = cofactor/det.
+    // (adj = cofactor^T, so adj^T = cofactor.)
+    // Output column-major [col*3+row] = C[row,col]/det:
+    //   col0: C[0,0],C[1,0],C[2,0] = c00,c10,c20
+    //   col1: C[0,1],C[1,1],C[2,1] = c01,c11,c21
+    //   col2: C[0,2],C[1,2],C[2,2] = c02,c12,c22
+    return .{
+        c00 * inv_det, c10 * inv_det, c20 * inv_det, // col 0
+        c01 * inv_det, c11 * inv_det, c21 * inv_det, // col 1
+        c02 * inv_det, c12 * inv_det, c22 * inv_det, // col 2
+    };
+}
+
 const testing = std.testing;
 const eps = 1e-5;
 
@@ -240,4 +285,64 @@ test "fromTrs: +90deg about Y, all three basis columns" {
     try testing.expectApproxEqAbs(@as(f32, 1), m.m[8], eps);
     try testing.expectApproxEqAbs(@as(f32, 0), m.m[9], eps);
     try testing.expectApproxEqAbs(@as(f32, 0), m.m[10], eps);
+}
+
+test "normalMatrix: pure rotation preserves upper 3x3" {
+    // For an orthogonal matrix R, (R^{-T}) == R, so normalMatrix == upper 3x3.
+    const q = Quat.fromAxisAngle(Vec3.init(0, 1, 0), std.math.pi / 2.0);
+    const m = Mat4.fromTrs(Vec3.init(0, 0, 0), q, Vec3.init(1, 1, 1));
+    const n = normalMatrix(m);
+    // upper 3x3 in col-major [col*3+row]; compare to m[col*4+row]
+    var col: usize = 0;
+    while (col < 3) : (col += 1) {
+        var row: usize = 0;
+        while (row < 3) : (row += 1) {
+            try testing.expectApproxEqAbs(m.m[col * 4 + row], n[col * 3 + row], eps);
+        }
+    }
+}
+
+test "normalMatrix: non-uniform scale diag(2,1,0.5) inverts scales" {
+    // M = diag(2,1,0.5) → upper 3x3 A = diag(2,1,0.5)
+    // A^{-T} = diag(1/2, 1, 2) = diag(0.5, 1, 2)
+    const m = Mat4.fromTrs(Vec3.init(0, 0, 0), Quat.identity, Vec3.init(2, 1, 0.5));
+    const n = normalMatrix(m);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), n[0], eps); // col0 row0
+    try testing.expectApproxEqAbs(@as(f32, 0), n[1], eps); // col0 row1
+    try testing.expectApproxEqAbs(@as(f32, 0), n[2], eps); // col0 row2
+    try testing.expectApproxEqAbs(@as(f32, 0), n[3], eps); // col1 row0
+    try testing.expectApproxEqAbs(@as(f32, 1), n[4], eps); // col1 row1
+    try testing.expectApproxEqAbs(@as(f32, 0), n[5], eps); // col1 row2
+    try testing.expectApproxEqAbs(@as(f32, 0), n[6], eps); // col2 row0
+    try testing.expectApproxEqAbs(@as(f32, 0), n[7], eps); // col2 row1
+    try testing.expectApproxEqAbs(@as(f32, 2), n[8], eps); // col2 row2
+}
+
+test "golden: normalMatrix rotation×non-uniform-scale" {
+    // M = R(+90°Y) × S(2,1,0.5). Upper 3×3 A in A[row,col] notation:
+    //   A[0,0]=0   A[0,1]=0    A[0,2]=0.5
+    //   A[1,0]=0   A[1,1]=1    A[1,2]=0
+    //   A[2,0]=-2  A[2,1]=0   A[2,2]=0
+    // det(A) via first row: 0 + 0 + 0.5*(0*0 - 1*(-2)) = 0.5*2 = 1
+    // Cofactors C[i,j] = (-1)^(i+j) * minor(row i, col j):
+    //   C[0,0]=+(1*0-0*0)=0    C[0,1]=-(0*0-0*(-2))=0    C[0,2]=+(0*0-1*(-2))=2
+    //   C[1,0]=-(0*0-0*0.5)=0  C[1,1]=+(0*0-(-2)*0.5)=1  C[1,2]=-(0*0-(-2)*0)=0
+    //   C[2,0]=+(0*0-0.5*1)=-0.5 C[2,1]=-(0*0-0.5*0)=0   C[2,2]=+(0*1-0*0)=0
+    // normalMatrix = A^{-T} = cofactor / det, col-major [col*3+row] = C[row,col]/det:
+    //   col0: C[0,0]=0   C[1,0]=0    C[2,0]=-0.5  → n[0,1,2]
+    //   col1: C[0,1]=0   C[1,1]=1    C[2,1]=0     → n[3,4,5]
+    //   col2: C[0,2]=2   C[1,2]=0    C[2,2]=0     → n[6,7,8]
+    const eps4 = 1e-4;
+    const q = Quat.fromAxisAngle(Vec3.init(0, 1, 0), std.math.pi / 2.0);
+    const m = Mat4.fromTrs(Vec3.init(0, 0, 0), q, Vec3.init(2, 1, 0.5));
+    const n = normalMatrix(m);
+    try testing.expectApproxEqAbs(@as(f32, 0), n[0], eps4);
+    try testing.expectApproxEqAbs(@as(f32, 0), n[1], eps4);
+    try testing.expectApproxEqAbs(@as(f32, -0.5), n[2], eps4);
+    try testing.expectApproxEqAbs(@as(f32, 0), n[3], eps4);
+    try testing.expectApproxEqAbs(@as(f32, 1), n[4], eps4);
+    try testing.expectApproxEqAbs(@as(f32, 0), n[5], eps4);
+    try testing.expectApproxEqAbs(@as(f32, 2), n[6], eps4);
+    try testing.expectApproxEqAbs(@as(f32, 0), n[7], eps4);
+    try testing.expectApproxEqAbs(@as(f32, 0), n[8], eps4);
 }
