@@ -102,6 +102,10 @@ pub const GlDemo = struct {
 /// `core/gl_scene.zig`'s `Props`, decoded field-by-field by the chunk. The
 /// design's `light_dir: [3]f32` is flattened to three scalars because the
 /// SSR↔hydration codec (serialize.zig) has no fixed-array tag.
+///
+/// WARNING: the codec is positional (field order, not names) — any change
+/// here MUST be applied identically to `core/gl_scene.zig`'s `Props`, or
+/// hydration silently decodes garbage.
 pub const GlScene = struct {
     pub const props_schema: []const u8 = "{\"src\":\"string\",\"env\":\"string\",\"orbit_distance\":\"f32\",\"orbit_pitch\":\"f32\",\"orbit_yaw\":\"f32\",\"auto_rotate\":\"f32\",\"light_dir_x\":\"f32\",\"light_dir_y\":\"f32\",\"light_dir_z\":\"f32\",\"light_intensity\":\"f32\",\"pick_names\":\"string[]\",\"pick_event_ids\":\"u32[]\"}";
 

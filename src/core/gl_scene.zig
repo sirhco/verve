@@ -152,7 +152,9 @@ pub const GlSceneBuilder = struct {
 /// so the encoded direction is always usable by the chunk.
 fn normalize3(v: [3]f32) [3]f32 {
     const len = @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-    if (len == 0) return .{ -0.4, -0.7, -0.6 };
+    // Fallback = default light dir (-0.4,-0.7,-0.6)/√1.01, pre-normalized so
+    // the zero-vector path also yields a unit direction.
+    if (len == 0) return .{ -0.39801488, -0.69652603, -0.59702231 };
     return .{ v[0] / len, v[1] / len, v[2] / len };
 }
 
