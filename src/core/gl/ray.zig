@@ -66,6 +66,21 @@ pub fn rayFromCamera(
 }
 
 // ---------------------------------------------------------------------------
+// Ray transform
+// ---------------------------------------------------------------------------
+
+/// Transform a ray by `m` (origin as a point, direction as a vector).
+/// The direction is NOT renormalized — valid for rigid transforms
+/// (rotation + translation, scale 1), where parameter t remains
+/// comparable across differently-transformed rays.
+pub fn transformRay(r: Ray, m: math.Mat4) Ray {
+    return .{
+        .origin = math.transformPoint(m, r.origin),
+        .dir = math.transformDir(m, r.dir),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Möller–Trumbore triangle intersection
 // ---------------------------------------------------------------------------
 
@@ -234,6 +249,100 @@ test "intersectTriangle ray pointing away → null" {
     const v1 = math.Vec3.init(1, -1, 0);
     const v2 = math.Vec3.init(0, 1, 0);
     try testing.expect(intersectTriangle(ray, v0, v1, v2) == null);
+}
+
+test "transformRay identity → ray unchanged" {
+    const r = Ray{
+        .origin = math.Vec3.init(1, 2, 3),
+        .dir = math.Vec3.init(0, 0, -1),
+    };
+    const out = transformRay(r, math.Mat4.identity);
+    try testing.expectApproxEqAbs(@as(f32, 1), out.origin.x, eps6);
+    try testing.expectApproxEqAbs(@as(f32, 2), out.origin.y, eps6);
+    try testing.expectApproxEqAbs(@as(f32, 3), out.origin.z, eps6);
+    try testing.expectApproxEqAbs(@as(f32, 0), out.dir.x, eps6);
+    try testing.expectApproxEqAbs(@as(f32, 0), out.dir.y, eps6);
+    try testing.expectApproxEqAbs(@as(f32, -1), out.dir.z, eps6);
+}
+
+test "transformRay rotated-geometry parity (rotation)" {
+    // Bind-pose triangle in the XY plane (z = 0) around the origin.
+    const v0 = math.Vec3.init(-1, -1, 0);
+    const v1 = math.Vec3.init(1, -1, 0);
+    const v2 = math.Vec3.init(0, 1, 0);
+
+    // World = +90° rotation about Y. Rotated triangle lies in the ZY plane
+    // (plane x = 0): (x,y,z) → (z, y, −x).
+    const w = math.Mat4.fromTrs(
+        math.Vec3.init(0, 0, 0),
+        math.Quat.fromAxisAngle(math.Vec3.init(0, 1, 0), std.math.pi / 2.0),
+        math.Vec3.init(1, 1, 1),
+    );
+
+    // World-space ray aimed at the ROTATED triangle: from (5,0,0) along −X.
+    const r = Ray{
+        .origin = math.Vec3.init(5, 0, 0),
+        .dir = math.Vec3.init(-1, 0, 0),
+    };
+
+    // The raw ray travels in the z=0 plane — parallel to the BIND-POSE
+    // triangle's plane — so direct intersection MISSES.
+    try testing.expect(intersectTriangle(r, v0, v1, v2) == null);
+
+    // Inverse-transform the ray into bind space and hit the bind triangle.
+    const local = transformRay(r, math.invert(w));
+    const t_local = intersectTriangle(local, v0, v1, v2);
+    try testing.expect(t_local != null);
+
+    // Cross-check: rotate the verts into world space and hit with the raw ray.
+    const t_world = intersectTriangle(
+        r,
+        math.transformPoint(w, v0),
+        math.transformPoint(w, v1),
+        math.transformPoint(w, v2),
+    );
+    try testing.expect(t_world != null);
+
+    // Rigid transform → t is comparable across spaces; both must agree.
+    try testing.expectApproxEqAbs(t_world.?, t_local.?, 1e-4);
+    // Rotated triangle lies in plane x = 0; ray starts at x = 5 with dir −X,
+    // so t = 5.0 exactly.
+    try testing.expectApproxEqAbs(@as(f32, 5.0), t_local.?, 1e-4);
+}
+
+test "transformRay rotated-geometry parity (translation)" {
+    const v0 = math.Vec3.init(-1, -1, 0);
+    const v1 = math.Vec3.init(1, -1, 0);
+    const v2 = math.Vec3.init(0, 1, 0);
+
+    // World = pure translation (3, 0, 0).
+    const w = math.Mat4.fromTrs(
+        math.Vec3.init(3, 0, 0),
+        math.Quat.identity,
+        math.Vec3.init(1, 1, 1),
+    );
+
+    // World-space ray over the translated triangle's centre, looking down −Z.
+    const r = Ray{
+        .origin = math.Vec3.init(3, 0, 5),
+        .dir = math.Vec3.init(0, 0, -1),
+    };
+
+    // Direct hit on the translated triangle.
+    const t_world = intersectTriangle(
+        r,
+        math.transformPoint(w, v0),
+        math.transformPoint(w, v1),
+        math.transformPoint(w, v2),
+    );
+    try testing.expect(t_world != null);
+
+    // Inverse-transformed ray against the bind-pose triangle: same t.
+    const local = transformRay(r, math.invert(w));
+    const t_local = intersectTriangle(local, v0, v1, v2);
+    try testing.expect(t_local != null);
+    try testing.expectApproxEqAbs(t_world.?, t_local.?, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 5.0), t_local.?, 1e-4);
 }
 
 test "intersectTriangle edge graze through vertex" {

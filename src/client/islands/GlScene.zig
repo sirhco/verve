@@ -22,9 +22,13 @@
 //!    returns, same reason as the `mats` pool). setRotation is only called
 //!    when a value actually changed (applied-mirrors) so updateWorld's
 //!    clean-subtree no-op stays effective. The CAMERA also orbits; mvp =
-//!    proj · view · world. Pick ray is still transformed into model space by
-//!    rotating origin+direction by -model_yaw about Y (root rotation only —
-//!    per-node rotation picking lands in Task 7).
+//!    proj · view · world. Pick/hover (Task 7) raycasts via inverse node
+//!    transforms, three paths: (1) fast — no rotation anywhere, one walk with
+//!    the raw ray; (2) root-only — model_yaw set but all node_rot zero, one
+//!    walk with the ray moved by invert(world[0]); (3) slow — any per-node
+//!    rotation, per-submesh walk with invert(world[s+1]), keeping hits owned
+//!    by that submesh, global nearest t wins. All transforms are rigid
+//!    (scale ≡ 1) so t stays comparable across spaces.
 //!  • autoRotate BYPASSES the orbit damping: `orbit.yaw += auto_rotate*dt_s`
 //!    applied before tick(), giving a constant angular rate (rad/s) rather than
 //!    an impulse that decays. User drag impulses still flow through tick().
@@ -474,37 +478,71 @@ export fn glscene_frame_restore() void {
 
 // ── pick raycast ──────────────────────────────────────────────────────────────
 
-/// Rotate a Vec3 about the Y axis by `angle` radians (right-hand, column-major).
-/// x' = x·cos - z·sin,  y' = y,  z' = x·sin + z·cos
-fn rotateYVec3(v: gl.math.Vec3, angle: f32) gl.math.Vec3 {
-    const c = @cos(angle);
-    const s = @sin(angle);
-    return gl.math.Vec3.init(v.x * c - v.z * s, v.y, v.x * s + v.z * c);
+/// True when every per-submesh node Euler rotation is zero — the common
+/// no-anim case that unlocks the cheap single-walk raycast paths.
+fn nodeRotIdentity() bool {
+    for (node_rot) |r| {
+        if (r[0] != 0 or r[1] != 0 or r[2] != 0) return false;
+    }
+    return true;
 }
 
 /// Build a pick ray for `(ndc_x, ndc_y)` and walk the mesh BVH. Returns the
 /// picked submesh index, or null on miss / no BVH data.
 ///
-/// When model_yaw != 0 the model matrix is rotateY(model_yaw), so world space
-/// and model space differ. Transform the ray into model space by applying the
-/// inverse rotation (rotateY(-model_yaw)) to both the ray origin and direction.
-/// The model rotates about the world origin, so the origin IS already relative
-/// to the rotation pivot — no extra translation needed.
+/// The walk always intersects MESH-LOCAL geometry (vmesh positions); only the
+/// ray moves between spaces, via inverse node world matrices. glscene_frame
+/// runs scene.updateWorld() BEFORE pick/hover processing, so scene.world[] is
+/// this frame's. Three paths:
+///   1. Fast — no rotation anywhere: one walk with the raw world-space ray.
+///   2. Root-only — model_yaw != 0, all node_rot zero: one walk with the ray
+///      moved into model space by invert(world[0]).
+///   3. Slow — any node_rot nonzero: per submesh s, move the ray into node
+///      s+1's space, walk, keep hits owned by submesh s, global nearest t.
+/// t comparability: every ray derives from the same world-space ray under
+/// rigid transforms (scale ≡ 1 in GlScene) with no renormalization, so
+/// nearest-t comparison across submeshes is valid.
+/// Cost: ≤ (max_submesh+1) inversions per raycast, raycasts ≤ 1/frame.
 fn raycastSubmesh(a: *const gl.vmesh.Reader, aspect: f32, ndc_x: f32, ndc_y: f32) ?u32 {
     if (a.bvh_node_count == 0) return null;
-    var r = gl.ray.rayFromCamera(orbit.eye(), orbit.target, up_vec, fov_y, aspect, ndc_x, ndc_y);
-    // Transform ray into model space (inverse Y-rotation = negate angle).
-    if (model_yaw != 0) {
-        r.origin = rotateYVec3(r.origin, -model_yaw);
-        r.dir = rotateYVec3(r.dir, -model_yaw);
-    }
+    const r = gl.ray.rayFromCamera(orbit.eye(), orbit.target, up_vec, fov_y, aspect, ndc_x, ndc_y);
     const nodes = gl.bvh.nodesFromBytes(a.bvh_nodes);
     const tri_perm = gl.bvh.triPermFromBytes(a.tri_perm);
     // Vertices: vmesh stride 48 bytes = 12 f32; position xyz at offset 0.
     const verts_f32 = bytesAsF32(a.vertices);
     const indices_u16 = bytesAsU16(a.indices);
-    const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, 12, indices_u16, r) orelse return null;
-    return submeshOfTri(a, hit.tri_index);
+
+    const rot_identity = nodeRotIdentity();
+    // Guard: scene_built is invariant-true whenever `asset` != null (buildScene
+    // runs in the same callback that sets it), but keep the world[] reads safe —
+    // an unbuilt scene degrades to the untransformed fast path.
+    if (!scene_built or (model_yaw == 0 and rot_identity)) {
+        const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, 12, indices_u16, r) orelse return null;
+        return submeshOfTri(a, hit.tri_index);
+    }
+    if (rot_identity) {
+        // Root-only: one walk with the ray in model (root) space.
+        const tr = gl.ray.transformRay(r, gl.math.invert(scene.world[0]));
+        const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, 12, indices_u16, tr) orelse return null;
+        return submeshOfTri(a, hit.tri_index);
+    }
+    // Slow path: per-submesh inverse transform; the walk covers the WHOLE mesh
+    // so only hits owned by submesh s are valid in node s+1's space.
+    var best_t: f32 = std.math.inf(f32);
+    var best_s: ?u32 = null;
+    const n: u32 = @min(a.submesh_count, max_submesh);
+    var s: u32 = 0;
+    while (s < n) : (s += 1) {
+        const tr = gl.ray.transformRay(r, gl.math.invert(scene.world[s + 1]));
+        const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, 12, indices_u16, tr) orelse continue;
+        const owner = submeshOfTri(a, hit.tri_index) orelse continue;
+        if (owner != s) continue;
+        if (hit.t < best_t) {
+            best_t = hit.t;
+            best_s = s;
+        }
+    }
+    return best_s;
 }
 
 fn bytesAsF32(b: []const u8) []const f32 {
