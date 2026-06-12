@@ -409,6 +409,7 @@ pub fn walk(
 /// number of nodes and be 16-aligned (vmesh BVH section alignment guarantees
 /// `Node`'s 4-byte requirement). Trailing bytes < node_size are ignored.
 pub fn nodesFromBytes(bytes: []const u8) []const Node {
+    std.debug.assert(@intFromPtr(bytes.ptr) % 4 == 0);
     const n = bytes.len / node_size;
     const ptr: [*]const Node = @ptrCast(@alignCast(bytes.ptr));
     return ptr[0..n];
@@ -417,6 +418,7 @@ pub fn nodesFromBytes(bytes: []const u8) []const Node {
 /// Reinterpret a byte slice as a `u32` tri_perm view. Slice must be 4-aligned
 /// (guaranteed by the 16-aligned vmesh section). Trailing bytes < 4 ignored.
 pub fn triPermFromBytes(bytes: []const u8) []const u32 {
+    std.debug.assert(@intFromPtr(bytes.ptr) % 4 == 0);
     const n = bytes.len / 4;
     const ptr: [*]const u32 = @ptrCast(@alignCast(bytes.ptr));
     return ptr[0..n];
