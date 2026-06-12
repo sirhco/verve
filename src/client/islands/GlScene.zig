@@ -716,11 +716,15 @@ fn applyAnimTarget(id: u32, value: f32) void {
             switch (@as(gl.anim_target.MaterialField, @enumFromInt(d.field))) {
                 .metallic => mats[s][4] = value,
                 .roughness => mats[s][5] = value,
+                // emissive fields — full GlScene support added in P6 Task 6.
+                .emissive_r, .emissive_g, .emissive_b => {},
             }
         },
         .model => switch (@as(gl.anim_target.ModelField, @enumFromInt(d.field))) {
             .yaw => model_yaw = value,
         },
+        // node rotation — full GlScene support added in P6 Task 6.
+        .node => {},
     }
 }
 
