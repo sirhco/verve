@@ -343,8 +343,15 @@ fn writeProps(w: *std.Io.Writer, t: *const tween_mod.Tween, surface: Surface) an
         // ("gl":<target_id>,"gls":<setter_slot>) then to/f — gl == null
         // entries stay byte-identical to the pre-gl wire format.
         if (p.gl) |g| {
-            try w.print("\"@gl:{d}\":{{\"gl\":{d},\"gls\":{d}", .{ g.target_id, g.target_id, g.setter_slot });
-            var gl_first = false; // gl/gls already written, so to/f gets a comma
+            // setter_slot == 0 means "page-default setter" (P6: resolved by
+            // the JS bridge at hydration time). Omit "gls" for slot-0 so SSR
+            // tweens stay compact; non-zero island slots emit it as before.
+            if (g.setter_slot != 0) {
+                try w.print("\"@gl:{d}\":{{\"gl\":{d},\"gls\":{d}", .{ g.target_id, g.target_id, g.setter_slot });
+            } else {
+                try w.print("\"@gl:{d}\":{{\"gl\":{d}", .{ g.target_id, g.target_id });
+            }
+            var gl_first = false; // gl(/gls) already written, so to/f gets a comma
             switch (t.kind) {
                 .to => {
                     try writeValueField(w, "to", p.to, surface, &gl_first);
@@ -1297,7 +1304,7 @@ test "golden: two gl-targets get distinct @gl:<id> keys" {
     const json = try tweenToJson(a, t, .island);
     try testing.expectEqualStrings(
         "{\"v\":1,\"d\":0.5,\"e\":\"outQuad\"," ++
-            "\"p\":{\"@gl:1\":{\"gl\":1,\"gls\":0,\"to\":1}," ++
+            "\"p\":{\"@gl:1\":{\"gl\":1,\"to\":1}," ++
             "\"@gl:2\":{\"gl\":2,\"gls\":1,\"to\":2}}}",
         json,
     );
@@ -1331,4 +1338,40 @@ test "frozen: non-gl tween serializes byte-identically (regression guard)" {
         "{\"v\":1,\"t\":{\"s\":\".box\"},\"d\":0.5,\"e\":\"outQuad\",\"p\":{\"x\":{\"to\":120}}}",
         json,
     );
+}
+
+// P6: setter_slot == 0 means "page-default setter" (resolved by the JS bridge
+// at write time). The wire format omits "gls" entirely for slot-0 so SSR-side
+// gl tweens remain compact and the bridge knows to fill in the slot at
+// hydration. Island chunks pass their registered non-zero slot; SSR passes 0.
+
+test "golden: gl-target slot-0 omits gls key" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // setter_slot = 0 → page-default; "gls" must NOT appear in output
+    const t = tween_mod.to(a, null).glTarget(42, 0, 1.5);
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"d\":0.5,\"e\":\"outQuad\"," ++
+            "\"p\":{\"@gl:42\":{\"gl\":42,\"to\":1.5}}}",
+        json,
+    );
+    try testing.expect(std.mem.indexOf(u8, json, "\"gls\"") == null);
+}
+
+test "golden: gl-target-range slot-0 omits gls key but keeps f" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // setter_slot = 0, range tween → "gls" absent, "to" and "f" both present
+    const t = tween_mod.to(a, null).glTargetRange(7, 0, 0.1, 0.9);
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"d\":0.5,\"e\":\"outQuad\"," ++
+            "\"p\":{\"@gl:7\":{\"gl\":7,\"to\":0.9,\"f\":0.1}}}",
+        json,
+    );
+    try testing.expect(std.mem.indexOf(u8, json, "\"gls\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"f\":0.1") != null);
 }

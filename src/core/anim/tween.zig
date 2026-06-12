@@ -320,6 +320,8 @@ pub const Tween = struct {
     /// the JS engine calls the setter per frame instead of writing DOM.
     /// Multiple glTarget calls on one tween are allowed — they are appended
     /// as separate "@gl" entries distinguished by target_id.
+    /// `setter_slot` 0 = page-default setter resolved by the bridge at write
+    /// time (island chunks should pass their registered slot; SSR passes 0).
     pub fn glTarget(self: *Tween, target_id: u32, setter_slot: u32, to_val: f64) *Tween {
         if (self.err != null) return self;
         const entry: PropEntry = .{
@@ -342,6 +344,8 @@ pub const Tween = struct {
 
     /// Explicit start value for a GL engine target (per-prop fromTo).
     /// Appends a new "@gl" entry with the `from` field set.
+    /// `setter_slot` 0 = page-default setter resolved by the bridge at write
+    /// time (island chunks should pass their registered slot; SSR passes 0).
     pub fn glTargetFrom(self: *Tween, target_id: u32, setter_slot: u32, from_val: f64) *Tween {
         if (self.err != null) return self;
         const entry: PropEntry = .{
@@ -368,6 +372,8 @@ pub const Tween = struct {
     /// append two separate entries that interpolate independently). Use this
     /// for true range interpolation — e.g. a turntable yaw 0→2π or a
     /// roughness ramp 0.045→1.0. Island-only; see `glTarget`.
+    /// `setter_slot` 0 = page-default setter resolved by the bridge at write
+    /// time (island chunks should pass their registered slot; SSR passes 0).
     pub fn glTargetRange(self: *Tween, target_id: u32, setter_slot: u32, from_val: f64, to_val: f64) *Tween {
         if (self.err != null) return self;
         const entry: PropEntry = .{
