@@ -1,4 +1,10 @@
 //! .vmesh packed asset format v3 — writer + freestanding reader.
+//!
+//! Invariant: the byte buffer handed to `Reader.init` must itself be at least
+//! 4-byte aligned (the asset region provides 16) — section offsets only
+//! preserve alignment relative to the buffer base, and
+//! `bvh.nodesFromBytes`/`triPermFromBytes` assert on the absolute pointer.
+//!
 //! Header layout (56 bytes, all integers little-endian u32):
 //!   [0..4]   magic "VMSH"
 //!   [4..8]   version u32 = 3
