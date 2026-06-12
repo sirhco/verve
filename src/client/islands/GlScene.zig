@@ -13,11 +13,18 @@
 //! would need namespacing.
 //!
 //! ── DESIGN CHOICES (see Task 12 spec) ───────────────────────────────────────
-//!  • Model matrix = rotateY(model_yaw); the CAMERA also orbits. mvp = proj ·
-//!    view · model. normal9 = upper-3x3 of model (pure rotation = orthonormal,
-//!    so normalMatrix(model) == upper-3x3). Pick ray is transformed into model
-//!    space by rotating both origin and direction by -model_yaw about Y (inverse
-//!    of a pure Y-rotation is rotation by the negated angle — cheap, exact).
+//!  • Scene graph (P6): node 0 = root "model", carrying model_yaw as a +Y
+//!    rotation; node s+1 = submesh s (named from the vmesh), animatable via
+//!    node:<Name>.rotationX/Y/Z — Euler radians composed Qz·Qy·Qx (X applied
+//!    first). Each draw reads its own world matrix: the per-submesh mvps/
+//!    model_mats/normal9s pools keep every drawPbr pointer at a stable
+//!    distinct slot (stream aliasing — JS walks the stream AFTER the frame fn
+//!    returns, same reason as the `mats` pool). setRotation is only called
+//!    when a value actually changed (applied-mirrors) so updateWorld's
+//!    clean-subtree no-op stays effective. The CAMERA also orbits; mvp =
+//!    proj · view · world. Pick ray is still transformed into model space by
+//!    rotating origin+direction by -model_yaw about Y (root rotation only —
+//!    per-node rotation picking lands in Task 7).
 //!  • autoRotate BYPASSES the orbit damping: `orbit.yaw += auto_rotate*dt_s`
 //!    applied before tick(), giving a constant angular rate (rad/s) rather than
 //!    an impulse that decays. User drag impulses still flow through tick().
@@ -153,13 +160,28 @@ var env_reader: ?gl.venv.Reader = null;
 
 // ── Render statics ───────────────────────────────────────────────────────────
 
-var mvp: [16]f32 = undefined;
-var model_mat: [16]f32 = identity4; // identity — camera orbits, model static
-var normal9: [9]f32 = identity3;
 var camera_pos: [3]f32 = .{ 0, 0, 4 }; // updated each frame to orbit.eye()
 
-const identity4: [16]f32 = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
-const identity3: [9]f32 = .{ 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+// ── Scene graph (P6) ─────────────────────────────────────────────────────────
+// Node 0 = root "model" (model_yaw about +Y); node s+1 = submesh s, named with
+// the submesh's vmesh name. Layout frozen — Tasks 7/8 rely on it.
+var scene: gl.Scene(max_submesh + 1) = .{};
+var scene_built: bool = false;
+
+// Per-submesh node Euler rotations (X,Y,Z radians; X applied first), written
+// by the anim setter, composed into quats per frame. The *_applied mirrors let
+// the frame skip setRotation when nothing changed — setRotation always marks
+// dirty, which would defeat updateWorld's clean-subtree optimization.
+var node_rot: [max_submesh][3]f32 = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
+var node_rot_applied: [max_submesh][3]f32 = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
+var model_yaw_applied: f32 = 0;
+
+// Per-submesh draw pools — like `mats`, each drawPbr must point at a STABLE
+// distinct slot because the JS interpreter dereferences the pointers when it
+// walks the stream AFTER the frame fn returns (stream aliasing).
+var mvps: [max_submesh][16]f32 = undefined;
+var model_mats: [max_submesh][16]f32 = undefined;
+var normal9s: [max_submesh][9]f32 = undefined;
 
 // Per-submesh material block pool (12 f32 each) — each drawPbr points at its own
 // stable slot so the JS interpreter reads the right material when walking the
@@ -193,6 +215,15 @@ var cmd_buf: [4096]u8 = undefined;
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 const up_vec = gl.math.Vec3.init(0, 1, 0);
+
+/// Compose per-node Euler radians (X,Y,Z) into a quaternion, applying X first:
+/// q = Qz · Qy · Qx (quat mul applies the right-hand factor first).
+fn nodeQuat(r: [3]f32) gl.math.Quat {
+    const qx = gl.math.Quat.fromAxisAngle(gl.math.Vec3.init(1, 0, 0), r[0]);
+    const qy = gl.math.Quat.fromAxisAngle(gl.math.Vec3.init(0, 1, 0), r[1]);
+    const qz = gl.math.Quat.fromAxisAngle(gl.math.Vec3.init(0, 0, 1), r[2]);
+    return gl.math.Quat.mul(gl.math.Quat.mul(qz, qy), qx);
+}
 
 /// vmesh texture index → wire handle (slot t gets handle t+1). Negatives clamp
 /// to handle 0 (never created) instead of trapping (parity with GlDemo).
@@ -263,8 +294,11 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     input = .{};
     pick_count = 0;
     model_yaw = 0;
-    model_mat = identity4;
-    normal9 = identity3;
+    model_yaw_applied = 0;
+    scene_built = false;
+    scene = .{};
+    node_rot = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
+    node_rot_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
     anim_setter_slot = 0;
     canvas_handle = null;
     scrub_built = false;
@@ -341,8 +375,25 @@ export fn glscene_vmesh_ready(ptr: u32, len: u32) void {
     if (ptr == 0) return; // fetch failed → stay on clear-only frames
     const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
     asset = gl.vmesh.Reader.init(bytes) catch null;
+    if (asset) |*a| buildScene(a);
     // With the Reader resolvable, build the scroll-scrubbed timeline once.
     if (scrub_enabled and !scrub_built) buildScrubTimeline();
+}
+
+/// (Re)build the scene graph for a freshly-read vmesh: root "model" at node 0,
+/// one child per submesh at node s+1 (named from the vmesh; capped at
+/// max_submesh). The applied-mirrors are reset to match the fresh scene's
+/// identity rotations; any pre-asset anim writes (nonzero model_yaw/node_rot)
+/// then differ from their mirror and get applied on the next frame.
+fn buildScene(a: *const gl.vmesh.Reader) void {
+    scene = .{};
+    _ = scene.addNode(-1, "model");
+    const n: u32 = @min(a.submesh_count, max_submesh);
+    var s: u32 = 0;
+    while (s < n) : (s += 1) _ = scene.addNode(0, a.name(s));
+    model_yaw_applied = 0;
+    node_rot_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
+    scene_built = true;
 }
 
 export fn glscene_env_ready(ptr: u32, len: u32) void {
@@ -469,16 +520,29 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
     const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(@max(height, 1)));
     const proj = gl.math.Mat4.perspective(fov_y, aspect, 0.1, 100.0);
-    // Build model matrix from model_yaw (pure Y-rotation; scale/translate = identity).
-    const model_q = gl.math.Quat.fromAxisAngle(up_vec, model_yaw);
-    const world = gl.math.Mat4.fromTrs(gl.math.Vec3.init(0, 0, 0), model_q, gl.math.Vec3.init(1, 1, 1));
-    model_mat = world.m;
-    // For a pure rotation, normalMatrix == upper-3x3 (orthonormal: R^{-T} = R).
-    normal9 = gl.math.normalMatrix(world);
-    // mvp = proj · view · model.
-    mvp = proj.mul(orbit.viewMatrix(up_vec)).mul(world).m;
+    const view = orbit.viewMatrix(up_vec);
     const eye = orbit.eye();
     camera_pos = .{ eye.x, eye.y, eye.z };
+
+    // Sync animated rotations into the scene graph. setRotation is skipped for
+    // unchanged values (applied-mirrors) so updateWorld's clean-subtree no-op
+    // keeps paying off; setRotation always marks dirty otherwise.
+    if (scene_built) {
+        if (model_yaw != model_yaw_applied) {
+            scene.setRotation(0, gl.math.Quat.fromAxisAngle(up_vec, model_yaw));
+            model_yaw_applied = model_yaw;
+        }
+        var n: u32 = 0;
+        while (n + 1 < scene.count) : (n += 1) {
+            const r = node_rot[n];
+            const ra = node_rot_applied[n];
+            if (r[0] != ra[0] or r[1] != ra[1] or r[2] != ra[2]) {
+                scene.setRotation(n + 1, nodeQuat(r));
+                node_rot_applied[n] = r;
+            }
+        }
+        scene.updateWorld();
+    }
 
     var enc = gl.Encoder.init(&cmd_buf);
 
@@ -523,6 +587,10 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         enc.setLights(1, @intCast(@intFromPtr(&lights)));
         enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
 
+        // pv hoisted out of the loop; per-draw matrices come from the scene
+        // graph (scene_built is invariant-true whenever `asset` is non-null —
+        // buildScene runs in the same callback that sets `asset`).
+        const pv = proj.mul(view);
         var s: u32 = 0;
         while (s < a.submesh_count) : (s += 1) {
             if (s >= max_submesh) break;
@@ -532,6 +600,10 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 sub.metallic,      sub.roughness,     sub.occlusion_strength, sub.normal_scale,
                 sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        0,
             };
+            const world_s = scene.world[s + 1];
+            model_mats[s] = world_s.m;
+            normal9s[s] = gl.math.normalMatrix(world_s);
+            mvps[s] = pv.mul(world_s).m;
             enc.bindTexture(0, texHandle(sub.tex_base));
             enc.bindTexture(1, texHandle(sub.tex_mr));
             enc.bindTexture(2, texHandle(sub.tex_normal));
@@ -542,9 +614,9 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 ibuf,
                 sub.index_byte_off,
                 sub.index_count,
-                @intCast(@intFromPtr(&mvp)),
-                @intCast(@intFromPtr(&model_mat)),
-                @intCast(@intFromPtr(&normal9)),
+                @intCast(@intFromPtr(&mvps[s])),
+                @intCast(@intFromPtr(&model_mats[s])),
+                @intCast(@intFromPtr(&normal9s[s])),
                 @intCast(@intFromPtr(&mats[s])),
                 @intCast(@intFromPtr(&camera_pos)),
             );
@@ -689,10 +761,12 @@ fn buildScrubTimeline() void {
 /// orbit.yaw/pitch/distance with pitch/distance clamped to the orbit's own
 /// constraints. tick() is NOT called; the next frame integrates normally.
 ///
-/// Material writes go to mats[submesh][4] (metallic) or [5] (roughness). Guard:
-/// submesh must be < max_submesh AND < the loaded asset's submesh_count (if any).
+/// Material writes go to mats[submesh]: [4] metallic, [5] roughness,
+/// [8]/[9]/[10] emissive rgb. Guard: submesh must be < max_submesh AND < the
+/// loaded asset's submesh_count (if any).
 ///
-/// Model yaw sets model_yaw directly.
+/// Model yaw sets model_yaw directly. Node writes store Euler radians into
+/// node_rot[submesh]; the frame composes them into the scene-graph quat.
 fn applyAnimTarget(id: u32, value: f32) void {
     const d = gl.anim_target.decode(id) orelse return;
     switch (d.kind) {
@@ -716,15 +790,21 @@ fn applyAnimTarget(id: u32, value: f32) void {
             switch (@as(gl.anim_target.MaterialField, @enumFromInt(d.field))) {
                 .metallic => mats[s][4] = value,
                 .roughness => mats[s][5] = value,
-                // emissive fields — full GlScene support added in P6 Task 6.
-                .emissive_r, .emissive_g, .emissive_b => {},
+                .emissive_r => mats[s][8] = value,
+                .emissive_g => mats[s][9] = value,
+                .emissive_b => mats[s][10] = value,
             }
         },
         .model => switch (@as(gl.anim_target.ModelField, @enumFromInt(d.field))) {
             .yaw => model_yaw = value,
         },
-        // node rotation — full GlScene support added in P6 Task 6.
-        .node => {},
+        // Node Euler rotation (field 0/1/2 = X/Y/Z; decode validated the range).
+        // Pre-asset writes are fine: node_rot is only consumed once the scene is
+        // built, and the frame loop only reads slots that exist in the scene.
+        .node => {
+            if (d.submesh >= max_submesh) return;
+            node_rot[d.submesh][d.field] = value;
+        },
     }
 }
 
