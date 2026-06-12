@@ -176,7 +176,7 @@ pub fn pack(
     std.mem.writeInt(u32, buf[48..52], name_table_off, .little);
     std.mem.writeInt(u32, buf[52..56], name_count, .little);
 
-    // Write submesh table @40
+    // Write submesh table @56 (right after the header)
     for (submeshes, 0..) |s, i| {
         const off: u32 = submesh_table_off + @as(u32, @intCast(i)) * submesh_size;
         // @0: index_byte_off, @4: index_count
