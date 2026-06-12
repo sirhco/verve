@@ -130,9 +130,8 @@ pub const lit_fs: []const u8 =
 // below; any byte change is a deliberate wire-contract bump.
 
 fn pbrCheck(comptime flags: u32) void {
+    // Also covers variant_normal_map / variant_emissive without variant_pbr.
     if (flags & variant_pbr == 0) @compileError("PBR shader requires variant_pbr");
-    if ((flags & (variant_normal_map | variant_emissive)) != 0 and flags & variant_pbr == 0)
-        @compileError("variant_normal_map / variant_emissive require variant_pbr");
 }
 
 pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
