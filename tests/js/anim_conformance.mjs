@@ -26,13 +26,13 @@ const fns = new Function(
   extract("mpSample") + extract("buildMorphD") + extract("animIsTriggerOnly") +
     extract("dragProject") + extract("dragSnapResolve") +
     extract("splitLineRuns") + extract("flipNatural") + extract("flipDelta") +
-    extract("stSnapResolve") + extract("dragZoneHit") +
+    extract("stSnapResolve") + extract("dragZoneHit") + extract("glTweenState") +
     "return { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve, " +
-    "splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit };",
+    "splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit, glTweenState };",
 )();
 const {
   mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve,
-  splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit,
+  splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit, glTweenState,
 } = fns;
 
 let fails = 0;
@@ -227,8 +227,28 @@ const approx = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
   check("zone empty", dragZoneHit([], 10, 10) === -1);
 }
 
+// ---- gl-target tween state: wire facts + from-default contract ----
+// props key "@gl:<id>", value {gl,gls,to,(f)}. glTargetFrom emits to:0 + f.
+{
+  // explicit from (glTargetFrom): f is the start, to is the end
+  let s = glTweenState({ gl: 7, gls: 3, to: 6.283, f: 1.5 });
+  check("gl explicit from/to", s.kind === "gl" && s.from === 1.5 && s.to === 6.283);
+  check("gl ids coerced u32", s.gl === 7 && s.gls === 3);
+  // from-only via glTargetFrom: to placeholder 0, f is the start
+  s = glTweenState({ gl: 0, gls: 1, to: 0, f: 2.5 });
+  check("gl from-only honors f", s.from === 2.5 && s.to === 0);
+  // no f -> deterministic 0 start (engine value unknowable JS-side)
+  s = glTweenState({ gl: 0, gls: 1, to: 6.283 });
+  check("gl no-f defaults from 0", s.from === 0 && s.to === 6.283);
+  // linear interpolation parity with the numeric path (from + (to-from)*e)
+  const lerp = (st, e) => st.from + (st.to - st.from) * e;
+  check("gl lerp e=0", approx(lerp(s, 0), 0));
+  check("gl lerp e=0.5", approx(lerp(s, 0.5), 3.1415));
+  check("gl lerp e=1", approx(lerp(s, 1), 6.283));
+}
+
 if (fails === 0) {
-  console.log("anim conformance: ALL PASS (mp + morph + routing + drag + split + flip + snap)");
+  console.log("anim conformance: ALL PASS (mp + morph + routing + drag + split + flip + snap + gl)");
 } else {
   console.log(`anim conformance: ${fails} FAILURES`);
   process.exit(1);

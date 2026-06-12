@@ -791,6 +791,7 @@ extern "verve_runtime" fn verve_anim_seek_label(handle: u32, name_ptr: [*]const 
 // embed in descriptor JSON (same hazard as registerEvent).
 extern "verve_runtime" fn verve_anim_register_dyn(handler_idx: u32) u32;
 extern "verve_runtime" fn verve_anim_register_mod(handler_idx: u32) u32;
+extern "verve_runtime" fn verve_anim_register_setter(idx: u32) u32;
 extern "verve_runtime" fn verve_ref_set_style(handle: i32, name_ptr: [*]const u8, name_len: u32, val_ptr: [*]const u8, val_len: u32) void;
 
 /// Live animation handle. Plain u32 id into the bridge registry — copy
@@ -911,6 +912,13 @@ pub fn animDyn(f: *const fn (u32, u32) f64) anim.Value {
 /// returns the value to write. `t.modifier(verve.animModFn("y", &snapY))`.
 pub fn animModFn(prop: []const u8, f: *const fn (f64) f64) anim.Modifier {
     return .{ .prop = prop, .op = .{ .dyn = verve_anim_register_mod(@intCast(@intFromPtr(f))) } };
+}
+
+/// Register a gl-value setter `fn(target_id, value)` for gl-target tweens
+/// (Tween.glTarget). Returns the translated indirect-table slot to pass as
+/// `setter_slot`. Mirror of animDyn/animModFn.
+pub fn animGlSetter(f: *const fn (u32, f64) void) u32 {
+    return verve_anim_register_setter(@intCast(@intFromPtr(f)));
 }
 
 // ---- ScrollTrigger / Observer (verve.anim phase 2) -------------------------

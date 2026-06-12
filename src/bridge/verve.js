@@ -972,6 +972,17 @@
       return v;
     }
   };
+  // gl-target write: hand the eased value to the registered gl setter
+  // `fn(target_id, value)` (verve_anim_register_setter). Slot arrives
+  // already translated into the main table (same as dyn/mod).
+  const animCallGlSetter = (slot, id, v) => {
+    try {
+      const fn = indirectFunctionTable.get(slot >>> 0);
+      if (typeof fn === "function") fn(id >>> 0, v);
+    } catch (e) {
+      console.error("verve: anim gl setter failed:", e);
+    }
+  };
 
   const buildMods = (mods) => {
     const byProp = {};
@@ -1212,6 +1223,16 @@
         return per;
       }
       for (const [name, spec] of Object.entries(tw.props || {})) {
+        // gl-target prop ("@gl:<target_id>"): the value lives in the gl
+        // engine, not the DOM — no element read, no DOM write. Wire facts:
+        // spec = {gl:<u32 target_id>, gls:<u32 setter_slot>, to:<num>, f?:<num>}.
+        // from defaults to 0 (the engine value at tween start is unknowable
+        // JS-side, so the contract is deterministic 0→to; authors set a
+        // nonzero start via glTargetFrom which emits an explicit "f").
+        if (name.startsWith("@gl")) {
+          per[name] = glTweenState(spec);
+          continue;
+        }
         let from = authored(spec.f, i);
         let to = authored(spec.to, i);
         if (!from) from = readCurrent(el, name);
@@ -1300,7 +1321,34 @@
   };
   // @verve-extract-end
 
+  // gl-target tween state from a "@gl:<id>" prop spec. Wire facts: spec =
+  // {gl:<u32 target_id>, gls:<u32 setter_slot>, to:<num>, f?:<num>}. The
+  // engine value at tween start is unknowable JS-side, so from defaults to
+  // a deterministic 0 (authors set a nonzero start via glTargetFrom, which
+  // emits an explicit "f"). 0→to fits scrub usage (e.g. yaw 0→2π).
+  // @verve-extract glTweenState
+  const glTweenState = (spec) => ({
+    kind: "gl",
+    gl: spec.gl >>> 0,
+    gls: spec.gls >>> 0,
+    from: typeof spec.f === "number" ? spec.f : 0,
+    to: typeof spec.to === "number" ? spec.to : 0,
+    unit: null,
+  });
+  // @verve-extract-end
+
   const animWriteProp = (el, name, st, phase, easeFn, mods) => {
+    // gl-target: interpolate from→to like the numeric path, apply this
+    // prop's modifiers, then hand the value to the gl setter. MUST return
+    // before any DOM write — `el` is the inert selfEl fallback (the island
+    // host) and has no styles/attrs to touch for a gl tween.
+    if (st.kind === "gl") {
+      let v = st.from + (st.to - st.from) * easeFn(phase);
+      const fns = mods[name];
+      if (fns) for (const f of fns) v = f(v);
+      animCallGlSetter(st.gls, st.gl, v);
+      return;
+    }
     if (st.kind === "morph") {
       el.setAttribute("d", buildMorphD(st, easeFn(phase)));
       return;
@@ -3719,6 +3767,7 @@
     // slots before they're embedded in descriptor JSON.
     verve_anim_register_dyn: (idx) => idx >>> 0,
     verve_anim_register_mod: (idx) => idx >>> 0,
+    verve_anim_register_setter: (idx) => idx >>> 0,
     // Generic per-handle style setter (gap-filler next to ref_set_attr).
     verve_ref_set_style: (h, np, nl, vp, vl) => {
       const el = refHandles[h];
@@ -3963,6 +4012,7 @@
       verve_queue_microtask: (idx) => verveRuntime.verve_queue_microtask(translate(idx)),
       verve_anim_register_dyn: (idx) => translate(idx),
       verve_anim_register_mod: (idx) => translate(idx),
+      verve_anim_register_setter: (idx) => translate(idx),
       // Observer handler crosses as a chunk-private fn-table index —
       // copy the funcref into the main table (timers precedent).
       verve_obs_create: (flags, tol, sp, sl, idx) =>
