@@ -186,6 +186,9 @@ var normal9s: [max_submesh][9]f32 = undefined;
 // Per-submesh material block pool (12 f32 each) — each drawPbr points at its own
 // stable slot so the JS interpreter reads the right material when walking the
 // stream (same aliasing reason as GlDemo).
+// Initialized ONCE from vmesh defaults in buildScene (at asset load); anim
+// setters own all subsequent mutations (metallic [4], roughness [5], emissive
+// [8..10]). Rebuilt on re-hydrate/asset reload via buildScene.
 var mats: [max_submesh][12]f32 = undefined;
 
 // Single directional light from props: 8 f32 [type, intensity, x,y,z, r,g,b].
@@ -385,12 +388,24 @@ export fn glscene_vmesh_ready(ptr: u32, len: u32) void {
 /// max_submesh). The applied-mirrors are reset to match the fresh scene's
 /// identity rotations; any pre-asset anim writes (nonzero model_yaw/node_rot)
 /// then differ from their mirror and get applied on the next frame.
+///
+/// Also initializes the mats pool from vmesh defaults. Doing it here (once, at
+/// asset load) instead of per-frame means anim setters writing metallic [4],
+/// roughness [5], and emissive [8..10] are never clobbered before draw.
 fn buildScene(a: *const gl.vmesh.Reader) void {
     scene = .{};
     _ = scene.addNode(-1, "model");
     const n: u32 = @min(a.submesh_count, max_submesh);
     var s: u32 = 0;
-    while (s < n) : (s += 1) _ = scene.addNode(0, a.name(s));
+    while (s < n) : (s += 1) {
+        _ = scene.addNode(0, a.name(s));
+        const sub = a.submesh(s);
+        mats[s] = .{
+            sub.base_color[0], sub.base_color[1], sub.base_color[2],      sub.base_color[3],
+            sub.metallic,      sub.roughness,     sub.occlusion_strength, sub.normal_scale,
+            sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        0,
+        };
+    }
     model_yaw_applied = 0;
     node_rot_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
     scene_built = true;
@@ -595,11 +610,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         while (s < a.submesh_count) : (s += 1) {
             if (s >= max_submesh) break;
             const sub = a.submesh(s);
-            mats[s] = .{
-                sub.base_color[0], sub.base_color[1], sub.base_color[2],      sub.base_color[3],
-                sub.metallic,      sub.roughness,     sub.occlusion_strength, sub.normal_scale,
-                sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        0,
-            };
+            // mats[s] initialized once in buildScene; anim setters own mutations.
             const world_s = scene.world[s + 1];
             model_mats[s] = world_s.m;
             normal9s[s] = gl.math.normalMatrix(world_s);
