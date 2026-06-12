@@ -106,6 +106,40 @@ const lut_handle: u32 = 18;
 // Comptime PBR variant: full Cook-Torrance + IBL + tangent-space normals + emissive.
 const pbr_variant = gl.command.variant_pbr | gl.command.variant_normal_map | gl.command.variant_emissive;
 
+// ── Context-restore exports ──────────────────────────────────────────────────
+//
+// On webglcontextrestored the bridge calls `<frame_export>_restore` before
+// resuming the rAF loop (Task 9 convention, bridge verve.js ~line 4636).
+// Resetting the sent flag causes the next frame to re-issue all CREATE_*
+// commands with the same handle IDs — safe because the JS resource arrays
+// were wiped when the context was lost, so overwriting the same slots is
+// correct (no live-context leak; the old objects are already dead).
+//
+// model_asset / model_env (vmesh/venv Readers) are NOT reset: the asset bytes
+// live in the WASM linear-memory asset region for the page lifetime, so the
+// Reader slices remain valid. Only the GPU-side objects need re-uploading.
+// The existing model_resources_sent guard already gates GPU sends, so
+// clearing it is the complete and correct restore action.
+//
+// Registry (Registry(cap)) is intentionally absent from GlDemo: recording
+// alongside every create* would be dead weight because GlDemo's restore
+// path re-runs the original create block naturally (flag → false → block
+// executes on next frame). Registry.replay() earns its keep in GlScene
+// (Task 12) where the create block runs once at startup and replay is the
+// only way to re-emit those creates on restore.
+
+export fn glcube_frame_restore() void {
+    // Re-run the one-time create block on the next glcube_frame tick.
+    cube_resources_sent = false;
+}
+
+export fn glmodel_frame_restore() void {
+    // Re-run the one-time create block on the next glmodel_frame tick
+    // (only fires when model_asset and model_env are both non-null, which
+    // they will be — the asset-region bytes are still valid after restore).
+    model_resources_sent = false;
+}
+
 // ── hydrate ─────────────────────────────────────────────────────────────────
 
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
