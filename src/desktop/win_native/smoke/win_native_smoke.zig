@@ -752,6 +752,16 @@ pub fn main() void {
         .title = "Verve win-native",
         .width = 900,
         .height = 640,
+        // Window.init always navigates verve://app/index.html before the
+        // loadHtml below replaces the page. Without an asset entry that
+        // boot request logs a scheme-handler "not found" — give it a real
+        // page so startup resolves cleanly (and the embedded asset router
+        // gets exercised on hardware as a side effect).
+        .assets = &.{.{
+            .path = "index.html",
+            .bytes = "<!doctype html><title>verve smoke</title>booting…",
+            .content_type = "text/html",
+        }},
     }) catch {
         std.debug.print("[zig] Window.init failed\n", .{});
         return;
