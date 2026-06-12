@@ -745,10 +745,13 @@ fn animSetTrampoline(target_id: u32, value: f64) void {
 /// Build the scroll-scrubbed turntable + roughness-ramp timeline. Runs ONCE,
 /// after the vmesh Reader is available (so `material:<Name>` paths resolve).
 ///
-/// Targets (one tween, two @gl range entries):
+/// Targets (one tween, four @gl range entries):
 ///   • camera.yaw — turntable: current orbit.yaw → +2π (one full turn).
 ///   • material:Cube.roughness — ramp 0.045 → 1.0 (skipped if the name is
 ///     absent in the mesh; the camera still scrubs).
+///   • node:Cube.rotationX — wobble −0.35 → +0.35 rad (name-gated like
+///     roughness).
+///   • material:Cube.emissiveR — pulse 0.0 → 0.6 (name-gated).
 ///
 /// Gating: a ScrollTrigger on the scroll-section ref ("glscene-scroll-section",
 /// added by Task 10). When that ref is absent (page without a section), the
@@ -787,6 +790,13 @@ fn buildScrubTimeline() void {
     // mesh has no matching name (camera still scrubs).
     if (gl.anim_target.resolvePath(a, "material:Cube.roughness")) |rough_id|
         _ = t.glTargetRange(rough_id, slot, 0.045, 1.0);
+
+    // P6 additions, same silently-skipped pattern: node-transform wobble on X
+    // and an emissive-red pulse — both resolved against the mesh name tables.
+    if (gl.anim_target.resolvePath(a, "node:Cube.rotationX")) |rx_id|
+        _ = t.glTargetRange(rx_id, slot, -0.35, 0.35);
+    if (gl.anim_target.resolvePath(a, "material:Cube.emissiveR")) |er_id|
+        _ = t.glTargetRange(er_id, slot, 0.0, 0.6);
 
     // Scroll trigger: section top hits viewport top (start) through section
     // bottom hits viewport top (end). Smooth scrub (0.4s catch-up); plain scrub

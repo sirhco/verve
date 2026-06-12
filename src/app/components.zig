@@ -811,6 +811,9 @@ pub fn glDemo(ctx: *const verve.Context) !*verve.Node {
 /// the demo app context, so .onPick passes 0 (data-gl-pick attr only; the
 /// client chunk resolves picking by mesh name without needing a closure id).
 pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
     // scrub(true): builder owns the 300vh scroll section + sticky wrapper
     // internally so that `queryRef("glscene-scroll-section")` resolves to the
     // vid-suffixed ref inside the island. autoRotate is zeroed automatically
@@ -826,6 +829,11 @@ pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
         .scrub(true)
         .build();
 
+    // SSR scroll-driven camera dolly (P6 slot-0 path): "camera.distance" is in
+    // the static (no-reader) gl-target vocabulary, so it resolves server-side
+    // at comptime — `orelse unreachable` is a const-assert on a frozen literal.
+    const dolly_id = comptime (verve.gl.anim_target.resolvePathStatic("camera.distance") orelse unreachable);
+
     return ctx.main_().class("home gl-scene-page").children(.{
         ctx.h1("verve.gl — scroll to spin"),
         ctx.p().text("Scroll to rotate · drag to orbit · wheel to zoom · click a mesh to pick. " ++
@@ -833,7 +841,23 @@ pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
         // The island brings its own 300vh scroll section + sticky viewport —
         // no aspect-ratio wrapper needed here.
         scene,
-        ctx.p().class("hint").text("Keep scrolling — the model completes a full rotation over 300vh of scroll travel."),
+        // SSR dolly tween: setter slot 0 = the page-default gl setter the
+        // bridge resolves at hydration. It rides the SAME 300vh section the
+        // island's scrub timeline uses (selector form — SSR cannot serialize
+        // ref handles), but targets camera.distance only, so the two anims
+        // coexist by design: independent timelines, disjoint targets
+        // (island = yaw/roughness/rotationX/emissiveR; SSR = distance).
+        ctx.p().class("hint")
+            .text("Keep scrolling — the model completes a full rotation over 300vh of scroll travel.")
+            .animate(anim.to(a, null)
+            .glTargetRange(dolly_id, 0, 4.0, 2.5)
+            .duration(1).ease(.linear)
+            .scrollTrigger(.{
+            .trigger = "section[data-ref^=glscene-scroll-section]",
+            .start = .{ .trigger = .top, .viewport = .top },
+            .end = .{ .at = .{ .trigger = .bottom, .viewport = .top } },
+            .scrub = .{ .smooth = 0.4 },
+        })),
         ctx.p().text("Drag to orbit · wheel to zoom · click a mesh to pick. " ++
             "The GlScene chunk owns the WebGL2 render loop; Zig declares the scene."),
     });
