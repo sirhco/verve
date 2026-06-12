@@ -41,8 +41,6 @@ const bv_png: u32 = 4;
 
 // 6 faces × 4 vertices = 24 vertices.
 // Each face: 4 positions, 1 normal (all verts share it), 4 uvs.
-// Vertex order per face (CCW from outside): matches indices 0,1,2,0,2,3.
-
 // Face description: [normal xyz] then 4 vertex positions.
 const Face = struct {
     nx: f32,
@@ -52,44 +50,42 @@ const Face = struct {
     v: [4][3]f32,
 };
 
-// Derive CCW winding from outside for each face.
-// Convention: looking from outside (along -normal direction), vertices are CCW.
-//
-//  +X face (right): normal=(1,0,0)  looking from +x → verts in yz plane, CCW = +y+z → +y-z → -y-z → -y+z
-//  -X face (left):  normal=(-1,0,0) looking from -x → CCW = +y-z → +y+z → -y+z → -y-z  (flip z compared to +x)
-//  +Y face (top):   normal=(0,1,0)  looking down from +y → verts in xz plane, CCW = -x-z → +x-z → +x+z → -x+z
-//  -Y face (bottom):normal=(0,-1,0) looking from -y → CCW = -x+z → +x+z → +x-z → -x-z
-//  +Z face (front): normal=(0,0,1)  looking from +z → verts in xy plane, CCW = -x-y → +x-y → +x+y → -x+y
-//  -Z face (back):  normal=(0,0,-1) looking from -z → CCW = +x-y → -x-y → -x+y → +x+y
+// Corner order per face is CCW viewed from outside, starting at uv(0,0):
+// corner 0 = uv(0,0), 1 = +u, 2 = +u+v, 3 = +v, so triangles {0,1,2, 0,2,3}
+// are CCW front faces under WebGL's default frontFace(CCW) + cullFace(BACK),
+// and each face's tangent (+u world direction) is corner0→corner1.
+// Verified per face: cross(v1−v0, v2−v0) points along the stored normal.
+// (P2 shipped ±X/±Y corner rows wound CW-from-outside — those four exterior
+// faces were culled and the cube rendered inside-out; caught by P4 e2e.)
 
 const faces = [6]Face{
     // +X
     .{ .nx = 1, .ny = 0, .nz = 0, .v = .{
-        .{ 1, 1, 1 },
-        .{ 1, 1, -1 },
-        .{ 1, -1, -1 },
         .{ 1, -1, 1 },
+        .{ 1, -1, -1 },
+        .{ 1, 1, -1 },
+        .{ 1, 1, 1 },
     } },
     // -X
     .{ .nx = -1, .ny = 0, .nz = 0, .v = .{
-        .{ -1, 1, -1 },
-        .{ -1, 1, 1 },
-        .{ -1, -1, 1 },
         .{ -1, -1, -1 },
+        .{ -1, -1, 1 },
+        .{ -1, 1, 1 },
+        .{ -1, 1, -1 },
     } },
     // +Y
     .{ .nx = 0, .ny = 1, .nz = 0, .v = .{
-        .{ -1, 1, -1 },
-        .{ 1, 1, -1 },
-        .{ 1, 1, 1 },
         .{ -1, 1, 1 },
+        .{ 1, 1, 1 },
+        .{ 1, 1, -1 },
+        .{ -1, 1, -1 },
     } },
     // -Y
     .{ .nx = 0, .ny = -1, .nz = 0, .v = .{
-        .{ -1, -1, 1 },
-        .{ 1, -1, 1 },
-        .{ 1, -1, -1 },
         .{ -1, -1, -1 },
+        .{ 1, -1, -1 },
+        .{ 1, -1, 1 },
+        .{ -1, -1, 1 },
     } },
     // +Z
     .{ .nx = 0, .ny = 0, .nz = 1, .v = .{
@@ -185,7 +181,7 @@ pub fn texturedCubeGlb(alloc: Allocator) ![]u8 {
         }
     }
 
-    // Write indices: per face base+{0,1,2,0,2,3}
+    // Write indices: per face base+{0,1,2,0,2,3} (corner tables are CCW from outside)
     var idx_off: usize = bv_idx_off;
     for (0..6) |face_i| {
         const base: u16 = @intCast(face_i * 4);
