@@ -44,29 +44,67 @@ var model_scn: SceneT = .{};
 var model_node: u32 = 0;
 var model_angle: f32 = 0;
 var model_asset: ?gl.vmesh.Reader = null;
+var model_env: ?gl.venv.Reader = null;
 var model_resources_sent: bool = false;
 var model_mvp: [16]f32 = undefined;
+var model_model_mat: [16]f32 = undefined; // node world matrix (column-major), stable static for drawPbr
+var model_normal9: [9]f32 = undefined; // inverse-transpose upper-3x3, column-major
+var model_camera: [3]f32 = .{ 0, 1.2, 4 }; // MUST equal the lookAt eye used in glmodel_frame below
 
-// Per-submesh color pool (cap 8). Each drawSub points at its own slot so
-// the JS interpreter reads the correct color when it walks the command
-// stream — a single shared `color: [4]f32` would leave only the LAST
-// submesh's color visible across all drawSub commands (latent bug).
-// Bail/clamp: submeshes beyond index 7 are skipped with a comment below.
-var model_colors: [8][4]f32 = undefined;
+// Per-submesh material block pool (cap 8). Each drawPbr points at its own
+// stable slot (model_mats[s]) so the JS interpreter reads the correct 12-f32
+// material block when it walks the command stream — a single shared block
+// would leave only the LAST submesh's material visible (same latent-aliasing
+// reason as the P1 color pool). Slots stay stable for the frame.
+var model_mats: [8][12]f32 = undefined;
 
-// cmd_buf sizing (N = 8 submesh cap):
-//   header(4) + 2×createBuffer(20) + createShader(28) + 8×createTexture(24)
-//   + beginFrame(28) + setPipeline(12) + 8×bindTexture(12) + 8×drawSub(28)
-//   + endFrame(4)
-//   = 4 + 40 + 28 + 192 + 28 + 12 + 96 + 224 + 4 = 628 < 1024 ✓
-var model_cmd_buf: [1024]u8 = undefined;
+// Direct lights, 8 f32 each: [type(0=dir,1=point), intensity, x,y,z, r,g,b].
+// dir-light direction literal (-0.4,-0.7,-0.6) is normalized by hand:
+//   len = sqrt(0.16+0.49+0.36) = sqrt(1.01) ≈ 1.00498756
+//   (-0.4,-0.7,-0.6)/len = (-0.39801488, -0.69652603, -0.59702231)
+var model_lights: [16]f32 = .{
+    // dir light: warm key from above-front
+    0.0, 3.0, // type=dir, intensity=3.0
+    -0.39801488, -0.69652603, -0.59702231, // normalized direction
+    1.0, 0.97, 0.92, // color
+    // point light: cool fill
+    1.0, 8.0, // type=point, intensity=8.0
+    2.0, 1.5, 2.0, // position
+    0.9, 0.95, 1.0, // color
+};
+
+// cmd_buf sizing (N = 8 submesh cap). Record = 4-byte tag/size header + payload.
+//   one-time send:
+//     2×createBuffer(4+16=20) + createShader(4+24=28)
+//     + 5×createTexture(4+20=24) + 3×createTextureEx(4+32=36)
+//     = 40 + 28 + 120 + 108 = 296
+//   per-frame:
+//     header(4) + beginFrame(4+24=28) + setPipeline(4+8=12)
+//     + setLights(4+8=12) + bindIbl(4+16=20)
+//     + N×(5×bindTexture(4+8=12) + drawPbr(4+36=40)) = 8×(60+40) = 800
+//     + endFrame(4)
+//     = 4 + 28 + 12 + 12 + 20 + 800 + 4 = 880
+//   worst case (one-time + per-frame on the same first frame) = 296 + 880 = 1176
+//   round up generously to 4096.
+var model_cmd_buf: [4096]u8 = undefined;
 
 const model_vbuf: u32 = 1;
 const model_ibuf: u32 = 2;
 const model_shader: u32 = 1;
 const model_url = "/gl/demo.vmesh";
+const model_env_url = "/gl/studio.venv";
 const model_ready_export = "glmodel_ready";
+const model_env_ready_export = "glmodel_env_ready";
 const model_frame_export = "glmodel_frame";
+
+// IBL texture handles (distinct from per-material texture handles t+1, which
+// range 1..5 from the v2 vmesh).
+const irr_handle: u32 = 16;
+const spec_handle: u32 = 17;
+const lut_handle: u32 = 18;
+
+// Comptime PBR variant: full Cook-Torrance + IBL + tangent-space normals + emissive.
+const pbr_variant = gl.command.variant_pbr | gl.command.variant_normal_map | gl.command.variant_emissive;
 
 // ── hydrate ─────────────────────────────────────────────────────────────────
 
@@ -74,6 +112,11 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     _ = props_ptr;
     _ = props_len;
     _ = root_id;
+
+    // This island owns the page's gl asset lifetime (single stateful gl island
+    // per page invariant). Free any assets fetched by a prior hydrate before we
+    // re-fetch — the venv/vmesh Reader slices below point into the asset region.
+    verve.assetReset();
 
     // Reset cube state.
     cube_scn = .{};
@@ -85,11 +128,13 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     model_scn = .{};
     model_node = model_scn.addNode(-1, "model");
     model_asset = null;
+    model_env = null;
     model_resources_sent = false;
     model_angle = 0;
 
-    // Kick the asset fetch for the model canvas.
+    // Kick the asset fetches for the model canvas (geometry + prefiltered IBL).
     gl_load(model_url.ptr, model_url.len, model_ready_export.ptr, model_ready_export.len);
+    gl_load(model_env_url.ptr, model_env_url.len, model_env_ready_export.ptr, model_env_ready_export.len);
 
     // Start each rAF loop independently — a missing canvas must not disable
     // the other, so we use separate optional checks rather than a shared return.
@@ -160,6 +205,13 @@ export fn glmodel_ready(ptr: u32, len: u32) void {
     model_asset = gl.vmesh.Reader.init(bytes) catch null;
 }
 
+export fn glmodel_env_ready(ptr: u32, len: u32) void {
+    if (ptr == 0) return; // fetch failed; leave model_env null → clear-only frames
+    const bytes = @as([*]const u8, @ptrFromInt(ptr))[0..len];
+    // Defensive parity with glmodel_ready: bad bytes leave model_env null.
+    model_env = gl.venv.Reader.init(bytes) catch null;
+}
+
 export fn glmodel_frame(dt_ms: f32, width: u32, height: u32) u32 {
     model_angle += dt_ms * 0.0005;
     model_scn.setRotation(model_node, gl.math.Quat.fromAxisAngle(gl.math.Vec3.init(0, 1, 0.2), model_angle));
@@ -167,43 +219,91 @@ export fn glmodel_frame(dt_ms: f32, width: u32, height: u32) u32 {
     const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(@max(height, 1)));
     const proj = gl.math.Mat4.perspective(1.0, aspect, 0.1, 100.0);
     const view = gl.math.Mat4.lookAt(
-        gl.math.Vec3.init(0, 1.2, 4),
+        gl.math.Vec3.init(0, 1.2, 4), // eye — keep in lockstep with model_camera
         gl.math.Vec3.init(0, 0, 0),
         gl.math.Vec3.init(0, 1, 0),
     );
-    model_mvp = proj.mul(view).mul(model_scn.world[model_node]).m;
+    const world = model_scn.world[model_node];
+    model_mvp = proj.mul(view).mul(world).m;
 
     var enc = gl.Encoder.init(&model_cmd_buf);
-    if (model_asset) |*a| {
+
+    // Full PBR only when BOTH geometry and the prefiltered environment are
+    // loaded; otherwise fall back to today's clear-only frame.
+    if (model_asset != null and model_env != null) {
+        const a = &model_asset.?;
+        const env = &model_env.?;
+
         if (!model_resources_sent) {
             model_resources_sent = true;
             enc.createBuffer(model_vbuf, .vertex, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
             enc.createBuffer(model_ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
+            // Comptime PBR über-shader — VS/FS assembled at comptime for pbr_variant.
+            const vs = gl.command.pbrVertexSrc(pbr_variant);
+            const fs = gl.command.pbrFragmentSrc(pbr_variant);
             enc.createShader(
                 model_shader,
-                gl.command.variant_lit_uv,
-                @intCast(@intFromPtr(gl.command.lit_vs.ptr)),
-                @intCast(gl.command.lit_vs.len),
-                @intCast(@intFromPtr(gl.command.lit_fs.ptr)),
-                @intCast(gl.command.lit_fs.len),
+                pbr_variant,
+                @intCast(@intFromPtr(vs.ptr)),
+                @intCast(vs.len),
+                @intCast(@intFromPtr(fs.ptr)),
+                @intCast(fs.len),
             );
+            // Material textures (up to 5 from the v2 vmesh): handle = t+1.
             var t: u32 = 0;
             while (t < a.tex_count) : (t += 1) {
                 const tex = a.texture(t);
                 enc.createTexture(t + 1, tex.width, tex.height, @intCast(@intFromPtr(tex.rgba.ptr)), @intCast(tex.rgba.len));
             }
+            // IBL: irradiance cube, prefiltered specular mip-chain, BRDF LUT.
+            enc.createTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));
+            enc.createTextureEx(spec_handle, .cube, .rgba16f, env.spec_size, env.spec_size, env.spec_mip_count, @intCast(@intFromPtr(env.specular.ptr)), @intCast(env.specular.len));
+            enc.createTextureEx(lut_handle, .tex_2d, .rgba16f, env.lut_size, env.lut_size, 1, @intCast(@intFromPtr(env.lut.ptr)), @intCast(env.lut.len));
         }
+
+        // Per-draw matrices: copy out to stable statics (drawPbr records carry
+        // their addresses, same stability requirement as model_mvp).
+        model_model_mat = world.m;
+        model_normal9 = gl.math.normalMatrix(world);
+
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
         enc.setPipeline(model_shader, gl.command.state_depth_test | gl.command.state_cull_back);
+        // Stream order: SET_PIPELINE must precede SET_LIGHTS / BIND_IBL.
+        enc.setLights(2, @intCast(@intFromPtr(&model_lights)));
+        enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+
         var s: u32 = 0;
         while (s < a.submesh_count) : (s += 1) {
-            // Clamp to color pool capacity; submeshes beyond index 7 are
+            // Clamp to material pool capacity; submeshes beyond index 7 are
             // skipped rather than aliasing into adjacent memory.
             if (s >= 8) break;
             const sub = a.submesh(s);
-            model_colors[s] = sub.base_color; // each slot is stable for the frame
-            if (sub.tex_base >= 0) enc.bindTexture(0, @intCast(sub.tex_base + 1));
-            enc.drawSub(model_vbuf, model_ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&model_mvp)), @intCast(@intFromPtr(&model_colors[s])));
+            // Fill the stable material slot: 12 f32 matching command.zig layout —
+            // base_color rgba | metallic, roughness, occlusion_strength, normal_scale | emissive rgb, 0.
+            model_mats[s] = .{
+                sub.base_color[0], sub.base_color[1], sub.base_color[2],      sub.base_color[3],
+                sub.metallic,      sub.roughness,     sub.occlusion_strength, sub.normal_scale,
+                sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        0,
+            };
+            // All five tex_* indices are guaranteed ≥ 0 by the gltf neutral
+            // baking (missing maps get a baked 1×1 neutral texture), so no -1
+            // branches are needed here.
+            enc.bindTexture(0, @intCast(sub.tex_base + 1));
+            enc.bindTexture(1, @intCast(sub.tex_mr + 1));
+            enc.bindTexture(2, @intCast(sub.tex_normal + 1));
+            enc.bindTexture(3, @intCast(sub.tex_emissive + 1));
+            enc.bindTexture(4, @intCast(sub.tex_occlusion + 1));
+            enc.drawPbr(
+                model_vbuf,
+                model_ibuf,
+                sub.index_byte_off,
+                sub.index_count,
+                @intCast(@intFromPtr(&model_mvp)),
+                @intCast(@intFromPtr(&model_model_mat)),
+                @intCast(@intFromPtr(&model_normal9)),
+                @intCast(@intFromPtr(&model_mats[s])),
+                @intCast(@intFromPtr(&model_camera)),
+            );
         }
         enc.endFrame();
     } else {

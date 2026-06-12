@@ -788,9 +788,9 @@ pub fn glDemo(ctx: *const verve.Context) !*verve.Node {
             cube_canvas,
         }),
         ctx.section().class("card").children(.{
-            ctx.h2("Asset pipeline — textured model"),
-            ctx.p().text("vmesh fetched via gl_load; vmesh Reader parses views; " ++
-                "lit shader variant with per-submesh color pool."),
+            ctx.h2("Asset pipeline — PBR + image-based lighting"),
+            ctx.p().text("vmesh + prefiltered .venv fetched via gl_load; readers parse " ++
+                "views; Cook-Torrance PBR under image-based lighting with direct lights."),
             model_canvas,
         }),
     });
