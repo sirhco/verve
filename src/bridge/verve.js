@@ -3640,6 +3640,10 @@
     verve_chunk_alloc: exp.verve_chunk_alloc,
     verve_chunk_arena_mark: exp.verve_chunk_arena_mark,
     verve_chunk_arena_reset: exp.verve_chunk_arena_reset,
+    // gl P3 — page-scoped asset region (.vmesh/.venv fetches).
+    verve_asset_alloc: exp.verve_asset_alloc,
+    verve_asset_reset: exp.verve_asset_reset,
+    verve_asset_used: exp.verve_asset_used,
     verve_drop_name: exp.verve_drop_name,
     verve_drop_name_len: exp.verve_drop_name_len,
     verve_drop_ptr: exp.verve_drop_ptr,
