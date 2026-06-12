@@ -34,7 +34,10 @@ pub const Tag = enum(u16) {
     set_lights = 11, // {count, ptr -> count*8 f32}
     bind_ibl = 12, // {irr, spec, lut, spec_mip_count}
     draw_pbr = 13, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr, model_ptr, normal_ptr, material_ptr, camera_ptr}
+    delete_resource = 14, // {kind, handle} — frees one GPU object; slot may be reused after
 };
+
+pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2 };
 
 pub const BufferKind = enum(u32) { vertex = 0, index = 1 };
 
@@ -470,6 +473,14 @@ pub const Encoder = struct {
         self.putU32(camera_ptr);
     }
 
+    /// Issued on island disposal and when replacing resources; the JS interpreter
+    /// frees the GPU object and nulls the handle slot.
+    pub fn deleteResource(self: *Encoder, kind: ResKind, handle: u32) void {
+        self.header(.delete_resource, 8);
+        self.putU32(@intFromEnum(kind));
+        self.putU32(handle);
+    }
+
     pub fn endFrame(self: *Encoder) void {
         self.header(.end_frame, 0);
     }
@@ -675,4 +686,31 @@ test "PBR fragment carries ACES constants (loose sync with ibl.acesTonemap)" {
     const fs = pbrFragmentSrc(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, fs, "2.51") != null);
     try testing.expect(std.mem.indexOf(u8, fs, "0.59") != null);
+}
+
+// ── P4 wire goldens ─────────────────────────────────────────────────
+
+test "golden: DELETE_RESOURCE (tag 14)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.deleteResource(.texture, 7);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // Hand-derived byte layout:
+    //   DELETE_RESOURCE  4 (header) + 8 (payload) = 12
+    //   END_FRAME        4 (header) + 0 (payload) =  4
+    //   total record bytes = 16 = 0x10  →  length header "10000000"
+    //   DELETE_RESOURCE: tag=0x0e payload_size=8 kind=texture(1) handle=7
+    try testing.expectEqualStrings(
+        "10000000" ++ // length header: 16 record bytes
+            "0e00" ++ "0800" ++ "01000000" ++ "07000000" ++ // DELETE_RESOURCE texture handle=7
+            "0600" ++ "0000", // END_FRAME
+        hex,
+    );
+}
+
+test "P3 goldens unchanged (P4 is additive)" {
+    // Marker: P3 golden tests above must still pass byte-identical. P4 adds tag 14 only.
 }
