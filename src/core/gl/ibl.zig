@@ -306,11 +306,6 @@ inline fn importanceSampleGGX(xi: [2]f32, n: V3, roughness: f32) V3 {
     return V3.add(V3.add(frame.t.scale(hl.x), frame.b.scale(hl.y)), n.scale(hl.z)).normalize();
 }
 
-inline fn reflect(i: V3, n: V3) V3 {
-    // reflect(I, N) = I - 2*dot(N,I)*N
-    return V3.sub(i, n.scale(2.0 * V3.dot(n, i)));
-}
-
 // ── irradiance (diffuse) ──────────────────────────────────────────────────────
 
 /// Cosine-convolved irradiance cube. For each output texel direction N,
