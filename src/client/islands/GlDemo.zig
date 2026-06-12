@@ -212,6 +212,12 @@ export fn glmodel_env_ready(ptr: u32, len: u32) void {
     model_env = gl.venv.Reader.init(bytes) catch null;
 }
 
+/// vmesh texture index → wire texture handle (table slot t gets handle t+1).
+/// Negative indices clamp to handle 0 (never created) instead of trapping.
+fn texHandle(i: i32) u32 {
+    return if (i >= 0) @intCast(i + 1) else 0;
+}
+
 export fn glmodel_frame(dt_ms: f32, width: u32, height: u32) u32 {
     model_angle += dt_ms * 0.0005;
     model_scn.setRotation(model_node, gl.math.Quat.fromAxisAngle(gl.math.Vec3.init(0, 1, 0.2), model_angle));
@@ -286,13 +292,15 @@ export fn glmodel_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        0,
             };
             // All five tex_* indices are guaranteed ≥ 0 by the gltf neutral
-            // baking (missing maps get a baked 1×1 neutral texture), so no -1
-            // branches are needed here.
-            enc.bindTexture(0, @intCast(sub.tex_base + 1));
-            enc.bindTexture(1, @intCast(sub.tex_mr + 1));
-            enc.bindTexture(2, @intCast(sub.tex_normal + 1));
-            enc.bindTexture(3, @intCast(sub.tex_emissive + 1));
-            enc.bindTexture(4, @intCast(sub.tex_occlusion + 1));
+            // baking (missing maps get a baked 1×1 neutral texture). texHandle
+            // still clamps negatives so a malformed .vmesh fetched over HTTP
+            // can't trap the cast in safe builds — handle 0 is never created,
+            // so the JS interpreter's null-guard simply skips the bind.
+            enc.bindTexture(0, texHandle(sub.tex_base));
+            enc.bindTexture(1, texHandle(sub.tex_mr));
+            enc.bindTexture(2, texHandle(sub.tex_normal));
+            enc.bindTexture(3, texHandle(sub.tex_emissive));
+            enc.bindTexture(4, texHandle(sub.tex_occlusion));
             enc.drawPbr(
                 model_vbuf,
                 model_ibuf,
