@@ -4506,6 +4506,7 @@
       }
       off += size;
     }
+    return total;
   };
 
   // Full GPU teardown for an island unmount: deletes every live buffer,
@@ -4535,6 +4536,9 @@
     }
     const ctx = canvas.getContext("webgl2", { antialias: true });
     if (!ctx) {
+      // No GL context was created, so no context-loss listeners are needed and
+      // there is nothing to dispose. The SSR poster is visible by default —
+      // leave it up so the user sees the static frame instead of a blank canvas.
       console.error("verve.gl: WebGL2 unavailable; canvas left inert");
       return;
     }
@@ -4548,8 +4552,20 @@
       vaos: new Map(),
       active: null,
       last: 0,
+      // Poster swap: SSR may drop an <img data-gl-poster> sibling under the
+      // canvas's parent. Looked up once on first non-empty frame, then cached.
+      poster: undefined, // undefined = not yet looked up; null = none present
+      posterHidden: false,
+      // Context loss: true between webglcontextlost and webglcontextrestored.
+      // While lost, the rAF loop is fully stopped (no idle polling); the
+      // restored handler resets resource state and restarts it.
+      lost: false,
     };
     const step = (now) => {
+      // Context lost: the GL objects are gone and any GL call would error.
+      // Stop the loop entirely; webglcontextrestored restarts it. (Chosen over
+      // idle rAF polling: zero work while suspended, single clear resume point.)
+      if (st.lost) return;
       // Island unmounted: canvas detached from the DOM. Free GPU objects and
       // stop without rescheduling, instead of leaking the whole resource set.
       if (!canvas.isConnected) {
@@ -4573,7 +4589,17 @@
         return;
       }
       try {
-        glInterpret(st, ptr);
+        const drawn = glInterpret(st, ptr);
+        // First successful non-empty frame: hide the SSR poster (the real
+        // scene is now on the canvas). Lookup is done once and cached.
+        if (drawn && !st.posterHidden) {
+          if (st.poster === undefined) {
+            st.poster = (canvas.parentElement &&
+              canvas.parentElement.querySelector("[data-gl-poster]")) || null;
+          }
+          if (st.poster) st.poster.style.display = "none";
+          st.posterHidden = true;
+        }
       } catch (err) {
         // A corrupt stream/pointer must not kill the loop silently.
         console.error("verve.gl: interpreter fault, loop stopped:", err, err && err.stack);
@@ -4581,6 +4607,36 @@
       }
       requestAnimationFrame(step);
     };
+    // preventDefault is REQUIRED — without it the browser never fires
+    // webglcontextrestored, leaving the canvas permanently dead.
+    canvas.addEventListener("webglcontextlost", (e) => {
+      e.preventDefault();
+      st.lost = true;
+      // Bring the static poster back while the GPU recovers.
+      if (st.poster) {
+        st.poster.style.display = "";
+        st.posterHidden = false;
+      }
+    });
+    canvas.addEventListener("webglcontextrestored", () => {
+      // The GL objects died with the old context; drop our handles WITHOUT
+      // calling gl.delete* (deleting names from a dead context errors / is a
+      // no-op). disposeGlState is deliberately NOT used here for that reason.
+      st.buffers = [];
+      st.textures = [];
+      st.shaders = [];
+      st.vaos.clear();
+      st.active = null;
+      // Re-hide poster only after the first new frame draws again.
+      st.posterHidden = false;
+      st.lost = false;
+      st.last = 0;
+      // Let the chunk re-upload GPU resources before frames resume, if it
+      // exports a restore hook. Convention: "<frame_export>_restore" (Task 10/12).
+      const restoreFn = st.exports[st.exportName + "_restore"];
+      if (typeof restoreFn === "function") restoreFn();
+      requestAnimationFrame(step);
+    });
     requestAnimationFrame(step);
   };
 
