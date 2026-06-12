@@ -6,6 +6,14 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-12
+
+The 3D engine release: `verve.gl` v1 complete — PBR metallic-roughness
+über-shader + IBL (P3), interactive orbit camera + BVH ray-picking +
+declarative `ctx.glScene` (P4), `verve.anim` fusion with scroll-scrubbed
+3D turntable (P5). New `examples/gl-viewer/` standalone 3D product
+viewer. 721 tests green.
+
 ### Added
 
 - **`verve.gl` P5 — verve.anim fusion: gl-target tweens + scroll-scrub
@@ -152,8 +160,14 @@ versions follow [Semantic Versioning](https://semver.org/).
   the scaffolded desktop app hardware-validated on Windows x86-64 and
   ARM64.
 
+### Added
+
+- **`examples/gl-viewer/`** — standalone declarative 3D product viewer: `ctx.glScene` builder, PBR + IBL `.venv` environment, orbit drag + wheel zoom, click pick + hover, scroll-scrub turntable (`verve.anim` ScrollTrigger fusion), poster swap on context loss. Reuses the framework `GlScene` chunk and asset pipeline.
+
 ### Fixed
 
+- **`gl_assets` stub** (`src/app/api.zig`): missing `gl_assets` route handler caused all 13 example servers referencing gl assets to fail with 404 since gl P2; added stub that serves from the build-generated asset table.
+- **`GlScene` pick/hover stamps lost in frame context** (`src/client/islands/GlScene.zig`): the canvas element reference was re-queried from the document each frame rather than captured at hydration; on SPA navigations the stale query returned null and dropped all pick/hover events. Fixed by capturing the canvas ref handle at island mount.
 - **`verve.gl` fixture cube winding** (`src/core/gl/fixture.zig`): the
   ±X and ±Y faces of the procedural unit cube had CW vertex order since
   P2, causing backface culling to discard the exterior surfaces — the
@@ -2842,5 +2856,7 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/sirhco/verve/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/sirhco/verve/releases/tag/v0.4.0
 [0.1.0]: https://github.com/sirhco/verve/releases/tag/v0.1.0

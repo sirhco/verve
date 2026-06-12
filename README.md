@@ -1,6 +1,6 @@
 # Verve
 
-> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.4.x. Public
+> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.5.x. Public
 > APIs are not stable and **will** break between minor versions.
 > All three desktop backends (macOS, Windows, Linux GTK4) are validated
 > on real hardware as of v0.2.0. Known limitations: desktop auto-updater
@@ -19,13 +19,13 @@ No Chromium. No Electron. No third-party dependencies.
 
 Targets **Zig 0.16.0**.
 
-📚 **[Documentation](docs/README.md)** — 23 topic guides covering every feature.
+📚 **[Documentation](docs/README.md)** — 24 topic guides covering every feature.
 🧪 **[Examples](examples/README.md)** — runnable sample apps including a full [showcase](examples/showcase/).
 
 ```sh
 # Web app — HTTP server + wasm hydration
 zig build                           # native server + wasm client + per-island chunks
-zig build test --summary all        # 568 tests across core + server + client + desktop + integration
+zig build test --summary all        # 721 tests across core + server + client + desktop + integration
 zig build docs                      # zig-out/docs/api/index.html — Zig autodoc for the public verve module
 ./zig-out/bin/verve-server          # open http://127.0.0.1:8080
 
@@ -156,7 +156,7 @@ Native 3D, pure Zig + one dumb WebGL2 interpreter — no three.js. The whole eng
 - **Engine core** — column-major f32 math, struct-of-arrays scene graph with pre-order dirty propagation, API-neutral command stream (WebGPU later = a second interpreter, same bytes), unlit vertex-color + textured/lit shader variants.
 - **Asset pipeline** — build-time `.glb` → packed `.vmesh` (`tools/gl_asset_gen`): zero runtime parsing, fetch → linear memory → GPU upload. Pure-Zig PNG decoder, glb parser, and vmesh reader, all hardened against hostile input (errors, never panics). Demo asset is fully procedural — no binaries in the repo.
 - **Runtime loading** — islands fetch `.vmesh` over `gl_load` into the chunk arena; failed fetches degrade to clear-only frames with a structured console error.
-- **Roadmap** — P3 PBR + image-based lighting, P4 orbit controls/picking/declarative `ctx.glScene`, P5 verve.anim fusion (scroll-scrubbed 3D).
+- **v1 complete** — PBR metallic-roughness + IBL (P3), orbit controls + BVH picking + declarative `ctx.glScene` (P4), `verve.anim` fusion with scroll-scrubbed 3D turntable (P5). Demo: [`examples/gl-viewer/`](examples/gl-viewer/README.md).
 
 ### Markdown & syntax highlighting
 Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed at SSR time into the `Node` tree; no client wasm, no JavaScript. Guide: [`docs/21-markdown-and-highlighting.md`](docs/21-markdown-and-highlighting.md). Demo: [`examples/markdown/`](examples/markdown/README.md).
@@ -232,7 +232,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.4.0
+zig fetch --save git+https://github.com/sirhco/verve#v0.5.0
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -292,7 +292,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.4.0 \
+verve-cli new ~/my-app --release v0.5.0 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 

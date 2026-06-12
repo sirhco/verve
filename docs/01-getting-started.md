@@ -69,7 +69,7 @@ trigger a clean shutdown.
 
 ```sh
 zig build test --summary all
-# Build Summary: 36/36 steps succeeded; 568/568 tests passed
+# Build Summary: 46/46 steps succeeded; 721/721 tests passed
 ```
 
 The suite groups five sub-suites (exact counts grow with the framework
