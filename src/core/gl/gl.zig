@@ -15,6 +15,7 @@ pub const vmesh = @import("vmesh.zig");
 // import free; only actual references would pull them into wasm.
 pub const png = @import("png.zig");
 pub const gltf = @import("gltf.zig");
+pub const hdr = @import("hdr.zig");
 pub const fixture = @import("fixture.zig");
 
 pub const Scene = scene.Scene;
@@ -28,5 +29,6 @@ test {
     _ = vmesh;
     _ = png;
     _ = gltf;
+    _ = hdr;
     _ = fixture;
 }
