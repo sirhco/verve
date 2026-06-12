@@ -490,7 +490,7 @@ pub fn pbrCubeGlb(alloc: Allocator, opts: struct { with_tangents: bool = true })
     try w.writeAll("\"scene\":0,");
     try w.writeAll("\"scenes\":[{\"nodes\":[0]}],");
     try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"PbrCube\"}],");
-    try w.writeAll("\"meshes\":[{\"primitives\":[{\"attributes\":{");
+    try w.writeAll("\"meshes\":[{\"name\":\"Cube\",\"primitives\":[{\"attributes\":{");
     try w.print("\"POSITION\":{d},\"NORMAL\":{d}", .{ acc_p_pos, acc_p_nrm });
     if (has_tan) try w.print(",\"TANGENT\":{d}", .{acc_p_tan});
     try w.print(",\"TEXCOORD_0\":{d}", .{acc_p_uv});

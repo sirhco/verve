@@ -64,13 +64,24 @@ fn convertGlb(alloc: std.mem.Allocator, in_path: []const u8, glb_bytes: []const 
     };
     defer model.deinit();
 
-    // Pack Model → .vmesh bytes.
+    // Build the per-mesh BVH over the interleaved vertex pool (stride 48 →
+    // 12 f32/vertex, position xyz at offset 0).
+    var bvh_result = gl.bvh.build(alloc, model.vertices, 12, model.indices) catch |err| {
+        std.log.err("gl_asset_gen: {s}: BVH build failed: {s}", .{ in_path, @errorName(err) });
+        return err;
+    };
+    defer bvh_result.deinit(alloc);
+
+    // Pack Model + BVH + names → v3 .vmesh bytes.
     return gl.vmesh.pack(
         alloc,
         model.vertices,
         model.indices,
         model.submeshes,
         model.textures,
+        bvh_result.nodes,
+        bvh_result.tri_perm,
+        model.names,
     );
 }
 

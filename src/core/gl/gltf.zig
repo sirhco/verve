@@ -37,6 +37,7 @@ pub const Model = struct {
     indices: []u16,
     submeshes: []vmesh.Submesh, // index_byte_off/count into `indices`
     textures: []vmesh.Texture, // decoded RGBA8 via png.zig
+    names: []const []const u8, // one per submesh; owning mesh's name (fallback "mesh{n}")
 
     pub fn deinit(self: *Model) void {
         self.arena.deinit();
@@ -207,14 +208,39 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         });
     }
 
+    // ── 6b. Build mesh-index → node-name fallback map ──────────────────────────
+    // glTF mesh names live on `meshes[i].name`; when absent we fall back to the
+    // name of a node that references that mesh (`nodes[j].name` where
+    // nodes[j].mesh == i), then finally to "mesh{i}". Walk `nodes` once.
+    const node_mesh_names = try aa.alloc(?[]const u8, meshes.len);
+    @memset(node_mesh_names, null);
+    if (root.get("nodes")) |nodes_val| {
+        if (nodes_val == .array) {
+            for (nodes_val.array.items) |node_val| {
+                const node_obj = switch (node_val) {
+                    .object => |o| o,
+                    else => continue,
+                };
+                const mesh_ref = node_obj.get("mesh") orelse continue;
+                const mi: usize = @intCast(jsonInt(mesh_ref) orelse continue);
+                if (mi >= meshes.len) continue;
+                if (node_mesh_names[mi] != null) continue; // first node wins
+                if (node_obj.get("name")) |nm_val| {
+                    if (nm_val == .string) node_mesh_names[mi] = nm_val.string;
+                }
+            }
+        }
+    }
+
     // ── 7. Process all mesh primitives ────────────────────────────────────────
     // Flatten all meshes / all primitives into one vertex pool + index pool.
     // Each primitive becomes one Submesh.
     var vert_list: std.ArrayList(f32) = .empty;
     var idx_list: std.ArrayList(u16) = .empty;
     var sub_list: std.ArrayList(vmesh.Submesh) = .empty;
+    var name_list: std.ArrayList([]const u8) = .empty;
 
-    for (meshes) |mesh_val| {
+    for (meshes, 0..) |mesh_val, mesh_i| {
         const mesh_obj = switch (mesh_val) {
             .object => |o| o,
             else => return error.Malformed,
@@ -223,6 +249,17 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         const prims = switch (prims_val) {
             .array => |a| a.items,
             else => return error.Malformed,
+        };
+
+        // Resolve this mesh's name: meshes[i].name → referencing node name →
+        // "mesh{i}". The chosen string is duped into the Model arena so it
+        // outlives the JSON arena.
+        const mesh_name: []const u8 = blk: {
+            if (mesh_obj.get("name")) |nm_val| {
+                if (nm_val == .string) break :blk try aa.dupe(u8, nm_val.string);
+            }
+            if (node_mesh_names[mesh_i]) |nn| break :blk try aa.dupe(u8, nn);
+            break :blk try std.fmt.allocPrint(aa, "mesh{d}", .{mesh_i});
         };
 
         for (prims) |prim_val| {
@@ -423,6 +460,7 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                 .tex_emissive = tex_emissive,
                 .tex_occlusion = tex_occlusion,
             });
+            try name_list.append(aa, mesh_name);
         }
     }
 
@@ -475,6 +513,7 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         .indices = idx_list.items,
         .submeshes = sub_list.items,
         .textures = tex_list.items,
+        .names = name_list.items,
     };
 }
 
@@ -746,6 +785,9 @@ test "parse pbrCubeGlb (with_tangents=true): full material + read tangents" {
 
     try testing.expectEqual(@as(usize, 24 * 12), model.vertices.len);
     try testing.expectEqual(@as(usize, 1), model.submeshes.len);
+    // names: one per submesh; pbrCubeGlb's mesh is named "Cube".
+    try testing.expectEqual(model.submeshes.len, model.names.len);
+    try testing.expectEqualStrings("Cube", model.names[0]);
     const s = model.submeshes[0];
     try testing.expectApproxEqAbs(@as(f32, 1.0), s.metallic, 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 1.0), s.roughness, 1e-6);
@@ -835,6 +877,18 @@ test "neutral-texture baking: no textures → deduped neutrals appended" {
     try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, white.rgba);
     const flat = model.textures[@intCast(s.tex_normal)];
     try testing.expectEqualSlices(u8, &.{ 128, 128, 255, 255 }, flat.rgba);
+}
+
+test "names: mesh + node both unnamed → fallback \"mesh0\"" {
+    // minimalNoTextureGlb: mesh has no "name", node {"mesh":0} has no "name" →
+    // submesh name falls back to "mesh{mesh_index}" == "mesh0".
+    const glb = try minimalNoTextureGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    try testing.expectEqual(model.submeshes.len, model.names.len);
+    try testing.expectEqual(@as(usize, 1), model.names.len);
+    try testing.expectEqualStrings("mesh0", model.names[0]);
 }
 
 test "rejects texCoord != 0" {
