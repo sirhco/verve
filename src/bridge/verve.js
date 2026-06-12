@@ -4190,7 +4190,17 @@
       vao = gl.createVertexArray();
       gl.bindVertexArray(vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
-      if (variant & 2) {
+      if (variant & 4) {
+        // PBR: pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40, stride 48
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);
+        gl.enableVertexAttribArray(1);
+        gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 48, 12);
+        gl.enableVertexAttribArray(2);
+        gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 48, 24);
+        gl.enableVertexAttribArray(3);
+        gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 48, 40);
+      } else if (variant & 2) {
         // lit/textured: pos f32x3 @0, normal f32x3 @12, uv f32x2 @24, stride 32
         gl.enableVertexAttribArray(0);
         gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 32, 0);
@@ -4253,13 +4263,41 @@
           const vs = readStr(dv.getUint32(off + 8, true), dv.getUint32(off + 12, true));
           const fs = readStr(dv.getUint32(off + 16, true), dv.getUint32(off + 20, true));
           const prog = glCompile(gl, vs, fs);
-          st.shaders[handle] = {
+          const sh = {
             prog,
             variant,
             mvp: gl.getUniformLocation(prog, "u_mvp"),
             color: (variant & 2) ? gl.getUniformLocation(prog, "u_color") : null,
             tex: (variant & 2) ? gl.getUniformLocation(prog, "u_tex") : null,
           };
+          if (variant & 4) { // PBR über-shader: cache extra locations + preset samplers
+            sh.model = gl.getUniformLocation(prog, "u_model");
+            sh.normalMat = gl.getUniformLocation(prog, "u_normal_mat");
+            sh.cameraPos = gl.getUniformLocation(prog, "u_camera_pos");
+            sh.material = gl.getUniformLocation(prog, "u_material");
+            sh.lights = gl.getUniformLocation(prog, "u_lights");
+            sh.lightCount = gl.getUniformLocation(prog, "u_light_count");
+            sh.prefMips = gl.getUniformLocation(prog, "u_prefiltered_mips");
+            // Sampler units are fixed at link time. Only set the ones that exist
+            // in this variant's compiled program (variant-stripped samplers
+            // return a null location). useProgram is required before uniform1i;
+            // SET_PIPELINE re-useProgram's every frame, so this stray bind is
+            // harmless to the active-program state machine.
+            gl.useProgram(prog);
+            const setSampler = (name, unit) => {
+              const loc = gl.getUniformLocation(prog, name);
+              if (loc) gl.uniform1i(loc, unit);
+            };
+            setSampler("u_base_tex", 0);
+            setSampler("u_mr_tex", 1);
+            setSampler("u_normal_tex", 2); // only when variant & 8
+            setSampler("u_emissive_tex", 3); // only when variant & 16
+            setSampler("u_occlusion_tex", 4);
+            setSampler("u_irradiance", 5);
+            setSampler("u_prefiltered", 6);
+            setSampler("u_brdf_lut", 7);
+          }
+          st.shaders[handle] = sh;
           break;
         }
         case 4: { // SET_PIPELINE
@@ -4301,15 +4339,15 @@
             gl.UNSIGNED_BYTE, new Uint8Array(memory.buffer, p, len));
           gl.generateMipmap(gl.TEXTURE_2D);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-          st.textures[handle] = tex;
+          st.textures[handle] = { tex, target: gl.TEXTURE_2D };
           break;
         }
         case 8: { // BIND_TEXTURE
           const slot = dv.getUint32(off, true);
-          const tex = st.textures[dv.getUint32(off + 4, true)];
-          if (!tex) break;
+          const entry = st.textures[dv.getUint32(off + 4, true)];
+          if (!entry) break;
           gl.activeTexture(gl.TEXTURE0 + slot);
-          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.bindTexture(entry.target, entry.tex);
           if (st.active && st.active.tex) gl.uniform1i(st.active.tex, slot);
           break;
         }
@@ -4325,6 +4363,103 @@
           gl.uniformMatrix4fv(st.active.mvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
           if (st.active.color)
             gl.uniform4fv(st.active.color, new Float32Array(memory.buffer, colorPtr, 4));
+          gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
+        case 10: { // CREATE_TEXTURE_EX — explicit-mip 2D/cube, RGBA8 or RGBA16F, no auto-mip
+          const handle = dv.getUint32(off, true);
+          const target = dv.getUint32(off + 4, true);
+          const format = dv.getUint32(off + 8, true);
+          const w = dv.getUint32(off + 12, true);
+          const h = dv.getUint32(off + 16, true);
+          const mips = dv.getUint32(off + 20, true);
+          const p = dv.getUint32(off + 24, true);
+          // off + 28 = byte_len (informational; views derive size per mip/face)
+          const cube = target === 1;
+          const glTarget = cube ? gl.TEXTURE_CUBE_MAP : gl.TEXTURE_2D;
+          const f16 = format === 1;
+          const internal = f16 ? gl.RGBA16F : gl.RGBA8;
+          const type = f16 ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+          const bpt = f16 ? 8 : 4; // bytes per texel (RGBA)
+          const tex = gl.createTexture();
+          gl.bindTexture(glTarget, tex);
+          const faces = cube ? 6 : 1;
+          let cursor = p;
+          // Layout: mip-major then face-major (cube: +X,-X,+Y,-Y,+Z,-Z).
+          for (let m = 0; m < mips; m++) {
+            const mw = Math.max(1, w >> m);
+            const mh = Math.max(1, h >> m);
+            for (let face = 0; face < faces; face++) {
+              const count = mw * mh * 4;
+              const view = f16
+                ? new Uint16Array(memory.buffer, cursor, count)
+                : new Uint8Array(memory.buffer, cursor, count);
+              const dst = cube ? gl.TEXTURE_CUBE_MAP_POSITIVE_X + face : gl.TEXTURE_2D;
+              gl.texImage2D(dst, m, internal, mw, mh, 0, gl.RGBA, type, view);
+              cursor += mw * mh * bpt;
+            }
+          }
+          gl.texParameteri(glTarget, gl.TEXTURE_MAX_LEVEL, mips - 1);
+          gl.texParameteri(glTarget, gl.TEXTURE_MIN_FILTER,
+            mips > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+          gl.texParameteri(glTarget, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(glTarget, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(glTarget, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          st.textures[handle] = { tex, target: glTarget };
+          break;
+        }
+        case 11: { // SET_LIGHTS — uniform4fv on the active PBR program (defensive skip)
+          const count = dv.getUint32(off, true);
+          const p = dv.getUint32(off + 4, true);
+          if (st.active && st.active.lights) {
+            // u_lights is vec4[8] (32 floats); count*8 floats updates only the
+            // leading vec4 elements — legal short uniform4fv in WebGL2.
+            gl.uniform4fv(st.active.lights, new Float32Array(memory.buffer, p, count * 8));
+            if (st.active.lightCount) gl.uniform1i(st.active.lightCount, count);
+          }
+          break;
+        }
+        case 12: { // BIND_IBL — irradiance(5)/prefiltered(6)/brdf_lut(7) on active program
+          const irr = st.textures[dv.getUint32(off, true)];
+          const spec = st.textures[dv.getUint32(off + 4, true)];
+          const lut = st.textures[dv.getUint32(off + 8, true)];
+          const specMips = dv.getUint32(off + 12, true);
+          if (irr) {
+            gl.activeTexture(gl.TEXTURE5);
+            gl.bindTexture(irr.target, irr.tex);
+          }
+          if (spec) {
+            gl.activeTexture(gl.TEXTURE6);
+            gl.bindTexture(spec.target, spec.tex);
+          }
+          if (lut) {
+            gl.activeTexture(gl.TEXTURE7);
+            gl.bindTexture(lut.target, lut.tex);
+          }
+          if (st.active && st.active.prefMips) gl.uniform1f(st.active.prefMips, specMips);
+          break;
+        }
+        case 13: { // DRAW_PBR — full PBR submesh draw
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const mvpPtr = dv.getUint32(off + 16, true);
+          const modelPtr = dv.getUint32(off + 20, true);
+          const normalPtr = dv.getUint32(off + 24, true);
+          const materialPtr = dv.getUint32(off + 28, true);
+          const cameraPtr = dv.getUint32(off + 32, true);
+          if (!st.buffers[vh] || !st.buffers[ih] || !st.active) break;
+          bindVaoFor(st, vh, ih);
+          gl.uniformMatrix4fv(st.active.mvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
+          if (st.active.model)
+            gl.uniformMatrix4fv(st.active.model, false, new Float32Array(memory.buffer, modelPtr, 16));
+          if (st.active.normalMat)
+            gl.uniformMatrix3fv(st.active.normalMat, false, new Float32Array(memory.buffer, normalPtr, 9));
+          if (st.active.material)
+            gl.uniform4fv(st.active.material, new Float32Array(memory.buffer, materialPtr, 12));
+          if (st.active.cameraPos)
+            gl.uniform3fv(st.active.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
           break;
         }
@@ -4441,13 +4576,15 @@
                 })
                 .then((ab) => {
                   const bytes = new Uint8Array(ab);
-                  // verve_chunk_alloc lives on the MAIN client (exp), not the chunk.
-                  // Same pattern as the drag-drop path (verve.js:3665).
-                  const ptr = typeof exp.verve_chunk_alloc === "function"
-                    ? exp.verve_chunk_alloc(bytes.length >>> 0, 16)
+                  // verve_asset_alloc lives on the MAIN client (exp), not the chunk —
+                  // the gl asset region is page-scoped runtime state. 16-byte
+                  // alignment kept: Uint16Array views need >=2 and .venv internal
+                  // offsets are 16-aligned.
+                  const ptr = typeof exp.verve_asset_alloc === "function"
+                    ? exp.verve_asset_alloc(bytes.length >>> 0, 16)
                     : 0;
                   if (!ptr) {
-                    console.error("verve.gl: chunk arena full for", url);
+                    console.error("verve.gl: asset region full for", url);
                     exports[cb](0, 0);
                     return;
                   }
