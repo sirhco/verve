@@ -8,6 +8,66 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`verve.gl` P4 — interactive orbit camera, BVH ray-picking,
+  declarative `ctx.glScene`, GPU lifecycle** (`src/core/gl/orbit.zig`,
+  `ray.zig`, `bvh.zig`, `registry.zig`, `src/core/gl_scene.zig`,
+  `src/client/islands/GlScene.zig`):
+  - **Orbit camera** (`orbit.zig`): damped spherical-coordinate
+    controller. `OrbitInput` carries `dyaw/dpitch/dzoom` impulses;
+    `Orbit.tick(dt_ms, input)` integrates via frame-rate-independent
+    exponential decay (`a = 1 − exp(−k·dt_s)`); `eye()` and
+    `viewMatrix(up)` expose the result. Min/max clamps on distance and
+    pitch. `autoRotate` in `GlScene` bypasses damping for a constant
+    rad/s rate.
+  - **Pick ray** (`ray.zig`): `rayFromCamera(eye, target, up, fov_y,
+    aspect, ndc_x, ndc_y)` builds the camera basis analytically (no
+    matrix inverse). `intersectTriangle` uses Möller–Trumbore.
+  - **BVH** (`bvh.zig`): flat 32-byte nodes (FROZEN format: `aabb_min
+    f32×3 @0`, `aabb_max f32×3 @12`, `left_or_first u32 @24`, `count
+    u32 @28`). `bvh.build` (native, median split, allocating).
+    `bvh.walk` (freestanding, fixed `[64]u32` stack, no alloc — wasm
+    safe). `nodesFromBytes` / `triPermFromBytes` reinterpret vmesh BVH
+    section in place.
+  - **vmesh v3**: 56-byte header gains `bvh_off`, `bvh_node_count`,
+    `name_table_off`, `name_count` (fields @40–@55). BVH nodes +
+    tri-perm appended after texture blob (16-aligned). Name table: 12
+    bytes/entry (FNV-1a-32 hash, absolute blob offset, blob_len), then
+    UTF-8 name blob. Entry index == submesh index. `gl_asset_gen` bakes
+    BVH + names at build time; `gltf.zig` extracts mesh/node names with
+    `"mesh{n}"` fallback. v1/v2 files hard-rejected by the reader.
+  - **GPU resource registry** (`registry.zig`): `Registry(cap)` — fixed
+    comptime capacity, freestanding. `record{Buffer,Shader,Texture,
+    TextureEx}` mirror each `CREATE_*` issue. `replay(enc)` re-emits all
+    records into an `Encoder` on context restore. `overflowed()` signals
+    capacity exhaustion. Asset-region pointers remain valid across
+    context loss for the page lifetime.
+  - **DELETE_RESOURCE wire tag 14**: `Encoder.deleteResource(kind,
+    handle)` — payload 8 bytes (`kind u32`, `handle u32`; 0=buffer,
+    1=texture, 2=shader). Bridge frees the GPU object and nulls the
+    handle slot. Issued on island unmount and resource replacement. P3
+    bytes untouched — P4 is strictly additive.
+  - **GPU lifecycle management**: bridge `disposeGlState` on island
+    unmount (`canvas.isConnected`) and when frame export returns 0.
+    `webglcontextlost` (preventDefault, loop stopped) and
+    `webglcontextrestored` (handle arrays reset, `<frame>_restore` called,
+    loop resumed). Poster swap: `img[data-gl-poster]` hidden on first
+    non-empty `interpret()`, restored on context loss or no-WebGL2.
+  - **`ctx.glScene` declarative builder** (`src/core/gl_scene.zig`):
+    fluent `GlSceneBuilder` — `.camera(opts)`, `.light(opts)`,
+    `.autoRotate(rad_s)`, `.onPick(name, closure_id)` (cap 4), `.build()`
+    → `*verve.Node`. Emits `<div>` wrapper, `<canvas>` with orbit/pick
+    event handlers, optional `<img data-gl-poster>`, wrapped in the
+    `GlScene` island marker. Props positional contract: `src`, `env`,
+    `orbit_distance`, `orbit_pitch`, `orbit_yaw`, `auto_rotate`,
+    `light_dir_x/y/z` (scalars — codec lacks fixed arrays),
+    `light_intensity`, `pick_names[]`, `pick_event_ids[]`.
+  - **`GlScene` island chunk** (`src/client/islands/GlScene.zig`,
+    ~33 KB wasm): orbit drag/wheel via pointer capture, click pick +
+    frame-throttled hover (`data-gl-pick` / `data-gl-hover` attrs +
+    `dispatchEvent` closure ids). Model identity; camera orbits.
+    `glscene_frame_restore` export triggers `registry.replay` on next
+    frame. `/gl-scene` demo route: declarative orbit + auto-rotate +
+    picking.
 - **`verve.gl` P3 — PBR metallic-roughness über-shader, image-based
   lighting, directional/point lights, ACES tonemap** (`src/core/gl/`,
   `src/client/asset_region.zig`): Cook-Torrance GGX + split-sum IBL +
@@ -47,6 +107,10 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`verve.gl` fixture cube winding** (`src/core/gl/fixture.zig`): the
+  ±X and ±Y faces of the procedural unit cube had CW vertex order since
+  P2, causing backface culling to discard the exterior surfaces — the
+  cube rendered inside-out. Corrected to CCW in commit e1818c2.
 - Win-native smoke page now loads over the boot `verve://` navigation
   (asset-table entry) instead of racing it with `loadHtml` — exercises
   the embedded asset router on hardware.
