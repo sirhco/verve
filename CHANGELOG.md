@@ -8,6 +8,23 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`verve.gl` P3 — PBR metallic-roughness über-shader, image-based
+  lighting, directional/point lights, ACES tonemap** (`src/core/gl/`,
+  `src/client/asset_region.zig`): Cook-Torrance GGX + split-sum IBL +
+  ACES comptime über-shader with `variant_pbr` / `variant_normal_map` /
+  `variant_emissive` sub-bits; four new wire tags (`CREATE_TEXTURE_EX`,
+  `SET_LIGHTS`, `BIND_IBL`, `DRAW_PBR`); uniform/sampler contract
+  (slots 0–4 material, 5/6/7 IBL); material block 12 f32; up to 4
+  lights × 8 f32. vmesh v2: stride-48 vertices (pos/normal/tangent4/uv),
+  72-byte PBR submesh records, build-side tangent generation. `.venv`
+  prefiltered environment format: RGBA16F-only irradiance 32² + 6-mip
+  specular 128² + BRDF LUT 64² — prefilter runs at build time (~3.6 s).
+  Dedicated 4 MB page-scoped client asset region (`verve_asset_alloc /
+  reset / used`) replaces chunk arena for large fetched assets. FNV-64
+  GLSL hash goldens freeze all PBR shader permutations; venv hostile
+  tests; prefilter numerics tests. sRGB decode in-shader (pow 2.2) for
+  base-color and emissive only. Demo `/gl` route: full-variant PBR cube
+  under studio IBL + warm dir light + cool point light.
 - **`verve.gl` — native 3D engine, phases P1–P2** (new, `src/core/gl/`):
   pure-Zig scene graph (SoA, pre-order dirty propagation), column-major
   f32 math, and a flat binary command stream walked by a small WebGL2
