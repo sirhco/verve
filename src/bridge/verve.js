@@ -4575,8 +4575,11 @@
       const dt = st.last ? now - st.last : 16.7;
       st.last = now;
       const dpr = window.devicePixelRatio || 1;
-      const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
-      const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+      // Clamp the backing store: an unstyled canvas would otherwise feed its
+      // own attribute size back through clientWidth and grow exponentially
+      // (the canvas CSS is the real fix; this caps the damage if it's missing).
+      const w = Math.min(4096, Math.max(1, Math.round(canvas.clientWidth * dpr)));
+      const h = Math.min(4096, Math.max(1, Math.round(canvas.clientHeight * dpr)));
       if (canvas.width !== w) canvas.width = w;
       if (canvas.height !== h) canvas.height = h;
       const ptr = st.exports[st.exportName](dt, w, h) >>> 0;

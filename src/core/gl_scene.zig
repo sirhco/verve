@@ -122,15 +122,24 @@ pub const GlSceneBuilder = struct {
             return poison;
         };
 
+        // The canvas MUST be CSS-sized (decoupled from its width/height
+        // attributes): the gl loop sets the backing-store size from
+        // clientWidth×dpr each frame, and an unstyled canvas would grow its
+        // own layout box from those attributes — an exponential resize
+        // feedback loop (observed on Firefox: 9600 → 19200 → … px).
+        // The embedding container supplies the definite size (e.g. the demo
+        // page wraps the island in width:100%/aspect-ratio:8/5).
         const canvas = self.ctx.el("canvas")
             .attr("data-ref", "glscene-canvas")
+            .attr("style", "display:block;width:100%;height:100%")
             .onPointerDown("glscene_pointerdown")
             .onPointerMove("glscene_pointermove")
             .onPointerUp("glscene_pointerup")
             .onWheel("glscene_wheel")
             .onClick("glscene_click");
 
-        const wrapper = self.ctx.div().attr("style", "position:relative");
+        const wrapper = self.ctx.div()
+            .attr("style", "position:relative;display:block;width:100%;height:100%");
         if (self.opts.poster) |poster_url| {
             _ = wrapper.children(.{
                 canvas,
