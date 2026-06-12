@@ -28,7 +28,7 @@ zig fmt --check build.zig src tests   # format gate
 
 Source under `src/` splits into framework vs. user-app vs. target runtimes:
 
-- **`src/core/`** — framework primitives, target-agnostic: `node.zig` (the `*Node` tree), `signal`/`effect`/`owner`/`resource`/`store` (reactive graph), `renderer`, `route`, `context` (the `ctx` passed to every render fn), `head`, `i18n`, `markdown`/`highlight` (server-side, replaces marked/highlight.js), `island`, `island_state`, `server_fn`, `csrf`, `sanitize`.
+- **`src/core/`** — framework primitives, target-agnostic: `node.zig` (the `*Node` tree), `signal`/`effect`/`owner`/`resource`/`store` (reactive graph), `renderer`, `route`, `context` (the `ctx` passed to every render fn), `head`, `i18n`, `markdown`/`highlight` (server-side, replaces marked/highlight.js), `island`, `island_state`, `server_fn`, `csrf`, `sanitize`; plus the domain libraries `viz/` (charts/graphs → SVG), `anim/` (tween/timeline engine + JSON wire format), and `gl/` (3D engine + binary command stream + .glb/.vmesh/PNG asset pipeline — its `command.zig` goldens freeze the Zig↔JS wire contract).
 - **`src/verve.zig`** — the **public module surface**: re-exports everything apps are allowed to touch (`Node`, `Signal`, `Route`, `Context`, `island`, `createResource`, i18n helpers, …). This is the `verve` import in app code. Treat it as the API boundary.
 - **`src/app/`** — the **user-editable demo app**, the part you change to build a site: `routes.zig` (the route table — `verve.Route.init(path, renderFn)`, `.layout(...)`, `.protect(guard)`), `components.zig`, `api.zig`, `islands.zig` (island registry — see below).
 - **`src/server/`** — HTTP server: `router`, `api_handler`, `pool`, `metrics`, `gzip`, `public_dir`.
@@ -54,4 +54,4 @@ An island is declared as a `pub const <Name> = struct { pub const props_schema =
 
 ## Docs
 
-`docs/` holds 23 numbered topic guides (`01-getting-started` … `23-animation`); `docs/README.md` is the index. `examples/` has runnable apps including `examples/showcase/`. Note: counts/specs in older docs (e.g. getting-started's "37 tests") may lag the README — trust `build.zig` and the README.
+`docs/` holds 24 numbered topic guides (`01-getting-started` … `24-gl`); `docs/README.md` is the index. `examples/` has runnable apps including `examples/showcase/`. Note: counts/specs in older docs (e.g. getting-started's "37 tests") may lag the README — trust `build.zig` and the README.

@@ -6,6 +6,42 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` — native 3D engine, phases P1–P2** (new, `src/core/gl/`):
+  pure-Zig scene graph (SoA, pre-order dirty propagation), column-major
+  f32 math, and a flat binary command stream walked by a small WebGL2
+  interpreter in the bridge — zero-copy typed-array views over linear
+  memory, byte layout frozen by golden tests (`command.zig`). Unlit
+  vertex-color and textured/lit shader variants. Guide: `docs/24-gl.md`;
+  demo: the `/gl` route.
+- **`verve.gl` asset pipeline**: build-time `.glb` → packed `.vmesh`
+  (`tools/gen_demo_glb` + `tools/gl_asset_gen`, wired into `build.zig`,
+  served at `/gl/<name>.vmesh`); pure-Zig PNG decode/encode, glb parser,
+  and a freestanding zero-parse `.vmesh` reader — all hardened against
+  hostile input. Runtime fetch into the chunk arena via the `gl_load`
+  chunk import.
+- **Windows ARM64 cross-compile gate**: `zig build win-native-arm64`
+  (artifacts under `zig-out/bin/arm64/`). Both WebView2 loader DLLs
+  (x64 + arm64, SDK 1.0.3967.48) are now vendored — fresh clones build
+  and run the smoke without manual DLL placement. Native-host smoke and
+  the scaffolded desktop app hardware-validated on Windows x86-64 and
+  ARM64.
+
+### Fixed
+
+- Win-native smoke page now loads over the boot `verve://` navigation
+  (asset-table entry) instead of racing it with `loadHtml` — exercises
+  the embedded asset router on hardware.
+- `vtSlot` COM helper: `@alignCast` required by aarch64.
+
+### Known limitations
+
+- Island chunks all link static data at the same base in the shared
+  linear memory: at most **one stateful chunk per page** (the `/gl` demo
+  drives both canvases from a single chunk for this reason). Framework
+  fix (per-chunk data regions) planned.
+
 ## [0.4.0] - 2026-06-11
 
 The animation release: a complete GSAP-class animation engine

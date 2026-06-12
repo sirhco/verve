@@ -28,6 +28,7 @@ you know what you need.
 21. [Markdown & syntax highlighting](21-markdown-and-highlighting.md) — pure-Zig server-side GFM markdown + code highlighting, safe-by-default, `ctx.markdown` / `ctx.codeBlock` / `verve.highlightThemeCss`
 22. [Visualization](22-visualization.md) — native `verve.viz` graphs/hierarchies/charts: SVG scene model, scales/axes, tree/radial/force/dag layouts with curved/orthogonal edge routing, 15 chart types (incl. sankey/treemap/chord), interactive islands with zoom/pan/drag/select, subtree collapse, runtime mutation under any layout, and live SSE wire-delta streaming
 23. [Animation](23-animation.md) — `verve.anim` GSAP-class engine: tweens/timelines/keyframes with 31 easings, stagger, dynamic values, modifiers, control API; ScrollTrigger (toggle actions, scrub, pins, snap, markers, zero-wasm reveals) + Observer; ScrollSmoother (native-scroll-preserving, parallax); MotionPath + MorphSVG (full SVG `d` parser, morph-from-current on islands); Draggable (bounds/snap/inertia/drop zones); SplitText (server-side splitting) + FLIP (enter/leave callbacks); built-in prefers-reduced-motion handling throughout
+24. [3D engine](24-gl.md) — `verve.gl`: Zig-side scene graph + binary command stream, dumb WebGL2 interpreter in the bridge (zero-copy over linear memory, golden-frozen wire contract); asset pipeline (.glb → packed .vmesh at build time, pure-Zig PNG decode, hostile-input hardened), unlit + textured/lit shader variants, runtime asset fetch via the chunk arena; demo at `/gl`
 
 ## Reference
 

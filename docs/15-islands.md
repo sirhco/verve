@@ -205,6 +205,17 @@ Result: a stub chunk weighs **~73 bytes**; a real chunk like
 **~290 bytes**. Pages without an island skip its chunk entirely;
 pages with one pay only that cost plus the network round-trip.
 
+> **Constraint — at most one stateful chunk per page.** Every chunk is
+> linked independently, so each one places its static data (mutable
+> `var`s AND `const` rodata like string literals) at the *same* base
+> address in the shared memory. Two co-located chunks with static state
+> silently clobber each other — symptoms range from corrupted state to
+> garbled strings. Stay safe by keeping chunk state in the main
+> runtime (named Signals, `chunkArena()` allocations) or by merging
+> co-located stateful features into one chunk with multiple exports —
+> the `/gl` demo's `GlDemo` chunk drives two canvases this way. A
+> framework-level fix (per-chunk reserved data regions) is planned.
+
 ## Build artifacts
 
 `zig build` produces:

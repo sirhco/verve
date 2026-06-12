@@ -151,6 +151,13 @@ GSAP-class animation engine, pure Zig + one hand-written JS interpreter — no G
 - **Draggable** — axis locks, bounds (selector or rect), grid/point snap, **analytic inertia throws** (velocity-continuous endpoint projection), drop zones with hover class + `on_drop`, pointer-capture gestures that keep inner clicks working.
 - **SplitText + FLIP** — chars/words split **server-side** (zero JS, two a11y attributes); line grouping at hydrate; FLIP layout animation over the keyed reconciler (identity + `data-vkey` matching, synchronous invert, enter/leave callbacks, entered-element fade-in).
 
+### 3D engine (`verve.gl`)
+Native 3D, pure Zig + one dumb WebGL2 interpreter — no three.js. The whole engine (scene graph, transforms, draw ordering, asset parsing) runs in wasm and emits a flat binary command stream into linear memory; the bridge walks it with zero-copy typed-array views. Wire contract frozen by byte-exact golden tests (the anim `serialize.zig` pattern). Guide: [`docs/24-gl.md`](docs/24-gl.md). Demo: the `/gl` route (`zig build run`).
+- **Engine core** — column-major f32 math, struct-of-arrays scene graph with pre-order dirty propagation, API-neutral command stream (WebGPU later = a second interpreter, same bytes), unlit vertex-color + textured/lit shader variants.
+- **Asset pipeline** — build-time `.glb` → packed `.vmesh` (`tools/gl_asset_gen`): zero runtime parsing, fetch → linear memory → GPU upload. Pure-Zig PNG decoder, glb parser, and vmesh reader, all hardened against hostile input (errors, never panics). Demo asset is fully procedural — no binaries in the repo.
+- **Runtime loading** — islands fetch `.vmesh` over `gl_load` into the chunk arena; failed fetches degrade to clear-only frames with a structured console error.
+- **Roadmap** — P3 PBR + image-based lighting, P4 orbit controls/picking/declarative `ctx.glScene`, P5 verve.anim fusion (scroll-scrubbed 3D).
+
 ### Markdown & syntax highlighting
 Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed at SSR time into the `Node` tree; no client wasm, no JavaScript. Guide: [`docs/21-markdown-and-highlighting.md`](docs/21-markdown-and-highlighting.md). Demo: [`examples/markdown/`](examples/markdown/README.md).
 - **`ctx.markdown(src)`** — GFM: CommonMark core + tables, task lists, strikethrough, autolinks, reference links. Returns a real `Node` subtree, so text is escaped by the one renderer escaper.
