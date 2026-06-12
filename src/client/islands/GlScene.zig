@@ -1,0 +1,546 @@
+//! verve.gl interactive scene chunk — orbit camera + ray-picking + autoRotate,
+//! with Registry-driven GPU-resource replay across WebGL context restore.
+//!
+//! WHY ONE STATEFUL CHUNK PER PAGE: per-island wasm chunks share the main
+//! client's linear memory and each links its static data starting at the same
+//! base (0x1000). Two stateful gl chunks on one page overlap their data
+//! segments (the same hazard documented in GlDemo.zig). The framework invariant
+//! (build.zig) allows at most ONE stateful chunk per page, so GlScene must live
+//! alone on its route (/gl-scene, Task 13) — never co-located with GlDemo.
+//!
+//! Multi-instance: singleton statics, same documented choice as GlDemo. The
+//! per-instance vid (root_id) scopes ref lookups; a second scene on one page
+//! would need namespacing.
+//!
+//! ── DESIGN CHOICES (see Task 12 spec) ───────────────────────────────────────
+//!  • Model matrix = IDENTITY; the CAMERA orbits. mvp = proj · view · identity,
+//!    so the normal matrix is identity-9 and the pick ray operates directly in
+//!    world == model space (no world→local inverse). autoRotate spins the
+//!    camera, not the mesh — picking stays coherent at every yaw.
+//!  • autoRotate BYPASSES the orbit damping: `orbit.yaw += auto_rotate*dt_s`
+//!    applied before tick(), giving a constant angular rate (rad/s) rather than
+//!    an impulse that decays. User drag impulses still flow through tick().
+//!  • Drag sign: orbit.eye() uses +sin(yaw) for +X. Dragging RIGHT should make
+//!    the model appear to follow the pointer → the camera swings LEFT → yaw
+//!    decreases. Hence `dyaw -= dx*sens`. Same logic vertically: `dpitch -=
+//!    dy*sens`. orbit.tick() clamps pitch to [min,max].
+//!  • Wheel: scroll DOWN (deltaY>0) zooms OUT (distance grows) → `dzoom +=
+//!    deltaY*zoom_sens`. orbit.tick() clamps distance.
+//!  • Pick dispatch: each picked submesh name is matched against pick_names[i];
+//!    on a match we fire the SSR-registered closure via dispatchEvent(
+//!    pick_event_ids[i]). dispatchEvent runs whatever event slot the SSR
+//!    `onPick(name, id)` registered, restoring that island's vid — a real
+//!    chunk→event-dispatch path, no gap.
+//!  • Hover: implemented (same ray path, throttled to one raycast per frame
+//!    while NOT dragging). Stamps data-gl-hover on the canvas.
+//!
+//! ── Context-restore (Registry replay) ───────────────────────────────────────
+//! Unlike GlDemo (whose restore re-runs its create block by clearing a flag),
+//! GlScene's create block runs exactly ONCE at startup (`resources_sent`).
+//! Every create* is mirrored into `registry` as it's issued. On restore the
+//! bridge calls `glscene_frame_restore` (Task 9 "<frame>_restore" convention),
+//! which sets `needs_replay`; the next frame emits `registry.replay(&enc)` to
+//! re-upload all GPU resources WITHOUT re-recording, then resumes normal
+//! frames. Asset Reader bytes live in the page-scoped asset region, so the
+//! recorded pointers stay valid for the page lifetime.
+
+const verve = @import("verve");
+const gl = verve.gl;
+
+extern "verve" fn gl_start(ref_handle: i32, name_ptr: [*]const u8, name_len: u32) void;
+extern "verve" fn gl_load(url_ptr: [*]const u8, url_len: u32, cb_ptr: [*]const u8, cb_len: u32) void;
+
+// ── Tuning ───────────────────────────────────────────────────────────────────
+
+const drag_sens: f32 = 0.01; // rad per client px
+const zoom_sens: f32 = 0.005; // distance per wheel deltaY unit
+const fov_y: f32 = 1.0; // vertical fov (rad) — MUST match the proj below
+
+const vmesh_ready_export = "glscene_vmesh_ready";
+const env_ready_export = "glscene_env_ready";
+const frame_export = "glscene_frame";
+
+// GPU resource handles (kept distinct from IBL handles 16/17/18).
+const vbuf: u32 = 1;
+const ibuf: u32 = 2;
+const shader: u32 = 1;
+const irr_handle: u32 = 16;
+const spec_handle: u32 = 17;
+const lut_handle: u32 = 18;
+
+// Comptime PBR variant — full Cook-Torrance + IBL + tangent-space normals +
+// emissive (parity with GlDemo's textured model path).
+const pbr_variant = gl.command.variant_pbr | gl.command.variant_normal_map | gl.command.variant_emissive;
+
+const max_submesh = 8; // material-pool cap
+
+// ── Props copies (decoded from SSR data-props; copied to statics before the
+//    chunk arena that held the decode result is reset) ────────────────────────
+
+const Props = struct {
+    src: []const u8,
+    env: []const u8,
+    orbit_distance: f32,
+    orbit_pitch: f32,
+    orbit_yaw: f32,
+    auto_rotate: f32,
+    light_dir_x: f32,
+    light_dir_y: f32,
+    light_dir_z: f32,
+    light_intensity: f32,
+    pick_names: []const []const u8,
+    pick_event_ids: []const u32,
+};
+
+// URL buffers — asset paths copied out of the arena. 128 matches the asset-URL
+// envelope GlDemo uses for its compile-time literals ("/gl/demo.vmesh" etc.).
+var src_buf: [128]u8 = undefined;
+var src_len: usize = 0;
+var env_buf: [128]u8 = undefined;
+var env_len: usize = 0;
+
+const max_picks = 4; // mirror of gl_scene.zig max_picks
+const max_name = 64; // per-name fixed storage
+var pick_names: [max_picks][max_name]u8 = undefined;
+var pick_name_lens: [max_picks]usize = undefined;
+var pick_ids: [max_picks]u32 = undefined;
+var pick_count: usize = 0;
+
+var auto_rotate: f32 = 0;
+
+// ── Camera + input ───────────────────────────────────────────────────────────
+
+var orbit: gl.Orbit = .{};
+var input: gl.OrbitInput = .{};
+
+// ── Drag / pick interaction state ────────────────────────────────────────────
+
+var dragging: bool = false;
+var last_x: f64 = 0;
+var last_y: f64 = 0;
+
+var pick_pending: bool = false;
+var pick_ndc_x: f32 = 0;
+var pick_ndc_y: f32 = 0;
+
+var hover_have: bool = false; // a hover position is queued for this frame
+var hover_ndc_x: f32 = 0;
+var hover_ndc_y: f32 = 0;
+var hover_name_hash: u32 = 0; // last stamped hover name's hash (dedup stamps)
+const no_hover_hash: u32 = 0xFFFF_FFFF;
+
+// ── Assets ───────────────────────────────────────────────────────────────────
+
+var asset: ?gl.vmesh.Reader = null;
+var env_reader: ?gl.venv.Reader = null;
+
+// ── Render statics ───────────────────────────────────────────────────────────
+
+var mvp: [16]f32 = undefined;
+var model_mat: [16]f32 = identity4; // identity — camera orbits, model static
+var normal9: [9]f32 = identity3;
+var camera_pos: [3]f32 = .{ 0, 0, 4 }; // updated each frame to orbit.eye()
+
+const identity4: [16]f32 = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+const identity3: [9]f32 = .{ 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+
+// Per-submesh material block pool (12 f32 each) — each drawPbr points at its own
+// stable slot so the JS interpreter reads the right material when walking the
+// stream (same aliasing reason as GlDemo).
+var mats: [max_submesh][12]f32 = undefined;
+
+// Single directional light from props: 8 f32 [type, intensity, x,y,z, r,g,b].
+var lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 };
+
+var reduced_motion: bool = false;
+
+// GPU-resource registry for context-restore replay. Cap 32:
+//   2 buffers + 1 shader + up to 5 material textures + 3 IBL textures = 11
+//   worst case; 32 leaves generous headroom (no overflow).
+var registry: gl.Registry(32) = .{};
+var resources_sent: bool = false;
+var needs_replay: bool = false;
+
+// cmd_buf sizing (N = max_submesh = 8). Record = 4-byte header + payload.
+//   one-time create OR replay (same set):
+//     2×createBuffer(20) + createShader(28) + 5×createTexture(24)
+//     + 3×createTextureEx(36) = 40 + 28 + 120 + 108 = 296
+//   per-frame:
+//     header(4) + beginFrame(28) + setPipeline(12) + setLights(12)
+//     + bindIbl(20) + N×(5×bindTexture(12) + drawPbr(40)) = 8×100 = 800
+//     + endFrame(4) = 880
+//   worst case (create/replay + frame on one tick) = 296 + 880 = 1176.
+//   Round up to 4096 (matches GlDemo).
+var cmd_buf: [4096]u8 = undefined;
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+const up_vec = gl.math.Vec3.init(0, 1, 0);
+
+/// vmesh texture index → wire handle (slot t gets handle t+1). Negatives clamp
+/// to handle 0 (never created) instead of trapping (parity with GlDemo).
+fn texHandle(i: i32) u32 {
+    return if (i >= 0) @intCast(i + 1) else 0;
+}
+
+/// Map an ORIGINAL triangle index to its owning submesh index by scanning the
+/// submesh index ranges. A triangle's first index sits at element position
+/// `tri*3` in the u16 index array; submesh s owns elements
+/// [index_byte_off/2, index_byte_off/2 + index_count). Returns null if no
+/// submesh contains it (malformed mesh).
+fn submeshOfTri(a: *const gl.vmesh.Reader, tri: u32) ?u32 {
+    const first_index: u32 = tri * 3;
+    var s: u32 = 0;
+    while (s < a.submesh_count) : (s += 1) {
+        const sub = a.submesh(s);
+        const start = sub.index_byte_off / 2; // u16 indices: 2 bytes each
+        if (first_index >= start and first_index < start + sub.index_count) return s;
+    }
+    return null;
+}
+
+/// Convert client (clientX, clientY) to NDC using the canvas bounding rect.
+/// +x right, +y UP (NDC convention) — the browser's y grows downward, so y is
+/// flipped. Mirrors VizGraphInteractive's client→svg conversion, retargeted to
+/// canvas NDC.
+fn clientToNdc(canvas: i32, cx: f64, cy: f64, ndc_x: *f32, ndc_y: *f32) void {
+    const r = verve.refRect(canvas);
+    const nx: f64 = if (r.w == 0) 0 else (cx - r.x) / r.w * 2.0 - 1.0;
+    const ny: f64 = if (r.h == 0) 0 else 1.0 - (cy - r.y) / r.h * 2.0;
+    ndc_x.* = @floatCast(nx);
+    ndc_y.* = @floatCast(ny);
+}
+
+/// Resolve the canvas ref handle (raw name; runtime auto-scopes to this vid).
+fn canvasRef() ?i32 {
+    return verve.queryRef(@as([]const u8, "glscene-canvas"));
+}
+
+// ── hydrate ──────────────────────────────────────────────────────────────────
+
+export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
+    _ = root_id; // ref lookups auto-scope; no per-instance state beyond singletons
+
+    // This island owns the page's gl asset lifetime. Free any prior assets
+    // before re-fetching — the Reader slices below point into the asset region.
+    verve.assetReset();
+
+    // Reset interaction + GPU state for a fresh hydrate.
+    asset = null;
+    env_reader = null;
+    resources_sent = false;
+    needs_replay = false;
+    registry.reset();
+    dragging = false;
+    pick_pending = false;
+    hover_have = false;
+    hover_name_hash = no_hover_hash;
+    input = .{};
+    pick_count = 0;
+    model_mat = identity4;
+    normal9 = identity3;
+
+    // Defaults so a missing/garbage props blob still yields a usable scene.
+    src_len = 0;
+    env_len = 0;
+    auto_rotate = 0;
+    orbit = .{};
+
+    if (props_len != 0) {
+        const bytes = @as([*]const u8, @ptrFromInt(@as(usize, props_ptr)))[0..props_len];
+        const mark = verve.chunkArenaMark();
+        defer verve.chunkArenaReset(mark);
+        if (verve.decodeProps(Props, bytes, verve.chunkArena())) |p| {
+            // Copy every slice out of the arena BEFORE it's reset.
+            src_len = @min(p.src.len, src_buf.len);
+            @memcpy(src_buf[0..src_len], p.src[0..src_len]);
+            env_len = @min(p.env.len, env_buf.len);
+            @memcpy(env_buf[0..env_len], p.env[0..env_len]);
+
+            orbit = .{
+                .distance = p.orbit_distance,
+                .pitch = p.orbit_pitch,
+                .yaw = p.orbit_yaw,
+            };
+            auto_rotate = p.auto_rotate;
+
+            lights = .{
+                0, // type = directional
+                p.light_intensity,
+                p.light_dir_x,
+                p.light_dir_y,
+                p.light_dir_z,
+                1, 1, 1, // white
+            };
+
+            // Deep-copy pick names/ids into fixed statics (arena dies on reset).
+            pick_count = @min(@min(p.pick_names.len, p.pick_event_ids.len), max_picks);
+            var i: usize = 0;
+            while (i < pick_count) : (i += 1) {
+                const nm = p.pick_names[i];
+                const ln = @min(nm.len, max_name);
+                @memcpy(pick_names[i][0..ln], nm[0..ln]);
+                pick_name_lens[i] = ln;
+                pick_ids[i] = p.pick_event_ids[i];
+            }
+        } else |_| {}
+    }
+
+    // Cache reduced-motion once (matchMedia is a host round-trip).
+    reduced_motion = verve.matchMedia("(prefers-reduced-motion: reduce)");
+
+    // Kick the asset fetches (geometry + prefiltered IBL).
+    if (src_len != 0)
+        gl_load(&src_buf, @intCast(src_len), vmesh_ready_export.ptr, vmesh_ready_export.len);
+    if (env_len != 0)
+        gl_load(&env_buf, @intCast(env_len), env_ready_export.ptr, env_ready_export.len);
+
+    if (canvasRef()) |h|
+        gl_start(h, frame_export.ptr, frame_export.len);
+}
+
+// ── asset-ready callbacks ─────────────────────────────────────────────────────
+
+export fn glscene_vmesh_ready(ptr: u32, len: u32) void {
+    if (ptr == 0) return; // fetch failed → stay on clear-only frames
+    const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
+    asset = gl.vmesh.Reader.init(bytes) catch null;
+}
+
+export fn glscene_env_ready(ptr: u32, len: u32) void {
+    if (ptr == 0) return;
+    const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
+    env_reader = gl.venv.Reader.init(bytes) catch null;
+}
+
+// ── pointer / wheel / click handlers ──────────────────────────────────────────
+
+export fn glscene_pointerdown() void {
+    if (verve.eventButton() != 0) return; // primary button only
+    dragging = true;
+    last_x = verve.eventCoordX();
+    last_y = verve.eventCoordY();
+    verve.eventCapturePointer();
+}
+
+export fn glscene_pointermove() void {
+    const x = verve.eventCoordX();
+    const y = verve.eventCoordY();
+    if (dragging) {
+        const dx: f32 = @floatCast(x - last_x);
+        const dy: f32 = @floatCast(y - last_y);
+        // See drag-sign note up top: dragging right swings the camera left.
+        input.dyaw -= dx * drag_sens;
+        input.dpitch -= dy * drag_sens;
+        last_x = x;
+        last_y = y;
+    } else {
+        // Queue a hover raycast for the next frame (one raycast/frame max).
+        if (canvasRef()) |h| {
+            clientToNdc(h, x, y, &hover_ndc_x, &hover_ndc_y);
+            hover_have = true;
+        }
+    }
+}
+
+export fn glscene_pointerup() void {
+    dragging = false;
+}
+
+export fn glscene_wheel() void {
+    verve.eventPreventDefault();
+    input.dzoom += @as(f32, @floatCast(verve.eventDeltaY())) * zoom_sens;
+}
+
+export fn glscene_click() void {
+    if (canvasRef()) |h| {
+        clientToNdc(h, verve.eventCoordX(), verve.eventCoordY(), &pick_ndc_x, &pick_ndc_y);
+        pick_pending = true;
+    }
+}
+
+// ── context-restore hook ──────────────────────────────────────────────────────
+
+export fn glscene_frame_restore() void {
+    // The GL objects died with the old context. Re-emit every recorded create*
+    // on the next frame via registry.replay (the records persist). The bridge
+    // restores the poster itself.
+    needs_replay = true;
+}
+
+// ── pick raycast ──────────────────────────────────────────────────────────────
+
+/// Build a pick ray for `(ndc_x, ndc_y)` and walk the mesh BVH. Returns the
+/// picked submesh index, or null on miss / no BVH data.
+fn raycastSubmesh(a: *const gl.vmesh.Reader, aspect: f32, ndc_x: f32, ndc_y: f32) ?u32 {
+    if (a.bvh_node_count == 0) return null;
+    const r = gl.ray.rayFromCamera(orbit.eye(), orbit.target, up_vec, fov_y, aspect, ndc_x, ndc_y);
+    const nodes = gl.bvh.nodesFromBytes(a.bvh_nodes);
+    const tri_perm = gl.bvh.triPermFromBytes(a.tri_perm);
+    // Vertices: vmesh stride 48 bytes = 12 f32; position xyz at offset 0.
+    const verts_f32 = bytesAsF32(a.vertices);
+    const indices_u16 = bytesAsU16(a.indices);
+    const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, 12, indices_u16, r) orelse return null;
+    return submeshOfTri(a, hit.tri_index);
+}
+
+fn bytesAsF32(b: []const u8) []const f32 {
+    const ptr: [*]const f32 = @ptrCast(@alignCast(b.ptr));
+    return ptr[0 .. b.len / 4];
+}
+
+fn bytesAsU16(b: []const u8) []const u16 {
+    const ptr: [*]const u16 = @ptrCast(@alignCast(b.ptr));
+    return ptr[0 .. b.len / 2];
+}
+
+/// Stamp `data-<attr>` on the canvas with submesh `s`'s name.
+fn stampName(attr: []const u8, a: *const gl.vmesh.Reader, s: u32) void {
+    if (canvasRef()) |h| verve.setRefAttr(h, attr, a.name(s));
+}
+
+// ── frame ─────────────────────────────────────────────────────────────────────
+
+export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
+    // autoRotate spins the camera at a constant rate, bypassing damping.
+    if (!reduced_motion and auto_rotate != 0)
+        orbit.yaw += auto_rotate * (dt_ms / 1000.0);
+
+    // Consume accumulated pointer/wheel input, then zero the accumulator.
+    orbit.tick(dt_ms, input);
+    input = .{};
+
+    const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(@max(height, 1)));
+    const proj = gl.math.Mat4.perspective(fov_y, aspect, 0.1, 100.0);
+    // mvp = proj · view · identity. model_mat stays identity, so normal9 too.
+    mvp = proj.mul(orbit.viewMatrix(up_vec)).m;
+    const eye = orbit.eye();
+    camera_pos = .{ eye.x, eye.y, eye.z };
+
+    var enc = gl.Encoder.init(&cmd_buf);
+
+    if (asset != null and env_reader != null) {
+        const a = &asset.?;
+        const env = &env_reader.?;
+
+        if (!resources_sent) {
+            resources_sent = true;
+            sendResources(&enc, a, env);
+        } else if (needs_replay) {
+            needs_replay = false;
+            registry.replay(&enc);
+        }
+
+        // Process a queued pick (camera state is coherent this frame).
+        if (pick_pending) {
+            pick_pending = false;
+            if (raycastSubmesh(a, aspect, pick_ndc_x, pick_ndc_y)) |s| {
+                stampName("data-gl-pick", a, s);
+                dispatchPick(a, s);
+            }
+        }
+
+        // At most one hover raycast per frame, and only when not dragging.
+        if (hover_have and !dragging) {
+            hover_have = false;
+            if (raycastSubmesh(a, aspect, hover_ndc_x, hover_ndc_y)) |s| {
+                const hash = gl.vmesh.Reader.nameHash(a.name(s));
+                if (hash != hover_name_hash) {
+                    hover_name_hash = hash;
+                    stampName("data-gl-hover", a, s);
+                }
+            } else if (hover_name_hash != no_hover_hash) {
+                hover_name_hash = no_hover_hash;
+                if (canvasRef()) |h| verve.setRefAttr(h, "data-gl-hover", "");
+            }
+        }
+
+        normal9 = identity3; // model is identity; restate for clarity/stability
+
+        enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
+        enc.setPipeline(shader, gl.command.state_depth_test | gl.command.state_cull_back);
+        enc.setLights(1, @intCast(@intFromPtr(&lights)));
+        enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+
+        var s: u32 = 0;
+        while (s < a.submesh_count) : (s += 1) {
+            if (s >= max_submesh) break;
+            const sub = a.submesh(s);
+            mats[s] = .{
+                sub.base_color[0], sub.base_color[1], sub.base_color[2],      sub.base_color[3],
+                sub.metallic,      sub.roughness,     sub.occlusion_strength, sub.normal_scale,
+                sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        0,
+            };
+            enc.bindTexture(0, texHandle(sub.tex_base));
+            enc.bindTexture(1, texHandle(sub.tex_mr));
+            enc.bindTexture(2, texHandle(sub.tex_normal));
+            enc.bindTexture(3, texHandle(sub.tex_emissive));
+            enc.bindTexture(4, texHandle(sub.tex_occlusion));
+            enc.drawPbr(
+                vbuf,
+                ibuf,
+                sub.index_byte_off,
+                sub.index_count,
+                @intCast(@intFromPtr(&mvp)),
+                @intCast(@intFromPtr(&model_mat)),
+                @intCast(@intFromPtr(&normal9)),
+                @intCast(@intFromPtr(&mats[s])),
+                @intCast(@intFromPtr(&camera_pos)),
+            );
+        }
+        enc.endFrame();
+    } else {
+        // Assets still loading / failed: clear-only frame.
+        enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
+        enc.endFrame();
+    }
+    _ = enc.finish();
+    return @intCast(@intFromPtr(&cmd_buf));
+}
+
+/// One-time GPU resource upload, mirrored into `registry` for restore replay.
+fn sendResources(enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: *const gl.venv.Reader) void {
+    enc.createBuffer(vbuf, .vertex, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
+    registry.recordBuffer(vbuf, .vertex, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
+    enc.createBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
+    registry.recordBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
+
+    const vs = gl.command.pbrVertexSrc(pbr_variant);
+    const fs = gl.command.pbrFragmentSrc(pbr_variant);
+    enc.createShader(shader, pbr_variant, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    registry.recordShader(shader, pbr_variant, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+
+    var t: u32 = 0;
+    while (t < a.tex_count) : (t += 1) {
+        const tex = a.texture(t);
+        enc.createTexture(t + 1, tex.width, tex.height, @intCast(@intFromPtr(tex.rgba.ptr)), @intCast(tex.rgba.len));
+        registry.recordTexture(t + 1, tex.width, tex.height, @intCast(@intFromPtr(tex.rgba.ptr)), @intCast(tex.rgba.len));
+    }
+
+    enc.createTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));
+    registry.recordTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));
+    enc.createTextureEx(spec_handle, .cube, .rgba16f, env.spec_size, env.spec_size, env.spec_mip_count, @intCast(@intFromPtr(env.specular.ptr)), @intCast(env.specular.len));
+    registry.recordTextureEx(spec_handle, .cube, .rgba16f, env.spec_size, env.spec_size, env.spec_mip_count, @intCast(@intFromPtr(env.specular.ptr)), @intCast(env.specular.len));
+    enc.createTextureEx(lut_handle, .tex_2d, .rgba16f, env.lut_size, env.lut_size, 1, @intCast(@intFromPtr(env.lut.ptr)), @intCast(env.lut.len));
+    registry.recordTextureEx(lut_handle, .tex_2d, .rgba16f, env.lut_size, env.lut_size, 1, @intCast(@intFromPtr(env.lut.ptr)), @intCast(env.lut.len));
+}
+
+/// If submesh `s`'s name matches a registered pick name, fire its SSR closure.
+fn dispatchPick(a: *const gl.vmesh.Reader, s: u32) void {
+    const nm = a.name(s);
+    if (nm.len == 0) return;
+    var i: usize = 0;
+    while (i < pick_count) : (i += 1) {
+        const reg = pick_names[i][0..pick_name_lens[i]];
+        if (eql(reg, nm) and pick_ids[i] != 0) {
+            verve.dispatchEvent(pick_ids[i]);
+            return;
+        }
+    }
+}
+
+fn eql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x != y) return false;
+    return true;
+}
