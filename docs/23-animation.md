@@ -647,6 +647,45 @@ bridge's lerp/string-building halves against the same fixtures.
   hero, snapping section deck, transform-pinned panel, and a probe
   island showing native vs smoothed scroll diverge live.
 
+## gl-target tweens (`verve.gl` integration)
+
+`verve.anim` can drive 3D scene properties — camera orbit, material
+coefficients, model rotation — through the `glTarget` family of tween
+builders. This is an **island-only** surface (setter slots are resolved
+at chunk hydration time).
+
+```zig
+// resolve the target id once (after vmesh is loaded and names are known)
+const id = verve.gl.anim_target.resolvePath("camera.yaw", reader) orelse return;
+const slot = verve.animGlSetter(&myGlSetterFn);
+
+// tween camera yaw to 1.57 rad over 1 s
+const t = tween.to(alloc, null)
+    .duration(1.0)
+    .glTarget(id, slot, 1.57);
+```
+
+**Wire keys**: the serialized prop key is `"@gl:<target_id-decimal>"`
+(e.g. `"@gl:16777473"`); the value object is
+`{"gl":<id>,"gls":<slot>,"to":<num>}` with an optional `"f"` from-value.
+The anim interpreter routes `@gl`-prefixed props to the registered
+setter callback instead of any DOM write.
+
+**Builders**: `glTarget(id, slot, to)`, `glTargetFrom(id, slot, from)`,
+`glTargetRange(id, slot, from, to)`. All three live on `TweenBuilder`.
+`"@gl"` is a reserved selector name — passing it to `tween.to(alloc, "@gl")` is a build error.
+
+**Target-id encoding and supported paths**: see `docs/24-gl.md` — the
+P5 section documents the full bit layout (`kind/submesh/field`), the
+path grammar (`"camera.yaw"`, `"material:<Name>.roughness"`,
+`"model.yaw"`), and the setter-registration API
+(`verve.animGlSetter`).
+
+**Scroll scrub example**: the `/gl-scene` demo uses a scroll-scrubbed
+timeline to drive a model.yaw turntable (0 → 2π) and a material
+roughness sweep (0.045 → 1.0) as the user scrolls through a 300 vh
+section. The separate-rAF deviation (≤1 frame lag) is also noted there.
+
 ## Not yet
 
 The original GSAP-class spec is complete. Tracked follow-ups:

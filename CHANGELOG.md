@@ -8,6 +8,53 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`verve.gl` P5 — verve.anim fusion: gl-target tweens + scroll-scrub
+  demo** (`src/core/anim/tween.zig`, `src/core/anim/serialize.zig`,
+  `src/core/gl/anim_target.zig`, `src/client/island_runtime.zig`,
+  `src/bridge/verve.js`, `src/client/islands/GlScene.zig`,
+  `src/core/gl_scene.zig`):
+  - **gl-target prop kind** (`serialize.zig`): frozen wire key
+    `"@gl:<target_id-decimal>"`, value `{"gl":<id>,"gls":<slot>,
+    "to":<num>}` + optional `"f"` from-value. Non-gl output
+    byte-identical (frozen regression golden). The `@gl` prefix lets
+    `animWriteProp` route to the setter indirect table, returning before
+    any DOM write.
+  - **Target-id encoding** (`src/core/gl/anim_target.zig`, frozen):
+    u32 `[31:24]` kind (0=camera, 1=material, 2=model) | `[23:8]`
+    submesh (material only) | `[7:0]` field. Camera fields: yaw=0,
+    pitch=1, distance=2. Material: metallic=0, roughness=1. Model:
+    yaw=0. Path grammar: `"camera.yaw"`, `"material:<Name>.metallic"`,
+    `"model.yaw"` — resolved once at setup against the vmesh v3 name
+    table.
+  - **Tween builders** (`tween.zig`): `glTarget(id, slot, to)`,
+    `glTargetFrom(id, slot, from)`, `glTargetRange(id, slot, from,
+    to)` — island-only (slot resolved at hydration); `"@gl"` is a
+    reserved selector name.
+  - **Setter registration** (`island_runtime.zig`):
+    `animGlSetter(*const fn(u32,f64) void) u32` — registers a
+    `fn(target_id, value)` callback and returns its indirect-table
+    slot. Mirrors the `dyn`/`mod` registration pattern.
+  - **JS engine** (`verve.js`): `animWriteProp` gl branch interpolates
+    + applies modifiers then calls `indirectTable.get(gls)(gl, value)`;
+    `from` defaults to 0 when `"f"` is absent. `verve_anim_register_setter` import wires chunk-registered setters.
+  - **GlScene scroll-scrub** (`GlScene.zig`): `.scrub(true)` prop
+    zeroes autoRotate and builds a scroll-scrubbed timeline in
+    `vmesh_ready`: model.yaw turntable (current → current + 2π) +
+    `material:Cube.roughness` sweep (0.045 → 1.0), `ScrollTrigger`
+    over the island-internal section with `smooth: 0.4`.
+  - **`/gl-scene` route** updated: island-internal 300 vh section,
+    sticky 100 vh viewport, aspect-ratio canvas box, "scroll to spin"
+    copy.
+  - **Separate rAF loops kept** (deviation recorded): anim writes gl
+    statics on its own tick; gl reads them the next frame (≤1 frame
+    lag at 60 fps). Shared-tick pass deferred.
+  - **Deferred** (recorded): shared-rAF tick, `node:<Name>.rotation`
+    paths, emissive tween paths, SSR-side glTarget.
+  - **Wire goldens**: `@gl:<id>` key, `gl/gls/to/f` value fields —
+    frozen by golden tests in `serialize.zig`.
+  - Guide: `docs/24-gl.md` (P5 section); cross-ref in
+    `docs/23-animation.md`.
+
 - **`verve.gl` P4 — interactive orbit camera, BVH ray-picking,
   declarative `ctx.glScene`, GPU lifecycle** (`src/core/gl/orbit.zig`,
   `ray.zig`, `bvh.zig`, `registry.zig`, `src/core/gl_scene.zig`,
