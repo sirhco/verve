@@ -1174,7 +1174,7 @@ test "phase 7 polish: drop zones, morph-from-current ref, flip toggle, attr ops"
     try std.testing.expect(std.mem.indexOf(u8, js.body, "sE") != null);
 }
 
-test "/gl-scene serves GlScene island with canvas, poster, and non-empty data-props" {
+test "/gl-scene serves GlScene island with scroll section, canvas, poster, and non-empty data-props" {
     const gpa = std.testing.allocator;
 
     var threaded: std.Io.Threaded = undefined;
@@ -1196,8 +1196,18 @@ test "/gl-scene serves GlScene island with canvas, poster, and non-empty data-pr
     // Poster img with data-gl-poster attribute is emitted.
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-gl-poster") != null);
 
-    // data-props is non-empty (encodes vmesh src, env, camera, light, etc.).
+    // data-props is non-empty (encodes vmesh src, env, camera, light, scrub, etc.).
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-props=\"") != null);
+
+    // scrub=true → builder emits 300vh scroll section inside the island.
+    // data-ref is vid-suffixed by rewriteBindings.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "glscene-scroll-section__v") != null);
+
+    // Tall section height.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "height:300vh") != null);
+
+    // Sticky viewport inner div.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "position:sticky") != null);
 
     // /gl untouched: still serves GlDemo island.
     var gl_resp = try request(io, gpa, port, "GET", "/gl");

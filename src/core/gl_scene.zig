@@ -110,6 +110,22 @@ pub const GlSceneBuilder = struct {
 
     /// Finalize: encode props, build the SSR DOM (wrapper > canvas [+ poster]),
     /// and wrap it in the GlScene island marker.
+    ///
+    /// Scrub mode layout (when `.scrub(true)`):
+    ///   island > section[data-ref=glscene-scroll-section, height:300vh, position:relative]
+    ///     > div[sticky top:0, height:100vh, display:flex, align-items:center]
+    ///       > div[aspect-ratio:8/5, width:100%, max-width:640px, margin:0 auto]
+    ///         > canvas + optional poster
+    ///
+    /// The section MUST live inside the island so that `queryRef` (which
+    /// appends the vid suffix) can resolve "glscene-scroll-section" to
+    /// "glscene-scroll-section__v{vid}". A section outside the island would
+    /// not be rewritten by `rewriteBindings` and queryRef would never find it.
+    ///
+    /// Non-scrub layout (when `.scrub(false)` / default):
+    ///   island > div[position:relative, width:100%, height:100%]
+    ///     > canvas + optional poster
+    /// The embedding page must supply a definite sized container.
     pub fn build(self: *GlSceneBuilder) *Node {
         const dir = normalize3(self.lgt.dir);
         // scrub=true means scroll owns yaw; auto_rotate would conflict — zero it.
@@ -139,8 +155,6 @@ pub const GlSceneBuilder = struct {
         // clientWidth×dpr each frame, and an unstyled canvas would grow its
         // own layout box from those attributes — an exponential resize
         // feedback loop (observed on Firefox: 9600 → 19200 → … px).
-        // The embedding container supplies the definite size (e.g. the demo
-        // page wraps the island in width:100%/aspect-ratio:8/5).
         const canvas = self.ctx.el("canvas")
             .attr("data-ref", "glscene-canvas")
             .attr("style", "display:block;width:100%;height:100%")
@@ -150,10 +164,10 @@ pub const GlSceneBuilder = struct {
             .onWheel("glscene_wheel")
             .onClick("glscene_click");
 
-        const wrapper = self.ctx.div()
+        const inner_wrapper = self.ctx.div()
             .attr("style", "position:relative;display:block;width:100%;height:100%");
         if (self.opts.poster) |poster_url| {
-            _ = wrapper.children(.{
+            _ = inner_wrapper.children(.{
                 canvas,
                 self.ctx.el("img")
                     .attr("data-gl-poster", "")
@@ -162,10 +176,35 @@ pub const GlSceneBuilder = struct {
                     .attr("style", "position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none"),
             });
         } else {
-            _ = wrapper.children(.{canvas});
+            _ = inner_wrapper.children(.{canvas});
         }
 
-        return island(self.ctx, .{ .name = "GlScene", .props = props }, wrapper);
+        if (self.scrub_on) {
+            // Scrub layout: island owns the tall scroll section so that
+            // `rewriteBindings` stamps the vid suffix on `data-ref=
+            // "glscene-scroll-section"`, making it resolvable by queryRef.
+            //
+            // The canvas parent has aspect-ratio:8/5 + definite width so the
+            // canvas fill (width:100%;height:100%) hits a real size — no
+            // feedback loop.
+            const canvas_box = self.ctx.div()
+                .attr("style", "aspect-ratio:8/5;width:100%;max-width:640px;margin:0 auto;position:relative");
+            _ = canvas_box.children(.{inner_wrapper});
+
+            const sticky_div = self.ctx.div()
+                .attr("style", "position:sticky;top:0;height:100vh;display:flex;align-items:center;justify-content:center");
+            _ = sticky_div.children(.{canvas_box});
+
+            const scroll_section = self.ctx.el("section")
+                .attr("data-ref", "glscene-scroll-section")
+                .attr("style", "height:300vh;position:relative");
+            _ = scroll_section.children(.{sticky_div});
+
+            return island(self.ctx, .{ .name = "GlScene", .props = props }, scroll_section);
+        }
+
+        // Non-scrub: plain wrapper; page supplies the sized container.
+        return island(self.ctx, .{ .name = "GlScene", .props = props }, inner_wrapper);
     }
 };
 
@@ -353,4 +392,43 @@ test "glScene scrub(true) round-trips and forces auto_rotate to 0" {
     try testing.expectEqual(true, p.scrub);
     // scrub owns yaw — auto_rotate must be zeroed out
     try testing.expectEqual(@as(f32, 0), p.auto_rotate);
+}
+
+test "glScene scrub(true) emits scroll section with vid-suffixed data-ref" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .scrub(true)
+        .build();
+    const html = try renderHtml(scene, arena.allocator());
+
+    // Section data-ref is vid-suffixed by rewriteBindings (same pattern as
+    // the canvas ref). The prefix check is sufficient — vid value is sequential.
+    try testing.expect(std.mem.indexOf(u8, html, "data-ref=\"glscene-scroll-section__v") != null);
+
+    // Tall section: height:300vh
+    try testing.expect(std.mem.indexOf(u8, html, "height:300vh") != null);
+
+    // Sticky inner container.
+    try testing.expect(std.mem.indexOf(u8, html, "position:sticky") != null);
+
+    // Canvas is still present and vid-suffixed.
+    try testing.expect(std.mem.indexOf(u8, html, "data-ref=\"glscene-canvas__v") != null);
+}
+
+test "glScene scrub(false) emits NO scroll section" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
+    const html = try renderHtml(scene, arena.allocator());
+
+    try testing.expect(std.mem.indexOf(u8, html, "glscene-scroll-section") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "height:300vh") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "position:sticky") == null);
 }

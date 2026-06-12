@@ -811,6 +811,10 @@ pub fn glDemo(ctx: *const verve.Context) !*verve.Node {
 /// the demo app context, so .onPick passes 0 (data-gl-pick attr only; the
 /// client chunk resolves picking by mesh name without needing a closure id).
 pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
+    // scrub(true): builder owns the 300vh scroll section + sticky wrapper
+    // internally so that `queryRef("glscene-scroll-section")` resolves to the
+    // vid-suffixed ref inside the island. autoRotate is zeroed automatically
+    // when scrub is on (scroll drives yaw; continuous spin would conflict).
     const scene = ctx.glScene(.{
         .src = "/gl/demo.vmesh",
         .env = "/gl/studio.venv",
@@ -819,16 +823,19 @@ pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
         .camera(.{ .distance = 4, .pitch = 0.3, .yaw = 0.6 })
         .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
         .onPick("Cube", 0)
-        .autoRotate(0.2)
+        .scrub(true)
         .build();
 
-    return ctx.main_().class("home").children(.{
-        ctx.h1("verve.gl — declarative scene"),
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — scroll to spin"),
+        ctx.p().text("Scroll to rotate · drag to orbit · wheel to zoom · click a mesh to pick. " ++
+            "Scene declared in Zig; scroll scrubs the turntable timeline."),
+        // The island brings its own 300vh scroll section + sticky viewport —
+        // no aspect-ratio wrapper needed here.
+        scene,
+        ctx.p().class("hint").text("Keep scrolling — the model completes a full rotation over 300vh of scroll travel."),
         ctx.p().text("Drag to orbit · wheel to zoom · click a mesh to pick. " ++
-            "Scene declared in Zig; the GlScene chunk owns the WebGL2 render loop."),
-        ctx.div()
-            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5")
-            .children(.{scene}),
+            "The GlScene chunk owns the WebGL2 render loop; Zig declares the scene."),
     });
 }
 
