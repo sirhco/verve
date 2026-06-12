@@ -15,6 +15,7 @@ pub const tangent = @import("tangent.zig");
 pub const orbit = @import("orbit.zig");
 pub const ray = @import("ray.zig");
 pub const bvh = @import("bvh.zig");
+pub const registry = @import("registry.zig");
 // Native-side asset pipeline (std.json / decoder allocations). Island
 // chunks must not reference these — Zig's lazy analysis makes the bare
 // import free; only actual references would pull them into wasm.
@@ -26,6 +27,7 @@ pub const fixture = @import("fixture.zig");
 
 pub const Scene = scene.Scene;
 pub const Encoder = command.Encoder;
+pub const Registry = registry.Registry;
 pub const Orbit = orbit.Orbit;
 pub const OrbitInput = orbit.OrbitInput;
 pub const Ray = ray.Ray;
@@ -41,6 +43,7 @@ test {
     _ = orbit;
     _ = ray;
     _ = bvh;
+    _ = registry;
     _ = png;
     _ = gltf;
     _ = hdr;
