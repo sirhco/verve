@@ -4467,11 +4467,63 @@
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
           break;
         }
+        case 14: { // DELETE_RESOURCE — frees one GPU object; slot may be reused after
+          const kind = dv.getUint32(off, true);
+          const handle = dv.getUint32(off + 4, true);
+          if (kind === 0) { // buffer
+            const entry = st.buffers[handle];
+            if (entry) {
+              gl.deleteBuffer(entry.buf);
+              st.buffers[handle] = null;
+              // Cached VAOs reference vbuf/ibuf in their `${vh}:${ih}:${variant}`
+              // key; a freed buffer makes them dangling. Drop + delete any match.
+              for (const [key, vao] of st.vaos) {
+                const [vh, ih] = key.split(":");
+                if (vh === String(handle) || ih === String(handle)) {
+                  gl.deleteVertexArray(vao);
+                  st.vaos.delete(key);
+                }
+              }
+            }
+          } else if (kind === 1) { // texture
+            const entry = st.textures[handle];
+            if (entry) {
+              gl.deleteTexture(entry.tex);
+              st.textures[handle] = null;
+            }
+          } else if (kind === 2) { // shader
+            const sh = st.shaders[handle];
+            if (sh) {
+              gl.deleteProgram(sh.prog);
+              if (st.active === sh) st.active = null;
+              st.shaders[handle] = null;
+            }
+          }
+          break;
+        }
         default:
           break; // unknown tag: size-skip = forward compatible
       }
       off += size;
     }
+  };
+
+  // Full GPU teardown for an island unmount: deletes every live buffer,
+  // texture (incl. tag-10 cubemaps), program, and cached VAO, then resets the
+  // tables so the state object is inert. Null-guarded throughout — slots may
+  // already be null from prior DELETE_RESOURCE commands.
+  const disposeGlState = (st) => {
+    const gl = st.gl;
+    if (!gl) return;
+    for (const entry of st.buffers) if (entry) gl.deleteBuffer(entry.buf);
+    for (const entry of st.textures) if (entry) gl.deleteTexture(entry.tex);
+    for (const sh of st.shaders) if (sh) gl.deleteProgram(sh.prog);
+    for (const vao of st.vaos.values()) gl.deleteVertexArray(vao);
+    st.buffers = [];
+    st.textures = [];
+    st.shaders = [];
+    st.vaos.clear();
+    st.active = null;
   };
 
   const glStart = (refHandle, exportName) => {
@@ -4498,6 +4550,12 @@
       last: 0,
     };
     const step = (now) => {
+      // Island unmounted: canvas detached from the DOM. Free GPU objects and
+      // stop without rescheduling, instead of leaking the whole resource set.
+      if (!canvas.isConnected) {
+        disposeGlState(st);
+        return;
+      }
       const dt = st.last ? now - st.last : 16.7;
       st.last = now;
       const dpr = window.devicePixelRatio || 1;
@@ -4506,7 +4564,14 @@
       if (canvas.width !== w) canvas.width = w;
       if (canvas.height !== h) canvas.height = h;
       const ptr = st.exports[st.exportName](dt, w, h) >>> 0;
-      if (!ptr) return; // wasm asked to stop (island unmount path, P4)
+      if (!ptr) {
+        // wasm asked to stop (island unmount path, P4). 0 = stop loop; per spec
+        // this is the unmount signal, so tear down GPU state rather than just
+        // halting and leaking. Frame exports that always return a pointer are
+        // unaffected.
+        disposeGlState(st);
+        return;
+      }
       try {
         glInterpret(st, ptr);
       } catch (err) {
