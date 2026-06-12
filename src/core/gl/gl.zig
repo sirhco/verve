@@ -16,6 +16,7 @@ pub const vmesh = @import("vmesh.zig");
 pub const png = @import("png.zig");
 pub const gltf = @import("gltf.zig");
 pub const hdr = @import("hdr.zig");
+pub const ibl = @import("ibl.zig");
 pub const fixture = @import("fixture.zig");
 
 pub const Scene = scene.Scene;
@@ -30,5 +31,6 @@ test {
     _ = png;
     _ = gltf;
     _ = hdr;
+    _ = ibl;
     _ = fixture;
 }
