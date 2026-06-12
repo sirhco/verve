@@ -228,9 +228,17 @@ fn clientToNdc(canvas: i32, cx: f64, cy: f64, ndc_x: *f32, ndc_y: *f32) void {
     ndc_y.* = @floatCast(ny);
 }
 
-/// Resolve the canvas ref handle (raw name; runtime auto-scopes to this vid).
+/// Canvas ref handle, cached at hydrate. queryRef vid-scopes through the
+/// main runtime's `current_island_id`, which is only set inside event/hydrate
+/// dispatch — the gl rAF loop calls `glscene_frame` directly with NO island
+/// scope, so a frame-context queryRef resolves the unsuffixed name and finds
+/// nothing (silently dropping data-gl-pick/hover stamps; caught live in P5).
+/// Resolving once in hydrate (scoped) and reusing the handle everywhere makes
+/// every context safe and skips the per-stamp DOM query.
+var canvas_handle: ?i32 = null;
+
 fn canvasRef() ?i32 {
-    return verve.queryRef(@as([]const u8, "glscene-canvas"));
+    return canvas_handle;
 }
 
 // ── hydrate ──────────────────────────────────────────────────────────────────
@@ -258,6 +266,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     model_mat = identity4;
     normal9 = identity3;
     anim_setter_slot = 0;
+    canvas_handle = null;
     scrub_built = false;
     scrub_anim_id = 0;
 
@@ -311,6 +320,10 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
 
     // Cache reduced-motion once (matchMedia is a host round-trip).
     reduced_motion = verve.matchMedia("(prefers-reduced-motion: reduce)");
+
+    // Resolve the canvas ref ONCE while hydrate runs inside island scope —
+    // frame-context lookups would silently miss (see canvas_handle doc).
+    canvas_handle = verve.queryRef(@as([]const u8, "glscene-canvas"));
 
     // Kick the asset fetches (geometry + prefiltered IBL).
     if (src_len != 0)
