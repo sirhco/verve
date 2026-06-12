@@ -89,3 +89,34 @@ pub const VizGraphInteractive = struct {
 pub const GlDemo = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// verve.gl declarative scene (P4). Built via `ctx.glScene(.{...})` — a vmesh
+/// model + venv environment rendered with orbit camera, a directional light,
+/// optional auto-rotate, and named pickable meshes wired to closure event ids.
+/// SSR emits `<canvas data-ref="glscene-canvas">` (+ optional poster `<img>`);
+/// the client chunk decodes `Props` and drives a WebGL2 scene over shared
+/// linear memory. Source: `src/client/islands/GlScene.zig` (Task 12; until then
+/// the build resolves it to the `_default.zig` no-op chunk).
+///
+/// `Props` is the frozen wire contract — a positional mirror of
+/// `core/gl_scene.zig`'s `Props`, decoded field-by-field by the chunk. The
+/// design's `light_dir: [3]f32` is flattened to three scalars because the
+/// SSR↔hydration codec (serialize.zig) has no fixed-array tag.
+pub const GlScene = struct {
+    pub const props_schema: []const u8 = "{\"src\":\"string\",\"env\":\"string\",\"orbit_distance\":\"f32\",\"orbit_pitch\":\"f32\",\"orbit_yaw\":\"f32\",\"auto_rotate\":\"f32\",\"light_dir_x\":\"f32\",\"light_dir_y\":\"f32\",\"light_dir_z\":\"f32\",\"light_intensity\":\"f32\",\"pick_names\":\"string[]\",\"pick_event_ids\":\"u32[]\"}";
+
+    pub const Props = struct {
+        src: []const u8,
+        env: []const u8,
+        orbit_distance: f32,
+        orbit_pitch: f32,
+        orbit_yaw: f32,
+        auto_rotate: f32,
+        light_dir_x: f32,
+        light_dir_y: f32,
+        light_dir_z: f32,
+        light_intensity: f32,
+        pick_names: []const []const u8,
+        pick_event_ids: []const u32,
+    };
+};

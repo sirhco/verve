@@ -17,6 +17,7 @@ const head_mod = @import("head.zig");
 const fetch_mod = @import("fetch.zig");
 const request_meta_mod = @import("request_meta.zig");
 const location_mod = @import("location.zig");
+const gl_scene_mod = @import("gl_scene.zig");
 
 const Node = node_mod.Node;
 const Signal = signal_mod.Signal;
@@ -548,6 +549,22 @@ pub const Context = struct {
         const n = ctx.el("script").raw(body);
         if (ctx.csp_nonce.len > 0) _ = n.attr("nonce", ctx.csp_nonce);
         return n;
+    }
+
+    /// Declarative `verve.gl` scene island. Returns a fluent builder —
+    /// chain `.camera(...)`, `.light(...)`, `.autoRotate(...)`, `.onPick(...)`,
+    /// then `.build()` to get the island-wrapped `*Node`. The builder encodes
+    /// a frozen props blob the GlScene client chunk decodes to drive a WebGL2
+    /// scene. The returned builder lives on the render arena.
+    pub fn glScene(ctx: *const Context, opts: gl_scene_mod.GlSceneOpts) *gl_scene_mod.GlSceneBuilder {
+        const b = ctx.allocator.create(gl_scene_mod.GlSceneBuilder) catch {
+            // Arena OOM is fatal for the render anyway; return a stub pointed
+            // at a fresh builder on the stack is unsafe, so panic mirrors the
+            // arena-exhaustion contract the rest of the factories rely on.
+            @panic("glScene: arena allocation failed");
+        };
+        b.* = .{ .ctx = ctx, .opts = opts };
+        return b;
     }
 
     /// Encode a set of named primitive values into an island state blob for

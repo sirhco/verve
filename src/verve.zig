@@ -282,6 +282,7 @@ test {
     _ = @import("core/markdown_inline.zig");
     _ = @import("core/island_state.zig");
     _ = @import("core/props.zig");
+    _ = @import("core/gl_scene.zig");
     _ = @import("core/viz/viz.zig");
     _ = @import("core/anim/anim.zig");
     _ = @import("core/gl/gl.zig");
