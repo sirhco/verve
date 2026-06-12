@@ -1173,3 +1173,35 @@ test "phase 7 polish: drop zones, morph-from-current ref, flip toggle, attr ops"
     try std.testing.expect(std.mem.indexOf(u8, js.body, "dragZoneHit") != null);
     try std.testing.expect(std.mem.indexOf(u8, js.body, "sE") != null);
 }
+
+test "/gl-scene serves GlScene island with canvas, poster, and non-empty data-props" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 21);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    var resp = try request(io, gpa, port, "GET", "/gl-scene");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // GlScene island marker is present.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-name=\"GlScene\"") != null);
+
+    // Canvas element rendered inside the island.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "<canvas") != null);
+
+    // Poster img with data-gl-poster attribute is emitted.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-gl-poster") != null);
+
+    // data-props is non-empty (encodes vmesh src, env, camera, light, etc.).
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-props=\"") != null);
+
+    // /gl untouched: still serves GlDemo island.
+    var gl_resp = try request(io, gpa, port, "GET", "/gl");
+    defer gl_resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), gl_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, gl_resp.body, "data-name=\"GlDemo\"") != null);
+}

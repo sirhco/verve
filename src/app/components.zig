@@ -805,6 +805,33 @@ pub fn glDemo(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl declarative scene demo — /gl-scene.
+/// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
+/// pick_event_ids choice: no server-side closure-id mechanism is available in
+/// the demo app context, so .onPick passes 0 (data-gl-pick attr only; the
+/// client chunk resolves picking by mesh name without needing a closure id).
+pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/demo.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3E3D%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 4, .pitch = 0.3, .yaw = 0.6 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .onPick("Cube", 0)
+        .autoRotate(0.2)
+        .build();
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — declarative scene"),
+        ctx.p().text("Drag to orbit · wheel to zoom · click a mesh to pick. " ++
+            "Scene declared in Zig; the GlScene chunk owns the WebGL2 render loop."),
+        ctx.div()
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5")
+            .children(.{scene}),
+    });
+}
+
 pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
     // Provide a default title only if the page didn't set one of its own.
     try ctx.setTitleIfUnset("Verve");
