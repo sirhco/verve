@@ -1274,6 +1274,21 @@ test "golden: gl-target-from emits f alongside to" {
     try testing.expect(std.mem.indexOf(u8, json, "\"f\":0.25") != null);
 }
 
+test "golden: gl-target-range emits to and f on one entry" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // glTargetRange sets to=1.0 and from=0.045 on ONE entry -> .to kind
+    // emits "to":1 then "f":0.045 (true from->to range interpolation).
+    const t = tween_mod.to(a, null).glTargetRange(5, 2, 0.045, 1.0);
+    const json = try tweenToJson(a, t, .island);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"d\":0.5,\"e\":\"outQuad\"," ++
+            "\"p\":{\"@gl:5\":{\"gl\":5,\"gls\":2,\"to\":1,\"f\":0.045}}}",
+        json,
+    );
+}
+
 test "golden: two gl-targets get distinct @gl:<id> keys" {
     var arena = testArena();
     defer arena.deinit();

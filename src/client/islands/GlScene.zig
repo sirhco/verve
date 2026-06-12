@@ -45,8 +45,10 @@
 //! frames. Asset Reader bytes live in the page-scoped asset region, so the
 //! recorded pointers stay valid for the page lifetime.
 
+const std = @import("std");
 const verve = @import("verve");
 const gl = verve.gl;
+const anim = verve.anim;
 
 extern "verve" fn gl_start(ref_handle: i32, name_ptr: [*]const u8, name_len: u32) void;
 extern "verve" fn gl_load(url_ptr: [*]const u8, url_len: u32, cb_ptr: [*]const u8, cb_len: u32) void;
@@ -111,6 +113,17 @@ var pick_count: usize = 0;
 var auto_rotate: f32 = 0;
 var scrub_enabled: bool = false; // Task 9 scroll-scrub timeline; wired there
 var model_yaw: f32 = 0; // model Y-rotation (radians); set via glscene_anim_set
+
+// ── scrub timeline (Task 9) ───────────────────────────────────────────────────
+// Translated gl-setter slot (0 = not yet registered). Registered ONCE, the
+// first time we have a chance (hydrate sets scrub flag; we register lazily in
+// vmesh_ready alongside the build so a re-hydrate re-registers cleanly).
+var anim_setter_slot: u32 = 0;
+// Build the scroll-scrubbed timeline exactly once (the asset Reader must be
+// resolvable for material:<Name> path lookup).
+var scrub_built: bool = false;
+// Live timeline handle id (0 = none / build skipped).
+var scrub_anim_id: u32 = 0;
 
 // ── Camera + input ───────────────────────────────────────────────────────────
 
@@ -244,6 +257,9 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     model_yaw = 0;
     model_mat = identity4;
     normal9 = identity3;
+    anim_setter_slot = 0;
+    scrub_built = false;
+    scrub_anim_id = 0;
 
     // Defaults so a missing/garbage props blob still yields a usable scene.
     src_len = 0;
@@ -312,6 +328,8 @@ export fn glscene_vmesh_ready(ptr: u32, len: u32) void {
     if (ptr == 0) return; // fetch failed → stay on clear-only frames
     const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
     asset = gl.vmesh.Reader.init(bytes) catch null;
+    // With the Reader resolvable, build the scroll-scrubbed timeline once.
+    if (scrub_enabled and !scrub_built) buildScrubTimeline();
 }
 
 export fn glscene_env_ready(ptr: u32, len: u32) void {
@@ -573,6 +591,80 @@ fn eql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;
     return true;
+}
+
+// ── scrub timeline build (Task 9) ──────────────────────────────────────────────
+
+/// Non-export gl-setter trampoline. `glscene_anim_set` is `pub export fn`
+/// (callconv(.c)); `animGlSetter` wants a default-callconv `fn(u32, f64) void`
+/// pointer, so we register THIS thin wrapper instead and forward straight to
+/// `applyAnimTarget` (the same body the export calls).
+fn animSetTrampoline(target_id: u32, value: f64) void {
+    applyAnimTarget(target_id, @floatCast(value));
+}
+
+/// Build the scroll-scrubbed turntable + roughness-ramp timeline. Runs ONCE,
+/// after the vmesh Reader is available (so `material:<Name>` paths resolve).
+///
+/// Targets (one tween, two @gl range entries):
+///   • camera.yaw — turntable: current orbit.yaw → +2π (one full turn).
+///   • material:Cube.roughness — ramp 0.045 → 1.0 (skipped if the name is
+///     absent in the mesh; the camera still scrubs).
+///
+/// Gating: a ScrollTrigger on the scroll-section ref ("glscene-scroll-section",
+/// added by Task 10). When that ref is absent (page without a section), the
+/// build is skipped entirely — `scrub` without a section is a no-op.
+fn buildScrubTimeline() void {
+    scrub_built = true; // attempt once regardless of outcome
+
+    if (asset == null) return;
+    const a = &asset.?;
+
+    // The scroll section is the trigger. No section → no scrub (documented).
+    const section = verve.queryRef(@as([]const u8, "glscene-scroll-section")) orelse return;
+
+    // Register the gl-setter once. Pass the non-export trampoline (matches the
+    // default-callconv fn pointer animGlSetter expects).
+    if (anim_setter_slot == 0)
+        anim_setter_slot = verve.animGlSetter(&animSetTrampoline);
+    const slot = anim_setter_slot;
+    if (slot == 0) return; // setter registration failed → no scrub
+
+    const mark = verve.chunkArenaMark();
+    defer verve.chunkArenaReset(mark);
+    const arena = verve.chunkArena();
+
+    // Camera yaw turntable: from current yaw → +2π (one full revolution).
+    const yaw_id = gl.anim_target.encode(.camera, 0, @intFromEnum(gl.anim_target.CameraField.yaw));
+    const yaw_from: f64 = orbit.yaw;
+    const yaw_to: f64 = yaw_from + std.math.tau;
+
+    const t = anim.to(arena, null)
+        .glTargetRange(yaw_id, slot, yaw_from, yaw_to)
+        .duration(1.0) // scrub maps progress over the scroll range; absolute ignored
+        .ease(.linear);
+
+    // Optional roughness ramp on the named material — skipped silently when the
+    // mesh has no matching name (camera still scrubs).
+    if (gl.anim_target.resolvePath(a, "material:Cube.roughness")) |rough_id|
+        _ = t.glTargetRange(rough_id, slot, 0.045, 1.0);
+
+    // Scroll trigger: section top hits viewport top (start) through section
+    // bottom hits viewport top (end). Smooth scrub (0.4s catch-up); plain scrub
+    // (.exact) is the fallback vocabulary if smooth is undesired. Default toggle
+    // actions are mandatory under scrub (validate rejects otherwise).
+    _ = t.scrollTrigger(.{
+        .trigger_handle = section,
+        .start = .{ .trigger = .top, .viewport = .top },
+        .end = .{ .at = .{ .trigger = .bottom, .viewport = .top } },
+        .scrub = .{ .smooth = 0.4 },
+    });
+
+    if (verve.animPlay(t)) |h| {
+        scrub_anim_id = h.id; // nonzero on success
+    } else {
+        scrub_anim_id = 0; // build/serialize/zero-match failure → no-op
+    }
 }
 
 // ── animation setter ─────────────────────────────────────────────────────────

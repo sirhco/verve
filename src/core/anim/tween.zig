@@ -363,6 +363,32 @@ pub const Tween = struct {
         return self;
     }
 
+    /// Tween a verve.gl engine value across an explicit `from`..`to` range
+    /// on a SINGLE "@gl" entry (unlike `glTarget` + `glTargetFrom`, which
+    /// append two separate entries that interpolate independently). Use this
+    /// for true range interpolation — e.g. a turntable yaw 0→2π or a
+    /// roughness ramp 0.045→1.0. Island-only; see `glTarget`.
+    pub fn glTargetRange(self: *Tween, target_id: u32, setter_slot: u32, from_val: f64, to_val: f64) *Tween {
+        if (self.err != null) return self;
+        const entry: PropEntry = .{
+            .name = "@gl",
+            .to = .{ .num = to_val },
+            .from = .{ .num = from_val },
+            .gl = .{ .target_id = target_id, .setter_slot = setter_slot },
+        };
+        if (self.steps.items.len > 0) {
+            const last = &self.steps.items[self.steps.items.len - 1];
+            last.props.append(self.alloc, entry) catch |e| {
+                self.err = e;
+            };
+            return self;
+        }
+        self.props.append(self.alloc, entry) catch |e| {
+            self.err = e;
+        };
+        return self;
+    }
+
     pub fn x(self: *Tween, v: anytype) *Tween {
         return self.prop("x", v);
     }
@@ -684,6 +710,21 @@ test "glTargetFrom sets from field" {
     try std.testing.expectEqual(@as(f64, 0.25), p.from.?.num);
     try std.testing.expectEqual(@as(u32, 2), p.gl.?.target_id);
     try std.testing.expectEqual(@as(u32, 9), p.gl.?.setter_slot);
+}
+
+test "glTargetRange sets both to and from on one entry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const t = to(arena.allocator(), null).glTargetRange(5, 2, 0.045, 1.0);
+    try std.testing.expect(t.err == null);
+    try std.testing.expectEqual(@as(usize, 1), t.props.items.len);
+    const p = t.props.items[0];
+    try std.testing.expectEqualStrings("@gl", p.name);
+    try std.testing.expectEqual(@as(f64, 1.0), p.to.num);
+    try std.testing.expect(p.from != null);
+    try std.testing.expectEqual(@as(f64, 0.045), p.from.?.num);
+    try std.testing.expectEqual(@as(u32, 5), p.gl.?.target_id);
+    try std.testing.expectEqual(@as(u32, 2), p.gl.?.setter_slot);
 }
 
 test "two glTargets coexist with distinct ids" {
