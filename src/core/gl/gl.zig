@@ -13,6 +13,7 @@ pub const vmesh = @import("vmesh.zig");
 pub const venv = @import("venv.zig");
 pub const tangent = @import("tangent.zig");
 pub const orbit = @import("orbit.zig");
+pub const ray = @import("ray.zig");
 // Native-side asset pipeline (std.json / decoder allocations). Island
 // chunks must not reference these — Zig's lazy analysis makes the bare
 // import free; only actual references would pull them into wasm.
@@ -26,6 +27,7 @@ pub const Scene = scene.Scene;
 pub const Encoder = command.Encoder;
 pub const Orbit = orbit.Orbit;
 pub const OrbitInput = orbit.OrbitInput;
+pub const Ray = ray.Ray;
 
 test {
     _ = math;
@@ -36,6 +38,7 @@ test {
     _ = venv;
     _ = tangent;
     _ = orbit;
+    _ = ray;
     _ = png;
     _ = gltf;
     _ = hdr;
