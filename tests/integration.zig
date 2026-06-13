@@ -468,30 +468,58 @@ test "counter form fallback: /api/incrementCount + /api/decrementCount via form 
     }
 }
 
-const FloodCtx = struct {
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    port: u16,
-    status: u16 = 0,
-    err: ?anyerror = null,
-};
-
-fn floodWorker(ctx: *FloodCtx) void {
-    var resp = request(ctx.io, ctx.gpa, ctx.port, "GET", "/health") catch |err| switch (err) {
-        // Under heavy concurrent load with --workers 1, the kernel may
-        // RST a freshly-accepted socket if the server closes before the
-        // client finishes its half of the handshake. Treat as "rejected".
-        error.ConnectionResetByPeer, error.ConnectionRefused, error.ReadFailed => {
-            ctx.status = 503;
-            return;
-        },
-        else => {
-            ctx.err = err;
-            return;
-        },
+/// Make a GET to `path`, treating a connection reset / refusal as a 503 — the
+/// accept loop sends a best-effort 503 then closes, which the kernel can surface
+/// to the client as an RST instead of a readable response.
+fn statusOrBusy(io: std.Io, gpa: std.mem.Allocator, port: u16, path: []const u8) !u16 {
+    var resp = request(io, gpa, port, "GET", path) catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.ConnectionRefused, error.ReadFailed => return 503,
+        else => return err,
     };
-    defer resp.deinit(ctx.gpa);
-    ctx.status = resp.status;
+    defer resp.deinit(gpa);
+    return resp.status;
+}
+
+/// Open a long-lived `/events` (SSE) connection and confirm it is admitted
+/// (200 + event-stream headers) — i.e. it now occupies a worker slot. Retries
+/// past a transient 503 (e.g. a worker still briefly held by `waitForReady`'s
+/// request-less readiness probe). Returns the held-open stream; the caller
+/// closes it to free the slot.
+fn occupyWorker(io: std.Io, gpa: std.mem.Allocator, addr: std.Io.net.IpAddress) !std.Io.net.Stream {
+    const delay = std.Io.Duration.fromMilliseconds(50);
+    var tries: usize = 0;
+    while (tries < 60) : (tries += 1) {
+        var s = addr.connect(io, .{ .mode = .stream }) catch {
+            std.Io.sleep(io, delay, .awake) catch {};
+            continue;
+        };
+        var wbuf: [256]u8 = undefined;
+        var w = s.writer(io, &wbuf);
+        const wrote = blk: {
+            w.interface.writeAll("GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n") catch break :blk false;
+            w.interface.flush() catch break :blk false;
+            break :blk true;
+        };
+        if (wrote) {
+            var rbuf: [1024]u8 = undefined;
+            var r = s.reader(io, &rbuf);
+            var acc: std.ArrayList(u8) = .empty;
+            defer acc.deinit(gpa);
+            const ok = blk: {
+                while (true) {
+                    const b = r.interface.takeByte() catch break :blk false;
+                    acc.append(gpa, b) catch break :blk false;
+                    if (acc.items.len >= 4 and std.mem.eql(u8, acc.items[acc.items.len - 4 ..], "\r\n\r\n")) break;
+                }
+                break :blk std.mem.indexOf(u8, acc.items, " 200 ") != null and
+                    std.mem.indexOf(u8, acc.items, "text/event-stream") != null;
+            };
+            if (ok) return s; // admitted — hold the slot
+        }
+        s.close(io);
+        std.Io.sleep(io, delay, .awake) catch {};
+    }
+    return error.CouldNotOccupyWorker;
 }
 
 test "--workers caps concurrent connections (excess returns 503)" {
@@ -503,31 +531,42 @@ test "--workers caps concurrent connections (excess returns 503)" {
     const io = harness.io();
     const port = harness.port;
 
-    const N: usize = 32;
-    var contexts: [N]FloodCtx = undefined;
-    var threads: [N]std.Thread = undefined;
-    for (0..N) |i| {
-        contexts[i] = .{ .io = io, .gpa = gpa, .port = port };
-        threads[i] = try std.Thread.spawn(.{}, floodWorker, .{&contexts[i]});
-    }
-    for (threads) |t| t.join();
+    // Occupy the single worker with one long-lived SSE connection. The server
+    // admits on accept (before reading the request) and `/events` blocks in its
+    // tick loop until the client disconnects — so while this holder is open the
+    // admission counter is saturated (in_flight == 1 == max).
+    const addr = loopback(port);
+    var holder = try occupyWorker(io, gpa, addr);
+    var holder_open = true;
+    defer if (holder_open) holder.close(io);
 
-    var ok_count: usize = 0;
-    var busy_count: usize = 0;
-    for (contexts) |c| {
-        if (c.err) |e| return e;
-        switch (c.status) {
-            200 => ok_count += 1,
-            503 => busy_count += 1,
-            else => return error.UnexpectedStatus,
-        }
+    // With the lone worker occupied, every additional request is rejected
+    // immediately with 503 by the accept loop — deterministic, no timing race.
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        try std.testing.expectEqual(@as(u16, 503), try statusOrBusy(io, gpa, port, "/health"));
     }
-    // With --workers 1 and 32 parallel connections, the admission counter
-    // must reject at least one request and admit at least one. The exact
-    // split is timing-dependent — only the invariants matter.
-    try std.testing.expect(ok_count >= 1);
-    try std.testing.expect(busy_count >= 1);
-    try std.testing.expectEqual(N, ok_count + busy_count);
+
+    // Release the worker; the server notices the closed socket on its next SSE
+    // tick (≤ ~1s) and frees the slot. Poll until a request is admitted again —
+    // condition-based, not a fixed sleep.
+    holder.close(io);
+    holder_open = false;
+
+    var recovered = false;
+    var attempts: usize = 0;
+    while (attempts < 60) : (attempts += 1) {
+        const s = statusOrBusy(io, gpa, port, "/health") catch {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+            continue;
+        };
+        if (s == 200) {
+            recovered = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+    }
+    try std.testing.expect(recovered);
 }
 
 test "-Dpublic-dir bakes files into the binary and serves them without --public-dir" {

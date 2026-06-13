@@ -29,9 +29,24 @@ jobs:
 
       - name: cross-compile backends (parser sanity)
         run: |
-          zig build-obj src/desktop/window.zig -target aarch64-macos    -fno-emit-bin
-          zig build-obj src/desktop/window.zig -target x86_64-linux-gnu -fno-emit-bin
+          # macOS + Windows: backend.zig's `.linux` switch prong is a dead
+          # branch (comptime os.tag guard), so `@import("desktop_options")` is
+          # never analysed — a plain standalone compile suffices.
+          zig build-obj src/desktop/window.zig -target aarch64-macos     -fno-emit-bin
           zig build-obj src/desktop/window.zig -target x86_64-windows-gnu -fno-emit-bin
+          # Linux: the `.linux` prong IS analysed, so backend.zig + tray.zig
+          # reach `@import("desktop_options")` (the gtk3/gtk4 toggle the desktop
+          # app templates inject via addOptions). Provide a stub module so the
+          # standalone compile resolves it — checking BOTH the gtk3 (linux.zig)
+          # and gtk4 (linux_gtk4.zig) backends.
+          printf 'pub const gtk4 = false;\n' > "$RUNNER_TEMP/dopts_gtk3.zig"
+          printf 'pub const gtk4 = true;\n'  > "$RUNNER_TEMP/dopts_gtk4.zig"
+          zig build-obj -fno-emit-bin -target x86_64-linux-gnu \
+            --dep desktop_options -Mroot=src/desktop/window.zig \
+            -Mdesktop_options="$RUNNER_TEMP/dopts_gtk3.zig"
+          zig build-obj -fno-emit-bin -target x86_64-linux-gnu \
+            --dep desktop_options -Mroot=src/desktop/window.zig \
+            -Mdesktop_options="$RUNNER_TEMP/dopts_gtk4.zig"
 
   scaffold-and-smoke:
     name: scaffold+smoke / ${{ matrix.os }}
