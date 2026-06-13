@@ -1056,6 +1056,13 @@
     } else if (selfEl) {
       targets = [selfEl];
     }
+    // gl-target tweens ("@gl:<id>" props) drive the gl engine through the
+    // registered setter, NOT the DOM — they legitimately match zero DOM
+    // elements. Run such a tween as ONE virtual instance (null element) so the
+    // scrub/write pipeline still executes; animWriteProp's gl branch ignores
+    // the element. Mixed gl+DOM tweens keep their real targets.
+    const hasGl = tweenHasGl(c.p);
+    if (targets.length === 0 && hasGl) targets = [null];
     const n = targets.length;
     const dur = typeof c.d === "number" ? c.d : 0.5;
     const del = c.del || 0;
@@ -1073,6 +1080,7 @@
     }
     return {
       start, targets, n, dur, del, rep, rd, delays, maxDelay, immediate,
+      hasGl,
       yo: !!c.yo,
       easeFn: easeFnOf(c.e),
       props: c.p || null,
@@ -1180,6 +1188,7 @@
     tw.resolved = true;
     const csCache = new Map();
     const readCurrent = (el, prop) => {
+      if (!el) return { n: 0 }; // gl-only virtual instance: no DOM to read
       if (XFORM.has(prop)) return { n: xformGet(getXform(el), prop) };
       if (prop.startsWith("attr:")) {
         return animParseVal(el.getAttribute(prop.slice(5))) || { n: 0 };
@@ -1340,6 +1349,16 @@
   });
   // @verve-extract-end
 
+  // True when a tween's prop set contains any gl-target ("@gl:<id>") prop.
+  // Such a tween drives the gl engine through the registered setter and has
+  // NO DOM element to animate — it must survive zero-matched-target rejection
+  // (animCreate) and the detached-target self-kill (the ticker liveness check),
+  // running as a single virtual instance (null element) instead.
+  // @verve-extract tweenHasGl
+  const tweenHasGl = (props) =>
+    !!props && Object.keys(props).some((k) => k.startsWith("@gl"));
+  // @verve-extract-end
+
   const animWriteProp = (el, name, st, phase, easeFn, mods) => {
     // gl-target: interpolate from→to like the numeric path, apply this
     // prop's modifiers, then hand the value to the gl setter. MUST return
@@ -1442,7 +1461,9 @@
     let maxCycle = 0;
     for (let i = 0; i < tw.n; i++) {
       const el = tw.targets[i];
-      if (!el || !el.isConnected) continue;
+      // null el = gl-only virtual instance (writes via the gl setter, no DOM);
+      // a real-but-detached element is skipped as before.
+      if (el && !el.isConnected) continue;
       const f = animFold(tw, local, i);
       if (!f) {
         if (tw.immediate && tw.state) {
@@ -1462,7 +1483,7 @@
       for (const name of Object.keys(per)) {
         animWriteProp(el, name, per[name], f.phase, tw.easeFn, tw.mods);
       }
-      if (tw.mp) animWriteMotionPath(el, tw.mp, f.phase, tw.easeFn, tw.mods);
+      if (tw.mp && el) animWriteMotionPath(el, tw.mp, f.phase, tw.easeFn, tw.mods);
     }
     if (anyActive && !tw.firedS) {
       tw.firedS = true;
@@ -1573,8 +1594,9 @@
     for (const a of [...anims.values()]) {
       if (a.paused || a.done) continue;
       // Self-kill animations whose targets all left the document
-      // (SPA swaps, removed subtrees). Silent, like GSAP kill.
-      if (!a.tweens.some((tw) => tw.targets.some((el) => el && el.isConnected))) {
+      // (SPA swaps, removed subtrees). Silent, like GSAP kill. gl-only tweens
+      // have no DOM target but stay live (the gl engine persists).
+      if (!a.tweens.some((tw) => tw.hasGl || tw.targets.some((el) => el && el.isConnected))) {
         animKill(a);
         continue;
       }

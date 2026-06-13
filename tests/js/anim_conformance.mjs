@@ -27,12 +27,13 @@ const fns = new Function(
     extract("dragProject") + extract("dragSnapResolve") +
     extract("splitLineRuns") + extract("flipNatural") + extract("flipDelta") +
     extract("stSnapResolve") + extract("dragZoneHit") + extract("glTweenState") +
+    extract("tweenHasGl") +
     "return { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve, " +
-    "splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit, glTweenState };",
+    "splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit, glTweenState, tweenHasGl };",
 )();
 const {
   mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve,
-  splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit, glTweenState,
+  splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit, glTweenState, tweenHasGl,
 } = fns;
 
 let fails = 0;
@@ -247,8 +248,21 @@ const approx = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
   check("gl lerp e=1", approx(lerp(s, 1), 6.283));
 }
 
+// ---- tweenHasGl: gates gl-only tweens past zero-DOM-target rejection ----
+// A scrub timeline built with no DOM selector (anim.to(arena, null)) carries
+// only "@gl:<id>" props; it must be recognized as gl-bearing so buildTweenInst
+// runs it as one virtual instance instead of dropping it (the bug that left
+// the /gl-scene turntable/roughness/node/emissive scrub dead).
+{
+  check("hasGl true for @gl prop", tweenHasGl({ "@gl:0": { gl: 0, gls: 1, to: 6.28 } }) === true);
+  check("hasGl true mixed gl+dom", tweenHasGl({ opacity: { to: 1 }, "@gl:5": { gl: 5 } }) === true);
+  check("hasGl false for dom-only", tweenHasGl({ opacity: { to: 1 }, x: { to: 10 } }) === false);
+  check("hasGl false for null props", tweenHasGl(null) === false);
+  check("hasGl false for empty props", tweenHasGl({}) === false);
+}
+
 if (fails === 0) {
-  console.log("anim conformance: ALL PASS (mp + morph + routing + drag + split + flip + snap + gl)");
+  console.log("anim conformance: ALL PASS (mp + morph + routing + drag + split + flip + snap + gl + gl-only)");
 } else {
   console.log(`anim conformance: ${fails} FAILURES`);
   process.exit(1);
