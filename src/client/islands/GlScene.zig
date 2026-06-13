@@ -279,6 +279,16 @@ fn canvasRef() ?i32 {
     return canvas_handle;
 }
 
+/// Scroll-section ref handle, cached at hydrate for the SAME reason as
+/// `canvas_handle`. `buildScrubTimeline` runs from the `glscene_vmesh_ready`
+/// asset callback, which the bridge invokes UNSCOPED (no `verve_enter_island`
+/// bracket, unlike hydrate/event dispatch) — so a `queryRef` there resolves the
+/// unsuffixed "glscene-scroll-section" and misses the real vid-suffixed ref,
+/// silently bailing the whole scrub build (turntable + roughness + node/emissive
+/// tweens AND the page-default setter the SSR dolly depends on). Resolve it once
+/// in hydrate (scoped) and reuse the handle. null when not in scrub mode.
+var scroll_section_handle: ?i32 = null;
+
 // ── hydrate ──────────────────────────────────────────────────────────────────
 
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
@@ -308,6 +318,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     node_rot_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
     anim_setter_slot = 0;
     canvas_handle = null;
+    scroll_section_handle = null;
     scrub_built = false;
     scrub_anim_id = 0;
 
@@ -362,9 +373,13 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     // Cache reduced-motion once (matchMedia is a host round-trip).
     reduced_motion = verve.matchMedia("(prefers-reduced-motion: reduce)");
 
-    // Resolve the canvas ref ONCE while hydrate runs inside island scope —
-    // frame-context lookups would silently miss (see canvas_handle doc).
+    // Resolve refs ONCE while hydrate runs inside island scope — frame- and
+    // asset-callback lookups would silently miss (see canvas_handle /
+    // scroll_section_handle docs). The section ref only exists in scrub mode;
+    // queryRef returns null otherwise, which buildScrubTimeline treats as "no
+    // section → skip".
     canvas_handle = verve.queryRef(@as([]const u8, "glscene-canvas"));
+    scroll_section_handle = verve.queryRef(@as([]const u8, "glscene-scroll-section"));
 
     // Kick the asset fetches (geometry + prefiltered IBL).
     if (src_len != 0)
@@ -762,8 +777,12 @@ fn buildScrubTimeline() void {
     if (asset == null) return;
     const a = &asset.?;
 
-    // The scroll section is the trigger. No section → no scrub (documented).
-    const section = verve.queryRef(@as([]const u8, "glscene-scroll-section")) orelse return;
+    // The scroll section is the trigger. Use the hydrate-cached handle —
+    // queryRef here (unscoped asset callback) would miss the vid-suffixed ref.
+    // No section → no scrub (documented).
+    // Use the hydrate-cached section handle — queryRef here (unscoped asset
+    // callback) would miss the vid-suffixed ref. No section → no scrub.
+    const section = scroll_section_handle orelse return;
 
     // Register the gl-setter once. Pass the non-export trampoline (matches the
     // default-callconv fn pointer animGlSetter expects).
