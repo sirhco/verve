@@ -46,7 +46,17 @@ for _ in $(seq 1 100); do
 done
 [[ -S "$xvfb_sock" ]] || { echo "smoke: FAIL — Xvfb not ready after 10s" >&2; exit 71; }
 
-DISPLAY="$DISPLAY_NUM" ZIG_LOG_LEVEL=debug "$APP" >"$OUT_DIR/app.log" 2>&1 &
+# Headless rendering: Xvfb has no GPU, so webkit2gtk's default DMA-BUF/DRI3
+# GL renderer can't get a device ("libEGL DRI3 error") and the WebView never
+# composites — the window is created but never shown. Disable the DMA-BUF
+# renderer and force software GL so webkit falls back to a path that works
+# without a GPU.
+DISPLAY="$DISPLAY_NUM" \
+  WEBKIT_DISABLE_DMABUF_RENDERER=1 \
+  WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+  LIBGL_ALWAYS_SOFTWARE=1 \
+  GALLIUM_DRIVER=llvmpipe \
+  ZIG_LOG_LEVEL=debug "$APP" >"$OUT_DIR/app.log" 2>&1 &
 APP_PID=$!
 
 sleep "$WAIT_SECS"
