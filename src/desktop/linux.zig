@@ -46,7 +46,8 @@ const GList = opaque {};
 const JSCValue = opaque {};
 const GObject = opaque {};
 const SoupCookie = opaque {};
-const SoupDate = opaque {};
+// libsoup 3.0 removed SoupDate; cookie expiry is a glib GDateTime now.
+const GDateTime = opaque {};
 const GClosureNotify = ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void;
 const GAsyncReadyCallback = ?*const fn (?*anyopaque, ?*GAsyncResult, ?*anyopaque) callconv(.c) void;
 const GDestroyNotify = ?*const fn (?*anyopaque) callconv(.c) void;
@@ -541,15 +542,18 @@ extern fn soup_cookie_get_domain(c: *SoupCookie) [*:0]const u8;
 extern fn soup_cookie_get_path(c: *SoupCookie) [*:0]const u8;
 extern fn soup_cookie_get_secure(c: *SoupCookie) gboolean;
 extern fn soup_cookie_get_http_only(c: *SoupCookie) gboolean;
-extern fn soup_cookie_get_expires(c: *SoupCookie) ?*SoupDate;
+extern fn soup_cookie_get_expires(c: *SoupCookie) ?*GDateTime;
 extern fn soup_cookie_get_same_site_policy(c: *SoupCookie) c_int;
 extern fn soup_cookie_set_secure(c: *SoupCookie, v: gboolean) void;
 extern fn soup_cookie_set_http_only(c: *SoupCookie, v: gboolean) void;
 extern fn soup_cookie_set_same_site_policy(c: *SoupCookie, p: c_int) void;
-extern fn soup_cookie_set_expires(c: *SoupCookie, date: ?*SoupDate) void;
-extern fn soup_date_new_from_time_t(t: c_long) *SoupDate;
-extern fn soup_date_to_time_t(d: *SoupDate) c_long;
-extern fn soup_date_free(d: *SoupDate) void;
+extern fn soup_cookie_set_expires(c: *SoupCookie, date: ?*GDateTime) void;
+// glib GDateTime replaces SoupDate (libsoup 3.0). `get_expires` returns a
+// borrowed pointer owned by the cookie (do not unref); a GDateTime we create
+// for `set_expires` is copied by the cookie, so we unref our own.
+extern fn g_date_time_new_from_unix_utc(t: i64) ?*GDateTime;
+extern fn g_date_time_to_unix(d: *GDateTime) i64;
+extern fn g_date_time_unref(d: *GDateTime) void;
 
 const SOUP_SAME_SITE_NONE: c_int = 0;
 const SOUP_SAME_SITE_LAX: c_int = 1;
@@ -1857,7 +1861,8 @@ fn marshalCookie(allocator: std.mem.Allocator, c: *SoupCookie) opts_mod.CookieEr
     };
 
     if (soup_cookie_get_expires(c)) |date| {
-        out.expires_unix = @intCast(soup_date_to_time_t(date));
+        // Borrowed from the cookie — do not unref.
+        out.expires_unix = @intCast(g_date_time_to_unix(date));
     }
 
     out.same_site = switch (soup_cookie_get_same_site_policy(c)) {
@@ -1889,9 +1894,10 @@ fn buildSoupCookie(allocator: std.mem.Allocator, cookie: opts_mod.Cookie) opts_m
     if (cookie.secure) soup_cookie_set_secure(c, 1);
     if (cookie.http_only) soup_cookie_set_http_only(c, 1);
     if (cookie.expires_unix > 0) {
-        const date = soup_date_new_from_time_t(@intCast(cookie.expires_unix));
-        soup_cookie_set_expires(c, date);
-        soup_date_free(date);
+        if (g_date_time_new_from_unix_utc(@intCast(cookie.expires_unix))) |date| {
+            soup_cookie_set_expires(c, date);
+            g_date_time_unref(date);
+        }
     }
     soup_cookie_set_same_site_policy(c, switch (cookie.same_site) {
         .default, .lax => SOUP_SAME_SITE_LAX,
