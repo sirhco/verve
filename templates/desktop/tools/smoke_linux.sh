@@ -31,8 +31,20 @@ mkdir -p "$OUT_DIR"
 
 Xvfb "$DISPLAY_NUM" -screen 0 1280x800x24 &
 XVFB_PID=$!
-sleep 0.5
 trap '[[ -n "${APP_PID:-}" ]] && kill "$APP_PID" 2>/dev/null || true; kill "$XVFB_PID" 2>/dev/null || true' EXIT
+
+# Wait for the X server to actually accept connections before launching the
+# app — a fixed `sleep` races on cold CI runners (Xvfb is still loading the
+# keymap when the app calls gtk_init_check, which then blocks/fails). The unix
+# socket /tmp/.X11-unix/X<N> appears once Xvfb is listening.
+xvfb_sock="/tmp/.X11-unix/X${DISPLAY_NUM#:}"
+for _ in $(seq 1 100); do
+  [[ -S "$xvfb_sock" ]] && break
+  # Bail early if Xvfb died (e.g. display already in use).
+  kill -0 "$XVFB_PID" 2>/dev/null || { echo "smoke: FAIL — Xvfb exited during startup" >&2; exit 71; }
+  sleep 0.1
+done
+[[ -S "$xvfb_sock" ]] || { echo "smoke: FAIL — Xvfb not ready after 10s" >&2; exit 71; }
 
 DISPLAY="$DISPLAY_NUM" ZIG_LOG_LEVEL=debug "$APP" >"$OUT_DIR/app.log" 2>&1 &
 APP_PID=$!
