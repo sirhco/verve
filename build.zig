@@ -13,6 +13,10 @@ pub fn build(b: *std.Build) void {
     const i18n_dir_opt = b.option([]const u8, "i18n-dir", "Directory of <locale>.json catalogs (default: i18n)") orelse "i18n";
     const i18n_default_opt = b.option([]const u8, "i18n-default", "Default locale tag for the lazy catalog");
 
+    // Lower the build-time IBL prefilter sample counts (faster build, coarser
+    // environment lighting). The .venv format is unchanged — only quality.
+    const gl_ibl_fast = b.option(bool, "gl-ibl-fast", "Faster, lower-quality IBL prefilter (fewer samples)") orelse false;
+
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -300,6 +304,7 @@ pub fn build(b: *std.Build) void {
     const gl_asset_gen_hdr_run = b.addRunArtifact(gl_asset_gen_exe);
     gl_asset_gen_hdr_run.addFileArg(studio_hdr_path);
     const studio_venv_path = gl_asset_gen_hdr_run.addOutputFileArg("studio.venv");
+    if (gl_ibl_fast) gl_asset_gen_hdr_run.addArg("--fast");
 
     // Embed the generated assets into a gl_assets.zig source that the server
     // imports. Pattern mirrors the island_chunks embedded table above.

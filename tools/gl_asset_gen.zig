@@ -20,6 +20,14 @@ pub fn main(init: std.process.Init) !void {
     const in_path = args[1];
     const out_path = args[2];
 
+    // `--fast` (any trailing arg): lower the IBL prefilter sample counts for a
+    // faster build at reduced quality. Output sizes are unchanged, so the .venv
+    // format is identical — only the prefiltered values are coarser.
+    var fast = false;
+    for (args[3..]) |a| {
+        if (std.mem.eql(u8, a, "--fast")) fast = true;
+    }
+
     const alloc = init.gpa;
     const cwd = std.Io.Dir.cwd();
 
@@ -40,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     // Dispatch on extension.
     const ext = std.fs.path.extension(in_path);
     const out_bytes = if (std.ascii.eqlIgnoreCase(ext, ".hdr"))
-        try convertHdr(alloc, in_path, in_bytes)
+        try convertHdr(alloc, in_path, in_bytes, quality(fast))
     else
         try convertGlb(alloc, in_path, in_bytes);
     defer alloc.free(out_bytes);
@@ -87,7 +95,18 @@ fn convertGlb(alloc: std.mem.Allocator, in_path: []const u8, glb_bytes: []const 
 
 // ── .hdr → .venv ─────────────────────────────────────────────────────────────
 
-fn convertHdr(alloc: std.mem.Allocator, in_path: []const u8, hdr_bytes: []const u8) ![]u8 {
+/// IBL prefilter sample counts. Output sizes are fixed (32²/128²/64²) — only the
+/// Monte-Carlo sample counts vary, so the .venv format is identical either way.
+const Quality = struct { irr_samples: u32, spec_samples: u32, lut_samples: u32 };
+
+fn quality(fast: bool) Quality {
+    return if (fast)
+        .{ .irr_samples = 32, .spec_samples = 16, .lut_samples = 64 }
+    else
+        .{ .irr_samples = 128, .spec_samples = 64, .lut_samples = 256 };
+}
+
+fn convertHdr(alloc: std.mem.Allocator, in_path: []const u8, hdr_bytes: []const u8, q: Quality) ![]u8 {
     // Decode .hdr → linear RGB image.
     var img = gl.hdr.decode(alloc, hdr_bytes) catch |err| {
         std.log.err("gl_asset_gen: {s}: failed to decode HDR: {s}", .{ in_path, @errorName(err) });
@@ -102,8 +121,8 @@ fn convertHdr(alloc: std.mem.Allocator, in_path: []const u8, hdr_bytes: []const 
     };
     defer env.deinit(alloc);
 
-    // Irradiance (diffuse) cube: 32² faces, 128 samples.
-    var irr_cube = gl.ibl.irradiance(alloc, env, 32, 128) catch |err| {
+    // Irradiance (diffuse) cube: 32² faces.
+    var irr_cube = gl.ibl.irradiance(alloc, env, 32, q.irr_samples) catch |err| {
         std.log.err("gl_asset_gen: {s}: irradiance failed: {s}", .{ in_path, @errorName(err) });
         return err;
     };
@@ -124,7 +143,7 @@ fn convertHdr(alloc: std.mem.Allocator, in_path: []const u8, hdr_bytes: []const 
         const mi: u32 = @intCast(m);
         const face_size: u32 = @as(u32, 128) >> @intCast(mi);
         const roughness: f32 = @as(f32, @floatFromInt(mi)) / 5.0;
-        var mip_cube = gl.ibl.prefilter(alloc, env, face_size, roughness, 64) catch |err| {
+        var mip_cube = gl.ibl.prefilter(alloc, env, face_size, roughness, q.spec_samples) catch |err| {
             std.log.err("gl_asset_gen: {s}: prefilter mip {d} failed: {s}", .{ in_path, m, @errorName(err) });
             return err;
         };
@@ -135,8 +154,8 @@ fn convertHdr(alloc: std.mem.Allocator, in_path: []const u8, hdr_bytes: []const 
         try spec_runs.appendSlice(alloc, mip_run);
     }
 
-    // BRDF integration LUT: 64 samples, 256² texels.
-    const lut_f32 = try gl.ibl.brdfLut(alloc, 64, 256);
+    // BRDF integration LUT: 64² texels.
+    const lut_f32 = try gl.ibl.brdfLut(alloc, 64, q.lut_samples);
     defer alloc.free(lut_f32);
 
     const lut_run = try gl.ibl.lutToRgba16f(alloc, lut_f32, 64);

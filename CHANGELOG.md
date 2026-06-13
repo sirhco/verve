@@ -8,11 +8,18 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **`verve.gl` P8 (correctness, in progress) — glTF node-transform baking,
-  vmesh tex-index hardening, onPickExport, sRGB textures**
+- **`verve.gl` P8 (correctness) — glTF node-transform baking, vmesh
+  tex-index hardening, onPickExport, sRGB textures, `-Dgl-ibl-fast`**
   (`src/core/gl/gltf.zig`, `vmesh.zig`, `command.zig`, `registry.zig`,
   `src/core/gl_scene.zig`, `src/app/islands.zig`,
-  `src/client/islands/{GlScene,GlDemo}.zig`, `src/bridge/verve.js`):
+  `src/client/islands/{GlScene,GlDemo}.zig`, `src/bridge/verve.js`,
+  `build.zig`, `tools/gl_asset_gen.zig`):
+  - **`-Dgl-ibl-fast` build flag**: lowers the build-time IBL prefilter
+    sample counts (irradiance 128→32, specular 64→16, BRDF LUT 256→64) for a
+    markedly faster build (~3.4× on the studio env) at reduced lighting
+    quality. Threaded as a `--fast` arg to the HDR→`.venv` asset-gen run;
+    output sizes (and the `.venv` format) are unchanged. Default builds are
+    full quality.
   - **sRGB internal formats**: base-color + emissive textures upload with an
     `SRGB8_ALPHA8` internal format (hardware sRGB→linear on sample) via a new
     additive command tag `CREATE_TEXTURE_SRGB` (15, same 20-byte payload as
