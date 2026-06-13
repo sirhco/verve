@@ -1553,7 +1553,8 @@ fn parseByteSize(text: []const u8) !usize {
 fn printUsage(program: []const u8) void {
     std.debug.print(
         \\Usage: {s} [--host HOST] [--port PORT] [--body-limit SIZE]
-        \\                    [--public-dir DIR] [--workers N] [--help]
+        \\                    [--public-dir DIR] [--workers N] [--csrf=MODE] [--dev]
+        \\                    [--help]
         \\
         \\Verve full-stack web server. Serves SSR pages, embedded WASM client,
         \\and auto-generated /api/<fn> endpoints from app.Actions.
@@ -1570,6 +1571,9 @@ fn printUsage(program: []const u8) void {
         \\  --workers N          Max concurrent in-flight connections. Excess
         \\                       requests get an immediate 503 with Retry-After: 1.
         \\                       Default: clamp(cpu*2, 4, 1024).
+        \\  --csrf MODE          CSRF protection: enforce (default) or disable.
+        \\  --dev                Inject auto-reload script and accept the
+        \\                       /__verve/dev_ws upgrade.
         \\  -h, --help           Show this message and exit.
         \\
         \\Environment:

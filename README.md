@@ -3,7 +3,7 @@
 > ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.5.x. Public
 > APIs are not stable and **will** break between minor versions.
 > All three desktop backends (macOS, Windows, Linux GTK4) are validated
-> on real hardware as of v0.2.0. Known limitations: desktop auto-updater
+> on real hardware (current as of v0.5.x). Known limitations: desktop auto-updater
 > apply is macOS-only; full a11y provider not yet implemented; Linux
 > image clipboard returns `Unsupported`. Use for learning, experiments,
 > and personal projects. Not production-ready.
@@ -67,7 +67,7 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - **Typed NodeRef** + `data-ref` markers; `verve.queryRef(ref)` resolves to a JS-owned element handle, and `setRefText` / `setRefAttr` / `setRefValue` / `setRefClass` / `focusRef` / `removeRef` / `refValueI32` / `refValueF32` mutate or read the live element by handle.
 - **Reactive ErrorBoundary** — `Signal(?anyerror)` with `captureError` / `reset`.
 - **Client-side runtime** — the wasm bundle hosts the real reactive graph. `registerI32` / `registerStr` / `registerBool` / `registerF32` allocate Signals whose `on_set` hook drives DOM updates. Per-frame scratch allocator keeps memory bounded across re-runs.
-- **Typed bindings + auto-walker** (Phase 14) — `Node.bindI32` / `bindStr` / `bindBool` / `bindF32` stamp `data-vh-type` + `data-vh-initial` on the rendered element; the bridge JS walks every `[data-vh-type]` after instantiation and calls the matching `verve_register_<kind>` export. Apps no longer need to ship per-binding `verve_init_<name>` exports.
+- **Typed bindings + auto-walker** — `Node.bindI32` / `bindStr` / `bindBool` / `bindF32` stamp `data-vh-type` + `data-vh-initial` on the rendered element; the bridge JS walks every `[data-vh-type]` after instantiation and calls the matching `verve_register_<kind>` export. Apps no longer need to ship per-binding `verve_init_<name>` exports.
 - **Declarative `autoHydrate(bindings)`** — alternative to typed bindings; pass a slice of `Binding { name, initial }` and the runtime dispatches to the right registrar per entry.
 - **Idempotent register***. Second `register*` call with the same name returns the existing slot — safe for multi-instance islands and hot-reloaded chunks.
 - **Closure-style event handlers** — `verve.registerEvent(fn)` returns a `u32` slot id; stamp via `Node.onClickFn` / `onSubmitFn` / `onInputFn` / `onChangeFn` / `onKeydownFn` at render time. Bridge JS delegates route through `verve_event_dispatch(id)`; handler runs in WASM with whatever state it captured at registration.
@@ -112,8 +112,8 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 - **Per-island WASM chunks** — `build.zig` parses `src/app/islands.zig` and builds one chunk per declared island (`src/client/islands/<Name>.zig` for custom logic, `_default.zig` as a shared stub).
 - **Shared linear memory** — chunks import their memory from the main `client.wasm` via `env.memory`, dropping per-chunk size to **~73 bytes** for stubs (~290 B for chunks that ship real logic) vs. ~180 B standalone. Total bytes-on-wire stays flat as you add more islands.
 - **Lazy dispatch** — JS bridge fetches each chunk on first encounter, caches the instantiation, copies props through shared scratch, and calls `hydrate(ptr, len, vid)`.
-- **Chunk-side reactive runtime** (Phase 13F) — chunks `@import("verve")` (the chunk-side façade) and call `registerI32` / `signalSetI32` / `signalGetI32` / `queryRef` / `setRefText` / `cleanup` / etc. via a `verve_runtime` import the bridge JS resolves against the main client's exports at instantiation. Per-island Signal registration without bouncing through the main client.
-- **Closure-style events from chunks** (Phase 13G, table-isolated) — `verve.registerEvent(&handler)` from a chunk lands in the main runtime's event-slot table and `call_indirect` dispatches it. Function tables are **isolated**: the main client imports a JS-owned growable `__indirect_function_table`, each chunk instantiates against a private table, and the bridge translates fn-pointer indices crossing the boundary (registerEvent, timers, response/drop handlers) into freshly grown main-table slots — a chunk's element segment can never clobber the main client's entries.
+- **Chunk-side reactive runtime** — chunks `@import("verve")` (the chunk-side façade) and call `registerI32` / `signalSetI32` / `signalGetI32` / `queryRef` / `setRefText` / `cleanup` / etc. via a `verve_runtime` import the bridge JS resolves against the main client's exports at instantiation. Per-island Signal registration without bouncing through the main client.
+- **Closure-style events from chunks** (table-isolated) — `verve.registerEvent(&handler)` from a chunk lands in the main runtime's event-slot table and `call_indirect` dispatches it. Function tables are **isolated**: the main client imports a JS-owned growable `__indirect_function_table`, each chunk instantiates against a private table, and the bridge translates fn-pointer indices crossing the boundary (registerEvent, timers, response/drop handlers) into freshly grown main-table slots — a chunk's element segment can never clobber the main client's entries.
 - **Multi-instance islands** — the framework auto-namespaces every `z-bind` / `data-ref` inside an island as `name__v{vid}` at SSR time. Two instances of the same component are fully independent with no author burden; `hydrate(props_ptr, props_len, vid)` receives the document-order `vid` assigned by the bridge.
 - **Typed props** — `verve.encodeProps(ctx, Props{...})` serializes a typed struct to base64 (binary codec in `src/core/props.zig`) for the server; `verve.decodeProps(Props, bytes, alloc)` reconstructs it chunk-side from `data-props`. `props_schema` is optional documentation, not the wire contract.
 - **Island resource-state hydration** — `ctx.islandState(fields)` / `ctx.islandStateStruct(key, value)` server-side embed state in `<script type="application/verve-state">`; chunks read it back with `verve.resourceFromState(T, owner, key)` (returns a `.ready` Resource, no re-fetch) or `verve.islandStateValue(T, key)` (raw primitive).
@@ -122,7 +122,7 @@ It's also short, unique on crates.io / npm / pypi (none of which Verve ships to)
 ### Downstream wasm clients (`verve_client` module)
 - **`verve_client`** is a sibling module published from `build.zig` alongside `verve` — re-exports every reactive primitive a wasm client needs (Signal / Effect / Owner / Action / Resource / Store / ErrorBoundary), the DOM-wired adapter (`registerI32` + variants, `bindForEach` / `applyReconcile`, NodeRef ops, closure events, cleanup, slot introspection), and the SPA navigation + control-flow + suspense + i18n helpers.
 - **Drop-in for downstream apps** — the desktop template imports it as `@import("verve")` from its wasm client; downstream apps written against the same `verve_client` surface compile against both web and desktop targets unchanged.
-- **Bundled with the desktop scaffold** by default. `templates/desktop/src/client/main.zig` ships only the click handlers — every binding is registered automatically by the Phase-14 auto-walker.
+- **Bundled with the desktop scaffold** by default. `templates/desktop/src/client/main.zig` ships only the click handlers — every binding is registered automatically by the auto-walker.
 
 ### Client runtime (wasm app primitives)
 Wasm-side primitives so app logic lives in Zig instead of an inline `<script>` blob. All chunk-callable; one shared `std.json` parser in the main client keeps chunks tiny. Guide: [`docs/20-client-runtime.md`](docs/20-client-runtime.md).
@@ -199,7 +199,7 @@ tour and platform support matrix.
 
 > Pre-1.0 — release artifacts are published for each tag, but
 > behavior is experimental. All three desktop backends (macOS,
-> Windows, Linux GTK4) are validated on real hardware as of v0.2.0.
+> Windows, Linux GTK4) are validated on real hardware (current as of v0.5.x).
 
 Tagged releases publish `verve-server` + `verve-cli` tarballs for
 five targets:
@@ -211,7 +211,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.2.0
+VERSION=0.5.1
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256
@@ -283,7 +283,7 @@ export fn increment_counter() void {
 ```
 
 No `verve_init_*` / `verve_hydrate` boilerplate when the SSR side
-uses `.bindI32("count", 0)` — the Phase-14 auto-walker registers
+uses `.bindI32("count", 0)` — the auto-walker registers
 every typed binding from the rendered HTML.
 
 ### Scaffold a new app pinned to a release
@@ -320,6 +320,11 @@ Then open:
 - <http://127.0.0.1:8080/todos> — pure server-rendered todo list (no wasm needed)
 - <http://127.0.0.1:8080/work/hello-world> — path-parameter + per-page head slots demo
 - <http://127.0.0.1:8080/app/dashboard> — nested layout route
+- <http://127.0.0.1:8080/viz> — `verve.viz` charts + node-link graphs (SVG, JS-off)
+- <http://127.0.0.1:8080/anim> — `verve.anim` engine: tweens, timelines, ScrollTrigger
+- <http://127.0.0.1:8080/smooth> — `verve.anim` ScrollSmoother demo
+- <http://127.0.0.1:8080/gl> — `verve.gl` 3D engine (WebGL2, no three.js)
+- <http://127.0.0.1:8080/gl-scene> — declarative `ctx.glScene` 3D scene
 
 Or run the **showcase** for a tour of every feature:
 
@@ -552,6 +557,8 @@ verve-server [--host HOST] [--port PORT] [--body-limit SIZE]
 | `tests/integration.zig` | E2E tests (spawn server, hit endpoints, kill) |
 | `tests/public_fixture/` | Files used by the `--public-dir` integration test |
 | `.github/workflows/ci.yml` | CI matrix (ubuntu + macos) — fmt check + build + test + smoke |
+| `.github/workflows/desktop.yml` | Desktop backend build/test matrix (macos + ubuntu + windows) |
+| `.github/workflows/release.yml` | Tagged-release tarballs for the 5 published targets |
 
 ## Scaffolding a new app
 
@@ -593,7 +600,7 @@ zig build test --summary all
 zig build docs                          # regenerate API reference
 ```
 
-CI runs the same on ubuntu-latest and macos-latest and adds a curl smoke test against the live binary. See `.github/workflows/ci.yml`.
+CI runs the same on ubuntu-latest and macos-latest and adds a curl smoke test against the live binary (`.github/workflows/ci.yml`). A separate `desktop.yml` exercises the three desktop backends across macOS, Linux, and Windows.
 
 ## License
 
