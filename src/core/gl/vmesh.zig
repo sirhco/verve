@@ -44,6 +44,7 @@
 
 const std = @import("std");
 const bvh = @import("bvh.zig");
+const command = @import("command.zig");
 
 pub const magic = "VMSH";
 pub const version: u32 = 3;
@@ -490,6 +491,19 @@ pub const Reader = struct {
         }
         return false;
     }
+
+    /// Returns the CREATE_SHADER variant bitset for submesh `s`.
+    /// Always sets `variant_pbr`; additionally sets `variant_normal_map` when
+    /// the submesh has a normal-map texture (`tex_normal >= 0`) and
+    /// `variant_emissive` when it has an emissive texture (`tex_emissive >= 0`).
+    /// Caller must ensure `s < self.submesh_count`.
+    pub fn submeshVariant(self: *const Reader, s: u32) u32 {
+        const sub = self.submesh(s);
+        var bits: u32 = command.variant_pbr;
+        if (sub.tex_normal >= 0) bits |= command.variant_normal_map;
+        if (sub.tex_emissive >= 0) bits |= command.variant_emissive;
+        return bits;
+    }
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -921,4 +935,61 @@ test "(f) v3 SizeMismatch: bad tri_perm len; names len mismatch" {
     // names.len == 1 with 2 submeshes → SizeMismatch.
     const one_name = [_][]const u8{"only"};
     try testing.expectError(error.SizeMismatch, pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &.{}, &.{}, &one_name));
+}
+
+// ── submeshVariant ────────────────────────────────────────────────────────────
+
+test "(i) submeshVariant: all four tex_normal × tex_emissive combinations" {
+    // Two textures so any non-negative tex index in [0,1] is valid.
+    const texels = [_]u8{ 0, 0, 0, 255 };
+    const texs = [_]Texture{
+        .{ .width = 1, .height = 1, .rgba = &texels },
+        .{ .width = 1, .height = 1, .rgba = &texels },
+    };
+
+    // Helper closure: build a minimal Submesh with given tex_normal/tex_emissive.
+    const make = struct {
+        fn sub(tn: i32, te: i32) Submesh {
+            return .{
+                .index_byte_off = 0,
+                .index_count = 3,
+                .base_color = .{ 1, 1, 1, 1 },
+                .metallic = 0,
+                .roughness = 1,
+                .emissive = .{ 0, 0, 0 },
+                .occlusion_strength = 1,
+                .normal_scale = 1,
+                .tex_base = -1,
+                .tex_mr = -1,
+                .tex_normal = tn,
+                .tex_emissive = te,
+                .tex_occlusion = -1,
+            };
+        }
+    }.sub;
+
+    // Four submeshes covering all (normal, emissive) combinations.
+    const subs = [_]Submesh{
+        make(0, 1), // both present
+        make(0, -1), // normal only
+        make(-1, 1), // emissive only
+        make(-1, -1), // neither
+    };
+
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &texs, &.{}, &.{}, &.{});
+    defer testing.allocator.free(bytes);
+    const r = try Reader.init(bytes);
+
+    const pbr = command.variant_pbr;
+    const nm = command.variant_normal_map;
+    const em = command.variant_emissive;
+
+    // both maps present → pbr | normal_map | emissive
+    try testing.expectEqual(pbr | nm | em, r.submeshVariant(0));
+    // normal present, emissive = -1 → pbr | normal_map
+    try testing.expectEqual(pbr | nm, r.submeshVariant(1));
+    // emissive present, normal = -1 → pbr | emissive
+    try testing.expectEqual(pbr | em, r.submeshVariant(2));
+    // both = -1 → pbr only
+    try testing.expectEqual(pbr, r.submeshVariant(3));
 }
