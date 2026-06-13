@@ -290,10 +290,16 @@ export fn glmodel_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 @intCast(fs.len),
             );
             // Material textures (up to 5 from the v2 vmesh): handle = t+1.
+            // base-color / emissive → sRGB (hardware decode); rest linear.
             var t: u32 = 0;
             while (t < a.tex_count) : (t += 1) {
                 const tex = a.texture(t);
-                enc.createTexture(t + 1, tex.width, tex.height, @intCast(@intFromPtr(tex.rgba.ptr)), @intCast(tex.rgba.len));
+                const ptr: u32 = @intCast(@intFromPtr(tex.rgba.ptr));
+                const len: u32 = @intCast(tex.rgba.len);
+                if (a.texIsSrgb(t))
+                    enc.createTextureSrgb(t + 1, tex.width, tex.height, ptr, len)
+                else
+                    enc.createTexture(t + 1, tex.width, tex.height, ptr, len);
             }
             // IBL: irradiance cube, prefiltered specular mip-chain, BRDF LUT.
             enc.createTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));

@@ -474,6 +474,22 @@ pub const Reader = struct {
     pub fn nameHash(s: []const u8) u32 {
         return fnv1a32(s);
     }
+
+    /// True if texture `tex_index` is used as a base-color or emissive map by
+    /// any submesh (→ sRGB color space; the chunk uploads it via
+    /// `CREATE_TEXTURE_SRGB`). metallic-roughness / normal / occlusion maps are
+    /// linear. A texture used in both contexts resolves to sRGB (base/emissive
+    /// wins) — harmless in practice (real assets keep color and data maps
+    /// distinct; the shared neutral white is identity in either space).
+    pub fn texIsSrgb(self: *const Reader, tex_index: u32) bool {
+        const ti: i32 = @intCast(tex_index);
+        var s: u32 = 0;
+        while (s < self.submesh_count) : (s += 1) {
+            const sub = self.submesh(s);
+            if (sub.tex_base == ti or sub.tex_emissive == ti) return true;
+        }
+        return false;
+    }
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -789,6 +805,36 @@ test "(d) v3 hostile sections → Truncated / empty (no panic)" {
         const r = try Reader.init(buf); // init must still succeed (lazy per-entry)
         try testing.expectEqual(@as(usize, 0), r.name(0).len); // empty, no panic
     }
+}
+
+test "(h) texIsSrgb: base/emissive → sRGB, mr/normal/occlusion → linear" {
+    const texels = [_]u8{ 0, 0, 0, 255 };
+    const texs = [_]Texture{
+        .{ .width = 1, .height = 1, .rgba = &texels },
+        .{ .width = 1, .height = 1, .rgba = &texels },
+        .{ .width = 1, .height = 1, .rgba = &texels },
+    };
+    const subs = [_]Submesh{.{
+        .index_byte_off = 0,
+        .index_count = 3,
+        .base_color = .{ 1, 1, 1, 1 },
+        .metallic = 0,
+        .roughness = 1,
+        .emissive = .{ 0, 0, 0 },
+        .occlusion_strength = 1,
+        .normal_scale = 1,
+        .tex_base = 0, // sRGB
+        .tex_mr = 1, // linear
+        .tex_normal = -1,
+        .tex_emissive = 2, // sRGB
+        .tex_occlusion = -1,
+    }};
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &texs, &.{}, &.{}, &.{});
+    defer testing.allocator.free(bytes);
+    const r = try Reader.init(bytes);
+    try testing.expect(r.texIsSrgb(0)); // base-color
+    try testing.expect(!r.texIsSrgb(1)); // metallic-roughness
+    try testing.expect(r.texIsSrgb(2)); // emissive
 }
 
 test "(g) v3 rejects out-of-range submesh tex index (BadTexIndex)" {

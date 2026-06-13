@@ -4444,6 +4444,22 @@
           st.textures[handle] = { tex, target: gl.TEXTURE_2D };
           break;
         }
+        case 15: { // CREATE_TEXTURE_SRGB — like tag 7 but SRGB8_ALPHA8 internal
+          // (hardware sRGB→linear on sample; for base-color + emissive maps).
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          const p = dv.getUint32(off + 12, true);
+          const len = dv.getUint32(off + 16, true);
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.SRGB8_ALPHA8, w, h, 0, gl.RGBA,
+            gl.UNSIGNED_BYTE, new Uint8Array(memory.buffer, p, len));
+          gl.generateMipmap(gl.TEXTURE_2D);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+          st.textures[handle] = { tex, target: gl.TEXTURE_2D };
+          break;
+        }
         case 8: { // BIND_TEXTURE
           const slot = dv.getUint32(off, true);
           const entry = st.textures[dv.getUint32(off + 4, true)];

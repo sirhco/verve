@@ -18,6 +18,7 @@ const Tag = enum(u4) {
     shader,
     texture,
     texture_ex,
+    texture_srgb,
 };
 
 /// Discriminated union payload for a single recorded CREATE_* call.
@@ -50,6 +51,13 @@ const Record = union(Tag) {
         width: u32,
         height: u32,
         mip_count: u32,
+        ptr: u32,
+        byte_len: u32,
+    },
+    texture_srgb: struct {
+        handle: u32,
+        width: u32,
+        height: u32,
         ptr: u32,
         byte_len: u32,
     },
@@ -144,6 +152,29 @@ pub fn Registry(comptime cap: usize) type {
             self._count += 1;
         }
 
+        /// Record a `Encoder.createTextureSrgb` call (P8 sRGB material texture).
+        pub fn recordTextureSrgb(
+            self: *Self,
+            handle: u32,
+            width: u32,
+            height: u32,
+            ptr: u32,
+            byte_len: u32,
+        ) void {
+            if (self._count >= cap) {
+                self._overflowed = true;
+                return;
+            }
+            self.records[self._count] = .{ .texture_srgb = .{
+                .handle = handle,
+                .width = width,
+                .height = height,
+                .ptr = ptr,
+                .byte_len = byte_len,
+            } };
+            self._count += 1;
+        }
+
         /// Record a `Encoder.createTextureEx` call.
         pub fn recordTextureEx(
             self: *Self,
@@ -182,6 +213,7 @@ pub fn Registry(comptime cap: usize) type {
                     .shader => |s| enc.createShader(s.handle, s.variant, s.vs_ptr, s.vs_len, s.fs_ptr, s.fs_len),
                     .texture => |t| enc.createTexture(t.handle, t.width, t.height, t.ptr, t.byte_len),
                     .texture_ex => |x| enc.createTextureEx(x.handle, x.target, x.format, x.width, x.height, x.mip_count, x.ptr, x.byte_len),
+                    .texture_srgb => |t| enc.createTextureSrgb(t.handle, t.width, t.height, t.ptr, t.byte_len),
                 }
             }
         }
@@ -210,6 +242,7 @@ test "replay matches direct encode — one of each resource type" {
     reg.recordShader(2, 1, 0x4000, 256, 0x5000, 128);
     reg.recordTexture(3, 8, 8, 0x6000, 256);
     reg.recordTextureEx(4, .cube, .rgba16f, 128, 128, 6, 0x8000, 0x100000);
+    reg.recordTextureSrgb(5, 16, 16, 0x9000, 1024); // P8 sRGB material texture
 
     var buf_a: [512]u8 = undefined;
     var enc_a = command.Encoder.init(&buf_a);
@@ -223,6 +256,7 @@ test "replay matches direct encode — one of each resource type" {
     enc_b.createShader(2, 1, 0x4000, 256, 0x5000, 128);
     enc_b.createTexture(3, 8, 8, 0x6000, 256);
     enc_b.createTextureEx(4, .cube, .rgba16f, 128, 128, 6, 0x8000, 0x100000);
+    enc_b.createTextureSrgb(5, 16, 16, 0x9000, 1024);
     const stream_b = enc_b.finish();
 
     try testing.expectEqualSlices(u8, stream_b, stream_a);

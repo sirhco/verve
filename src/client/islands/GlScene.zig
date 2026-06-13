@@ -730,8 +730,17 @@ fn sendResources(enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: *const gl.ven
     var t: u32 = 0;
     while (t < a.tex_count) : (t += 1) {
         const tex = a.texture(t);
-        enc.createTexture(t + 1, tex.width, tex.height, @intCast(@intFromPtr(tex.rgba.ptr)), @intCast(tex.rgba.len));
-        registry.recordTexture(t + 1, tex.width, tex.height, @intCast(@intFromPtr(tex.rgba.ptr)), @intCast(tex.rgba.len));
+        const ptr: u32 = @intCast(@intFromPtr(tex.rgba.ptr));
+        const len: u32 = @intCast(tex.rgba.len);
+        // base-color / emissive maps are sRGB (hardware decode); mr/normal/
+        // occlusion are linear. See vmesh.Reader.texIsSrgb.
+        if (a.texIsSrgb(t)) {
+            enc.createTextureSrgb(t + 1, tex.width, tex.height, ptr, len);
+            registry.recordTextureSrgb(t + 1, tex.width, tex.height, ptr, len);
+        } else {
+            enc.createTexture(t + 1, tex.width, tex.height, ptr, len);
+            registry.recordTexture(t + 1, tex.width, tex.height, ptr, len);
+        }
     }
 
     enc.createTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));

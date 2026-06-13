@@ -9,9 +9,19 @@ versions follow [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **`verve.gl` P8 (correctness, in progress) — glTF node-transform baking,
-  vmesh tex-index hardening, onPickExport** (`src/core/gl/gltf.zig`,
-  `vmesh.zig`, `src/core/gl_scene.zig`, `src/app/islands.zig`,
-  `src/client/islands/GlScene.zig`, `src/bridge/verve.js`):
+  vmesh tex-index hardening, onPickExport, sRGB textures**
+  (`src/core/gl/gltf.zig`, `vmesh.zig`, `command.zig`, `registry.zig`,
+  `src/core/gl_scene.zig`, `src/app/islands.zig`,
+  `src/client/islands/{GlScene,GlDemo}.zig`, `src/bridge/verve.js`):
+  - **sRGB internal formats**: base-color + emissive textures upload with an
+    `SRGB8_ALPHA8` internal format (hardware sRGB→linear on sample) via a new
+    additive command tag `CREATE_TEXTURE_SRGB` (15, same 20-byte payload as
+    tag 7) + bridge case + registry `texture_srgb` record. The PBR shader
+    drops its in-shader `pow(2.2)` on base/emissive (frag GLSL FNV-64 hashes
+    bumped). Color-space is inferred chunk-side — `vmesh.Reader.texIsSrgb(i)`
+    (used as base/emissive by any submesh → sRGB; mr/normal/occlusion linear)
+    — so no vmesh format change. Both gl chunks branch on it. Runtime-verified
+    on `/gl` (PBR cube renders correctly, no GL errors).
   - **onPickExport — DOM CustomEvent pick dispatch**: new builder method
     `.onPickExport(name, event_name)` dispatches a bubbling
     `CustomEvent(event_name, {detail:{name}})` from the canvas on a pick hit

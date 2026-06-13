@@ -35,6 +35,7 @@ pub const Tag = enum(u16) {
     bind_ibl = 12, // {irr, spec, lut, spec_mip_count}
     draw_pbr = 13, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr, model_ptr, normal_ptr, material_ptr, camera_ptr}
     delete_resource = 14, // {kind, handle} — frees one GPU object; slot may be reused after
+    create_texture_srgb = 15, // {handle, width, height, ptr, len} raw RGBA8 → SRGB8_ALPHA8 internal (P8); same layout as tag 7
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2 };
@@ -255,7 +256,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\  float occlusion_strength = u_material[1].z;
         \\  float normal_scale = u_material[1].w;
         \\  vec3 emissive_factor = u_material[2].rgb;
-        \\  vec3 base_sample = pow(texture(u_base_tex, v_uv).rgb, vec3(2.2));
+        \\  vec3 base_sample = texture(u_base_tex, v_uv).rgb;
         \\  vec3 albedo = base_sample * base_color.rgb;
         \\  float ao_sample = texture(u_occlusion_tex, v_uv).r;
         \\
@@ -317,7 +318,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\
     ;
     const emissive =
-        \\  color += emissive_factor * pow(texture(u_emissive_tex, v_uv).rgb, vec3(2.2));
+        \\  color += emissive_factor * texture(u_emissive_tex, v_uv).rgb;
         \\
     ;
     const tail =
@@ -406,6 +407,19 @@ pub const Encoder = struct {
 
     pub fn createTexture(self: *Encoder, handle: u32, width: u32, height: u32, ptr: u32, byte_len: u32) void {
         self.header(.create_texture, 20);
+        self.putU32(handle);
+        self.putU32(width);
+        self.putU32(height);
+        self.putU32(ptr);
+        self.putU32(byte_len);
+    }
+
+    /// Like `createTexture` but the bridge uploads the bytes with an
+    /// `SRGB8_ALPHA8` internal format (hardware sRGB→linear on sample). Used for
+    /// base-color and emissive material textures (P8) so the PBR shader no longer
+    /// applies an in-shader `pow(2.2)` decode. Identical 20-byte payload to tag 7.
+    pub fn createTextureSrgb(self: *Encoder, handle: u32, width: u32, height: u32, ptr: u32, byte_len: u32) void {
+        self.header(.create_texture_srgb, 20);
         self.putU32(handle);
         self.putU32(width);
         self.putU32(height);
@@ -565,6 +579,26 @@ test "encoder asserts on overflow" {
     try testing.expectEqual(@as(usize, 32), enc.finish().len);
 }
 
+test "golden: CREATE_TEXTURE_SRGB (tag 15) byte layout" {
+    // P8: sRGB material texture upload. Same payload as CREATE_TEXTURE (tag 7);
+    // the bridge uploads with internalFormat SRGB8_ALPHA8 + generated mips.
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createTextureSrgb(2, 4, 4, 0x5000, 64);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "1c000000" ++ // 28 record bytes
+            // CREATE_TEXTURE_SRGB handle=2 w=4 h=4 ptr=0x5000 len=64
+            "0f00" ++ "1400" ++ "02000000" ++ "04000000" ++ "04000000" ++ "00500000" ++ "40000000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
 test "golden: texture + lit submesh draw" {
     var buf: [512]u8 = undefined;
     var enc = Encoder.init(&buf);
@@ -650,12 +684,14 @@ test "golden: PBR GLSL hashes frozen (FNV-1a-64)" {
     const F1 = variant_pbr | variant_normal_map;
     const F2 = variant_pbr | variant_normal_map | variant_emissive;
     // Frozen from first green run — a change here = deliberate GLSL contract bump.
+    // Fragment hashes bumped in P8: base-color + emissive samples no longer apply
+    // an in-shader pow(2.2) — those textures upload as SRGB8_ALPHA8 (hardware decode).
     try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(F0)));
     try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(F1)));
     try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(F2))); // emissive does not touch the VS
-    try testing.expectEqual(@as(u64, 0x351b42b633fda5af), fnv64(pbrFragmentSrc(F0)));
-    try testing.expectEqual(@as(u64, 0xadcb72b813f0d4e4), fnv64(pbrFragmentSrc(F1)));
-    try testing.expectEqual(@as(u64, 0x3434b94b317be944), fnv64(pbrFragmentSrc(F2)));
+    try testing.expectEqual(@as(u64, 0x2f65f1426c2c4ed2), fnv64(pbrFragmentSrc(F0)));
+    try testing.expectEqual(@as(u64, 0x4b3d632d4e94e70d), fnv64(pbrFragmentSrc(F1)));
+    try testing.expectEqual(@as(u64, 0xf0c580cec075612c), fnv64(pbrFragmentSrc(F2)));
 }
 
 test "PBR uniform contract: full-variant names present" {
