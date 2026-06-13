@@ -471,11 +471,16 @@ test "counter form fallback: /api/incrementCount + /api/decrementCount via form 
 /// Make a GET to `path`, treating a connection reset / refusal as a 503 — the
 /// accept loop sends a best-effort 503 then closes, which the kernel can surface
 /// to the client as an RST instead of a readable response.
-fn statusOrBusy(io: std.Io, gpa: std.mem.Allocator, port: u16, path: []const u8) !u16 {
-    var resp = request(io, gpa, port, "GET", path) catch |err| switch (err) {
-        error.ConnectionResetByPeer, error.ConnectionRefused, error.ReadFailed => return 503,
-        else => return err,
-    };
+/// GET `path` and return the HTTP status, mapping ANY connection failure to
+/// 503 ("rejected"). When a worker is held, the accept loop sends a best-effort
+/// 503 then closes — which the kernel surfaces to the client as a readable 503
+/// OR a reset/refusal, spelled differently per platform (Windows reports it as
+/// error.Unexpected / NTSTATUS CONNECTION_RESET). Rather than enumerate
+/// target-specific error names, treat every failure as "not admitted"; the
+/// recovery probe (a 200 after the holder is released) guards against mistaking
+/// a dead server for rejection.
+fn statusOrBusy(io: std.Io, gpa: std.mem.Allocator, port: u16, path: []const u8) u16 {
+    var resp = request(io, gpa, port, "GET", path) catch return 503;
     defer resp.deinit(gpa);
     return resp.status;
 }
@@ -544,7 +549,7 @@ test "--workers caps concurrent connections (excess returns 503)" {
     // immediately with 503 by the accept loop — deterministic, no timing race.
     var i: usize = 0;
     while (i < 16) : (i += 1) {
-        try std.testing.expectEqual(@as(u16, 503), try statusOrBusy(io, gpa, port, "/health"));
+        try std.testing.expectEqual(@as(u16, 503), statusOrBusy(io, gpa, port, "/health"));
     }
 
     // Release the worker; the server notices the closed socket on its next SSE
@@ -556,11 +561,7 @@ test "--workers caps concurrent connections (excess returns 503)" {
     var recovered = false;
     var attempts: usize = 0;
     while (attempts < 60) : (attempts += 1) {
-        const s = statusOrBusy(io, gpa, port, "/health") catch {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
-            continue;
-        };
-        if (s == 200) {
+        if (statusOrBusy(io, gpa, port, "/health") == 200) {
             recovered = true;
             break;
         }
