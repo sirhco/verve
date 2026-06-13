@@ -80,16 +80,53 @@ const frame_export = "glscene_frame";
 // GPU resource handles (kept distinct from IBL handles 16/17/18).
 const vbuf: u32 = 1;
 const ibuf: u32 = 2;
-const shader: u32 = 1;
+// Shader handles 1..4 live in the bridge's separate `st.shaders[]` namespace
+// (distinct from buffers/textures), one per PBR variant — see shaderHandleFor.
 const irr_handle: u32 = 16;
 const spec_handle: u32 = 17;
 const lut_handle: u32 = 18;
 
-// Comptime PBR variant — full Cook-Torrance + IBL + tangent-space normals +
-// emissive (parity with GlDemo's textured model path).
-const pbr_variant = gl.command.variant_pbr | gl.command.variant_normal_map | gl.command.variant_emissive;
-
 const max_submesh = 8; // material-pool cap
+
+// Up to four PBR variants per mesh: variant_pbr is always set; normal_map and
+// emissive are independent sub-bits. Each maps to a fixed shader handle 1..4 in
+// the bridge's `st.shaders[]` namespace (separate from buffers/textures).
+const variant_pbr = gl.command.variant_pbr;
+const variant_nm = gl.command.variant_normal_map;
+const variant_em = gl.command.variant_emissive;
+
+/// Stable shader handle per PBR variant: pbr→1, pbr|nm→2, pbr|em→3,
+/// pbr|nm|em→4. Any out-of-set value (incl. the sentinel 0) maps to 1.
+fn shaderHandleFor(variant: u32) u32 {
+    return switch (variant) {
+        variant_pbr => 1,
+        variant_pbr | variant_nm => 2,
+        variant_pbr | variant_em => 3,
+        variant_pbr | variant_nm | variant_em => 4,
+        else => 1,
+    };
+}
+
+/// Create + record one shader for a runtime `variant`. The GLSL sources are
+/// assembled at comptime (`pbr*Src` take comptime flags), so we dispatch over
+/// the four legal variants. Recording is required for context-restore replay.
+fn createShaderForVariant(enc: *gl.Encoder, variant: u32) void {
+    switch (variant) {
+        variant_pbr => emitShader(enc, variant_pbr),
+        variant_pbr | variant_nm => emitShader(enc, variant_pbr | variant_nm),
+        variant_pbr | variant_em => emitShader(enc, variant_pbr | variant_em),
+        variant_pbr | variant_nm | variant_em => emitShader(enc, variant_pbr | variant_nm | variant_em),
+        else => emitShader(enc, variant_pbr),
+    }
+}
+
+fn emitShader(enc: *gl.Encoder, comptime variant: u32) void {
+    const handle = shaderHandleFor(variant);
+    const vs = gl.command.pbrVertexSrc(variant);
+    const fs = gl.command.pbrFragmentSrc(variant);
+    enc.createShader(handle, variant, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    registry.recordShader(handle, variant, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+}
 
 // ── Props copies (decoded from SSR data-props; copied to statics before the
 //    chunk arena that held the decode result is reset) ────────────────────────
@@ -207,21 +244,23 @@ var lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 };
 var reduced_motion: bool = false;
 
 // GPU-resource registry for context-restore replay. Cap 32:
-//   2 buffers + 1 shader + up to 5 material textures + 3 IBL textures = 11
-//   worst case; 32 leaves generous headroom (no overflow).
+//   2 buffers + up to 4 shaders + up to 5 material textures + 3 IBL textures =
+//   14 worst case; 32 leaves generous headroom (no overflow).
 var registry: gl.Registry(32) = .{};
 var resources_sent: bool = false;
 var needs_replay: bool = false;
 
 // cmd_buf sizing (N = max_submesh = 8). Record = 4-byte header + payload.
 //   one-time create OR replay (same set):
-//     2×createBuffer(20) + createShader(28) + 5×createTexture(24)
-//     + 3×createTextureEx(36) = 40 + 28 + 120 + 108 = 296
-//   per-frame:
-//     header(4) + beginFrame(28) + setPipeline(12) + setLights(12)
-//     + bindIbl(20) + N×(5×bindTexture(12) + drawPbr(40)) = 8×100 = 800
-//     + endFrame(4) = 880
-//   worst case (create/replay + frame on one tick) = 296 + 880 = 1176.
+//     2×createBuffer(20) + up to 4×createShader(28) + 5×createTexture(24)
+//     + 3×createTextureEx(36) = 40 + 112 + 120 + 108 = 380
+//   per-frame (worst case: every submesh a distinct variant, so the
+//     pipeline/lights/IBL group re-emits per submesh):
+//     header(4) + beginFrame(28)
+//     + N×(setPipeline(12) + setLights(12) + bindIbl(20)
+//          + 5×bindTexture(12) + drawPbr(40)) = 8×144 = 1152
+//     + endFrame(4) = 1188
+//   worst case (create/replay + frame on one tick) = 380 + 1188 = 1568.
 //   Round up to 4096 (matches GlDemo).
 var cmd_buf: [4096]u8 = undefined;
 
@@ -671,18 +710,27 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         }
 
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
-        enc.setPipeline(shader, gl.command.state_depth_test | gl.command.state_cull_back);
-        enc.setLights(1, @intCast(@intFromPtr(&lights)));
-        enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
 
         // pv hoisted out of the loop; per-draw matrices come from the scene
         // graph (scene_built is invariant-true whenever `asset` is non-null —
         // buildScene runs in the same callback that sets `asset`).
         const pv = proj.mul(view);
+        // Sentinel 0 is never a valid variant (variant_pbr is always set), so
+        // the first submesh always (re)binds its pipeline group. The wire's
+        // stream-order rule requires SET_PIPELINE before SET_LIGHTS / BIND_IBL
+        // for *each* pipeline, so we re-emit all three after every switch.
+        var last_variant: u32 = 0;
         var s: u32 = 0;
         while (s < a.submesh_count) : (s += 1) {
             if (s >= max_submesh) break;
             const sub = a.submesh(s);
+            const v = a.submeshVariant(s);
+            if (v != last_variant) {
+                enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_back);
+                enc.setLights(1, @intCast(@intFromPtr(&lights)));
+                enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+                last_variant = v;
+            }
             // mats[s] initialized once in buildScene; anim setters own mutations.
             const world_s = scene.world[s + 1];
             model_mats[s] = world_s.m;
@@ -722,10 +770,18 @@ fn sendResources(enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: *const gl.ven
     enc.createBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
     registry.recordBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
 
-    const vs = gl.command.pbrVertexSrc(pbr_variant);
-    const fs = gl.command.pbrFragmentSrc(pbr_variant);
-    enc.createShader(shader, pbr_variant, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
-    registry.recordShader(shader, pbr_variant, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    // Create + record only the distinct shader variants the mesh actually uses.
+    // Dedup via a 5-wide seen-bitset over handles 0..4 (handle 0 unused).
+    var shader_seen: [5]bool = .{ false, false, false, false, false };
+    var sv: u32 = 0;
+    while (sv < a.submesh_count) : (sv += 1) {
+        if (sv >= max_submesh) break;
+        const variant = a.submeshVariant(sv);
+        const handle = shaderHandleFor(variant);
+        if (shader_seen[handle]) continue;
+        shader_seen[handle] = true;
+        createShaderForVariant(enc, variant);
+    }
 
     var t: u32 = 0;
     while (t < a.tex_count) : (t += 1) {
