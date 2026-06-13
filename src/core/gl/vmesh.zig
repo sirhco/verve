@@ -278,7 +278,7 @@ pub const Reader = struct {
     names: []const u8, // raw name table (name_count × 12B); use name(i)
     bytes: []const u8,
 
-    pub fn init(bytes: []const u8) error{ BadMagic, BadVersion, Truncated }!Reader {
+    pub fn init(bytes: []const u8) error{ BadMagic, BadVersion, Truncated, BadTexIndex }!Reader {
         if (bytes.len < header_size) return error.Truncated;
         if (!std.mem.eql(u8, bytes[0..4], magic)) return error.BadMagic;
         const ver = std.mem.readInt(u32, bytes[4..8], .little);
@@ -314,6 +314,20 @@ pub const Reader = struct {
         const sub_table_off: u32 = header_size;
         if (@as(u64, sub_table_off) > blen or need_subs > blen - @as(u64, sub_table_off)) return error.Truncated;
         const sub_table_bytes: usize = @intCast(need_subs);
+
+        // Validate every submesh's five texture indices: each must be the
+        // missing-sentinel (-1) or a real index in [0, tex_count). A hostile or
+        // corrupt file would otherwise reach the GL bind path with an
+        // out-of-range handle (the island `texHandle` clamp is the last line of
+        // defense — reject here so a bad asset fails at parse, not at draw).
+        const tex_lim: i64 = @as(i64, tex_count);
+        for (0..sub_count) |i| {
+            const off = sub_table_off + @as(u64, @intCast(i)) * submesh_size + 52; // first tex i32 @52
+            inline for (0..5) |k| {
+                const idx = std.mem.readInt(i32, bytes[@intCast(off + k * 4)..][0..4], .little);
+                if (idx < -1 or @as(i64, idx) >= tex_lim) return error.BadTexIndex;
+            }
+        }
 
         // Bounds-check texture table (u64 to prevent u32 multiply wrap)
         const need_tex_table: u64 = @as(u64, tex_count) * @as(u64, tex_entry_size);
@@ -491,7 +505,14 @@ test "round-trip: one submesh (full PBR fields), one texture" {
         .tex_emissive = 2,
         .tex_occlusion = -1,
     }};
-    const texs = [_]Texture{.{ .width = 2, .height = 2, .rgba = &texels }};
+    // Three textures so tex indices 0/1/2 are all in range (reader rejects
+    // out-of-range now). tex 0 keeps the 2×2 checked below; 1/2 are 1×1 fillers.
+    const fill = [_]u8{ 0, 0, 0, 255 };
+    const texs = [_]Texture{
+        .{ .width = 2, .height = 2, .rgba = &texels },
+        .{ .width = 1, .height = 1, .rgba = &fill },
+        .{ .width = 1, .height = 1, .rgba = &fill },
+    };
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &texs, &.{}, &.{}, &.{});
     defer testing.allocator.free(bytes);
 
@@ -767,6 +788,47 @@ test "(d) v3 hostile sections → Truncated / empty (no panic)" {
         std.mem.writeInt(u32, buf[nto + 4 ..][0..4], @intCast(buf.len + 100), .little); // blob_off past EOF
         const r = try Reader.init(buf); // init must still succeed (lazy per-entry)
         try testing.expectEqual(@as(usize, 0), r.name(0).len); // empty, no panic
+    }
+}
+
+test "(g) v3 rejects out-of-range submesh tex index (BadTexIndex)" {
+    // One texture present (tex_count == 1 → only index 0 or sentinel -1 valid).
+    const texels = [_]u8{ 255, 0, 0, 255 };
+    const texs = [_]Texture{.{ .width = 1, .height = 1, .rgba = &texels }};
+    const good = [_]Submesh{.{
+        .index_byte_off = 0,
+        .index_count = 3,
+        .base_color = .{ 1, 1, 1, 1 },
+        .metallic = 0,
+        .roughness = 1,
+        .emissive = .{ 0, 0, 0 },
+        .occlusion_strength = 1,
+        .normal_scale = 1,
+        .tex_base = 0,
+        .tex_mr = -1,
+        .tex_normal = -1,
+        .tex_emissive = -1,
+        .tex_occlusion = -1,
+    }};
+    // Sanity: the in-range version parses fine.
+    {
+        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{});
+        defer testing.allocator.free(bytes);
+        _ = try Reader.init(bytes);
+    }
+    // tex index == tex_count (1) → out of range → reject.
+    {
+        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{});
+        defer testing.allocator.free(bytes);
+        std.mem.writeInt(i32, bytes[header_size + 56 ..][0..4], 1, .little); // tex_mr @56
+        try testing.expectError(error.BadTexIndex, Reader.init(bytes));
+    }
+    // tex index < -1 (e.g. -2, not the missing-sentinel) → reject.
+    {
+        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{});
+        defer testing.allocator.free(bytes);
+        std.mem.writeInt(i32, bytes[header_size + 52 ..][0..4], -2, .little); // tex_base @52
+        try testing.expectError(error.BadTexIndex, Reader.init(bytes));
     }
 }
 

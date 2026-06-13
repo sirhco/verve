@@ -8,6 +8,27 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`verve.gl` P8 (correctness, in progress) — glTF node-transform baking +
+  vmesh tex-index hardening** (`src/core/gl/gltf.zig`, `vmesh.zig`):
+  - **Node transforms baked** (`gltf.zig`): node TRS/`matrix` transforms are
+    now composed down the scene-graph hierarchy and baked into vertex
+    position (point), normal (inverse-transpose normal matrix), and tangent
+    (direction) at parse time — previously geometry was flattened in bind-pose
+    and all node transforms were silently ignored. A mesh inherits the world
+    matrix of the first node that references it (first-node-wins, matching the
+    name fallback; no instancing). Identity-transform assets (the demo cubes)
+    are byte-unchanged.
+  - **vmesh tex-index hardening** (`vmesh.Reader.init`): every submesh's five
+    `tex_*` indices are validated at parse — each must be the missing-sentinel
+    `-1` or a real index in `[0, texture_count)`. Out-of-range indices now
+    return the new `error.BadTexIndex` (rejected at parse) instead of reaching
+    the GL bind path and relying on the island `texHandle` clamp.
+
+### Fixed
+
+- **`verve.gl`**: glTF importer no longer drops node transforms (meshes
+  positioned/rotated/scaled by their node now render in the correct pose).
+
 - **`verve.gl` P6 — anim completion + node transform stack**
   (`src/core/gl/math.zig`, `ray.zig`, `bvh.zig`, `anim_target.zig`,
   `src/core/anim/serialize.zig`, `src/bridge/verve.js`,

@@ -5,9 +5,12 @@
 //! reference gl.gltf pay zero size / compat cost).
 //!
 //! Limitations:
-//! - Node transforms IGNORED — geometry is flattened in bind-pose. P-later bakes them.
-//! - Normals lit in model space (no u_normal_matrix). P3 adds it.
-//! - Multiple meshes/nodes: all flatten into one vertex+index pool (no scene graph).
+//! - Node transforms are BAKED into vertex pos/normal/tangent at parse time
+//!   (P8): each mesh inherits the world matrix of the first node that
+//!   references it, composed down the scene-graph hierarchy. A mesh instanced
+//!   by multiple nodes still bakes only the first node's transform (no
+//!   instancing; first node wins, matching the name fallback).
+//! - Multiple meshes/nodes: all flatten into one vertex+index pool (no runtime scene graph).
 //! - byteStride (interleaved sources) rejected with error.Unsupported; tight packing only.
 //! - Only a single BIN buffer (buffers[0]) is supported; URIs rejected.
 //! - Only componentType 5126 (f32) for vertex attributes, 5123 (u16) for indices.
@@ -28,6 +31,7 @@ const std = @import("std");
 const vmesh = @import("vmesh.zig");
 const png = @import("png.zig");
 const tangent = @import("tangent.zig");
+const math = @import("math.zig");
 
 // ── public surface ─────────────────────────────────────────────────────────────
 
@@ -232,6 +236,76 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         }
     }
 
+    // ── 6c. Per-mesh world matrices (node-transform baking) ────────────────────
+    // Compose each mesh's world matrix down the node hierarchy. A mesh inherits
+    // the world matrix of the FIRST node that references it (first visit wins,
+    // matching the name fallback). Orphan meshes (no referencing node) keep
+    // identity. The matrices are baked into vertex pos/normal/tangent in §7.
+    const mesh_world = try aa.alloc(math.Mat4, meshes.len);
+    for (mesh_world) |*m| m.* = math.Mat4.identity;
+    if (root.get("nodes")) |nodes_val| {
+        if (nodes_val == .array and nodes_val.array.items.len > 0) {
+            const nodes_items = nodes_val.array.items;
+            const mesh_set = try aa.alloc(bool, meshes.len);
+            @memset(mesh_set, false);
+            const visited = try aa.alloc(bool, nodes_items.len);
+            @memset(visited, false);
+
+            // Roots = the active scene's node list when present, else any node
+            // not referenced as another node's child.
+            var used_scene_roots = false;
+            if (root.get("scenes")) |scenes_val| {
+                if (scenes_val == .array and scenes_val.array.items.len > 0) {
+                    const scene_idx: usize = blk: {
+                        if (root.get("scene")) |sv| {
+                            if (jsonInt(sv)) |si| {
+                                if (std.math.cast(usize, si)) |su| {
+                                    if (su < scenes_val.array.items.len) break :blk su;
+                                }
+                            }
+                        }
+                        break :blk 0;
+                    };
+                    if (scenes_val.array.items[scene_idx] == .object) {
+                        if (scenes_val.array.items[scene_idx].object.get("nodes")) |rn| {
+                            if (rn == .array) {
+                                for (rn.array.items) |nv| {
+                                    if (jsonInt(nv)) |ni| {
+                                        if (std.math.cast(usize, ni)) |nu|
+                                            accumulateWorld(nodes_items, meshes.len, nu, math.Mat4.identity, mesh_world, mesh_set, visited);
+                                    }
+                                }
+                                used_scene_roots = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!used_scene_roots) {
+                const is_child = try aa.alloc(bool, nodes_items.len);
+                @memset(is_child, false);
+                for (nodes_items) |nv| {
+                    if (nv != .object) continue;
+                    if (nv.object.get("children")) |cv| {
+                        if (cv == .array) {
+                            for (cv.array.items) |c| {
+                                if (jsonInt(c)) |ci| {
+                                    if (std.math.cast(usize, ci)) |cu| {
+                                        if (cu < is_child.len) is_child[cu] = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for (0..nodes_items.len) |i| {
+                    if (!is_child[i])
+                        accumulateWorld(nodes_items, meshes.len, i, math.Mat4.identity, mesh_world, mesh_set, visited);
+                }
+            }
+        }
+    }
+
     // ── 7. Process all mesh primitives ────────────────────────────────────────
     // Flatten all meshes / all primitives into one vertex pool + index pool.
     // Each primitive becomes one Submesh.
@@ -261,6 +335,11 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
             if (node_mesh_names[mesh_i]) |nn| break :blk try aa.dupe(u8, nn);
             break :blk try std.fmt.allocPrint(aa, "mesh{d}", .{mesh_i});
         };
+
+        // World transform for this mesh and the matching normal matrix
+        // (inverse-transpose upper-3×3), baked into every vertex below.
+        const world = mesh_world[mesh_i];
+        const nmat = math.normalMatrix(world);
 
         for (prims) |prim_val| {
             const prim_obj = switch (prim_val) {
@@ -347,18 +426,38 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
             // ── Interleave pos/normal/tangent/uv into stride-48 layout ─────────
             try vert_list.ensureUnusedCapacity(aa, vert_count * 12);
             for (0..vert_count) |vi| {
-                // pos
-                vert_list.appendAssumeCapacity(pos_f32[vi * 3 + 0]);
-                vert_list.appendAssumeCapacity(pos_f32[vi * 3 + 1]);
-                vert_list.appendAssumeCapacity(pos_f32[vi * 3 + 2]);
-                // normal
-                vert_list.appendAssumeCapacity(nrm_f32[vi * 3 + 0]);
-                vert_list.appendAssumeCapacity(nrm_f32[vi * 3 + 1]);
-                vert_list.appendAssumeCapacity(nrm_f32[vi * 3 + 2]);
-                // tangent (xyz, w=handedness)
-                vert_list.appendAssumeCapacity(tan_f32[vi * 4 + 0]);
-                vert_list.appendAssumeCapacity(tan_f32[vi * 4 + 1]);
-                vert_list.appendAssumeCapacity(tan_f32[vi * 4 + 2]);
+                // pos — transformed as a point (w=1, translation applies).
+                const p = math.transformPoint(world, math.Vec3.init(
+                    pos_f32[vi * 3 + 0],
+                    pos_f32[vi * 3 + 1],
+                    pos_f32[vi * 3 + 2],
+                ));
+                vert_list.appendAssumeCapacity(p.x);
+                vert_list.appendAssumeCapacity(p.y);
+                vert_list.appendAssumeCapacity(p.z);
+                // normal — transformed by the normal matrix (inverse-transpose),
+                // renormalized (col-major nmat: [col*3+row]).
+                const n = normalize3(.{
+                    nmat[0] * nrm_f32[vi * 3 + 0] + nmat[3] * nrm_f32[vi * 3 + 1] + nmat[6] * nrm_f32[vi * 3 + 2],
+                    nmat[1] * nrm_f32[vi * 3 + 0] + nmat[4] * nrm_f32[vi * 3 + 1] + nmat[7] * nrm_f32[vi * 3 + 2],
+                    nmat[2] * nrm_f32[vi * 3 + 0] + nmat[5] * nrm_f32[vi * 3 + 1] + nmat[8] * nrm_f32[vi * 3 + 2],
+                });
+                vert_list.appendAssumeCapacity(n[0]);
+                vert_list.appendAssumeCapacity(n[1]);
+                vert_list.appendAssumeCapacity(n[2]);
+                // tangent xyz — transformed as a direction (covariant with pos),
+                // renormalized; w (handedness) preserved.
+                const td = normalize3(blk: {
+                    const t = math.transformDir(world, math.Vec3.init(
+                        tan_f32[vi * 4 + 0],
+                        tan_f32[vi * 4 + 1],
+                        tan_f32[vi * 4 + 2],
+                    ));
+                    break :blk .{ t.x, t.y, t.z };
+                });
+                vert_list.appendAssumeCapacity(td[0]);
+                vert_list.appendAssumeCapacity(td[1]);
+                vert_list.appendAssumeCapacity(td[2]);
                 vert_list.appendAssumeCapacity(tan_f32[vi * 4 + 3]);
                 // uv
                 vert_list.appendAssumeCapacity(uv_f32[vi * 2 + 0]);
@@ -537,6 +636,86 @@ fn jsonFloat(v: std.json.Value) ?f32 {
         .integer => |i| @floatFromInt(i),
         else => null,
     };
+}
+
+/// Normalize a 3-vector; a zero-length vector is returned unchanged.
+fn normalize3(v: [3]f32) [3]f32 {
+    const len = @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (len == 0) return v;
+    const inv = 1.0 / len;
+    return .{ v[0] * inv, v[1] * inv, v[2] * inv };
+}
+
+/// A node's local transform: explicit `matrix` (16 col-major f32) when present,
+/// else composed from translation/rotation/scale (glTF defaults 0 / identity / 1).
+fn nodeLocalMatrix(node_obj: std.json.ObjectMap) math.Mat4 {
+    if (node_obj.get("matrix")) |mv| {
+        if (mv == .array and mv.array.items.len == 16) {
+            var m: math.Mat4 = undefined;
+            for (mv.array.items, 0..) |e, i| m.m[i] = jsonFloat(e) orelse 0;
+            return m;
+        }
+    }
+    var t = math.Vec3.init(0, 0, 0);
+    var r = math.Quat.identity;
+    var s = math.Vec3.init(1, 1, 1);
+    if (node_obj.get("translation")) |tv| {
+        if (tv == .array and tv.array.items.len == 3) {
+            t = math.Vec3.init(jsonFloat(tv.array.items[0]) orelse 0, jsonFloat(tv.array.items[1]) orelse 0, jsonFloat(tv.array.items[2]) orelse 0);
+        }
+    }
+    if (node_obj.get("rotation")) |rv| {
+        if (rv == .array and rv.array.items.len == 4) {
+            r = .{ .x = jsonFloat(rv.array.items[0]) orelse 0, .y = jsonFloat(rv.array.items[1]) orelse 0, .z = jsonFloat(rv.array.items[2]) orelse 0, .w = jsonFloat(rv.array.items[3]) orelse 1 };
+        }
+    }
+    if (node_obj.get("scale")) |sv| {
+        if (sv == .array and sv.array.items.len == 3) {
+            s = math.Vec3.init(jsonFloat(sv.array.items[0]) orelse 1, jsonFloat(sv.array.items[1]) orelse 1, jsonFloat(sv.array.items[2]) orelse 1);
+        }
+    }
+    return math.Mat4.fromTrs(t, r, s);
+}
+
+/// DFS the node hierarchy from `idx`, composing world = parent · local. Records
+/// the world matrix on the first node that references each mesh. `visited`
+/// guards against cycles (hostile input); `mesh_count` bounds the mesh index.
+fn accumulateWorld(
+    nodes: []const std.json.Value,
+    mesh_count: usize,
+    idx: usize,
+    parent: math.Mat4,
+    mesh_world: []math.Mat4,
+    mesh_set: []bool,
+    visited: []bool,
+) void {
+    if (idx >= nodes.len or visited[idx]) return;
+    visited[idx] = true;
+    const node_obj = switch (nodes[idx]) {
+        .object => |o| o,
+        else => return,
+    };
+    const world = parent.mul(nodeLocalMatrix(node_obj));
+    if (node_obj.get("mesh")) |mref| {
+        if (jsonInt(mref)) |mi64| {
+            if (std.math.cast(usize, mi64)) |mi| {
+                if (mi < mesh_count and !mesh_set[mi]) {
+                    mesh_world[mi] = world;
+                    mesh_set[mi] = true;
+                }
+            }
+        }
+    }
+    if (node_obj.get("children")) |cv| {
+        if (cv == .array) {
+            for (cv.array.items) |c| {
+                if (jsonInt(c)) |ci| {
+                    if (std.math.cast(usize, ci)) |cu|
+                        accumulateWorld(nodes, mesh_count, cu, world, mesh_world, mesh_set, visited);
+                }
+            }
+        }
+    }
 }
 
 /// Read a glTF textureInfo object: returns its `index` (or -1 when absent).
@@ -897,6 +1076,38 @@ test "rejects texCoord != 0" {
     try testing.expectError(error.Unsupported, parseGlb(testing.allocator, glb));
 }
 
+test "node transform: translation baked into positions" {
+    // Triangle at (0,0,0)/(1,0,0)/(0,1,0), node translation (10,2,3).
+    const glb = try nodeXformGlb(testing.allocator, "\"translation\":[10,2,3]");
+    defer testing.allocator.free(glb);
+    var model = try parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    // vertex 0 pos (stride 12, pos@0) → (10,2,3).
+    try testing.expectApproxEqAbs(@as(f32, 10), model.vertices[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 2), model.vertices[1], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 3), model.vertices[2], 1e-5);
+    // vertex 1 pos (1,0,0) → (11,2,3).
+    try testing.expectApproxEqAbs(@as(f32, 11), model.vertices[12], 1e-5);
+    // normals (0,0,1) unchanged by pure translation (normal@3).
+    try testing.expectApproxEqAbs(@as(f32, 1), model.vertices[5], 1e-5);
+}
+
+test "node transform: rotation baked into positions and normals" {
+    // +90° about Y as a quat: (0, sin45, 0, cos45).
+    const glb = try nodeXformGlb(testing.allocator, "\"rotation\":[0,0.70710678,0,0.70710678]");
+    defer testing.allocator.free(glb);
+    var model = try parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    // pos (1,0,0): +90°Y maps +X → -Z → (0,0,-1).
+    try testing.expectApproxEqAbs(@as(f32, 0), model.vertices[12], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0), model.vertices[13], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, -1), model.vertices[14], 1e-4);
+    // normal (0,0,1): +Z → +X → (1,0,0).
+    try testing.expectApproxEqAbs(@as(f32, 1), model.vertices[3], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0), model.vertices[4], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0), model.vertices[5], 1e-4);
+}
+
 // ── test-only minimal glb builders ──────────────────────────────────────────────
 
 /// One triangle (3 verts, 3 indices), material with NO textures (only factors).
@@ -923,6 +1134,37 @@ fn minimalNoTextureGlb(alloc: std.mem.Allocator) ![]u8 {
         "\"buffers\":[{\"byteLength\":102}]," ++
         "\"materials\":[{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}]}";
     return assembleGlb(alloc, json, &pos, &nrm, &uv, &idx, null);
+}
+
+/// Same triangle as minimalNoTextureGlb, but the node carries a transform
+/// (`xform_json` injected into the node object, e.g. `"translation":[10,2,3]`).
+fn nodeXformGlb(alloc: std.mem.Allocator, xform_json: []const u8) ![]u8 {
+    const pos = [_]f32{ 0, 0, 0, 1, 0, 0, 0, 1, 0 };
+    const nrm = [_]f32{ 0, 0, 1, 0, 0, 1, 0, 0, 1 };
+    const uv = [_]f32{ 0, 0, 1, 0, 0, 1 };
+    const idx = [_]u16{ 0, 1, 2 };
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+    try w.writeAll("{\"asset\":{\"version\":\"2.0\"},\"scene\":0,\"scenes\":[{\"nodes\":[0]}],");
+    try w.print("\"nodes\":[{{\"mesh\":0,{s}}}],", .{xform_json});
+    try w.writeAll("\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}],");
+    try w.writeAll("\"accessors\":[");
+    try w.writeAll("{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":3,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}],");
+    try w.writeAll("\"bufferViews\":[");
+    try w.writeAll("{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36},");
+    try w.writeAll("{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36},");
+    try w.writeAll("{\"buffer\":0,\"byteOffset\":72,\"byteLength\":24},");
+    try w.writeAll("{\"buffer\":0,\"byteOffset\":96,\"byteLength\":6,\"target\":34963}],");
+    try w.writeAll("\"buffers\":[{\"byteLength\":102}],");
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}]}");
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    return assembleGlb(alloc, json_bytes, &pos, &nrm, &uv, &idx, null);
 }
 
 /// Same triangle but baseColorTexture references texCoord 1 → must error.
