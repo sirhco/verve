@@ -834,30 +834,33 @@ pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
     // at comptime — `orelse unreachable` is a const-assert on a frozen literal.
     const dolly_id = comptime (verve.gl.anim_target.resolvePathStatic("camera.distance") orelse unreachable);
 
+    // SSR dolly tween: setter slot 0 = the page-default gl setter the bridge
+    // resolves at hydration; it targets camera.distance only, coexisting with
+    // the island's scrub timeline (disjoint targets: island = yaw/roughness/
+    // rotationX/emissiveR; SSR = distance). The tween is hung on a wrapper that
+    // CONTAINS the island's 300vh section so the ScrollTrigger selector (SSR
+    // cannot serialize ref handles) resolves within scope — a selector on a
+    // sibling element would query an empty subtree and never trigger.
+    const scene_wrap = ctx.div()
+        .children(.{scene})
+        .animate(anim.to(a, null)
+        .glTargetRange(dolly_id, 0, 4.0, 2.5)
+        .duration(1).ease(.linear)
+        .scrollTrigger(.{
+        .trigger = "section[data-ref^=glscene-scroll-section]",
+        .start = .{ .trigger = .top, .viewport = .top },
+        .end = .{ .at = .{ .trigger = .bottom, .viewport = .top } },
+        .scrub = .{ .smooth = 0.4 },
+    }));
+
     return ctx.main_().class("home gl-scene-page").children(.{
         ctx.h1("verve.gl — scroll to spin"),
         ctx.p().text("Scroll to rotate · drag to orbit · wheel to zoom · click a mesh to pick. " ++
             "Scene declared in Zig; scroll scrubs the turntable timeline."),
-        // The island brings its own 300vh scroll section + sticky viewport —
-        // no aspect-ratio wrapper needed here.
-        scene,
-        // SSR dolly tween: setter slot 0 = the page-default gl setter the
-        // bridge resolves at hydration. It rides the SAME 300vh section the
-        // island's scrub timeline uses (selector form — SSR cannot serialize
-        // ref handles), but targets camera.distance only, so the two anims
-        // coexist by design: independent timelines, disjoint targets
-        // (island = yaw/roughness/rotationX/emissiveR; SSR = distance).
+        // The island brings its own 300vh scroll section + sticky viewport.
+        scene_wrap,
         ctx.p().class("hint")
-            .text("Keep scrolling — the model completes a full rotation over 300vh of scroll travel.")
-            .animate(anim.to(a, null)
-            .glTargetRange(dolly_id, 0, 4.0, 2.5)
-            .duration(1).ease(.linear)
-            .scrollTrigger(.{
-            .trigger = "section[data-ref^=glscene-scroll-section]",
-            .start = .{ .trigger = .top, .viewport = .top },
-            .end = .{ .at = .{ .trigger = .bottom, .viewport = .top } },
-            .scrub = .{ .smooth = 0.4 },
-        })),
+            .text("Keep scrolling — the model completes a full rotation over 300vh of scroll travel."),
         ctx.p().text("Drag to orbit · wheel to zoom · click a mesh to pick. " ++
             "The GlScene chunk owns the WebGL2 render loop; Zig declares the scene."),
     });
