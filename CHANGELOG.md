@@ -8,8 +8,18 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **`verve.gl` P8 (correctness, in progress) — glTF node-transform baking +
-  vmesh tex-index hardening** (`src/core/gl/gltf.zig`, `vmesh.zig`):
+- **`verve.gl` P8 (correctness, in progress) — glTF node-transform baking,
+  vmesh tex-index hardening, onPickExport** (`src/core/gl/gltf.zig`,
+  `vmesh.zig`, `src/core/gl_scene.zig`, `src/app/islands.zig`,
+  `src/client/islands/GlScene.zig`, `src/bridge/verve.js`):
+  - **onPickExport — DOM CustomEvent pick dispatch**: new builder method
+    `.onPickExport(name, event_name)` dispatches a bubbling
+    `CustomEvent(event_name, {detail:{name}})` from the canvas on a pick hit
+    (new `gl_emit_event` bridge import), instead of firing a runtime
+    closure id. Shares the `max_picks` (4) budget with `.onPick`; both may
+    target the same mesh. Adds a parallel `pick_export_names` string array as
+    the new last `Props` field (positional codec; mirrored across the three
+    `Props` copies). The `/gl-scene` demo wires the cube to `verve:glpick`.
   - **Node transforms baked** (`gltf.zig`): node TRS/`matrix` transforms are
     now composed down the scene-graph hierarchy and baked into vertex
     position (point), normal (inverse-transpose normal matrix), and tangent

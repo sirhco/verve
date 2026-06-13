@@ -63,6 +63,9 @@ const anim = verve.anim;
 
 extern "verve" fn gl_start(ref_handle: i32, name_ptr: [*]const u8, name_len: u32) void;
 extern "verve" fn gl_load(url_ptr: [*]const u8, url_len: u32, cb_ptr: [*]const u8, cb_len: u32) void;
+// P8 onPickExport: dispatch a bubbling DOM CustomEvent(name, {detail:{name:detail}})
+// from the element behind `ref_handle` (the canvas). No-op if the handle is stale.
+extern "verve" fn gl_emit_event(ref_handle: i32, name_ptr: [*]const u8, name_len: u32, detail_ptr: [*]const u8, detail_len: u32) void;
 
 // ── Tuning ───────────────────────────────────────────────────────────────────
 
@@ -105,6 +108,7 @@ const Props = struct {
     pick_names: []const []const u8,
     pick_event_ids: []const u32,
     scrub: bool, // scroll-scrub mode (Task 9); wired to timeline in Task 9
+    pick_export_names: []const []const u8, // P8 onPickExport: per-slot DOM event name ("" = none)
 };
 
 // URL buffers — asset paths copied out of the arena. 128 matches the asset-URL
@@ -119,6 +123,8 @@ const max_name = 64; // per-name fixed storage
 var pick_names: [max_picks][max_name]u8 = undefined;
 var pick_name_lens: [max_picks]usize = undefined;
 var pick_ids: [max_picks]u32 = undefined;
+var pick_exports: [max_picks][max_name]u8 = undefined; // P8: per-slot DOM event name
+var pick_export_lens: [max_picks]usize = undefined; // 0 = no DOM event on this slot
 var pick_count: usize = 0;
 
 var auto_rotate: f32 = 0;
@@ -366,6 +372,15 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
                 @memcpy(pick_names[i][0..ln], nm[0..ln]);
                 pick_name_lens[i] = ln;
                 pick_ids[i] = p.pick_event_ids[i];
+                // P8: parallel DOM-event name (guard length; empty = no event).
+                if (i < p.pick_export_names.len) {
+                    const ev = p.pick_export_names[i];
+                    const el = @min(ev.len, max_name);
+                    @memcpy(pick_exports[i][0..el], ev[0..el]);
+                    pick_export_lens[i] = el;
+                } else {
+                    pick_export_lens[i] = 0;
+                }
             }
         } else |_| {}
     }
@@ -727,17 +742,24 @@ fn sendResources(enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: *const gl.ven
     registry.recordTextureEx(lut_handle, .tex_2d, .rgba16f, env.lut_size, env.lut_size, 1, @intCast(@intFromPtr(env.lut.ptr)), @intCast(env.lut.len));
 }
 
-/// If submesh `s`'s name matches a registered pick name, fire its SSR closure.
+/// If submesh `s`'s name matches a registered pick, fire its SSR closure
+/// (`onPick`) and/or dispatch its DOM CustomEvent (`onPickExport`). Both may
+/// fire for the same slot; the first name match wins.
 fn dispatchPick(a: *const gl.vmesh.Reader, s: u32) void {
     const nm = a.name(s);
     if (nm.len == 0) return;
     var i: usize = 0;
     while (i < pick_count) : (i += 1) {
         const reg = pick_names[i][0..pick_name_lens[i]];
-        if (eql(reg, nm) and pick_ids[i] != 0) {
-            verve.dispatchEvent(pick_ids[i]);
-            return;
+        if (!eql(reg, nm)) continue;
+        if (pick_ids[i] != 0) verve.dispatchEvent(pick_ids[i]);
+        if (pick_export_lens[i] != 0) {
+            if (canvas_handle) |h| {
+                const ev = pick_exports[i][0..pick_export_lens[i]];
+                gl_emit_event(h, ev.ptr, @intCast(ev.len), nm.ptr, @intCast(nm.len));
+            }
         }
+        return;
     }
 }
 

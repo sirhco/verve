@@ -4798,6 +4798,18 @@
           verve: {
             gl_start: (refHandle, namePtr, nameLen) =>
               glStart(refHandle, readStr(namePtr, nameLen)),
+            // P8 onPickExport: dispatch a bubbling DOM CustomEvent from the
+            // canvas (resolved by ref handle). detail.name carries the picked
+            // submesh name. No-op if the handle is stale.
+            gl_emit_event: (refHandle, namePtr, nameLen, detailPtr, detailLen) => {
+              const el = refHandles[refHandle];
+              if (!el) return;
+              const name = readStr(namePtr, nameLen);
+              const detail = readStr(detailPtr, detailLen);
+              el.dispatchEvent(
+                new CustomEvent(name, { bubbles: true, detail: { name: detail } }),
+              );
+            },
             gl_load: (urlPtr, urlLen, cbPtr, cbLen) => {
               const url = readStr(urlPtr, urlLen);
               const cb = readStr(cbPtr, cbLen);

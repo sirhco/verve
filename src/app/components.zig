@@ -807,9 +807,10 @@ pub fn glDemo(ctx: *const verve.Context) !*verve.Node {
 
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
-/// pick_event_ids choice: no server-side closure-id mechanism is available in
-/// the demo app context, so .onPick passes 0 (data-gl-pick attr only; the
-/// client chunk resolves picking by mesh name without needing a closure id).
+/// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a
+/// DOM CustomEvent instead of a server closure id — clicking the cube
+/// dispatches `verve:glpick` (detail.name = "Cube") from the canvas, which any
+/// page JS can `addEventListener` for. No closure-id mechanism needed.
 pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
     const anim = verve.anim;
     const a = ctx.alloc();
@@ -825,7 +826,7 @@ pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
     })
         .camera(.{ .distance = 4, .pitch = 0.3, .yaw = 0.6 })
         .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
-        .onPick("Cube", 0)
+        .onPickExport("Cube", "verve:glpick")
         .scrub(true)
         .build();
 

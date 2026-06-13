@@ -110,8 +110,8 @@ pub const GlScene = struct {
     /// WARNING: the codec is positional (field order, not names) — any change
     /// here MUST be applied identically to `core/gl_scene.zig`'s `Props` AND
     /// `src/client/islands/GlScene.zig`'s `Props`, or hydration silently decodes
-    /// garbage. Last field added: `scrub` (Task 8, P5).
-    pub const props_schema: []const u8 = "{\"src\":\"string\",\"env\":\"string\",\"orbit_distance\":\"f32\",\"orbit_pitch\":\"f32\",\"orbit_yaw\":\"f32\",\"auto_rotate\":\"f32\",\"light_dir_x\":\"f32\",\"light_dir_y\":\"f32\",\"light_dir_z\":\"f32\",\"light_intensity\":\"f32\",\"pick_names\":\"string[]\",\"pick_event_ids\":\"u32[]\",\"scrub\":\"bool\"}";
+    /// garbage. Last field added: `pick_export_names` (P8, onPickExport).
+    pub const props_schema: []const u8 = "{\"src\":\"string\",\"env\":\"string\",\"orbit_distance\":\"f32\",\"orbit_pitch\":\"f32\",\"orbit_yaw\":\"f32\",\"auto_rotate\":\"f32\",\"light_dir_x\":\"f32\",\"light_dir_y\":\"f32\",\"light_dir_z\":\"f32\",\"light_intensity\":\"f32\",\"pick_names\":\"string[]\",\"pick_event_ids\":\"u32[]\",\"scrub\":\"bool\",\"pick_export_names\":\"string[]\"}";
 
     pub const Props = struct {
         src: []const u8,
@@ -127,5 +127,6 @@ pub const GlScene = struct {
         pick_names: []const []const u8,
         pick_event_ids: []const u32,
         scrub: bool, // scroll-scrub mode (Task 9); when true auto_rotate is forced 0 at build()
+        pick_export_names: []const []const u8, // P8 onPickExport: per-slot DOM event name ("" = none)
     };
 };

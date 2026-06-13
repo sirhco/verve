@@ -35,6 +35,7 @@ pub const Props = struct {
     pick_names: []const []const u8,
     pick_event_ids: []const u32, // parallel closure ids (0 = none)
     scrub: bool, // scroll-scrub mode (Task 9); when true auto_rotate is forced 0
+    pick_export_names: []const []const u8, // parallel DOM-event names ("" = none) — P8 onPickExport
 };
 
 /// Max number of `.onPick(...)` registrations accumulated per scene.
@@ -73,6 +74,7 @@ pub const GlSceneBuilder = struct {
     scrub_on: bool = false,
     pick_names_buf: [max_picks][]const u8 = undefined,
     pick_ids_buf: [max_picks]u32 = undefined,
+    pick_export_buf: [max_picks][]const u8 = undefined,
     pick_count: usize = 0,
 
     pub fn camera(self: *GlSceneBuilder, c: CameraOpts) *GlSceneBuilder {
@@ -104,6 +106,20 @@ pub const GlSceneBuilder = struct {
         if (self.pick_count >= max_picks) return self;
         self.pick_names_buf[self.pick_count] = name;
         self.pick_ids_buf[self.pick_count] = event_id;
+        self.pick_export_buf[self.pick_count] = ""; // no DOM event on this slot
+        self.pick_count += 1;
+        return self;
+    }
+
+    /// Register a pickable mesh by name → DOM CustomEvent name. On a pick hit
+    /// the GlScene chunk dispatches `CustomEvent(event_name, {detail:{name}})`
+    /// (bubbling) from the canvas. Shares the `max_picks` budget with `onPick`;
+    /// extra registrations past the cap are dropped.
+    pub fn onPickExport(self: *GlSceneBuilder, name: []const u8, event_name: []const u8) *GlSceneBuilder {
+        if (self.pick_count >= max_picks) return self;
+        self.pick_names_buf[self.pick_count] = name;
+        self.pick_ids_buf[self.pick_count] = 0; // no closure id on an export slot
+        self.pick_export_buf[self.pick_count] = event_name;
         self.pick_count += 1;
         return self;
     }
@@ -144,6 +160,7 @@ pub const GlSceneBuilder = struct {
             .pick_names = self.pick_names_buf[0..self.pick_count],
             .pick_event_ids = self.pick_ids_buf[0..self.pick_count],
             .scrub = self.scrub_on,
+            .pick_export_names = self.pick_export_buf[0..self.pick_count],
         }) catch |e| {
             const poison = self.ctx.el("verve-island");
             poison.err = e;
@@ -348,6 +365,67 @@ test "glScene chained setters encode camera, light, autoRotate, picks" {
     try testing.expectEqualStrings("Cube", p.pick_names[0]);
     try testing.expectEqualStrings("Sphere", p.pick_names[1]);
     try testing.expectEqualSlices(u32, &.{ 11, 22 }, p.pick_event_ids);
+}
+
+test "glScene onPickExport encodes event name into pick_export_names" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .onPickExport("Cube", "verve:glpick")
+        .build();
+    const raw = try rawProps(attrVal(scene, "data-props").?, arena.allocator());
+    const p = try decodeProps(Props, raw, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), p.pick_names.len);
+    try testing.expectEqualStrings("Cube", p.pick_names[0]);
+    // Export-only slot carries no closure id.
+    try testing.expectEqual(@as(u32, 0), p.pick_event_ids[0]);
+    try testing.expectEqual(@as(usize, 1), p.pick_export_names.len);
+    try testing.expectEqualStrings("verve:glpick", p.pick_export_names[0]);
+}
+
+test "glScene onPick + onPickExport coexist, arrays stay parallel by slot" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .onPick("A", 7)
+        .onPickExport("B", "ev")
+        .build();
+    const raw = try rawProps(attrVal(scene, "data-props").?, arena.allocator());
+    const p = try decodeProps(Props, raw, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 2), p.pick_names.len);
+    try testing.expectEqualStrings("A", p.pick_names[0]);
+    try testing.expectEqualStrings("B", p.pick_names[1]);
+    // Slot 0 = onPick (closure id, no export); slot 1 = onPickExport (event, no id).
+    try testing.expectEqualSlices(u32, &.{ 7, 0 }, p.pick_event_ids);
+    try testing.expectEqual(@as(usize, 2), p.pick_export_names.len);
+    try testing.expectEqualStrings("", p.pick_export_names[0]);
+    try testing.expectEqualStrings("ev", p.pick_export_names[1]);
+}
+
+test "glScene onPick + onPickExport share the max_picks cap" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+
+    var b = ctx.glScene(.{ .src = "s", .env = "e" });
+    _ = b.onPick("A", 1).onPick("B", 2);
+    var i: u32 = 0;
+    while (i < max_picks) : (i += 1) _ = b.onPickExport("M", "ev"); // overflow the cap
+    const scene = b.build();
+    const raw = try rawProps(attrVal(scene, "data-props").?, arena.allocator());
+    const p = try decodeProps(Props, raw, arena.allocator());
+    try testing.expectEqual(@as(usize, max_picks), p.pick_names.len);
+    try testing.expectEqual(@as(usize, max_picks), p.pick_export_names.len);
+    try testing.expectEqual(@as(usize, max_picks), p.pick_event_ids.len);
 }
 
 test "glScene onPick caps at max_picks" {
