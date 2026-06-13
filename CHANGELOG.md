@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-13
+
 ### Added
 
 - **`verve.gl` P8 (correctness) — glTF node-transform baking, vmesh
@@ -50,11 +52,6 @@ versions follow [Semantic Versioning](https://semver.org/).
     `-1` or a real index in `[0, texture_count)`. Out-of-range indices now
     return the new `error.BadTexIndex` (rejected at parse) instead of reaching
     the GL bind path and relying on the island `texHandle` clamp.
-
-### Fixed
-
-- **`verve.gl`**: glTF importer no longer drops node transforms (meshes
-  positioned/rotated/scaled by their node now render in the correct pose).
 
 - **`verve.gl` P6 — anim completion + node transform stack**
   (`src/core/gl/math.zig`, `ray.zig`, `bvh.zig`, `anim_target.zig`,
@@ -105,6 +102,34 @@ versions follow [Semantic Versioning](https://semver.org/).
     `components.zig`.
   - Guide: `docs/24-gl.md` (P6 section); cross-ref in
     `docs/23-animation.md`.
+
+### Fixed
+
+- **`verve.gl` scroll-scrub was dead since 0.5.0** —
+  `ctx.glScene(...).scrub(true)` rendered the model and supported drag-orbit /
+  wheel-zoom, but the scroll-scrubbed turntable never moved the camera (no
+  console errors). Three independent root causes, all fixed:
+  - **gl-only tween dropped** (`src/bridge/verve.js`): a gl-target tween (an
+    `@gl` prop) has no DOM element, so it resolved zero targets and
+    `animCreate`'s "has targets" gate (`tweens.some(tw => tw.n > 0)`) rejected
+    the whole timeline (`verve_anim_create` → 0). The bridge now runs a
+    gl-bearing zero-target tween as one **virtual instance** (`tweenHasGl` →
+    `targets = [null]`); `readCurrent` / `animWriteTween` / liveness-kill all
+    tolerate the null element (the `@gl` write path ignores it). DOM tweens are
+    byte-identical.
+  - **scrub timeline built out of island scope** (`GlScene.zig`):
+    `buildScrubTimeline` runs from the `glscene_vmesh_ready` asset callback,
+    which the bridge invokes **without** an island-scope bracket — so
+    `queryRef("glscene-scroll-section")` could not apply the instance's
+    `__v{vid}` suffix and missed the SSR'd element, bailing early. The section
+    handle is now cached at `hydrate` (where scope is active), exactly like
+    `canvas_handle`.
+  - **SSR `ScrollTrigger` selector out of scope** (`components.zig`): the
+    trigger selector resolves within the carrier element's subtree, not the
+    document, so a selector on a sibling found nothing. It now hangs on a
+    wrapper that contains the pinned section.
+- **`verve.gl`**: glTF importer no longer drops node transforms (meshes
+  positioned/rotated/scaled by their node now render in the correct pose).
 
 ## [0.5.0] - 2026-06-12
 
@@ -2956,7 +2981,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/sirhco/verve/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/sirhco/verve/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/sirhco/verve/releases/tag/v0.4.0
 [0.1.0]: https://github.com/sirhco/verve/releases/tag/v0.1.0

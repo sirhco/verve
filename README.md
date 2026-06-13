@@ -232,7 +232,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.5.0
+zig fetch --save git+https://github.com/sirhco/verve#v0.5.1
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -292,7 +292,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.5.0 \
+verve-cli new ~/my-app --release v0.5.1 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 
