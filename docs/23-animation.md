@@ -669,7 +669,20 @@ const t = tween.to(alloc, null)
 (e.g. `"@gl:16777473"`); the value object is
 `{"gl":<id>,"gls":<slot>,"to":<num>}` with an optional `"f"` from-value.
 The anim interpreter routes `@gl`-prefixed props to the registered
-setter callback instead of any DOM write.
+setter callback instead of any DOM write. As of P6, `"gls"` is omitted
+when the setter slot is 0 — slot 0 means "page-default setter" and the
+bridge resolves it at write time (see SSR-side gl tweens below).
+
+**SSR-side gl tweens (P6)**: gl-target tweens can also be built on the
+**SSR surface** for `camera.*` and `model.*` paths. Resolve the id with
+the reader-free `verve.gl.anim_target.resolvePathStatic(path)` (no vmesh
+name table needed) and pass setter slot **0** — the server emits a
+slot-0 gl tween and the bridge binds it to the gl island's setter once
+that island hydrates. `material:` and `node:` paths stay **island-only**
+(they need the runtime vmesh name table to resolve `<Name>`). Example:
+the `/gl-scene` demo builds an SSR `camera.distance` dolly
+(`glTargetRange(resolvePathStatic("camera.distance").?, 0, 4.0, 2.5)`)
+server-side, composed under a `ScrollTrigger`.
 
 **Builders**: `glTarget(id, slot, to)`, `glTargetFrom(id, slot, from)`,
 `glTargetRange(id, slot, from, to)`. All three live on `TweenBuilder`.
@@ -679,12 +692,18 @@ setter callback instead of any DOM write.
 P5 section documents the full bit layout (`kind/submesh/field`), the
 path grammar (`"camera.yaw"`, `"material:<Name>.roughness"`,
 `"model.yaw"`), and the setter-registration API
-(`verve.animGlSetter`).
+(`verve.animGlSetter`); the P6 section adds the `node:<Name>.rotation*`
+and `material:<Name>.emissive*` paths, `resolvePathStatic` for SSR, and
+the shared anim+gl rAF tick.
 
 **Scroll scrub example**: the `/gl-scene` demo uses a scroll-scrubbed
-timeline to drive a model.yaw turntable (0 → 2π) and a material
-roughness sweep (0.045 → 1.0) as the user scrolls through a 300 vh
-section. The separate-rAF deviation (≤1 frame lag) is also noted there.
+timeline to drive a `camera.yaw` turntable (current → +2π), a
+`material:Cube.roughness` sweep (0.045 → 1.0), plus (P6) a
+`node:Cube.rotationX` wobble and a `material:Cube.emissiveR` pulse, as
+the user scrolls through a 300 vh section — alongside an SSR-built
+`camera.distance` dolly. As of P6 the anim and gl engines share one
+rAF tick, so setter writes land in the same visual frame the gl engine
+reads them (the earlier ≤1-frame lag is gone).
 
 ## Not yet
 

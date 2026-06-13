@@ -6,6 +6,58 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` P6 — anim completion + node transform stack**
+  (`src/core/gl/math.zig`, `ray.zig`, `bvh.zig`, `anim_target.zig`,
+  `src/core/anim/serialize.zig`, `src/bridge/verve.js`,
+  `src/client/islands/GlScene.zig`, `src/app/components.zig`):
+  - **Anim completion**: new `node` target kind (`node:<Name>.rotationX|
+    Y|Z`, kind 3 — submesh bits carry the vmesh submesh index) and
+    `material:<Name>.emissive{R,G,B}` fields (material fields 2/3/4).
+    Frozen target-id encoding unchanged — pre-P6 ids byte-identical
+    (regression-locked). New `resolvePathStatic(path)` resolves
+    `camera.*` / `model.*` reader-free for SSR (`material:`/`node:`
+    still need the runtime name table → island-only).
+  - **SSR-side gl tweens**: the `@gl` value object omits `"gls"` when
+    the setter slot is 0; slot 0 = "page-default setter". The gl
+    island's `verve_anim_register_setter` registration also sets
+    `defaultGlSlot` (last-wins, one stateful gl island per page);
+    `animWriteProp` resolves `st.gls || defaultGlSlot` at write time
+    (unresolved → drop + retry next tick). Lets the server emit a
+    slot-0 gl tween that binds to the island once hydrated. Existing
+    gl + non-gl wire goldens byte-identical.
+  - **Shared anim+gl rAF tick** (`verve.js`): the two P5 rAF loops are
+    merged — the master anim tick runs the anim engine first, then every
+    registered gl frame sink (`glSinks`) in the same frame, so anim
+    setter writes land in the SAME visual frame the gl engine reads
+    (removes the P5 ≤1-frame lag). Sinks register/deregister on
+    start / unmount / context-lost / restore.
+  - **Per-submesh scene graph** (`GlScene.zig`): the single `model_yaw`
+    model-matrix is replaced by a real `gl.Scene(max_submesh+1)` —
+    node 0 = root `"model"` (carries `model.yaw`), node s+1 = submesh s
+    (named from the vmesh name table). Per-draw world/mvp/normal
+    matrices come from `scene.world[s+1]` (per-submesh pools for
+    stream-aliasing safety). Enables per-node rotation animation.
+  - **Inverse-transform picking**: the pick ray is moved into each
+    node's local space via `transformRay(r, invert(world))` — three
+    paths: fast (no rotation → raw walk), root-only (`model.yaw` only →
+    one inverse walk), slow (per-node rotation → per-submesh
+    `bvh.walkRange` + global nearest-t). Replaces the pure-Y
+    `rotateYVec3` hack; per-node rotations now pick/hover correctly.
+  - **Math** (`math.zig`): `Mat4.invert` (full 4×4 cofactor inverse) +
+    `transformPoint` (w=1) / `transformDir` (w=0); `ray.transformRay`
+    transforms a ray (origin as point, dir as vector, not renormalized —
+    valid for rigid transforms). `bvh.walkRange` restricts leaf testing
+    to a contiguous triangle range (no out-of-range shadowing).
+  - **`/gl-scene` demo**: scroll-scrub timeline drives `camera.yaw`
+    turntable + `material:Cube.roughness` ramp + `node:Cube.rotationX`
+    wobble + `material:Cube.emissiveR` pulse (island), plus an SSR
+    `camera.distance` dolly (4→2.5, slot-0 page-default) built in
+    `components.zig`.
+  - Guide: `docs/24-gl.md` (P6 section); cross-ref in
+    `docs/23-animation.md`.
+
 ## [0.5.0] - 2026-06-12
 
 The 3D engine release: `verve.gl` v1 complete — PBR metallic-roughness
