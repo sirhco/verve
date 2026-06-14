@@ -23,7 +23,7 @@ pub fn poll(ctx: *const verve.Context) !*verve.Node {
                     ctx.span().attrFmt("style", "width:{d}%", .{pct}),
                 }),
                 ctx.span().class("tally").textFmt("{d} ({d}%)", .{ votes, pct }),
-                ctx.form(.{ .post = "/api/vote", .class = "vote" }).children(.{
+                ctx.actionForm(.{ .post = "/api/vote", .class = "vote" }).children(.{
                     ctx.input().type_("hidden").name("candidate").attrFmt("value", "{d}", .{idx}),
                     ctx.button("Vote").type_("submit"),
                 }),
@@ -33,7 +33,7 @@ pub fn poll(ctx: *const verve.Context) !*verve.Node {
 
     _ = root.children(.{
         ctx.p().class("muted").textFmt("Total votes: {d}", .{totals}),
-        ctx.form(.{ .post = "/api/resetTallies", .class = "actions" }).children(.{
+        ctx.actionForm(.{ .post = "/api/resetTallies", .class = "actions" }).children(.{
             ctx.button("Reset tallies").type_("submit").class("danger"),
         }),
         ctx.el("script").text(

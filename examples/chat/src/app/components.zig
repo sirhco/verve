@@ -23,7 +23,7 @@ pub fn chat(ctx: *const verve.Context, messages: []api.Message) !*verve.Node {
             ctx.a("/", "← Home"),
             ctx.span().textFmt("{d} messages", .{messages.len}),
         }),
-        ctx.form(.{ .post = "/api/postMessage", .class = "post" }).children(.{
+        ctx.actionForm(.{ .post = "/api/postMessage", .class = "post" }).children(.{
             ctx.input().name("author").type_("text").placeholder("Your name").required().attr("maxlength", "40"),
             ctx.textarea().name("body").placeholder("What's on your mind?").required().attr("maxlength", "200"),
             ctx.div().children(.{ ctx.button("Post").type_("submit") }),
@@ -52,7 +52,7 @@ pub fn chat(ctx: *const verve.Context, messages: []api.Message) !*verve.Node {
     }
 
     _ = root.children(.{
-        ctx.form(.{ .post = "/api/clearMessages" }).children(.{
+        ctx.actionForm(.{ .post = "/api/clearMessages" }).children(.{
             ctx.button("Clear all").type_("submit").class("danger"),
         }),
         ctx.el("script").text(

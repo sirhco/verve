@@ -583,6 +583,310 @@ pub fn pbrCubeGlb(alloc: Allocator, opts: struct { with_tangents: bool = true })
     return glb;
 }
 
+// ── mixed-material cube fixture (P9 shader-variant fan-out) ──────────────────────
+
+/// Two-cube, two-material, two-mesh glb that forces per-submesh shader
+/// variant fan-out. TWO meshes, each ONE primitive, each on its own node so the
+/// two resulting submeshes get DISTINCT names (name-based addressing can reach
+/// both):
+///   - mesh 0 "MixedFull" / material 0: FULL PBR (base/mr/normal/emissive+factor/
+///     occlusion) → after the writer runs, all five tex_* >= 0 → variant
+///     pbr|normal_map|emissive.
+///   - mesh 1 "MixedBase" / material 1: BASE-COLOR ONLY (one baseColorTexture, no
+///     mr/normal/emissive/occlusion, zero emissive factor) → writer emits
+///     tex_normal == -1 and tex_emissive == -1 → variant pbr.
+/// Two distinct variants in one asset = GlScene builds two shaders and switches
+/// setPipeline between them.
+///
+/// Geometry: the same 24-vertex cube as pbrCubeGlb, twice; the second cube is
+/// offset +x_off (2.5) on X so the two read side-by-side. Both primitives use the SAME
+/// attribute set (POSITION + NORMAL + TEXCOORD_0, NO TANGENT) so the downstream
+/// vmesh is uniform stride-48; the asset-gen tool generates tangents.
+///
+/// Six embedded 8x8 RGBA PNGs: material 0's five maps + material 1's lone base map.
+pub fn pbrCubeMixedMaterialGlb(alloc: Allocator) ![]u8 {
+    // ── 1. Build the six 8x8 RGBA maps ────────────────────────────────────────
+    var base_map: [8 * 8 * 4]u8 = undefined; // mat0 base: checkerboard
+    var mr_map: [8 * 8 * 4]u8 = undefined; // mat0 metallicRoughness
+    var nrm_map: [8 * 8 * 4]u8 = undefined; // mat0 normal
+    var emi_map: [8 * 8 * 4]u8 = undefined; // mat0 emissive
+    var occ_map: [8 * 8 * 4]u8 = undefined; // mat0 occlusion
+    var base2_map: [8 * 8 * 4]u8 = undefined; // mat1 base (only map)
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            const light = (row + col) % 2 == 0;
+            if (light) {
+                base_map[idx + 0] = 230;
+                base_map[idx + 1] = 230;
+                base_map[idx + 2] = 230;
+            } else {
+                base_map[idx + 0] = 60;
+                base_map[idx + 1] = 60;
+                base_map[idx + 2] = 200;
+            }
+            base_map[idx + 3] = 255;
+            mr_map[idx + 0] = 0;
+            mr_map[idx + 1] = @intCast(col * 255 / 7);
+            mr_map[idx + 2] = @intCast(row * 255 / 7);
+            mr_map[idx + 3] = 255;
+            const groove: bool = ((row + col) % 4) < 2;
+            nrm_map[idx + 0] = if (groove) 160 else 96;
+            nrm_map[idx + 1] = if (groove) 96 else 160;
+            nrm_map[idx + 2] = 255;
+            nrm_map[idx + 3] = 255;
+            const bright = (row >= 3 and row <= 4 and col >= 3 and col <= 4);
+            emi_map[idx + 0] = if (bright) 255 else 0;
+            emi_map[idx + 1] = if (bright) 255 else 0;
+            emi_map[idx + 2] = if (bright) 255 else 0;
+            emi_map[idx + 3] = 255;
+            const oc: u8 = @intCast(128 + (row + col) * 127 / 14);
+            occ_map[idx + 0] = oc;
+            occ_map[idx + 1] = oc;
+            occ_map[idx + 2] = oc;
+            occ_map[idx + 3] = 255;
+            // mat1 base: solid warm tint (distinct from mat0's checkerboard).
+            base2_map[idx + 0] = 200;
+            base2_map[idx + 1] = 140;
+            base2_map[idx + 2] = 90;
+            base2_map[idx + 3] = 255;
+        }
+    }
+
+    const base_png = try png.encodeRgba(alloc, &base_map, 8, 8);
+    defer alloc.free(base_png);
+    const mr_png = try png.encodeRgba(alloc, &mr_map, 8, 8);
+    defer alloc.free(mr_png);
+    const nrm_png = try png.encodeRgba(alloc, &nrm_map, 8, 8);
+    defer alloc.free(nrm_png);
+    const emi_png = try png.encodeRgba(alloc, &emi_map, 8, 8);
+    defer alloc.free(emi_png);
+    const occ_png = try png.encodeRgba(alloc, &occ_map, 8, 8);
+    defer alloc.free(occ_png);
+    const base2_png = try png.encodeRgba(alloc, &base2_map, 8, 8);
+    defer alloc.free(base2_png);
+
+    // image order: 0..4 = mat0 (base/mr/nrm/emi/occ), 5 = mat1 base.
+    const pngs = [6][]const u8{ base_png, mr_png, nrm_png, emi_png, occ_png, base2_png };
+
+    // ── 2. Compute BIN layout ─────────────────────────────────────────────────
+    // +X offset for the second cube. The cube spans [-1,+1] so primitive 1's
+    // POSITION min/max X derive from this const (x_off-1 .. x_off+1) — single
+    // source of truth so geometry and accessor bounds can't drift.
+    const x_off: f32 = 2.5;
+    // Two geometry sets (no TANGENT): each pos(288) nrm(288) uv(192) idx(72).
+    const geom_len: u32 = 24 * 3 * 4; // 288
+    const uv_len: u32 = 24 * 2 * 4; // 192
+    const idx_len: u32 = 36 * 2; // 72
+
+    // primitive 0 geometry
+    const m0_pos_off: u32 = 0;
+    const m0_nrm_off: u32 = m0_pos_off + geom_len; // 288
+    const m0_uv_off: u32 = m0_nrm_off + geom_len; // 576
+    const m0_idx_off: u32 = m0_uv_off + uv_len; // 768
+    // primitive 1 geometry (4-aligned after primitive 0's indices)
+    const m1_pos_off: u32 = (m0_idx_off + idx_len + 3) & ~@as(u32, 3); // 840
+    const m1_nrm_off: u32 = m1_pos_off + geom_len;
+    const m1_uv_off: u32 = m1_nrm_off + geom_len;
+    const m1_idx_off: u32 = m1_uv_off + uv_len;
+
+    // PNGs each 4-aligned after primitive 1's indices.
+    var png_offs: [6]u32 = undefined;
+    var cursor: u32 = (m1_idx_off + idx_len + 3) & ~@as(u32, 3);
+    for (pngs, 0..) |p, i| {
+        png_offs[i] = cursor;
+        cursor += @intCast(p.len);
+        cursor = (cursor + 3) & ~@as(u32, 3);
+    }
+    const bin_total: u32 = cursor;
+    // cursor is 4-aligned after every PNG, so bin_padded == bin_total (no-op).
+    const bin_padded = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // Helper writers for one cube's geometry into bin at the given offsets.
+    // x_offset shifts every position on X (second cube is +2.5).
+    const writeCube = struct {
+        fn go(b: []u8, pos_off: u32, nrm_off: u32, uvw_off: u32, idxw_off: u32, x_shift: f32) void {
+            var po: usize = pos_off;
+            for (faces) |face| {
+                for (face.v) |v| {
+                    std.mem.writeInt(u32, b[po..][0..4], @bitCast(v[0] + x_shift), .little);
+                    std.mem.writeInt(u32, b[po + 4 ..][0..4], @bitCast(v[1]), .little);
+                    std.mem.writeInt(u32, b[po + 8 ..][0..4], @bitCast(v[2]), .little);
+                    po += 12;
+                }
+            }
+            var no: usize = nrm_off;
+            for (faces) |face| {
+                for (0..4) |_| {
+                    std.mem.writeInt(u32, b[no..][0..4], @bitCast(face.nx), .little);
+                    std.mem.writeInt(u32, b[no + 4 ..][0..4], @bitCast(face.ny), .little);
+                    std.mem.writeInt(u32, b[no + 8 ..][0..4], @bitCast(face.nz), .little);
+                    no += 12;
+                }
+            }
+            var uo: usize = uvw_off;
+            for (faces) |_| {
+                for (face_uvs) |uv| {
+                    std.mem.writeInt(u32, b[uo..][0..4], @bitCast(uv[0]), .little);
+                    std.mem.writeInt(u32, b[uo + 4 ..][0..4], @bitCast(uv[1]), .little);
+                    uo += 8;
+                }
+            }
+            var io: usize = idxw_off;
+            for (0..6) |face_i| {
+                const base: u16 = @intCast(face_i * 4);
+                const tri_offsets = [6]u16{ 0, 1, 2, 0, 2, 3 };
+                for (tri_offsets) |o| {
+                    std.mem.writeInt(u16, b[io..][0..2], base + o, .little);
+                    io += 2;
+                }
+            }
+        }
+    }.go;
+
+    writeCube(bin, m0_pos_off, m0_nrm_off, m0_uv_off, m0_idx_off, 0.0);
+    writeCube(bin, m1_pos_off, m1_nrm_off, m1_uv_off, m1_idx_off, x_off);
+
+    for (pngs, 0..) |p, i| {
+        @memcpy(bin[png_offs[i]..][0..p.len], p);
+    }
+
+    // ── 3. Build JSON ─────────────────────────────────────────────────────────
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    // accessor layout: per primitive 0..3 (pos/nrm/uv/idx), per primitive 4..7.
+    // bufferView layout mirrors accessors (8 geom bufferViews), then 6 PNG bvs.
+    const acc_m0_pos: u32 = 0;
+    const acc_m0_nrm: u32 = 1;
+    const acc_m0_uv: u32 = 2;
+    const acc_m0_idx: u32 = 3;
+    const acc_m1_pos: u32 = 4;
+    const acc_m1_nrm: u32 = 5;
+    const acc_m1_uv: u32 = 6;
+    const acc_m1_idx: u32 = 7;
+    const bv_geom_count: u32 = 8;
+
+    try w.writeAll("{");
+    try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"scene\":0,");
+    // Two nodes (one per mesh) both in the scene → two distinctly named submeshes.
+    try w.writeAll("\"scenes\":[{\"nodes\":[0,1]}],");
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"MixedFullNode\"},{\"mesh\":1,\"name\":\"MixedBaseNode\"}],");
+    // Two meshes, each one primitive. Distinct mesh names → distinct submesh names.
+    try w.writeAll("\"meshes\":[");
+    // mesh 0 "MixedFull" → primitive / material 0 (full PBR)
+    try w.print("{{\"name\":\"MixedFull\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}},", .{ acc_m0_pos, acc_m0_nrm, acc_m0_uv, acc_m0_idx });
+    // mesh 1 "MixedBase" → primitive / material 1 (base-only)
+    try w.print("{{\"name\":\"MixedBase\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":1}}]}}", .{ acc_m1_pos, acc_m1_nrm, acc_m1_uv, acc_m1_idx });
+    try w.writeAll("],");
+
+    // accessors (primitive 0 geom, then primitive 1 geom)
+    try w.writeAll("\"accessors\":[");
+    try w.print("{{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[-1.0,-1.0,-1.0],\"max\":[1.0,1.0,1.0]}},", .{});
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"},");
+    try w.print("{{\"bufferView\":4,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[{d:.1},-1.0,-1.0],\"max\":[{d:.1},1.0,1.0]}},", .{ x_off - 1.0, x_off + 1.0 });
+    try w.writeAll("{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"}");
+    try w.writeAll("],");
+
+    // bufferViews (8 geometry, then 6 PNG)
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ m0_pos_off, geom_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ m0_nrm_off, geom_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ m0_uv_off, uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ m0_idx_off, idx_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ m1_pos_off, geom_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ m1_nrm_off, geom_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ m1_uv_off, uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ m1_idx_off, idx_len });
+    for (pngs, 0..) |p, i| {
+        try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ png_offs[i], p.len });
+        if (i + 1 < pngs.len) try w.writeAll(",");
+    }
+    try w.writeAll("],");
+
+    // buffer
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+
+    // materials: 0 = full PBR (textures 0..4), 1 = base-only (texture 5)
+    try w.writeAll("\"materials\":[");
+    try w.writeAll("{");
+    try w.writeAll("\"pbrMetallicRoughness\":{");
+    try w.writeAll("\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
+    try w.writeAll("\"baseColorTexture\":{\"index\":0},");
+    try w.writeAll("\"metallicFactor\":1.0,\"roughnessFactor\":1.0,");
+    try w.writeAll("\"metallicRoughnessTexture\":{\"index\":1}");
+    try w.writeAll("},");
+    try w.writeAll("\"normalTexture\":{\"index\":2,\"scale\":1.0},");
+    try w.writeAll("\"emissiveTexture\":{\"index\":3},");
+    try w.writeAll("\"emissiveFactor\":[1.0,1.0,1.0],");
+    try w.writeAll("\"occlusionTexture\":{\"index\":4,\"strength\":0.8}");
+    try w.writeAll("},");
+    // material 1: base-color only. No mr/normal/emissive/occlusion, no emissive factor.
+    try w.writeAll("{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1.0,1.0,1.0,1.0],\"baseColorTexture\":{\"index\":5}}}");
+    try w.writeAll("],");
+
+    // textures: one per image (6).
+    try w.writeAll("\"textures\":[");
+    for (0..6) |i| {
+        try w.print("{{\"source\":{d}}}", .{i});
+        if (i + 1 < 6) try w.writeAll(",");
+    }
+    try w.writeAll("],");
+    // images point at the PNG bufferViews (geom count + i).
+    try w.writeAll("\"images\":[");
+    for (0..6) |i| {
+        try w.print("{{\"bufferView\":{d},\"mimeType\":\"image/png\"}}", .{bv_geom_count + @as(u32, @intCast(i))});
+        if (i + 1 < 6) try w.writeAll(",");
+    }
+    try w.writeAll("]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) {
+        try w.writeByte(0x20);
+    }
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── 4. Assemble GLB ───────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42; // B
+    glb[goff + 1] = 0x49; // I
+    glb[goff + 2] = 0x4E; // N
+    glb[goff + 3] = 0x00; // \0
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    return glb;
+}
+
 // ── studio HDR environment fixture ──────────────────────────────────────────────
 
 /// Procedural studio environment as a complete .hdr file (flat RGBE):

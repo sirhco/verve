@@ -23,9 +23,10 @@
 //!   (+scale), emissiveFactor, emissiveTexture, occlusionTexture (+strength).
 //! - TANGENT (VEC4 f32) read when present; generated via tangent.zig otherwise.
 //! - Vertices interleave 12 f32/vertex (stride 48): pos3/normal3/tangent4/uv2.
-//! - Neutral-texture baking: any unset tex_* slot is patched to a deduped 1×1
-//!   white (base/mr/emissive/occlusion) or flat-normal (normal) texture so the
-//!   runtime never branches on texture presence; ALL five tex_* are ≥ 0 in output.
+//! - Neutral-texture baking: tex_base/tex_mr/tex_occlusion are always white-baked
+//!   when unset. tex_emissive is white-baked only when the emissive factor is non-zero
+//!   (else left -1). tex_normal is always left -1 when absent. The -1 sentinels let
+//!   vmesh.Reader.submeshVariant select leaner shader variants per submesh.
 
 const std = @import("std");
 const vmesh = @import("vmesh.zig");
@@ -564,18 +565,20 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
     }
 
     // ── 7b. Neutral-texture baking ─────────────────────────────────────────────
-    // Downstream the runtime never branches on texture presence: every tex_* slot
-    // must resolve to a real texture. For any unset slot (== -1), patch it to a
-    // deduped 1×1 neutral:
-    //   - white (255,255,255,255): base/mr/emissive/occlusion slots,
-    //   - flat-normal (128,128,255,255): normal slot.
-    // The two neutral textures are appended once (deduped) only if referenced.
+    // tex_base, tex_mr, tex_occlusion: always white-neutral-baked when unset
+    //   (the base PBR path always samples these slots).
+    // tex_emissive: white-neutral-baked ONLY when the material has a non-zero
+    //   emissive factor (so a texture-less factor-driven emissive still has a
+    //   sampler); left as -1 when no emissive texture AND factor ≈ 0.
+    // tex_normal: left as -1 when the material has no normal map — the -1
+    //   sentinel is read by vmesh.Reader.submeshVariant to select a leaner
+    //   shader variant (no normal-map branch).
+    // The white neutral texture is appended once (deduped) only if referenced.
     {
         var white_idx: i32 = -1;
-        var flat_idx: i32 = -1;
         for (sub_list.items) |*s| {
-            // White-backed slots.
-            inline for (.{ "tex_base", "tex_mr", "tex_emissive", "tex_occlusion" }) |field| {
+            // Always white-backed: base / mr / occlusion.
+            inline for (.{ "tex_base", "tex_mr", "tex_occlusion" }) |field| {
                 if (@field(s, field) < 0) {
                     if (white_idx < 0) {
                         const px = try aa.alloc(u8, 4);
@@ -589,19 +592,26 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                     @field(s, field) = white_idx;
                 }
             }
-            // Flat-normal slot.
-            if (s.tex_normal < 0) {
-                if (flat_idx < 0) {
-                    const px = try aa.alloc(u8, 4);
-                    px[0] = 128;
-                    px[1] = 128;
-                    px[2] = 255;
-                    px[3] = 255;
-                    flat_idx = @intCast(tex_list.items.len);
-                    try tex_list.append(aa, .{ .width = 1, .height = 1, .rgba = px });
+            // Emissive: white-baked only when the factor is non-zero.
+            if (s.tex_emissive < 0) {
+                const ef = s.emissive;
+                const has_factor = ef[0] != 0.0 or ef[1] != 0.0 or ef[2] != 0.0;
+                if (has_factor) {
+                    if (white_idx < 0) {
+                        const px = try aa.alloc(u8, 4);
+                        px[0] = 255;
+                        px[1] = 255;
+                        px[2] = 255;
+                        px[3] = 255;
+                        white_idx = @intCast(tex_list.items.len);
+                        try tex_list.append(aa, .{ .width = 1, .height = 1, .rgba = px });
+                    }
+                    s.tex_emissive = white_idx;
                 }
-                s.tex_normal = flat_idx;
+                // else: leave tex_emissive == -1 (no-emissive sentinel)
             }
+            // tex_normal: leave as -1 (no-normal-map sentinel); downstream
+            // vmesh.Reader.submeshVariant uses -1 to select the lean variant.
         }
     }
 
@@ -932,14 +942,15 @@ test "parse fixture cube (P2 textured, v2 layout + neutral baking)" {
     try testing.expectEqual(@as(usize, 36), model.indices.len);
     try testing.expectEqual(@as(usize, 1), model.submeshes.len);
     const s = model.submeshes[0];
-    // baseColorTexture → tex_base 0; all other slots neutral-baked → ≥ 0.
+    // baseColorTexture → tex_base 0; mr/occlusion white-baked; normal/emissive → -1
+    // (no normal map, no emissive texture, no emissive factor).
     try testing.expectEqual(@as(i32, 0), s.tex_base);
     try testing.expect(s.tex_mr >= 0);
-    try testing.expect(s.tex_normal >= 0);
-    try testing.expect(s.tex_emissive >= 0);
+    try testing.expectEqual(@as(i32, -1), s.tex_normal);
+    try testing.expectEqual(@as(i32, -1), s.tex_emissive);
     try testing.expect(s.tex_occlusion >= 0);
-    // 1 original + 1 white (shared base/mr/emissive/occlusion) + 1 flat-normal.
-    try testing.expectEqual(@as(usize, 3), model.textures.len);
+    // 1 original + 1 white (shared mr/occlusion); normal/emissive not baked.
+    try testing.expectEqual(@as(usize, 2), model.textures.len);
     try testing.expectEqual(@as(u32, 8), model.textures[0].width);
     // a +z face vertex has normal (0,0,1): find any vertex with nz≈1 (stride 12, normal@3)
     var found = false;
@@ -1027,8 +1038,93 @@ test "parse pbrCubeGlb (with_tangents=false): generated tangents valid" {
     }
 }
 
-test "neutral-texture baking: no textures → deduped neutrals appended" {
-    // Minimal cube-less glb: a single triangle, material with NO textures.
+// GLB container invariants (magic/version/total-length/JSON-chunk alignment).
+// Same magic/version/chunk-alignment checks the pbrCubeGlb fixture tests run,
+// but material-count-agnostic so it also fits the mixed (2-material) asset.
+fn mixedGlbContainerInvariants(glb: []const u8) !void {
+    try testing.expectEqualSlices(u8, "glTF", glb[0..4]);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, glb[4..8], .little));
+    try testing.expectEqual(@as(u32, @intCast(glb.len)), std.mem.readInt(u32, glb[8..12], .little));
+    try testing.expectEqualSlices(u8, "JSON", glb[16..20]);
+    const json_len = std.mem.readInt(u32, glb[12..16], .little);
+    try testing.expectEqual(@as(u32, 0), json_len % 4); // JSON chunk 4-aligned
+}
+
+test "parse pbrCubeMixedMaterialGlb: 2 submeshes, variant fan-out (full vs base-only)" {
+    const command = @import("command.zig");
+    const glb = try @import("fixture.zig").pbrCubeMixedMaterialGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    // GLB container invariants (magic/version/length/JSON chunk alignment) before
+    // we trust the parse — same guard the pbrCubeGlb fixture tests apply.
+    try mixedGlbContainerInvariants(glb);
+    var model = try parseGlb(testing.allocator, glb);
+    defer model.deinit();
+
+    // ── 1. exactly two submeshes (one per mesh/primitive) ─────────────────────
+    try testing.expectEqual(@as(usize, 2), model.submeshes.len);
+
+    // Parse order follows mesh order: submesh 0 = mesh 0 "MixedFull" = full PBR,
+    // submesh 1 = mesh 1 "MixedBase" = base-only. Don't assume the order: pick the
+    // full submesh by material signature (it has a normal map) and swap aliases if
+    // primitive/parse order ever flips, so a regression fails clearly here instead
+    // of with an opaque tex_normal>=0 got -1.
+    var full_i: usize = 0;
+    var base_i: usize = 1;
+    if (model.submeshes[0].tex_normal < 0) {
+        // submesh 0 has no normal map → it is the base-only one; swap.
+        full_i = 1;
+        base_i = 0;
+    }
+    const full = model.submeshes[full_i];
+    const base = model.submeshes[base_i];
+
+    // ── 2. full-material submesh: all five tex_* >= 0 ─────────────────────────
+    try testing.expect(full.tex_base >= 0);
+    try testing.expect(full.tex_mr >= 0);
+    try testing.expect(full.tex_normal >= 0);
+    try testing.expect(full.tex_emissive >= 0);
+    try testing.expect(full.tex_occlusion >= 0);
+
+    // ── 3. base-only submesh: base/mr/occlusion white-baked, normal/emissive==-1 ─
+    try testing.expect(base.tex_base >= 0); // neutral-baked ok
+    try testing.expect(base.tex_mr >= 0); // white-baked (regression guard: not -1)
+    try testing.expect(base.tex_occlusion >= 0); // white-baked (regression guard)
+    try testing.expectEqual(@as(i32, -1), base.tex_normal);
+    try testing.expectEqual(@as(i32, -1), base.tex_emissive);
+
+    // ── 3b. distinct submesh names: name-based addressing reaches both ────────
+    try testing.expectEqual(model.submeshes.len, model.names.len);
+    try testing.expectEqualStrings("MixedFull", model.names[full_i]);
+    try testing.expectEqualStrings("MixedBase", model.names[base_i]);
+
+    // ── 4. pack → read → variant: prove writer→reader→variant end to end ──────
+    const bytes = try vmesh.pack(
+        testing.allocator,
+        model.vertices,
+        model.indices,
+        model.submeshes,
+        model.textures,
+        &.{}, // no bvh
+        &.{}, // no tri_perm
+        model.names,
+    );
+    defer testing.allocator.free(bytes);
+    const r = try vmesh.Reader.init(bytes);
+
+    const pbr = command.variant_pbr;
+    const nm = command.variant_normal_map;
+    const em = command.variant_emissive;
+
+    // full submesh → pbr | normal_map | emissive; base-only → pbr.
+    try testing.expectEqual(pbr | nm | em, r.submeshVariant(@intCast(full_i)));
+    try testing.expectEqual(pbr, r.submeshVariant(@intCast(base_i)));
+    // Two distinct variants in one asset → GlScene fan-out fires.
+    try testing.expect(r.submeshVariant(@intCast(full_i)) != r.submeshVariant(@intCast(base_i)));
+}
+
+test "neutral-texture baking: no textures, zero factor → sentinels for normal/emissive" {
+    // Minimal glb: a single triangle, material with NO textures and no emissive factor.
+    // New behavior: tex_base/mr/occlusion white-baked; tex_normal == -1, tex_emissive == -1.
     const glb = try minimalNoTextureGlb(testing.allocator);
     defer testing.allocator.free(glb);
     var model = try parseGlb(testing.allocator, glb);
@@ -1036,26 +1132,61 @@ test "neutral-texture baking: no textures → deduped neutrals appended" {
 
     try testing.expectEqual(@as(usize, 1), model.submeshes.len);
     const s = model.submeshes[0];
-    // All five tex_* ≥ 0 after baking.
+    // base/mr/occlusion white-baked.
     try testing.expect(s.tex_base >= 0);
     try testing.expect(s.tex_mr >= 0);
-    try testing.expect(s.tex_normal >= 0);
-    try testing.expect(s.tex_emissive >= 0);
     try testing.expect(s.tex_occlusion >= 0);
-    // White shared across base/mr/emissive/occlusion.
+    // White shared across base/mr/occlusion.
     try testing.expectEqual(s.tex_base, s.tex_mr);
-    try testing.expectEqual(s.tex_base, s.tex_emissive);
     try testing.expectEqual(s.tex_base, s.tex_occlusion);
-    // Flat-normal distinct from white.
-    try testing.expect(s.tex_normal != s.tex_base);
-    // Started with 0 textures; grows by exactly 2 (white + flat-normal).
-    try testing.expectEqual(@as(usize, 2), model.textures.len);
-    // White texel = (255,255,255,255); flat-normal = (128,128,255,255).
+    // normal and emissive left as -1 (no map, no non-zero factor).
+    try testing.expectEqual(@as(i32, -1), s.tex_normal);
+    try testing.expectEqual(@as(i32, -1), s.tex_emissive);
+    // Started with 0 textures; grows by exactly 1 (white only).
+    try testing.expectEqual(@as(usize, 1), model.textures.len);
+    // White texel = (255,255,255,255).
     const white = model.textures[@intCast(s.tex_base)];
     try testing.expectEqual(@as(u32, 1), white.width);
     try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, white.rgba);
-    const flat = model.textures[@intCast(s.tex_normal)];
-    try testing.expectEqualSlices(u8, &.{ 128, 128, 255, 255 }, flat.rgba);
+}
+
+test "neutral-texture baking: no emissive texture + non-zero factor → tex_emissive white-baked" {
+    // Material with NO emissive texture but emissiveFactor = [1,0,0] → tex_emissive >= 0.
+    const pos = [_]f32{ 0, 0, 0, 1, 0, 0, 0, 1, 0 };
+    const nrm = [_]f32{ 0, 0, 1, 0, 0, 1, 0, 0, 1 };
+    const uv = [_]f32{ 0, 0, 1, 0, 0, 1 };
+    const idx = [_]u16{ 0, 1, 2 };
+    const json =
+        "{\"asset\":{\"version\":\"2.0\"}," ++
+        "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}]," ++
+        "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}]," ++
+        "\"accessors\":[" ++
+        "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+        "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+        "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}," ++
+        "{\"bufferView\":3,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}]," ++
+        "\"bufferViews\":[" ++
+        "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36}," ++
+        "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36}," ++
+        "{\"buffer\":0,\"byteOffset\":72,\"byteLength\":24}," ++
+        "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":6,\"target\":34963}]," ++
+        "\"buffers\":[{\"byteLength\":102}]," ++
+        "\"materials\":[{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":0.5}," ++
+        "\"emissiveFactor\":[1.0,0.0,0.0]}]}";
+    const glb = try assembleGlb(testing.allocator, json, &pos, &nrm, &uv, &idx, null);
+    defer testing.allocator.free(glb);
+    var model = try parseGlb(testing.allocator, glb);
+    defer model.deinit();
+
+    try testing.expectEqual(@as(usize, 1), model.submeshes.len);
+    const s = model.submeshes[0];
+    // Emissive factor non-zero → tex_emissive must be white-baked (>= 0).
+    try testing.expect(s.tex_emissive >= 0);
+    // Verify white texel.
+    const white = model.textures[@intCast(s.tex_emissive)];
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, white.rgba);
+    // tex_normal still -1 (no normal map).
+    try testing.expectEqual(@as(i32, -1), s.tex_normal);
 }
 
 test "names: mesh + node both unnamed → fallback \"mesh0\"" {
