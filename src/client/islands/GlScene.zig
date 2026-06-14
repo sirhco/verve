@@ -103,7 +103,8 @@ fn shaderHandleFor(variant: u32) u32 {
         variant_pbr | variant_nm => 2,
         variant_pbr | variant_em => 3,
         variant_pbr | variant_nm | variant_em => 4,
-        else => 1,
+        // submeshVariant always sets variant_pbr, so the four arms above are exhaustive.
+        else => unreachable,
     };
 }
 
@@ -116,7 +117,8 @@ fn createShaderForVariant(enc: *gl.Encoder, variant: u32) void {
         variant_pbr | variant_nm => emitShader(enc, variant_pbr | variant_nm),
         variant_pbr | variant_em => emitShader(enc, variant_pbr | variant_em),
         variant_pbr | variant_nm | variant_em => emitShader(enc, variant_pbr | variant_nm | variant_em),
-        else => emitShader(enc, variant_pbr),
+        // submeshVariant always sets variant_pbr, so the four arms above are exhaustive.
+        else => unreachable,
     }
 }
 
