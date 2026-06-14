@@ -18,6 +18,31 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("../../src/verve.zig"),
     });
 
+    // Chunk-side `verve` façade (the island runtime) + the core modules it
+    // imports. Framework island chunks (resolved from ../../src/client/islands)
+    // `@import("verve")` against this — mirrors examples/viz-live.
+    const serialize_island_mod = b.createModule(.{
+        .root_source_file = b.path("../../src/core/serialize.zig"),
+    });
+    const island_state_island_mod = b.createModule(.{
+        .root_source_file = b.path("../../src/core/island_state.zig"),
+    });
+    const viz_core_mod = b.createModule(.{
+        .root_source_file = b.path("../../src/core/viz/client_core.zig"),
+    });
+    const anim_core_mod = b.createModule(.{
+        .root_source_file = b.path("../../src/core/anim/client_core.zig"),
+    });
+    const verve_island_mod = b.addModule("verve_island", .{
+        .root_source_file = b.path("../../src/client/island_runtime.zig"),
+        .imports = &.{
+            .{ .name = "serialize", .module = serialize_island_mod },
+            .{ .name = "island_state", .module = island_state_island_mod },
+            .{ .name = "viz_core", .module = viz_core_mod },
+            .{ .name = "anim_core", .module = anim_core_mod },
+        },
+    });
+
     const client_mod = b.createModule(.{
         .root_source_file = b.path("../../src/client/main.zig"),
         .target = wasm_target,
@@ -96,20 +121,33 @@ pub fn build(b: *std.Build) void {
     ) catch @panic("OOM");
 
     for (island_names) |name| {
-        const source_rel = b.fmt("src/client/islands/{s}.zig", .{name});
+        // Chunk source resolution: example-local override → the framework's
+        // own implementation → the `_default` stub.
+        const local_rel = b.fmt("src/client/islands/{s}.zig", .{name});
+        const framework_rel = b.fmt("../../src/client/islands/{s}.zig", .{name});
         const fallback_rel = "../../src/client/islands/_default.zig";
         const io_h = b.graph.io;
-        const exists = blk: {
-            var probe = b.build_root.handle.openFile(io_h, source_rel, .{}) catch break :blk false;
-            probe.close(io_h);
-            break :blk true;
-        };
-        const rel = if (exists) source_rel else fallback_rel;
+        const probe = struct {
+            fn exists(bld: *std.Build, io: anytype, p: []const u8) bool {
+                var f = bld.build_root.handle.openFile(io, p, .{}) catch return false;
+                f.close(io);
+                return true;
+            }
+        }.exists;
+        const rel = if (probe(b, io_h, local_rel))
+            local_rel
+        else if (probe(b, io_h, framework_rel))
+            framework_rel
+        else
+            fallback_rel;
 
         const island_mod = b.createModule(.{
             .root_source_file = b.path(rel),
             .target = wasm_target,
             .optimize = .ReleaseSmall,
+            .imports = &.{
+                .{ .name = "verve", .module = verve_island_mod },
+            },
         });
         const exe = b.addExecutable(.{
             .name = b.fmt("island_{s}", .{name}),

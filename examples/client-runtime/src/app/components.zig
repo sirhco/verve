@@ -87,7 +87,7 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\form{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center}
             ),
         }),
-        ctx.el("body").children(.{body}),
+        ctx.el("body").children(.{ body, ctx.script("/verve.js") }),
     }).build();
 }
 
