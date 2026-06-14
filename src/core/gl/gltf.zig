@@ -1038,35 +1038,64 @@ test "parse pbrCubeGlb (with_tangents=false): generated tangents valid" {
     }
 }
 
+// GLB container invariants (magic/version/total-length/JSON-chunk alignment).
+// Same magic/version/chunk-alignment checks the pbrCubeGlb fixture tests run,
+// but material-count-agnostic so it also fits the mixed (2-material) asset.
+fn mixedGlbContainerInvariants(glb: []const u8) !void {
+    try testing.expectEqualSlices(u8, "glTF", glb[0..4]);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, glb[4..8], .little));
+    try testing.expectEqual(@as(u32, @intCast(glb.len)), std.mem.readInt(u32, glb[8..12], .little));
+    try testing.expectEqualSlices(u8, "JSON", glb[16..20]);
+    const json_len = std.mem.readInt(u32, glb[12..16], .little);
+    try testing.expectEqual(@as(u32, 0), json_len % 4); // JSON chunk 4-aligned
+}
+
 test "parse pbrCubeMixedMaterialGlb: 2 submeshes, variant fan-out (full vs base-only)" {
     const command = @import("command.zig");
     const glb = try @import("fixture.zig").pbrCubeMixedMaterialGlb(testing.allocator);
     defer testing.allocator.free(glb);
+    // GLB container invariants (magic/version/length/JSON chunk alignment) before
+    // we trust the parse — same guard the pbrCubeGlb fixture tests apply.
+    try mixedGlbContainerInvariants(glb);
     var model = try parseGlb(testing.allocator, glb);
     defer model.deinit();
 
-    // ── 1. exactly two submeshes (one per primitive) ──────────────────────────
+    // ── 1. exactly two submeshes (one per mesh/primitive) ─────────────────────
     try testing.expectEqual(@as(usize, 2), model.submeshes.len);
 
-    // Parse order follows primitive order: submesh 0 = primitive 0 = full PBR,
-    // submesh 1 = primitive 1 = base-only. Verify the contract holds rather than
-    // assuming: identify by material signature.
-    const s0 = model.submeshes[0];
-    const s1 = model.submeshes[1];
+    // Parse order follows mesh order: submesh 0 = mesh 0 "MixedFull" = full PBR,
+    // submesh 1 = mesh 1 "MixedBase" = base-only. Don't assume the order: pick the
+    // full submesh by material signature (it has a normal map) and swap aliases if
+    // primitive/parse order ever flips, so a regression fails clearly here instead
+    // of with an opaque tex_normal>=0 got -1.
+    var full_i: usize = 0;
+    var base_i: usize = 1;
+    if (model.submeshes[0].tex_normal < 0) {
+        // submesh 0 has no normal map → it is the base-only one; swap.
+        full_i = 1;
+        base_i = 0;
+    }
+    const full = model.submeshes[full_i];
+    const base = model.submeshes[base_i];
 
     // ── 2. full-material submesh: all five tex_* >= 0 ─────────────────────────
-    const full = s0;
     try testing.expect(full.tex_base >= 0);
     try testing.expect(full.tex_mr >= 0);
     try testing.expect(full.tex_normal >= 0);
     try testing.expect(full.tex_emissive >= 0);
     try testing.expect(full.tex_occlusion >= 0);
 
-    // ── 3. base-only submesh: base baked, but normal/emissive == -1 ───────────
-    const base = s1;
+    // ── 3. base-only submesh: base/mr/occlusion white-baked, normal/emissive==-1 ─
     try testing.expect(base.tex_base >= 0); // neutral-baked ok
+    try testing.expect(base.tex_mr >= 0); // white-baked (regression guard: not -1)
+    try testing.expect(base.tex_occlusion >= 0); // white-baked (regression guard)
     try testing.expectEqual(@as(i32, -1), base.tex_normal);
     try testing.expectEqual(@as(i32, -1), base.tex_emissive);
+
+    // ── 3b. distinct submesh names: name-based addressing reaches both ────────
+    try testing.expectEqual(model.submeshes.len, model.names.len);
+    try testing.expectEqualStrings("MixedFull", model.names[full_i]);
+    try testing.expectEqualStrings("MixedBase", model.names[base_i]);
 
     // ── 4. pack → read → variant: prove writer→reader→variant end to end ──────
     const bytes = try vmesh.pack(
@@ -1087,10 +1116,10 @@ test "parse pbrCubeMixedMaterialGlb: 2 submeshes, variant fan-out (full vs base-
     const em = command.variant_emissive;
 
     // full submesh → pbr | normal_map | emissive; base-only → pbr.
-    try testing.expectEqual(pbr | nm | em, r.submeshVariant(0));
-    try testing.expectEqual(pbr, r.submeshVariant(1));
+    try testing.expectEqual(pbr | nm | em, r.submeshVariant(@intCast(full_i)));
+    try testing.expectEqual(pbr, r.submeshVariant(@intCast(base_i)));
     // Two distinct variants in one asset → GlScene fan-out fires.
-    try testing.expect(r.submeshVariant(0) != r.submeshVariant(1));
+    try testing.expect(r.submeshVariant(@intCast(full_i)) != r.submeshVariant(@intCast(base_i)));
 }
 
 test "neutral-texture baking: no textures, zero factor → sentinels for normal/emissive" {

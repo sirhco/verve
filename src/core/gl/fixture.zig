@@ -585,18 +585,21 @@ pub fn pbrCubeGlb(alloc: Allocator, opts: struct { with_tangents: bool = true })
 
 // ── mixed-material cube fixture (P9 shader-variant fan-out) ──────────────────────
 
-/// Two-cube, two-material, two-primitive glb that forces per-submesh shader
-/// variant fan-out. ONE mesh, TWO primitives:
-///   - primitive 0 / material 0: FULL PBR (base/mr/normal/emissive+factor/occlusion)
-///     → after the writer runs, all five tex_* >= 0 → variant pbr|normal_map|emissive.
-///   - primitive 1 / material 1: BASE-COLOR ONLY (one baseColorTexture, no mr/normal/
-///     emissive/occlusion, zero emissive factor) → writer emits tex_normal == -1 and
-///     tex_emissive == -1 → variant pbr.
+/// Two-cube, two-material, two-mesh glb that forces per-submesh shader
+/// variant fan-out. TWO meshes, each ONE primitive, each on its own node so the
+/// two resulting submeshes get DISTINCT names (name-based addressing can reach
+/// both):
+///   - mesh 0 "MixedFull" / material 0: FULL PBR (base/mr/normal/emissive+factor/
+///     occlusion) → after the writer runs, all five tex_* >= 0 → variant
+///     pbr|normal_map|emissive.
+///   - mesh 1 "MixedBase" / material 1: BASE-COLOR ONLY (one baseColorTexture, no
+///     mr/normal/emissive/occlusion, zero emissive factor) → writer emits
+///     tex_normal == -1 and tex_emissive == -1 → variant pbr.
 /// Two distinct variants in one asset = GlScene builds two shaders and switches
 /// setPipeline between them.
 ///
 /// Geometry: the same 24-vertex cube as pbrCubeGlb, twice; the second cube is
-/// offset +2.5 on X so the two read side-by-side. Both primitives use the SAME
+/// offset +x_off (2.5) on X so the two read side-by-side. Both primitives use the SAME
 /// attribute set (POSITION + NORMAL + TEXCOORD_0, NO TANGENT) so the downstream
 /// vmesh is uniform stride-48; the asset-gen tool generates tangents.
 ///
@@ -667,6 +670,10 @@ pub fn pbrCubeMixedMaterialGlb(alloc: Allocator) ![]u8 {
     const pngs = [6][]const u8{ base_png, mr_png, nrm_png, emi_png, occ_png, base2_png };
 
     // ── 2. Compute BIN layout ─────────────────────────────────────────────────
+    // +X offset for the second cube. The cube spans [-1,+1] so primitive 1's
+    // POSITION min/max X derive from this const (x_off-1 .. x_off+1) — single
+    // source of truth so geometry and accessor bounds can't drift.
+    const x_off: f32 = 2.5;
     // Two geometry sets (no TANGENT): each pos(288) nrm(288) uv(192) idx(72).
     const geom_len: u32 = 24 * 3 * 4; // 288
     const uv_len: u32 = 24 * 2 * 4; // 192
@@ -692,6 +699,7 @@ pub fn pbrCubeMixedMaterialGlb(alloc: Allocator) ![]u8 {
         cursor = (cursor + 3) & ~@as(u32, 3);
     }
     const bin_total: u32 = cursor;
+    // cursor is 4-aligned after every PNG, so bin_padded == bin_total (no-op).
     const bin_padded = (bin_total + 3) & ~@as(u32, 3);
 
     var bin = try alloc.alloc(u8, bin_padded);
@@ -701,11 +709,11 @@ pub fn pbrCubeMixedMaterialGlb(alloc: Allocator) ![]u8 {
     // Helper writers for one cube's geometry into bin at the given offsets.
     // x_offset shifts every position on X (second cube is +2.5).
     const writeCube = struct {
-        fn go(b: []u8, pos_off: u32, nrm_off: u32, uvw_off: u32, idxw_off: u32, x_off: f32) void {
+        fn go(b: []u8, pos_off: u32, nrm_off: u32, uvw_off: u32, idxw_off: u32, x_shift: f32) void {
             var po: usize = pos_off;
             for (faces) |face| {
                 for (face.v) |v| {
-                    std.mem.writeInt(u32, b[po..][0..4], @bitCast(v[0] + x_off), .little);
+                    std.mem.writeInt(u32, b[po..][0..4], @bitCast(v[0] + x_shift), .little);
                     std.mem.writeInt(u32, b[po + 4 ..][0..4], @bitCast(v[1]), .little);
                     std.mem.writeInt(u32, b[po + 8 ..][0..4], @bitCast(v[2]), .little);
                     po += 12;
@@ -741,7 +749,7 @@ pub fn pbrCubeMixedMaterialGlb(alloc: Allocator) ![]u8 {
     }.go;
 
     writeCube(bin, m0_pos_off, m0_nrm_off, m0_uv_off, m0_idx_off, 0.0);
-    writeCube(bin, m1_pos_off, m1_nrm_off, m1_uv_off, m1_idx_off, 2.5);
+    writeCube(bin, m1_pos_off, m1_nrm_off, m1_uv_off, m1_idx_off, x_off);
 
     for (pngs, 0..) |p, i| {
         @memcpy(bin[png_offs[i]..][0..p.len], p);
@@ -767,14 +775,16 @@ pub fn pbrCubeMixedMaterialGlb(alloc: Allocator) ![]u8 {
     try w.writeAll("{");
     try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
     try w.writeAll("\"scene\":0,");
-    try w.writeAll("\"scenes\":[{\"nodes\":[0]}],");
-    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"MixedCube\"}],");
-    try w.writeAll("\"meshes\":[{\"name\":\"Mixed\",\"primitives\":[");
-    // primitive 0 → material 0 (full PBR)
-    try w.print("{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}},", .{ acc_m0_pos, acc_m0_nrm, acc_m0_uv, acc_m0_idx });
-    // primitive 1 → material 1 (base-only)
-    try w.print("{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":1}}", .{ acc_m1_pos, acc_m1_nrm, acc_m1_uv, acc_m1_idx });
-    try w.writeAll("]}],");
+    // Two nodes (one per mesh) both in the scene → two distinctly named submeshes.
+    try w.writeAll("\"scenes\":[{\"nodes\":[0,1]}],");
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"MixedFullNode\"},{\"mesh\":1,\"name\":\"MixedBaseNode\"}],");
+    // Two meshes, each one primitive. Distinct mesh names → distinct submesh names.
+    try w.writeAll("\"meshes\":[");
+    // mesh 0 "MixedFull" → primitive / material 0 (full PBR)
+    try w.print("{{\"name\":\"MixedFull\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}},", .{ acc_m0_pos, acc_m0_nrm, acc_m0_uv, acc_m0_idx });
+    // mesh 1 "MixedBase" → primitive / material 1 (base-only)
+    try w.print("{{\"name\":\"MixedBase\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":1}}]}}", .{ acc_m1_pos, acc_m1_nrm, acc_m1_uv, acc_m1_idx });
+    try w.writeAll("],");
 
     // accessors (primitive 0 geom, then primitive 1 geom)
     try w.writeAll("\"accessors\":[");
@@ -782,7 +792,7 @@ pub fn pbrCubeMixedMaterialGlb(alloc: Allocator) ![]u8 {
     try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
     try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
     try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"},");
-    try w.print("{{\"bufferView\":4,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[{d:.1},-1.0,-1.0],\"max\":[{d:.1},1.0,1.0]}},", .{ @as(f32, 1.5), @as(f32, 3.5) });
+    try w.print("{{\"bufferView\":4,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[{d:.1},-1.0,-1.0],\"max\":[{d:.1},1.0,1.0]}},", .{ x_off - 1.0, x_off + 1.0 });
     try w.writeAll("{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
     try w.writeAll("{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
     try w.writeAll("{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"}");
