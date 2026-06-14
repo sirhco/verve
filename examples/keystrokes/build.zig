@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const client_mod = b.createModule(.{
-        .root_source_file = b.path("../../src/client/main.zig"),
+        .root_source_file = b.path("src/client/main.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSmall,
         .imports = &.{
