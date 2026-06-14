@@ -1255,3 +1255,30 @@ test "/gl-scene serves GlScene island with scroll section, canvas, poster, and n
     try std.testing.expectEqual(@as(u16, 200), gl_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, gl_resp.body, "data-name=\"GlDemo\"") != null);
 }
+
+test "/gl-mixed serves GlScene island and /gl/mixed.vmesh serves the asset" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 22);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    var resp = try request(io, gpa, port, "GET", "/gl-mixed");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // GlScene island marker + canvas present.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-name=\"GlScene\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "<canvas") != null);
+
+    // data-props is non-empty (encodes the mixed.vmesh src, camera, picks).
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "data-props=\"") != null);
+
+    // The mixed-material vmesh is served from the embedded gl asset table.
+    var vmesh_resp = try request(io, gpa, port, "GET", "/gl/mixed.vmesh");
+    defer vmesh_resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), vmesh_resp.status);
+    try std.testing.expect(vmesh_resp.body.len > 0);
+}
