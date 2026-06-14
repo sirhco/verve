@@ -6,6 +6,55 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-06-14
+
+### Added
+
+- **`verve.gl` P9 (render quality) — per-submesh shader-variant selection**
+  (`src/core/gl/vmesh.zig`, `gltf.zig`, `fixture.zig`,
+  `src/client/islands/GlScene.zig`, `tools/gen_mixed_glb.zig`, `build.zig`,
+  `src/app/{routes,components}.zig`, `docs/24-gl.md`): each submesh now draws
+  with the leanest correct PBR variant instead of one hard-coded über-shader.
+  - `vmesh.Reader.submeshVariant(s)` derives the variant bitset
+    (`variant_pbr | normal_map? | emissive?`) from the per-submesh texture
+    indices — no vmesh format change: it reuses the `-1` "missing map"
+    sentinel the P8 reader already validates (format stays v3).
+  - The glTF→vmesh writer now emits `tex_normal = -1` for an absent normal
+    map and `tex_emissive = -1` when there is no emissive texture and a zero
+    emissive factor; base / metallic-roughness / occlusion stay neutral-baked.
+  - `GlScene` creates one shader per distinct variant used (deduped, each
+    recorded for context-restore replay) and switches `SET_PIPELINE` per
+    variant group, re-emitting `SET_LIGHTS` / `BIND_IBL` per the wire
+    stream-order rule. No `verve.js` bridge change required.
+  - New **`/gl-mixed` demo route** + procedural mixed-material fixture
+    (`pbrCubeMixedMaterialGlb`) rendering a full-PBR cube beside a
+    base-color-only cube, exercising the multi-shader fan-out.
+
+### Fixed
+
+- **Server `--help` usage banner** now lists `--csrf` and `--dev`
+  (`src/server/main.zig`): both flags were supported but missing from the
+  printed usage.
+- **Examples — CSRF on form POSTs**: `poll`, `chat`, `bookmarks`, and
+  `dashboard` built their `/api` POST forms with `ctx.form` (no `__csrf`
+  field), so a JS-less submit failed the enforced CSRF check with a 403.
+  Switched to `ctx.actionForm`, which injects the token field.
+- **Examples — dead client-side interactivity**: `stopwatch`, `calculator`,
+  `keystrokes`, and `dashboard` compiled the framework's
+  `../../src/client/main.zig` instead of each example's own
+  `src/client/main.zig`, so the served `client.wasm` never exported their
+  handlers; `client-runtime`'s page shell omitted the `/verve.js` bridge
+  script; and `showcase`'s island resolver built `Counter` from the
+  `_default` stub. Each example's `build.zig` / page shell is fixed.
+
+### Changed
+
+- **README** refreshed: corrected the stale `0.2.0` install example,
+  reframed the desktop hardware-validation marker as present-tense, added the
+  `desktop.yml` / `release.yml` workflows to the repository layout, surfaced
+  the `/viz`, `/anim`, `/smooth`, `/gl`, `/gl-scene` demo routes in the
+  quickstart, and dropped internal phase-number jargon from the feature tour.
+
 ## [0.5.1] - 2026-06-13
 
 ### Added
