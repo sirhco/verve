@@ -14,7 +14,7 @@ pub fn index(ctx: *const verve.Context, items: anytype) !*verve.Node {
         nav(ctx),
         ctx.h1("Bookmarks"),
         ctx.p().text("Add a link, then click to visit it. Visit counts are tracked server-side and shown in the rightmost column."),
-        ctx.form(.{ .post = "/api/addBookmark", .class = "add" }).children(.{
+        ctx.actionForm(.{ .post = "/api/addBookmark", .class = "add" }).children(.{
             ctx.input().name("title").type_("text").placeholder("Title").required().attr("maxlength", "120"),
             ctx.input().name("url").type_("url").placeholder("https://example.com").required().attr("maxlength", "500"),
             ctx.button("Add").type_("submit"),
@@ -36,7 +36,7 @@ pub fn index(ctx: *const verve.Context, items: anytype) !*verve.Node {
                         ctx.div().class("bm-url").text(entry.url),
                     }),
                     ctx.span().class("bm-visits").textInt(entry.visits),
-                    ctx.form(.{ .post = "/api/removeBookmark" }).children(.{
+                    ctx.actionForm(.{ .post = "/api/removeBookmark" }).children(.{
                         ctx.input().type_("hidden").name("index").attrFmt("value", "{d}", .{entry.index}),
                         ctx.button("Remove").type_("submit").class("danger"),
                     }),

@@ -123,7 +123,7 @@ fn taskCard(ctx: *const verve.Context, t: *const api.Task, members: []const api.
     for ([_]api.Column{ .backlog, .doing, .done }) |col| {
         if (col == t.column) continue;
         _ = actions.children(.{
-            ctx.form(.{ .post = "/api/moveTask" }).children(.{
+            ctx.actionForm(.{ .post = "/api/moveTask" }).children(.{
                 ctx.input().type_("hidden").name("id").attrFmt("value", "{d}", .{t.id}),
                 ctx.input().type_("hidden").name("column").value(col.slug()),
                 ctx.button(col.label()).type_("submit").class("ghost"),
@@ -131,7 +131,7 @@ fn taskCard(ctx: *const verve.Context, t: *const api.Task, members: []const api.
         });
     }
     _ = actions.children(.{
-        ctx.form(.{ .post = "/api/removeTask" }).children(.{
+        ctx.actionForm(.{ .post = "/api/removeTask" }).children(.{
             ctx.input().type_("hidden").name("id").attrFmt("value", "{d}", .{t.id}),
             ctx.button("Delete").type_("submit").class("danger ghost"),
         }),
@@ -154,7 +154,7 @@ fn memberCard(ctx: *const verve.Context, m: *const api.Member) *verve.Node {
         }),
         ctx.div().class("member-foot").children(.{
             badge(ctx, m.statusSlug(), m.statusLabel()),
-            ctx.form(.{ .post = "/api/removeMember" }).children(.{
+            ctx.actionForm(.{ .post = "/api/removeMember" }).children(.{
                 ctx.input().type_("hidden").name("id").attrFmt("value", "{d}", .{m.id}),
                 ctx.button("Remove").type_("submit").class("danger ghost small"),
             }),
@@ -311,7 +311,7 @@ pub fn tasksPage(
         ctx.div().class("card").children(.{
             ctx.div().class("card-head").children(.{ ctx.h2("Add a task") }),
             ctx.div().class("card-body").children(.{
-                ctx.form(.{ .post = "/api/addTask", .class = "form-row" }).ariaLabel("Add a new task").children(.{
+                ctx.actionForm(.{ .post = "/api/addTask", .class = "form-row" }).ariaLabel("Add a new task").children(.{
                     ctx.input().name("title").type_("text").placeholder("New task title")
                         .ariaLabel("Task title").required().attr("maxlength", "80"),
                     ctx.select().name("column").ariaLabel("Initial column").children(.{
@@ -386,7 +386,7 @@ pub fn teamPage(ctx: *const verve.Context, members: []const api.Member) !*verve.
         ctx.div().class("card").children(.{
             ctx.div().class("card-head").children(.{ ctx.h2("Add a teammate") }),
             ctx.div().class("card-body").children(.{
-                ctx.form(.{ .post = "/api/addMember", .class = "form-row" }).ariaLabel("Add a teammate").children(.{
+                ctx.actionForm(.{ .post = "/api/addMember", .class = "form-row" }).ariaLabel("Add a teammate").children(.{
                     ctx.input().name("name").type_("text").placeholder("Full name")
                         .ariaLabel("Full name").required().attr("maxlength", "48"),
                     ctx.input().name("role").type_("text").placeholder("Role (default: Engineer)")
@@ -483,7 +483,7 @@ pub fn settingsPage(ctx: *const verve.Context) !*verve.Node {
                 badge(ctx, "info", "All changes save instantly"),
             }),
         }),
-        ctx.form(.{ .post = "/api/saveSettings", .class = "settings-form" }).children(.{
+        ctx.actionForm(.{ .post = "/api/saveSettings", .class = "settings-form" }).children(.{
             // Section: appearance
             ctx.div().class("card").children(.{
                 ctx.div().class("card-head").children(.{ ctx.h2("Appearance") }),
