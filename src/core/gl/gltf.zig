@@ -1038,6 +1038,61 @@ test "parse pbrCubeGlb (with_tangents=false): generated tangents valid" {
     }
 }
 
+test "parse pbrCubeMixedMaterialGlb: 2 submeshes, variant fan-out (full vs base-only)" {
+    const command = @import("command.zig");
+    const glb = try @import("fixture.zig").pbrCubeMixedMaterialGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try parseGlb(testing.allocator, glb);
+    defer model.deinit();
+
+    // ── 1. exactly two submeshes (one per primitive) ──────────────────────────
+    try testing.expectEqual(@as(usize, 2), model.submeshes.len);
+
+    // Parse order follows primitive order: submesh 0 = primitive 0 = full PBR,
+    // submesh 1 = primitive 1 = base-only. Verify the contract holds rather than
+    // assuming: identify by material signature.
+    const s0 = model.submeshes[0];
+    const s1 = model.submeshes[1];
+
+    // ── 2. full-material submesh: all five tex_* >= 0 ─────────────────────────
+    const full = s0;
+    try testing.expect(full.tex_base >= 0);
+    try testing.expect(full.tex_mr >= 0);
+    try testing.expect(full.tex_normal >= 0);
+    try testing.expect(full.tex_emissive >= 0);
+    try testing.expect(full.tex_occlusion >= 0);
+
+    // ── 3. base-only submesh: base baked, but normal/emissive == -1 ───────────
+    const base = s1;
+    try testing.expect(base.tex_base >= 0); // neutral-baked ok
+    try testing.expectEqual(@as(i32, -1), base.tex_normal);
+    try testing.expectEqual(@as(i32, -1), base.tex_emissive);
+
+    // ── 4. pack → read → variant: prove writer→reader→variant end to end ──────
+    const bytes = try vmesh.pack(
+        testing.allocator,
+        model.vertices,
+        model.indices,
+        model.submeshes,
+        model.textures,
+        &.{}, // no bvh
+        &.{}, // no tri_perm
+        model.names,
+    );
+    defer testing.allocator.free(bytes);
+    const r = try vmesh.Reader.init(bytes);
+
+    const pbr = command.variant_pbr;
+    const nm = command.variant_normal_map;
+    const em = command.variant_emissive;
+
+    // full submesh → pbr | normal_map | emissive; base-only → pbr.
+    try testing.expectEqual(pbr | nm | em, r.submeshVariant(0));
+    try testing.expectEqual(pbr, r.submeshVariant(1));
+    // Two distinct variants in one asset → GlScene fan-out fires.
+    try testing.expect(r.submeshVariant(0) != r.submeshVariant(1));
+}
+
 test "neutral-texture baking: no textures, zero factor → sentinels for normal/emissive" {
     // Minimal glb: a single triangle, material with NO textures and no emissive factor.
     // New behavior: tex_base/mr/occlusion white-baked; tex_normal == -1, tex_emissive == -1.
