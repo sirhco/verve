@@ -38,6 +38,19 @@ versions follow [Semantic Versioning](https://semver.org/).
   byte-for-byte. A dedicated WebGPU-only chunk + `pbr_cube` static mesh keep the
   WebGL2 path and slice-1 `/gl-webgpu` untouched. IBL cubemaps, the shadow pass,
   and shared-island backend selection are the remaining P10 slice-2b work.
+- **`verve.gl` P10 (WebGPU backend) — slice 2b: image-based lighting (IBL)**
+  (`src/bridge/verve.js`, `src/client/islands/GlSceneWebgpu.zig`,
+  `src/app/{components,islands}.zig`, `docs/24-gl.md`): the WebGPU PBR cube now
+  picks up real environment lighting — `gpuInterpret` gains `create_texture_ex`
+  (tag 10, cube + RGBA16F, explicit mip-major/face-major upload, cube views) and
+  `bind_ibl` (tag 12, irradiance/prefiltered cubemaps + BRDF LUT bound at group(1)
+  bindings 6/7/8, `prefiltered_mips` uniform), with black-default fallback when no
+  environment is bound. `GlSceneWebgpu` loads a prefiltered `.venv` via `gl_load`
+  and renders a metallic cube reflecting the studio environment (`/gl-scene-webgpu`),
+  verified rendering headless. **No `command.zig`/shader change** — `wgslPbr`
+  already declared + sampled the IBL bindings in 2a, so all shader goldens stay
+  byte-identical. The shadow pass + shared-island backend selection remain
+  slice-2c+ work.
 
 ## [0.5.4] - 2026-06-15
 

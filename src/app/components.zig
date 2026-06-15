@@ -834,10 +834,12 @@ pub fn glWebgpu(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
-/// verve.gl P10 WebGPU PBR scene — /gl-scene-webgpu (slice 2a). A textured,
-/// direct-lit Cook-Torrance cube driven through the WebGPU backend: the WGSL PBR
-/// shader, stride-48 mesh, material/lights, and draw_pbr command all computed in
-/// Zig/wasm. Requires a WebGPU-capable browser; degrades to a blank canvas.
+/// verve.gl P10 WebGPU PBR scene — /gl-scene-webgpu (slices 2a + 2b). A textured,
+/// metallic Cook-Torrance cube lit by a directional light AND image-based lighting
+/// (a prefiltered `.venv` environment) driven through the WebGPU backend: the WGSL
+/// PBR shader, stride-48 mesh, material/lights, IBL cubemaps, and draw_pbr command
+/// all computed in Zig/wasm. Requires a WebGPU-capable browser; degrades to a
+/// blank canvas.
 pub fn glSceneWebgpu(ctx: *const verve.Context) !*verve.Node {
     const canvas = ctx.div().class("gl-wrap").children(.{
         ctx.el("canvas")
@@ -848,18 +850,19 @@ pub fn glSceneWebgpu(ctx: *const verve.Context) !*verve.Node {
     });
 
     const inner = ctx.section().class("card").children(.{
-        ctx.h2("Textured PBR cube — WebGPU backend"),
+        ctx.h2("Textured PBR cube + IBL — WebGPU backend"),
         canvas,
     });
     const demo_island = verve.island(ctx, .{ .name = "GlSceneWebgpu" }, inner);
 
     return ctx.main_().class("home").children(.{
         ctx.h1("verve.gl — WebGPU PBR"),
-        ctx.p().text("A textured, direct-lit Cook-Torrance cube rendered through " ++
-            "the WebGPU backend (P10 slice 2a): WGSL PBR shader, stride-48 mesh, " ++
-            "material + directional light, all from the same Zig-computed command " ++
-            "stream. Requires a WebGPU-capable browser; degrades to a blank " ++
-            "canvas otherwise."),
+        ctx.p().text("A textured, metallic Cook-Torrance cube rendered through " ++
+            "the WebGPU backend (P10 slices 2a + 2b): WGSL PBR shader, stride-48 " ++
+            "mesh, a directional light plus image-based lighting from a prefiltered " ++
+            ".venv environment (irradiance + specular cubemaps + BRDF LUT), all " ++
+            "from the same Zig-computed command stream. Requires a WebGPU-capable " ++
+            "browser; degrades to a blank canvas otherwise."),
         demo_island,
     });
 }
