@@ -909,6 +909,42 @@ pub fn glSceneMixed(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-shadow: a cube on a floor, demonstrating the P9 slice-3 directional
+/// shadow map. The "Cube" casts a real depth-mapped shadow onto the "Floor"
+/// receiver; the camera looks slightly down so the cast shadow is in frame.
+pub fn glSceneShadow(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/shadow.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3E3D%3C/text%3E%3C/svg%3E",
+    })
+        // Pitch up so the camera looks down onto the floor; pull back to frame
+        // the cube + its cast shadow.
+        .camera(.{ .distance = 9, .pitch = 0.55, .yaw = 0.7 })
+        // Light from up and to the side → the cube's shadow rakes across the
+        // floor toward the viewer.
+        .light(.{ .dir = .{ -0.45, -0.82, -0.35 }, .intensity = 3.2 })
+        .autoRotate(0.25)
+        .onPickExport("Cube", "verve:glpick-cube")
+        .build();
+
+    const scene_box = ctx.div().class("gl-wrap").children(.{
+        ctx.div()
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;margin:0 auto")
+            .children(.{scene}),
+    });
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — shadow map"),
+        ctx.p().text("A cube on a floor. The single directional light casts a " ++
+            "real depth-mapped shadow (P9 slice 3): a depth pass renders the " ++
+            "scene from the light, and the floor samples it with 3×3 PCF."),
+        scene_box,
+        ctx.p().class("hint")
+            .text("Drag to orbit · wheel to zoom · the cube casts onto the floor."),
+    });
+}
+
 pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
     // Provide a default title only if the page didn't set one of its own.
     try ctx.setTitleIfUnset("Verve");

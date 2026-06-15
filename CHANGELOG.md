@@ -28,6 +28,8 @@ versions follow [Semantic Versioning](https://semver.org/).
   - `GlScene` fits the light's orthographic frustum to the union of submesh world
     AABBs (reusing the slice-2 `cull.worldAabb`); the depth shader + shadow map
     are recorded for context-restore replay. `math.Mat4.ortho` added.
+  - New **`/gl-shadow` demo route** + `fixture.pbrCubeFloorGlb` (`shadow.vmesh`):
+    a cube casting a soft depth-mapped shadow onto a floor receiver.
 - **`verve.gl` P9 (render quality) — per-node frustum culling**
   (`src/core/gl/cull.zig`, `gl.zig`, `src/client/islands/GlScene.zig`,
   `docs/24-gl.md`): a submesh whose world-space AABB falls fully outside the

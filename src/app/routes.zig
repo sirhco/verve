@@ -15,6 +15,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/gl", renderGl),
     verve.Route.init("/gl-scene", renderGlScene),
     verve.Route.init("/gl-mixed", renderGlMixed),
+    verve.Route.init("/gl-shadow", renderGlShadow),
     verve.Route.init("/todos", renderTodos),
     verve.Route.init("/work/:slug", renderWorkDetail),
     verve.Route.layout("/app", renderAppShell, &.{
@@ -61,6 +62,11 @@ fn renderGlScene(ctx: *verve.Context) !*verve.Node {
 
 fn renderGlMixed(ctx: *verve.Context) !*verve.Node {
     const body = try components.glSceneMixed(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderGlShadow(ctx: *verve.Context) !*verve.Node {
+    const body = try components.glSceneShadow(ctx);
     return components.page(ctx, body);
 }
 

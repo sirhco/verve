@@ -887,6 +887,229 @@ pub fn pbrCubeMixedMaterialGlb(alloc: Allocator) ![]u8 {
     return glb;
 }
 
+/// Shadow demo glb: a checkerboard cube sitting above a large neutral floor
+/// quad, two base-color-only meshes ("Cube", "Floor") so both resolve to the
+/// single `variant_pbr` shader. The floor is a receiver for the cube's
+/// directional shadow (P9 slice 3, /gl-shadow demo route). Same attribute set
+/// as the other fixtures (POSITION + NORMAL + TEXCOORD_0, no TANGENT) → uniform
+/// stride-48 vmesh; the asset-gen pass generates tangents.
+pub fn pbrCubeFloorGlb(alloc: Allocator) ![]u8 {
+    // ── 1. Two 8×8 RGBA maps: cube checker + neutral floor ────────────────────
+    var cube_map: [8 * 8 * 4]u8 = undefined;
+    var floor_map: [8 * 8 * 4]u8 = undefined;
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            const light = (row + col) % 2 == 0;
+            cube_map[idx + 0] = if (light) 230 else 60;
+            cube_map[idx + 1] = if (light) 230 else 60;
+            cube_map[idx + 2] = if (light) 230 else 200;
+            cube_map[idx + 3] = 255;
+            // Floor: near-uniform light gray with a faint checker so the shadow
+            // reads clearly against it.
+            const f: u8 = if (light) 205 else 185;
+            floor_map[idx + 0] = f;
+            floor_map[idx + 1] = f;
+            floor_map[idx + 2] = @intCast(@as(u16, f) + 8);
+            floor_map[idx + 3] = 255;
+        }
+    }
+    const cube_png = try png.encodeRgba(alloc, &cube_map, 8, 8);
+    defer alloc.free(cube_png);
+    const floor_png = try png.encodeRgba(alloc, &floor_map, 8, 8);
+    defer alloc.free(floor_png);
+    const pngs = [2][]const u8{ cube_png, floor_png };
+
+    // ── 2. BIN layout: cube geom, floor geom, then the two PNGs ───────────────
+    const geom_len: u32 = 24 * 3 * 4; // 288 (cube pos / nrm)
+    const uv_len: u32 = 24 * 2 * 4; // 192 (cube uv)
+    const idx_len: u32 = 36 * 2; // 72  (cube idx)
+    const f_geom_len: u32 = 4 * 3 * 4; // 48 (floor pos / nrm)
+    const f_uv_len: u32 = 4 * 2 * 4; // 32 (floor uv)
+    const f_idx_len: u32 = 6 * 2; // 12 (floor idx)
+
+    const c_pos_off: u32 = 0;
+    const c_nrm_off: u32 = c_pos_off + geom_len;
+    const c_uv_off: u32 = c_nrm_off + geom_len;
+    const c_idx_off: u32 = c_uv_off + uv_len;
+    const f_pos_off: u32 = (c_idx_off + idx_len + 3) & ~@as(u32, 3);
+    const f_nrm_off: u32 = f_pos_off + f_geom_len;
+    const f_uv_off: u32 = f_nrm_off + f_geom_len;
+    const f_idx_off: u32 = f_uv_off + f_uv_len;
+
+    var png_offs: [2]u32 = undefined;
+    var cursor: u32 = (f_idx_off + f_idx_len + 3) & ~@as(u32, 3);
+    for (pngs, 0..) |p, i| {
+        png_offs[i] = cursor;
+        cursor += @intCast(p.len);
+        cursor = (cursor + 3) & ~@as(u32, 3);
+    }
+    const bin_total: u32 = cursor;
+    const bin_padded = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // Cube geometry (reuse the shared face tables; no x-shift).
+    {
+        var po: usize = c_pos_off;
+        for (faces) |face| {
+            for (face.v) |v| {
+                std.mem.writeInt(u32, bin[po..][0..4], @bitCast(v[0]), .little);
+                std.mem.writeInt(u32, bin[po + 4 ..][0..4], @bitCast(v[1]), .little);
+                std.mem.writeInt(u32, bin[po + 8 ..][0..4], @bitCast(v[2]), .little);
+                po += 12;
+            }
+        }
+        var no: usize = c_nrm_off;
+        for (faces) |face| {
+            for (0..4) |_| {
+                std.mem.writeInt(u32, bin[no..][0..4], @bitCast(face.nx), .little);
+                std.mem.writeInt(u32, bin[no + 4 ..][0..4], @bitCast(face.ny), .little);
+                std.mem.writeInt(u32, bin[no + 8 ..][0..4], @bitCast(face.nz), .little);
+                no += 12;
+            }
+        }
+        var uo: usize = c_uv_off;
+        for (faces) |_| {
+            for (face_uvs) |uv| {
+                std.mem.writeInt(u32, bin[uo..][0..4], @bitCast(uv[0]), .little);
+                std.mem.writeInt(u32, bin[uo + 4 ..][0..4], @bitCast(uv[1]), .little);
+                uo += 8;
+            }
+        }
+        var io: usize = c_idx_off;
+        for (0..6) |face_i| {
+            const base: u16 = @intCast(face_i * 4);
+            for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |o| {
+                std.mem.writeInt(u16, bin[io..][0..2], base + o, .little);
+                io += 2;
+            }
+        }
+    }
+
+    // Floor quad: y = -1.5, spans [-6,6] on X/Z, normal +Y. Winding chosen so
+    // the up-facing side is the front face (survives back-face culling).
+    {
+        const fy: f32 = -1.5;
+        const s: f32 = 6.0;
+        const fpos = [4][3]f32{
+            .{ -s, fy, -s }, .{ s, fy, -s }, .{ s, fy, s }, .{ -s, fy, s },
+        };
+        var po: usize = f_pos_off;
+        for (fpos) |v| {
+            std.mem.writeInt(u32, bin[po..][0..4], @bitCast(v[0]), .little);
+            std.mem.writeInt(u32, bin[po + 4 ..][0..4], @bitCast(v[1]), .little);
+            std.mem.writeInt(u32, bin[po + 8 ..][0..4], @bitCast(v[2]), .little);
+            po += 12;
+        }
+        var no: usize = f_nrm_off;
+        for (0..4) |_| {
+            std.mem.writeInt(u32, bin[no..][0..4], @bitCast(@as(f32, 0)), .little);
+            std.mem.writeInt(u32, bin[no + 4 ..][0..4], @bitCast(@as(f32, 1)), .little);
+            std.mem.writeInt(u32, bin[no + 8 ..][0..4], @bitCast(@as(f32, 0)), .little);
+            no += 12;
+        }
+        const fuv = [4][2]f32{ .{ 0, 0 }, .{ 4, 0 }, .{ 4, 4 }, .{ 0, 4 } };
+        var uo: usize = f_uv_off;
+        for (fuv) |uv| {
+            std.mem.writeInt(u32, bin[uo..][0..4], @bitCast(uv[0]), .little);
+            std.mem.writeInt(u32, bin[uo + 4 ..][0..4], @bitCast(uv[1]), .little);
+            uo += 8;
+        }
+        var io: usize = f_idx_off;
+        for ([6]u16{ 0, 2, 1, 0, 3, 2 }) |o| {
+            std.mem.writeInt(u16, bin[io..][0..2], o, .little);
+            io += 2;
+        }
+    }
+
+    for (pngs, 0..) |p, i| @memcpy(bin[png_offs[i]..][0..p.len], p);
+
+    // ── 3. JSON ───────────────────────────────────────────────────────────────
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    try w.writeAll("{\"asset\":{\"version\":\"2.0\"},\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0,1]}],");
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"CubeNode\"},{\"mesh\":1,\"name\":\"FloorNode\"}],");
+    try w.writeAll("\"meshes\":[");
+    try w.writeAll("{\"name\":\"Cube\",\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]},");
+    try w.writeAll("{\"name\":\"Floor\",\"primitives\":[{\"attributes\":{\"POSITION\":4,\"NORMAL\":5,\"TEXCOORD_0\":6},\"indices\":7,\"material\":1}]}");
+    try w.writeAll("],");
+
+    try w.writeAll("\"accessors\":[");
+    try w.writeAll("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[-1.0,-1.0,-1.0],\"max\":[1.0,1.0,1.0]},");
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"},");
+    try w.writeAll("{\"bufferView\":4,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"min\":[-6.0,-1.5,-6.0],\"max\":[6.0,-1.5,6.0]},");
+    try w.writeAll("{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"}");
+    try w.writeAll("],");
+
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ c_pos_off, geom_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ c_nrm_off, geom_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ c_uv_off, uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ c_idx_off, idx_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ f_pos_off, f_geom_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ f_nrm_off, f_geom_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ f_uv_off, f_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ f_idx_off, f_idx_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ png_offs[0], cube_png.len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ png_offs[1], floor_png.len });
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+
+    // Two base-color-only materials → both variant_pbr (no normal/emissive maps).
+    try w.writeAll("\"materials\":[");
+    try w.writeAll("{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1.0,1.0,1.0,1.0],\"baseColorTexture\":{\"index\":0},\"metallicFactor\":0.0,\"roughnessFactor\":0.85}},");
+    try w.writeAll("{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1.0,1.0,1.0,1.0],\"baseColorTexture\":{\"index\":1},\"metallicFactor\":0.0,\"roughnessFactor\":1.0}}");
+    try w.writeAll("],");
+
+    try w.writeAll("\"textures\":[{\"source\":0},{\"source\":1}],");
+    try w.writeAll("\"images\":[{\"bufferView\":8,\"mimeType\":\"image/png\"},{\"bufferView\":9,\"mimeType\":\"image/png\"}]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── 4. Assemble GLB ───────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42; // B
+    glb[goff + 1] = 0x49; // I
+    glb[goff + 2] = 0x4E; // N
+    glb[goff + 3] = 0x00; // \0
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    return glb;
+}
+
 // ── studio HDR environment fixture ──────────────────────────────────────────────
 
 /// Procedural studio environment as a complete .hdr file (flat RGBE):
