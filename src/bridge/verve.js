@@ -5127,6 +5127,48 @@
           st.textures[handle] = { tex, view: tex.createView(), w, h };
           break;
         }
+        case 10: { // CREATE_TEXTURE_EX — explicit-mip 2D/cube, RGBA8 or RGBA16F (IBL)
+          // Payload (command.zig Encoder.createTextureEx, 32B):
+          //   handle|target|format|w|h|mip_count|ptr|byte_len.
+          // target: 0=2d, 1=cube; format: 0=rgba8, 1=rgba16f. A cube is a 2d
+          // texture with 6 array layers + a cube VIEW. Data is mip-major then
+          // face-major (+X,-X,+Y,-Y,+Z,-Z), tightly packed.
+          const handle = dv.getUint32(off, true);
+          const cube = dv.getUint32(off + 4, true) === 1;
+          const f16 = dv.getUint32(off + 8, true) === 1;
+          const w = dv.getUint32(off + 12, true);
+          const h = dv.getUint32(off + 16, true);
+          const mips = dv.getUint32(off + 20, true);
+          let cursor = dv.getUint32(off + 24, true);
+          // off + 28 = byte_len (informational; per-mip/face sizes derived below).
+          const bpt = f16 ? 8 : 4; // bytes per RGBA texel (rgba16float vs rgba8)
+          const tex = device.createTexture({
+            size: [w, h, cube ? 6 : 1],
+            format: f16 ? "rgba16float" : "rgba8unorm",
+            mipLevelCount: mips,
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+          });
+          const faces = cube ? 6 : 1;
+          for (let m = 0; m < mips; m++) {
+            const mw = Math.max(1, w >> m);
+            const mh = Math.max(1, h >> m);
+            for (let face = 0; face < faces; face++) {
+              const byteLen = mw * mh * bpt;
+              device.queue.writeTexture(
+                { texture: tex, mipLevel: m, origin: [0, 0, face] },
+                new Uint8Array(memory.buffer, cursor, byteLen),
+                { bytesPerRow: mw * bpt, rowsPerImage: mh },
+                [mw, mh, 1],
+              );
+              cursor += byteLen;
+            }
+          }
+          const view = cube
+            ? tex.createView({ dimension: "cube" })
+            : tex.createView();
+          st.textures[handle] = { tex, view, w, h, cube };
+          break;
+        }
         case 8: { // BIND_TEXTURE — record slot→handle; bind group assembled at draw_pbr (T3)
           const slot = dv.getUint32(off, true);
           const handle = dv.getUint32(off + 4, true);
