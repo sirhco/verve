@@ -449,6 +449,253 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     return src;
 }
 
+// ── WebGPU PBR über-shader (P10 slice 2a) ───────────────────────────
+//
+// One WGSL module holding BOTH stages (vs_main + fs_main), a parallel
+// emission to the GLSL pbrVertexSrc/pbrFragmentSrc above. The GLSL goldens
+// remain the source of truth; this mirrors their semantics exactly for the
+// three PBR variants:
+//   F0 = variant_pbr
+//   F1 = variant_pbr | variant_normal_map
+//   F2 = variant_pbr | variant_normal_map | variant_emissive
+//
+// variant_shadow / variant_depth are NOT part of this slice (rejected at
+// comptime). IBL bindings (slots 5-7) are always present; in slice 2a they
+// sample default placeholder textures (~zero contribution) so the WGSL
+// goldens freeze ONCE here and slice 2b adds no golden churn.
+//
+// Uniform layout (std140-equivalent, explicit 16B member alignment):
+//   mvp        : mat4x4<f32>      (offset 0)
+//   model      : mat4x4<f32>      (offset 64)
+//   normal_mat : mat3x3<f32>      (offset 128; occupies 48B, three vec4 cols)
+//   camera_pos : vec3<f32>        (offset 176; +4B pad)
+//   material   : array<vec4<f32>,3>
+//   lights     : array<vec4<f32>,8>
+//   light_count: i32
+//   prefiltered_mips: f32         (+8B pad to 16B)
+//
+// Bindings (@group(1)): a shared sampler (binding 0) + per-slot textures.
+// Slots mirror the GLSL sampler order / JS texture-unit contract:
+//   1 base (2D), 2 metallic-roughness (2D), (F1) 3 normal (2D),
+//   (F2) 4 emissive (2D), 5 occlusion (2D), 6 irradiance (cube),
+//   7 prefiltered (cube), 8 brdf_lut (2D).
+pub fn wgslPbr(comptime flags: u32) []const u8 {
+    comptime pbrCheck(flags);
+    if (flags & variant_shadow != 0) @compileError("wgslPbr: variant_shadow not in P10 slice 2a");
+    if (flags & variant_depth != 0) @compileError("wgslPbr: variant_depth not in P10 slice 2a");
+
+    // ── Uniform block + group(0) ────────────────────────────────────
+    const uniforms =
+        \\struct U {
+        \\  mvp: mat4x4<f32>,
+        \\  model: mat4x4<f32>,
+        \\  normal_mat: mat3x3<f32>,
+        \\  camera_pos: vec3<f32>,
+        \\  material: array<vec4<f32>, 3>,
+        \\  lights: array<vec4<f32>, 8>,
+        \\  light_count: i32,
+        \\  prefiltered_mips: f32,
+        \\};
+        \\@group(0) @binding(0) var<uniform> u: U;
+        \\
+    ;
+    // ── group(1) texture + sampler bindings (varied by variant) ─────
+    const samp =
+        \\@group(1) @binding(0) var samp: sampler;
+        \\
+    ;
+    const tex_base =
+        \\@group(1) @binding(1) var base_tex: texture_2d<f32>;
+        \\@group(1) @binding(2) var mr_tex: texture_2d<f32>;
+        \\
+    ;
+    const tex_normal =
+        \\@group(1) @binding(3) var normal_tex: texture_2d<f32>;
+        \\
+    ;
+    const tex_emissive =
+        \\@group(1) @binding(4) var emissive_tex: texture_2d<f32>;
+        \\
+    ;
+    const tex_ibl =
+        \\@group(1) @binding(5) var occlusion_tex: texture_2d<f32>;
+        \\@group(1) @binding(6) var irradiance: texture_cube<f32>;
+        \\@group(1) @binding(7) var prefiltered: texture_cube<f32>;
+        \\@group(1) @binding(8) var brdf_lut: texture_2d<f32>;
+        \\
+    ;
+    // ── varyings: VSOut struct ──────────────────────────────────────
+    const vsout_head =
+        \\struct VSOut {
+        \\  @builtin(position) pos: vec4<f32>,
+        \\  @location(0) world_pos: vec3<f32>,
+        \\  @location(1) normal: vec3<f32>,
+        \\  @location(2) uv: vec2<f32>,
+        \\
+    ;
+    const vsout_nm =
+        \\  @location(3) tangent: vec3<f32>,
+        \\  @location(4) bitangent: vec3<f32>,
+        \\
+    ;
+    const vsout_tail =
+        \\};
+        \\
+    ;
+    // ── vertex stage ────────────────────────────────────────────────
+    const vs_head =
+        \\@vertex
+        \\fn vs_main(
+        \\  @location(0) a_pos: vec3<f32>,
+        \\  @location(1) a_normal: vec3<f32>,
+        \\  @location(2) a_tangent: vec4<f32>,
+        \\  @location(3) a_uv: vec2<f32>,
+        \\) -> VSOut {
+        \\  var out: VSOut;
+        \\  out.world_pos = (u.model * vec4<f32>(a_pos, 1.0)).xyz;
+        \\  out.normal = u.normal_mat * a_normal;
+        \\  out.uv = a_uv;
+        \\
+    ;
+    const vs_nm =
+        \\  let t = normalize((mat3x3<f32>(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz)) * a_tangent.xyz);
+        \\  out.tangent = t;
+        \\  out.bitangent = cross(out.normal, t) * a_tangent.w;
+        \\
+    ;
+    const vs_tail =
+        \\  out.pos = u.mvp * vec4<f32>(a_pos, 1.0);
+        \\  return out;
+        \\}
+        \\
+    ;
+    // ── fragment helpers (Cook-Torrance) ────────────────────────────
+    const helpers =
+        \\const PI: f32 = 3.14159265359;
+        \\fn distributionGGX(N: vec3<f32>, H: vec3<f32>, a: f32) -> f32 {
+        \\  let a2 = a * a;
+        \\  let NdotH = max(dot(N, H), 0.0);
+        \\  let d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+        \\  return a2 / (PI * d * d);
+        \\}
+        \\fn geometrySchlickGGX(NdotX: f32, k: f32) -> f32 {
+        \\  return NdotX / (NdotX * (1.0 - k) + k);
+        \\}
+        \\fn geometrySmith(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, k: f32) -> f32 {
+        \\  return geometrySchlickGGX(max(dot(N, V), 0.0), k) * geometrySchlickGGX(max(dot(N, L), 0.0), k);
+        \\}
+        \\fn fresnelSchlick(cosT: f32, F0: vec3<f32>) -> vec3<f32> {
+        \\  return F0 + (vec3<f32>(1.0) - F0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
+        \\}
+        \\fn fresnelSchlickRoughness(cosT: f32, F0: vec3<f32>, rough: f32) -> vec3<f32> {
+        \\  let Fr = max(vec3<f32>(1.0 - rough), F0);
+        \\  return F0 + (Fr - F0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
+        \\}
+        \\
+    ;
+    // ── fragment stage ──────────────────────────────────────────────
+    const fs_open =
+        \\@fragment
+        \\fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+        \\  let base_color = u.material[0];
+        \\  let mr = textureSample(mr_tex, samp, in.uv).rgb;
+        \\  let metallic = u.material[1].x * mr.b;
+        \\  let roughness = clamp(u.material[1].y * mr.g, 0.045, 1.0);
+        \\  let occlusion_strength = u.material[1].z;
+        \\  let normal_scale = u.material[1].w;
+        \\  let emissive_factor = u.material[2].rgb;
+        \\  let base_sample = textureSample(base_tex, samp, in.uv).rgb;
+        \\  let albedo = base_sample * base_color.rgb;
+        \\  let ao_sample = textureSample(occlusion_tex, samp, in.uv).r;
+        \\
+    ;
+    const fs_normal_nm =
+        \\  var n_ts = textureSample(normal_tex, samp, in.uv).xyz * 2.0 - 1.0;
+        \\  n_ts = vec3<f32>(n_ts.xy * normal_scale, n_ts.z);
+        \\  let TBN = mat3x3<f32>(normalize(in.tangent), normalize(in.bitangent), normalize(in.normal));
+        \\  let N = normalize(TBN * n_ts);
+        \\
+    ;
+    const fs_normal_plain =
+        \\  let N = normalize(in.normal);
+        \\
+    ;
+    const fs_lighting =
+        \\  let V = normalize(u.camera_pos - in.world_pos);
+        \\  let NdotV = max(dot(N, V), 0.0);
+        \\  let F0 = mix(vec3<f32>(0.04), albedo, metallic);
+        \\  let k_direct = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+        \\  let alpha = roughness * roughness;
+        \\  var Lo = vec3<f32>(0.0);
+        \\  for (var i: i32 = 0; i < u.light_count; i = i + 1) {
+        \\    let l0 = u.lights[2 * i];
+        \\    let l1 = u.lights[2 * i + 1];
+        \\    let ltype = l0.x;
+        \\    let intensity = l0.y;
+        \\    let posdir = vec3<f32>(l0.z, l0.w, l1.x);
+        \\    let lcolor = l1.yzw;
+        \\    var L: vec3<f32>;
+        \\    var radiance: vec3<f32>;
+        \\    if (ltype < 0.5) {
+        \\      L = -posdir;
+        \\      radiance = lcolor * intensity;
+        \\    } else {
+        \\      let Lvec = posdir - in.world_pos;
+        \\      let dist = length(Lvec);
+        \\      L = Lvec / dist;
+        \\      radiance = lcolor * intensity / (dist * dist);
+        \\    }
+        \\    let H = normalize(V + L);
+        \\    let NdotL = max(dot(N, L), 0.0);
+        \\    let D = distributionGGX(N, H, alpha);
+        \\    let G = geometrySmith(N, V, L, k_direct);
+        \\    let F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+        \\    let spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.0001);
+        \\    let kD = (vec3<f32>(1.0) - F) * (1.0 - metallic);
+        \\    Lo = Lo + (kD * albedo / PI + spec) * radiance * NdotL;
+        \\  }
+        \\  let F_ibl = fresnelSchlickRoughness(NdotV, F0, roughness);
+        \\  let kD_ibl = (vec3<f32>(1.0) - F_ibl) * (1.0 - metallic);
+        \\  let diffuse = textureSample(irradiance, samp, N).rgb * albedo;
+        \\  let R = reflect(-V, N);
+        \\  let prefiltered_c = textureSampleLevel(prefiltered, samp, R, roughness * (u.prefiltered_mips - 1.0)).rgb;
+        \\  let lut = textureSample(brdf_lut, samp, vec2<f32>(NdotV, roughness)).rg;
+        \\  let specular_ibl = prefiltered_c * (F0 * lut.x + lut.y);
+        \\  let ambient = (kD_ibl * diffuse + specular_ibl) * mix(1.0, ao_sample, occlusion_strength);
+        \\  var color = ambient + Lo;
+        \\
+    ;
+    const fs_emissive =
+        \\  color = color + emissive_factor * textureSample(emissive_tex, samp, in.uv).rgb;
+        \\
+    ;
+    const fs_tail =
+        \\  color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
+        \\  color = pow(color, vec3<f32>(1.0 / 2.2));
+        \\  return vec4<f32>(color, base_color.a);
+        \\}
+        \\
+    ;
+
+    comptime var src: []const u8 = uniforms ++ samp ++ tex_base;
+    if (flags & variant_normal_map != 0) src = src ++ tex_normal;
+    if (flags & variant_emissive != 0) src = src ++ tex_emissive;
+    src = src ++ tex_ibl;
+    src = src ++ vsout_head;
+    if (flags & variant_normal_map != 0) src = src ++ vsout_nm;
+    src = src ++ vsout_tail;
+    src = src ++ vs_head;
+    if (flags & variant_normal_map != 0) src = src ++ vs_nm;
+    src = src ++ vs_tail;
+    src = src ++ helpers;
+    src = src ++ fs_open;
+    src = src ++ (if (flags & variant_normal_map != 0) fs_normal_nm else fs_normal_plain);
+    src = src ++ fs_lighting;
+    if (flags & variant_emissive != 0) src = src ++ fs_emissive;
+    src = src ++ fs_tail;
+    return src;
+}
+
 pub const Encoder = struct {
     buf: []u8,
     len: usize,
@@ -860,6 +1107,68 @@ test "WGSL unlit: both stages and uniform present" {
 test "golden: WGSL unlit hash frozen (FNV-1a-64)" {
     // Frozen from first green run — a change here = deliberate WGSL contract bump.
     try testing.expectEqual(@as(u64, 0xa159f35e040f6f8f), fnv64(wgslUnlit));
+}
+
+test "WGSL PBR: both stages, uniform + bindings, ACES present" {
+    const F0 = variant_pbr;
+    const F1 = variant_pbr | variant_normal_map;
+    const F2 = variant_pbr | variant_normal_map | variant_emissive;
+    inline for ([_]u32{ F0, F1, F2 }) |f| {
+        const src = wgslPbr(f);
+        // both stages + entry points
+        try testing.expect(std.mem.indexOf(u8, src, "@vertex") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "@fragment") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "fn vs_main") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "fn fs_main") != null);
+        // uniform block + group(0)
+        try testing.expect(std.mem.indexOf(u8, src, "@group(0) @binding(0) var<uniform> u: U") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "mvp: mat4x4<f32>") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "light_count: i32") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "prefiltered_mips: f32") != null);
+        // sampler + texture bindings always present (incl. IBL cubes)
+        try testing.expect(std.mem.indexOf(u8, src, "var samp: sampler") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "base_tex: texture_2d<f32>") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "irradiance: texture_cube<f32>") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "prefiltered: texture_cube<f32>") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "brdf_lut: texture_2d<f32>") != null);
+        // Cook-Torrance helpers
+        try testing.expect(std.mem.indexOf(u8, src, "fn distributionGGX") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "fn geometrySmith") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "fn fresnelSchlickRoughness") != null);
+        // ACES tonemap frozen constants + gamma
+        try testing.expect(std.mem.indexOf(u8, src, "2.51") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "0.03") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "2.43") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "0.59") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "0.14") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "1.0 / 2.2") != null);
+    }
+}
+
+test "WGSL PBR: variant-gated normal-map / emissive paths" {
+    const F0 = variant_pbr;
+    const F1 = variant_pbr | variant_normal_map;
+    const F2 = variant_pbr | variant_normal_map | variant_emissive;
+    // normal-map / tangent path only for F1 + F2
+    try testing.expect(std.mem.indexOf(u8, wgslPbr(F0), "normal_tex") == null);
+    try testing.expect(std.mem.indexOf(u8, wgslPbr(F0), "tangent: vec3<f32>") == null);
+    try testing.expect(std.mem.indexOf(u8, wgslPbr(F1), "normal_tex") != null);
+    try testing.expect(std.mem.indexOf(u8, wgslPbr(F1), "TBN") != null);
+    try testing.expect(std.mem.indexOf(u8, wgslPbr(F2), "normal_tex") != null);
+    // emissive term only for F2
+    try testing.expect(std.mem.indexOf(u8, wgslPbr(F0), "emissive_tex") == null);
+    try testing.expect(std.mem.indexOf(u8, wgslPbr(F1), "emissive_tex") == null);
+    try testing.expect(std.mem.indexOf(u8, wgslPbr(F2), "emissive_tex") != null);
+}
+
+test "golden: WGSL PBR hashes frozen (FNV-1a-64)" {
+    const F0 = variant_pbr;
+    const F1 = variant_pbr | variant_normal_map;
+    const F2 = variant_pbr | variant_normal_map | variant_emissive;
+    // Frozen from first green run — a change here = deliberate WGSL contract bump.
+    try testing.expectEqual(@as(u64, 0x22da26fe9b6d11ce), fnv64(wgslPbr(F0)));
+    try testing.expectEqual(@as(u64, 0x8415f4d5595e6473), fnv64(wgslPbr(F1)));
+    try testing.expectEqual(@as(u64, 0x08b2f7cb68681f01), fnv64(wgslPbr(F2)));
 }
 
 test "PBR uniform contract: full-variant names present" {
