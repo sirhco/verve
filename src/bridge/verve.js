@@ -5684,6 +5684,9 @@
       lastW: 0,
       lastH: 0,
       last: 0,
+      pbrSlot: 0, // per-frame draw counter (also gates the poster swap below)
+      poster: undefined, // SSR <img data-gl-poster>; undefined=unlooked, null=none
+      posterHidden: false,
     };
     const sink = (now) => {
       // Island unmounted: canvas detached. Stop without rescheduling.
@@ -5710,6 +5713,17 @@
         console.error("verve.gl: WebGPU interpreter fault, loop stopped:", err);
         glSinks.delete(sink);
         return;
+      }
+      // First frame that actually drew geometry: hide the SSR poster (the real
+      // scene is now on the canvas). Clear-only frames (assets still loading)
+      // leave pbrSlot at 0, so the poster stays up until the scene renders.
+      if (st.pbrSlot > 0 && !st.posterHidden) {
+        if (st.poster === undefined) {
+          st.poster = (canvas.parentElement &&
+            canvas.parentElement.querySelector("[data-gl-poster]")) || null;
+        }
+        if (st.poster) st.poster.style.display = "none";
+        st.posterHidden = true;
       }
     };
     glSinks.add(sink);
