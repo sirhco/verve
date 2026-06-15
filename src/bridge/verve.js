@@ -4148,7 +4148,9 @@
   window.verveHost.verveVizPoll = (argsJson) => {
     let a = {};
     try {
-      a = JSON.parse(argsJson || "{}");
+      // `verve_host_call` hands these a parsed object; a JS caller may pass a
+      // JSON string. Tolerate both — JSON.parse on an object throws.
+      a = typeof argsJson === "string" ? JSON.parse(argsJson || "{}") : argsJson || {};
     } catch {}
     if (vizPollTimer) {
       clearInterval(vizPollTimer);
@@ -4185,7 +4187,9 @@
   window.verveHost.vervePush = (argsJson) => {
     let a = {};
     try {
-      a = JSON.parse(argsJson || "{}");
+      // `verve_host_call` hands these a parsed object; a JS caller may pass a
+      // JSON string. Tolerate both — JSON.parse on an object throws.
+      a = typeof argsJson === "string" ? JSON.parse(argsJson || "{}") : argsJson || {};
     } catch {}
     if (!a.channel || !a.island) return '{"err":"bad args"}';
     if (a.op === "unsub") {
@@ -4224,7 +4228,9 @@
   window.verveHost.verveRafNamed = (argsJson) => {
     let a = {};
     try {
-      a = JSON.parse(argsJson || "{}");
+      // `verve_host_call` hands these a parsed object; a JS caller may pass a
+      // JSON string. Tolerate both — JSON.parse on an object throws.
+      a = typeof argsJson === "string" ? JSON.parse(argsJson || "{}") : argsJson || {};
     } catch {}
     if (!a.island || !a.export) return '{"err":"bad args"}';
     const key = `${a.island}|${a.export}`;
@@ -4894,7 +4900,9 @@
   window.verveHost.verveFetchExport = (argsJson) => {
     let a = {};
     try {
-      a = JSON.parse(argsJson || "{}");
+      // `verve_host_call` hands these a parsed object; a JS caller may pass a
+      // JSON string. Tolerate both — JSON.parse on an object throws.
+      a = typeof argsJson === "string" ? JSON.parse(argsJson || "{}") : argsJson || {};
     } catch {}
     if (!a.api || !a.island || !a.export) return '{"err":"bad args"}';
     fetch(`/api/${a.api}`, {

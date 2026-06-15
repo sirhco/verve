@@ -118,14 +118,17 @@ fn invoke(
             return;
         };
     } else {
-        const parsed = std.json.parseFromSlice(ArgsStruct, gpa, body, .{
+        // Parse into `arg_arena` (freed at function end, AFTER func(args)). A
+        // block-scoped `Parsed.deinit()` would free the parse arena here — before
+        // func(args) runs — leaving string fields dangling (UAF: any string arg
+        // with a JSON escape gets a heap-allocated unescaped copy). Leaky parse
+        // ties every allocation to the longer-lived arg_arena instead.
+        args = std.json.parseFromSliceLeaky(ArgsStruct, arg_arena.allocator(), body, .{
             .ignore_unknown_fields = true,
         }) catch {
             try request.respond("bad json", .{ .status = .bad_request });
             return;
         };
-        defer parsed.deinit();
-        args = parsed.value;
     }
 
     if (returns_error and returns_value) {
