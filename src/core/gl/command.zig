@@ -108,8 +108,7 @@ pub const unlit_fs: []const u8 =
 //   - vs: color = a_color; pos = u.mvp * vec4(a_pos, 1.0)
 //   - fs: vec4(color, 1.0)
 // The GLSL goldens are the source of truth; this is a parallel WGSL emission.
-pub fn wgslUnlit() []const u8 {
-    return
+pub const wgslUnlit: []const u8 =
     \\struct U { mvp: mat4x4<f32> };
     \\@group(0) @binding(0) var<uniform> u: U;
     \\
@@ -130,8 +129,7 @@ pub fn wgslUnlit() []const u8 {
     \\fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     \\  return vec4<f32>(in.color, 1.0);
     \\}
-    ;
-}
+;
 
 // Lit/textured shader pair for variant_lit_uv.
 // Normals are transformed in model space (valid for rotation + uniform scale only).
@@ -851,7 +849,7 @@ test "golden: PBR GLSL hashes frozen (FNV-1a-64)" {
 }
 
 test "WGSL unlit: both stages and uniform present" {
-    const src = wgslUnlit();
+    const src = wgslUnlit;
     try testing.expect(std.mem.indexOf(u8, src, "@vertex") != null);
     try testing.expect(std.mem.indexOf(u8, src, "@fragment") != null);
     try testing.expect(std.mem.indexOf(u8, src, "vs_main") != null);
@@ -861,7 +859,7 @@ test "WGSL unlit: both stages and uniform present" {
 
 test "golden: WGSL unlit hash frozen (FNV-1a-64)" {
     // Frozen from first green run — a change here = deliberate WGSL contract bump.
-    try testing.expectEqual(@as(u64, 0xa159f35e040f6f8f), fnv64(wgslUnlit()));
+    try testing.expectEqual(@as(u64, 0xa159f35e040f6f8f), fnv64(wgslUnlit));
 }
 
 test "PBR uniform contract: full-variant names present" {
