@@ -4868,29 +4868,38 @@
     lightVp: 384, // variant_shadow light-space matrix (set by bind_shadow_map)
     size: 448,
   };
+  // Multiple draws per frame each need isolated uniforms: WebGPU defers draws, so
+  // a single shared buffer would let the last writeBuffer clobber earlier draws.
+  // Solution: dynamic uniform offsets — each draw writes its full struct to its
+  // own 256-aligned slot and binds with that offset. Per-frame values (lights/
+  // ibl/light_vp) are cached and replicated into every slot.
+  const PBR_STRIDE = 512; // align(448, 256)
+  const DEPTH_STRIDE = 256; // one mat4 (64B) padded to the 256B dynamic-offset min
+  const MAX_DRAWS = 64; // per-frame draw cap (cube+plane today; headroom for scenes)
   // Lazily create the shared PBR uniform buffer (reused across frames/draws).
   const gpuEnsurePbrUniform = (st) => {
     if (!st.pbrUniform) {
       st.pbrUniform = st.device.createBuffer({
-        size: PBR_U.size,
+        size: PBR_STRIDE * MAX_DRAWS, // one PBR_U.size slot per draw
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
     }
     return st.pbrUniform;
   };
-  // Lazily create the depth-pass uniform (a single mat4 light-space mvp) + its
-  // bind group against the depth pipeline's layout. Reused across draws/frames.
+  // Lazily create the depth-pass uniform (a mat4 per draw) + its bind group
+  // against the depth pipeline's dynamic-offset layout. Reused across frames.
   const gpuEnsureDepthUniform = (st, depthPipe) => {
     if (!st.depthUniform) {
       st.depthUniform = st.device.createBuffer({
-        size: 64, // one mat4x4<f32>
+        size: DEPTH_STRIDE * MAX_DRAWS,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
     }
     if (!st.depthBindGroup && depthPipe) {
       st.depthBindGroup = st.device.createBindGroup({
         layout: depthPipe.bgl0,
-        entries: [{ binding: 0, resource: { buffer: st.depthUniform } }],
+        // size = one mat4; the dynamic offset selects the per-draw slot.
+        entries: [{ binding: 0, resource: { buffer: st.depthUniform, offset: 0, size: 64 } }],
       });
     }
     return st.depthUniform;
@@ -4951,6 +4960,7 @@
             st.lastW = w;
             st.lastH = h;
           }
+          st.pbrSlot = 0; // reset per-draw uniform slot allocation for this frame
           // Reuse the encoder if a shadow pass already opened one this frame
           // (begin_shadow_pass runs BEFORE begin_frame); else create one. Both
           // the shadow depth pass and the color pass share one encoder + submit.
@@ -5001,7 +5011,7 @@
             // target, renders into the depth32float shadow map. Front-face cull
             // pushes self-shadow acne behind geometry (mirrors the WebGL2 path).
             const bgl0 = device.createBindGroupLayout({
-              entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } }],
+              entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform", hasDynamicOffset: true } }],
             });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
             const pipeline = device.createRenderPipeline({
@@ -5035,7 +5045,7 @@
               entries: [{
                 binding: 0,
                 visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                buffer: { type: "uniform" },
+                buffer: { type: "uniform", hasDynamicOffset: true },
               }],
             });
             // group(1): sampler@0 + per-slot textures. Binding numbers + types
@@ -5258,18 +5268,13 @@
           //   l0 = lights[2i] = [type, intensity, pos.x, pos.y], l1 =
           //   lights[2i+1] = [pos.z, color.r, color.g, color.b]. So count*8 f32
           //   copies verbatim into lights[] (max 8 lights = 16 vec4 = 64 f32).
+          // Per-frame state (same for every draw): cache a copy; draw_pbr writes
+          // it into each draw's uniform slot. Copy out of wasm memory now.
           const count = dv.getUint32(off, true);
           const p = dv.getUint32(off + 4, true);
-          const ubuf = gpuEnsurePbrUniform(st);
           const n = Math.min(count, 8);
-          if (n > 0) {
-            device.queue.writeBuffer(
-              ubuf,
-              PBR_U.lights,
-              new Float32Array(memory.buffer, p, n * 8),
-            );
-          }
-          device.queue.writeBuffer(ubuf, PBR_U.lightCount, new Int32Array([n]));
+          st.frameLights = (n > 0) ? new Float32Array(memory.buffer, p, n * 8).slice() : new Float32Array(0);
+          st.frameLightCount = n;
           break;
         }
         case 12: { // BIND_IBL — irradiance(6)/prefiltered(7)/brdf_lut(8) + prefMips.
@@ -5282,8 +5287,7 @@
           const lut = dv.getUint32(off + 8, true);
           const specMips = dv.getUint32(off + 12, true);
           st.ibl = { irr, spec, lut };
-          const ubuf = gpuEnsurePbrUniform(st);
-          device.queue.writeBuffer(ubuf, PBR_U.prefMips, new Float32Array([specMips]));
+          st.framePrefMips = specMips; // cached; draw_pbr writes it per slot
           st.bg1Dirty = true; // rebind group(1) with the real IBL views
           break;
         }
@@ -5323,6 +5327,7 @@
             },
           });
           st.active = depthPipe;
+          st.depthSlot = 0; // reset per-draw depth-uniform slot allocation
           gpuEnsureDepthUniform(st, depthPipe);
           break;
         }
@@ -5341,11 +5346,14 @@
           const count = dv.getUint32(off + 12, true);
           const mvpPtr = dv.getUint32(off + 16, true);
           if (!vb || !ib || !st.shadowPass || !st.active || st.active.kind !== "depth") break;
-          device.queue.writeBuffer(st.depthUniform, 0, new Float32Array(memory.buffer, mvpPtr, 16));
+          const dslot = st.depthSlot++;
+          if (dslot >= MAX_DRAWS) break; // per-pass draw cap
+          const dbase = dslot * DEPTH_STRIDE;
+          device.queue.writeBuffer(st.depthUniform, dbase, new Float32Array(memory.buffer, mvpPtr, 16));
           st.shadowPass.setPipeline(st.active.pipeline);
           st.shadowPass.setVertexBuffer(0, vb.buf);
           st.shadowPass.setIndexBuffer(ib.buf, "uint16", byteOff);
-          st.shadowPass.setBindGroup(0, st.depthBindGroup);
+          st.shadowPass.setBindGroup(0, st.depthBindGroup, [dbase]);
           st.shadowPass.drawIndexed(count);
           break;
         }
@@ -5356,8 +5364,8 @@
           const shadowHandle = dv.getUint32(off + 4, true);
           const lvpPtr = dv.getUint32(off + 8, true);
           st.shadow = { handle: shadowHandle };
-          const ubuf = gpuEnsurePbrUniform(st);
-          device.queue.writeBuffer(ubuf, PBR_U.lightVp, new Float32Array(memory.buffer, lvpPtr, 16));
+          // Cache the light-space matrix; draw_pbr writes it into each slot.
+          st.frameLightVp = new Float32Array(memory.buffer, lvpPtr, 16).slice();
           st.bg1Dirty = true; // rebind group(1) with the real shadow map
           break;
         }
@@ -5379,9 +5387,14 @@
           const active = st.active;
           if (!vb || !ib || !active || active.kind !== "pbr" || !st.pass) break;
           const ubuf = gpuEnsurePbrUniform(st);
-          // ── Write uniform members at their WGSL byte offsets (PBR_U map) ──
-          device.queue.writeBuffer(ubuf, PBR_U.mvp, new Float32Array(memory.buffer, mvpPtr, 16));
-          device.queue.writeBuffer(ubuf, PBR_U.model, new Float32Array(memory.buffer, modelPtr, 16));
+          const slot = st.pbrSlot++;
+          if (slot >= MAX_DRAWS) break; // per-frame draw cap (silently drop extras)
+          const base = slot * PBR_STRIDE;
+          // ── Write the FULL uniform struct into this draw's slot (per-draw from
+          // the payload + cached per-frame values replicated per draw). Dynamic
+          // offset isolates draws so a later writeBuffer can't clobber this one. ──
+          device.queue.writeBuffer(ubuf, base + PBR_U.mvp, new Float32Array(memory.buffer, mvpPtr, 16));
+          device.queue.writeBuffer(ubuf, base + PBR_U.model, new Float32Array(memory.buffer, modelPtr, 16));
           // mat3 (9 f32, column-major) → mat3x3 (3 vec4 cols, 12 f32). Re-pack:
           // each 3-f32 column at +0/+12/+24 in source goes to +0/+16/+32 in dest.
           const nm = new Float32Array(memory.buffer, normalPtr, 9);
@@ -5389,16 +5402,25 @@
           nmPadded[0] = nm[0]; nmPadded[1] = nm[1]; nmPadded[2] = nm[2];
           nmPadded[4] = nm[3]; nmPadded[5] = nm[4]; nmPadded[6] = nm[5];
           nmPadded[8] = nm[6]; nmPadded[9] = nm[7]; nmPadded[10] = nm[8];
-          device.queue.writeBuffer(ubuf, PBR_U.normalMat, nmPadded);
+          device.queue.writeBuffer(ubuf, base + PBR_U.normalMat, nmPadded);
           // camera_pos: vec3 (3 f32) — write 3, the 4th byte slot is pad.
-          device.queue.writeBuffer(ubuf, PBR_U.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
+          device.queue.writeBuffer(ubuf, base + PBR_U.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
           // material: 3×vec4 = 12 f32.
-          device.queue.writeBuffer(ubuf, PBR_U.material, new Float32Array(memory.buffer, materialPtr, 12));
-          // ── Bind group 0: uniform buffer. Rebuilt when the buffer changes. ──
+          device.queue.writeBuffer(ubuf, base + PBR_U.material, new Float32Array(memory.buffer, materialPtr, 12));
+          // Per-frame cached uniforms (lights / IBL mips / shadow light_vp).
+          if (st.frameLights && st.frameLights.length) {
+            device.queue.writeBuffer(ubuf, base + PBR_U.lights, st.frameLights);
+          }
+          device.queue.writeBuffer(ubuf, base + PBR_U.lightCount, new Int32Array([st.frameLightCount | 0]));
+          device.queue.writeBuffer(ubuf, base + PBR_U.prefMips, new Float32Array([st.framePrefMips || 0]));
+          if (st.frameLightVp) {
+            device.queue.writeBuffer(ubuf, base + PBR_U.lightVp, st.frameLightVp);
+          }
+          // ── Bind group 0: created once; the dynamic offset selects the slot. ──
           if (!st.bg0 || st.bg0Layout !== active.bgl0) {
             st.bg0 = device.createBindGroup({
               layout: active.bgl0,
-              entries: [{ binding: 0, resource: { buffer: ubuf } }],
+              entries: [{ binding: 0, resource: { buffer: ubuf, offset: 0, size: PBR_U.size } }],
             });
             st.bg0Layout = active.bgl0;
           }
@@ -5437,7 +5459,7 @@
           st.pass.setPipeline(active.pipeline);
           st.pass.setVertexBuffer(0, vb.buf);
           st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
-          st.pass.setBindGroup(0, st.bg0);
+          st.pass.setBindGroup(0, st.bg0, [base]);
           st.pass.setBindGroup(1, st.bg1);
           st.pass.drawIndexed(count);
           break;
