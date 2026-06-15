@@ -834,6 +834,36 @@ pub fn glWebgpu(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl P10 WebGPU PBR scene — /gl-scene-webgpu (slice 2a). A textured,
+/// direct-lit Cook-Torrance cube driven through the WebGPU backend: the WGSL PBR
+/// shader, stride-48 mesh, material/lights, and draw_pbr command all computed in
+/// Zig/wasm. Requires a WebGPU-capable browser; degrades to a blank canvas.
+pub fn glSceneWebgpu(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "glscenewebgpu-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Textured PBR cube — WebGPU backend"),
+        canvas,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlSceneWebgpu" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — WebGPU PBR"),
+        ctx.p().text("A textured, direct-lit Cook-Torrance cube rendered through " ++
+            "the WebGPU backend (P10 slice 2a): WGSL PBR shader, stride-48 mesh, " ++
+            "material + directional light, all from the same Zig-computed command " ++
+            "stream. Requires a WebGPU-capable browser; degrades to a blank " ++
+            "canvas otherwise."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a

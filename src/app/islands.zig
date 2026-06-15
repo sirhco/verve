@@ -107,6 +107,18 @@ pub const GlWebgpu = struct {
     pub const props_schema: []const u8 = "{}";
 };
 
+/// verve.gl P10 WebGPU PBR scene (slice 2a) — a single stateful chunk that
+/// uploads a static stride-48 PBR cube + base/metallic-roughness textures and
+/// drives a textured, direct-lit Cook-Torrance render through the WebGPU backend
+/// (gl_start_gpu) using the WGSL PBR shader (gl.command.wgslPbr). SSR emits
+/// `<canvas data-ref="glscenewebgpu-canvas">`. Dedicated WebGPU-only chunk (no
+/// IBL/shadows yet — the bridge fills those slots with placeholder textures).
+/// Requires a WebGPU-capable browser; degrades to the blank canvas otherwise.
+/// Source: `src/client/islands/GlSceneWebgpu.zig`.
+pub const GlSceneWebgpu = struct {
+    pub const props_schema: []const u8 = "{}";
+};
+
 /// verve.gl declarative scene (P4). Built via `ctx.glScene(.{...})` — a vmesh
 /// model + venv environment rendered with orbit camera, a directional light,
 /// optional auto-rotate, and named pickable meshes wired to closure event ids.
