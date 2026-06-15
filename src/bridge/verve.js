@@ -5708,8 +5708,15 @@
       // P11: this canvas's GlScene instance vid — selected before each frame so
       // the chunk renders THIS instance's state (mirrors glStart). 0 = single.
       vid: vidOfEl(canvas),
+      lost: false, // P11: true between device.lost and a successful re-init
     };
     const sink = (now) => {
+      // Device lost: the GPU objects are gone; stop the loop. The device.lost
+      // handler (armDeviceLost) drives recovery and re-adds the sink.
+      if (st.lost) {
+        glSinks.delete(sink);
+        return;
+      }
       // Island unmounted: canvas detached. Reclaim the chunk instance slot (P7)
       // then stop without rescheduling. GPU objects are GC'd (no WebGL-style
       // dispose needed); the unmount keeps the chunk's instance pool from leaking.
@@ -5752,6 +5759,66 @@
         st.posterHidden = true;
       }
     };
+    // P11 device-loss/restore (mirrors WebGL2 webglcontextlost/restored). WebGPU
+    // device loss can't be triggered headless, so this is structural: on a real
+    // loss, re-init a fresh device, drop the dead resource refs (NOT .destroy() —
+    // invalid on a lost device), and let the chunk's `<frame>_restore` hook replay
+    // its create* commands (registry replay). Graceful: poster stays up if re-init
+    // fails. The no-loss path is untouched.
+    const resetGpuResourcesForRestore = () => {
+      st.buffers = [];
+      st.pipelines = [];
+      st.textures = [];
+      st.boundTex = [];
+      st.shadowMaps = [];
+      st.ibl = null;
+      st.shadow = null;
+      st.pbrUniform = null;
+      st.depthUniform = null;
+      st.depthBindGroup = null;
+      st.bg0 = null;
+      st.bg0Layout = null;
+      st.bg1 = null;
+      st.bg1Layout = null;
+      st.bg1Dirty = true;
+      st.depthTex = null;
+      st.depthView = null;
+      st.encoder = null;
+      st.pass = null;
+      st.shadowPass = null;
+      st.lastW = 0;
+      st.lastH = 0;
+      st.last = 0;
+    };
+    const armDeviceLost = () => {
+      st.device.lost.then(async (info) => {
+        if (info && info.reason === "destroyed") return; // intentional teardown
+        st.lost = true;
+        glSinks.delete(sink);
+        if (st.poster) {
+          st.poster.style.display = "";
+          st.posterHidden = false;
+        }
+        const g2 = await gpuInit(canvas);
+        if (!g2) {
+          console.warn("verve.gl: WebGPU device lost; recovery failed, poster left up");
+          return;
+        }
+        st.device = g2.device;
+        st.ctx = g2.ctx;
+        st.format = g2.format;
+        st.defaults = gpuMakeDefaults(g2.device);
+        resetGpuResourcesForRestore();
+        st.lost = false;
+        glSelect(st.exports, st.vid);
+        const restoreFn = st.exports[st.exportName + "_restore"];
+        if (typeof restoreFn === "function") restoreFn();
+        armDeviceLost(); // re-arm on the fresh device
+        glSinks.add(sink);
+        tickerKick();
+      });
+    };
+    armDeviceLost();
     glSinks.add(sink);
     tickerKick();
   };
