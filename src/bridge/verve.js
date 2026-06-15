@@ -4962,10 +4962,39 @@
           // variant_emissive = 1 << 4 — gate which group(1) texture bindings the
           // WGSL declares (wgslPbr appends tex_normal/tex_emissive conditionally;
           // tex_base + tex_ibl are unconditional).
+          if ((variant & 0x40) !== 0) { // variant_depth = 1 << 6 — shadow depth pass
+            // Depth-only pipeline (wgslDepth): position-only vertex, NO color
+            // target, renders into the depth32float shadow map. Front-face cull
+            // pushes self-shadow acne behind geometry (mirrors the WebGL2 path).
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } }],
+            });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
+            const pipeline = device.createRenderPipeline({
+              layout,
+              vertex: {
+                module,
+                entryPoint: "vs_main",
+                buffers: [{
+                  arrayStride: 48, // stride-48 layout; only position (attr 0) is read
+                  attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
+                }],
+              },
+              primitive: { topology: "triangle-list", cullMode: "front" },
+              depthStencil: {
+                format: "depth32float",
+                depthWriteEnabled: true,
+                depthCompare: "less",
+              },
+            });
+            st.pipelines[handle] = { pipeline, bgl0, kind: "depth" };
+            break;
+          }
           const isPbr = (variant & 0x4) !== 0;
           if (isPbr) {
             const hasNormal = (variant & 0x8) !== 0;
             const hasEmissive = (variant & 0x10) !== 0;
+            const hasShadow = (variant & 0x20) !== 0;
             // group(0): single uniform buffer, visible to VERTEX|FRAGMENT
             // (wgslPbr: @group(0) @binding(0) var<uniform> u: U).
             const bgl0 = device.createBindGroupLayout({
@@ -4994,6 +5023,10 @@
             g1.push({ binding: 6, visibility: FRAG, texture: texCube }); // irradiance
             g1.push({ binding: 7, visibility: FRAG, texture: texCube }); // prefiltered
             g1.push({ binding: 8, visibility: FRAG, texture: tex2d }); // brdf_lut
+            if (hasShadow) { // variant_shadow: depth-compare shadow map + sampler
+              g1.push({ binding: 9, visibility: FRAG, texture: { sampleType: "depth", viewDimension: "2d" } });
+              g1.push({ binding: 10, visibility: FRAG, sampler: { type: "comparison" } });
+            }
             const bgl1 = device.createBindGroupLayout({ entries: g1 });
             const layout = device.createPipelineLayout({
               bindGroupLayouts: [bgl0, bgl1],
@@ -5034,6 +5067,7 @@
               flags: variant,
               hasNormal,
               hasEmissive,
+              hasShadow,
             };
             break;
           }
@@ -5217,6 +5251,24 @@
           const ubuf = gpuEnsurePbrUniform(st);
           device.queue.writeBuffer(ubuf, PBR_U.prefMips, new Float32Array([specMips]));
           st.bg1Dirty = true; // rebind group(1) with the real IBL views
+          break;
+        }
+        case 16: { // CREATE_SHADOW_MAP — depth texture + comparison sampler.
+          // Payload (command.zig Encoder.createShadowMap, 8B): handle | size.
+          const handle = dv.getUint32(off, true);
+          const size = dv.getUint32(off + 4, true);
+          const tex = device.createTexture({
+            size: [size, size],
+            format: "depth32float",
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+          });
+          // Hardware depth comparison (textureSampleCompare) — LEQUAL via 'less'.
+          const sampler = device.createSampler({
+            compare: "less",
+            magFilter: "linear",
+            minFilter: "linear",
+          });
+          st.shadowMaps[handle] = { tex, view: tex.createView(), sampler, size };
           break;
         }
         case 13: { // DRAW_PBR — full PBR submesh draw.
@@ -5493,6 +5545,9 @@
       textures: [],
       boundTex: [],
       ibl: null, // { irr, spec, lut } texture handles set by bind_ibl (2b)
+      shadowMaps: [], // { tex, view, sampler, size } by handle (create_shadow_map, 2c)
+      shadow: null, // { handle } set by bind_shadow_map (2c)
+      shadowPass: null, // active depth render pass during begin/end_shadow_pass
       defaults: gpuMakeDefaults(gpu.device),
       active: null,
       encoder: null,
