@@ -4830,6 +4830,51 @@
     };
   };
 
+  // ── PBR uniform-buffer byte-offset map (derived from wgslPbr's `U` struct) ──
+  // WGSL uniform address space: every member 16B-aligned; mat3x3 = 3 vec4 cols;
+  // vec3 padded to 16. Confirmed against command.zig's `U` decl + its layout
+  // comment (lines ~467-476). All offsets in BYTES.
+  //   mvp        : mat4x4  @   0  (16 f32)
+  //   model      : mat4x4  @  64  (16 f32)
+  //   normal_mat : mat3x3  @ 128  (3 cols × vec4 = 12 f32, col i at 128+16i)
+  //   camera_pos : vec3    @ 176  (3 f32 + 4B pad)
+  //   material   : vec4[3] @ 192  (12 f32)
+  //   lights     : vec4[8] @ 240  (16 f32 packed = count*8 from wasm)
+  //   light_count: i32     @ 368
+  //   prefiltered_mips:f32 @ 372
+  // total struct size = 376 → round up to 384 (16B multiple).
+  const PBR_U = {
+    mvp: 0,
+    model: 64,
+    normalMat: 128, // 3 vec4 columns at 128,144,160
+    cameraPos: 176,
+    material: 192,
+    lights: 240,
+    lightCount: 368,
+    prefMips: 372,
+    size: 384,
+  };
+  // Lazily create the shared PBR uniform buffer (reused across frames/draws).
+  const gpuEnsurePbrUniform = (st) => {
+    if (!st.pbrUniform) {
+      st.pbrUniform = st.device.createBuffer({
+        size: PBR_U.size,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    return st.pbrUniform;
+  };
+  // Resolve a material slot (0=base,1=mr,2=normal,3=emissive,4=occlusion — the
+  // bind_texture wire numbering) to a texture view, falling back to a device
+  // default per gpuMakeDefaults' documented mapping. IBL slots (irradiance/
+  // prefiltered/brdf_lut) are not driven by bind_texture in slice 2a, so they
+  // always resolve to defaults (real cubes arrive in slice 2b via bind_ibl).
+  const gpuSlotView = (st, slot, fallback) => {
+    const h = st.boundTex[slot];
+    const t = (h != null) ? st.textures[h] : null;
+    return (t && t.view) ? t.view : fallback.view;
+  };
+
   // WebGPU command-stream interpreter. Consumes the SAME binary stream as
   // glInterpret (4-byte tag/size header per command, little-endian) but drives
   // WebGPU. Slice 1 handles only the minimal unlit-cube subset (6 tags);
@@ -4898,10 +4943,94 @@
           st.buffers[handle] = { buf, kind };
           break;
         }
-        case 3: { // CREATE_SHADER — one WGSL module in vs_ptr/vs_len
+        case 3: { // CREATE_SHADER — one WGSL module in vs_ptr/vs_len.
+          // Payload (command.zig Encoder.createShader, 24B): handle | variant |
+          //   vs_ptr | vs_len | fs_ptr | fs_len. The WGSL holds BOTH stages in
+          //   the vs slot (fs slot is 0/0). variant carries the variant_* bits.
           const handle = dv.getUint32(off, true);
+          const variant = dv.getUint32(off + 4, true);
           const code = readStr(dv.getUint32(off + 8, true), dv.getUint32(off + 12, true));
           const module = device.createShaderModule({ code });
+          // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
+          // variant_emissive = 1 << 4 — gate which group(1) texture bindings the
+          // WGSL declares (wgslPbr appends tex_normal/tex_emissive conditionally;
+          // tex_base + tex_ibl are unconditional).
+          const isPbr = (variant & 0x4) !== 0;
+          if (isPbr) {
+            const hasNormal = (variant & 0x8) !== 0;
+            const hasEmissive = (variant & 0x10) !== 0;
+            // group(0): single uniform buffer, visible to VERTEX|FRAGMENT
+            // (wgslPbr: @group(0) @binding(0) var<uniform> u: U).
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform" },
+              }],
+            });
+            // group(1): sampler@0 + per-slot textures. Binding numbers + types
+            // EXACTLY match wgslPbr's @group(1) decls. base@1, mr@2 always;
+            // normal@3 only with variant_normal_map; emissive@4 only with
+            // variant_emissive; then occlusion@5(2d), irradiance@6(cube),
+            // prefiltered@7(cube), brdf_lut@8(2d) always (tex_ibl unconditional).
+            const FRAG = GPUShaderStage.FRAGMENT;
+            const tex2d = { sampleType: "float", viewDimension: "2d" };
+            const texCube = { sampleType: "float", viewDimension: "cube" };
+            const g1 = [
+              { binding: 0, visibility: FRAG, sampler: { type: "filtering" } },
+              { binding: 1, visibility: FRAG, texture: tex2d }, // base
+              { binding: 2, visibility: FRAG, texture: tex2d }, // metallic-roughness
+            ];
+            if (hasNormal) g1.push({ binding: 3, visibility: FRAG, texture: tex2d });
+            if (hasEmissive) g1.push({ binding: 4, visibility: FRAG, texture: tex2d });
+            g1.push({ binding: 5, visibility: FRAG, texture: tex2d }); // occlusion
+            g1.push({ binding: 6, visibility: FRAG, texture: texCube }); // irradiance
+            g1.push({ binding: 7, visibility: FRAG, texture: texCube }); // prefiltered
+            g1.push({ binding: 8, visibility: FRAG, texture: tex2d }); // brdf_lut
+            const bgl1 = device.createBindGroupLayout({ entries: g1 });
+            const layout = device.createPipelineLayout({
+              bindGroupLayouts: [bgl0, bgl1],
+            });
+            const pipeline = device.createRenderPipeline({
+              layout,
+              vertex: {
+                module,
+                entryPoint: "vs_main",
+                buffers: [{
+                  // Stride-48 PBR vertex: pos@0, normal@12, tangent@24, uv@40.
+                  arrayStride: 48,
+                  attributes: [
+                    { shaderLocation: 0, offset: 0, format: "float32x3" },
+                    { shaderLocation: 1, offset: 12, format: "float32x3" },
+                    { shaderLocation: 2, offset: 24, format: "float32x4" },
+                    { shaderLocation: 3, offset: 40, format: "float32x2" },
+                  ],
+                }],
+              },
+              fragment: {
+                module,
+                entryPoint: "fs_main",
+                targets: [{ format: st.format }],
+              },
+              primitive: { topology: "triangle-list", cullMode: "back" },
+              depthStencil: {
+                format: "depth24plus",
+                depthWriteEnabled: true,
+                depthCompare: "less",
+              },
+            });
+            st.pipelines[handle] = {
+              pipeline,
+              bgl0,
+              bgl1,
+              kind: "pbr",
+              flags: variant,
+              hasNormal,
+              hasEmissive,
+            };
+            break;
+          }
+          // Unlit stride-24 path (slice 1) — unchanged.
           const pipeline = device.createRenderPipeline({
             layout: "auto",
             vertex: {
@@ -4927,7 +5056,7 @@
               depthCompare: "less",
             },
           });
-          st.pipelines[handle] = { pipeline };
+          st.pipelines[handle] = { pipeline, kind: "unlit" };
           break;
         }
         case 4: { // SET_PIPELINE — state ignored in slice 1
@@ -5002,6 +5131,101 @@
           const slot = dv.getUint32(off, true);
           const handle = dv.getUint32(off + 4, true);
           st.boundTex[slot] = handle;
+          st.bg1Dirty = true; // invalidate cached group(1) bind group
+          break;
+        }
+        case 11: { // SET_LIGHTS — pack into the PBR uniform's lights region.
+          // Payload (command.zig Encoder.setLights, 8B): count | ptr. Each light
+          // is 8 f32 = 32B: [type(0=dir,1=point), intensity, posOrDir.xyz,
+          //   color.rgb]. This is ALREADY the WGSL packing: wgslPbr unpacks
+          //   l0 = lights[2i] = [type, intensity, pos.x, pos.y], l1 =
+          //   lights[2i+1] = [pos.z, color.r, color.g, color.b]. So count*8 f32
+          //   copies verbatim into lights[] (max 8 lights = 16 vec4 = 64 f32).
+          const count = dv.getUint32(off, true);
+          const p = dv.getUint32(off + 4, true);
+          const ubuf = gpuEnsurePbrUniform(st);
+          const n = Math.min(count, 8);
+          if (n > 0) {
+            device.queue.writeBuffer(
+              ubuf,
+              PBR_U.lights,
+              new Float32Array(memory.buffer, p, n * 8),
+            );
+          }
+          device.queue.writeBuffer(ubuf, PBR_U.lightCount, new Int32Array([n]));
+          break;
+        }
+        case 13: { // DRAW_PBR — full PBR submesh draw.
+          // Payload (command.zig Encoder.drawPbr, 36B / 9 u32):
+          //   vbuf | ibuf | idx_byte_off | count | mvp_ptr | model_ptr |
+          //   normal_ptr(mat3) | material_ptr | camera_ptr.
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const mvpPtr = dv.getUint32(off + 16, true);
+          const modelPtr = dv.getUint32(off + 20, true);
+          const normalPtr = dv.getUint32(off + 24, true);
+          const materialPtr = dv.getUint32(off + 28, true);
+          const cameraPtr = dv.getUint32(off + 32, true);
+          const vb = st.buffers[vh];
+          const ib = st.buffers[ih];
+          const active = st.active;
+          if (!vb || !ib || !active || active.kind !== "pbr" || !st.pass) break;
+          const ubuf = gpuEnsurePbrUniform(st);
+          // ── Write uniform members at their WGSL byte offsets (PBR_U map) ──
+          device.queue.writeBuffer(ubuf, PBR_U.mvp, new Float32Array(memory.buffer, mvpPtr, 16));
+          device.queue.writeBuffer(ubuf, PBR_U.model, new Float32Array(memory.buffer, modelPtr, 16));
+          // mat3 (9 f32, column-major) → mat3x3 (3 vec4 cols, 12 f32). Re-pack:
+          // each 3-f32 column at +0/+12/+24 in source goes to +0/+16/+32 in dest.
+          const nm = new Float32Array(memory.buffer, normalPtr, 9);
+          const nmPadded = new Float32Array(12);
+          nmPadded[0] = nm[0]; nmPadded[1] = nm[1]; nmPadded[2] = nm[2];
+          nmPadded[4] = nm[3]; nmPadded[5] = nm[4]; nmPadded[6] = nm[5];
+          nmPadded[8] = nm[6]; nmPadded[9] = nm[7]; nmPadded[10] = nm[8];
+          device.queue.writeBuffer(ubuf, PBR_U.normalMat, nmPadded);
+          // camera_pos: vec3 (3 f32) — write 3, the 4th byte slot is pad.
+          device.queue.writeBuffer(ubuf, PBR_U.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
+          // material: 3×vec4 = 12 f32.
+          device.queue.writeBuffer(ubuf, PBR_U.material, new Float32Array(memory.buffer, materialPtr, 12));
+          // ── Bind group 0: uniform buffer. Rebuilt when the buffer changes. ──
+          if (!st.bg0 || st.bg0Layout !== active.bgl0) {
+            st.bg0 = device.createBindGroup({
+              layout: active.bgl0,
+              entries: [{ binding: 0, resource: { buffer: ubuf } }],
+            });
+            st.bg0Layout = active.bgl0;
+          }
+          // ── Bind group 1: sampler + textures. Cached; invalidated by tag 8 ──
+          // (bg1Dirty) or a layout/pipeline change. Slot→default mapping per
+          // gpuMakeDefaults: 0/1/2/4→white2d, 3→black2d, 5/6→blackCube, 7→
+          // black2d. bind_texture wire slots: 0 base,1 mr,2 normal,3 emissive,
+          // 4 occlusion. IBL bindings (6/7/8) fall back to defaults in slice 2a.
+          if (st.bg1Dirty || !st.bg1 || st.bg1Layout !== active.bgl1) {
+            const d = st.defaults;
+            const e = [{ binding: 0, resource: d.sampler }];
+            e.push({ binding: 1, resource: gpuSlotView(st, 0, d.white2d) }); // base
+            e.push({ binding: 2, resource: gpuSlotView(st, 1, d.white2d) }); // mr
+            if (active.hasNormal) {
+              e.push({ binding: 3, resource: gpuSlotView(st, 2, d.white2d) }); // normal
+            }
+            if (active.hasEmissive) {
+              e.push({ binding: 4, resource: gpuSlotView(st, 3, d.black2d) }); // emissive
+            }
+            e.push({ binding: 5, resource: gpuSlotView(st, 4, d.white2d) }); // occlusion
+            e.push({ binding: 6, resource: d.blackCube.view }); // irradiance (cube)
+            e.push({ binding: 7, resource: d.blackCube.view }); // prefiltered (cube)
+            e.push({ binding: 8, resource: d.black2d.view }); // brdf_lut
+            st.bg1 = device.createBindGroup({ layout: active.bgl1, entries: e });
+            st.bg1Layout = active.bgl1;
+            st.bg1Dirty = false;
+          }
+          st.pass.setPipeline(active.pipeline);
+          st.pass.setVertexBuffer(0, vb.buf);
+          st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
+          st.pass.setBindGroup(0, st.bg0);
+          st.pass.setBindGroup(1, st.bg1);
+          st.pass.drawIndexed(count);
           break;
         }
         default:
@@ -5207,6 +5431,12 @@
       pass: null,
       uniformBuf: null,
       bindGroup: null,
+      pbrUniform: null, // shared PBR uniform buffer (lazy; PBR_U.size bytes)
+      bg0: null, // cached group(0) bind group (uniform)
+      bg0Layout: null,
+      bg1: null, // cached group(1) bind group (sampler + textures)
+      bg1Layout: null,
+      bg1Dirty: true, // rebuild group(1) on first draw / after bind_texture
       depthTex: null,
       depthView: null,
       lastW: 0,
