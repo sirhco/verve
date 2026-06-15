@@ -41,11 +41,11 @@ var ibl_sent: bool = false;
 var mvp: [16]f32 = undefined;
 var model_mat: [16]f32 = undefined;
 var normal9: [9]f32 = undefined;
-var camera_pos: [3]f32 = .{ 0, 2.5, 5 };
+var camera_pos: [3]f32 = .{ 3, 3.5, 6 };
 // Material block: baseColor.rgba, [metallic, roughness, occlusion, normalScale],
 // emissive.rgb, pad. Metallic + low roughness so the IBL environment shows as
 // reflections (metals tint the reflection by the base-color texture).
-var material: [12]f32 = .{ 1, 1, 1, 1, 1, 0.25, 1, 1, 0, 0, 0, 0 };
+var material: [12]f32 = .{ 1, 1, 1, 1, 0, 0.5, 1, 1, 0, 0, 0, 0 };
 // One directional light: [type(0=dir), intensity, dir.xyz, color.rgb].
 var light: [8]f32 = .{ 0, 3, -0.4, -0.7, -0.6, 1, 1, 1 };
 
@@ -157,11 +157,11 @@ export fn glscenewebgpu_frame(dt_ms: f32, width: u32, height: u32) u32 {
     const proj = gl.math.Mat4.perspective(1.0, aspect, 0.1, 100.0);
     const view = gl.math.Mat4.lookAt(
         gl.math.Vec3.init(camera_pos[0], camera_pos[1], camera_pos[2]),
-        gl.math.Vec3.init(0, 0, 0),
+        gl.math.Vec3.init(0, -0.3, 0),
         gl.math.Vec3.init(0, 1, 0),
     );
     const model = gl.math.Mat4.fromTrs(
-        gl.math.Vec3.init(0, 0, 0),
+        gl.math.Vec3.init(0, 0.3, 0),
         gl.math.Quat.fromAxisAngle(gl.math.Vec3.init(0, 1, 0), yaw),
         gl.math.Vec3.init(1, 1, 1),
     );
@@ -171,9 +171,9 @@ export fn glscenewebgpu_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
     // Ground plane: a large flat quad below the cube (static).
     const pmodel = gl.math.Mat4.fromTrs(
-        gl.math.Vec3.init(0, -1.5, 0),
+        gl.math.Vec3.init(0, -1.2, 0),
         gl.math.Quat.fromAxisAngle(gl.math.Vec3.init(0, 1, 0), 0),
-        gl.math.Vec3.init(6, 1, 6),
+        gl.math.Vec3.init(4, 1, 4),
     );
     plane_mvp = proj.mul(view).mul(pmodel).m;
     plane_model = pmodel.m;
