@@ -21,6 +21,23 @@ versions follow [Semantic Versioning](https://semver.org/).
   WebGPU's pipeline/render-pass model. Purely additive — the WebGL2 path and the
   GLSL goldens are untouched. PBR/IBL/shadow parity + texture tags are the
   remaining P10 slices.
+- **`verve.gl` P10 (WebGPU backend) — slice 2a: textured, direct-lit PBR**
+  (`src/core/gl/command.zig`, `src/core/gl/mesh.zig`, `src/bridge/verve.js`,
+  `src/client/islands/GlSceneWebgpu.zig`, `src/app/{routes,components,islands}.zig`,
+  `docs/24-gl.md`): a textured Cook-Torrance PBR cube under a direct directional
+  light renders through the WebGPU backend (`/gl-scene-webgpu`), verified
+  rendering headless. New `wgslPbr(flags)` emits the WGSL PBR über-shader for the
+  F0/F1/F2 variants (plain / +normal-map / +emissive), FNV-golden-frozen
+  alongside the GLSL — the WGSL mirrors the full GLSL fragment incl. the IBL
+  ambient term + ACES tonemap, so 2b adds real IBL maps without a shader-byte
+  change. `gpuInterpret` gains the material-texture tags (`create_texture` 7 /
+  `create_texture_srgb` 15 / `bind_texture` 8) with 1×1 default placeholder
+  textures filling unbound material/IBL slots, the stride-48 PBR pipeline
+  (explicit bind-group layouts, not `"auto"`), and `set_lights` (11) + `draw_pbr`
+  (13) — the JS uniform packing matches the WGSL `std140`-equivalent layout
+  byte-for-byte. A dedicated WebGPU-only chunk + `pbr_cube` static mesh keep the
+  WebGL2 path and slice-1 `/gl-webgpu` untouched. IBL cubemaps, the shadow pass,
+  and shared-island backend selection are the remaining P10 slice-2b work.
 
 ## [0.5.4] - 2026-06-15
 
