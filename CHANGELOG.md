@@ -6,8 +6,23 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-06-15
+
 ### Fixed
 
+- **Server crash on a server-fn string arg with a JSON escape**
+  (`src/server/api_handler.zig`): the JSON action-arg parse used a block-scoped
+  `defer parsed.deinit()`, freeing the parse arena at block exit — before
+  `func(args)` ran. Any string field with an escape (`\n`, `\t`, …) becomes a
+  heap-allocated unescaped copy, so `args` dangled into freed memory → segfault
+  (S1) on every such call. Now parsed with `parseFromSliceLeaky` into the
+  request-scoped `arg_arena`, which outlives `func(args)`.
+- **`verve_host_call` host fns lost their arguments**
+  (`src/bridge/verve.js`): `verve_host_call` hands the host fn a parsed object,
+  but `vervePush` / `verveRafNamed` / `verveVizPoll` / `verveFetchExport`
+  `JSON.parse`'d it as a string → threw → args silently dropped (no-op). This
+  broke push/SSE subscription, named animation loops, and the viz-poll fallback.
+  The handlers now tolerate both an object and a JSON string.
 - **Push events reached only the first same-name island instance**
   (`src/bridge/verve.js`, `src/client/island_runtime.zig`, new
   `src/client/push.zig`): the bridge resolved a pushed frame's target island via
@@ -3122,7 +3137,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.4...HEAD
+[0.5.4]: https://github.com/sirhco/verve/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/sirhco/verve/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/sirhco/verve/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/sirhco/verve/compare/v0.5.0...v0.5.1
