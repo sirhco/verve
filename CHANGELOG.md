@@ -6,6 +6,22 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` P10 (WebGPU backend) — slice 1: unlit-cube bring-up**
+  (`src/core/gl/command.zig`, `src/bridge/verve.js`,
+  `src/client/islands/GlWebgpu.zig`, `src/app/{routes,components,islands}.zig`,
+  `docs/24-gl.md`): a SECOND GPU backend over the same frozen binary command
+  stream — an unlit vertex-color cube renders on a real WebGPU device
+  (`/gl-webgpu`), verified headless. WGSL shaders are generated in Zig
+  (`wgslUnlit`, FNV-golden-frozen) alongside the GLSL; no wire-format change.
+  New JS `gpuInit` / `gpuInterpret` / `gpuStart` (+ `gl_start_gpu` chunk import)
+  mirror the WebGL2 interpreter for the minimal 6-tag subset (begin_frame,
+  create_buffer, create_shader, set_pipeline, draw, end_frame) and map it onto
+  WebGPU's pipeline/render-pass model. Purely additive — the WebGL2 path and the
+  GLSL goldens are untouched. PBR/IBL/shadow parity + texture tags are the
+  remaining P10 slices.
+
 ## [0.5.4] - 2026-06-15
 
 ### Fixed
