@@ -4793,13 +4793,14 @@
           const w = dv.getUint32(off + 16, true);
           const h = dv.getUint32(off + 20, true);
           if (!st.depthTex || w !== st.lastW || h !== st.lastH) {
-            if (st.depthTex) st.depthTex.destroy();
+            const oldDepth = st.depthTex;
             st.depthTex = device.createTexture({
               size: [w, h],
               format: "depth24plus",
               usage: GPUTextureUsage.RENDER_ATTACHMENT,
             });
             st.depthView = st.depthTex.createView();
+            if (oldDepth) oldDepth.destroy();
             st.lastW = w;
             st.lastH = h;
           }
@@ -4893,7 +4894,6 @@
               layout: st.active.pipeline.getBindGroupLayout(0),
               entries: [{ binding: 0, resource: { buffer: st.uniformBuf } }],
             });
-            st.pass.setPipeline(st.active.pipeline);
             st.pass.setVertexBuffer(0, vb.buf);
             st.pass.setIndexBuffer(ib.buf, "uint16");
             st.pass.setBindGroup(0, st.bindGroup);
