@@ -55,6 +55,11 @@ const gl = verve.gl;
 const anim = verve.anim;
 
 extern "verve" fn gl_start(ref_handle: i32, name_ptr: [*]const u8, name_len: u32) void;
+// P10 slice 2d: WebGPU frame loop + synchronous backend feature-detect. When
+// WebGPU is available the scene emits WGSL + drives gl_start_gpu instead of GLSL +
+// gl_start; the command stream is otherwise identical (gpuInterpret handles it).
+extern "verve" fn gl_start_gpu(ref_handle: i32, name_ptr: [*]const u8, name_len: u32) void;
+extern "verve" fn gl_webgpu_available() i32;
 extern "verve" fn gl_load(url_ptr: [*]const u8, url_len: u32, cb_ptr: [*]const u8, cb_len: u32) void;
 // P8 onPickExport: dispatch a bubbling DOM CustomEvent(name, {detail:{name:detail}})
 // from the element behind `ref_handle` (the canvas). No-op if the handle is stale.
@@ -216,6 +221,32 @@ var current: ?*Inst = null;
 var live_count: u32 = 0;
 
 var reduced_motion: bool = false; // page media query — same for every instance
+// P10 slice 2d: page-global backend choice. Set once at the first hydrate from
+// gl_webgpu_available(); selects WGSL + gl_start_gpu vs GLSL + gl_start, and
+// whether the clip-space z fix is applied to the proj/light matrices.
+var use_webgpu: bool = false;
+
+/// Clip-space z remap [−1,1]→[0,1] for WebGPU (gl.math proj/ortho are GL
+/// convention; WebGPU clips z<0 and stores depth in [0,1]). Identity on WebGL2 so
+/// that path is byte-for-byte unchanged. Premultiplied onto proj (color mvp) and
+/// the light matrix (shadow), matching GlSceneWebgpu's computeLightVp (2c).
+fn clipFix() gl.math.Mat4 {
+    if (!use_webgpu) {
+        var m = gl.math.Mat4{ .m = [_]f32{0} ** 16 };
+        m.m[0] = 1;
+        m.m[5] = 1;
+        m.m[10] = 1;
+        m.m[15] = 1;
+        return m;
+    }
+    var z = gl.math.Mat4{ .m = [_]f32{0} ** 16 };
+    z.m[0] = 1;
+    z.m[5] = 1;
+    z.m[10] = 0.5;
+    z.m[14] = 0.5;
+    z.m[15] = 1;
+    return z;
+}
 
 // Shared transient scratch — `glscene_frame` fills it and returns its pointer;
 // the bridge walks the stream synchronously before the next frame call, so
@@ -377,6 +408,13 @@ fn emitShader(inst: *Inst, enc: *gl.Encoder, comptime variant: u32) void {
     const handle = shaderHandleFor(variant); // handle keyed on the bare variant (1..4)
     // Every PBR program receives the directional shadow map (P9 slice 3).
     const full = variant | gl.command.variant_shadow;
+    if (use_webgpu) {
+        // One WGSL module (both stages) in the vs slot; fs slot 0/0.
+        const w = gl.command.wgslPbr(full);
+        enc.createShader(handle, full, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        inst.registry.recordShader(handle, full, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        return;
+    }
     const vs = gl.command.pbrVertexSrc(full);
     const fs = gl.command.pbrFragmentSrc(full);
     enc.createShader(handle, full, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
@@ -384,6 +422,12 @@ fn emitShader(inst: *Inst, enc: *gl.Encoder, comptime variant: u32) void {
 }
 
 fn emitDepthShader(inst: *Inst, enc: *gl.Encoder) void {
+    if (use_webgpu) {
+        const w = gl.command.wgslDepth();
+        enc.createShader(depth_shader, gl.command.variant_depth, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        inst.registry.recordShader(depth_shader, gl.command.variant_depth, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        return;
+    }
     const vs = gl.command.depthVertexSrc();
     const fs = gl.command.depthFragmentSrc();
     enc.createShader(depth_shader, gl.command.variant_depth, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
@@ -454,6 +498,8 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
 
     // Cache reduced-motion once (matchMedia is a host round-trip; page-global).
     reduced_motion = verve.matchMedia("(prefers-reduced-motion: reduce)");
+    // Pick the GPU backend once (page-global): WebGPU when available, else WebGL2.
+    use_webgpu = gl_webgpu_available() != 0;
 
     // Resolve refs ONCE while hydrate runs inside island scope — frame- and
     // asset-callback lookups run UNSCOPED and would miss the vid-suffixed ref.
@@ -468,8 +514,9 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     if (inst.env_len != 0)
         gl_load(&inst.env_buf, @intCast(inst.env_len), env_ready_export.ptr, env_ready_export.len);
 
-    if (canvasRef(inst)) |h|
-        gl_start(h, frame_export.ptr, frame_export.len);
+    if (canvasRef(inst)) |h| {
+        if (use_webgpu) gl_start_gpu(h, frame_export.ptr, frame_export.len) else gl_start(h, frame_export.ptr, frame_export.len);
+    }
 }
 
 // ── asset-ready callbacks ─────────────────────────────────────────────────────
@@ -738,7 +785,10 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         }
 
         // ── shadow depth pass (P9 slice 3) — render scene depth from the light.
-        const light_vp = lightSpaceMatrix(inst, a);
+        // clipFix is identity on WebGL2 (path unchanged) and the [−1,1]→[0,1] z
+        // remap on WebGPU (gl.math ortho is GL-convention; the receiver's WGSL
+        // shadowFactor uses ndc.z directly).
+        const light_vp = clipFix().mul(lightSpaceMatrix(inst, a));
         inst.light_vp_mat = light_vp.m;
         enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
         {
@@ -754,7 +804,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
 
-        const pv = proj.mul(view);
+        const pv = clipFix().mul(proj).mul(view);
         // World-space frustum planes for this frame's camera (P9 slice 2).
         const planes = gl.cull.frustumPlanes(pv);
         // Sentinel 0 is never a valid variant (variant_pbr always set).
