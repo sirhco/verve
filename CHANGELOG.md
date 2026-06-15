@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-06-15
+
 ### Added
 
 - **`verve.gl` P11 — WebGPU parity (multi-instance · resource delete · device-loss)**
@@ -3232,7 +3234,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.5...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.6...HEAD
+[0.5.6]: https://github.com/sirhco/verve/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/sirhco/verve/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/sirhco/verve/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/sirhco/verve/compare/v0.5.2...v0.5.3
