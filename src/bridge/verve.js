@@ -4766,6 +4766,158 @@
     st.active = null;
   };
 
+  // WebGPU command-stream interpreter. Consumes the SAME binary stream as
+  // glInterpret (4-byte tag/size header per command, little-endian) but drives
+  // WebGPU. Slice 1 handles only the minimal unlit-cube subset (6 tags);
+  // unknown tags size-skip for forward compatibility, exactly like glInterpret.
+  // `st` carries the per-canvas WebGPU state (device/ctx/format + resource
+  // tables + frame-scoped encoder/pass). Each tag null-guards its prerequisites
+  // so a missing resource is a no-op rather than a crash.
+  const gpuInterpret = (st, ptr) => {
+    // Fresh DataView every frame: memory.buffer detaches on wasm growth.
+    const dv = new DataView(memory.buffer);
+    const total = dv.getUint32(ptr, true);
+    let off = ptr + 4;
+    const end = off + total;
+    const device = st.device;
+    while (off < end) {
+      const tag = dv.getUint16(off, true);
+      const size = dv.getUint16(off + 2, true);
+      off += 4;
+      switch (tag) {
+        case 1: { // BEGIN_FRAME
+          const r = dv.getFloat32(off, true);
+          const g = dv.getFloat32(off + 4, true);
+          const b = dv.getFloat32(off + 8, true);
+          const a = dv.getFloat32(off + 12, true);
+          const w = dv.getUint32(off + 16, true);
+          const h = dv.getUint32(off + 20, true);
+          if (!st.depthTex || w !== st.lastW || h !== st.lastH) {
+            if (st.depthTex) st.depthTex.destroy();
+            st.depthTex = device.createTexture({
+              size: [w, h],
+              format: "depth24plus",
+              usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            st.depthView = st.depthTex.createView();
+            st.lastW = w;
+            st.lastH = h;
+          }
+          st.encoder = device.createCommandEncoder();
+          st.pass = st.encoder.beginRenderPass({
+            colorAttachments: [{
+              view: st.ctx.getCurrentTexture().createView(),
+              clearValue: { r, g, b, a },
+              loadOp: "clear",
+              storeOp: "store",
+            }],
+            depthStencilAttachment: {
+              view: st.depthView,
+              depthClearValue: 1.0,
+              depthLoadOp: "clear",
+              depthStoreOp: "store",
+            },
+          });
+          break;
+        }
+        case 2: { // CREATE_BUFFER
+          const handle = dv.getUint32(off, true);
+          const kind = dv.getUint32(off + 4, true);
+          const p = dv.getUint32(off + 8, true);
+          const len = dv.getUint32(off + 12, true);
+          const usage = kind === 1
+            ? (GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST)
+            : (GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
+          const buf = device.createBuffer({ size: (len + 3) & ~3, usage });
+          device.queue.writeBuffer(buf, 0, new Uint8Array(memory.buffer, p, len));
+          st.buffers[handle] = { buf, kind };
+          break;
+        }
+        case 3: { // CREATE_SHADER — one WGSL module in vs_ptr/vs_len
+          const handle = dv.getUint32(off, true);
+          const code = readStr(dv.getUint32(off + 8, true), dv.getUint32(off + 12, true));
+          const module = device.createShaderModule({ code });
+          const pipeline = device.createRenderPipeline({
+            layout: "auto",
+            vertex: {
+              module,
+              entryPoint: "vs_main",
+              buffers: [{
+                arrayStride: 24,
+                attributes: [
+                  { shaderLocation: 0, offset: 0, format: "float32x3" },
+                  { shaderLocation: 1, offset: 12, format: "float32x3" },
+                ],
+              }],
+            },
+            fragment: {
+              module,
+              entryPoint: "fs_main",
+              targets: [{ format: st.format }],
+            },
+            primitive: { topology: "triangle-list", cullMode: "back" },
+            depthStencil: {
+              format: "depth24plus",
+              depthWriteEnabled: true,
+              depthCompare: "less",
+            },
+          });
+          st.pipelines[handle] = { pipeline };
+          break;
+        }
+        case 4: { // SET_PIPELINE — state ignored in slice 1
+          const handle = dv.getUint32(off, true);
+          const entry = st.pipelines[handle];
+          if (entry && st.pass) {
+            st.pass.setPipeline(entry.pipeline);
+            st.active = entry;
+          }
+          break;
+        }
+        case 5: { // DRAW
+          const vbuf = dv.getUint32(off, true);
+          const ibuf = dv.getUint32(off + 4, true);
+          const indexCount = dv.getUint32(off + 8, true);
+          const mvpPtr = dv.getUint32(off + 12, true);
+          const vb = st.buffers[vbuf];
+          const ib = st.buffers[ibuf];
+          if (vb && ib && st.active && st.pass) {
+            if (!st.uniformBuf) {
+              st.uniformBuf = device.createBuffer({
+                size: 64,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+              });
+            }
+            device.queue.writeBuffer(st.uniformBuf, 0, new Float32Array(memory.buffer, mvpPtr, 16));
+            st.bindGroup = device.createBindGroup({
+              layout: st.active.pipeline.getBindGroupLayout(0),
+              entries: [{ binding: 0, resource: { buffer: st.uniformBuf } }],
+            });
+            st.pass.setPipeline(st.active.pipeline);
+            st.pass.setVertexBuffer(0, vb.buf);
+            st.pass.setIndexBuffer(ib.buf, "uint16");
+            st.pass.setBindGroup(0, st.bindGroup);
+            st.pass.drawIndexed(indexCount);
+          }
+          break;
+        }
+        case 6: { // END_FRAME
+          if (st.pass && st.encoder) {
+            st.pass.end();
+            st.device.queue.submit([st.encoder.finish()]);
+            st.pass = null;
+            st.encoder = null;
+          }
+          break;
+        }
+        default:
+          break; // unknown tag: size-skip = forward compatible
+      }
+      off += size;
+    }
+    return total;
+  };
+
   // WebGPU device bootstrap. Feature-detects navigator.gpu, requests an
   // adapter + device, and configures the canvas' "webgpu" context with the
   // preferred format. Degrades gracefully: returns null (never throws) on any
