@@ -5082,6 +5082,71 @@
     tickerKick();
   };
 
+  // WebGPU frame loop — parallel to glStart but kept SEPARATE. Driven by the
+  // same master rAF (glSinks). Slice 1: no context-loss / poster-swap handling.
+  const gpuStart = async (refHandle, exportName) => {
+    const canvas = refHandles[refHandle];
+    const exports = glActiveChunkExports;
+    if (!canvas || !exports || typeof exports[exportName] !== "function") {
+      console.error("verve.gl: gpuStart cannot resolve canvas/export:", exportName);
+      return;
+    }
+    const gpu = await gpuInit(canvas);
+    if (!gpu) {
+      // Leave the SSR poster up — do NOT throw.
+      console.warn("verve.gl: WebGPU unavailable; canvas left inert");
+      return;
+    }
+    const st = {
+      device: gpu.device,
+      ctx: gpu.ctx,
+      format: gpu.format,
+      exports,
+      exportName,
+      buffers: [],
+      pipelines: [],
+      active: null,
+      encoder: null,
+      pass: null,
+      uniformBuf: null,
+      bindGroup: null,
+      depthTex: null,
+      depthView: null,
+      lastW: 0,
+      lastH: 0,
+      last: 0,
+    };
+    const sink = (now) => {
+      // Island unmounted: canvas detached. Stop without rescheduling.
+      if (!canvas.isConnected) {
+        glSinks.delete(sink);
+        return;
+      }
+      const dt = st.last ? now - st.last : 16.7;
+      st.last = now;
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.min(4096, Math.max(1, Math.round(canvas.clientWidth * dpr)));
+      const h = Math.min(4096, Math.max(1, Math.round(canvas.clientHeight * dpr)));
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+      const ptr = st.exports[st.exportName](dt, w, h) >>> 0;
+      if (!ptr) {
+        // wasm asked to stop. 0 = stop loop.
+        glSinks.delete(sink);
+        return;
+      }
+      try {
+        gpuInterpret(st, ptr);
+      } catch (err) {
+        console.error("verve.gl: WebGPU interpreter fault, loop stopped:", err);
+        glSinks.delete(sink);
+        return;
+      }
+    };
+    glSinks.add(sink);
+    tickerKick();
+  };
+
   // One-shot fetch routed to an island export: `{api, island, export}` POSTs
   // `/api/<api>` and delivers the reply text to the named export. This is the
   // push path's resync hook, reusable by any island.
@@ -5126,6 +5191,9 @@
           verve: {
             gl_start: (refHandle, namePtr, nameLen) =>
               glStart(refHandle, readStr(namePtr, nameLen)),
+            // P10: WebGPU frame loop. Fire-and-forget (gpuStart is async).
+            gl_start_gpu: (refHandle, namePtr, nameLen) =>
+              gpuStart(refHandle, readStr(namePtr, nameLen)),
             // P8 onPickExport: dispatch a bubbling DOM CustomEvent from the
             // canvas (resolved by ref handle). detail.name carries the picked
             // submesh name. No-op if the handle is stale.
