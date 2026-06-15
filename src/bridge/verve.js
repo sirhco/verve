@@ -4874,6 +4874,13 @@
     const t = (h != null) ? st.textures[h] : null;
     return (t && t.view) ? t.view : fallback.view;
   };
+  // Resolve an IBL texture handle (set by bind_ibl) to its view, falling back to
+  // a device default (black) when no environment is bound — so the bind group is
+  // always complete and unbound IBL contributes zero.
+  const gpuIblView = (st, handle, fallback) => {
+    const t = (handle != null) ? st.textures[handle] : null;
+    return (t && t.view) ? t.view : fallback.view;
+  };
 
   // WebGPU command-stream interpreter. Consumes the SAME binary stream as
   // glInterpret (4-byte tag/size header per command, little-endian) but drives
@@ -5197,6 +5204,21 @@
           device.queue.writeBuffer(ubuf, PBR_U.lightCount, new Int32Array([n]));
           break;
         }
+        case 12: { // BIND_IBL — irradiance(6)/prefiltered(7)/brdf_lut(8) + prefMips.
+          // Payload (command.zig Encoder.bindIbl, 16B): irr|spec|lut|spec_mip_count.
+          // Records the IBL handles; draw_pbr resolves them into bind group 1
+          // (replacing the black placeholders). prefiltered_mips drives the
+          // specular reflection LOD in wgslPbr.
+          const irr = dv.getUint32(off, true);
+          const spec = dv.getUint32(off + 4, true);
+          const lut = dv.getUint32(off + 8, true);
+          const specMips = dv.getUint32(off + 12, true);
+          st.ibl = { irr, spec, lut };
+          const ubuf = gpuEnsurePbrUniform(st);
+          device.queue.writeBuffer(ubuf, PBR_U.prefMips, new Float32Array([specMips]));
+          st.bg1Dirty = true; // rebind group(1) with the real IBL views
+          break;
+        }
         case 13: { // DRAW_PBR — full PBR submesh draw.
           // Payload (command.zig Encoder.drawPbr, 36B / 9 u32):
           //   vbuf | ibuf | idx_byte_off | count | mvp_ptr | model_ptr |
@@ -5257,9 +5279,10 @@
               e.push({ binding: 4, resource: gpuSlotView(st, 3, d.black2d) }); // emissive
             }
             e.push({ binding: 5, resource: gpuSlotView(st, 4, d.white2d) }); // occlusion
-            e.push({ binding: 6, resource: d.blackCube.view }); // irradiance (cube)
-            e.push({ binding: 7, resource: d.blackCube.view }); // prefiltered (cube)
-            e.push({ binding: 8, resource: d.black2d.view }); // brdf_lut
+            const ibl = st.ibl;
+            e.push({ binding: 6, resource: gpuIblView(st, ibl?.irr, d.blackCube) }); // irradiance (cube)
+            e.push({ binding: 7, resource: gpuIblView(st, ibl?.spec, d.blackCube) }); // prefiltered (cube)
+            e.push({ binding: 8, resource: gpuIblView(st, ibl?.lut, d.black2d) }); // brdf_lut
             st.bg1 = device.createBindGroup({ layout: active.bgl1, entries: e });
             st.bg1Layout = active.bgl1;
             st.bg1Dirty = false;
@@ -5469,6 +5492,7 @@
       pipelines: [],
       textures: [],
       boundTex: [],
+      ibl: null, // { irr, spec, lut } texture handles set by bind_ibl (2b)
       defaults: gpuMakeDefaults(gpu.device),
       active: null,
       encoder: null,
