@@ -481,11 +481,12 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
 //   7 prefiltered (cube), 8 brdf_lut (2D).
 pub fn wgslPbr(comptime flags: u32) []const u8 {
     comptime pbrCheck(flags);
-    if (flags & variant_shadow != 0) @compileError("wgslPbr: variant_shadow not in P10 slice 2a");
-    if (flags & variant_depth != 0) @compileError("wgslPbr: variant_depth not in P10 slice 2a");
+    if (flags & variant_depth != 0) @compileError("wgslPbr: variant_depth uses wgslDepth(), not wgslPbr");
 
     // ── Uniform block + group(0) ────────────────────────────────────
-    const uniforms =
+    // Split so variant_shadow can append `light_vp` (offset 384, after the f32
+    // prefiltered_mips @ 372 padded to 384) without changing the non-shadow bytes.
+    const uniforms_head =
         \\struct U {
         \\  mvp: mat4x4<f32>,
         \\  model: mat4x4<f32>,
@@ -495,6 +496,13 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  lights: array<vec4<f32>, 8>,
         \\  light_count: i32,
         \\  prefiltered_mips: f32,
+        \\
+    ;
+    const uniforms_shadow =
+        \\  light_vp: mat4x4<f32>,
+        \\
+    ;
+    const uniforms_tail =
         \\};
         \\@group(0) @binding(0) var<uniform> u: U;
         \\
@@ -524,6 +532,13 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\@group(1) @binding(8) var brdf_lut: texture_2d<f32>;
         \\
     ;
+    // Shadow receiver (variant_shadow): a depth texture + comparison sampler at
+    // bindings 9/10 (after the IBL units). slot tex_slot_shadow=8 → binding 9.
+    const tex_shadow =
+        \\@group(1) @binding(9) var shadow_map: texture_depth_2d;
+        \\@group(1) @binding(10) var shadow_samp: sampler_comparison;
+        \\
+    ;
     // ── varyings: VSOut struct ──────────────────────────────────────
     const vsout_head =
         \\struct VSOut {
@@ -536,6 +551,10 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const vsout_nm =
         \\  @location(3) tangent: vec3<f32>,
         \\  @location(4) bitangent: vec3<f32>,
+        \\
+    ;
+    const vsout_shadow =
+        \\  @location(5) light_pos: vec4<f32>,
         \\
     ;
     const vsout_tail =
@@ -561,6 +580,10 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  let t = normalize((mat3x3<f32>(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz)) * a_tangent.xyz);
         \\  out.tangent = t;
         \\  out.bitangent = cross(out.normal, t) * a_tangent.w;
+        \\
+    ;
+    const vs_shadow =
+        \\  out.light_pos = u.light_vp * u.model * vec4<f32>(a_pos, 1.0);
         \\
     ;
     const vs_tail =
@@ -662,7 +685,34 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  let lut = textureSample(brdf_lut, samp, vec2<f32>(NdotV, roughness)).rg;
         \\  let specular_ibl = prefiltered_c * (F0 * lut.x + lut.y);
         \\  let ambient = (kD_ibl * diffuse + specular_ibl) * mix(1.0, ao_sample, occlusion_strength);
+        \\
+    ;
+    // 3×3 PCF over the depth-compare sampler. The chunk supplies a light_vp that
+    // already remaps clip z to WebGPU's [0,1] range (Zfix·ortho·view), so the
+    // depth ref is ndc.z directly; uv flips Y for WebGPU texture space.
+    const fs_shadow_decl =
+        \\fn shadowFactor(lp: vec4<f32>) -> f32 {
+        \\  let ndc = lp.xyz / lp.w;
+        \\  if (ndc.z > 1.0) { return 1.0; }
+        \\  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * -0.5 + 0.5);
+        \\  let bias = 0.0015;
+        \\  let texel = 1.0 / vec2<f32>(textureDimensions(shadow_map, 0));
+        \\  var sum = 0.0;
+        \\  for (var y = -1; y <= 1; y = y + 1) {
+        \\    for (var x = -1; x <= 1; x = x + 1) {
+        \\      sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + vec2<f32>(f32(x), f32(y)) * texel, ndc.z - bias);
+        \\    }
+        \\  }
+        \\  return sum / 9.0;
+        \\}
+        \\
+    ;
+    const fs_combine_plain =
         \\  var color = ambient + Lo;
+        \\
+    ;
+    const fs_combine_shadow =
+        \\  var color = ambient + Lo * shadowFactor(in.light_pos);
         \\
     ;
     const fs_emissive =
@@ -677,23 +727,53 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\
     ;
 
-    comptime var src: []const u8 = uniforms ++ samp ++ tex_base;
-    if (flags & variant_normal_map != 0) src = src ++ tex_normal;
-    if (flags & variant_emissive != 0) src = src ++ tex_emissive;
+    const nm = flags & variant_normal_map != 0;
+    const em = flags & variant_emissive != 0;
+    const shadow = flags & variant_shadow != 0;
+    comptime var src: []const u8 = uniforms_head;
+    if (shadow) src = src ++ uniforms_shadow;
+    src = src ++ uniforms_tail ++ samp ++ tex_base;
+    if (nm) src = src ++ tex_normal;
+    if (em) src = src ++ tex_emissive;
     src = src ++ tex_ibl;
+    if (shadow) src = src ++ tex_shadow;
     src = src ++ vsout_head;
-    if (flags & variant_normal_map != 0) src = src ++ vsout_nm;
+    if (nm) src = src ++ vsout_nm;
+    if (shadow) src = src ++ vsout_shadow;
     src = src ++ vsout_tail;
     src = src ++ vs_head;
-    if (flags & variant_normal_map != 0) src = src ++ vs_nm;
+    if (nm) src = src ++ vs_nm;
+    if (shadow) src = src ++ vs_shadow;
     src = src ++ vs_tail;
     src = src ++ helpers;
+    if (shadow) src = src ++ fs_shadow_decl;
     src = src ++ fs_open;
-    src = src ++ (if (flags & variant_normal_map != 0) fs_normal_nm else fs_normal_plain);
+    src = src ++ (if (nm) fs_normal_nm else fs_normal_plain);
     src = src ++ fs_lighting;
-    if (flags & variant_emissive != 0) src = src ++ fs_emissive;
+    src = src ++ (if (shadow) fs_combine_shadow else fs_combine_plain);
+    if (em) src = src ++ fs_emissive;
     src = src ++ fs_tail;
     return src;
+}
+
+/// Depth-only WGSL for the WebGPU shadow pass (variant_depth). Reads only
+/// position (attrib 0) of the stride-48 PBR layout; the fragment stage writes
+/// nothing — the depth buffer is the sole output. Parallel to depthVertexSrc /
+/// depthFragmentSrc (GLSL). Uniform: a single light-space mvp.
+pub fn wgslDepth() []const u8 {
+    return
+    \\struct U {
+    \\  mvp: mat4x4<f32>,
+    \\};
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\@vertex
+    \\fn vs_main(@location(0) a_pos: vec3<f32>) -> @builtin(position) vec4<f32> {
+    \\  return u.mvp * vec4<f32>(a_pos, 1.0);
+    \\}
+    \\@fragment
+    \\fn fs_main() {}
+    \\
+    ;
 }
 
 pub const Encoder = struct {
@@ -1169,6 +1249,45 @@ test "golden: WGSL PBR hashes frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0x22da26fe9b6d11ce), fnv64(wgslPbr(F0)));
     try testing.expectEqual(@as(u64, 0x8415f4d5595e6473), fnv64(wgslPbr(F1)));
     try testing.expectEqual(@as(u64, 0x08b2f7cb68681f01), fnv64(wgslPbr(F2)));
+}
+
+test "WGSL PBR shadow + depth: variant_shadow path and wgslDepth structure" {
+    const S0 = variant_pbr | variant_shadow;
+    const S1 = variant_pbr | variant_normal_map | variant_shadow;
+    const S2 = variant_pbr | variant_normal_map | variant_emissive | variant_shadow;
+    inline for ([_]u32{ S0, S1, S2 }) |f| {
+        const src = wgslPbr(f);
+        try testing.expect(std.mem.indexOf(u8, src, "shadow_map: texture_depth_2d") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "shadow_samp: sampler_comparison") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "textureSampleCompareLevel") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "light_vp: mat4x4<f32>") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "light_pos: vec4<f32>") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "shadowFactor(in.light_pos)") != null);
+    }
+    // Non-shadow variants must NOT carry any shadow machinery.
+    inline for ([_]u32{ variant_pbr, variant_pbr | variant_normal_map | variant_emissive }) |f| {
+        const src = wgslPbr(f);
+        try testing.expect(std.mem.indexOf(u8, src, "shadow_map") == null);
+        try testing.expect(std.mem.indexOf(u8, src, "light_vp") == null);
+        try testing.expect(std.mem.indexOf(u8, src, "shadowFactor") == null);
+    }
+    // Depth-only shader: a vertex stage on position + an empty fragment.
+    const d = wgslDepth();
+    try testing.expect(std.mem.indexOf(u8, d, "@vertex") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "fn vs_main") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "fn fs_main() {}") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "mvp: mat4x4<f32>") != null);
+}
+
+test "golden: WGSL shadow + depth hashes frozen (FNV-1a-64)" {
+    const S0 = variant_pbr | variant_shadow;
+    const S1 = variant_pbr | variant_normal_map | variant_shadow;
+    const S2 = variant_pbr | variant_normal_map | variant_emissive | variant_shadow;
+    // Frozen from first green run — a change here = deliberate WGSL contract bump.
+    try testing.expectEqual(@as(u64, 0x7135291bd052822a), fnv64(wgslPbr(S0)));
+    try testing.expectEqual(@as(u64, 0x3755ccbc75857e09), fnv64(wgslPbr(S1)));
+    try testing.expectEqual(@as(u64, 0x9df4e0e12b66da1f), fnv64(wgslPbr(S2)));
+    try testing.expectEqual(@as(u64, 0x3bb6cf33bcf5f8b1), fnv64(wgslDepth()));
 }
 
 test "PBR uniform contract: full-variant names present" {
