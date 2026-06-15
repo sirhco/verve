@@ -805,6 +805,35 @@ pub fn glDemo(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl P10 WebGPU demo — /gl-webgpu. An unlit vertex-color cube uploaded
+/// and driven through the WebGPU backend (gl_start_gpu) instead of WebGL2. The
+/// same Zig-computed binary command stream feeds a WebGPU interpreter. Requires
+/// a WebGPU-capable browser; degrades to the poster/blank canvas otherwise.
+pub fn glWebgpu(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "glwebgpu-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Unlit cube — WebGPU backend"),
+        canvas,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlWebgpu" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — WebGPU"),
+        ctx.p().text("The same Zig-computed binary draw-command stream as /gl, " ++
+            "but interpreted by the WebGPU backend (P10) instead of WebGL2. " ++
+            "Requires a WebGPU-capable browser; degrades to a blank canvas " ++
+            "otherwise."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a

@@ -17,6 +17,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/gl-mixed", renderGlMixed),
     verve.Route.init("/gl-shadow", renderGlShadow),
     verve.Route.init("/gl-multi", renderGlMulti),
+    verve.Route.init("/gl-webgpu", renderGlWebgpu),
     verve.Route.init("/push-multi", renderPushMulti),
     verve.Route.init("/todos", renderTodos),
     verve.Route.init("/work/:slug", renderWorkDetail),
@@ -74,6 +75,11 @@ fn renderGlShadow(ctx: *verve.Context) !*verve.Node {
 
 fn renderGlMulti(ctx: *verve.Context) !*verve.Node {
     const body = try components.glSceneMulti(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderGlWebgpu(ctx: *verve.Context) !*verve.Node {
+    const body = try components.glWebgpu(ctx);
     return components.page(ctx, body);
 }
 

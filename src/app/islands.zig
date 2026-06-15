@@ -97,6 +97,16 @@ pub const GlDemo = struct {
     pub const props_schema: []const u8 = "{}";
 };
 
+/// verve.gl P10 WebGPU demo — a single stateful chunk that uploads an unlit
+/// vertex-color cube and drives it through the WebGPU backend (gl_start_gpu).
+/// SSR emits `<canvas data-ref="glwebgpu-canvas">`; the client chunk creates
+/// buffers + a WGSL shader (gl.command.wgslUnlit) and renders over shared
+/// linear memory. Requires a WebGPU-capable browser; degrades to the poster
+/// otherwise. Source: `src/client/islands/GlWebgpu.zig`.
+pub const GlWebgpu = struct {
+    pub const props_schema: []const u8 = "{}";
+};
+
 /// verve.gl declarative scene (P4). Built via `ctx.glScene(.{...})` — a vmesh
 /// model + venv environment rendered with orbit camera, a directional light,
 /// optional auto-rotate, and named pickable meshes wired to closure event ids.
