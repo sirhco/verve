@@ -105,6 +105,20 @@ pub const Mat4 = struct {
         return out;
     }
 
+    /// Orthographic projection, WebGL clip space (z in [-1, 1]). Column-major.
+    /// Used to build the directional-light projection for shadow mapping.
+    pub fn ortho(l: f32, r: f32, b: f32, t: f32, near: f32, far: f32) Mat4 {
+        var out = Mat4{ .m = [_]f32{0} ** 16 };
+        out.m[0] = 2.0 / (r - l);
+        out.m[5] = 2.0 / (t - b);
+        out.m[10] = -2.0 / (far - near);
+        out.m[12] = -(r + l) / (r - l);
+        out.m[13] = -(t + b) / (t - b);
+        out.m[14] = -(far + near) / (far - near);
+        out.m[15] = 1;
+        return out;
+    }
+
     /// `up` must not be parallel to `eye - target` (degenerate basis).
     pub fn lookAt(eye: Vec3, target: Vec3, up: Vec3) Mat4 {
         const zaxis = eye.sub(target).normalize();
@@ -328,6 +342,31 @@ test "golden: perspective fovy=pi/2 aspect=1 near=1 far=10" {
     try testing.expectApproxEqAbs(@as(f32, -1), p.m[11], eps);
     try testing.expectApproxEqAbs(@as(f32, -20.0 / 9.0), p.m[14], eps);
     try testing.expectApproxEqAbs(@as(f32, 0), p.m[15], eps);
+}
+
+test "golden: ortho l=-2 r=2 b=-3 t=3 near=1 far=11" {
+    const o = Mat4.ortho(-2, 2, -3, 3, 1, 11);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), o.m[0], eps); // 2/(r-l)
+    try testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), o.m[5], eps); // 2/(t-b)
+    try testing.expectApproxEqAbs(@as(f32, -0.2), o.m[10], eps); // -2/(f-n)
+    try testing.expectApproxEqAbs(@as(f32, -1.2), o.m[14], eps); // -(f+n)/(f-n)
+    try testing.expectApproxEqAbs(@as(f32, 1), o.m[15], eps);
+    // symmetric extents → no x/y offset
+    try testing.expectApproxEqAbs(@as(f32, 0), o.m[12], eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), o.m[13], eps);
+}
+
+test "ortho maps box to NDC corners" {
+    const o = Mat4.ortho(-2, 2, -3, 3, 1, 11);
+    // near-bottom-left of the box → NDC (-1,-1,-1); far-top-right → (1,1,1).
+    const a = transformPoint(o, Vec3.init(-2, -3, -1)); // z=-near
+    try testing.expectApproxEqAbs(@as(f32, -1), a.x, eps);
+    try testing.expectApproxEqAbs(@as(f32, -1), a.y, eps);
+    try testing.expectApproxEqAbs(@as(f32, -1), a.z, eps);
+    const b = transformPoint(o, Vec3.init(2, 3, -11)); // z=-far
+    try testing.expectApproxEqAbs(@as(f32, 1), b.x, eps);
+    try testing.expectApproxEqAbs(@as(f32, 1), b.y, eps);
+    try testing.expectApproxEqAbs(@as(f32, 1), b.z, eps);
 }
 
 test "golden: lookAt from +z" {

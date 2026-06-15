@@ -8,6 +8,26 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`verve.gl` P9 (render quality) — directional shadow map**
+  (`src/core/gl/command.zig`, `math.zig`, `registry.zig`,
+  `src/bridge/verve.js`, `src/client/islands/GlScene.zig`, `docs/24-gl.md`):
+  the scene's single directional light now casts a real depth-mapped shadow via
+  a per-frame depth pass + a shadow-sampling color pass. Additive on the wire —
+  the P1–P8 byte and FNV-64 GLSL goldens are unchanged.
+  - Five new wire tags (16–20): `create_shadow_map` (FBO + `DEPTH_COMPONENT24`
+    comparison texture), `begin`/`end_shadow_pass`, `draw_depth` (position-only),
+    and `bind_shadow_map` (re-emitted per pipeline switch like `set_lights`).
+    Two new shader-variant bits — `variant_shadow` (receiver) and `variant_depth`
+    (depth-only shader); the shadow map binds to texture unit 8.
+  - The PBR über-shader gains a byte-preserving shadow path: light-space position
+    in the vertex stage, 3×3 PCF (`sampler2DShadow`) in the fragment stage,
+    attenuating the direct light term only (IBL ambient stays lit). New FNV-64
+    goldens freeze the shadow + depth variants; existing variants unchanged.
+  - First framebuffer-object support in the `verve.js` gl interpreter; front-face
+    culling during the depth pass mitigates self-shadow acne.
+  - `GlScene` fits the light's orthographic frustum to the union of submesh world
+    AABBs (reusing the slice-2 `cull.worldAabb`); the depth shader + shadow map
+    are recorded for context-restore replay. `math.Mat4.ortho` added.
 - **`verve.gl` P9 (render quality) — per-node frustum culling**
   (`src/core/gl/cull.zig`, `gl.zig`, `src/client/islands/GlScene.zig`,
   `docs/24-gl.md`): a submesh whose world-space AABB falls fully outside the

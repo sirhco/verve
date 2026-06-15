@@ -36,9 +36,15 @@ pub const Tag = enum(u16) {
     draw_pbr = 13, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr, model_ptr, normal_ptr, material_ptr, camera_ptr}
     delete_resource = 14, // {kind, handle} — frees one GPU object; slot may be reused after
     create_texture_srgb = 15, // {handle, width, height, ptr, len} raw RGBA8 → SRGB8_ALPHA8 internal (P8); same layout as tag 7
+    // ── P9 slice 3: single directional shadow map ──────────────────────
+    create_shadow_map = 16, // {handle, size} — FBO + DEPTH_COMPONENT24 depth tex (size²), compare mode for sampler2DShadow
+    begin_shadow_pass = 17, // {shadow_handle, depth_shader_handle, size} — bind FBO, viewport, clear depth, bind depth shader
+    end_shadow_pass = 18, // {width, height} — unbind FBO back to canvas, restore viewport
+    draw_depth = 19, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr} — depth-only draw (mvp = light_vp·world)
+    bind_shadow_map = 20, // {slot, shadow_handle, light_vp_ptr} — bind depth tex + set u_light_vp on active program
 };
 
-pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2 };
+pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3 };
 
 pub const BufferKind = enum(u32) { vertex = 0, index = 1 };
 
@@ -61,6 +67,8 @@ pub const TexFormat = enum(u32) { rgba8 = 0, rgba16f = 1 };
 pub const variant_pbr: u32 = 1 << 2; // stride-48 layout, Cook-Torrance + IBL + tonemap
 pub const variant_normal_map: u32 = 1 << 3; // requires variant_pbr; tangent-space normal sampling
 pub const variant_emissive: u32 = 1 << 4; // requires variant_pbr; emissive term
+pub const variant_shadow: u32 = 1 << 5; // requires variant_pbr; samples the shadow map (P9 slice 3)
+pub const variant_depth: u32 = 1 << 6; // depth-only shader for the shadow pass; pbr vertex layout, attrib 0 only
 
 pub const max_lights: u32 = 4;
 pub const light_stride_f32: u32 = 8; // [type(0=dir,1=point), intensity, x,y,z, r,g,b]
@@ -72,6 +80,7 @@ pub const tex_slot_normal: u32 = 2;
 pub const tex_slot_emissive: u32 = 3;
 pub const tex_slot_occlusion: u32 = 4;
 // IBL units (JS contract): irradiance=5 (cube), prefiltered=6 (cube), brdf_lut=7 (2D)
+pub const tex_slot_shadow: u32 = 8; // directional shadow map (sampler2DShadow), after the IBL units
 
 pub const unlit_vs: []const u8 =
     \\#version 300 es
@@ -176,12 +185,49 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    // Shadow-receiver additions (variant_shadow): light-space clip position
+    // forwarded to the fragment shader for the depth comparison.
+    const shadow_outs =
+        \\uniform mat4 u_light_vp;
+        \\out vec4 v_light_pos;
+        \\
+    ;
+    const shadow_body =
+        \\  v_light_pos = u_light_vp * u_model * vec4(a_pos, 1.0);
+        \\
+    ;
     comptime var src: []const u8 = head;
     if (flags & variant_normal_map != 0) src = src ++ nm_outs;
+    if (flags & variant_shadow != 0) src = src ++ shadow_outs;
     src = src ++ body_open;
     if (flags & variant_normal_map != 0) src = src ++ nm_body;
+    if (flags & variant_shadow != 0) src = src ++ shadow_body;
     src = src ++ body_close;
     return src;
+}
+
+/// Depth-only shader for the shadow pass. Uses the PBR vertex layout but reads
+/// only position (attrib 0); the fragment stage writes nothing — the depth
+/// buffer is the sole output.
+pub fn depthVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\uniform mat4 u_mvp;
+    \\void main() {
+    \\  gl_Position = u_mvp * vec4(a_pos, 1.0);
+    \\}
+    \\
+    ;
+}
+
+pub fn depthFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\void main() {}
+    \\
+    ;
 }
 
 pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
@@ -314,7 +360,37 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\  vec2 lut = texture(u_brdf_lut, vec2(NdotV, roughness)).rg;
         \\  vec3 specular_ibl = prefiltered * (F0 * lut.x + lut.y);
         \\  vec3 ambient = (kD_ibl * diffuse + specular_ibl) * mix(1.0, ao_sample, occlusion_strength);
+        \\
+    ;
+    // Direct-light combine, split out so the shadow variant can attenuate the
+    // direct term (`Lo`) while leaving the IBL ambient unshadowed. The
+    // non-shadow string is byte-identical to the pre-slice-3 source.
+    const combine_plain =
         \\  vec3 color = ambient + Lo;
+        \\
+    ;
+    const combine_shadow =
+        \\  vec3 color = ambient + Lo * shadowFactor(v_light_pos);
+        \\
+    ;
+    // Shadow-receiver declarations (variant_shadow): the depth-compare sampler,
+    // the interpolated light-space position, and a 3×3 PCF lookup. Hardware
+    // comparison (sampler2DShadow + LINEAR) gives 2×2 filtering per tap.
+    const shadow_decls =
+        \\uniform highp sampler2DShadow u_shadow_map;
+        \\in vec4 v_light_pos;
+        \\float shadowFactor(vec4 lp) {
+        \\  vec3 proj = lp.xyz / lp.w;
+        \\  proj = proj * 0.5 + 0.5;
+        \\  if (proj.z > 1.0) return 1.0;
+        \\  float bias = 0.0015;
+        \\  vec2 texel = 1.0 / vec2(textureSize(u_shadow_map, 0));
+        \\  float sum = 0.0;
+        \\  for (int y = -1; y <= 1; y++)
+        \\    for (int x = -1; x <= 1; x++)
+        \\      sum += texture(u_shadow_map, vec3(proj.xy + vec2(x, y) * texel, proj.z - bias));
+        \\  return sum / 9.0;
+        \\}
         \\
     ;
     const emissive =
@@ -333,9 +409,12 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ uniforms;
     if (flags & variant_normal_map != 0) src = src ++ nm_sampler;
     if (flags & variant_emissive != 0) src = src ++ em_sampler;
-    src = src ++ ibl_samplers ++ main_open;
+    src = src ++ ibl_samplers;
+    if (flags & variant_shadow != 0) src = src ++ shadow_decls;
+    src = src ++ main_open;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
     src = src ++ lighting;
+    src = src ++ (if (flags & variant_shadow != 0) combine_shadow else combine_plain);
     if (flags & variant_emissive != 0) src = src ++ emissive;
     src = src ++ tail;
     return src;
@@ -493,6 +572,52 @@ pub const Encoder = struct {
         self.header(.delete_resource, 8);
         self.putU32(@intFromEnum(kind));
         self.putU32(handle);
+    }
+
+    // ── P9 slice 3: shadow pass ─────────────────────────────────────────
+    /// Create the depth render target (FBO + `size`×`size` depth texture). One
+    /// per scene; recorded for context-restore replay.
+    pub fn createShadowMap(self: *Encoder, handle: u32, size: u32) void {
+        self.header(.create_shadow_map, 8);
+        self.putU32(handle);
+        self.putU32(size);
+    }
+
+    /// Begin the depth pass: bind the shadow FBO, set the depth-only shader, and
+    /// size the viewport to the shadow map. `drawDepth` calls follow.
+    pub fn beginShadowPass(self: *Encoder, shadow_handle: u32, depth_shader: u32, size: u32) void {
+        self.header(.begin_shadow_pass, 12);
+        self.putU32(shadow_handle);
+        self.putU32(depth_shader);
+        self.putU32(size);
+    }
+
+    /// End the depth pass: restore the default framebuffer + canvas viewport.
+    pub fn endShadowPass(self: *Encoder, width: u32, height: u32) void {
+        self.header(.end_shadow_pass, 8);
+        self.putU32(width);
+        self.putU32(height);
+    }
+
+    /// Depth-only submesh draw (shadow pass). `mvp_ptr` is the light-space
+    /// `light_vp · world` matrix.
+    pub fn drawDepth(self: *Encoder, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, mvp_ptr: u32) void {
+        self.header(.draw_depth, 20);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(mvp_ptr);
+    }
+
+    /// Bind the shadow map to `slot` and set `u_light_vp` on the active program.
+    /// Like setLights / bindIbl, must be re-emitted after each SET_PIPELINE since
+    /// it writes a uniform on the currently active program.
+    pub fn bindShadowMap(self: *Encoder, slot: u32, shadow_handle: u32, light_vp_ptr: u32) void {
+        self.header(.bind_shadow_map, 12);
+        self.putU32(slot);
+        self.putU32(shadow_handle);
+        self.putU32(light_vp_ptr);
     }
 
     pub fn endFrame(self: *Encoder) void {
@@ -749,4 +874,64 @@ test "golden: DELETE_RESOURCE (tag 14)" {
 
 test "P3 goldens unchanged (P4 is additive)" {
     // Marker: P3 golden tests above must still pass byte-identical. P4 adds tag 14 only.
+}
+
+// ── P9 slice 3: shadow-map wire + shader goldens ────────────────────
+
+test "golden: shadow-variant GLSL hashes frozen (FNV-1a-64)" {
+    const S0 = variant_pbr | variant_shadow;
+    const S1 = variant_pbr | variant_normal_map | variant_shadow;
+    const S2 = variant_pbr | variant_normal_map | variant_emissive | variant_shadow;
+    // Frozen from first green run. A change here = deliberate GLSL contract bump.
+    try testing.expectEqual(@as(u64, 0x4c653dc19966e2c9), fnv64(pbrVertexSrc(S0)));
+    try testing.expectEqual(@as(u64, 0x39a20440b418312f), fnv64(pbrVertexSrc(S1)));
+    try testing.expectEqual(@as(u64, 0x39a20440b418312f), fnv64(pbrVertexSrc(S2))); // emissive does not touch the VS
+    try testing.expectEqual(@as(u64, 0xe29b0bf3c830deef), fnv64(pbrFragmentSrc(S0)));
+    try testing.expectEqual(@as(u64, 0x361efc733727617a), fnv64(pbrFragmentSrc(S1)));
+    try testing.expectEqual(@as(u64, 0x55ae1c2b63596b7b), fnv64(pbrFragmentSrc(S2)));
+    // Depth-only shadow-pass shader.
+    try testing.expectEqual(@as(u64, 0x5bd62d643af5c2d5), fnv64(depthVertexSrc()));
+    try testing.expectEqual(@as(u64, 0xe43018c9a1312d96), fnv64(depthFragmentSrc()));
+}
+
+test "shadow variant adds receiver uniforms; base variant has none" {
+    const S0 = variant_pbr | variant_shadow;
+    try testing.expect(std.mem.indexOf(u8, pbrVertexSrc(S0), "u_light_vp") != null);
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "u_shadow_map") != null);
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "shadowFactor(v_light_pos)") != null);
+    // The shadow term attenuates direct light only — IBL ambient stays lit.
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "ambient + Lo * shadowFactor") != null);
+    // Base PBR variant carries none of it.
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(variant_pbr), "u_shadow_map") == null);
+    try testing.expect(std.mem.indexOf(u8, pbrVertexSrc(variant_pbr), "u_light_vp") == null);
+}
+
+test "golden: shadow-pass frame records (tags 16-20)" {
+    var buf: [128]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createShadowMap(8, 1024);
+    enc.beginShadowPass(8, 4, 1024);
+    enc.drawDepth(1, 2, 12, 36, 0x3000);
+    enc.endShadowPass(300, 150);
+    enc.bindShadowMap(tex_slot_shadow, 8, 0x3500);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "54000000" ++ // length header: 84 record bytes
+            // CREATE_SHADOW_MAP handle=8 size=1024
+            "1000" ++ "0800" ++ "08000000" ++ "00040000" ++
+            // BEGIN_SHADOW_PASS shadow=8 depth_shader=4 size=1024
+            "1100" ++ "0c00" ++ "08000000" ++ "04000000" ++ "00040000" ++
+            // DRAW_DEPTH vbuf=1 ibuf=2 idx_off=12 count=36 mvp=0x3000
+            "1300" ++ "1400" ++ "01000000" ++ "02000000" ++ "0c000000" ++ "24000000" ++ "00300000" ++
+            // END_SHADOW_PASS width=300 height=150
+            "1200" ++ "0800" ++ "2c010000" ++ "96000000" ++
+            // BIND_SHADOW_MAP slot=8 shadow=8 light_vp=0x3500
+            "1400" ++ "0c00" ++ "08000000" ++ "08000000" ++ "00350000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
 }

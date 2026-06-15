@@ -86,6 +86,13 @@ const irr_handle: u32 = 16;
 const spec_handle: u32 = 17;
 const lut_handle: u32 = 18;
 
+// P9 slice 3 — single directional shadow map. The depth-only shader lives at
+// handle 5 (above the four PBR variants 1..4); the shadow map is handle 1 in the
+// bridge's separate `st.shadowMaps[]` namespace.
+const depth_shader: u32 = 5;
+const shadow_handle: u32 = 1;
+const shadow_size: u32 = 1024;
+
 const max_submesh = 8; // material-pool cap
 
 // Up to four PBR variants per mesh: variant_pbr is always set; normal_map and
@@ -123,11 +130,23 @@ fn createShaderForVariant(enc: *gl.Encoder, variant: u32) void {
 }
 
 fn emitShader(enc: *gl.Encoder, comptime variant: u32) void {
-    const handle = shaderHandleFor(variant);
-    const vs = gl.command.pbrVertexSrc(variant);
-    const fs = gl.command.pbrFragmentSrc(variant);
-    enc.createShader(handle, variant, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
-    registry.recordShader(handle, variant, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    const handle = shaderHandleFor(variant); // handle keyed on the bare variant (1..4)
+    // Every PBR program receives the directional shadow map (P9 slice 3): the
+    // shadow bit adds the light-space uniform + depth sampler without changing
+    // the handle or the vertex layout.
+    const full = variant | gl.command.variant_shadow;
+    const vs = gl.command.pbrVertexSrc(full);
+    const fs = gl.command.pbrFragmentSrc(full);
+    enc.createShader(handle, full, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    registry.recordShader(handle, full, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+}
+
+/// Create + record the depth-only shadow-pass shader (handle `depth_shader`).
+fn emitDepthShader(enc: *gl.Encoder) void {
+    const vs = gl.command.depthVertexSrc();
+    const fs = gl.command.depthFragmentSrc();
+    enc.createShader(depth_shader, gl.command.variant_depth, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    registry.recordShader(depth_shader, gl.command.variant_depth, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
 }
 
 // ── Props copies (decoded from SSR data-props; copied to statics before the
@@ -237,6 +256,12 @@ var normal9s: [max_submesh][9]f32 = undefined;
 // culling (P9 slice 2). CPU-only — never touches the wire stream.
 var submesh_aabb: [max_submesh]gl.cull.Aabb = undefined;
 
+// Shadow pass (P9 slice 3). Per-submesh light-space mvp pool (stable pointers,
+// same stream-aliasing reason as `mvps`), and the frame's light view-projection
+// matrix (pointed at by every BIND_SHADOW_MAP record this frame).
+var depth_mvps: [max_submesh][16]f32 = undefined;
+var light_vp_mat: [16]f32 = undefined;
+
 // Per-submesh material block pool (12 f32 each) — each drawPbr points at its own
 // stable slot so the JS interpreter reads the right material when walking the
 // stream (same aliasing reason as GlDemo).
@@ -251,23 +276,25 @@ var lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 };
 var reduced_motion: bool = false;
 
 // GPU-resource registry for context-restore replay. Cap 32:
-//   2 buffers + up to 4 shaders + up to 5 material textures + 3 IBL textures =
-//   14 worst case; 32 leaves generous headroom (no overflow).
+//   2 buffers + up to 4 PBR shaders + 1 depth shader + up to 5 material textures
+//   + 3 IBL textures + 1 shadow map = 16 worst case; 32 leaves headroom.
 var registry: gl.Registry(32) = .{};
 var resources_sent: bool = false;
 var needs_replay: bool = false;
 
 // cmd_buf sizing (N = max_submesh = 8). Record = 4-byte header + payload.
 //   one-time create OR replay (same set):
-//     2×createBuffer(20) + up to 4×createShader(28) + 5×createTexture(24)
-//     + 3×createTextureEx(36) = 40 + 112 + 120 + 108 = 380
+//     2×createBuffer(20) + up to 4×createShader(28) + 1×createShader(28, depth)
+//     + 1×createShadowMap(12) + 5×createTexture(24) + 3×createTextureEx(36)
+//     = 40 + 112 + 28 + 12 + 120 + 108 = 420
 //   per-frame (worst case: every submesh a distinct variant, so the
-//     pipeline/lights/IBL group re-emits per submesh):
-//     header(4) + beginFrame(28)
-//     + N×(setPipeline(12) + setLights(12) + bindIbl(20)
-//          + 5×bindTexture(12) + drawPbr(40)) = 8×144 = 1152
-//     + endFrame(4) = 1188
-//   worst case (create/replay + frame on one tick) = 380 + 1188 = 1568.
+//     pipeline/lights/IBL/shadow group re-emits per submesh):
+//     depth pass: beginShadowPass(16) + N×drawDepth(24) + endShadowPass(12) = 220
+//     + beginFrame(28)
+//     + N×(setPipeline(12) + setLights(12) + bindIbl(20) + bindShadowMap(16)
+//          + 5×bindTexture(12) + drawPbr(40)) = 8×160 = 1280
+//     + endFrame(4) = 1532
+//   worst case (create/replay + frame on one tick) = 420 + 1532 = 1952.
 //   Round up to 4096 (matches GlDemo).
 var cmd_buf: [4096]u8 = undefined;
 
@@ -665,6 +692,40 @@ fn stampName(attr: []const u8, a: *const gl.vmesh.Reader, s: u32) void {
     if (canvasRef()) |h| verve.setRefAttr(h, attr, a.name(s));
 }
 
+/// Directional light view-projection for the shadow pass. The light is pushed
+/// back along its travel direction far enough to frame the whole scene, with an
+/// orthographic projection sized to the union of submesh world AABBs. Must be
+/// called after `scene.updateWorld()` so `scene.world[]` is current.
+fn lightSpaceMatrix(a: *const gl.vmesh.Reader) gl.math.Mat4 {
+    const Vec3 = gl.math.Vec3;
+    const inf = std.math.inf(f32);
+    var lo = Vec3.init(inf, inf, inf);
+    var hi = Vec3.init(-inf, -inf, -inf);
+    const n: u32 = @min(a.submesh_count, max_submesh);
+    var s: u32 = 0;
+    while (s < n) : (s += 1) {
+        const wb = gl.cull.worldAabb(submesh_aabb[s], scene.world[s + 1]);
+        lo = Vec3.init(@min(lo.x, wb.min.x), @min(lo.y, wb.min.y), @min(lo.z, wb.min.z));
+        hi = Vec3.init(@max(hi.x, wb.max.x), @max(hi.y, wb.max.y), @max(hi.z, wb.max.z));
+    }
+    if (n == 0 or lo.x > hi.x) { // no geometry: a unit box at the origin
+        lo = Vec3.init(-1, -1, -1);
+        hi = Vec3.init(1, 1, 1);
+    }
+    const center = Vec3.scale(Vec3.add(lo, hi), 0.5);
+    const radius = @max(@as(f32, 0.5), Vec3.length(Vec3.sub(hi, lo)) * 0.5);
+    // `lights` holds the light's travel direction (the fragment shader uses
+    // L = -dir). Place the light's eye opposite that direction.
+    const dir = Vec3.normalize(Vec3.init(lights[2], lights[3], lights[4]));
+    const up = if (@abs(dir.y) > 0.99) Vec3.init(0, 0, 1) else Vec3.init(0, 1, 0);
+    const dist = radius * 3.0;
+    const eye = Vec3.sub(center, Vec3.scale(dir, dist));
+    const view = gl.math.Mat4.lookAt(eye, center, up);
+    const ext = radius * 1.2;
+    const proj = gl.math.Mat4.ortho(-ext, ext, -ext, ext, dist - radius * 1.5, dist + radius * 1.5);
+    return proj.mul(view);
+}
+
 // ── frame ─────────────────────────────────────────────────────────────────────
 
 export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
@@ -740,6 +801,24 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             }
         }
 
+        // ── shadow depth pass (P9 slice 3) ────────────────────────────────
+        // Render scene depth from the light's POV into the shadow map BEFORE
+        // the color pass. No camera-frustum culling here: an off-screen caster
+        // can still cast a shadow into view.
+        const light_vp = lightSpaceMatrix(a);
+        light_vp_mat = light_vp.m;
+        enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
+        {
+            var sd: u32 = 0;
+            while (sd < a.submesh_count) : (sd += 1) {
+                if (sd >= max_submesh) break;
+                const sub = a.submesh(sd);
+                depth_mvps[sd] = light_vp.mul(scene.world[sd + 1]).m;
+                enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&depth_mvps[sd])));
+            }
+        }
+        enc.endShadowPass(width, height);
+
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
 
         // pv hoisted out of the loop; per-draw matrices come from the scene
@@ -769,6 +848,9 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_back);
                 enc.setLights(1, @intCast(@intFromPtr(&lights)));
                 enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+                // Bind the shadow map + light-space matrix on the freshly-bound
+                // program (same per-switch re-emit rule as setLights / bindIbl).
+                enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&light_vp_mat)));
                 last_variant = v;
             }
             // mats[s] initialized once in buildScene; anim setters own mutations.
@@ -822,6 +904,12 @@ fn sendResources(enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: *const gl.ven
         shader_seen[handle] = true;
         createShaderForVariant(enc, variant);
     }
+
+    // Shadow-pass resources (P9 slice 3): the depth-only shader and the depth
+    // render target. Both recorded so a context restore replays them.
+    emitDepthShader(enc);
+    enc.createShadowMap(shadow_handle, shadow_size);
+    registry.recordShadowMap(shadow_handle, shadow_size);
 
     var t: u32 = 0;
     while (t < a.tex_count) : (t += 1) {

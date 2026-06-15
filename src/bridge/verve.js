@@ -4292,7 +4292,11 @@
       vao = gl.createVertexArray();
       gl.bindVertexArray(vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
-      if (variant & 4) {
+      if (variant & 64) {
+        // depth-only (shadow pass): PBR-layout buffer, position attrib only.
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);
+      } else if (variant & 4) {
         // PBR: pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40, stride 48
         gl.enableVertexAttribArray(0);
         gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);
@@ -4398,6 +4402,10 @@
             setSampler("u_irradiance", 5);
             setSampler("u_prefiltered", 6);
             setSampler("u_brdf_lut", 7);
+            if (variant & 32) { // shadow receiver: light-space matrix + depth sampler (unit 8)
+              sh.lightVp = gl.getUniformLocation(prog, "u_light_vp");
+              setSampler("u_shadow_map", 8);
+            }
           }
           st.shaders[handle] = sh;
           break;
@@ -4612,7 +4620,84 @@
               if (st.active === sh) st.active = null;
               st.shaders[handle] = null;
             }
+          } else if (kind === 3) { // shadow map (FBO + depth texture)
+            const sm = st.shadowMaps[handle];
+            if (sm) {
+              gl.deleteFramebuffer(sm.fbo);
+              gl.deleteTexture(sm.tex);
+              st.shadowMaps[handle] = null;
+            }
           }
+          break;
+        }
+        case 16: { // CREATE_SHADOW_MAP — FBO + depth texture for the shadow pass
+          const handle = dv.getUint32(off, true);
+          const size = dv.getUint32(off + 4, true);
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, size, size, 0,
+            gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          // Hardware depth comparison → sampler2DShadow PCF (2×2 per tap).
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+          const fbo = gl.createFramebuffer();
+          gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, tex, 0);
+          gl.drawBuffers([gl.NONE]); // depth-only: no color attachment
+          gl.readBuffer(gl.NONE);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          st.shadowMaps[handle] = { fbo, tex, size };
+          break;
+        }
+        case 17: { // BEGIN_SHADOW_PASS — render depth from the light's POV
+          const sm = st.shadowMaps[dv.getUint32(off, true)];
+          const sh = st.shaders[dv.getUint32(off + 4, true)];
+          const size = dv.getUint32(off + 8, true);
+          if (!sm || !sh) break;
+          gl.bindFramebuffer(gl.FRAMEBUFFER, sm.fbo);
+          gl.viewport(0, 0, size, size);
+          gl.clear(gl.DEPTH_BUFFER_BIT);
+          gl.useProgram(sh.prog);
+          st.active = sh;
+          gl.enable(gl.DEPTH_TEST);
+          // Front-face culling during the depth pass pushes self-shadow acne
+          // behind the geometry instead of onto its lit faces.
+          gl.enable(gl.CULL_FACE);
+          gl.cullFace(gl.FRONT);
+          break;
+        }
+        case 18: { // END_SHADOW_PASS — back to the canvas framebuffer
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.viewport(0, 0, dv.getUint32(off, true), dv.getUint32(off + 4, true));
+          gl.cullFace(gl.BACK); // restore the color-pass winding
+          break;
+        }
+        case 19: { // DRAW_DEPTH — position-only submesh draw into the shadow map
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const mvpPtr = dv.getUint32(off + 16, true);
+          if (!st.buffers[vh] || !st.buffers[ih] || !st.active) break;
+          bindVaoFor(st, vh, ih);
+          gl.uniformMatrix4fv(st.active.mvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
+          gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
+        case 20: { // BIND_SHADOW_MAP — depth tex + light-space matrix on active program
+          const slot = dv.getUint32(off, true);
+          const sm = st.shadowMaps[dv.getUint32(off + 4, true)];
+          const lvpPtr = dv.getUint32(off + 8, true);
+          if (sm) {
+            gl.activeTexture(gl.TEXTURE0 + slot);
+            gl.bindTexture(gl.TEXTURE_2D, sm.tex);
+          }
+          if (st.active && st.active.lightVp)
+            gl.uniformMatrix4fv(st.active.lightVp, false, new Float32Array(memory.buffer, lvpPtr, 16));
           break;
         }
         default:
@@ -4663,6 +4748,7 @@
       buffers: [],
       shaders: [],
       textures: [],
+      shadowMaps: [], // P9 slice 3: { fbo, tex, size } per handle
       vaos: new Map(),
       active: null,
       last: 0,
