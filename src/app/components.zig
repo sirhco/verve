@@ -988,6 +988,30 @@ pub fn glSceneMulti(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /push-multi: TWO PushProbe islands of the same name on one page, each
+/// subscribing to the "viz" push channel with its own vid. Both bound `probe`
+/// signals must move off "init" — the P7 push-routing regression (pre-fix the
+/// bridge delivered every pushed frame to the first DOM instance only).
+pub fn pushMulti(ctx: *const verve.Context) !*verve.Node {
+    const probe = struct {
+        fn go(c: *const verve.Context, label: []const u8) *verve.Node {
+            const inner = c.div().attr("style", "padding:1rem;border:1px solid #333;border-radius:8px;margin:.5rem 0").children(.{
+                c.span().text(label),
+                c.span().bind("probe").attr("style", "display:block;color:#0f0;font:700 28px monospace;padding-top:.25rem").text("init"),
+            });
+            return verve.island(c, .{ .name = "PushProbe" }, inner);
+        }
+    }.go;
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — push routing (two instances)"),
+        ctx.p().text("Two same-name PushProbe islands subscribe to the same push " ++
+            "channel, each with its own vid. Both probes must move off \"init\" to " ++
+            "\"GOT N\" — proving pushed frames reach the right instance, not just the first."),
+        probe(ctx, "Instance A:"),
+        probe(ctx, "Instance B:"),
+    }).build();
+}
+
 pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
     // Provide a default title only if the page didn't set one of its own.
     try ctx.setTitleIfUnset("Verve");

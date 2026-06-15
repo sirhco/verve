@@ -27,6 +27,13 @@ pub const JsonProbe = struct {
     pub const props_schema: []const u8 = "{}";
 };
 
+/// Multi-instance push-routing regression probe — two instances on one page,
+/// each subscribes to the "viz" channel with its vid and updates its own
+/// `probe` signal. Drives `/push-multi`. See src/client/islands/PushProbe.zig.
+pub const PushProbe = struct {
+    pub const props_schema: []const u8 = "{}";
+};
+
 /// Interactive node-link graph (verve.viz). SSR renders the converged layout
 /// (works with JS off); the client chunk reveals the nodes — scaling each from
 /// 0→1 in place — by mutating each group's `transform` by ref over a few

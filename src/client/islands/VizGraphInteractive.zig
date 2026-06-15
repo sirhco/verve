@@ -1007,7 +1007,7 @@ fn indexOfIdIn(list: []const []const u8, id: []const u8) ?usize {
 export fn viz_toggle_live() void {
     polling = !polling;
     if (polling) {
-        live_push = verve.pushSubscribe("viz", "VizGraphInteractive", "viz_apply_delta");
+        live_push = verve.pushSubscribe("viz", "VizGraphInteractive", "viz_apply_delta", vid);
         if (live_push) {
             requestResync();
         } else {
@@ -1016,7 +1016,7 @@ export fn viz_toggle_live() void {
         }
     } else {
         if (live_push) {
-            verve.pushUnsubscribe("viz", "VizGraphInteractive");
+            verve.pushUnsubscribe("viz", "VizGraphInteractive", vid);
             live_push = false;
         } else {
             var out: [16]u8 = undefined;

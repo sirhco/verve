@@ -1510,25 +1510,21 @@ pub fn host(name: []const u8, args_json: []const u8, out: []u8) []const u8 {
 /// and delivered to `export fn <export_name>(ptr: u32, len: u32) void`
 /// (payload valid only for the call). Returns false when the host has no
 /// EventSource — fall back to polling.
-pub fn pushSubscribe(channel: []const u8, island: []const u8, export_name: []const u8) bool {
-    var args_buf: [192]u8 = undefined;
-    const args = std.fmt.bufPrint(
-        &args_buf,
-        "{{\"op\":\"sub\",\"channel\":\"{s}\",\"island\":\"{s}\",\"export\":\"{s}\"}}",
-        .{ channel, island, export_name },
-    ) catch return false;
+/// `vid` is the subscribing island's per-instance id (its `root_id` from
+/// hydrate). The bridge routes pushed events back to THIS instance via the vid;
+/// without it, a page with multiple same-name islands delivers every event to
+/// the first DOM match, whose name-keyed signals never match (silent no-repaint).
+pub fn pushSubscribe(channel: []const u8, island: []const u8, export_name: []const u8, vid: u32) bool {
+    var args_buf: [224]u8 = undefined;
+    const args = @import("push.zig").subscribeArgs(&args_buf, channel, island, export_name, vid) orelse return false;
     var out: [64]u8 = undefined;
     const reply = host("vervePush", args, &out);
     return std.mem.indexOf(u8, reply, "\"err\"") == null;
 }
 
-pub fn pushUnsubscribe(channel: []const u8, island: []const u8) void {
-    var args_buf: [160]u8 = undefined;
-    const args = std.fmt.bufPrint(
-        &args_buf,
-        "{{\"op\":\"unsub\",\"channel\":\"{s}\",\"island\":\"{s}\"}}",
-        .{ channel, island },
-    ) catch return;
+pub fn pushUnsubscribe(channel: []const u8, island: []const u8, vid: u32) void {
+    var args_buf: [192]u8 = undefined;
+    const args = @import("push.zig").unsubscribeArgs(&args_buf, channel, island, vid) orelse return;
     var out: [16]u8 = undefined;
     _ = host("vervePush", args, &out);
 }

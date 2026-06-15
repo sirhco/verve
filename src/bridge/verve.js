@@ -4112,7 +4112,7 @@
   // stage the bytes in the island scratch buffer, scope to the island's vid,
   // call by name (never via the shared indirect function table — chunk fn
   // pointers would collide with the main client's table entries).
-  const callIslandExport = (islandName, exportName, text) => {
+  const callIslandExport = (islandName, exportName, text, wantVid) => {
     const chunk = chunkExports[islandName];
     if (
       !chunk ||
@@ -4125,10 +4125,15 @@
     const bytes = new TextEncoder().encode(text);
     if (bytes.length > cap) return;
     new Uint8Array(memory.buffer, ptr, cap).set(bytes, 0);
-    const el = document.querySelector(
-      `verve-island[data-name="${islandName}"]`,
-    );
-    const vid = el ? parseInt(el.getAttribute("data-vid"), 10) || 0 : 0;
+    // Prefer the caller-supplied instance vid (the one that registered the
+    // subscription / request); fall back to the first DOM match only when no
+    // vid is threaded through. Selecting the wrong instance leaves its name-
+    // keyed signals unresolved → silent no-repaint.
+    let vid = (wantVid >>> 0) || 0;
+    if (!vid) {
+      const el = document.querySelector(`verve-island[data-name="${islandName}"]`);
+      vid = el ? parseInt(el.getAttribute("data-vid"), 10) || 0 : 0;
+    }
     if (vid && typeof exp.verve_enter_island === "function")
       exp.verve_enter_island(vid);
     try {
@@ -4183,7 +4188,11 @@
   // EventSource handles retry/Last-Event-ID resume natively. Returns
   // `{"err":"unsupported"}` when the host has no EventSource so the chunk can
   // fall back to polling.
-  const pushChannels = new Map(); // channel → { es, subs: Map(island → export) }
+  // channel → { es, subs: Map(subKey → {island, export, vid}) }. subKey is the
+  // subscriber's vid (so two same-name island instances are DISTINCT subs);
+  // falls back to the island name when no vid is threaded (legacy single-sub).
+  const pushChannels = new Map();
+  const pushSubKey = (a) => (a.vid >>> 0) || a.island;
   window.verveHost.vervePush = (argsJson) => {
     let a = {};
     try {
@@ -4195,7 +4204,7 @@
     if (a.op === "unsub") {
       const entry = pushChannels.get(a.channel);
       if (entry) {
-        entry.subs.delete(a.island);
+        entry.subs.delete(pushSubKey(a));
         if (entry.subs.size === 0) {
           entry.es.close();
           pushChannels.delete(a.channel);
@@ -4209,12 +4218,18 @@
       const es = new EventSource(`/push?channel=${encodeURIComponent(a.channel)}`);
       entry = { es, subs: new Map() };
       es.addEventListener(a.channel, (e) => {
-        for (const [island, exportName] of entry.subs)
-          callIslandExport(island, exportName, e.data);
+        // Deliver to EACH subscribed instance under ITS OWN vid, so two
+        // same-name islands on one page each update their own state.
+        for (const [, sub] of entry.subs)
+          callIslandExport(sub.island, sub.export, e.data, sub.vid);
       });
       pushChannels.set(a.channel, entry);
     }
-    entry.subs.set(a.island, a.export);
+    entry.subs.set(pushSubKey(a), {
+      island: a.island,
+      export: a.export,
+      vid: (a.vid >>> 0) || 0,
+    });
     return "{}";
   };
 

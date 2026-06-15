@@ -16,4 +16,5 @@ test {
     _ = @import("event_state.zig");
     _ = @import("chunk_arena.zig");
     _ = @import("asset_region.zig");
+    _ = @import("push.zig");
 }

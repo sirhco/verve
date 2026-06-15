@@ -6,6 +6,21 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Push events reached only the first same-name island instance**
+  (`src/bridge/verve.js`, `src/client/island_runtime.zig`, new
+  `src/client/push.zig`): the bridge resolved a pushed frame's target island via
+  `querySelector('verve-island[data-name=X]')` — the first DOM match — instead of
+  the instance that registered the subscription. With multiple same-name islands
+  on one page (now common after P7), every frame went to the first instance; the
+  others' name-keyed signals never resolved → silent no-repaint (`signalSetStr`
+  on the async SSE path appeared not to flush). The subscriber's `vid` is now
+  threaded through `pushSubscribe`/`pushUnsubscribe` → the bridge's per-channel
+  sub map (keyed by vid) → `callIslandExport(..., vid)`, mirroring the working
+  `dispatchResponse` path. New `/push-multi` demo + a two-instance CDP regression;
+  `push.zig` unit-tests the wire-arg builders.
+
 ### Added
 
 - **`verve.gl` P7 — multiple GlScene instances per page**
