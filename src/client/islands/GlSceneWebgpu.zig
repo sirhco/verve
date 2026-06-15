@@ -19,12 +19,21 @@ const gl = verve.gl;
 
 // Matches the bridge import (gpuStart), shared with GlWebgpu.
 extern "verve" fn gl_start_gpu(ref_handle: i32, name_ptr: [*]const u8, name_len: u32) void;
+// Asset fetch (backend-agnostic): fetches a URL, calls the named export with the
+// loaded bytes (ptr/len). Shared with GlScene's env path.
+extern "verve" fn gl_load(url_ptr: [*]const u8, url_len: u32, cb_ptr: [*]const u8, cb_len: u32) void;
 
 // ── Statics ─────────────────────────────────────────────────────────────────
 
 var canvas_handle: ?i32 = null;
 var yaw: f32 = 0;
 var resources_sent: bool = false;
+// IBL environment (P10 2b): fetched async via gl_load; the create_texture_ex
+// uploads are emitted once `env_reader` resolves (gated by `ibl_sent`), then
+// `bindIbl` is re-emitted each frame. The Reader holds slices into the page
+// asset region, which stays valid for this single-instance chunk's lifetime.
+var env_reader: ?gl.venv.Reader = null;
+var ibl_sent: bool = false;
 
 // STABLE statics — drawPbr records their addresses; the bridge reads them after
 // the frame fn returns, so they must outlive the call (exactly like GlScene's
@@ -34,8 +43,9 @@ var model_mat: [16]f32 = undefined;
 var normal9: [9]f32 = undefined;
 var camera_pos: [3]f32 = .{ 0, 0, 4 };
 // Material block: baseColor.rgba, [metallic, roughness, occlusion, normalScale],
-// emissive.rgb, pad. White dielectric, mid roughness.
-var material: [12]f32 = .{ 1, 1, 1, 1, 0, 0.5, 1, 1, 0, 0, 0, 0 };
+// emissive.rgb, pad. Metallic + low roughness so the IBL environment shows as
+// reflections (metals tint the reflection by the base-color texture).
+var material: [12]f32 = .{ 1, 1, 1, 1, 1, 0.25, 1, 1, 0, 0, 0, 0 };
 // One directional light: [type(0=dir), intensity, dir.xyz, color.rgb].
 var light: [8]f32 = .{ 0, 3, -0.4, -0.7, -0.6, 1, 1, 1 };
 
@@ -48,17 +58,24 @@ const base_rgba = [_]u8{
 // 0.5) dominate (glTF packs roughness in G, metallic in B; factor × texel).
 const mr_rgba = [_]u8{ 255, 255, 255, 255 };
 
-// cmd_buf: one-time creates (2×createBuffer + createShader + 2×createTexture
-// ≈ 160 B) + per-frame beginFrame/setPipeline/setLights/2×bindTexture/drawPbr/
-// endFrame (≈ 130 B). Round generously to 512.
-var cmd_buf: [512]u8 = undefined;
+// cmd_buf: one-time mesh creates (≈ 160 B) + one-time IBL creates (3×
+// createTextureEx ≈ 110 B) + per-frame beginFrame/setPipeline/setLights/bindIbl/
+// 2×bindTexture/drawPbr/endFrame (≈ 150 B). Round generously to 1024.
+var cmd_buf: [1024]u8 = undefined;
 
 const vbuf_handle: u32 = 1;
 const ibuf_handle: u32 = 2;
 const shader_handle: u32 = 1;
 const base_tex: u32 = 1;
 const mr_tex: u32 = 2;
+// IBL texture handles — distinct from base/mr (textures live in their own bridge
+// handle space; 16/17/18 mirror GlScene's irr/spec/lut handles).
+const irr_handle: u32 = 16;
+const spec_handle: u32 = 17;
+const lut_handle: u32 = 18;
 const frame_export = "glscenewebgpu_frame";
+const env_ready_export = "glscenewebgpu_env_ready";
+const env_url = "/gl/studio.venv";
 
 // ── hydrate ─────────────────────────────────────────────────────────────────
 
@@ -68,6 +85,8 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     _ = root_id;
 
     resources_sent = false;
+    ibl_sent = false;
+    env_reader = null;
     yaw = 0;
     canvas_handle = verve.queryRef(@as([]const u8, "glscenewebgpu-canvas"));
 
@@ -75,6 +94,18 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     // first frame (guarded by resources_sent), exactly like GlWebgpu.
     if (canvas_handle) |h|
         gl_start_gpu(h, frame_export.ptr, frame_export.len);
+
+    // Fetch the prefiltered IBL environment; createTextureEx + bindIbl follow once
+    // the bytes land (glscenewebgpu_env_ready).
+    gl_load(env_url.ptr, env_url.len, env_ready_export.ptr, env_ready_export.len);
+}
+
+// ── asset-ready callback ──────────────────────────────────────────────────────
+
+export fn glscenewebgpu_env_ready(ptr: u32, len: u32) void {
+    if (ptr == 0) return; // fetch failed → stay direct-lit (black IBL defaults)
+    const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
+    env_reader = gl.venv.Reader.init(bytes) catch null;
 }
 
 // ── frame export ──────────────────────────────────────────────────────────────
@@ -128,9 +159,19 @@ export fn glscenewebgpu_frame(dt_ms: f32, width: u32, height: u32) u32 {
         enc.createTextureSrgb(base_tex, 2, 2, @intCast(@intFromPtr(&base_rgba)), @intCast(base_rgba.len));
         enc.createTexture(mr_tex, 1, 1, @intCast(@intFromPtr(&mr_rgba)), @intCast(mr_rgba.len));
     }
+    // One-time IBL upload once the .venv environment has loaded: irradiance cube,
+    // prefiltered specular mip-chain, BRDF LUT — all RGBA16F (mirror GlScene).
+    if (env_reader != null and !ibl_sent) {
+        ibl_sent = true;
+        const env = &env_reader.?;
+        enc.createTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));
+        enc.createTextureEx(spec_handle, .cube, .rgba16f, env.spec_size, env.spec_size, env.spec_mip_count, @intCast(@intFromPtr(env.specular.ptr)), @intCast(env.specular.len));
+        enc.createTextureEx(lut_handle, .tex_2d, .rgba16f, env.lut_size, env.lut_size, 1, @intCast(@intFromPtr(env.lut.ptr)), @intCast(env.lut.len));
+    }
     enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
     enc.setPipeline(shader_handle, gl.command.state_depth_test | gl.command.state_cull_back);
     enc.setLights(1, @intCast(@intFromPtr(&light)));
+    if (ibl_sent) enc.bindIbl(irr_handle, spec_handle, lut_handle, env_reader.?.spec_mip_count);
     enc.bindTexture(0, base_tex);
     enc.bindTexture(1, mr_tex);
     enc.drawPbr(
