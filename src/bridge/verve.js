@@ -4766,6 +4766,70 @@
     st.active = null;
   };
 
+  // Build the device-default placeholder textures + sampler that fill any
+  // unbound PBR material slot (0–7), so the draw_pbr bind group (T3) is always
+  // complete. WebGPU has no global texture state: every sampled binding in the
+  // WGSL must resolve to a valid view. Created ONCE per device.
+  //
+  // Default-slot color mapping (T3 consults this when a slot has no bound tex):
+  //   0 base-color           → white (neutral multiply → material base factor)
+  //   1 metallic-roughness   → white (factors carry metallic/roughness)
+  //   2 normal               → white (no per-pixel normal; geometric normal used)
+  //   3 emissive             → black (no emission)
+  //   4 occlusion            → white (neutral multiply → full ambient)
+  //   5 irradiance (cube)    → black (zero diffuse IBL; real cubes in slice 2b)
+  //   6 prefiltered (cube)   → black (zero specular IBL)
+  //   7 brdf_lut             → black (zero IBL contribution)
+  // i.e. slots 0/1/2/4 → white2d, 3 → black2d, 5/6 → blackCube, 7 → black2d.
+  const gpuMakeDefaults = (device) => {
+    const make2d = (rgba) => {
+      const tex = device.createTexture({
+        size: [1, 1],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
+          GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      device.queue.writeTexture(
+        { texture: tex },
+        new Uint8Array(rgba),
+        { bytesPerRow: 4, rowsPerImage: 1 },
+        [1, 1],
+      );
+      return { tex, view: tex.createView(), w: 1, h: 1 };
+    };
+    // 1×1×6 black cube. Each face is one RGBA texel; upload per-layer.
+    const cubeTex = device.createTexture({
+      size: [1, 1, 6],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    for (let face = 0; face < 6; face++) {
+      device.queue.writeTexture(
+        { texture: cubeTex, origin: [0, 0, face] },
+        new Uint8Array([0, 0, 0, 255]),
+        { bytesPerRow: 4, rowsPerImage: 1 },
+        [1, 1, 1],
+      );
+    }
+    return {
+      white2d: make2d([255, 255, 255, 255]),
+      black2d: make2d([0, 0, 0, 255]),
+      blackCube: {
+        tex: cubeTex,
+        view: cubeTex.createView({ dimension: "cube" }),
+        w: 1,
+        h: 1,
+      },
+      sampler: device.createSampler({
+        magFilter: "linear",
+        minFilter: "linear",
+        addressModeU: "repeat",
+        addressModeV: "repeat",
+      }),
+    };
+  };
+
   // WebGPU command-stream interpreter. Consumes the SAME binary stream as
   // glInterpret (4-byte tag/size header per command, little-endian) but drives
   // WebGPU. Slice 1 handles only the minimal unlit-cube subset (6 tags);
@@ -4908,6 +4972,36 @@
             st.pass = null;
             st.encoder = null;
           }
+          break;
+        }
+        case 7: // CREATE_TEXTURE — raw RGBA8 (linear)
+        case 15: { // CREATE_TEXTURE_SRGB — RGBA8 sRGB internal (hw sRGB→linear on sample)
+          // Same 20-byte payload for both: handle|w|h|ptr|byte_len.
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          const p = dv.getUint32(off + 12, true);
+          const len = dv.getUint32(off + 16, true);
+          const format = tag === 15 ? "rgba8unorm-srgb" : "rgba8unorm";
+          const tex = device.createTexture({
+            size: [w, h],
+            format,
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
+              GPUTextureUsage.RENDER_ATTACHMENT,
+          });
+          device.queue.writeTexture(
+            { texture: tex },
+            new Uint8Array(memory.buffer, p, len),
+            { bytesPerRow: w * 4, rowsPerImage: h },
+            [w, h],
+          );
+          st.textures[handle] = { tex, view: tex.createView(), w, h };
+          break;
+        }
+        case 8: { // BIND_TEXTURE — record slot→handle; bind group assembled at draw_pbr (T3)
+          const slot = dv.getUint32(off, true);
+          const handle = dv.getUint32(off + 4, true);
+          st.boundTex[slot] = handle;
           break;
         }
         default:
@@ -5105,6 +5199,9 @@
       exportName,
       buffers: [],
       pipelines: [],
+      textures: [],
+      boundTex: [],
+      defaults: gpuMakeDefaults(gpu.device),
       active: null,
       encoder: null,
       pass: null,
