@@ -55,7 +55,10 @@ pub fn chat(ctx: *const verve.Context, messages: []api.Message) !*verve.Node {
         ctx.actionForm(.{ .post = "/api/clearMessages" }).children(.{
             ctx.button("Clear all").type_("submit").class("danger"),
         }),
-        ctx.el("script").text(
+        // Inline JS must be emitted verbatim. `.text()` HTML-escapes `>` and
+        // `&`, corrupting `=>` into `=&gt;` (a SyntaxError that kills the
+        // live-reload); `scriptInline` emits the body raw with the CSP nonce.
+        ctx.scriptInline(
             \\(()=>{const seen=Number(document.body.dataset.tick||0);const es=new EventSource('/events');es.addEventListener('count',(e)=>{const v=Number(e.data);if(!Number.isNaN(v)&&v!==seen){location.reload();}});})();
         ),
     });

@@ -38,7 +38,10 @@ pub fn build(b: *std.Build) void {
 
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(wasm.getEmittedBin(), "client.wasm");
-    _ = wf.addCopyFile(b.path("../../src/bridge/verve.js"), "verve.js");
+    // This example ships its OWN bridge (the 50 ms tick loop + z-on-click →
+    // wasm-export routing); it must NOT use the framework's default bridge,
+    // which speaks the island-runtime contract the custom client doesn't.
+    _ = wf.addCopyFile(b.path("src/bridge/verve.js"), "verve.js");
     _ = wf.add("assets.zig",
         \\pub const wasm: []const u8 = @embedFile("client.wasm");
         \\pub const js: []const u8 = @embedFile("verve.js");
