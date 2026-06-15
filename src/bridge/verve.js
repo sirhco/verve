@@ -5705,10 +5705,16 @@
       pbrSlot: 0, // per-frame draw counter (also gates the poster swap below)
       poster: undefined, // SSR <img data-gl-poster>; undefined=unlooked, null=none
       posterHidden: false,
+      // P11: this canvas's GlScene instance vid — selected before each frame so
+      // the chunk renders THIS instance's state (mirrors glStart). 0 = single.
+      vid: vidOfEl(canvas),
     };
     const sink = (now) => {
-      // Island unmounted: canvas detached. Stop without rescheduling.
+      // Island unmounted: canvas detached. Reclaim the chunk instance slot (P7)
+      // then stop without rescheduling. GPU objects are GC'd (no WebGL-style
+      // dispose needed); the unmount keeps the chunk's instance pool from leaking.
       if (!canvas.isConnected) {
+        if (typeof st.exports.glscene_unmount === "function") st.exports.glscene_unmount(st.vid >>> 0);
         glSinks.delete(sink);
         return;
       }
@@ -5719,6 +5725,8 @@
       const h = Math.min(4096, Math.max(1, Math.round(canvas.clientHeight * dpr)));
       if (canvas.width !== w) canvas.width = w;
       if (canvas.height !== h) canvas.height = h;
+      // P11: select this canvas's instance before the frame export reads state.
+      glSelect(st.exports, st.vid);
       const ptr = st.exports[st.exportName](dt, w, h) >>> 0;
       if (!ptr) {
         // wasm asked to stop. 0 = stop loop.
