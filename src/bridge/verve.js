@@ -4827,6 +4827,18 @@
         addressModeU: "repeat",
         addressModeV: "repeat",
       }),
+      // Fallback shadow resources (variant_shadow bind group is always complete
+      // even before bind_shadow_map): a 1×1 depth texture (content irrelevant —
+      // unbound shadow leaves geometry lit) + a comparison sampler.
+      shadowTex: (() => {
+        const t = device.createTexture({
+          size: [1, 1],
+          format: "depth32float",
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        return { tex: t, view: t.createView() };
+      })(),
+      shadowSampler: device.createSampler({ compare: "less" }),
     };
   };
 
@@ -4842,7 +4854,8 @@
   //   lights     : vec4[8] @ 240  (16 f32 packed = count*8 from wasm)
   //   light_count: i32     @ 368
   //   prefiltered_mips:f32 @ 372
-  // total struct size = 376 → round up to 384 (16B multiple).
+  //   light_vp   : mat4x4  @ 384  (variant_shadow only; non-shadow ignores it)
+  // base struct = 376 → 384; with light_vp → 448 (both 16B multiples).
   const PBR_U = {
     mvp: 0,
     model: 64,
@@ -4852,7 +4865,8 @@
     lights: 240,
     lightCount: 368,
     prefMips: 372,
-    size: 384,
+    lightVp: 384, // variant_shadow light-space matrix (set by bind_shadow_map)
+    size: 448,
   };
   // Lazily create the shared PBR uniform buffer (reused across frames/draws).
   const gpuEnsurePbrUniform = (st) => {
@@ -4863,6 +4877,23 @@
       });
     }
     return st.pbrUniform;
+  };
+  // Lazily create the depth-pass uniform (a single mat4 light-space mvp) + its
+  // bind group against the depth pipeline's layout. Reused across draws/frames.
+  const gpuEnsureDepthUniform = (st, depthPipe) => {
+    if (!st.depthUniform) {
+      st.depthUniform = st.device.createBuffer({
+        size: 64, // one mat4x4<f32>
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    if (!st.depthBindGroup && depthPipe) {
+      st.depthBindGroup = st.device.createBindGroup({
+        layout: depthPipe.bgl0,
+        entries: [{ binding: 0, resource: { buffer: st.depthUniform } }],
+      });
+    }
+    return st.depthUniform;
   };
   // Resolve a material slot (0=base,1=mr,2=normal,3=emissive,4=occlusion — the
   // bind_texture wire numbering) to a texture view, falling back to a device
@@ -4920,7 +4951,10 @@
             st.lastW = w;
             st.lastH = h;
           }
-          st.encoder = device.createCommandEncoder();
+          // Reuse the encoder if a shadow pass already opened one this frame
+          // (begin_shadow_pass runs BEFORE begin_frame); else create one. Both
+          // the shadow depth pass and the color pass share one encoder + submit.
+          if (!st.encoder) st.encoder = device.createCommandEncoder();
           st.pass = st.encoder.beginRenderPass({
             colorAttachments: [{
               view: st.ctx.getCurrentTexture().createView(),
@@ -5271,6 +5305,62 @@
           st.shadowMaps[handle] = { tex, view: tex.createView(), sampler, size };
           break;
         }
+        case 17: { // BEGIN_SHADOW_PASS — open a depth-only pass on the shadow map.
+          // Payload (12B): shadow_handle | depth_shader_handle | size. Runs BEFORE
+          // begin_frame; opens (and owns) the frame's command encoder so the depth
+          // pass and the later color pass share one encoder + submit.
+          const sm = st.shadowMaps[dv.getUint32(off, true)];
+          const depthPipe = st.pipelines[dv.getUint32(off + 4, true)];
+          if (!sm || !depthPipe) break;
+          if (!st.encoder) st.encoder = device.createCommandEncoder();
+          st.shadowPass = st.encoder.beginRenderPass({
+            colorAttachments: [],
+            depthStencilAttachment: {
+              view: sm.view,
+              depthClearValue: 1.0,
+              depthLoadOp: "clear",
+              depthStoreOp: "store",
+            },
+          });
+          st.active = depthPipe;
+          gpuEnsureDepthUniform(st, depthPipe);
+          break;
+        }
+        case 18: { // END_SHADOW_PASS — close the depth pass (keep encoder for color).
+          if (st.shadowPass) {
+            st.shadowPass.end();
+            st.shadowPass = null;
+          }
+          break;
+        }
+        case 19: { // DRAW_DEPTH — position-only draw into the shadow map.
+          // Payload (20B): vbuf | ibuf | idx_byte_off | count | mvp_ptr.
+          const vb = st.buffers[dv.getUint32(off, true)];
+          const ib = st.buffers[dv.getUint32(off + 4, true)];
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const mvpPtr = dv.getUint32(off + 16, true);
+          if (!vb || !ib || !st.shadowPass || !st.active || st.active.kind !== "depth") break;
+          device.queue.writeBuffer(st.depthUniform, 0, new Float32Array(memory.buffer, mvpPtr, 16));
+          st.shadowPass.setPipeline(st.active.pipeline);
+          st.shadowPass.setVertexBuffer(0, vb.buf);
+          st.shadowPass.setIndexBuffer(ib.buf, "uint16", byteOff);
+          st.shadowPass.setBindGroup(0, st.depthBindGroup);
+          st.shadowPass.drawIndexed(count);
+          break;
+        }
+        case 20: { // BIND_SHADOW_MAP — record the shadow map + write light_vp.
+          // Payload (12B): slot | shadow_handle | light_vp_ptr. The depth-compare
+          // map + comparison sampler are bound at draw_pbr (group(1) 9/10); here we
+          // record the handle and write the light-space matrix into the uniform.
+          const shadowHandle = dv.getUint32(off + 4, true);
+          const lvpPtr = dv.getUint32(off + 8, true);
+          st.shadow = { handle: shadowHandle };
+          const ubuf = gpuEnsurePbrUniform(st);
+          device.queue.writeBuffer(ubuf, PBR_U.lightVp, new Float32Array(memory.buffer, lvpPtr, 16));
+          st.bg1Dirty = true; // rebind group(1) with the real shadow map
+          break;
+        }
         case 13: { // DRAW_PBR — full PBR submesh draw.
           // Payload (command.zig Encoder.drawPbr, 36B / 9 u32):
           //   vbuf | ibuf | idx_byte_off | count | mvp_ptr | model_ptr |
@@ -5335,6 +5425,11 @@
             e.push({ binding: 6, resource: gpuIblView(st, ibl?.irr, d.blackCube) }); // irradiance (cube)
             e.push({ binding: 7, resource: gpuIblView(st, ibl?.spec, d.blackCube) }); // prefiltered (cube)
             e.push({ binding: 8, resource: gpuIblView(st, ibl?.lut, d.black2d) }); // brdf_lut
+            if (active.hasShadow) { // variant_shadow: depth-compare map + sampler
+              const sm = st.shadow ? st.shadowMaps[st.shadow.handle] : null;
+              e.push({ binding: 9, resource: (sm && sm.view) ? sm.view : d.shadowTex.view });
+              e.push({ binding: 10, resource: (sm && sm.sampler) ? sm.sampler : d.shadowSampler });
+            }
             st.bg1 = device.createBindGroup({ layout: active.bgl1, entries: e });
             st.bg1Layout = active.bgl1;
             st.bg1Dirty = false;
@@ -5555,6 +5650,8 @@
       uniformBuf: null,
       bindGroup: null,
       pbrUniform: null, // shared PBR uniform buffer (lazy; PBR_U.size bytes)
+      depthUniform: null, // shadow depth-pass uniform (lazy; one mat4)
+      depthBindGroup: null, // cached depth-pass bind group (2c)
       bg0: null, // cached group(0) bind group (uniform)
       bg0Layout: null,
       bg1: null, // cached group(1) bind group (sampler + textures)
