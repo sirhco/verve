@@ -4766,6 +4766,27 @@
     st.active = null;
   };
 
+  // WebGPU device bootstrap. Feature-detects navigator.gpu, requests an
+  // adapter + device, and configures the canvas' "webgpu" context with the
+  // preferred format. Degrades gracefully: returns null (never throws) on any
+  // missing capability or async failure so the WebGL2 path stays the fallback.
+  const gpuInit = async (canvas) => {
+    try {
+      if (typeof navigator === "undefined" || !navigator.gpu) return null;
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) return null;
+      const device = await adapter.requestDevice();
+      const ctx = canvas.getContext("webgpu");
+      if (!ctx) return null;
+      const format = navigator.gpu.getPreferredCanvasFormat();
+      ctx.configure({ device, format, alphaMode: "opaque" });
+      return { device, ctx, format };
+    } catch (err) {
+      console.warn("verve.gl: WebGPU init failed:", err);
+      return null;
+    }
+  };
+
   const glStart = (refHandle, exportName) => {
     const canvas = refHandles[refHandle];
     const exports = glActiveChunkExports;
