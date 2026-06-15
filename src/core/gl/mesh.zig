@@ -86,6 +86,22 @@ pub const pbr_cube_indices = [_]u16{
     20, 21, 22, 20, 22, 23, // -Y
 };
 
+// ── PBR ground plane (stride-48 layout) ──────────────────────────────────────
+//
+// A unit quad in the XZ plane (y=0), normal +Y, tangent +X, uv 0..1. Position +
+// scale via a model matrix. Used by the WebGPU shadow demo (GlSceneWebgpu) as the
+// receiver the cube casts its shadow onto. Winding (0,2,1 / 0,3,2) makes the top
+// face front-facing (CCW-from-above) so it survives back-face cull.
+pub const pbr_plane_vertices = [_]f32{
+    // pos        normal     tangent      uv
+    -1, 0, -1, 0, 1, 0, 1, 0, 0, 1, 0, 0,
+    1,  0, -1, 0, 1, 0, 1, 0, 0, 1, 1, 0,
+    1,  0, 1,  0, 1, 0, 1, 0, 0, 1, 1, 1,
+    -1, 0, 1,  0, 1, 0, 1, 0, 0, 1, 0, 1,
+};
+
+pub const pbr_plane_indices = [_]u16{ 0, 2, 1, 0, 3, 2 };
+
 const testing = std.testing;
 
 test "cube shape invariants" {
@@ -98,4 +114,10 @@ test "pbr cube shape invariants" {
     try testing.expectEqual(@as(usize, 24 * 12), pbr_cube_vertices.len); // 24 verts * 12 f32
     try testing.expectEqual(@as(usize, 36), pbr_cube_indices.len); // 12 triangles
     for (pbr_cube_indices) |i| try testing.expect(i < 24);
+}
+
+test "pbr plane shape invariants" {
+    try testing.expectEqual(@as(usize, 4 * 12), pbr_plane_vertices.len); // 4 verts * 12 f32
+    try testing.expectEqual(@as(usize, 6), pbr_plane_indices.len); // 2 triangles
+    for (pbr_plane_indices) |i| try testing.expect(i < 4);
 }

@@ -41,13 +41,27 @@ var ibl_sent: bool = false;
 var mvp: [16]f32 = undefined;
 var model_mat: [16]f32 = undefined;
 var normal9: [9]f32 = undefined;
-var camera_pos: [3]f32 = .{ 0, 0, 4 };
+var camera_pos: [3]f32 = .{ 0, 2.5, 5 };
 // Material block: baseColor.rgba, [metallic, roughness, occlusion, normalScale],
 // emissive.rgb, pad. Metallic + low roughness so the IBL environment shows as
 // reflections (metals tint the reflection by the base-color texture).
 var material: [12]f32 = .{ 1, 1, 1, 1, 1, 0.25, 1, 1, 0, 0, 0, 0 };
 // One directional light: [type(0=dir), intensity, dir.xyz, color.rgb].
 var light: [8]f32 = .{ 0, 3, -0.4, -0.7, -0.6, 1, 1, 1 };
+
+// Ground plane (shadow receiver): matte dielectric so the shadow reads clearly.
+var plane_mvp: [16]f32 = undefined;
+var plane_model: [16]f32 = undefined;
+var plane_normal9: [9]f32 = undefined;
+var plane_material: [12]f32 = .{ 0.8, 0.8, 0.8, 1, 0, 0.9, 1, 1, 0, 0, 0, 0 };
+
+// Shadow pass (STABLE statics — the wire records their addresses):
+//   light_vp      = Zfix · ortho · lookAt (WebGPU [0,1]-z light matrix); the
+//                   PBR vertex shader applies ·model, so this is the raw light VP.
+//   depth_mvp_*   = light_vp · model, fed to the depth-only draw per object.
+var light_vp: [16]f32 = undefined;
+var depth_mvp_cube: [16]f32 = undefined;
+var depth_mvp_plane: [16]f32 = undefined;
 
 // 2×2 sRGB base-color checker (orange / slate) so the UV texturing is visible.
 const base_rgba = [_]u8{
@@ -73,9 +87,34 @@ const mr_tex: u32 = 2;
 const irr_handle: u32 = 16;
 const spec_handle: u32 = 17;
 const lut_handle: u32 = 18;
+// Ground-plane receiver buffers (own buffer-handle space) + shadow resources.
+const plane_vbuf_handle: u32 = 3;
+const plane_ibuf_handle: u32 = 4;
+const depth_shader: u32 = 5; // variant_depth program (separate shader space)
+const shadow_handle: u32 = 1; // shadow map (separate shadowMaps space)
+const shadow_size: u32 = 1024;
 const frame_export = "glscenewebgpu_frame";
 const env_ready_export = "glscenewebgpu_env_ready";
 const env_url = "/gl/studio.venv";
+
+// Directional light view-projection for the shadow pass. `gl.math` ortho/lookAt
+// are GL-convention (clip z ∈ [−1,1]); WebGPU clips z<0 and stores depth in [0,1],
+// so premultiply Zfix (row 2 = [0,0,0.5,0.5]) to remap clip z → [0,1]. The WGSL
+// shadowFactor then uses ndc.z directly (see command.zig wgslPbr fs_shadow_decl).
+fn computeLightVp() gl.math.Mat4 {
+    const dir = gl.math.Vec3.normalize(gl.math.Vec3.init(light[2], light[3], light[4]));
+    const center = gl.math.Vec3.init(0, -0.5, 0);
+    const eye = gl.math.Vec3.sub(center, gl.math.Vec3.scale(dir, 8.0));
+    const view = gl.math.Mat4.lookAt(eye, center, gl.math.Vec3.init(0, 1, 0));
+    const proj = gl.math.Mat4.ortho(-4, 4, -4, 4, 0.1, 20);
+    var zfix = gl.math.Mat4{ .m = [_]f32{0} ** 16 };
+    zfix.m[0] = 1;
+    zfix.m[5] = 1;
+    zfix.m[10] = 0.5;
+    zfix.m[14] = 0.5;
+    zfix.m[15] = 1;
+    return zfix.mul(proj).mul(view);
+}
 
 // ── hydrate ─────────────────────────────────────────────────────────────────
 
@@ -130,6 +169,23 @@ export fn glscenewebgpu_frame(dt_ms: f32, width: u32, height: u32) u32 {
     model_mat = model.m;
     normal9 = gl.math.normalMatrix(model);
 
+    // Ground plane: a large flat quad below the cube (static).
+    const pmodel = gl.math.Mat4.fromTrs(
+        gl.math.Vec3.init(0, -1.5, 0),
+        gl.math.Quat.fromAxisAngle(gl.math.Vec3.init(0, 1, 0), 0),
+        gl.math.Vec3.init(6, 1, 6),
+    );
+    plane_mvp = proj.mul(view).mul(pmodel).m;
+    plane_model = pmodel.m;
+    plane_normal9 = gl.math.normalMatrix(pmodel);
+
+    // Light-space matrices for the shadow pass (depth = light_vp·model per object;
+    // the receiver shader applies ·model itself, so bind_shadow_map gets light_vp).
+    const lvp = computeLightVp();
+    light_vp = lvp.m;
+    depth_mvp_cube = lvp.mul(model).m;
+    depth_mvp_plane = lvp.mul(pmodel).m;
+
     var enc = gl.Encoder.init(&cmd_buf);
     if (!resources_sent) {
         resources_sent = true;
@@ -145,16 +201,40 @@ export fn glscenewebgpu_frame(dt_ms: f32, width: u32, height: u32) u32 {
             @intCast(@intFromPtr(&gl.mesh.pbr_cube_indices)),
             @sizeOf(@TypeOf(gl.mesh.pbr_cube_indices)),
         );
-        // WGSL module (both stages) — F0 plain PBR. fs args 0/0: one source.
-        const wgsl = gl.command.wgslPbr(gl.command.variant_pbr);
+        // Ground-plane receiver buffers.
+        enc.createBuffer(
+            plane_vbuf_handle,
+            .vertex,
+            @intCast(@intFromPtr(&gl.mesh.pbr_plane_vertices)),
+            @sizeOf(@TypeOf(gl.mesh.pbr_plane_vertices)),
+        );
+        enc.createBuffer(
+            plane_ibuf_handle,
+            .index,
+            @intCast(@intFromPtr(&gl.mesh.pbr_plane_indices)),
+            @sizeOf(@TypeOf(gl.mesh.pbr_plane_indices)),
+        );
+        // PBR shadow-receiver shader (one WGSL module, both stages).
+        const wgsl = gl.command.wgslPbr(gl.command.variant_pbr | gl.command.variant_shadow);
         enc.createShader(
             shader_handle,
-            gl.command.variant_pbr,
+            gl.command.variant_pbr | gl.command.variant_shadow,
             @intCast(@intFromPtr(wgsl.ptr)),
             @intCast(wgsl.len),
             0,
             0,
         );
+        // Depth-only shader for the shadow pass + the shadow map target.
+        const dwgsl = gl.command.wgslDepth();
+        enc.createShader(
+            depth_shader,
+            gl.command.variant_depth,
+            @intCast(@intFromPtr(dwgsl.ptr)),
+            @intCast(dwgsl.len),
+            0,
+            0,
+        );
+        enc.createShadowMap(shadow_handle, shadow_size);
         // Base color is sRGB (hardware decode); MR stays linear.
         enc.createTextureSrgb(base_tex, 2, 2, @intCast(@intFromPtr(&base_rgba)), @intCast(base_rgba.len));
         enc.createTexture(mr_tex, 1, 1, @intCast(@intFromPtr(&mr_rgba)), @intCast(mr_rgba.len));
@@ -168,10 +248,19 @@ export fn glscenewebgpu_frame(dt_ms: f32, width: u32, height: u32) u32 {
         enc.createTextureEx(spec_handle, .cube, .rgba16f, env.spec_size, env.spec_size, env.spec_mip_count, @intCast(@intFromPtr(env.specular.ptr)), @intCast(env.specular.len));
         enc.createTextureEx(lut_handle, .tex_2d, .rgba16f, env.lut_size, env.lut_size, 1, @intCast(@intFromPtr(env.lut.ptr)), @intCast(env.lut.len));
     }
+    // ── shadow depth pass (light's POV) — MUST precede the color pass ──
+    enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
+    enc.drawDepth(vbuf_handle, ibuf_handle, 0, @intCast(gl.mesh.pbr_cube_indices.len), @intCast(@intFromPtr(&depth_mvp_cube)));
+    enc.drawDepth(plane_vbuf_handle, plane_ibuf_handle, 0, @intCast(gl.mesh.pbr_plane_indices.len), @intCast(@intFromPtr(&depth_mvp_plane)));
+    enc.endShadowPass(width, height);
+
+    // ── color pass ──
     enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
     enc.setPipeline(shader_handle, gl.command.state_depth_test | gl.command.state_cull_back);
     enc.setLights(1, @intCast(@intFromPtr(&light)));
     if (ibl_sent) enc.bindIbl(irr_handle, spec_handle, lut_handle, env_reader.?.spec_mip_count);
+    enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&light_vp)));
+    // Cube (metallic, textured).
     enc.bindTexture(0, base_tex);
     enc.bindTexture(1, mr_tex);
     enc.drawPbr(
@@ -183,6 +272,18 @@ export fn glscenewebgpu_frame(dt_ms: f32, width: u32, height: u32) u32 {
         @intCast(@intFromPtr(&model_mat)),
         @intCast(@intFromPtr(&normal9)),
         @intCast(@intFromPtr(&material)),
+        @intCast(@intFromPtr(&camera_pos)),
+    );
+    // Ground plane (matte receiver; same bound textures, plane material).
+    enc.drawPbr(
+        plane_vbuf_handle,
+        plane_ibuf_handle,
+        0,
+        @intCast(gl.mesh.pbr_plane_indices.len),
+        @intCast(@intFromPtr(&plane_mvp)),
+        @intCast(@intFromPtr(&plane_model)),
+        @intCast(@intFromPtr(&plane_normal9)),
+        @intCast(@intFromPtr(&plane_material)),
         @intCast(@intFromPtr(&camera_pos)),
     );
     enc.endFrame();
