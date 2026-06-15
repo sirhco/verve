@@ -157,6 +157,7 @@ Native 3D, pure Zig + one dumb WebGL2 interpreter — no three.js. The whole eng
 - **Asset pipeline** — build-time `.glb` → packed `.vmesh` (`tools/gl_asset_gen`): zero runtime parsing, fetch → linear memory → GPU upload. Pure-Zig PNG decoder, glb parser, and vmesh reader, all hardened against hostile input (errors, never panics). Demo asset is fully procedural — no binaries in the repo.
 - **Runtime loading** — islands fetch `.vmesh` over `gl_load` into the chunk arena; failed fetches degrade to clear-only frames with a structured console error.
 - **v1 complete** — PBR metallic-roughness + IBL (P3), orbit controls + BVH picking + declarative `ctx.glScene` (P4), `verve.anim` fusion with scroll-scrubbed 3D turntable (P5). Demo: [`examples/gl-viewer/`](examples/gl-viewer/README.md).
+- **Render quality (P9)** — per-submesh shader-variant selection (leanest correct PBR program per submesh), per-node frustum culling (CPU-side, wire-invisible), and a single directional shadow map (depth pass into a `DEPTH_COMPONENT24` FBO + 3×3 PCF). Demos: the `/gl-mixed` (variants) and `/gl-shadow` (cast shadow) routes.
 
 ### Markdown & syntax highlighting
 Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed at SSR time into the `Node` tree; no client wasm, no JavaScript. Guide: [`docs/21-markdown-and-highlighting.md`](docs/21-markdown-and-highlighting.md). Demo: [`examples/markdown/`](examples/markdown/README.md).
@@ -211,7 +212,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.5.2
+VERSION=0.5.3
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256
@@ -232,7 +233,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.5.2
+zig fetch --save git+https://github.com/sirhco/verve#v0.5.3
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -292,7 +293,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.5.2 \
+verve-cli new ~/my-app --release v0.5.3 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 

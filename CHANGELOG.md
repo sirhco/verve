@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-06-14
+
 ### Added
 
 - **`verve.gl` P9 (render quality) — directional shadow map**
@@ -47,6 +49,19 @@ versions follow [Semantic Versioning](https://semver.org/).
     culled submesh before its variant/pipeline block, so lazy `SET_PIPELINE`
     emission keeps the wire stream-order rule intact. Picking/hover are
     unaffected (culled submeshes stay pickable).
+
+### Fixed
+
+- **`examples/stopwatch` interactivity** (`examples/stopwatch/build.zig`): the
+  build served the framework's default bridge (`../../src/bridge/verve.js`, the
+  island-runtime contract) instead of the example's own `src/bridge/verve.js` —
+  so its 50 ms tick loop and `z-on-click` → wasm-export routing never loaded and
+  the timer was dead. Now copies the example's own bridge.
+- **`examples/chat` live updates** (`examples/chat/src/app/components.zig`): the
+  SSE auto-reload `<script>` was built with `ctx.el("script").text(...)`, which
+  HTML-escapes the body and turned the `=>` arrow into `=&gt;` — a `SyntaxError`
+  that killed the `EventSource('/events')` subscription. Now uses
+  `ctx.scriptInline(...)`, which emits the body verbatim with the CSP nonce.
 
 ## [0.5.2] - 2026-06-14
 
@@ -3072,7 +3087,9 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/sirhco/verve/compare/v0.5.2...v0.5.3
+[0.5.2]: https://github.com/sirhco/verve/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/sirhco/verve/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/sirhco/verve/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/sirhco/verve/releases/tag/v0.4.0
