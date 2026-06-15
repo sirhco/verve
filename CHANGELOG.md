@@ -69,6 +69,20 @@ versions follow [Semantic Versioning](https://semver.org/).
   buffer let the last `writeBuffer` clobber earlier draws — now each PBR + depth
   draw gets its own 256-aligned uniform slot bound via dynamic offset. Shared-island
   backend selection remains slice-2d work.
+- **`verve.gl` P10 (WebGPU backend) — slice 2d: shared-island backend selection
+  (P10 COMPLETE)** (`src/bridge/verve.js`, `src/client/islands/GlScene.zig`,
+  `docs/24-gl.md`): the real asset-driven `GlScene` island now renders through
+  WebGPU when available — `/gl-scene` (+ the other `glScene` routes) feature-detect
+  `navigator.gpu` (new bridge extern `gl_webgpu_available`) and emit WGSL
+  (`wgslPbr`/`wgslDepth`) + drive `gl_start_gpu`, else GLSL + `gl_start` (WebGL2).
+  The command stream is otherwise backend-agnostic — vmesh mesh, material textures,
+  IBL cubemaps, the shadow pass, and multi-variant PBR all flow through
+  `gpuInterpret` (and 2c's dynamic offsets make the multi-submesh scene viable).
+  GlScene applies the WebGPU clip-z fix (Zfix) to its proj + light matrices only on
+  the WebGPU path; the WebGL2 path is byte-for-byte unchanged. `gpuStart` now hides
+  the SSR `data-gl-poster` on the first drawn frame (GlScene parity). Verified
+  rendering headless on BOTH backends. No `command.zig` change — all goldens frozen.
+  Single-instance; multi-instance WebGPU + WebGPU device-loss remain deferred.
 
 ## [0.5.4] - 2026-06-15
 
