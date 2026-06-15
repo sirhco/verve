@@ -6,6 +6,26 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` P9 (render quality) — per-node frustum culling**
+  (`src/core/gl/cull.zig`, `gl.zig`, `src/client/islands/GlScene.zig`,
+  `docs/24-gl.md`): a submesh whose world-space AABB falls fully outside the
+  camera frustum no longer emits a `DRAW_PBR` record. CPU-only and invisible to
+  the Zig↔JS wire contract — the `command.zig` byte and FNV goldens are
+  unchanged.
+  - New `cull.zig`: `frustumPlanes(pv)` (Gribb–Hartmann, six normalized
+    inward-facing planes, WebGL `z ∈ [-1, 1]` near plane), `worldAabb`
+    (eight-corner transform, rotation-safe), and the conservative
+    positive-vertex `aabbInFrustum` test.
+  - Per-submesh model-local AABBs are computed once at asset load in
+    `GlScene.buildScene` from the existing stride-12 vertex / u16 index data —
+    no vmesh format change (stays v3).
+  - The `GlScene` frame loop extracts the frustum once per frame and skips a
+    culled submesh before its variant/pipeline block, so lazy `SET_PIPELINE`
+    emission keeps the wire stream-order rule intact. Picking/hover are
+    unaffected (culled submeshes stay pickable).
+
 ## [0.5.2] - 2026-06-14
 
 ### Added

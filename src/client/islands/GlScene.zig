@@ -232,6 +232,11 @@ var mvps: [max_submesh][16]f32 = undefined;
 var model_mats: [max_submesh][16]f32 = undefined;
 var normal9s: [max_submesh][9]f32 = undefined;
 
+// Per-submesh model-local AABB, computed once in buildScene from vmesh
+// positions. Transformed by the node world matrix each frame for frustum
+// culling (P9 slice 2). CPU-only — never touches the wire stream.
+var submesh_aabb: [max_submesh]gl.cull.Aabb = undefined;
+
 // Per-submesh material block pool (12 f32 each) — each drawPbr points at its own
 // stable slot so the JS interpreter reads the right material when walking the
 // stream (same aliasing reason as GlDemo).
@@ -458,6 +463,26 @@ export fn glscene_vmesh_ready(ptr: u32, len: u32) void {
     if (scrub_enabled and !scrub_built) buildScrubTimeline();
 }
 
+/// Model-local AABB over a submesh's indexed vertex positions (stride 12 f32,
+/// pos xyz @0; `first`/`count` index into the u16 index buffer). An empty range
+/// yields an inverted (inf) box — the frustum test then treats it as never
+/// visible, which is harmless since a zero-index submesh draws nothing anyway.
+fn submeshLocalAabb(verts: []const f32, indices: []const u16, first: u32, count: u32) gl.cull.Aabb {
+    const inf = std.math.inf(f32);
+    var lo = gl.math.Vec3.init(inf, inf, inf);
+    var hi = gl.math.Vec3.init(-inf, -inf, -inf);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const vi = @as(usize, indices[first + i]) * 12;
+        const x = verts[vi];
+        const y = verts[vi + 1];
+        const z = verts[vi + 2];
+        lo = gl.math.Vec3.init(@min(lo.x, x), @min(lo.y, y), @min(lo.z, z));
+        hi = gl.math.Vec3.init(@max(hi.x, x), @max(hi.y, y), @max(hi.z, z));
+    }
+    return .{ .min = lo, .max = hi };
+}
+
 /// (Re)build the scene graph for a freshly-read vmesh: root "model" at node 0,
 /// one child per submesh at node s+1 (named from the vmesh; capped at
 /// max_submesh). The applied-mirrors are reset to match the fresh scene's
@@ -471,6 +496,9 @@ fn buildScene(a: *const gl.vmesh.Reader) void {
     scene = .{};
     _ = scene.addNode(-1, "model");
     const n: u32 = @min(a.submesh_count, max_submesh);
+    // Vertices: vmesh stride 48 bytes = 12 f32; position xyz at offset 0.
+    const verts_f32 = bytesAsF32(a.vertices);
+    const indices_u16 = bytesAsU16(a.indices);
     var s: u32 = 0;
     while (s < n) : (s += 1) {
         _ = scene.addNode(0, a.name(s));
@@ -480,6 +508,7 @@ fn buildScene(a: *const gl.vmesh.Reader) void {
             sub.metallic,      sub.roughness,     sub.occlusion_strength, sub.normal_scale,
             sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        0,
         };
+        submesh_aabb[s] = submeshLocalAabb(verts_f32, indices_u16, sub.index_byte_off / 2, sub.index_count);
     }
     model_yaw_applied = 0;
     node_rot_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
@@ -717,6 +746,10 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // graph (scene_built is invariant-true whenever `asset` is non-null —
         // buildScene runs in the same callback that sets `asset`).
         const pv = proj.mul(view);
+        // World-space frustum planes for this frame's camera (P9 slice 2).
+        // Submeshes whose world AABB falls fully outside are skipped before
+        // they emit any draw — purely CPU-side, invisible to the wire stream.
+        const planes = gl.cull.frustumPlanes(pv);
         // Sentinel 0 is never a valid variant (variant_pbr is always set), so
         // the first submesh always (re)binds its pipeline group. The wire's
         // stream-order rule requires SET_PIPELINE before SET_LIGHTS / BIND_IBL
@@ -725,6 +758,11 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         var s: u32 = 0;
         while (s < a.submesh_count) : (s += 1) {
             if (s >= max_submesh) break;
+            // Cull before the variant/pipeline block: a skipped submesh never
+            // triggers a SET_PIPELINE switch (those emit lazily on the first
+            // DRAWN submesh of a variant), so the wire stream-order rule holds.
+            const wbox = gl.cull.worldAabb(submesh_aabb[s], scene.world[s + 1]);
+            if (!gl.cull.aabbInFrustum(planes, wbox)) continue;
             const sub = a.submesh(s);
             const v = a.submeshVariant(s);
             if (v != last_variant) {
