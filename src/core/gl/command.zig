@@ -102,6 +102,37 @@ pub const unlit_fs: []const u8 =
     \\void main() { o_frag = vec4(v_color, 1.0); }
 ;
 
+// WebGPU (P10) port of the unlit vertex-color variant. One WGSL module holding
+// both stages, mirroring unlit_vs/unlit_fs above exactly:
+//   - mvp uniform at @group(0) @binding(0)
+//   - vs: color = a_color; pos = u.mvp * vec4(a_pos, 1.0)
+//   - fs: vec4(color, 1.0)
+// The GLSL goldens are the source of truth; this is a parallel WGSL emission.
+pub fn wgslUnlit() []const u8 {
+    return
+    \\struct U { mvp: mat4x4<f32> };
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\
+    \\struct VSOut {
+    \\  @builtin(position) pos: vec4<f32>,
+    \\  @location(0) color: vec3<f32>,
+    \\};
+    \\
+    \\@vertex
+    \\fn vs_main(@location(0) a_pos: vec3<f32>, @location(1) a_color: vec3<f32>) -> VSOut {
+    \\  var out: VSOut;
+    \\  out.color = a_color;
+    \\  out.pos = u.mvp * vec4<f32>(a_pos, 1.0);
+    \\  return out;
+    \\}
+    \\
+    \\@fragment
+    \\fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+    \\  return vec4<f32>(in.color, 1.0);
+    \\}
+    ;
+}
+
 // Lit/textured shader pair for variant_lit_uv.
 // Normals are transformed in model space (valid for rotation + uniform scale only).
 // u_normal_matrix arrives with P3.
@@ -817,6 +848,20 @@ test "golden: PBR GLSL hashes frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0x2f65f1426c2c4ed2), fnv64(pbrFragmentSrc(F0)));
     try testing.expectEqual(@as(u64, 0x4b3d632d4e94e70d), fnv64(pbrFragmentSrc(F1)));
     try testing.expectEqual(@as(u64, 0xf0c580cec075612c), fnv64(pbrFragmentSrc(F2)));
+}
+
+test "WGSL unlit: both stages and uniform present" {
+    const src = wgslUnlit();
+    try testing.expect(std.mem.indexOf(u8, src, "@vertex") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "@fragment") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "vs_main") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "fs_main") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "u.mvp") != null);
+}
+
+test "golden: WGSL unlit hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate WGSL contract bump.
+    try testing.expectEqual(@as(u64, 0xa159f35e040f6f8f), fnv64(wgslUnlit()));
 }
 
 test "PBR uniform contract: full-variant names present" {
