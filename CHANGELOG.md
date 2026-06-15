@@ -6,6 +6,21 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` P11 — WebGPU parity (multi-instance · resource delete · device-loss)**
+  (`src/bridge/verve.js`): brings the WebGPU backend to functional parity with
+  WebGL2, closing the three items deferred in P10 2d. (1) **Multi-instance** —
+  `gpuStart`'s frame loop now `glscene_select`s this canvas's instance vid before
+  the frame export (and `glscene_unmount`s on disconnect), so a page with multiple
+  `GlScene` islands renders each independently through WebGPU (`/gl-multi` verified
+  rendering two distinct scenes). (2) **`DELETE_RESOURCE` (tag 14)** — `gpuInterpret`
+  frees the WebGPU object (`GPUBuffer`/`GPUTexture.destroy()`, pipeline drop + clear
+  active, shadow-map destroy). (3) **Device-loss/restore** — `gpuStart` handles
+  `device.lost`: re-inits a fresh device, drops the dead resource refs, and replays
+  the chunk's create* via the `<frame>_restore` hook (best-effort; WebGPU device
+  loss isn't triggerable headless). No `command.zig` change — all goldens frozen.
+
 ## [0.5.5] - 2026-06-15
 
 ### Added
