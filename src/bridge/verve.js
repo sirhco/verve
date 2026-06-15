@@ -5774,6 +5774,8 @@
       st.ibl = null;
       st.shadow = null;
       st.pbrUniform = null;
+      st.uniformBuf = null; // slice-1 basic-draw path's persistent buffer
+      st.bindGroup = null;
       st.depthUniform = null;
       st.depthBindGroup = null;
       st.bg0 = null;
