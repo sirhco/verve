@@ -6,6 +6,26 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` P7 — multiple GlScene instances per page**
+  (`src/client/islands/GlScene.zig`, `src/bridge/verve.js`,
+  `src/app/{routes,components}.zig`, `docs/24-gl.md`): two or more
+  `ctx.glScene(...)` islands can now share a page, each with its own camera,
+  scene, picking, and animation. New `/gl-multi` demo route.
+  - GlScene's ~51 module statics moved into a per-instance `Inst` struct;
+    `instances[4]` keyed by the island vid (`root_id`). The bridge calls a new
+    `glscene_select(root_id)` export before each frame / event / asset-callback /
+    restore so the chunk operates on the right instance; all other export
+    signatures are unchanged, so the generic gl-driving contract stays frozen and
+    GlDemo / non-gl islands are unaffected (guarded no-op). No wire-contract
+    change — the `command.zig` byte and FNV goldens are unchanged.
+  - The page asset region resets only on the first instance of a fresh
+    population (`live_count` 0→1); instances share it while ≥1 is live.
+    `glscene_unmount(root_id)` reclaims a slot on canvas disconnect. Anim setters
+    scope per-instance via a comptime per-slot trampoline table (no `anim_target`
+    format change).
+
 ## [0.5.3] - 2026-06-14
 
 ### Added

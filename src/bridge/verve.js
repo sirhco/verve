@@ -552,6 +552,22 @@
     if (typeof exp.verve_event_end === "function") exp.verve_event_end();
   };
 
+  // P7 multi-instance gl: route a dispatch (frame / event / asset callback /
+  // restore) to the right GlScene instance by its island vid. `glscene_select`
+  // exists only on stateful gl chunks; the guard makes the call a no-op for
+  // GlDemo and every non-gl island, leaving the generic island machinery
+  // unchanged. `glHydratingVid` carries the in-flight hydrate's vid so async
+  // `gl_load` callbacks can re-select the requesting instance.
+  let glHydratingVid = 0;
+  const glSelect = (exports, vid) => {
+    if (vid && exports && typeof exports.glscene_select === "function")
+      exports.glscene_select(vid >>> 0);
+  };
+  const vidOfEl = (el) => {
+    const isl = el && el.closest && el.closest("verve-island");
+    return isl ? parseInt(isl.getAttribute("data-vid"), 10) || 0 : 0;
+  };
+
   const dispatchEventId = (e, attr, prevent) => {
     const node = e.target.closest(`[${attr}]`);
     if (!node) return false;
@@ -586,6 +602,8 @@
     const vid = islandEl ? parseInt(islandEl.getAttribute("data-vid"), 10) || 0 : 0;
     const scope = vid && typeof exp.verve_enter_island === "function";
     if (scope) exp.verve_enter_island(vid);
+    // Route to the right gl instance (no-op unless this is a stateful gl chunk).
+    if (islandName) glSelect(chunkExports[islandName], vid);
     try {
       fn();
     } finally {
@@ -634,6 +652,7 @@
       const vid = islandEl ? parseInt(islandEl.getAttribute("data-vid"), 10) || 0 : 0;
       const scope = vid && typeof exp.verve_enter_island === "function";
       if (scope) exp.verve_enter_island(vid);
+      if (islandName) glSelect(chunkExports[islandName], vid);
       try {
         fn();
       } finally {
@@ -4760,6 +4779,9 @@
       // While lost, the rAF loop is fully stopped (no idle polling); the
       // restored handler resets resource state and restarts it.
       lost: false,
+      // P7: this canvas's GlScene instance vid — selected before each frame so
+      // the chunk renders THIS instance's state. 0 for single-instance chunks.
+      vid: vidOfEl(canvas),
     };
     // Sink driven by the master anim rAF (animTick) — see glSinks. Same body
     // as the old self-rescheduling step(), except stop paths remove the sink
@@ -4775,6 +4797,11 @@
       // Island unmounted: canvas detached from the DOM. Free GPU objects and
       // stop without rescheduling, instead of leaking the whole resource set.
       if (!canvas.isConnected) {
+        // Reclaim the chunk-side instance slot (P7) before tearing down GPU
+        // state, so add/remove cycles don't exhaust the pool. No-op for
+        // single-instance chunks (no glscene_unmount export).
+        if (typeof st.exports.glscene_unmount === "function")
+          st.exports.glscene_unmount(st.vid >>> 0);
         disposeGlState(st);
         glSinks.delete(sink);
         return;
@@ -4789,6 +4816,8 @@
       const h = Math.min(4096, Math.max(1, Math.round(canvas.clientHeight * dpr)));
       if (canvas.width !== w) canvas.width = w;
       if (canvas.height !== h) canvas.height = h;
+      // P7: select this canvas's instance before the frame export reads state.
+      glSelect(st.exports, st.vid);
       const ptr = st.exports[st.exportName](dt, w, h) >>> 0;
       if (!ptr) {
         // wasm asked to stop (island unmount path, P4). 0 = stop loop; per spec
@@ -4847,6 +4876,7 @@
       st.last = 0;
       // Let the chunk re-upload GPU resources before frames resume, if it
       // exports a restore hook. Convention: "<frame_export>_restore" (Task 10/12).
+      glSelect(st.exports, st.vid); // P7: restore THIS instance's resources
       const restoreFn = st.exports[st.exportName + "_restore"];
       if (typeof restoreFn === "function") restoreFn();
       // st.last was reset to 0 above, so the first resumed frame uses the
@@ -4916,6 +4946,15 @@
               const url = readStr(urlPtr, urlLen);
               const cb = readStr(cbPtr, cbLen);
               const exports = glActiveChunkExports;
+              // P7: the fetch resolves async, after other instances may have
+              // hydrated/rendered. Capture the requesting instance's vid NOW
+              // (this gl_load runs synchronously inside that instance's hydrate)
+              // and re-select it before delivering the callback.
+              const reqVid = glHydratingVid;
+              const deliver = (a, b) => {
+                glSelect(exports, reqVid);
+                exports[cb](a, b);
+              };
               if (!exports || typeof exports[cb] !== "function") {
                 // No callback to deliver failure to — the callback IS what's
                 // missing (typo'd export name = programmer error). The chunk
@@ -4940,15 +4979,15 @@
                     : 0;
                   if (!ptr) {
                     console.error("verve.gl: asset region full for", url);
-                    exports[cb](0, 0);
+                    deliver(0, 0);
                     return;
                   }
                   new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
-                  exports[cb](ptr, bytes.length >>> 0);
+                  deliver(ptr, bytes.length >>> 0);
                 })
                 .catch((err) => {
                   console.error("verve.gl: asset fetch failed:", url, err);
-                  exports[cb](0, 0);
+                  deliver(0, 0);
                 });
             },
           },
@@ -4980,6 +5019,10 @@
     // owner so per-island unmount disposes them.
     const scope = typeof exp.verve_enter_island === "function";
     if (scope) exp.verve_enter_island(instanceId);
+    // P7: the chunk's hydrate self-selects from its root_id arg, but any
+    // gl_load it kicks captures this vid for its async callback. Reset in the
+    // finally so a stray later gl_load can't mis-route.
+    glHydratingVid = instanceId;
     try {
       if (
         typeof exp.verve_island_scratch_ptr === "function" &&
@@ -5001,6 +5044,7 @@
       }
     } finally {
       if (scope && typeof exp.verve_exit_island === "function") exp.verve_exit_island();
+      glHydratingVid = 0;
     }
   };
   // ---- Per-island hydrate/dispose lifecycle ---------------------------

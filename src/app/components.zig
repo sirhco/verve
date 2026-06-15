@@ -945,6 +945,49 @@ pub fn glSceneShadow(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-multi: TWO independent GlScene islands on one page (P7 multi-instance).
+/// Each `<verve-island data-name="GlScene">` gets its own per-instance state
+/// slot keyed by vid; the bridge selects the right instance before each frame /
+/// event. Distinct assets + cameras + opposite auto-rotation make the
+/// independence visible — neither scene mirrors or freezes the other.
+pub fn glSceneMulti(ctx: *const verve.Context) !*verve.Node {
+    const poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3E3D%3C/text%3E%3C/svg%3E";
+
+    const scene_a = ctx.glScene(.{ .src = "/gl/demo.vmesh", .env = "/gl/studio.venv", .poster = poster })
+        .camera(.{ .distance = 4, .pitch = 0.3, .yaw = 0.6 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .autoRotate(0.5)
+        .build();
+
+    const scene_b = ctx.glScene(.{ .src = "/gl/shadow.vmesh", .env = "/gl/studio.venv", .poster = poster })
+        .camera(.{ .distance = 9, .pitch = 0.55, .yaw = -0.5 })
+        .light(.{ .dir = .{ -0.45, -0.82, -0.35 }, .intensity = 3.2 })
+        .autoRotate(-0.35)
+        .build();
+
+    const box = struct {
+        fn go(c: *const verve.Context, scene: *verve.Node) *verve.Node {
+            return c.div().class("gl-wrap").children(.{
+                c.div()
+                    .attr("style", "width:100%;max-width:420px;aspect-ratio:1/1;display:block;background:#121420;border-radius:8px;margin:0 auto")
+                    .children(.{scene}),
+            });
+        }
+    }.go;
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — two scenes, one page"),
+        ctx.p().text("Two independent GlScene islands (P7 multi-instance): a model and " ++
+            "a cube-on-floor, each with its own camera, light, and auto-rotation. " ++
+            "Each owns a separate per-instance state slot in the one shared chunk."),
+        ctx.div()
+            .attr("style", "display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start")
+            .children(.{ box(ctx, scene_a), box(ctx, scene_b) }),
+        ctx.p().class("hint")
+            .text("Drag either scene to orbit it independently · they spin opposite ways."),
+    });
+}
+
 pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
     // Provide a default title only if the page didn't set one of its own.
     try ctx.setTitleIfUnset("Verve");
