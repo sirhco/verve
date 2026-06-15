@@ -5291,6 +5291,24 @@
           st.bg1Dirty = true; // rebind group(1) with the real IBL views
           break;
         }
+        case 14: { // DELETE_RESOURCE — free one GPU object (parity with glInterpret).
+          // Payload (command.zig Encoder.deleteResource, 8B): kind | handle.
+          // ResKind: 0 buffer, 1 texture, 2 shader/pipeline, 3 shadow map.
+          const kind = dv.getUint32(off, true);
+          const handle = dv.getUint32(off + 4, true);
+          if (kind === 0) {
+            if (st.buffers[handle]) { st.buffers[handle].buf.destroy(); st.buffers[handle] = null; }
+          } else if (kind === 1) {
+            if (st.textures[handle]) { st.textures[handle].tex.destroy(); st.textures[handle] = null; }
+          } else if (kind === 2) {
+            // Pipelines have no .destroy() (GC-only); drop the ref + clear active.
+            if (st.active === st.pipelines[handle]) st.active = null;
+            st.pipelines[handle] = null;
+          } else if (kind === 3) {
+            if (st.shadowMaps[handle]) { st.shadowMaps[handle].tex.destroy(); st.shadowMaps[handle] = null; }
+          }
+          break;
+        }
         case 16: { // CREATE_SHADOW_MAP — depth texture + comparison sampler.
           // Payload (command.zig Encoder.createShadowMap, 8B): handle | size.
           const handle = dv.getUint32(off, true);
