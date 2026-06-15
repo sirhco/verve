@@ -5763,6 +5763,11 @@
             // P10: WebGPU frame loop. Fire-and-forget (gpuStart is async).
             gl_start_gpu: (refHandle, namePtr, nameLen) =>
               gpuStart(refHandle, readStr(namePtr, nameLen)),
+            // P10 slice 2d: synchronous backend feature-detect. The chunk calls
+            // this at hydrate to choose WGSL + gl_start_gpu (1) vs GLSL +
+            // gl_start (0). gpuInit still degrades gracefully if the async
+            // adapter/device request later fails.
+            gl_webgpu_available: () => (navigator.gpu ? 1 : 0),
             // P8 onPickExport: dispatch a bubbling DOM CustomEvent from the
             // canvas (resolved by ref handle). detail.name carries the picked
             // submesh name. No-op if the handle is stale.
