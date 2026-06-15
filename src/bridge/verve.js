@@ -5197,10 +5197,12 @@
             st.bg0Layout = active.bgl0;
           }
           // ── Bind group 1: sampler + textures. Cached; invalidated by tag 8 ──
-          // (bg1Dirty) or a layout/pipeline change. Slot→default mapping per
-          // gpuMakeDefaults: 0/1/2/4→white2d, 3→black2d, 5/6→blackCube, 7→
-          // black2d. bind_texture wire slots: 0 base,1 mr,2 normal,3 emissive,
-          // 4 occlusion. IBL bindings (6/7/8) fall back to defaults in slice 2a.
+          // (bg1Dirty) or a layout/pipeline change. WGSL @group(1) binding =
+          // logical PBR slot + 1 (binding 0 is the sampler). Per-logical-slot
+          // default (gpuMakeDefaults): 0 base/1 mr/2 normal/4 occlusion→white2d,
+          // 3 emissive→black2d, 5 irradiance/6 prefiltered→blackCube, 7 brdf_lut
+          // →black2d. bind_texture wire slots: 0 base,1 mr,2 normal,3 emissive,
+          // 4 occlusion. IBL (bindings 6/7/8) fall back to defaults in slice 2a.
           if (st.bg1Dirty || !st.bg1 || st.bg1Layout !== active.bgl1) {
             const d = st.defaults;
             const e = [{ binding: 0, resource: d.sampler }];
