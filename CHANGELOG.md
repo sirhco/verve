@@ -51,6 +51,24 @@ versions follow [Semantic Versioning](https://semver.org/).
   already declared + sampled the IBL bindings in 2a, so all shader goldens stay
   byte-identical. The shadow pass + shared-island backend selection remain
   slice-2c+ work.
+- **`verve.gl` P10 (WebGPU backend) — slice 2c: directional shadow pass (PCF)**
+  (`src/core/gl/command.zig`, `src/core/gl/mesh.zig`, `src/bridge/verve.js`,
+  `src/client/islands/GlSceneWebgpu.zig`, `src/app/{components,islands}.zig`,
+  `docs/24-gl.md`): the WebGPU PBR cube casts a shadow onto a ground plane
+  (`/gl-scene-webgpu`), verified rendering headless. New WGSL: `wgslPbr` gains the
+  `variant_shadow` branch (a `light_vp` uniform, `texture_depth_2d` +
+  `sampler_comparison` at group(1) bindings 9/10, 3×3 PCF via
+  `textureSampleCompareLevel`) and a new `wgslDepth()` depth-only shader — new FNV
+  goldens frozen; the non-shadow + GLSL goldens stay byte-identical. `gpuInterpret`
+  gains the shadow tags: `create_shadow_map` (16, depth32float + comparison
+  sampler), `begin/end_shadow_pass` (17/18, a depth-only render pass sharing the
+  frame's encoder), `draw_depth` (19), `bind_shadow_map` (20). The light matrix is
+  built WebGPU-convention in the chunk (a Zfix z-remap [−1,1]→[0,1], since
+  `gl.math` ortho is GL-convention). **Also fixes a latent multi-draw bug**
+  (2a/2b drew one object so it never bit): WebGPU defers draws, so a shared uniform
+  buffer let the last `writeBuffer` clobber earlier draws — now each PBR + depth
+  draw gets its own 256-aligned uniform slot bound via dynamic offset. Shared-island
+  backend selection remains slice-2d work.
 
 ## [0.5.4] - 2026-06-15
 

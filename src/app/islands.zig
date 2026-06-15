@@ -107,13 +107,14 @@ pub const GlWebgpu = struct {
     pub const props_schema: []const u8 = "{}";
 };
 
-/// verve.gl P10 WebGPU PBR scene (slices 2a + 2b) — a single stateful chunk that
-/// uploads a static stride-48 PBR cube + base/metallic-roughness textures, loads a
-/// prefiltered `.venv` environment, and drives a textured, metallic Cook-Torrance
-/// render (directional light + image-based lighting) through the WebGPU backend
-/// (gl_start_gpu) using the WGSL PBR shader (gl.command.wgslPbr). SSR emits
-/// `<canvas data-ref="glscenewebgpu-canvas">`. Dedicated WebGPU-only chunk (shadow
-/// pass + backend selection remain slice-2c+ work). Requires a WebGPU-capable
+/// verve.gl P10 WebGPU PBR scene (slices 2a + 2b + 2c) — a single stateful chunk
+/// that uploads a static stride-48 PBR cube + ground plane + base/metallic-roughness
+/// textures, loads a prefiltered `.venv` environment, and drives a textured
+/// Cook-Torrance render (directional light + image-based lighting + a PCF shadow
+/// pass) through the WebGPU backend (gl_start_gpu) using the WGSL PBR + depth
+/// shaders (gl.command.wgslPbr / wgslDepth). SSR emits
+/// `<canvas data-ref="glscenewebgpu-canvas">`. Dedicated WebGPU-only chunk (shared-
+/// island backend selection remains slice-2d work). Requires a WebGPU-capable
 /// browser; degrades to the blank canvas otherwise.
 /// Source: `src/client/islands/GlSceneWebgpu.zig`.
 pub const GlSceneWebgpu = struct {
