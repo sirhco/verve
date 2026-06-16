@@ -6,6 +6,21 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` — skeletal skinning, slice 4 (cross-fade blending)**
+  (`src/core/gl/math.zig`, `src/client/islands/GlSkin.zig`): switching clips on
+  `/gl-skin` now cross-fades the pose old→new over 0.3 s instead of a hard cut. On
+  a switch, `GlSkin` snapshots the old clip + its looped time (frozen) and blends
+  per-joint T/R/S — `Vec3.lerp` (new) for translation/scale, `Quat.slerp` for
+  rotation — between the frozen old pose and the advancing new pose, then
+  `fromTrs`. The fade is a real-time 0.3 s (not speed-scaled); past the window it's
+  the pure new clip. Pure chunk-side — **no vmesh/gltf/fixture/shader/wire/format
+  change** (same `set_bones`, same buttons, same `skinbar.vmesh` v7); steady-state
+  playback is byte-identical to slice 3. Verified on WebGPU and WebGL2 (headless
+  CDP: a mid-fade frame shows an intermediate pose strictly between Bend and
+  Twist). Deferred: scrub, per-clip loop/once modes, additive/blend-tree.
+
 ## [0.5.10] - 2026-06-16
 
 ### Added
