@@ -36,6 +36,12 @@ const math = @import("math.zig");
 
 // ── public surface ─────────────────────────────────────────────────────────────
 
+/// A texture kept as ORIGINAL compressed bytes (not baked to RGBA). `index` is
+/// the position in `Model.textures` whose RGBA was dropped; `ext` is the file
+/// extension (e.g. "png"); `bytes` is the original compressed image. The
+/// asset-gen writes these out as separate files (Task D2).
+pub const ExternalTex = struct { index: u32, ext: []const u8, bytes: []const u8 };
+
 pub const Model = struct {
     arena: std.heap.ArenaAllocator,
     vertices: []f32, // interleaved pos3/normal3/tangent4/uv2, stride 48 — vmesh-ready
@@ -43,6 +49,7 @@ pub const Model = struct {
     submeshes: []vmesh.Submesh, // index_byte_off/count into `indices`
     textures: []vmesh.Texture, // decoded RGBA8 via png.zig
     names: []const []const u8, // one per submesh; owning mesh's name (fallback "mesh{n}")
+    external_textures: []const ExternalTex = &.{}, // textures >64×64: original bytes kept, RGBA dropped
 
     pub fn deinit(self: *Model) void {
         self.arena.deinit();
@@ -180,6 +187,9 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
     // First build the glTF texture list (texture → image source index),
     // then decode each referenced image bufferView with png.decode.
     var tex_list: std.ArrayList(vmesh.Texture) = .empty;
+    // Textures larger than 64×64 (>4096 px) are externalized: their original
+    // compressed bytes are kept here and the RGBA in tex_list is dropped.
+    var ext_list: std.ArrayList(ExternalTex) = .empty;
 
     for (textures_arr) |tex_val| {
         const tex_obj = switch (tex_val) {
@@ -199,18 +209,28 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
 
         const bv_slice = try getBufferViewSlice(buffer_views, bv_idx, bin);
 
-        // Decode PNG into a temporary Image, then copy RGBA into the arena.
+        // Decode PNG into a temporary Image (gives w/h + validates the bytes),
+        // then either externalize (large) or copy RGBA into the arena (small).
         var img = png.decode(backing_alloc, bv_slice) catch return error.Malformed;
         defer img.deinit(backing_alloc);
 
-        const rgba_copy = try aa.alloc(u8, img.rgba.len);
-        @memcpy(rgba_copy, img.rgba);
-
-        try tex_list.append(aa, .{
-            .width = img.width,
-            .height = img.height,
-            .rgba = rgba_copy,
-        });
+        const px_count: u64 = @as(u64, img.width) * @as(u64, img.height);
+        if (px_count > 4096) {
+            // Externalize: keep the original compressed bytes; drop the RGBA.
+            const ext_bytes = try aa.alloc(u8, bv_slice.len);
+            @memcpy(ext_bytes, bv_slice);
+            try ext_list.append(aa, .{ .index = @intCast(tex_list.items.len), .ext = "png", .bytes = ext_bytes });
+            try tex_list.append(aa, .{ .width = 0, .height = 0, .rgba = &.{}, .format = .png });
+        } else {
+            const rgba_copy = try aa.alloc(u8, img.rgba.len);
+            @memcpy(rgba_copy, img.rgba);
+            try tex_list.append(aa, .{
+                .width = img.width,
+                .height = img.height,
+                .rgba = rgba_copy,
+                .format = .raw,
+            });
+        }
     }
 
     // ── 6b. Build mesh-index → node-name fallback map ──────────────────────────
@@ -623,6 +643,7 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         .submeshes = sub_list.items,
         .textures = tex_list.items,
         .names = name_list.items,
+        .external_textures = try ext_list.toOwnedSlice(aa),
     };
 }
 
