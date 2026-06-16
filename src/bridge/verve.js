@@ -5511,6 +5511,46 @@
     }
   };
 
+  // Asset-loader worker: lazily-spawned same-origin module worker that fetches +
+  // (passthrough) decodes a gl asset off the main thread and transfers the bytes
+  // back. gl_load prefers it and falls back to a main-thread fetch if the worker is
+  // unavailable / CSP-blocked / errors. Decode runs in the worker (hook for future
+  // compressed formats); the wasm-memory copy stays on the main thread.
+  let assetWorker = null;
+  let assetWorkerDead = false;
+  let assetReqId = 0;
+  const assetPending = new Map(); // id -> { resolve, reject }
+  const assetWorkerLoad = (url) => {
+    if (assetWorkerDead || typeof Worker === "undefined") {
+      return Promise.reject(new Error("no worker"));
+    }
+    if (!assetWorker) {
+      try {
+        assetWorker = new Worker("/verve-worker.js", { type: "module" });
+        assetWorker.onmessage = ({ data }) => {
+          const p = assetPending.get(data.id);
+          if (!p) return;
+          assetPending.delete(data.id);
+          if (data.ok) p.resolve(data.buffer);
+          else p.reject(new Error(data.err || "worker error"));
+        };
+        assetWorker.onerror = () => {
+          assetWorkerDead = true;
+          for (const p of assetPending.values()) p.reject(new Error("worker crashed"));
+          assetPending.clear();
+        };
+      } catch (e) {
+        assetWorkerDead = true;
+        return Promise.reject(e);
+      }
+    }
+    const id = ++assetReqId;
+    return new Promise((resolve, reject) => {
+      assetPending.set(id, { resolve, reject });
+      assetWorker.postMessage({ id, url });
+    });
+  };
+
   const glStart = (refHandle, exportName) => {
     const canvas = refHandles[refHandle];
     const exports = glActiveChunkExports;
@@ -5910,32 +5950,41 @@
                 console.error("verve.gl: gl_load callback missing:", cb);
                 return;
               }
-              fetch(url)
-                .then((r) => {
-                  if (!r.ok) throw new Error("HTTP " + r.status);
-                  return r.arrayBuffer();
-                })
-                .then((ab) => {
-                  const bytes = new Uint8Array(ab);
-                  // verve_asset_alloc lives on the MAIN client (exp), not the chunk —
-                  // the gl asset region is page-scoped runtime state. 16-byte
-                  // alignment kept: Uint16Array views need >=2 and .venv internal
-                  // offsets are 16-aligned.
-                  const ptr = typeof exp.verve_asset_alloc === "function"
-                    ? exp.verve_asset_alloc(bytes.length >>> 0, 16)
-                    : 0;
-                  if (!ptr) {
-                    console.error("verve.gl: asset region full for", url);
-                    deliver(0, 0);
-                    return;
-                  }
-                  new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
-                  deliver(ptr, bytes.length >>> 0);
-                })
-                .catch((err) => {
-                  console.error("verve.gl: asset fetch failed:", url, err);
+              // Alloc in the page-scoped asset region (MAIN client `exp`, not the
+              // chunk), copy the bytes into shared wasm memory, deliver the ptr.
+              // 16-byte alignment kept: Uint16Array views need >=2 and .venv
+              // internal offsets are 16-aligned. (Copy stays main-thread — the
+              // worker has its own memory.)
+              const onBytes = (bytes) => {
+                const ptr = typeof exp.verve_asset_alloc === "function"
+                  ? exp.verve_asset_alloc(bytes.length >>> 0, 16)
+                  : 0;
+                if (!ptr) {
+                  console.error("verve.gl: asset region full for", url);
                   deliver(0, 0);
-                });
+                  return;
+                }
+                new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
+                deliver(ptr, bytes.length >>> 0);
+              };
+              const mainThreadFetch = () => {
+                fetch(url)
+                  .then((r) => {
+                    if (!r.ok) throw new Error("HTTP " + r.status);
+                    return r.arrayBuffer();
+                  })
+                  .then((ab) => onBytes(new Uint8Array(ab)))
+                  .catch((err) => {
+                    console.error("verve.gl: asset fetch failed:", url, err);
+                    deliver(0, 0);
+                  });
+              };
+              // Prefer the asset worker; fall back to a main-thread fetch on any
+              // worker failure (unavailable / CSP-blocked / crashed / fetch error).
+              assetWorkerLoad(url).then(
+                (ab) => onBytes(new Uint8Array(ab)),
+                () => mainThreadFetch(),
+              );
             },
           },
         }).catch((err) => {
