@@ -4342,15 +4342,29 @@
         gl.enableVertexAttribArray(0);
         gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);
       } else if (variant & 4) {
-        // PBR: pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40, stride 48
+        // PBR: pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40.
+        // Skinned (variant & 0x80) widens the vertex to stride 56, appending
+        // joints (u8x4 @48) + weights (u8x4 @52); attribs 0-3 then re-stride to
+        // 56. Non-skinned keeps stride 48 / attribs 0-3 only. The VAO cache key
+        // already carries `variant`, so skinned + non-skinned uses of the same
+        // buffers get distinct VAOs (no attrib 4/5 leakage onto the 48 path).
+        const stride = (variant & 128) ? 56 : 48;
         gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);
+        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, stride, 0);
         gl.enableVertexAttribArray(1);
-        gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 48, 12);
+        gl.vertexAttribPointer(1, 3, gl.FLOAT, false, stride, 12);
         gl.enableVertexAttribArray(2);
-        gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 48, 24);
+        gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 24);
         gl.enableVertexAttribArray(3);
-        gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 48, 40);
+        gl.vertexAttribPointer(3, 2, gl.FLOAT, false, stride, 40);
+        if (variant & 128) {
+          // joints: uvec4 a_joints — integer attrib, NOT normalized
+          gl.enableVertexAttribArray(4);
+          gl.vertexAttribIPointer(4, 4, gl.UNSIGNED_BYTE, 56, 48);
+          // weights: vec4 a_weights — u8 normalized to [0,1]
+          gl.enableVertexAttribArray(5);
+          gl.vertexAttribPointer(5, 4, gl.UNSIGNED_BYTE, true, 56, 52);
+        }
       } else if (variant & 2) {
         // lit/textured: pos f32x3 @0, normal f32x3 @12, uv f32x2 @24, stride 32
         gl.enableVertexAttribArray(0);
@@ -4451,6 +4465,11 @@
               sh.lightVp = gl.getUniformLocation(prog, "u_light_vp");
               setSampler("u_shadow_map", 8);
             }
+            // Skinned variant: cache the bone-palette array base location.
+            // Querying "u_bones[0]" yields the array's base location, which
+            // uniformMatrix4fv uploads the whole mat4[] against (case 21).
+            sh.skinned = (variant & 128) !== 0;
+            sh.bones = sh.skinned ? gl.getUniformLocation(prog, "u_bones[0]") : null;
           }
           st.shaders[handle] = sh;
           break;
@@ -4743,6 +4762,13 @@
           }
           if (st.active && st.active.lightVp)
             gl.uniformMatrix4fv(st.active.lightVp, false, new Float32Array(memory.buffer, lvpPtr, 16));
+          break;
+        }
+        case 21: { // SET_BONES — upload the bone palette to u_bones[] (skinned program)
+          const count = dv.getUint32(off, true);
+          const p = dv.getUint32(off + 4, true);
+          if (st.active && st.active.bones)
+            gl.uniformMatrix4fv(st.active.bones, false, new Float32Array(memory.buffer, p, count * 16));
           break;
         }
         default:
