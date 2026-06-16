@@ -4917,6 +4917,18 @@
     }
     return st.pbrUniform;
   };
+  // Lazily create the shared bones palette uniform (64 mat4 = 4096 B), bound at
+  // @group(0) @binding(1) for skinned variants. set_bones (tag 21) writes it;
+  // skinned bg0 binds the whole buffer (static, no dynamic offset).
+  const gpuEnsureBones = (st) => {
+    if (!st.bonesBuf) {
+      st.bonesBuf = st.device.createBuffer({
+        size: 64 * 64, // 64 mat4x4<f32> = 64 * 64 B
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    return st.bonesBuf;
+  };
   // Lazily create the depth-pass uniform (a mat4 per draw) + its bind group
   // against the depth pipeline's dynamic-offset layout. Reused across frames.
   const gpuEnsureDepthUniform = (st, depthPipe) => {
@@ -5070,15 +5082,26 @@
             const hasNormal = (variant & 0x8) !== 0;
             const hasEmissive = (variant & 0x10) !== 0;
             const hasShadow = (variant & 0x20) !== 0;
-            // group(0): single uniform buffer, visible to VERTEX|FRAGMENT
-            // (wgslPbr: @group(0) @binding(0) var<uniform> u: U).
-            const bgl0 = device.createBindGroupLayout({
-              entries: [{
-                binding: 0,
-                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                buffer: { type: "uniform", hasDynamicOffset: true },
-              }],
-            });
+            const skinned = (variant & 0x80) !== 0; // variant_skinned
+            // group(0): binding 0 is the per-draw uniform (dynamic offset),
+            // visible to VERTEX|FRAGMENT (wgslPbr: @group(0) @binding(0)
+            // var<uniform> u: U). Skinned variants ALSO declare a bones uniform
+            // at @group(0) @binding(1) (struct Bones { m: array<mat4x4,64> }),
+            // VERTEX-only, static (no dynamic offset). Non-skinned layout is
+            // binding-0-only — UNCHANGED.
+            const bgl0Entries = [{
+              binding: 0,
+              visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+              buffer: { type: "uniform", hasDynamicOffset: true },
+            }];
+            if (skinned) {
+              bgl0Entries.push({
+                binding: 1,
+                visibility: GPUShaderStage.VERTEX,
+                buffer: { type: "uniform" },
+              });
+            }
+            const bgl0 = device.createBindGroupLayout({ entries: bgl0Entries });
             // group(1): sampler@0 + per-slot textures. Binding numbers + types
             // EXACTLY match wgslPbr's @group(1) decls. base@1, mr@2 always;
             // normal@3 only with variant_normal_map; emissive@4 only with
@@ -5112,9 +5135,18 @@
                 module,
                 entryPoint: "vs_main",
                 buffers: [{
-                  // Stride-48 PBR vertex: pos@0, normal@12, tangent@24, uv@40.
-                  arrayStride: 48,
-                  attributes: [
+                  // PBR vertex: pos@0, normal@12, tangent@24, uv@40 (stride 48).
+                  // Skinned variants extend to stride 56 with joints@48
+                  // (uint8x4) + weights@52 (unorm8x4) at locations 4/5.
+                  arrayStride: skinned ? 56 : 48,
+                  attributes: skinned ? [
+                    { shaderLocation: 0, offset: 0, format: "float32x3" },
+                    { shaderLocation: 1, offset: 12, format: "float32x3" },
+                    { shaderLocation: 2, offset: 24, format: "float32x4" },
+                    { shaderLocation: 3, offset: 40, format: "float32x2" },
+                    { shaderLocation: 4, offset: 48, format: "uint8x4" },
+                    { shaderLocation: 5, offset: 52, format: "unorm8x4" },
+                  ] : [
                     { shaderLocation: 0, offset: 0, format: "float32x3" },
                     { shaderLocation: 1, offset: 12, format: "float32x3" },
                     { shaderLocation: 2, offset: 24, format: "float32x4" },
@@ -5143,6 +5175,7 @@
               hasNormal,
               hasEmissive,
               hasShadow,
+              skinned,
             };
             break;
           }
@@ -5322,6 +5355,15 @@
           st.bg1Dirty = true; // rebind group(1) with the real IBL views
           break;
         }
+        case 21: { // SET_BONES — upload the bone palette to bones @group(0)@binding(1).
+          // Payload (command.zig Encoder.setBones, 8B): count | ptr. count = number
+          // of mat4 (≤64); ptr → count*16 f32 column-major. Writes the whole
+          // palette into the bones uniform; skinned bg0 binds it (binding 1).
+          const count = dv.getUint32(off, true);
+          const p = dv.getUint32(off + 4, true);
+          device.queue.writeBuffer(gpuEnsureBones(st), 0, new Float32Array(memory.buffer, p, count * 16));
+          break;
+        }
         case 14: { // DELETE_RESOURCE — free one GPU object (parity with glInterpret).
           // Payload (command.zig Encoder.deleteResource, 8B): kind | handle.
           // ResKind: 0 buffer, 1 texture, 2 shader/pipeline, 3 shadow map.
@@ -5466,11 +5508,17 @@
             device.queue.writeBuffer(ubuf, base + PBR_U.lightVp, st.frameLightVp);
           }
           // ── Bind group 0: created once; the dynamic offset selects the slot. ──
+          // Skinned variants add binding 1 (bones palette, whole buffer, static).
+          // Keyed on active.bgl0, so switching between skinned (2-entry) and
+          // non-skinned (1-entry) layouts rebuilds. The setBindGroup offsets
+          // array length tracks hasDynamicOffset entries — binding 0 only — so it
+          // stays exactly 1 (binding 1 is static).
           if (!st.bg0 || st.bg0Layout !== active.bgl0) {
-            st.bg0 = device.createBindGroup({
-              layout: active.bgl0,
-              entries: [{ binding: 0, resource: { buffer: ubuf, offset: 0, size: PBR_U.size } }],
-            });
+            const bg0Entries = [{ binding: 0, resource: { buffer: ubuf, offset: 0, size: PBR_U.size } }];
+            if (active.skinned) {
+              bg0Entries.push({ binding: 1, resource: { buffer: gpuEnsureBones(st) } });
+            }
+            st.bg0 = device.createBindGroup({ layout: active.bgl0, entries: bg0Entries });
             st.bg0Layout = active.bgl0;
           }
           // ── Bind group 1: sampler + textures. Cached; invalidated by tag 8 ──
@@ -5761,6 +5809,7 @@
       uniformBuf: null,
       bindGroup: null,
       pbrUniform: null, // shared PBR uniform buffer (lazy; PBR_U.size bytes)
+      bonesBuf: null, // shared bones palette uniform (lazy; 64 mat4) — skinned
       depthUniform: null, // shadow depth-pass uniform (lazy; one mat4)
       depthBindGroup: null, // cached depth-pass bind group (2c)
       bg0: null, // cached group(0) bind group (uniform)
@@ -5845,6 +5894,7 @@
       st.ibl = null;
       st.shadow = null;
       st.pbrUniform = null;
+      st.bonesBuf = null;
       st.uniformBuf = null; // slice-1 basic-draw path's persistent buffer
       st.bindGroup = null;
       st.depthUniform = null;
