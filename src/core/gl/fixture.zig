@@ -1138,6 +1138,245 @@ pub fn pbrCubeFloorGlb(alloc: Allocator) ![]u8 {
 
 // ── studio HDR environment fixture ──────────────────────────────────────────────
 
+// ── skinned-bar fixture (skinning slice 1) ──────────────────────────────────────
+
+/// A procedural rigged bar along +Y for the skinning demo. A square-section
+/// open tube (4 side walls, 5 rings) skinned to a 3-joint vertical chain
+/// (root @y=0 → mid @y=1.5 → top @y=3). Vertices are weighted ring-by-ring so a
+/// rotation of the mid joint visibly bends the upper half.
+///
+/// Geometry: 4 sides × 5 rings × 2 corners = 40 vertices, 96 indices.
+/// Skin: skins[0].joints = [root,mid,node], inverseBindMatrices = inverse of
+/// each joint's bind WORLD (translate(0,−jointY,0)); node TRS gives bind_local.
+/// JOINTS_0 (u8 VEC4, indices into the joint list) + WEIGHTS_0 (f32 VEC4).
+/// One small (8×8) base-color PNG so the texture stays in-blob (no sidecar).
+pub fn skinnedBarGlb(alloc: Allocator) ![]u8 {
+    const half: f32 = 0.3;
+    const nr: usize = 5; // rings
+    const ring_y = [nr]f32{ 0.0, 0.75, 1.5, 2.25, 3.0 };
+    // joint indices in the skin's joint list: root=0, mid=1, top=2.
+    // Per-ring (joint0,w0,joint1,w1) — the other two weights are 0.
+    const RingSkin = struct { j0: u8, w0: f32, j1: u8, w1: f32 };
+    const ring_skin = [nr]RingSkin{
+        .{ .j0 = 0, .w0 = 1.0, .j1 = 0, .w1 = 0.0 }, // y=0    → root
+        .{ .j0 = 0, .w0 = 0.5, .j1 = 1, .w1 = 0.5 }, // y=0.75 → root/mid
+        .{ .j0 = 1, .w0 = 1.0, .j1 = 1, .w1 = 0.0 }, // y=1.5  → mid
+        .{ .j0 = 1, .w0 = 0.5, .j1 = 2, .w1 = 0.5 }, // y=2.25 → mid/top
+        .{ .j0 = 2, .w0 = 1.0, .j1 = 2, .w1 = 0.0 }, // y=3.0  → top
+    };
+    // Per side: left corner (Lx,Lz), right corner (Rx,Rz), outward normal (nx,nz)
+    // — ordered so {L,R}×{ring,ring+1} winds CCW viewed from outside (+normal).
+    const Side = struct { lx: f32, lz: f32, rx: f32, rz: f32, nx: f32, nz: f32 };
+    const sides = [4]Side{
+        .{ .lx = half, .lz = half, .rx = -half, .rz = half, .nx = 0, .nz = 1 }, // +Z
+        .{ .lx = -half, .lz = half, .rx = -half, .rz = -half, .nx = -1, .nz = 0 }, // -X
+        .{ .lx = -half, .lz = -half, .rx = half, .rz = -half, .nx = 0, .nz = -1 }, // -Z
+        .{ .lx = half, .lz = -half, .rx = half, .rz = half, .nx = 1, .nz = 0 }, // +X
+    };
+
+    const vert_count: u32 = 4 * @as(u32, nr) * 2; // 40
+    const index_count: u32 = 4 * (@as(u32, nr) - 1) * 6; // 96
+    const joint_count: u32 = 3;
+
+    // ── base-color PNG (8×8 amber checker, stays in-blob) ──────────────────────
+    var checker: [8 * 8 * 4]u8 = undefined;
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            const light = (row + col) % 2 == 0;
+            checker[idx + 0] = if (light) 235 else 150;
+            checker[idx + 1] = if (light) 170 else 90;
+            checker[idx + 2] = if (light) 70 else 30;
+            checker[idx + 3] = 255;
+        }
+    }
+    const png_bytes = try png.encodeRgba(alloc, &checker, 8, 8);
+    defer alloc.free(png_bytes);
+
+    // ── BIN layout ─────────────────────────────────────────────────────────────
+    const off_pos: u32 = 0;
+    const len_pos: u32 = vert_count * 12;
+    const off_nrm: u32 = off_pos + len_pos;
+    const len_nrm: u32 = vert_count * 12;
+    const off_uv: u32 = off_nrm + len_nrm;
+    const len_uv: u32 = vert_count * 8;
+    const off_jnt: u32 = off_uv + len_uv;
+    const len_jnt: u32 = vert_count * 4; // u8 VEC4
+    const off_wgt: u32 = off_jnt + len_jnt;
+    const len_wgt: u32 = vert_count * 16; // f32 VEC4
+    const off_idx: u32 = off_wgt + len_wgt;
+    const len_idx: u32 = index_count * 2;
+    const off_ibm: u32 = off_idx + len_idx;
+    const len_ibm: u32 = joint_count * 64; // MAT4 f32
+    const off_png: u32 = off_ibm + len_ibm;
+    const png_len: u32 = @intCast(png_bytes.len);
+
+    const bin_total: u32 = off_png + png_len;
+    const bin_padded = (bin_total + 3) & ~@as(u32, 3);
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // positions / normals / uvs / joints / weights — one pass over (side, ring, col)
+    var pc: usize = off_pos;
+    var nc: usize = off_nrm;
+    var uc: usize = off_uv;
+    var jc: usize = off_jnt;
+    var wc: usize = off_wgt;
+    for (sides) |s| {
+        for (0..nr) |r| {
+            const y = ring_y[r];
+            const rs = ring_skin[r];
+            // col 0 = L, col 1 = R
+            const cols = [2][2]f32{ .{ s.lx, s.lz }, .{ s.rx, s.rz } };
+            for (cols, 0..) |c, col| {
+                // position
+                std.mem.writeInt(u32, bin[pc..][0..4], @bitCast(c[0]), .little);
+                std.mem.writeInt(u32, bin[pc + 4 ..][0..4], @bitCast(y), .little);
+                std.mem.writeInt(u32, bin[pc + 8 ..][0..4], @bitCast(c[1]), .little);
+                pc += 12;
+                // normal
+                std.mem.writeInt(u32, bin[nc..][0..4], @bitCast(s.nx), .little);
+                std.mem.writeInt(u32, bin[nc + 4 ..][0..4], @bitCast(@as(f32, 0)), .little);
+                std.mem.writeInt(u32, bin[nc + 8 ..][0..4], @bitCast(s.nz), .little);
+                nc += 12;
+                // uv (u = col, v = ring fraction)
+                std.mem.writeInt(u32, bin[uc..][0..4], @bitCast(@as(f32, @floatFromInt(col))), .little);
+                std.mem.writeInt(u32, bin[uc + 4 ..][0..4], @bitCast(y / 3.0), .little);
+                uc += 8;
+                // joints (u8 VEC4): j0,j1,0,0
+                bin[jc + 0] = rs.j0;
+                bin[jc + 1] = rs.j1;
+                bin[jc + 2] = 0;
+                bin[jc + 3] = 0;
+                jc += 4;
+                // weights (f32 VEC4): w0,w1,0,0
+                std.mem.writeInt(u32, bin[wc..][0..4], @bitCast(rs.w0), .little);
+                std.mem.writeInt(u32, bin[wc + 4 ..][0..4], @bitCast(rs.w1), .little);
+                std.mem.writeInt(u32, bin[wc + 8 ..][0..4], @bitCast(@as(f32, 0)), .little);
+                std.mem.writeInt(u32, bin[wc + 12 ..][0..4], @bitCast(@as(f32, 0)), .little);
+                wc += 16;
+            }
+        }
+    }
+
+    // indices: per side, per quad (ring r → r+1): (BL,BR,TR),(BL,TR,TL)
+    var ic: usize = off_idx;
+    for (0..4) |side| {
+        const base: u16 = @intCast(side * nr * 2);
+        for (0..nr - 1) |r| {
+            const bl: u16 = base + @as(u16, @intCast(r * 2 + 0));
+            const br: u16 = base + @as(u16, @intCast(r * 2 + 1));
+            const tr: u16 = base + @as(u16, @intCast((r + 1) * 2 + 1));
+            const tl: u16 = base + @as(u16, @intCast((r + 1) * 2 + 0));
+            for ([6]u16{ bl, br, tr, bl, tr, tl }) |v| {
+                std.mem.writeInt(u16, bin[ic..][0..2], v, .little);
+                ic += 2;
+            }
+        }
+    }
+
+    // inverseBindMatrices (column-major translate(0,−jointY,0)): root y=0, mid
+    // y=1.5, top y=3.0 → inverse translation (0,−jointY,0) in elements [13].
+    const inv_y = [joint_count]f32{ 0.0, -1.5, -3.0 };
+    for (inv_y, 0..) |ty, j| {
+        const mo = off_ibm + @as(u32, @intCast(j)) * 64;
+        // identity
+        const ident = [16]f32{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+        var m = ident;
+        m[13] = ty; // column-major translation.y
+        inline for (0..16) |k| {
+            std.mem.writeInt(u32, bin[mo + k * 4 ..][0..4], @bitCast(m[k]), .little);
+        }
+    }
+
+    // PNG
+    @memcpy(bin[off_png..][0..png_len], png_bytes);
+
+    // ── JSON chunk ─────────────────────────────────────────────────────────────
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    try w.writeAll("{");
+    try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0,1]}],");
+    // node0 = mesh (skin 0); node1..3 = joint chain root→mid→top
+    try w.writeAll("\"nodes\":[");
+    try w.writeAll("{\"mesh\":0,\"skin\":0,\"name\":\"SkinBar\"},");
+    try w.writeAll("{\"name\":\"jroot\",\"translation\":[0.0,0.0,0.0],\"children\":[2]},");
+    try w.writeAll("{\"name\":\"jmid\",\"translation\":[0.0,1.5,0.0],\"children\":[3]},");
+    try w.writeAll("{\"name\":\"jtop\",\"translation\":[0.0,1.5,0.0]}");
+    try w.writeAll("],");
+    try w.writeAll("\"skins\":[{\"joints\":[1,2,3],\"inverseBindMatrices\":6}],");
+    try w.writeAll("\"meshes\":[{\"primitives\":[{\"attributes\":{");
+    try w.writeAll("\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2,\"JOINTS_0\":3,\"WEIGHTS_0\":4");
+    try w.writeAll("},\"indices\":5,\"material\":0}]}],");
+
+    // accessors
+    try w.writeAll("\"accessors\":[");
+    try w.print("{{\"bufferView\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{vert_count});
+    try w.print("{{\"bufferView\":1,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{vert_count});
+    try w.print("{{\"bufferView\":2,\"componentType\":5126,\"count\":{d},\"type\":\"VEC2\"}},", .{vert_count});
+    // JOINTS_0: unsigned byte (5121), VEC4
+    try w.print("{{\"bufferView\":3,\"componentType\":5121,\"count\":{d},\"type\":\"VEC4\"}},", .{vert_count});
+    // WEIGHTS_0: f32 (5126), VEC4
+    try w.print("{{\"bufferView\":4,\"componentType\":5126,\"count\":{d},\"type\":\"VEC4\"}},", .{vert_count});
+    try w.print("{{\"bufferView\":5,\"componentType\":5123,\"count\":{d},\"type\":\"SCALAR\"}},", .{index_count});
+    try w.print("{{\"bufferView\":6,\"componentType\":5126,\"count\":{d},\"type\":\"MAT4\"}}", .{joint_count});
+    try w.writeAll("],");
+
+    // bufferViews
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_pos, len_pos });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_nrm, len_nrm });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_uv, len_uv });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_jnt, len_jnt });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_wgt, len_wgt });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ off_idx, len_idx });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_ibm, len_ibm });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_png, png_len });
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},\"baseColorFactor\":[1.0,1.0,1.0,1.0],\"metallicFactor\":0.0,\"roughnessFactor\":0.8}}],");
+    try w.writeAll("\"textures\":[{\"source\":0}],");
+    try w.writeAll("\"images\":[{\"bufferView\":7,\"mimeType\":\"image/png\"}]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── assemble GLB ───────────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42;
+    glb[goff + 1] = 0x49;
+    glb[goff + 2] = 0x4E;
+    glb[goff + 3] = 0x00;
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+    return glb;
+}
+
 /// Procedural studio environment as a complete .hdr file (flat RGBE):
 /// vertical gradient (zenith (0.4,0.6,1.2) -> horizon (1.0,0.8,0.6) ->
 /// ground (0.15,0.12,0.1)) plus a sun disk (~12 deg diameter) at
@@ -1278,6 +1517,35 @@ test "pbrCubeGlb with_tangents=false: no TANGENT accessor" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len], .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 4), parsed.value.object.get("accessors").?.array.items.len);
+}
+
+// ── skinnedBarGlb fixture tests ─────────────────────────────────────────────────
+
+test "skinnedBarGlb: container + skin/JOINTS_0/WEIGHTS_0 present" {
+    const glb = try skinnedBarGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    // GLB container invariants
+    try testing.expectEqualSlices(u8, "glTF", glb[0..4]);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, glb[4..8], .little));
+    try testing.expectEqual(@as(u32, @intCast(glb.len)), std.mem.readInt(u32, glb[8..12], .little));
+    try testing.expectEqualSlices(u8, "JSON", glb[16..20]);
+    const json_len = std.mem.readInt(u32, glb[12..16], .little);
+    try testing.expectEqual(@as(u32, 0), json_len % 4);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len], .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    // skins[0].joints has 3 entries; inverseBindMatrices accessor present.
+    const skins = root.get("skins").?.array.items;
+    try testing.expectEqual(@as(usize, 1), skins.len);
+    try testing.expectEqual(@as(usize, 3), skins[0].object.get("joints").?.array.items.len);
+    try testing.expect(skins[0].object.get("inverseBindMatrices") != null);
+    // primitive carries JOINTS_0 + WEIGHTS_0
+    const prim = root.get("meshes").?.array.items[0].object.get("primitives").?.array.items[0].object;
+    const attrs = prim.get("attributes").?.object;
+    try testing.expect(attrs.get("JOINTS_0") != null);
+    try testing.expect(attrs.get("WEIGHTS_0") != null);
+    // 7 accessors (pos,nrm,uv,joints,weights,indices,ibm)
+    try testing.expectEqual(@as(usize, 7), root.get("accessors").?.array.items.len);
 }
 
 // ── studioHdr fixture tests ─────────────────────────────────────────────────────
