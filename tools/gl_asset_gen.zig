@@ -1,11 +1,14 @@
 //! Build-time GL asset converter.
 //!
 //! Dispatches on the input file extension:
-//!   .glb → gl.gltf.parseGlb + gl.vmesh.pack → writes <out.vmesh>
-//!   .hdr → gl.hdr.decode + IBL prefilter chain + gl.venv.pack → writes <out.venv>
+//!   .glb → gl.gltf.parseGlb + gl.vmesh.pack → writes <out_dir>/<stem>.vmesh
+//!          plus one sibling <out_dir>/<stem>.tex{index}.{ext} per externalized
+//!          (large) texture kept as compressed bytes.
+//!   .hdr → gl.hdr.decode + IBL prefilter chain + gl.venv.pack → writes
+//!          <out_dir>/<stem>.venv
 //!
-//! Invoked by build.zig via addRunArtifact; the output LazyPath is embedded
-//! into the server's gl_assets module.
+//! Invoked by build.zig via addRunArtifact; the output directory LazyPath is
+//! embedded (per-file) into the server's gl_assets module.
 
 const std = @import("std");
 const gl = @import("verve_gl");
@@ -13,23 +16,28 @@ const gl = @import("verve_gl");
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 3) {
-        std.log.err("gl_asset_gen: usage: gl_asset_gen <in.glb|in.hdr> <out.vmesh|out.venv>", .{});
+    if (args.len < 4) {
+        std.log.err("gl_asset_gen: usage: gl_asset_gen <in.glb|in.hdr> <out_dir> <stem> [--fast]", .{});
         return error.MissingArgs;
     }
     const in_path = args[1];
-    const out_path = args[2];
+    const out_dir = args[2];
+    const stem = args[3];
 
     // `--fast` (any trailing arg): lower the IBL prefilter sample counts for a
     // faster build at reduced quality. Output sizes are unchanged, so the .venv
     // format is identical — only the prefiltered values are coarser.
     var fast = false;
-    for (args[3..]) |a| {
+    for (args[4..]) |a| {
         if (std.mem.eql(u8, a, "--fast")) fast = true;
     }
 
     const alloc = init.gpa;
     const cwd = std.Io.Dir.cwd();
+
+    // The output directory is created by build.zig's addOutputDirectoryArg, but
+    // make sure it exists when running the tool standalone.
+    cwd.createDirPath(io, out_dir) catch {};
 
     // Read the input file.
     const in_bytes = blk: {
@@ -47,24 +55,47 @@ pub fn main(init: std.process.Init) !void {
 
     // Dispatch on extension.
     const ext = std.fs.path.extension(in_path);
-    const out_bytes = if (std.ascii.eqlIgnoreCase(ext, ".hdr"))
-        try convertHdr(alloc, in_path, in_bytes, quality(fast))
-    else
-        try convertGlb(alloc, in_path, in_bytes);
-    defer alloc.free(out_bytes);
+    if (std.ascii.eqlIgnoreCase(ext, ".hdr")) {
+        const out_bytes = try convertHdr(alloc, in_path, in_bytes, quality(fast));
+        defer alloc.free(out_bytes);
+        const venv_name = try std.fmt.allocPrint(alloc, "{s}.venv", .{stem});
+        defer alloc.free(venv_name);
+        try writeAsset(io, cwd, alloc, out_dir, venv_name, out_bytes);
+    } else {
+        try convertGlb(io, cwd, alloc, out_dir, stem, in_path, in_bytes);
+    }
+}
 
-    // Write output file.
-    var out_file = cwd.createFile(io, out_path, .{}) catch |err| {
-        std.log.err("gl_asset_gen: {s}: cannot create: {s}", .{ out_path, @errorName(err) });
+/// Join `<dir>/<name>` and write `bytes` to it.
+fn writeAsset(
+    io: std.Io,
+    cwd: std.Io.Dir,
+    alloc: std.mem.Allocator,
+    dir: []const u8,
+    name: []const u8,
+    bytes: []const u8,
+) !void {
+    const path = try std.fs.path.join(alloc, &.{ dir, name });
+    defer alloc.free(path);
+    var out_file = cwd.createFile(io, path, .{}) catch |err| {
+        std.log.err("gl_asset_gen: {s}: cannot create: {s}", .{ path, @errorName(err) });
         return err;
     };
     defer out_file.close(io);
-    try out_file.writePositionalAll(io, out_bytes, 0);
+    try out_file.writePositionalAll(io, bytes, 0);
 }
 
-// ── .glb → .vmesh ────────────────────────────────────────────────────────────
+// ── .glb → .vmesh (+ external texture files) ──────────────────────────────────
 
-fn convertGlb(alloc: std.mem.Allocator, in_path: []const u8, glb_bytes: []const u8) ![]u8 {
+fn convertGlb(
+    io: std.Io,
+    cwd: std.Io.Dir,
+    alloc: std.mem.Allocator,
+    out_dir: []const u8,
+    stem: []const u8,
+    in_path: []const u8,
+    glb_bytes: []const u8,
+) !void {
     // Parse GLB → Model.
     var model = gl.gltf.parseGlb(alloc, glb_bytes) catch |err| {
         std.log.err("gl_asset_gen: {s}: unsupported or malformed glb: {s}", .{ in_path, @errorName(err) });
@@ -81,7 +112,7 @@ fn convertGlb(alloc: std.mem.Allocator, in_path: []const u8, glb_bytes: []const 
     defer bvh_result.deinit(alloc);
 
     // Pack Model + BVH + names → v3 .vmesh bytes.
-    return gl.vmesh.pack(
+    const vmesh_bytes = try gl.vmesh.pack(
         alloc,
         model.vertices,
         model.indices,
@@ -91,6 +122,19 @@ fn convertGlb(alloc: std.mem.Allocator, in_path: []const u8, glb_bytes: []const 
         bvh_result.tri_perm,
         model.names,
     );
+    defer alloc.free(vmesh_bytes);
+
+    const vmesh_name = try std.fmt.allocPrint(alloc, "{s}.vmesh", .{stem});
+    defer alloc.free(vmesh_name);
+    try writeAsset(io, cwd, alloc, out_dir, vmesh_name, vmesh_bytes);
+
+    // Write each externalized (large) texture as a sibling
+    // <stem>.tex{index}.{ext} file with its original compressed bytes.
+    for (model.external_textures) |tex| {
+        const tex_name = try std.fmt.allocPrint(alloc, "{s}.tex{d}.{s}", .{ stem, tex.index, tex.ext });
+        defer alloc.free(tex_name);
+        try writeAsset(io, cwd, alloc, out_dir, tex_name, tex.bytes);
+    }
 }
 
 // ── .hdr → .venv ─────────────────────────────────────────────────────────────
