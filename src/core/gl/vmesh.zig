@@ -7,7 +7,7 @@
 //!
 //! Header layout (56 bytes, all integers little-endian u32):
 //!   [0..4]   magic "VMSH"
-//!   [4..8]   version u32 = 3
+//!   [4..8]   version u32 = 4
 //!   [8..12]  vertex_count
 //!   [12..16] index_count
 //!   [16..20] submesh_count
@@ -26,8 +26,9 @@
 //!   emissive f32×3 @32, occlusion_strength f32 @44, normal_scale f32 @48,
 //!   tex_base i32 @52, tex_mr i32 @56, tex_normal i32 @60,
 //!   tex_emissive i32 @64, tex_occlusion i32 @68
-//! texture table @tex_table_off, texture_count × 16 bytes:
-//!   width u32, height u32, data_off u32 (into tex blob), data_len u32
+//! texture table @tex_table_off, texture_count × 20 bytes:
+//!   width u32, height u32, data_off u32 (into tex blob), data_len u32,
+//!   format u32 (Format enum; 0 = raw)
 //!
 //! Sections appended after the texture blob, in order:
 //!   BVH nodes  : bvh_node_count × 32 B @ bvh_off (16-aligned), followed
@@ -47,12 +48,16 @@ const bvh = @import("bvh.zig");
 const command = @import("command.zig");
 
 pub const magic = "VMSH";
-pub const version: u32 = 3;
+pub const version: u32 = 4;
 pub const vertex_stride: u32 = 48; // pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40
 pub const header_size: u32 = 56;
 pub const submesh_size: u32 = 72;
-pub const tex_entry_size: u32 = 16;
+pub const tex_entry_size: u32 = 20;
 pub const name_entry_size: u32 = 12;
+
+/// Per-texture pixel encoding. v4: every texture is `.raw` today; the tag is
+/// groundwork for compressed/encoded payloads (PNG/JPEG/WebP) in later slices.
+pub const Format = enum(u32) { raw = 0, png = 1, jpeg = 2, webp = 3 };
 
 /// FNV-1a-32 hash (offset basis 0x811c9dc5, prime 0x01000193). The chunk-side
 /// findName uses the same fn — keep frozen.
@@ -84,7 +89,8 @@ pub const Submesh = struct {
 pub const Texture = struct {
     width: u32,
     height: u32,
-    rgba: []const u8, // width*height*4
+    rgba: []const u8, // width*height*4 (raw) or encoded payload bytes
+    format: Format = .raw,
 };
 
 /// Native-side packer. Caller supplies all arrays; `pack` computes
@@ -215,6 +221,7 @@ pub fn pack(
         std.mem.writeInt(u32, buf[off + 4 ..][0..4], t.height, .little);
         std.mem.writeInt(u32, buf[off + 8 ..][0..4], tex_blob_cursor, .little);
         std.mem.writeInt(u32, buf[off + 12 ..][0..4], data_len, .little);
+        std.mem.writeInt(u32, buf[off + 16 ..][0..4], @intFromEnum(t.format), .little);
         tex_blob_cursor += data_len;
     }
 
@@ -426,7 +433,7 @@ pub const Reader = struct {
     }
 
     /// Caller must ensure `i < self.tex_count`.
-    pub fn texture(self: *const Reader, i: u32) struct { width: u32, height: u32, rgba: []const u8 } {
+    pub fn texture(self: *const Reader, i: u32) struct { width: u32, height: u32, rgba: []const u8, format: Format } {
         std.debug.assert(i < self.tex_count);
         const tex_table_off = std.mem.readInt(u32, self.bytes[32..36], .little);
         const tex_data_off = std.mem.readInt(u32, self.bytes[36..40], .little);
@@ -436,11 +443,22 @@ pub const Reader = struct {
         const height = std.mem.readInt(u32, raw[4..8], .little);
         const data_off = std.mem.readInt(u32, raw[8..12], .little);
         const data_len = std.mem.readInt(u32, raw[12..16], .little);
+        const fmt = std.mem.readInt(u32, raw[16..20], .little);
         return .{
             .width = width,
             .height = height,
             .rgba = self.bytes[@as(usize, tex_data_off) + data_off ..][0..data_len],
+            .format = @enumFromInt(fmt),
         };
+    }
+
+    /// Pixel-encoding tag for texture `i`. Caller must ensure `i < self.tex_count`.
+    pub fn texFormat(self: *const Reader, i: u32) Format {
+        std.debug.assert(i < self.tex_count);
+        const tex_table_off = std.mem.readInt(u32, self.bytes[32..36], .little);
+        const entry_off = @as(usize, tex_table_off) + @as(usize, i) * tex_entry_size;
+        const raw = self.bytes[entry_off..][0..tex_entry_size];
+        return @enumFromInt(std.mem.readInt(u32, raw[16..20], .little));
     }
 
     /// Submesh name for entry `i`. Returns an empty slice if `i >= name_count`
