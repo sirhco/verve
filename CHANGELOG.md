@@ -6,6 +6,18 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` — asset-loader Web Worker** (`src/bridge/verve-worker.js`,
+  `src/bridge/verve.js`, `build.zig`, `src/server/{main,metrics}.zig`): `gl_load`
+  now fetches + decodes gl assets in a dedicated same-origin module worker
+  (`/verve-worker.js`), returning the bytes as a transferable `ArrayBuffer`; the main
+  thread keeps the `verve_asset_alloc` + wasm-memory copy + chunk callback. Falls
+  back to a main-thread fetch when the worker is unavailable / CSP-blocked / errors.
+  `worker-src 'self'` added to the CSP. Decode is passthrough today — the worker's
+  decode registry is the hook for off-main compressed-texture transcoding later. No
+  wire/shader change; goldens frozen.
+
 ## [0.5.6] - 2026-06-15
 
 ### Added
