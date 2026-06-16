@@ -1208,7 +1208,11 @@ pub fn skinnedBarGlb(alloc: Allocator) ![]u8 {
     const len_idx: u32 = index_count * 2;
     const off_ibm: u32 = off_idx + len_idx;
     const len_ibm: u32 = joint_count * 64; // MAT4 f32
-    const off_png: u32 = off_ibm + len_ibm;
+    const off_atime: u32 = off_ibm + len_ibm;
+    const len_atime: u32 = 3 * 4; // 3 SCALAR f32 times
+    const off_arot: u32 = off_atime + len_atime;
+    const len_arot: u32 = 3 * 4 * 4; // 3 VEC4 f32 quats
+    const off_png: u32 = off_arot + len_arot;
     const png_len: u32 = @intCast(png_bytes.len);
 
     const bin_total: u32 = off_png + png_len;
@@ -1290,6 +1294,20 @@ pub fn skinnedBarGlb(alloc: Allocator) ![]u8 {
         }
     }
 
+    // animation: 3 keyframe times + 3 rotation quats (id → ~rotZ(0.7) → id)
+    const a_times = [3]f32{ 0.0, 0.5, 1.0 };
+    for (a_times, 0..) |tv, i| {
+        std.mem.writeInt(u32, bin[off_atime + @as(u32, @intCast(i)) * 4 ..][0..4], @bitCast(tv), .little);
+    }
+    const a_half: f32 = 0.7 * 0.5;
+    const a_sin = @sin(a_half);
+    const a_cos = @cos(a_half);
+    const a_quats = [3][4]f32{ .{ 0, 0, 0, 1 }, .{ 0, 0, a_sin, a_cos }, .{ 0, 0, 0, 1 } };
+    for (a_quats, 0..) |q, i| {
+        const base = off_arot + @as(u32, @intCast(i)) * 16;
+        inline for (0..4) |c| std.mem.writeInt(u32, bin[base + c * 4 ..][0..4], @bitCast(q[c]), .little);
+    }
+
     // PNG
     @memcpy(bin[off_png..][0..png_len], png_bytes);
 
@@ -1325,6 +1343,8 @@ pub fn skinnedBarGlb(alloc: Allocator) ![]u8 {
     try w.print("{{\"bufferView\":4,\"componentType\":5126,\"count\":{d},\"type\":\"VEC4\"}},", .{vert_count});
     try w.print("{{\"bufferView\":5,\"componentType\":5123,\"count\":{d},\"type\":\"SCALAR\"}},", .{index_count});
     try w.print("{{\"bufferView\":6,\"componentType\":5126,\"count\":{d},\"type\":\"MAT4\"}}", .{joint_count});
+    try w.writeAll(",{\"bufferView\":7,\"componentType\":5126,\"count\":3,\"type\":\"SCALAR\"}");
+    try w.writeAll(",{\"bufferView\":8,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"}");
     try w.writeAll("],");
 
     // bufferViews
@@ -1336,13 +1356,16 @@ pub fn skinnedBarGlb(alloc: Allocator) ![]u8 {
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_wgt, len_wgt });
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ off_idx, len_idx });
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_ibm, len_ibm });
-    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_png, png_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_atime, len_atime }); // 7 anim times
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_arot, len_arot }); // 8 anim rot
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_png, png_len }); // 9 PNG
     try w.writeAll("],");
 
     try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
     try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},\"baseColorFactor\":[1.0,1.0,1.0,1.0],\"metallicFactor\":0.0,\"roughnessFactor\":0.8}}],");
     try w.writeAll("\"textures\":[{\"source\":0}],");
-    try w.writeAll("\"images\":[{\"bufferView\":7,\"mimeType\":\"image/png\"}]");
+    try w.writeAll("\"images\":[{\"bufferView\":9,\"mimeType\":\"image/png\"}],");
+    try w.writeAll("\"animations\":[{\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"rotation\"}}],\"samplers\":[{\"input\":7,\"output\":8,\"interpolation\":\"LINEAR\"}]}]");
     try w.writeAll("}");
 
     while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
@@ -1544,8 +1567,9 @@ test "skinnedBarGlb: container + skin/JOINTS_0/WEIGHTS_0 present" {
     const attrs = prim.get("attributes").?.object;
     try testing.expect(attrs.get("JOINTS_0") != null);
     try testing.expect(attrs.get("WEIGHTS_0") != null);
-    // 7 accessors (pos,nrm,uv,joints,weights,indices,ibm)
-    try testing.expectEqual(@as(usize, 7), root.get("accessors").?.array.items.len);
+    // 9 accessors (pos,nrm,uv,joints,weights,indices,ibm,anim_times,anim_rot)
+    try testing.expectEqual(@as(usize, 9), root.get("accessors").?.array.items.len);
+    try testing.expect(root.get("animations") != null);
 }
 
 // ── studioHdr fixture tests ─────────────────────────────────────────────────────
