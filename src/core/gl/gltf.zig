@@ -1076,25 +1076,44 @@ fn readAccessorJointsU8(
     return result;
 }
 
-/// Quantize a 4-weight vector (f32, ≈ sum 1) to u8 with an exact sum of 255.
-/// Rounds each to 0..255, then folds the rounding residual into the largest
-/// component so the four bytes always sum to 255 (matches the shader's /255).
+/// Quantize a 4-weight vector to u8 with an exact sum of 255 (matches the
+/// shader's /255). Renormalizes to the input's total (so any non-negative input
+/// — including sums ≠ 1 — is handled), floors each scaled weight, then hands the
+/// remaining counts to the largest fractional remainders (largest-remainder
+/// method). An all-zero input degenerates to {255,0,0,0}.
 fn quantizeWeights(w: [4]f32) [4]u8 {
-    var q: [4]u16 = undefined;
-    var sum: i32 = 0;
+    var c: [4]f32 = undefined;
+    var total: f32 = 0;
     for (0..4) |i| {
-        const c: f32 = @max(0.0, w[i]);
-        const r: u16 = @intFromFloat(@round(c * 255.0));
-        q[i] = @min(r, 255);
-        sum += q[i];
+        c[i] = @max(0.0, w[i]);
+        total += c[i];
     }
-    // Fold residual (255 − sum) into the largest component.
-    var max_i: usize = 0;
-    for (1..4) |i| if (q[i] > q[max_i]) {
-        max_i = i;
-    };
-    const adj: i32 = @as(i32, q[max_i]) + (255 - sum);
-    q[max_i] = @intCast(std.math.clamp(adj, 0, 255));
+    if (total <= 0) return .{ 255, 0, 0, 0 };
+
+    var q: [4]u16 = undefined;
+    var rem: [4]f32 = undefined;
+    var assigned: i32 = 0;
+    for (0..4) |i| {
+        const scaled = c[i] / total * 255.0;
+        const fl = @floor(scaled);
+        q[i] = @intFromFloat(fl);
+        rem[i] = scaled - fl;
+        assigned += @intCast(q[i]);
+    }
+    // Distribute the remaining (255 − assigned) units to the largest remainders.
+    var need: i32 = 255 - assigned;
+    while (need > 0) : (need -= 1) {
+        var mi: usize = 0;
+        var mr: f32 = -1;
+        for (0..4) |i| {
+            if (rem[i] > mr) {
+                mr = rem[i];
+                mi = i;
+            }
+        }
+        q[mi] += 1;
+        rem[mi] = -1; // don't pick the same slot twice
+    }
     return .{ @intCast(q[0]), @intCast(q[1]), @intCast(q[2]), @intCast(q[3]) };
 }
 
