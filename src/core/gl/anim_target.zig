@@ -312,6 +312,10 @@ fn makeFixtureReader(alloc: std.mem.Allocator) !struct {
         &.{}, // no BVH
         &.{},
         model.names,
+        false,
+        &.{},
+        &.{},
+        &.{},
     );
     const reader = try vmesh_mod.Reader.init(bytes);
     return .{ .bytes = bytes, .reader = reader };
@@ -402,6 +406,10 @@ test "(e) camera/model paths work with zero-name reader" {
         &.{},
         &.{},
         &.{}, // empty names
+        false,
+        &.{},
+        &.{},
+        &.{},
     );
     defer testing.allocator.free(bytes);
     const reader = try vmesh_mod.Reader.init(bytes);
@@ -432,6 +440,10 @@ test "(f) resolvePathStatic equals resolvePath for camera.* and model.yaw" {
         &idx,
         &.{},
         &.{},
+        &.{},
+        &.{},
+        &.{},
+        false,
         &.{},
         &.{},
         &.{},

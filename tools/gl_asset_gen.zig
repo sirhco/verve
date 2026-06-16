@@ -121,6 +121,10 @@ fn convertGlb(
         bvh_result.nodes,
         bvh_result.tri_perm,
         model.names,
+        false, // non-skinned (gltf skin extraction lands in a later task)
+        &.{},
+        &.{},
+        &.{},
     );
     defer alloc.free(vmesh_bytes);
 

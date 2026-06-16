@@ -1128,6 +1128,10 @@ test "parse pbrCubeMixedMaterialGlb: 2 submeshes, variant fan-out (full vs base-
         &.{}, // no bvh
         &.{}, // no tri_perm
         model.names,
+        false,
+        &.{},
+        &.{},
+        &.{},
     );
     defer testing.allocator.free(bytes);
     const r = try vmesh.Reader.init(bytes);
