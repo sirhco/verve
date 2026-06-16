@@ -539,6 +539,16 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\@group(0) @binding(0) var<uniform> u: U;
         \\
     ;
+    // Bone-matrix palette (variant_skinned). A SEPARATE group(0) binding, not part
+    // of the per-draw U block: a 64-entry mat4 array uploaded via set_bones. Joint
+    // indices/weights (vs_main locations 4/5) index it.
+    const uniforms_bones =
+        \\struct Bones {
+        \\  m: array<mat4x4<f32>, 64>,
+        \\};
+        \\@group(0) @binding(1) var<uniform> bones: Bones;
+        \\
+    ;
     // ── group(1) texture + sampler bindings (varied by variant) ─────
     const samp =
         \\@group(1) @binding(0) var samp: sampler;
@@ -608,8 +618,35 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  out.uv = a_uv;
         \\
     ;
+    // Skinned vs_main: adds joint/weight vertex inputs (locations 4/5), builds the
+    // skin matrix from the bone palette, and feeds the skinned position/normal into
+    // the world-space + normal varyings. uint8x4 → vec4<u32>; unorm8x4 → vec4<f32>.
+    const vs_head_skinned =
+        \\@vertex
+        \\fn vs_main(
+        \\  @location(0) a_pos: vec3<f32>,
+        \\  @location(1) a_normal: vec3<f32>,
+        \\  @location(2) a_tangent: vec4<f32>,
+        \\  @location(3) a_uv: vec2<f32>,
+        \\  @location(4) a_joints: vec4<u32>,
+        \\  @location(5) a_weights: vec4<f32>,
+        \\) -> VSOut {
+        \\  var out: VSOut;
+        \\  let skin = a_weights.x * bones.m[a_joints.x] + a_weights.y * bones.m[a_joints.y] + a_weights.z * bones.m[a_joints.z] + a_weights.w * bones.m[a_joints.w];
+        \\  let sp = skin * vec4<f32>(a_pos, 1.0);
+        \\  out.world_pos = (u.model * sp).xyz;
+        \\  out.normal = u.normal_mat * (mat3x3<f32>(skin[0].xyz, skin[1].xyz, skin[2].xyz) * a_normal);
+        \\  out.uv = a_uv;
+        \\
+    ;
     const vs_nm =
         \\  let t = normalize((mat3x3<f32>(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz)) * a_tangent.xyz);
+        \\  out.tangent = t;
+        \\  out.bitangent = cross(out.normal, t) * a_tangent.w;
+        \\
+    ;
+    const vs_nm_skinned =
+        \\  let t = normalize((mat3x3<f32>(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz)) * (mat3x3<f32>(skin[0].xyz, skin[1].xyz, skin[2].xyz) * a_tangent.xyz));
         \\  out.tangent = t;
         \\  out.bitangent = cross(out.normal, t) * a_tangent.w;
         \\
@@ -620,6 +657,12 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     ;
     const vs_tail =
         \\  out.pos = u.mvp * vec4<f32>(a_pos, 1.0);
+        \\  return out;
+        \\}
+        \\
+    ;
+    const vs_tail_skinned =
+        \\  out.pos = u.mvp * sp;
         \\  return out;
         \\}
         \\
@@ -762,9 +805,12 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const nm = flags & variant_normal_map != 0;
     const em = flags & variant_emissive != 0;
     const shadow = flags & variant_shadow != 0;
+    const skinned = flags & variant_skinned != 0;
     comptime var src: []const u8 = uniforms_head;
     if (shadow) src = src ++ uniforms_shadow;
-    src = src ++ uniforms_tail ++ samp ++ tex_base;
+    src = src ++ uniforms_tail;
+    if (skinned) src = src ++ uniforms_bones;
+    src = src ++ samp ++ tex_base;
     if (nm) src = src ++ tex_normal;
     if (em) src = src ++ tex_emissive;
     src = src ++ tex_ibl;
@@ -773,10 +819,10 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (nm) src = src ++ vsout_nm;
     if (shadow) src = src ++ vsout_shadow;
     src = src ++ vsout_tail;
-    src = src ++ vs_head;
-    if (nm) src = src ++ vs_nm;
+    src = src ++ (if (skinned) vs_head_skinned else vs_head);
+    if (nm) src = src ++ (if (skinned) vs_nm_skinned else vs_nm);
     if (shadow) src = src ++ vs_shadow;
-    src = src ++ vs_tail;
+    src = src ++ (if (skinned) vs_tail_skinned else vs_tail);
     src = src ++ helpers;
     if (shadow) src = src ++ fs_shadow_decl;
     src = src ++ fs_open;
@@ -1313,6 +1359,24 @@ test "WGSL PBR: variant-gated normal-map / emissive paths" {
     try testing.expect(std.mem.indexOf(u8, wgslPbr(F0), "emissive_tex") == null);
     try testing.expect(std.mem.indexOf(u8, wgslPbr(F1), "emissive_tex") == null);
     try testing.expect(std.mem.indexOf(u8, wgslPbr(F2), "emissive_tex") != null);
+}
+
+test "WGSL PBR: variant_skinned vertex path" {
+    const SK = variant_pbr | variant_skinned;
+    const sk = wgslPbr(SK);
+    for ([_][]const u8{
+        "a_joints", "a_weights", "@group(0) @binding(1)", "bones.m", "bones.m[a_joints.x]",
+    }) |needle|
+        try testing.expect(std.mem.indexOf(u8, sk, needle) != null);
+    // Non-skinned variant carries none of the skinning machinery.
+    const ns = wgslPbr(variant_pbr);
+    for ([_][]const u8{ "a_joints", "a_weights", "@group(0) @binding(1)", "bones.m" }) |needle|
+        try testing.expect(std.mem.indexOf(u8, ns, needle) == null);
+}
+
+test "golden: WGSL skinned hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate WGSL contract bump.
+    try testing.expectEqual(@as(u64, 0x1bab1e6822205a6a), fnv64(wgslPbr(variant_pbr | variant_skinned)));
 }
 
 test "golden: WGSL PBR hashes frozen (FNV-1a-64)" {
