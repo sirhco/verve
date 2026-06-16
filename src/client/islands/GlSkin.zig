@@ -1,9 +1,11 @@
-//! verve.gl skinning slice 1 — drives the /gl-skin canvas.
+//! verve.gl skinning — drives the /gl-skin canvas.
 //!
 //! A dedicated, single-instance chunk that renders a GPU-skinned rigged bar
-//! (`skinbar.vmesh`, stride-56 skinned vertices + a 3-joint skeleton) deformed
-//! by a FIXED bent pose: the mid joint carries a constant rotation, so the upper
-//! half of the bar visibly bends. Animation (time-varying pose) is slice 2.
+//! (`skinbar.vmesh`, stride-56 skinned vertices + a 3-joint skeleton). Slice 2:
+//! the bar plays a looping animation CLIP — each frame samples every joint's
+//! baked T/R/S keyframe tracks at `t = elapsed mod duration`, composing local
+//! transforms that deform the mesh over time. With no clip it falls back to the
+//! static bind pose (slice-1 behavior).
 //!
 //! Backend-detect mirrors GlScene: `gl_webgpu_available()` selects the WGSL
 //! skinned shader + `gl_start_gpu`, else the GLSL skinned shader + `gl_start`.
@@ -14,6 +16,7 @@
 //! STABLE module statics whose addresses the draw record carries (the bridge
 //! dereferences them AFTER the frame fn returns, so they must outlive the call).
 
+const std = @import("std");
 const verve = @import("verve");
 const gl = verve.gl;
 
@@ -30,6 +33,7 @@ var canvas_handle: ?i32 = null;
 var use_webgpu: bool = false;
 var resources_sent: bool = false;
 var yaw: f32 = 0;
+var elapsed_s: f32 = 0;
 // Resolved once the vmesh bytes land (gl_load → glskin_vmesh_ready). Holds slices
 // into the page asset region, valid for this single-instance chunk's lifetime.
 var asset: ?gl.vmesh.Reader = null;
@@ -71,9 +75,6 @@ const frame_export = "glskin_frame";
 const vmesh_ready_export = "glskin_vmesh_ready";
 const vmesh_url = "/gl/skinbar.vmesh";
 
-// Constant bend applied at the mid joint (rad about +Z) — the fixed pose.
-const bend_angle: f32 = 0.7;
-
 // ── hydrate ─────────────────────────────────────────────────────────────────
 
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
@@ -84,6 +85,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     resources_sent = false;
     asset = null;
     yaw = 0;
+    elapsed_s = 0;
     use_webgpu = gl_webgpu_available() != 0;
     canvas_handle = verve.queryRef(@as([]const u8, "glskin-canvas"));
 
@@ -107,22 +109,60 @@ export fn glskin_vmesh_ready(ptr: u32, len: u32) void {
 
 // ── bone palette ──────────────────────────────────────────────────────────────
 
-/// Recompute the bone palette for the fixed bent pose: per joint
-/// `world = parent_world · local` (mid joint's local carries the bend), then
-/// `bone = world · inverse_bind`. Joints are stored parent-before-child, so the
-/// parent world matrix is always ready.
+/// Last keyframe index whose time <= t (clamped to [0, key_count-1]).
+fn lowerKey(a: *const gl.vmesh.Reader, tr: gl.vmesh.TrackInfo, t: f32) u32 {
+    if (tr.key_count <= 1) return 0;
+    var i: u32 = 0;
+    while (i + 1 < tr.key_count and a.animTime(tr, i + 1) <= t) : (i += 1) {}
+    return i;
+}
+
+/// Sample a vec3 track (translation c=0 / scale c=2) at time t.
+fn sampleVec3(a: *const gl.vmesh.Reader, j: u32, c: u2, t: f32) gl.math.Vec3 {
+    const tr = a.animTrack(j, c);
+    const k0 = lowerKey(a, tr, t);
+    const v0 = gl.math.Vec3.init(a.animValue(tr, k0, 0), a.animValue(tr, k0, 1), a.animValue(tr, k0, 2));
+    if (tr.key_count <= 1 or tr.interp == 1 or k0 + 1 >= tr.key_count) return v0;
+    const k1 = k0 + 1;
+    const t0 = a.animTime(tr, k0);
+    const t1 = a.animTime(tr, k1);
+    const f = if (t1 > t0) std.math.clamp((t - t0) / (t1 - t0), 0, 1) else 0;
+    const v1 = gl.math.Vec3.init(a.animValue(tr, k1, 0), a.animValue(tr, k1, 1), a.animValue(tr, k1, 2));
+    return gl.math.Vec3.init(v0.x + (v1.x - v0.x) * f, v0.y + (v1.y - v0.y) * f, v0.z + (v1.z - v0.z) * f);
+}
+
+/// Sample the rotation track (c=1) at time t (slerp, or hold for STEP).
+fn sampleQuat(a: *const gl.vmesh.Reader, j: u32, t: f32) gl.math.Quat {
+    const tr = a.animTrack(j, 1);
+    const k0 = lowerKey(a, tr, t);
+    const q0 = gl.math.Quat{ .x = a.animValue(tr, k0, 0), .y = a.animValue(tr, k0, 1), .z = a.animValue(tr, k0, 2), .w = a.animValue(tr, k0, 3) };
+    if (tr.key_count <= 1 or tr.interp == 1 or k0 + 1 >= tr.key_count) return q0;
+    const k1 = k0 + 1;
+    const t0 = a.animTime(tr, k0);
+    const t1 = a.animTime(tr, k1);
+    const f = if (t1 > t0) std.math.clamp((t - t0) / (t1 - t0), 0, 1) else 0;
+    const q1 = gl.math.Quat{ .x = a.animValue(tr, k1, 0), .y = a.animValue(tr, k1, 1), .z = a.animValue(tr, k1, 2), .w = a.animValue(tr, k1, 3) };
+    return gl.math.Quat.slerp(q0, q1, f);
+}
+
+/// Recompute the bone palette. With a clip: sample each joint's T/R/S tracks at
+/// the looped time → local TRS. Without: the static bind pose (slice-1 fallback).
+/// `world = parent_world · local` (parents precede children) → `bone = world ·
+/// inverse_bind`.
 fn updateBones(a: *const gl.vmesh.Reader) void {
     const jc = @min(a.jointCount(), max_bones);
-    const bend = gl.math.Mat4.fromTrs(
-        gl.math.Vec3.init(0, 0, 0),
-        gl.math.Quat.fromAxisAngle(gl.math.Vec3.init(0, 0, 1), bend_angle),
-        gl.math.Vec3.init(1, 1, 1),
-    );
+    const has_anim = a.animPresent();
+    const dur = a.animDuration();
+    const t = if (has_anim and dur > 0) @mod(elapsed_s, dur) else 0;
     var j: u32 = 0;
     while (j < jc) : (j += 1) {
         const joint = a.joint(j);
-        var local = gl.math.Mat4{ .m = joint.bind_local };
-        if (j == 1) local = local.mul(bend); // bend at the mid joint
+        const local = if (has_anim) blk: {
+            const tr = sampleVec3(a, j, 0, t); // translation
+            const rot = sampleQuat(a, j, t); // rotation
+            const scl = sampleVec3(a, j, 2, t); // scale
+            break :blk gl.math.Mat4.fromTrs(tr, rot, scl);
+        } else gl.math.Mat4{ .m = joint.bind_local };
         const w = if (joint.parent < 0)
             local
         else
@@ -147,6 +187,7 @@ export fn glskin_frame(dt_ms: f32, width: u32, height: u32) u32 {
         return @intCast(@intFromPtr(&cmd_buf));
     };
     yaw += dt_ms * 0.0006; // slow orbit so the 3D bend reads from all sides
+    elapsed_s += dt_ms * 0.001; // clip playback time (looped in updateBones)
 
     const aspect = @as(f32, @floatFromInt(width)) /
         @as(f32, @floatFromInt(@max(height, 1)));
