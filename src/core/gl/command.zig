@@ -199,10 +199,28 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\out vec3 v_bitangent;
         \\
     ;
+    // Skinning attribs + bone-matrix palette (variant_skinned). Joint indices
+    // and weights index a 64-entry mat4 array uploaded via set_bones.
+    const skin_decl =
+        \\layout(location = 4) in uvec4 a_joints;
+        \\layout(location = 5) in vec4 a_weights;
+        \\uniform mat4 u_bones[64];
+        \\
+    ;
     const body_open =
         \\void main() {
         \\  v_world_pos = (u_model * vec4(a_pos, 1.0)).xyz;
         \\  v_normal = u_normal_mat * a_normal;
+        \\  v_uv = a_uv;
+        \\
+    ;
+    // Skinned body_open: skin matrix from the bone palette, then skinned
+    // position/normal feeding world-space + normal varyings.
+    const body_open_skinned =
+        \\void main() {
+        \\  mat4 skin = a_weights.x * u_bones[a_joints.x] + a_weights.y * u_bones[a_joints.y] + a_weights.z * u_bones[a_joints.z] + a_weights.w * u_bones[a_joints.w];
+        \\  v_world_pos = (u_model * (skin * vec4(a_pos, 1.0))).xyz;
+        \\  v_normal = u_normal_mat * (mat3(skin) * a_normal);
         \\  v_uv = a_uv;
         \\
     ;
@@ -211,8 +229,18 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\  v_bitangent = cross(v_normal, v_tangent) * a_tangent.w;
         \\
     ;
+    const nm_body_skinned =
+        \\  v_tangent = normalize(mat3(u_model) * (mat3(skin) * a_tangent.xyz));
+        \\  v_bitangent = cross(v_normal, v_tangent) * a_tangent.w;
+        \\
+    ;
     const body_close =
         \\  gl_Position = u_mvp * vec4(a_pos, 1.0);
+        \\}
+        \\
+    ;
+    const body_close_skinned =
+        \\  gl_Position = u_mvp * (skin * vec4(a_pos, 1.0));
         \\}
         \\
     ;
@@ -227,13 +255,15 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\  v_light_pos = u_light_vp * u_model * vec4(a_pos, 1.0);
         \\
     ;
+    const skinned = flags & variant_skinned != 0;
     comptime var src: []const u8 = head;
     if (flags & variant_normal_map != 0) src = src ++ nm_outs;
     if (flags & variant_shadow != 0) src = src ++ shadow_outs;
-    src = src ++ body_open;
-    if (flags & variant_normal_map != 0) src = src ++ nm_body;
+    if (skinned) src = src ++ skin_decl;
+    src = src ++ (if (skinned) body_open_skinned else body_open);
+    if (flags & variant_normal_map != 0) src = src ++ (if (skinned) nm_body_skinned else nm_body);
     if (flags & variant_shadow != 0) src = src ++ shadow_body;
-    src = src ++ body_close;
+    src = src ++ (if (skinned) body_close_skinned else body_close);
     return src;
 }
 
@@ -1198,6 +1228,25 @@ test "golden: PBR GLSL hashes frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0x2f65f1426c2c4ed2), fnv64(pbrFragmentSrc(F0)));
     try testing.expectEqual(@as(u64, 0x4b3d632d4e94e70d), fnv64(pbrFragmentSrc(F1)));
     try testing.expectEqual(@as(u64, 0xf0c580cec075612c), fnv64(pbrFragmentSrc(F2)));
+}
+
+test "skinned vertex variant: attribs + bone palette present, absent when off" {
+    const SK = variant_pbr | variant_skinned;
+    const sk = pbrVertexSrc(SK);
+    try testing.expect(std.mem.indexOf(u8, sk, "a_joints") != null);
+    try testing.expect(std.mem.indexOf(u8, sk, "a_weights") != null);
+    try testing.expect(std.mem.indexOf(u8, sk, "u_bones[64]") != null);
+    try testing.expect(std.mem.indexOf(u8, sk, "u_bones[a_joints.x]") != null);
+
+    // Non-skinned VS must not leak any skinning declarations.
+    const ns = pbrVertexSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, ns, "a_joints") == null);
+    try testing.expect(std.mem.indexOf(u8, ns, "u_bones") == null);
+}
+
+test "golden: skinned PBR VS hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate GLSL contract bump.
+    try testing.expectEqual(@as(u64, 0x967adc56f7ed4c24), fnv64(pbrVertexSrc(variant_pbr | variant_skinned)));
 }
 
 test "WGSL unlit: both stages and uniform present" {
