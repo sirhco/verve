@@ -125,6 +125,7 @@ fn convertGlb(
         model.joints,
         model.weights,
         model.skel,
+        null,
     );
     defer alloc.free(vmesh_bytes);
 
