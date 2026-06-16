@@ -39,6 +39,14 @@ var elapsed_s: f32 = 0;
 var cur_clip: u32 = 0;
 var paused: bool = false;
 var speed: f32 = 1.0;
+// Cross-fade (slice 4): on a clip switch, snapshot the old clip + its looped time
+// (FROZEN), and blend old→new pose over `fade_dur` real-time seconds. `pending_clip`
+// is set by the control exports and applied in updateBones (which has the Reader).
+const fade_dur: f32 = 0.3;
+var from_clip: u32 = 0;
+var from_time: f32 = 0;
+var fade_t: f32 = fade_dur; // start settled (no blend on the first frame)
+var pending_clip: i32 = -1;
 // Resolved once the vmesh bytes land (gl_load → glskin_vmesh_ready). Holds slices
 // into the page asset region, valid for this single-instance chunk's lifetime.
 var asset: ?gl.vmesh.Reader = null;
@@ -94,6 +102,10 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     cur_clip = 0;
     paused = false;
     speed = 1.0;
+    from_clip = 0;
+    from_time = 0;
+    fade_t = fade_dur;
+    pending_clip = -1;
     use_webgpu = gl_webgpu_available() != 0;
     canvas_handle = verve.queryRef(@as([]const u8, "glskin-canvas"));
 
@@ -161,24 +173,52 @@ fn updateBones(a: *const gl.vmesh.Reader) void {
     const jc = @min(a.jointCount(), max_bones);
     const ccount = a.animClipCount();
     const has_anim = a.animPresent() and ccount > 0;
+
+    // Apply a pending clip switch → start a cross-fade from the frozen old pose.
+    if (pending_clip >= 0) {
+        const np: u32 = @intCast(pending_clip);
+        pending_clip = -1;
+        if (has_anim and np != cur_clip and np < ccount) {
+            const old_dur = a.animClip(cur_clip).duration;
+            from_clip = cur_clip;
+            from_time = if (old_dur > 0) @mod(elapsed_s, old_dur) else 0;
+            fade_t = 0;
+            cur_clip = np;
+            elapsed_s = 0;
+        }
+    }
+
     const clip = if (cur_clip < ccount) cur_clip else 0;
     const dur = if (has_anim) a.animClip(clip).duration else 0;
     const t = if (has_anim and dur > 0) @mod(elapsed_s, dur) else 0;
+    const blending = has_anim and fade_t < fade_dur;
+    const w = if (fade_dur > 0) std.math.clamp(fade_t / fade_dur, 0, 1) else 1;
+
     var j: u32 = 0;
     while (j < jc) : (j += 1) {
         const joint = a.joint(j);
         const local = if (has_anim) blk: {
-            const tr = sampleVec3(a, clip, j, 0, t); // translation
-            const rot = sampleQuat(a, clip, j, t); // rotation
-            const scl = sampleVec3(a, clip, j, 2, t); // scale
-            break :blk gl.math.Mat4.fromTrs(tr, rot, scl);
+            const nt = sampleVec3(a, clip, j, 0, t); // new translation
+            const nr = sampleQuat(a, clip, j, t); // new rotation
+            const ns = sampleVec3(a, clip, j, 2, t); // new scale
+            if (blending) {
+                const ot = sampleVec3(a, from_clip, j, 0, from_time);
+                const orr = sampleQuat(a, from_clip, j, from_time);
+                const os = sampleVec3(a, from_clip, j, 2, from_time);
+                break :blk gl.math.Mat4.fromTrs(
+                    gl.math.Vec3.lerp(ot, nt, w),
+                    gl.math.Quat.slerp(orr, nr, w),
+                    gl.math.Vec3.lerp(os, ns, w),
+                );
+            }
+            break :blk gl.math.Mat4.fromTrs(nt, nr, ns);
         } else gl.math.Mat4{ .m = joint.bind_local };
-        const w = if (joint.parent < 0)
+        const wm = if (joint.parent < 0)
             local
         else
             world_mats[@intCast(joint.parent)].mul(local);
-        world_mats[j] = w;
-        const bone = w.mul(gl.math.Mat4{ .m = joint.inverse_bind });
+        world_mats[j] = wm;
+        const bone = wm.mul(gl.math.Mat4{ .m = joint.inverse_bind });
         @memcpy(bones[j * 16 ..][0..16], &bone.m);
     }
 }
@@ -188,12 +228,10 @@ fn updateBones(a: *const gl.vmesh.Reader) void {
 // so glskin_clip1 on a single-clip mesh is harmless.
 
 export fn glskin_clip0() void {
-    cur_clip = 0;
-    elapsed_s = 0;
+    pending_clip = 0;
 }
 export fn glskin_clip1() void {
-    cur_clip = 1;
-    elapsed_s = 0;
+    pending_clip = 1;
 }
 export fn glskin_pause() void {
     paused = true;
@@ -225,7 +263,10 @@ export fn glskin_frame(dt_ms: f32, width: u32, height: u32) u32 {
         return @intCast(@intFromPtr(&cmd_buf));
     };
     yaw += dt_ms * 0.0006; // slow orbit so the 3D bend reads from all sides
-    if (!paused) elapsed_s += dt_ms * 0.001 * speed; // clip playback time (looped)
+    if (!paused) {
+        elapsed_s += dt_ms * 0.001 * speed; // clip playback time (speed-scaled, looped)
+        fade_t += dt_ms * 0.001; // cross-fade timer (real-time, NOT speed-scaled)
+    }
 
     const aspect = @as(f32, @floatFromInt(width)) /
         @as(f32, @floatFromInt(@max(height, 1)));
