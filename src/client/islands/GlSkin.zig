@@ -136,7 +136,16 @@ fn updateBones(a: *const gl.vmesh.Reader) void {
 // ── frame export ──────────────────────────────────────────────────────────────
 
 export fn glskin_frame(dt_ms: f32, width: u32, height: u32) u32 {
-    const a = if (asset) |*r| r else return 0; // no mesh yet → nothing to draw
+    // The mesh loads async; until it lands emit a clear-only frame (NOT 0 —
+    // the WebGL2 loop reads a 0 return as the unmount signal and tears the loop
+    // down, which would stop us before the vmesh ever arrives).
+    const a = if (asset) |*r| r else {
+        var enc0 = gl.Encoder.init(&cmd_buf);
+        enc0.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
+        enc0.endFrame();
+        _ = enc0.finish();
+        return @intCast(@intFromPtr(&cmd_buf));
+    };
     yaw += dt_ms * 0.0006; // slow orbit so the 3D bend reads from all sides
 
     const aspect = @as(f32, @floatFromInt(width)) /
