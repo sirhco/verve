@@ -619,7 +619,7 @@ test "reader rejects hostile counts (u32 overflow)" {
     try testing.expectError(error.Truncated, Reader.init(&buf));
 
     std.mem.writeInt(u32, buf[16..20], 0, .little);
-    std.mem.writeInt(u32, buf[20..24], 0xFFFF_FFFF, .little); // texture_count: *16 wraps
+    std.mem.writeInt(u32, buf[20..24], 0xFFFF_FFFF, .little); // texture_count: *20 wraps
     try testing.expectError(error.Truncated, Reader.init(&buf));
 
     std.mem.writeInt(u32, buf[20..24], 0, .little);
