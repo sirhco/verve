@@ -6,6 +6,25 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` — skeletal skinning, slice 3 (multiple clips + controls)**
+  (`src/core/gl/vmesh.zig` v7, `gltf.zig`, `fixture.zig`, `tools/gl_asset_gen.zig`,
+  `src/client/islands/GlSkin.zig`, `src/app/components.zig`): `/gl-skin` now carries
+  multiple animation clips with runtime controls — buttons switch clip (Bend /
+  Twist), pause/play, and set speed (0.5× / 1× / 2×). vmesh format v7 generalizes
+  the v6 single-clip anim section into a clip table (N clips, each with a name hash
+  + duration + the per-joint keyframe tracks). `gltf.zig` parses the whole
+  `animations[]` array into one clip each. `GlSkin` holds `{cur_clip, paused,
+  speed}` state, samples the selected clip per frame, and exposes no-arg control
+  exports (`glskin_clip0`/`clip1`/`pause`/`play`/`speed_half`/`speed_1x`/
+  `speed_2x`) wired to `z-on-click` buttons. The fixture ships two clips (Bend =
+  mid-joint Z rotation, Twist = jmid+jtop Y rotation). **No `command.zig` / shader
+  / wire change** — selection + playback are chunk-side over the same `set_bones`
+  palette; all shader + wire goldens byte-identical (vmesh bumped 6→7). Verified on
+  WebGPU and WebGL2 (headless CDP: switch changes pose, pause freezes, play
+  resumes). Deferred: cross-fade blending, scrub, loop/once modes, CUBICSPLINE.
+
 ## [0.5.9] - 2026-06-16
 
 ### Added
