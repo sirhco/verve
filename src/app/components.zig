@@ -868,6 +868,38 @@ pub fn glSceneWebgpu(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl skinning demo — /gl-skin. A GPU-skinned rigged bar deformed by a
+/// fixed bent pose, rendered through either backend (WebGPU when available, else
+/// WebGL2). The GlSkin chunk fetches skinbar.vmesh and drives the skinned PBR
+/// program; the SSR marker just places the canvas + island.
+pub fn glSkin(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "glskin-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Skinned bar (static bent pose) — GPU skinning"),
+        canvas,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlSkin" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — skeletal skinning"),
+        ctx.p().text("A rigged bar GPU-skinned by a 3-joint skeleton, deformed by " ++
+            "a fixed bent pose (the mid joint carries a constant rotation, so the " ++
+            "upper half bends). Vertices carry joint indices + weights; the bone " ++
+            "matrix palette is computed per frame in Zig and pushed via set_bones, " ++
+            "and the skinned PBR shader (variant_pbr | variant_skinned) blends the " ++
+            "bone matrices per vertex. Renders through WebGPU when available, else " ++
+            "WebGL2. Keyframe animation is the next slice."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a

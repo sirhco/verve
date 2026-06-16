@@ -121,6 +121,14 @@ pub const GlSceneWebgpu = struct {
     pub const props_schema: []const u8 = "{}";
 };
 
+/// verve.gl skinning slice 1 (/gl-skin). Renders a GPU-skinned rigged bar
+/// (`skinbar.vmesh`) deformed by a fixed bent pose; backend-detects WebGPU vs
+/// WebGL2 like GlScene. SSR emits `<canvas data-ref="glskin-canvas">`.
+/// Source: `src/client/islands/GlSkin.zig`.
+pub const GlSkin = struct {
+    pub const props_schema: []const u8 = "{}";
+};
+
 /// verve.gl declarative scene (P4). Built via `ctx.glScene(.{...})` — a vmesh
 /// model + venv environment rendered with orbit camera, a directional light,
 /// optional auto-rotate, and named pickable meshes wired to closure event ids.
