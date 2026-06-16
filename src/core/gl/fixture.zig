@@ -316,8 +316,43 @@ const face_tangents = [6][3]f32{
 /// Same 24-vertex cube geometry as texturedCubeGlb. Five embedded PNGs
 /// (base/MR/normal/emissive/occlusion) each 8x8 RGBA.
 pub fn pbrCubeGlb(alloc: Allocator, opts: struct { with_tangents: bool = true }) ![]u8 {
-    // ── 1. Build the five 8x8 RGBA maps ───────────────────────────────────────
-    var base_map: [8 * 8 * 4]u8 = undefined; // checkerboard
+    // ── 1. Build the maps ──────────────────────────────────────────────────────
+    // ── Base-color map: detailed 256×256 procedural (real-sized for the
+    //    compressed-textures demo). Deterministic — no RNG — so goldens are stable.
+    const base_dim: u32 = 256;
+    const base_map = try alloc.alloc(u8, base_dim * base_dim * 4);
+    defer alloc.free(base_map);
+    {
+        var y: u32 = 0;
+        while (y < base_dim) : (y += 1) {
+            var x: u32 = 0;
+            while (x < base_dim) : (x += 1) {
+                const idx = (y * base_dim + x) * 4;
+                const cell = ((x / 32) + (y / 32)) % 2 == 0;
+                var r: u32 = if (cell) 210 else 70;
+                var g: u32 = if (cell) 200 else 80;
+                var b: u32 = if (cell) 180 else 190;
+                r = r * (160 + x / 4) / 255;
+                g = g * (160 + y / 4) / 255;
+                const h = (x *% 374761393 +% y *% 668265263) *% 1274126177;
+                const n: u32 = (h >> 24) & 0xFF;
+                r = (r * 3 + n) / 4;
+                g = (g * 3 + n) / 4;
+                b = (b * 3 + n) / 4;
+                if (x % 32 == 0 or y % 32 == 0) {
+                    r /= 2;
+                    g /= 2;
+                    b /= 2;
+                }
+                base_map[idx + 0] = @intCast(@min(r, 255));
+                base_map[idx + 1] = @intCast(@min(g, 255));
+                base_map[idx + 2] = @intCast(@min(b, 255));
+                base_map[idx + 3] = 255;
+            }
+        }
+    }
+
+    // ── The four 8x8 PBR side maps ─────────────────────────────────────────────
     var mr_map: [8 * 8 * 4]u8 = undefined; // G=roughness ramp(x), B=metallic ramp(y)
     var nrm_map: [8 * 8 * 4]u8 = undefined; // diagonal groove around (128,128,255)
     var emi_map: [8 * 8 * 4]u8 = undefined; // bright 2x2 patch
@@ -325,18 +360,6 @@ pub fn pbrCubeGlb(alloc: Allocator, opts: struct { with_tangents: bool = true })
     for (0..8) |row| {
         for (0..8) |col| {
             const idx = (row * 8 + col) * 4;
-            // base: checkerboard
-            const light = (row + col) % 2 == 0;
-            if (light) {
-                base_map[idx + 0] = 230;
-                base_map[idx + 1] = 230;
-                base_map[idx + 2] = 230;
-            } else {
-                base_map[idx + 0] = 60;
-                base_map[idx + 1] = 60;
-                base_map[idx + 2] = 200;
-            }
-            base_map[idx + 3] = 255;
             // metallicRoughness: G ramps roughness across x, B ramps metallic across y
             mr_map[idx + 0] = 0;
             mr_map[idx + 1] = @intCast(col * 255 / 7); // roughness across x
@@ -363,7 +386,7 @@ pub fn pbrCubeGlb(alloc: Allocator, opts: struct { with_tangents: bool = true })
         }
     }
 
-    const base_png = try png.encodeRgba(alloc, &base_map, 8, 8);
+    const base_png = try png.encodeRgba(alloc, base_map, base_dim, base_dim);
     defer alloc.free(base_png);
     const mr_png = try png.encodeRgba(alloc, &mr_map, 8, 8);
     defer alloc.free(mr_png);
