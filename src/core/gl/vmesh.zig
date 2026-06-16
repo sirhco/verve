@@ -1,13 +1,13 @@
-//! .vmesh packed asset format v5 — writer + freestanding reader.
+//! .vmesh packed asset format v6 — writer + freestanding reader.
 //!
 //! Invariant: the byte buffer handed to `Reader.init` must itself be at least
 //! 4-byte aligned (the asset region provides 16) — section offsets only
 //! preserve alignment relative to the buffer base, and
 //! `bvh.nodesFromBytes`/`triPermFromBytes` assert on the absolute pointer.
 //!
-//! Header layout (68 bytes, all integers little-endian u32):
+//! Header layout (72 bytes, all integers little-endian u32):
 //!   [0..4]   magic "VMSH"
-//!   [4..8]   version u32 = 5
+//!   [4..8]   version u32 = 6
 //!   [8..12]  vertex_count
 //!   [12..16] index_count
 //!   [16..20] submesh_count
@@ -23,6 +23,7 @@
 //!   [56..60] skinned u32 (0 = non-skinned stride 48; 1 = skinned stride 56)
 //!   [60..64] skeleton_off (16-aligned; 0 allowed ONLY if joint_count == 0)
 //!   [64..68] joint_count
+//!   [68..72] anim_off (16-aligned; 0 = no animation clip)
 //! submesh table @68, submesh_count × 72 bytes:
 //!   index_byte_off u32 @0, index_count u32 @4,
 //!   base_color f32×4 @8, metallic f32 @24, roughness f32 @28,
@@ -56,10 +57,10 @@ const bvh = @import("bvh.zig");
 const command = @import("command.zig");
 
 pub const magic = "VMSH";
-pub const version: u32 = 5;
+pub const version: u32 = 6;
 pub const vertex_stride: u32 = 48; // pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40
 pub const skinned_vertex_stride: u32 = 56; // …48, then joints uint8x4 @48, weights unorm8x4 @52
-pub const header_size: u32 = 68;
+pub const header_size: u32 = 72;
 pub const submesh_size: u32 = 72;
 pub const tex_entry_size: u32 = 20;
 pub const name_entry_size: u32 = 12;
@@ -68,6 +69,14 @@ pub const joint_entry_size: u32 = 132; // parent i32 (4) + inverse_bind 16f32 (6
 /// One skeleton joint. `parent` is an index into the joint array, or -1 for root.
 /// Matrices are column-major 4×4 (16 f32), matching the GL command stream.
 pub const Joint = struct { parent: i32, inverse_bind: [16]f32, bind_local: [16]f32 };
+
+pub const Track = struct { interp: u8, times: []const f32, values: []const f32 };
+pub const Anim = struct { duration: f32, tracks: []const Track };
+pub fn animComps(channel: u2) u32 {
+    return if (channel == 1) 4 else 3;
+}
+pub const TrackInfo = struct { interp: u8, key_count: u32, data_off: u32, comps: u32 };
+const anim_dir_entry_size: u32 = 12;
 
 /// Per-texture pixel encoding. v4: every texture is `.raw` today; the tag is
 /// groundwork for compressed/encoded payloads (PNG/JPEG/WebP) in later slices.
@@ -135,6 +144,7 @@ pub fn pack(
     joints: []const [4]u8,
     weights: []const [4]u8,
     skel: []const Joint,
+    anim: ?Anim,
 ) ![]u8 {
     // Validate BVH section coupling.
     if (bvh_nodes.len > 0) {
@@ -208,7 +218,23 @@ pub fn pack(
     const skeleton_bytes: u32 = joint_count * joint_entry_size;
     const after_skeleton: u32 = if (joint_count == 0) after_names else skeleton_off + skeleton_bytes;
 
-    const total_size: u32 = after_skeleton;
+    var anim_dir_bytes: u32 = 0;
+    var anim_blob_bytes: u32 = 0;
+    if (anim) |an| {
+        std.debug.assert(an.tracks.len == @as(usize, joint_count) * 3);
+        anim_dir_bytes = joint_count * 3 * anim_dir_entry_size;
+        for (an.tracks, 0..) |tr, ti| {
+            const comps = animComps(@intCast(ti % 3));
+            const kc: u32 = @intCast(tr.times.len);
+            std.debug.assert(tr.values.len == @as(usize, kc) * comps);
+            anim_blob_bytes += kc * 4 + kc * comps * 4;
+        }
+    }
+    const anim_off: u32 = if (anim == null) 0 else alignUp(after_skeleton, 16);
+    const anim_section_bytes: u32 = if (anim == null) 0 else 8 + anim_dir_bytes + anim_blob_bytes;
+    const after_anim: u32 = if (anim == null) after_skeleton else anim_off + anim_section_bytes;
+
+    const total_size: u32 = after_anim;
     const buf = try alloc.alloc(u8, total_size);
     @memset(buf, 0);
 
@@ -230,6 +256,7 @@ pub fn pack(
     std.mem.writeInt(u32, buf[56..60], @intFromBool(skinned), .little);
     std.mem.writeInt(u32, buf[60..64], skeleton_off, .little);
     std.mem.writeInt(u32, buf[64..68], joint_count, .little);
+    std.mem.writeInt(u32, buf[68..72], anim_off, .little);
 
     // Write submesh table @68 (right after the header)
     for (submeshes, 0..) |s, i| {
@@ -335,6 +362,34 @@ pub fn pack(
         }
     }
 
+    // Write animation section: duration f32 @0, flags u32 @4, directory @8
+    // (joint_count*3 entries × 12B), then per-track time + value blobs.
+    if (anim) |an| {
+        std.mem.writeInt(u32, buf[anim_off..][0..4], @bitCast(an.duration), .little);
+        std.mem.writeInt(u32, buf[anim_off + 4 ..][0..4], 0, .little);
+        const dir_off = anim_off + 8;
+        var blob_cursor: u32 = 8 + anim_dir_bytes;
+        for (an.tracks, 0..) |tr, ti| {
+            const comps = animComps(@intCast(ti % 3));
+            const kc: u32 = @intCast(tr.times.len);
+            const e = dir_off + @as(u32, @intCast(ti)) * anim_dir_entry_size;
+            buf[e] = tr.interp;
+            buf[e + 1] = 0;
+            buf[e + 2] = 0;
+            buf[e + 3] = 0;
+            std.mem.writeInt(u32, buf[e + 4 ..][0..4], kc, .little);
+            std.mem.writeInt(u32, buf[e + 8 ..][0..4], blob_cursor, .little);
+            var k: u32 = 0;
+            while (k < kc) : (k += 1)
+                std.mem.writeInt(u32, buf[anim_off + blob_cursor + k * 4 ..][0..4], @bitCast(tr.times[k]), .little);
+            const vbase = anim_off + blob_cursor + kc * 4;
+            var vi: u32 = 0;
+            while (vi < kc * comps) : (vi += 1)
+                std.mem.writeInt(u32, buf[vbase + vi * 4 ..][0..4], @bitCast(tr.values[vi]), .little);
+            blob_cursor += kc * 4 + kc * comps * 4;
+        }
+    }
+
     return buf;
 }
 
@@ -359,6 +414,7 @@ pub const Reader = struct {
     names: []const u8, // raw name table (name_count × 12B); use name(i)
     skinned: bool,
     joint_count_: u32,
+    anim_off_: u32,
     bytes: []const u8,
 
     pub fn init(bytes: []const u8) error{ BadMagic, BadVersion, Truncated, BadTexIndex }!Reader {
@@ -382,6 +438,7 @@ pub const Reader = struct {
         const skinned = std.mem.readInt(u32, bytes[56..60], .little) != 0;
         const skeleton_off = std.mem.readInt(u32, bytes[60..64], .little);
         const joint_count = std.mem.readInt(u32, bytes[64..68], .little);
+        const anim_off = std.mem.readInt(u32, bytes[68..72], .little);
 
         const blen: u64 = bytes.len;
 
@@ -474,6 +531,26 @@ pub const Reader = struct {
             if (@as(u64, skeleton_off) > blen or need_skel > blen - @as(u64, skeleton_off)) return error.Truncated;
         }
 
+        // ── Animation section ────────────────────────────────────────────────
+        // anim_off == 0 → no clip. When present, validate the section header +
+        // directory fit, then each track's time+value blob is in bounds.
+        if (anim_off != 0) {
+            if (anim_off % 16 != 0) return error.Truncated;
+            const dir_bytes: u64 = @as(u64, joint_count) * 3 * anim_dir_entry_size;
+            const header_end: u64 = @as(u64, anim_off) + 8 + dir_bytes;
+            if (header_end > blen) return error.Truncated;
+            var ti: u32 = 0;
+            while (ti < joint_count * 3) : (ti += 1) {
+                const comps: u64 = if (ti % 3 == 1) 4 else 3;
+                const e: usize = @intCast(@as(u64, anim_off) + 8 + @as(u64, ti) * anim_dir_entry_size);
+                const kc: u64 = std.mem.readInt(u32, bytes[e + 4 ..][0..4], .little);
+                const data_off: u64 = std.mem.readInt(u32, bytes[e + 8 ..][0..4], .little);
+                const need: u64 = kc * 4 + kc * comps * 4;
+                const abs: u64 = @as(u64, anim_off) + data_off;
+                if (abs > blen or need > blen - abs) return error.Truncated;
+            }
+        }
+
         return Reader{
             .vertex_count = vertex_count,
             .index_count = index_count,
@@ -489,6 +566,7 @@ pub const Reader = struct {
             .names = names_slice,
             .skinned = skinned,
             .joint_count_ = joint_count,
+            .anim_off_ = anim_off,
             .bytes = bytes,
         };
     }
@@ -515,6 +593,44 @@ pub const Reader = struct {
             j.bind_local[k] = @bitCast(std.mem.readInt(u32, raw[68 + k * 4 ..][0..4], .little));
         }
         return j;
+    }
+
+    /// True when the file carries a baked animation clip (header anim_off != 0).
+    pub fn animPresent(self: *const Reader) bool {
+        return self.anim_off_ != 0;
+    }
+
+    /// Clip duration in seconds (anim section @0). 0 when no clip present.
+    pub fn animDuration(self: *const Reader) f32 {
+        if (self.anim_off_ == 0) return 0;
+        return @bitCast(std.mem.readInt(u32, self.bytes[self.anim_off_..][0..4], .little));
+    }
+
+    /// Directory entry for joint `j`, channel `c` (0=T,1=R,2=S). Caller must
+    /// ensure the clip is present and `j < jointCount()`.
+    pub fn animTrack(self: *const Reader, j: u32, c: u2) TrackInfo {
+        const idx = j * 3 + @as(u32, c);
+        const e = @as(usize, self.anim_off_) + 8 + @as(usize, idx) * anim_dir_entry_size;
+        return .{
+            .interp = self.bytes[e],
+            .key_count = std.mem.readInt(u32, self.bytes[e + 4 ..][0..4], .little),
+            .data_off = std.mem.readInt(u32, self.bytes[e + 8 ..][0..4], .little),
+            .comps = animComps(c),
+        };
+    }
+
+    /// Keyframe `i` time of track `t`. Caller must ensure `i < t.key_count`.
+    pub fn animTime(self: *const Reader, t: TrackInfo, i: u32) f32 {
+        const off = @as(usize, self.anim_off_) + t.data_off + @as(usize, i) * 4;
+        return @bitCast(std.mem.readInt(u32, self.bytes[off..][0..4], .little));
+    }
+
+    /// Component `comp` of keyframe `i` value of track `t`. Caller must ensure
+    /// `i < t.key_count` and `comp < t.comps`.
+    pub fn animValue(self: *const Reader, t: TrackInfo, i: u32, comp: u32) f32 {
+        const vbase = @as(usize, self.anim_off_) + t.data_off + @as(usize, t.key_count) * 4;
+        const off = vbase + (@as(usize, i) * t.comps + comp) * 4;
+        return @bitCast(std.mem.readInt(u32, self.bytes[off..][0..4], .little));
     }
 
     /// Caller must ensure `i < self.submesh_count`.
@@ -644,6 +760,8 @@ pub const Reader = struct {
 
 const testing = std.testing;
 
+const Mat4Identity = [_]f32{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+
 test "round-trip: one submesh (full PBR fields), one texture" {
     // 12 f32/vertex = stride 48: pos3 + normal3 + tangent4 + uv2
     const verts = [_]f32{
@@ -677,7 +795,7 @@ test "round-trip: one submesh (full PBR fields), one texture" {
         .{ .width = 1, .height = 1, .rgba = &fill },
         .{ .width = 1, .height = 1, .rgba = &fill },
     };
-    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{});
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
     defer testing.allocator.free(bytes);
 
     const r = try Reader.init(bytes);
@@ -714,7 +832,7 @@ test "round-trip: one submesh (full PBR fields), one texture" {
 test "alignment: vertex_off 16-aligned, index/tex 4-aligned" {
     const verts = [_]f32{0} ** 12;
     const idx = [_]u16{0};
-    const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{});
+    const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
     defer testing.allocator.free(bytes);
     const vo = std.mem.readInt(u32, bytes[24..28], .little);
     const io = std.mem.readInt(u32, bytes[28..32], .little);
@@ -723,7 +841,7 @@ test "alignment: vertex_off 16-aligned, index/tex 4-aligned" {
 }
 
 test "reader rejects hostile counts (u32 overflow)" {
-    var buf = [_]u8{0} ** 68;
+    var buf = [_]u8{0} ** 72;
     @memcpy(buf[0..4], magic);
     std.mem.writeInt(u32, buf[4..8], version, .little);
     std.mem.writeInt(u32, buf[8..12], 0x8000_0000, .little); // vertex_count: *48 wraps
@@ -745,7 +863,7 @@ test "reader rejects hostile counts (u32 overflow)" {
 }
 
 test "reader rejects bad magic and truncation" {
-    var junk = [_]u8{0} ** 68;
+    var junk = [_]u8{0} ** 72;
     try testing.expectError(error.BadMagic, Reader.init(&junk));
     @memcpy(junk[0..4], magic);
     std.mem.writeInt(u32, junk[4..8], 99, .little);
@@ -755,8 +873,8 @@ test "reader rejects bad magic and truncation" {
 
 test "reader rejects v1 and v2 buffers (BadVersion)" {
     // Build valid-looking old-version buffers (version word = 1, then 2) →
-    // both must get BadVersion now that the reader only accepts v5.
-    var buf = [_]u8{0} ** 68;
+    // both must get BadVersion now that the reader only accepts v6.
+    var buf = [_]u8{0} ** 72;
     @memcpy(buf[0..4], magic);
     // zero vertex/index/submesh/tex counts, offsets pointing into buf
     std.mem.writeInt(u32, buf[24..28], 56, .little); // vertex_off
@@ -820,7 +938,7 @@ test "(a) v3 round-trip: 2 BVH nodes, tri_perm, names" {
     const perm = [_]u32{0}; // index_count/3 == 1
     const names = [_][]const u8{ "Cube", "Lid" };
 
-    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &perm, &names, false, &.{}, &.{}, &.{});
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &perm, &names, false, &.{}, &.{}, &.{}, null);
     defer testing.allocator.free(bytes);
 
     const r = try Reader.init(bytes);
@@ -843,7 +961,7 @@ test "(a) v3 round-trip: 2 BVH nodes, tri_perm, names" {
 }
 
 test "(b) v3 zero-BVH zero-names → valid, empty slices" {
-    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{});
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
     defer testing.allocator.free(bytes);
 
     const r = try Reader.init(bytes);
@@ -879,7 +997,7 @@ test "(c) v3 section offsets: bvh_off %16==0, name_table_off %4==0" {
     };
     const perm = [_]u32{0};
     const names = [_][]const u8{"Solo"};
-    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &perm, &names, false, &.{}, &.{}, &.{});
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &perm, &names, false, &.{}, &.{}, &.{}, null);
     defer testing.allocator.free(bytes);
 
     const bvh_off = std.mem.readInt(u32, bytes[40..44], .little);
@@ -890,7 +1008,7 @@ test "(c) v3 section offsets: bvh_off %16==0, name_table_off %4==0" {
 
 test "(d) v3 hostile sections → Truncated / empty (no panic)" {
     // Start from a valid zero-section v3 file, then corrupt the header.
-    const base = try pack(testing.allocator, &v3_verts, &v3_idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{});
+    const base = try pack(testing.allocator, &v3_verts, &v3_idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
     defer testing.allocator.free(base);
 
     // bvh_node_count *32 wraps u32.
@@ -944,7 +1062,7 @@ test "(d) v3 hostile sections → Truncated / empty (no panic)" {
             .tex_occlusion = -1,
         }};
         const names = [_][]const u8{"X"};
-        const buf = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &.{}, &.{}, &names, false, &.{}, &.{}, &.{});
+        const buf = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &.{}, &.{}, &names, false, &.{}, &.{}, &.{}, null);
         defer testing.allocator.free(buf);
         const r0 = try Reader.init(buf);
         try testing.expectEqualStrings("X", r0.name(0)); // sanity: valid first
@@ -977,7 +1095,7 @@ test "(h) texIsSrgb: base/emissive → sRGB, mr/normal/occlusion → linear" {
         .tex_emissive = 2, // sRGB
         .tex_occlusion = -1,
     }};
-    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{});
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
     defer testing.allocator.free(bytes);
     const r = try Reader.init(bytes);
     try testing.expect(r.texIsSrgb(0)); // base-color
@@ -1006,20 +1124,20 @@ test "(g) v3 rejects out-of-range submesh tex index (BadTexIndex)" {
     }};
     // Sanity: the in-range version parses fine.
     {
-        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{});
+        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
         defer testing.allocator.free(bytes);
         _ = try Reader.init(bytes);
     }
     // tex index == tex_count (1) → out of range → reject.
     {
-        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{});
+        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
         defer testing.allocator.free(bytes);
         std.mem.writeInt(i32, bytes[header_size + 56 ..][0..4], 1, .little); // tex_mr @56
         try testing.expectError(error.BadTexIndex, Reader.init(bytes));
     }
     // tex index < -1 (e.g. -2, not the missing-sentinel) → reject.
     {
-        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{});
+        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
         defer testing.allocator.free(bytes);
         std.mem.writeInt(i32, bytes[header_size + 52 ..][0..4], -2, .little); // tex_base @52
         try testing.expectError(error.BadTexIndex, Reader.init(bytes));
@@ -1064,11 +1182,11 @@ test "(f) v3 SizeMismatch: bad tri_perm len; names len mismatch" {
     };
     // tri_perm must be index_count/3 == 1; give it 2 → SizeMismatch.
     const bad_perm = [_]u32{ 0, 1 };
-    try testing.expectError(error.SizeMismatch, pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &bad_perm, &.{}, false, &.{}, &.{}, &.{}));
+    try testing.expectError(error.SizeMismatch, pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &bad_perm, &.{}, false, &.{}, &.{}, &.{}, null));
 
     // names.len == 1 with 2 submeshes → SizeMismatch.
     const one_name = [_][]const u8{"only"};
-    try testing.expectError(error.SizeMismatch, pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &.{}, &.{}, &one_name, false, &.{}, &.{}, &.{}));
+    try testing.expectError(error.SizeMismatch, pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &.{}, &.{}, &one_name, false, &.{}, &.{}, &.{}, null));
 }
 
 // ── submeshVariant ────────────────────────────────────────────────────────────
@@ -1110,7 +1228,7 @@ test "(i) submeshVariant: all four tex_normal × tex_emissive combinations" {
         make(-1, -1), // neither
     };
 
-    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{});
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
     defer testing.allocator.free(bytes);
     const r = try Reader.init(bytes);
 
@@ -1153,11 +1271,11 @@ test "(j) v5 skinned round-trip: stride 56, 2-joint skeleton" {
         },
     };
 
-    const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel);
+    const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, null);
     defer testing.allocator.free(bytes);
 
-    // Header: version 5, skinned flag set, joint_count == 2.
-    try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, bytes[4..8], .little));
+    // Header: version 6, skinned flag set, joint_count == 2.
+    try testing.expectEqual(@as(u32, 6), std.mem.readInt(u32, bytes[4..8], .little));
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[56..60], .little));
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[64..68], .little));
     // skeleton_off 16-aligned.
@@ -1183,4 +1301,36 @@ test "(j) v5 skinned round-trip: stride 56, 2-joint skeleton" {
     try testing.expectEqualSlices(u8, &weights[1], r.vertices[56 + 52 .. 56 + 56]);
     // The 48 base bytes of v0 match the source.
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(verts[0..12]), r.vertices[0..48]);
+}
+
+test "vmesh v6: animation section round-trips" {
+    const verts = [_]f32{0} ** 12;
+    const joints = [_][4]u8{.{ 0, 0, 0, 0 }};
+    const weights = [_][4]u8{.{ 255, 0, 0, 0 }};
+    const skel = [_]Joint{.{ .parent = -1, .inverse_bind = Mat4Identity, .bind_local = Mat4Identity }};
+    const t_times = [_]f32{0};
+    const t_vals = [_]f32{ 0, 0, 0 };
+    const r_times = [_]f32{ 0, 0.5, 1.0 };
+    const r_vals = [_]f32{ 0, 0, 0, 1, 0, 0, 0.3827, 0.9239, 0, 0, 0, 1 };
+    const s_times = [_]f32{0};
+    const s_vals = [_]f32{ 1, 1, 1 };
+    const tracks = [_]Track{
+        .{ .interp = 0, .times = &t_times, .values = &t_vals },
+        .{ .interp = 0, .times = &r_times, .values = &r_vals },
+        .{ .interp = 0, .times = &s_times, .values = &s_vals },
+    };
+    const anim = Anim{ .duration = 1.0, .tracks = &tracks };
+    const bytes = try pack(std.testing.allocator, &verts, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, anim);
+    defer std.testing.allocator.free(bytes);
+    var r = try Reader.init(bytes);
+    try std.testing.expect(r.animPresent());
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), r.animDuration(), 1e-6);
+    const rt = r.animTrack(0, 1);
+    try std.testing.expectEqual(@as(u32, 3), rt.key_count);
+    try std.testing.expectEqual(@as(u32, 4), rt.comps);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), r.animTime(rt, 1), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9239), r.animValue(rt, 1, 3), 1e-4);
+    const tt = r.animTrack(0, 0);
+    try std.testing.expectEqual(@as(u32, 1), tt.key_count);
+    try std.testing.expectEqual(@as(u32, 3), tt.comps);
 }

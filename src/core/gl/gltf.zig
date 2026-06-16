@@ -57,6 +57,11 @@ pub const Model = struct {
     joints: []const [4]u8 = &.{}, // per-vertex joint indices (into skel)
     weights: []const [4]u8 = &.{}, // per-vertex weights, u8 (sum 255)
     skel: []const vmesh.Joint = &.{}, // joint list: parent + inverse_bind + bind_local
+    // Animation (slice 2). `anim_tracks` is in directory order (joint-major, then
+    // channel T=0/R=1/S=2), length == skel.len*3 when a clip exists; one baked
+    // track per joint per channel. `anim_duration` == 0 when no clip.
+    anim_duration: f32 = 0,
+    anim_tracks: []const vmesh.Track = &.{},
 
     pub fn deinit(self: *Model) void {
         self.arena.deinit();
@@ -706,6 +711,8 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
     // node's TRS, inverse_bind from the inverseBindMatrices accessor, parent =
     // joint-list index of the node's parent in the hierarchy (-1 if not a joint).
     var skel_slice: []const vmesh.Joint = &.{};
+    var anim_dur: f32 = 0;
+    var anim_tracks_slice: []const vmesh.Track = &.{};
     if (model_skinned) {
         const skin0 = switch (skins_arr[0]) {
             .object => |o| o,
@@ -723,6 +730,12 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         const ibm_acc: usize = @intCast(jsonInt(ibm_acc_val) orelse return error.Malformed);
         const ibm = try readAccessorF32(accessors, buffer_views, bin, ibm_acc, aa);
         if (ibm.len != jc * 16) return error.Malformed;
+
+        // Per-joint bind-TRS components (for baking single-key tracks on the
+        // channels a glTF animation doesn't drive). Defaults: 0 / identity / 1.
+        const bind_t = try aa.alloc([3]f32, jc);
+        const bind_r = try aa.alloc([4]f32, jc);
+        const bind_s = try aa.alloc([3]f32, jc);
 
         // node index → parent node index (walk every node's children once).
         const parent_of = try aa.alloc(i32, nodes_arr.len);
@@ -754,6 +767,28 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                 else => return error.Malformed,
             };
             const local = nodeLocalMatrix(node_obj);
+            // Capture this joint node's bind-TRS components (glTF defaults).
+            bind_t[k] = .{ 0, 0, 0 };
+            bind_r[k] = .{ 0, 0, 0, 1 };
+            bind_s[k] = .{ 1, 1, 1 };
+            if (node_obj.get("translation")) |tv| {
+                if (tv == .array and tv.array.items.len == 3)
+                    for (0..3) |c| {
+                        bind_t[k][c] = jsonFloat(tv.array.items[c]) orelse 0;
+                    };
+            }
+            if (node_obj.get("rotation")) |rv| {
+                if (rv == .array and rv.array.items.len == 4)
+                    for (0..4) |c| {
+                        bind_r[k][c] = jsonFloat(rv.array.items[c]) orelse 0;
+                    };
+            }
+            if (node_obj.get("scale")) |sv| {
+                if (sv == .array and sv.array.items.len == 3)
+                    for (0..3) |c| {
+                        bind_s[k][c] = jsonFloat(sv.array.items[c]) orelse 1;
+                    };
+            }
             // parent joint = index in joint_nodes whose node == this node's parent.
             var parent_joint: i32 = -1;
             const pn = parent_of[node_idx];
@@ -770,6 +805,108 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
             skel_buf[k] = .{ .parent = parent_joint, .inverse_bind = inv, .bind_local = local.m };
         }
         skel_slice = skel_buf;
+
+        // ── 7d. Animation clip (slice 2: animations[0]) ───────────────────────
+        // Bake ALL 3 tracks (T=0,R=1,S=2) for EVERY joint: a glTF channel's keys
+        // when present, else a single keyframe of the joint's bind component.
+        if (root.get("animations")) |anims_val| {
+            if (anims_val == .array and anims_val.array.items.len > 0) {
+                const anim0 = switch (anims_val.array.items[0]) {
+                    .object => |o| o,
+                    else => return error.Malformed,
+                };
+                const channels = switch (anim0.get("channels") orelse return error.Malformed) {
+                    .array => |a| a.items,
+                    else => return error.Malformed,
+                };
+                const samplers = switch (anim0.get("samplers") orelse return error.Malformed) {
+                    .array => |a| a.items,
+                    else => return error.Malformed,
+                };
+                // (joint, channel) → glTF sampler index, or -1.
+                const refs = try aa.alloc(i32, jc * 3);
+                @memset(refs, -1);
+                for (channels) |ch_val| {
+                    const ch = switch (ch_val) {
+                        .object => |o| o,
+                        else => return error.Malformed,
+                    };
+                    const target = switch (ch.get("target") orelse return error.Malformed) {
+                        .object => |o| o,
+                        else => return error.Malformed,
+                    };
+                    const node_ref = target.get("node") orelse continue;
+                    const node_idx: i64 = jsonInt(node_ref) orelse continue;
+                    var jidx: i32 = -1;
+                    for (joint_nodes, 0..) |jn2, k2| {
+                        if ((jsonInt(jn2) orelse continue) == node_idx) {
+                            jidx = @intCast(k2);
+                            break;
+                        }
+                    }
+                    if (jidx < 0) continue; // channel targets a non-joint node
+                    const path_str = switch (target.get("path") orelse return error.Malformed) {
+                        .string => |s| s,
+                        else => return error.Malformed,
+                    };
+                    const chan: usize = if (std.mem.eql(u8, path_str, "translation"))
+                        0
+                    else if (std.mem.eql(u8, path_str, "rotation"))
+                        1
+                    else if (std.mem.eql(u8, path_str, "scale"))
+                        2
+                    else
+                        continue; // weights/other — ignored
+                    const samp_idx: i32 = @intCast(jsonInt(ch.get("sampler") orelse return error.Malformed) orelse return error.Malformed);
+                    refs[@as(usize, @intCast(jidx)) * 3 + chan] = samp_idx;
+                }
+
+                const tracks = try aa.alloc(vmesh.Track, jc * 3);
+                for (0..jc) |j| {
+                    for (0..3) |c| {
+                        const comps: usize = if (c == 1) 4 else 3;
+                        const samp_idx = refs[j * 3 + c];
+                        if (samp_idx >= 0) {
+                            const samp = switch (samplers[@intCast(samp_idx)]) {
+                                .object => |o| o,
+                                else => return error.Malformed,
+                            };
+                            const interp_str = if (samp.get("interpolation")) |iv| (switch (iv) {
+                                .string => |s| s,
+                                else => return error.Malformed,
+                            }) else "LINEAR";
+                            const interp: u8 = if (std.mem.eql(u8, interp_str, "LINEAR"))
+                                0
+                            else if (std.mem.eql(u8, interp_str, "STEP"))
+                                1
+                            else
+                                return error.Unsupported; // CUBICSPLINE
+                            const in_idx: usize = @intCast(jsonInt(samp.get("input") orelse return error.Malformed) orelse return error.Malformed);
+                            const out_idx: usize = @intCast(jsonInt(samp.get("output") orelse return error.Malformed) orelse return error.Malformed);
+                            const times = try readAccessorF32(accessors, buffer_views, bin, in_idx, aa);
+                            const values = try readAccessorF32(accessors, buffer_views, bin, out_idx, aa);
+                            if (values.len != times.len * comps) return error.Malformed;
+                            if (times.len > 0 and times[times.len - 1] > anim_dur) anim_dur = times[times.len - 1];
+                            tracks[j * 3 + c] = .{ .interp = interp, .times = times, .values = values };
+                        } else {
+                            // single keyframe holding the joint's bind component
+                            const one_t = try aa.alloc(f32, 1);
+                            one_t[0] = 0;
+                            const v = try aa.alloc(f32, comps);
+                            if (c == 0) {
+                                @memcpy(v, &bind_t[j]);
+                            } else if (c == 1) {
+                                @memcpy(v, &bind_r[j]);
+                            } else {
+                                @memcpy(v, &bind_s[j]);
+                            }
+                            tracks[j * 3 + c] = .{ .interp = 0, .times = one_t, .values = v };
+                        }
+                    }
+                }
+                anim_tracks_slice = tracks;
+            }
+        }
     }
 
     // ── 8. Package Model ───────────────────────────────────────────────────────
@@ -785,6 +922,8 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         .joints = if (model_skinned) jnt_list.items else &.{},
         .weights = if (model_skinned) wgt_list.items else &.{},
         .skel = skel_slice,
+        .anim_duration = anim_dur,
+        .anim_tracks = anim_tracks_slice,
     };
 }
 
@@ -1365,6 +1504,7 @@ test "parse pbrCubeMixedMaterialGlb: 2 submeshes, variant fan-out (full vs base-
         &.{},
         &.{},
         &.{},
+        null,
     );
     defer testing.allocator.free(bytes);
     const r = try vmesh.Reader.init(bytes);
@@ -1523,6 +1663,28 @@ test "parse skinnedBarGlb: skinned, joints/weights 1:1, 3-joint chain" {
         try testing.expectEqual(@as(u32, 255), sum);
         for (j) |ji| try testing.expect(ji < 3);
     }
+}
+
+test "parse skinnedBarGlb: animation clip baked (jmid rotation, others single-key)" {
+    const glb = try @import("fixture.zig").skinnedBarGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    try testing.expect(model.anim_duration > 0.0);
+    // one baked track per joint per channel (T,R,S)
+    try testing.expectEqual(model.skel.len * 3, model.anim_tracks.len);
+    // jmid = joint 1; rotation channel (index 1) carries the keyed clip.
+    const r_mid = model.anim_tracks[1 * 3 + 1];
+    try testing.expect(r_mid.times.len >= 2);
+    try testing.expectEqual(r_mid.times.len * 4, r_mid.values.len);
+    // root (joint 0) translation track: single bind keyframe.
+    const t_root = model.anim_tracks[0 * 3 + 0];
+    try testing.expectEqual(@as(usize, 1), t_root.times.len);
+    try testing.expectEqual(@as(usize, 3), t_root.values.len);
+    // mid joint's unanimated scale channel: single bind keyframe of (1,1,1).
+    const s_mid = model.anim_tracks[1 * 3 + 2];
+    try testing.expectEqual(@as(usize, 1), s_mid.times.len);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), s_mid.values[0], 1e-6);
 }
 
 // ── test-only minimal glb builders ──────────────────────────────────────────────

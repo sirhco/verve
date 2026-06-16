@@ -67,6 +67,46 @@ pub const Quat = struct {
             .w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
         };
     }
+
+    /// Spherical linear interpolation, shortest arc. Inputs need not be unit
+    /// (normalized internally); returns a unit quaternion. Falls back to
+    /// normalized-lerp when the endpoints are nearly parallel (avoids div-by-~0).
+    pub fn slerp(a: Quat, b: Quat, t: f32) Quat {
+        const an = a.normalizeQ();
+        var bn = b.normalizeQ();
+        var d = an.x * bn.x + an.y * bn.y + an.z * bn.z + an.w * bn.w;
+        if (d < 0) {
+            bn = .{ .x = -bn.x, .y = -bn.y, .z = -bn.z, .w = -bn.w };
+            d = -d;
+        }
+        if (d > 0.9995) {
+            const r = Quat{
+                .x = an.x + (bn.x - an.x) * t,
+                .y = an.y + (bn.y - an.y) * t,
+                .z = an.z + (bn.z - an.z) * t,
+                .w = an.w + (bn.w - an.w) * t,
+            };
+            return r.normalizeQ();
+        }
+        const theta0 = std.math.acos(d);
+        const theta = theta0 * t;
+        const sin0 = @sin(theta0);
+        const s0 = @sin(theta0 - theta) / sin0;
+        const s1 = @sin(theta) / sin0;
+        return .{
+            .x = an.x * s0 + bn.x * s1,
+            .y = an.y * s0 + bn.y * s1,
+            .z = an.z * s0 + bn.z * s1,
+            .w = an.w * s0 + bn.w * s1,
+        };
+    }
+
+    fn normalizeQ(q: Quat) Quat {
+        const len = @sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        if (len == 0) return Quat.identity;
+        const inv = 1.0 / len;
+        return .{ .x = q.x * inv, .y = q.y * inv, .z = q.z * inv, .w = q.w * inv };
+    }
 };
 
 pub const Mat4 = struct {
@@ -566,4 +606,23 @@ test "golden: transformDir — +90°Y rotation, translation ignored" {
     try testing.expectApproxEqAbs(@as(f32, 0), r.x, eps4);
     try testing.expectApproxEqAbs(@as(f32, 0), r.y, eps4);
     try testing.expectApproxEqAbs(@as(f32, -1), r.z, eps4);
+}
+
+test "Quat.slerp endpoints + midpoint + sign flip" {
+    const Q = Quat;
+    const a = Q.identity;
+    const b = Q.fromAxisAngle(Vec3.init(0, 0, 1), std.math.pi / 2.0); // 90° about z
+    const s0 = Q.slerp(a, b, 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), s0.w, 1e-5);
+    const s1 = Q.slerp(a, b, 1);
+    try std.testing.expectApproxEqAbs(b.w, s1.w, 1e-5);
+    try std.testing.expectApproxEqAbs(b.z, s1.z, 1e-5);
+    const m = Q.slerp(a, b, 0.5);
+    try std.testing.expectApproxEqAbs(@cos(std.math.pi / 8.0), m.w, 1e-4);
+    try std.testing.expectApproxEqAbs(@sin(std.math.pi / 8.0), m.z, 1e-4);
+    const len = @sqrt(m.x * m.x + m.y * m.y + m.z * m.z + m.w * m.w);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), len, 1e-5);
+    const nb = Q{ .x = -b.x, .y = -b.y, .z = -b.z, .w = -b.w };
+    const mn = Q.slerp(a, nb, 0.5);
+    try std.testing.expectApproxEqAbs(@abs(m.z), @abs(mn.z), 1e-4);
 }
