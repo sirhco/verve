@@ -334,7 +334,10 @@ pub fn pbrCubeGlb(alloc: Allocator, opts: struct { with_tangents: bool = true })
                 var b: u32 = if (cell) 180 else 190;
                 r = r * (160 + x / 4) / 255;
                 g = g * (160 + y / 4) / 255;
-                const h = (x *% 374761393 +% y *% 668265263) *% 1274126177;
+                // Per-8×8-block value noise (constant within a block) — adds visual
+                // variation while staying PNG-compressible (runs), unlike per-pixel
+                // noise which is near-incompressible.
+                const h = ((x / 8) *% 374761393 +% (y / 8) *% 668265263) *% 1274126177;
                 const n: u32 = (h >> 24) & 0xFF;
                 r = (r * 3 + n) / 4;
                 g = (g * 3 + n) / 4;

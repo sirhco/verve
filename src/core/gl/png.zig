@@ -3,8 +3,8 @@
 //! Decode: 8-bit-depth, color type 2 (RGB) or 6 (RGBA), non-interlaced,
 //! filter types 0-4 per scanline → RGBA8 output.
 //!
-//! Encode: RGBA8 → valid PNG using filter 0 + zlib stored (uncompressed)
-//! deflate blocks.  Fixture/demo use only — not size-optimized.
+//! Encode: RGBA8 → valid PNG using filter 0 + real zlib DEFLATE (std flate).
+//! Fixture/demo + compressed-texture asset use.
 //!
 //! Errors: `error.Unsupported`, `error.BadSignature`, `error.Corrupt`.
 
@@ -31,7 +31,7 @@ pub fn decode(alloc: Allocator, bytes: []const u8) !Image {
 }
 
 /// Encode RGBA8 pixels (w × h) → PNG bytes (alloc-owned).
-/// Uses filter 0 (None) per scanline, zlib stored-block deflate.
+/// Uses filter 0 (None) per scanline + real zlib DEFLATE (std flate).
 pub fn encodeRgba(alloc: Allocator, rgba: []const u8, w: u32, h: u32) ![]u8 {
     const stride: usize = @as(usize, w) * 4;
     // filtered stream: 1 filter-byte (0) + stride bytes per row
@@ -223,8 +223,8 @@ fn paethPredictor(a: u8, b: u8, c: u8) u8 {
 /// `filtered`: h rows of (1 filter-byte + row-bytes), ready for zlib.
 /// `color_type`: 2=RGB, 6=RGBA.
 fn buildPng(alloc: Allocator, filtered: []const u8, w: u32, h: u32, color_type: u8) ![]u8 {
-    // zlib-wrap the filtered data using stored (uncompressed) deflate blocks
-    const compressed = try zlibStored(alloc, filtered);
+    // zlib-wrap the filtered data with real DEFLATE compression (std flate).
+    const compressed = try zlibDeflate(alloc, filtered);
     defer alloc.free(compressed);
 
     // Build PNG using Io.Writer.Allocating
@@ -269,72 +269,27 @@ fn writeChunk(w: *std.Io.Writer, chunk_type: *const [4]u8, data: []const u8) !vo
     try w.writeInt(u32, crc.final(), .big);
 }
 
-/// Compress `data` using zlib format with stored (uncompressed) deflate blocks.
-/// Format: zlib 2-byte header | stored deflate blocks | 4-byte adler32 footer.
-/// Each stored block: BFINAL+BTYPE byte (1B) | LEN (2B LE) | NLEN (2B LE) | data.
-fn zlibStored(alloc: Allocator, data: []const u8) ![]u8 {
-    const max_block: usize = 65535;
-    // Number of blocks: at least 1 (for empty input), else ceil(len / max_block)
-    const num_blocks: usize = if (data.len == 0)
-        1
-    else
-        (data.len + max_block - 1) / max_block;
-    // Each stored block overhead: 5 bytes (header byte + LEN 2B + NLEN 2B)
-    const out_len = 2 + num_blocks * 5 + data.len + 4;
-    const out = try alloc.alloc(u8, out_len);
-    var pos: usize = 0;
-
-    // Zlib header: CMF=0x78 (CM=8 deflate, CINFO=7), FLG=0x01
-    // Validity: (CMF * 256 + FLG) must be divisible by 31.
-    // 0x78 * 256 + 0x01 = 30721 = 991 * 31 ✓
-    out[pos] = 0x78;
-    pos += 1;
-    out[pos] = 0x01;
-    pos += 1;
-
-    // Adler32 over uncompressed data (for footer)
-    var adler = std.hash.Adler32{};
-    adler.update(data);
-
-    // Stored deflate blocks
-    var src_off: usize = 0;
-    var blocks_written: usize = 0;
-    while (src_off < data.len or blocks_written == 0) {
-        const remaining = data.len - src_off;
-        const block_len: usize = @min(remaining, max_block);
-        const is_last = (src_off + block_len >= data.len);
-
-        // BFINAL (bit 0) = 1 if last block; BTYPE = 00 (stored) in bits 1-2
-        out[pos] = if (is_last) 0x01 else 0x00;
-        pos += 1;
-
-        // LEN (2 bytes LE)
-        mem.writeInt(u16, out[pos..][0..2], @intCast(block_len), .little);
-        pos += 2;
-        // NLEN = one's complement of LEN (2 bytes LE)
-        mem.writeInt(u16, out[pos..][0..2], @as(u16, @intCast(block_len)) ^ 0xFFFF, .little);
-        pos += 2;
-
-        // Data payload
-        @memcpy(out[pos .. pos + block_len], data[src_off .. src_off + block_len]);
-        pos += block_len;
-        src_off += block_len;
-        blocks_written += 1;
-    }
-
-    // Adler32 footer (big-endian per RFC 1950)
-    mem.writeInt(u32, out[pos..][0..4], adler.adler, .big);
-    pos += 4;
-
-    std.debug.assert(pos == out_len);
-    return out;
+/// Compress `data` into a zlib stream with real DEFLATE (std.compress.flate,
+/// `.zlib` container → 2-byte header + deflate body + adler32 footer). Mirrors
+/// the server's gzip helper; zero-dep (Zig std). png.decode already inflates this.
+fn zlibDeflate(alloc: Allocator, data: []const u8) ![]u8 {
+    const flate = std.compress.flate;
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    errdefer aw.deinit();
+    try aw.ensureUnusedCapacity(64);
+    const window = try alloc.alloc(u8, flate.max_window_len);
+    defer alloc.free(window);
+    var comp = try flate.Compress.init(&aw.writer, window, .zlib, flate.Compress.Options.default);
+    try comp.writer.writeAll(data);
+    try comp.finish();
+    return aw.toOwnedSlice();
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-test "round-trip 4x3 RGBA through store-mode encode" {
+test "round-trip 4x3 RGBA through deflate encode" {
     var pixels: [4 * 3 * 4]u8 = undefined;
     for (&pixels, 0..) |*p, i| p.* = @intCast((i * 7) % 256);
     const png_bytes = try encodeRgba(testing.allocator, &pixels, 4, 3);
