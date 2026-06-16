@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-06-15
+
 ### Added
 
 - **`verve.gl` — compressed (source-format) textures** (`src/core/gl/vmesh.zig` v4,
@@ -3272,7 +3274,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.7...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.8...HEAD
+[0.5.8]: https://github.com/sirhco/verve/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/sirhco/verve/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/sirhco/verve/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/sirhco/verve/compare/v0.5.4...v0.5.5
