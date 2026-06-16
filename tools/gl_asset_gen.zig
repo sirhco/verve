@@ -125,7 +125,7 @@ fn convertGlb(
         model.joints,
         model.weights,
         model.skel,
-        if (model.anim_tracks.len == 0) null else gl.vmesh.Anim{ .duration = model.anim_duration, .tracks = model.anim_tracks },
+        if (model.anim_clips.len == 0) null else gl.vmesh.Anims{ .clips = model.anim_clips },
     );
     defer alloc.free(vmesh_bytes);
 
