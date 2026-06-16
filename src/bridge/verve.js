@@ -5967,13 +5967,31 @@
                 new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
                 deliver(ptr, bytes.length >>> 0);
               };
+              const isImageUrl = (u) => /\.(png|jpe?g|webp)$/i.test(u);
+              const decodeImageMain = async (ab) => {
+                const bm = await createImageBitmap(new Blob([ab]));
+                const c = new OffscreenCanvas(bm.width, bm.height);
+                const cx = c.getContext("2d");
+                cx.drawImage(bm, 0, 0);
+                const px = cx.getImageData(0, 0, bm.width, bm.height).data;
+                const out = new Uint8Array(8 + px.length);
+                const dv = new DataView(out.buffer);
+                dv.setUint32(0, bm.width, true);
+                dv.setUint32(4, bm.height, true);
+                out.set(px, 8);
+                bm.close();
+                return out;
+              };
               const mainThreadFetch = () => {
                 fetch(url)
                   .then((r) => {
                     if (!r.ok) throw new Error("HTTP " + r.status);
                     return r.arrayBuffer();
                   })
-                  .then((ab) => onBytes(new Uint8Array(ab)))
+                  .then((ab) =>
+                    isImageUrl(url) ? decodeImageMain(ab) : new Uint8Array(ab),
+                  )
+                  .then((bytes) => onBytes(bytes))
                   .catch((err) => {
                     console.error("verve.gl: asset fetch failed:", url, err);
                     deliver(0, 0);
