@@ -297,6 +297,10 @@ fn handleRequest(
         try respondBuffered(gpa, request, .ok, "application/javascript", "public, max-age=300", meta.accept_gzip, assets.js);
         return;
     }
+    if (std.mem.eql(u8, path, "/verve-worker.js")) {
+        try respondBuffered(gpa, request, .ok, "application/javascript", "public, max-age=300", meta.accept_gzip, assets.worker_js);
+        return;
+    }
     const ISLAND_PREFIX = "/islands/";
     const ISLAND_SUFFIX = ".wasm";
     if (std.mem.startsWith(u8, path, ISLAND_PREFIX) and std.mem.endsWith(u8, path, ISLAND_SUFFIX)) {
@@ -591,7 +595,7 @@ fn renderPage(req: RenderRequest) !void {
     // `wasm-unsafe-eval` is required for WebAssembly.instantiateStreaming;
     // the framework's client.wasm needs it. Without the directive the
     // browser blocks the wasm compile with a CSP error.
-    const csp_header = std.fmt.bufPrint(&csp_buf, "script-src 'nonce-{s}' 'strict-dynamic' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'self'", .{csp_nonce}) catch null;
+    const csp_header = std.fmt.bufPrint(&csp_buf, "script-src 'nonce-{s}' 'strict-dynamic' 'wasm-unsafe-eval'; worker-src 'self'; object-src 'none'; base-uri 'self'", .{csp_nonce}) catch null;
 
     // Dev mode: splice the auto-reload client snippet into the body
     // right before `</body>`. Skips fragment / non-HTML responses since

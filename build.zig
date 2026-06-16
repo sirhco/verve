@@ -115,6 +115,7 @@ pub fn build(b: *std.Build) void {
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(wasm.getEmittedBin(), "client.wasm");
     _ = wf.addCopyFile(b.path("src/bridge/verve.js"), "verve.js");
+    _ = wf.addCopyFile(b.path("src/bridge/verve-worker.js"), "verve-worker.js");
 
     // Phase 13D: meta-codegen builds one WASM chunk per island
     // declared under `app.islands`. Names are discovered by parsing
@@ -130,6 +131,7 @@ pub fn build(b: *std.Build) void {
     assets_buf.appendSlice(b.allocator,
         \\pub const wasm: []const u8 = @embedFile("client.wasm");
         \\pub const js: []const u8 = @embedFile("verve.js");
+        \\pub const worker_js: []const u8 = @embedFile("verve-worker.js");
         \\
         \\pub const IslandChunk = struct { name: []const u8, bytes: []const u8 };
         \\

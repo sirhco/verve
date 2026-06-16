@@ -46,6 +46,7 @@ fn collectLabels() []const []const u8 {
         "/ws",
         "/client.wasm",
         "/verve.js",
+        "/verve-worker.js",
         "/public/*",
         "__not_found__",
     };
@@ -68,7 +69,7 @@ pub fn routeLabel(path: []const u8) []const u8 {
         if (std.mem.eql(u8, path, r.pattern)) return r.pattern;
     }
     const fixed = .{
-        "/health", "/metrics", "/events", "/ws", "/client.wasm", "/verve.js",
+        "/health", "/metrics", "/events", "/ws", "/client.wasm", "/verve.js", "/verve-worker.js",
     };
     inline for (fixed) |f| {
         if (std.mem.eql(u8, path, f)) return f;
