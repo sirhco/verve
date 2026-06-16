@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-06-16
+
 ### Added
 
 - **`verve.gl` — skeletal skinning, slice 2 (keyframe animation)** (`src/core/gl/vmesh.zig`
@@ -3311,7 +3313,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.8...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.9...HEAD
+[0.5.9]: https://github.com/sirhco/verve/compare/v0.5.8...v0.5.9
 [0.5.8]: https://github.com/sirhco/verve/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/sirhco/verve/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/sirhco/verve/compare/v0.5.5...v0.5.6
