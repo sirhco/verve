@@ -881,21 +881,34 @@ pub fn glSkin(ctx: *const verve.Context) !*verve.Node {
             .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;"),
     });
 
+    // Controls (slice 3) — wired to the GlSkin chunk's no-arg exports via
+    // z-on-click. Must live INSIDE the island subtree so events route to it.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glskin_clip0").text("Bend"),
+        ctx.el("button").attr("z-on-click", "glskin_clip1").text("Twist"),
+        ctx.el("button").attr("z-on-click", "glskin_pause").text("Pause"),
+        ctx.el("button").attr("z-on-click", "glskin_play").text("Play"),
+        ctx.el("button").attr("z-on-click", "glskin_speed_half").text("0.5×"),
+        ctx.el("button").attr("z-on-click", "glskin_speed_1x").text("1×"),
+        ctx.el("button").attr("z-on-click", "glskin_speed_2x").text("2×"),
+    });
+
     const inner = ctx.section().class("card").children(.{
-        ctx.h2("Skinned bar (static bent pose) — GPU skinning"),
+        ctx.h2("Skinned bar — multiple clips + controls"),
         canvas,
+        controls,
     });
     const demo_island = verve.island(ctx, .{ .name = "GlSkin" }, inner);
 
     return ctx.main_().class("home").children(.{
         ctx.h1("verve.gl — skeletal skinning"),
-        ctx.p().text("A rigged bar GPU-skinned by a 3-joint skeleton, deformed by " ++
-            "a fixed bent pose (the mid joint carries a constant rotation, so the " ++
-            "upper half bends). Vertices carry joint indices + weights; the bone " ++
-            "matrix palette is computed per frame in Zig and pushed via set_bones, " ++
-            "and the skinned PBR shader (variant_pbr | variant_skinned) blends the " ++
-            "bone matrices per vertex. Renders through WebGPU when available, else " ++
-            "WebGL2. Keyframe animation is the next slice."),
+        ctx.p().text("A rigged bar GPU-skinned by a 3-joint skeleton, playing baked " ++
+            "animation clips. Buttons switch clip (Bend / Twist), pause/play, and set " ++
+            "speed. Vertices carry joint indices + weights; per frame the selected " ++
+            "clip's keyframe tracks are sampled into a bone-matrix palette and pushed " ++
+            "via set_bones, and the skinned PBR shader (variant_pbr | variant_skinned) " ++
+            "blends the bone matrices per vertex. Renders through WebGPU when " ++
+            "available, else WebGL2."),
         demo_island,
     });
 }

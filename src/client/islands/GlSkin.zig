@@ -34,6 +34,11 @@ var use_webgpu: bool = false;
 var resources_sent: bool = false;
 var yaw: f32 = 0;
 var elapsed_s: f32 = 0;
+// Playback state (slice 3): selected clip, paused, speed multiplier. Mutated by
+// the glskin_* control exports (wired to /gl-skin buttons).
+var cur_clip: u32 = 0;
+var paused: bool = false;
+var speed: f32 = 1.0;
 // Resolved once the vmesh bytes land (gl_load → glskin_vmesh_ready). Holds slices
 // into the page asset region, valid for this single-instance chunk's lifetime.
 var asset: ?gl.vmesh.Reader = null;
@@ -86,6 +91,9 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     asset = null;
     yaw = 0;
     elapsed_s = 0;
+    cur_clip = 0;
+    paused = false;
+    speed = 1.0;
     use_webgpu = gl_webgpu_available() != 0;
     canvas_handle = verve.queryRef(@as([]const u8, "glskin-canvas"));
 
@@ -117,9 +125,9 @@ fn lowerKey(a: *const gl.vmesh.Reader, tr: gl.vmesh.TrackInfo, t: f32) u32 {
     return i;
 }
 
-/// Sample a vec3 track (translation c=0 / scale c=2) at time t.
-fn sampleVec3(a: *const gl.vmesh.Reader, j: u32, c: u2, t: f32) gl.math.Vec3 {
-    const tr = a.animTrack(j, c);
+/// Sample a vec3 track (translation c=0 / scale c=2) of `clip` at time t.
+fn sampleVec3(a: *const gl.vmesh.Reader, clip: u32, j: u32, c: u2, t: f32) gl.math.Vec3 {
+    const tr = a.animTrack(clip, j, c);
     const k0 = lowerKey(a, tr, t);
     const v0 = gl.math.Vec3.init(a.animValue(tr, k0, 0), a.animValue(tr, k0, 1), a.animValue(tr, k0, 2));
     if (tr.key_count <= 1 or tr.interp == 1 or k0 + 1 >= tr.key_count) return v0;
@@ -131,9 +139,9 @@ fn sampleVec3(a: *const gl.vmesh.Reader, j: u32, c: u2, t: f32) gl.math.Vec3 {
     return gl.math.Vec3.init(v0.x + (v1.x - v0.x) * f, v0.y + (v1.y - v0.y) * f, v0.z + (v1.z - v0.z) * f);
 }
 
-/// Sample the rotation track (c=1) at time t (slerp, or hold for STEP).
-fn sampleQuat(a: *const gl.vmesh.Reader, j: u32, t: f32) gl.math.Quat {
-    const tr = a.animTrack(j, 1);
+/// Sample the rotation track (c=1) of `clip` at time t (slerp, or hold for STEP).
+fn sampleQuat(a: *const gl.vmesh.Reader, clip: u32, j: u32, t: f32) gl.math.Quat {
+    const tr = a.animTrack(clip, j, 1);
     const k0 = lowerKey(a, tr, t);
     const q0 = gl.math.Quat{ .x = a.animValue(tr, k0, 0), .y = a.animValue(tr, k0, 1), .z = a.animValue(tr, k0, 2), .w = a.animValue(tr, k0, 3) };
     if (tr.key_count <= 1 or tr.interp == 1 or k0 + 1 >= tr.key_count) return q0;
@@ -151,16 +159,18 @@ fn sampleQuat(a: *const gl.vmesh.Reader, j: u32, t: f32) gl.math.Quat {
 /// inverse_bind`.
 fn updateBones(a: *const gl.vmesh.Reader) void {
     const jc = @min(a.jointCount(), max_bones);
-    const has_anim = a.animPresent();
-    const dur = a.animDuration();
+    const ccount = a.animClipCount();
+    const has_anim = a.animPresent() and ccount > 0;
+    const clip = if (cur_clip < ccount) cur_clip else 0;
+    const dur = if (has_anim) a.animClip(clip).duration else 0;
     const t = if (has_anim and dur > 0) @mod(elapsed_s, dur) else 0;
     var j: u32 = 0;
     while (j < jc) : (j += 1) {
         const joint = a.joint(j);
         const local = if (has_anim) blk: {
-            const tr = sampleVec3(a, j, 0, t); // translation
-            const rot = sampleQuat(a, j, t); // rotation
-            const scl = sampleVec3(a, j, 2, t); // scale
+            const tr = sampleVec3(a, clip, j, 0, t); // translation
+            const rot = sampleQuat(a, clip, j, t); // rotation
+            const scl = sampleVec3(a, clip, j, 2, t); // scale
             break :blk gl.math.Mat4.fromTrs(tr, rot, scl);
         } else gl.math.Mat4{ .m = joint.bind_local };
         const w = if (joint.parent < 0)
@@ -171,6 +181,34 @@ fn updateBones(a: *const gl.vmesh.Reader) void {
         const bone = w.mul(gl.math.Mat4{ .m = joint.inverse_bind });
         @memcpy(bones[j * 16 ..][0..16], &bone.m);
     }
+}
+
+// ── controls (wired to /gl-skin buttons via z-on-click) ─────────────────────────
+// No-arg named exports (AnimDemo convention). cur_clip is clamped in updateBones,
+// so glskin_clip1 on a single-clip mesh is harmless.
+
+export fn glskin_clip0() void {
+    cur_clip = 0;
+    elapsed_s = 0;
+}
+export fn glskin_clip1() void {
+    cur_clip = 1;
+    elapsed_s = 0;
+}
+export fn glskin_pause() void {
+    paused = true;
+}
+export fn glskin_play() void {
+    paused = false;
+}
+export fn glskin_speed_half() void {
+    speed = 0.5;
+}
+export fn glskin_speed_1x() void {
+    speed = 1.0;
+}
+export fn glskin_speed_2x() void {
+    speed = 2.0;
 }
 
 // ── frame export ──────────────────────────────────────────────────────────────
@@ -187,7 +225,7 @@ export fn glskin_frame(dt_ms: f32, width: u32, height: u32) u32 {
         return @intCast(@intFromPtr(&cmd_buf));
     };
     yaw += dt_ms * 0.0006; // slow orbit so the 3D bend reads from all sides
-    elapsed_s += dt_ms * 0.001; // clip playback time (looped in updateBones)
+    if (!paused) elapsed_s += dt_ms * 0.001 * speed; // clip playback time (looped)
 
     const aspect = @as(f32, @floatFromInt(width)) /
         @as(f32, @floatFromInt(@max(height, 1)));

@@ -57,7 +57,7 @@ const bvh = @import("bvh.zig");
 const command = @import("command.zig");
 
 pub const magic = "VMSH";
-pub const version: u32 = 6;
+pub const version: u32 = 7;
 pub const vertex_stride: u32 = 48; // pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40
 pub const skinned_vertex_stride: u32 = 56; // …48, then joints uint8x4 @48, weights unorm8x4 @52
 pub const header_size: u32 = 72;
@@ -71,12 +71,15 @@ pub const joint_entry_size: u32 = 132; // parent i32 (4) + inverse_bind 16f32 (6
 pub const Joint = struct { parent: i32, inverse_bind: [16]f32, bind_local: [16]f32 };
 
 pub const Track = struct { interp: u8, times: []const f32, values: []const f32 };
-pub const Anim = struct { duration: f32, tracks: []const Track };
+pub const Clip = struct { name_hash: u32, duration: f32, tracks: []const Track };
+pub const Anims = struct { clips: []const Clip };
+pub const ClipInfo = struct { name_hash: u32, duration: f32 };
 pub fn animComps(channel: u2) u32 {
     return if (channel == 1) 4 else 3;
 }
 pub const TrackInfo = struct { interp: u8, key_count: u32, data_off: u32, comps: u32 };
 const anim_dir_entry_size: u32 = 12;
+const anim_clip_entry_size: u32 = 16;
 
 /// Per-texture pixel encoding. v4: every texture is `.raw` today; the tag is
 /// groundwork for compressed/encoded payloads (PNG/JPEG/WebP) in later slices.
@@ -144,7 +147,7 @@ pub fn pack(
     joints: []const [4]u8,
     weights: []const [4]u8,
     skel: []const Joint,
-    anim: ?Anim,
+    anim: ?Anims,
 ) ![]u8 {
     // Validate BVH section coupling.
     if (bvh_nodes.len > 0) {
@@ -218,21 +221,26 @@ pub fn pack(
     const skeleton_bytes: u32 = joint_count * joint_entry_size;
     const after_skeleton: u32 = if (joint_count == 0) after_names else skeleton_off + skeleton_bytes;
 
-    var anim_dir_bytes: u32 = 0;
-    var anim_blob_bytes: u32 = 0;
+    var anim_total: u32 = 0;
     if (anim) |an| {
-        std.debug.assert(an.tracks.len == @as(usize, joint_count) * 3);
-        anim_dir_bytes = joint_count * 3 * anim_dir_entry_size;
-        for (an.tracks, 0..) |tr, ti| {
-            const comps = animComps(@intCast(ti % 3));
-            const kc: u32 = @intCast(tr.times.len);
-            std.debug.assert(tr.values.len == @as(usize, kc) * comps);
-            anim_blob_bytes += kc * 4 + kc * comps * 4;
+        const clip_table: u32 = 8 + @as(u32, @intCast(an.clips.len)) * anim_clip_entry_size;
+        var cur: u32 = clip_table;
+        for (an.clips) |cl| {
+            std.debug.assert(cl.tracks.len == @as(usize, joint_count) * 3);
+            cur = alignUp(cur, 4);
+            var sect: u32 = joint_count * 3 * anim_dir_entry_size;
+            for (cl.tracks, 0..) |tr, ti| {
+                const comps = animComps(@intCast(ti % 3));
+                const kc: u32 = @intCast(tr.times.len);
+                std.debug.assert(tr.values.len == @as(usize, kc) * comps);
+                sect += kc * 4 + kc * comps * 4;
+            }
+            cur += sect;
         }
+        anim_total = cur;
     }
     const anim_off: u32 = if (anim == null) 0 else alignUp(after_skeleton, 16);
-    const anim_section_bytes: u32 = if (anim == null) 0 else 8 + anim_dir_bytes + anim_blob_bytes;
-    const after_anim: u32 = if (anim == null) after_skeleton else anim_off + anim_section_bytes;
+    const after_anim: u32 = if (anim == null) after_skeleton else anim_off + anim_total;
 
     const total_size: u32 = after_anim;
     const buf = try alloc.alloc(u8, total_size);
@@ -362,31 +370,43 @@ pub fn pack(
         }
     }
 
-    // Write animation section: duration f32 @0, flags u32 @4, directory @8
-    // (joint_count*3 entries × 12B), then per-track time + value blobs.
+    // Write animation section: clip_count u32 @0, flags u32 @4, clip table @8
+    // (clip_count × 16B), then per-clip directory (joint_count*3 × 12B) + blobs.
     if (anim) |an| {
-        std.mem.writeInt(u32, buf[anim_off..][0..4], @bitCast(an.duration), .little);
+        std.mem.writeInt(u32, buf[anim_off..][0..4], @intCast(an.clips.len), .little);
         std.mem.writeInt(u32, buf[anim_off + 4 ..][0..4], 0, .little);
-        const dir_off = anim_off + 8;
-        var blob_cursor: u32 = 8 + anim_dir_bytes;
-        for (an.tracks, 0..) |tr, ti| {
-            const comps = animComps(@intCast(ti % 3));
-            const kc: u32 = @intCast(tr.times.len);
-            const e = dir_off + @as(u32, @intCast(ti)) * anim_dir_entry_size;
-            buf[e] = tr.interp;
-            buf[e + 1] = 0;
-            buf[e + 2] = 0;
-            buf[e + 3] = 0;
-            std.mem.writeInt(u32, buf[e + 4 ..][0..4], kc, .little);
-            std.mem.writeInt(u32, buf[e + 8 ..][0..4], blob_cursor, .little);
-            var k: u32 = 0;
-            while (k < kc) : (k += 1)
-                std.mem.writeInt(u32, buf[anim_off + blob_cursor + k * 4 ..][0..4], @bitCast(tr.times[k]), .little);
-            const vbase = anim_off + blob_cursor + kc * 4;
-            var vi: u32 = 0;
-            while (vi < kc * comps) : (vi += 1)
-                std.mem.writeInt(u32, buf[vbase + vi * 4 ..][0..4], @bitCast(tr.values[vi]), .little);
-            blob_cursor += kc * 4 + kc * comps * 4;
+        const table_off = anim_off + 8;
+        var sect_cursor: u32 = 8 + @as(u32, @intCast(an.clips.len)) * anim_clip_entry_size;
+        for (an.clips, 0..) |cl, ci| {
+            sect_cursor = alignUp(sect_cursor, 4);
+            const te = table_off + @as(u32, @intCast(ci)) * anim_clip_entry_size;
+            std.mem.writeInt(u32, buf[te..][0..4], cl.name_hash, .little);
+            std.mem.writeInt(u32, buf[te + 4 ..][0..4], @bitCast(cl.duration), .little);
+            std.mem.writeInt(u32, buf[te + 8 ..][0..4], sect_cursor, .little);
+            std.mem.writeInt(u32, buf[te + 12 ..][0..4], 0, .little);
+            const dir_off = anim_off + sect_cursor;
+            const dir_bytes: u32 = joint_count * 3 * anim_dir_entry_size;
+            var blob_cursor: u32 = sect_cursor + dir_bytes;
+            for (cl.tracks, 0..) |tr, ti| {
+                const comps = animComps(@intCast(ti % 3));
+                const kc: u32 = @intCast(tr.times.len);
+                const e = dir_off + @as(u32, @intCast(ti)) * anim_dir_entry_size;
+                buf[e] = tr.interp;
+                buf[e + 1] = 0;
+                buf[e + 2] = 0;
+                buf[e + 3] = 0;
+                std.mem.writeInt(u32, buf[e + 4 ..][0..4], kc, .little);
+                std.mem.writeInt(u32, buf[e + 8 ..][0..4], blob_cursor, .little);
+                var k: u32 = 0;
+                while (k < kc) : (k += 1)
+                    std.mem.writeInt(u32, buf[anim_off + blob_cursor + k * 4 ..][0..4], @bitCast(tr.times[k]), .little);
+                const vbase = anim_off + blob_cursor + kc * 4;
+                var vi: u32 = 0;
+                while (vi < kc * comps) : (vi += 1)
+                    std.mem.writeInt(u32, buf[vbase + vi * 4 ..][0..4], @bitCast(tr.values[vi]), .little);
+                blob_cursor += kc * 4 + kc * comps * 4;
+            }
+            sect_cursor = blob_cursor;
         }
     }
 
@@ -536,18 +556,27 @@ pub const Reader = struct {
         // directory fit, then each track's time+value blob is in bounds.
         if (anim_off != 0) {
             if (anim_off % 16 != 0) return error.Truncated;
-            const dir_bytes: u64 = @as(u64, joint_count) * 3 * anim_dir_entry_size;
-            const header_end: u64 = @as(u64, anim_off) + 8 + dir_bytes;
-            if (header_end > blen) return error.Truncated;
-            var ti: u32 = 0;
-            while (ti < joint_count * 3) : (ti += 1) {
-                const comps: u64 = if (ti % 3 == 1) 4 else 3;
-                const e: usize = @intCast(@as(u64, anim_off) + 8 + @as(u64, ti) * anim_dir_entry_size);
-                const kc: u64 = std.mem.readInt(u32, bytes[e + 4 ..][0..4], .little);
-                const data_off: u64 = std.mem.readInt(u32, bytes[e + 8 ..][0..4], .little);
-                const need: u64 = kc * 4 + kc * comps * 4;
-                const abs: u64 = @as(u64, anim_off) + data_off;
-                if (abs > blen or need > blen - abs) return error.Truncated;
+            if (@as(u64, anim_off) + 8 > blen) return error.Truncated;
+            const clip_count = std.mem.readInt(u32, bytes[anim_off..][0..4], .little);
+            const table_end: u64 = @as(u64, anim_off) + 8 + @as(u64, clip_count) * anim_clip_entry_size;
+            if (table_end > blen) return error.Truncated;
+            var ci: u32 = 0;
+            while (ci < clip_count) : (ci += 1) {
+                const te: usize = @intCast(@as(u64, anim_off) + 8 + @as(u64, ci) * anim_clip_entry_size);
+                const dir_off: u64 = std.mem.readInt(u32, bytes[te + 8 ..][0..4], .little);
+                const dir_bytes: u64 = @as(u64, joint_count) * 3 * anim_dir_entry_size;
+                const dir_end: u64 = @as(u64, anim_off) + dir_off + dir_bytes;
+                if (dir_end > blen) return error.Truncated;
+                var ti: u32 = 0;
+                while (ti < joint_count * 3) : (ti += 1) {
+                    const comps: u64 = if (ti % 3 == 1) 4 else 3;
+                    const e: usize = @intCast(@as(u64, anim_off) + dir_off + @as(u64, ti) * anim_dir_entry_size);
+                    const kc: u64 = std.mem.readInt(u32, bytes[e + 4 ..][0..4], .little);
+                    const data_off: u64 = std.mem.readInt(u32, bytes[e + 8 ..][0..4], .little);
+                    const need: u64 = kc * 4 + kc * comps * 4;
+                    const abs: u64 = @as(u64, anim_off) + data_off;
+                    if (abs > blen or need > blen - abs) return error.Truncated;
+                }
             }
         }
 
@@ -600,17 +629,29 @@ pub const Reader = struct {
         return self.anim_off_ != 0;
     }
 
-    /// Clip duration in seconds (anim section @0). 0 when no clip present.
-    pub fn animDuration(self: *const Reader) f32 {
+    /// Number of animation clips in the clip table. 0 when no anim present.
+    pub fn animClipCount(self: *const Reader) u32 {
         if (self.anim_off_ == 0) return 0;
-        return @bitCast(std.mem.readInt(u32, self.bytes[self.anim_off_..][0..4], .little));
+        return std.mem.readInt(u32, self.bytes[self.anim_off_..][0..4], .little);
     }
 
-    /// Directory entry for joint `j`, channel `c` (0=T,1=R,2=S). Caller must
-    /// ensure the clip is present and `j < jointCount()`.
-    pub fn animTrack(self: *const Reader, j: u32, c: u2) TrackInfo {
+    /// Clip table entry `i`: name_hash + duration. Caller must ensure
+    /// `i < animClipCount()`.
+    pub fn animClip(self: *const Reader, i: u32) ClipInfo {
+        const te = @as(usize, self.anim_off_) + 8 + @as(usize, i) * anim_clip_entry_size;
+        return .{
+            .name_hash = std.mem.readInt(u32, self.bytes[te..][0..4], .little),
+            .duration = @bitCast(std.mem.readInt(u32, self.bytes[te + 4 ..][0..4], .little)),
+        };
+    }
+
+    /// Directory entry for clip `clip`, joint `j`, channel `c` (0=T,1=R,2=S).
+    /// Caller must ensure `clip < animClipCount()` and `j < jointCount()`.
+    pub fn animTrack(self: *const Reader, clip: u32, j: u32, c: u2) TrackInfo {
+        const te = @as(usize, self.anim_off_) + 8 + @as(usize, clip) * anim_clip_entry_size;
+        const dir_off = std.mem.readInt(u32, self.bytes[te + 8 ..][0..4], .little);
         const idx = j * 3 + @as(u32, c);
-        const e = @as(usize, self.anim_off_) + 8 + @as(usize, idx) * anim_dir_entry_size;
+        const e = @as(usize, self.anim_off_) + dir_off + @as(usize, idx) * anim_dir_entry_size;
         return .{
             .interp = self.bytes[e],
             .key_count = std.mem.readInt(u32, self.bytes[e + 4 ..][0..4], .little),
@@ -1274,8 +1315,8 @@ test "(j) v5 skinned round-trip: stride 56, 2-joint skeleton" {
     const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, null);
     defer testing.allocator.free(bytes);
 
-    // Header: version 6, skinned flag set, joint_count == 2.
-    try testing.expectEqual(@as(u32, 6), std.mem.readInt(u32, bytes[4..8], .little));
+    // Header: version 7, skinned flag set, joint_count == 2.
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, bytes[4..8], .little));
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[56..60], .little));
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[64..68], .little));
     // skeleton_off 16-aligned.
@@ -1303,34 +1344,44 @@ test "(j) v5 skinned round-trip: stride 56, 2-joint skeleton" {
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(verts[0..12]), r.vertices[0..48]);
 }
 
-test "vmesh v6: animation section round-trips" {
+test "vmesh v7: multi-clip table round-trips" {
     const verts = [_]f32{0} ** 12;
     const joints = [_][4]u8{.{ 0, 0, 0, 0 }};
     const weights = [_][4]u8{.{ 255, 0, 0, 0 }};
     const skel = [_]Joint{.{ .parent = -1, .inverse_bind = Mat4Identity, .bind_local = Mat4Identity }};
-    const t_times = [_]f32{0};
-    const t_vals = [_]f32{ 0, 0, 0 };
-    const r_times = [_]f32{ 0, 0.5, 1.0 };
-    const r_vals = [_]f32{ 0, 0, 0, 1, 0, 0, 0.3827, 0.9239, 0, 0, 0, 1 };
-    const s_times = [_]f32{0};
-    const s_vals = [_]f32{ 1, 1, 1 };
-    const tracks = [_]Track{
-        .{ .interp = 0, .times = &t_times, .values = &t_vals },
-        .{ .interp = 0, .times = &r_times, .values = &r_vals },
-        .{ .interp = 0, .times = &s_times, .values = &s_vals },
+    const t1 = [_]f32{0};
+    const v_t = [_]f32{ 0, 0, 0 };
+    const v_s = [_]f32{ 1, 1, 1 };
+    const r0_times = [_]f32{ 0, 0.5, 1.0 };
+    const r0_vals = [_]f32{ 0, 0, 0, 1, 0, 0, 0.3827, 0.9239, 0, 0, 0, 1 };
+    const r1_times = [_]f32{0};
+    const r1_vals = [_]f32{ 0, 0, 0, 1 };
+    const c0 = [_]Track{
+        .{ .interp = 0, .times = &t1, .values = &v_t },
+        .{ .interp = 0, .times = &r0_times, .values = &r0_vals },
+        .{ .interp = 0, .times = &t1, .values = &v_s },
     };
-    const anim = Anim{ .duration = 1.0, .tracks = &tracks };
-    const bytes = try pack(std.testing.allocator, &verts, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, anim);
+    const c1 = [_]Track{
+        .{ .interp = 0, .times = &t1, .values = &v_t },
+        .{ .interp = 0, .times = &r1_times, .values = &r1_vals },
+        .{ .interp = 0, .times = &t1, .values = &v_s },
+    };
+    const clips = [_]Clip{
+        .{ .name_hash = fnv1a32("Bend"), .duration = 1.0, .tracks = &c0 },
+        .{ .name_hash = fnv1a32("Twist"), .duration = 2.0, .tracks = &c1 },
+    };
+    const anims = Anims{ .clips = &clips };
+    const bytes = try pack(std.testing.allocator, &verts, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, anims);
     defer std.testing.allocator.free(bytes);
     var r = try Reader.init(bytes);
     try std.testing.expect(r.animPresent());
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), r.animDuration(), 1e-6);
-    const rt = r.animTrack(0, 1);
-    try std.testing.expectEqual(@as(u32, 3), rt.key_count);
-    try std.testing.expectEqual(@as(u32, 4), rt.comps);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), r.animTime(rt, 1), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9239), r.animValue(rt, 1, 3), 1e-4);
-    const tt = r.animTrack(0, 0);
-    try std.testing.expectEqual(@as(u32, 1), tt.key_count);
-    try std.testing.expectEqual(@as(u32, 3), tt.comps);
+    try std.testing.expectEqual(@as(u32, 2), r.animClipCount());
+    try std.testing.expectEqual(fnv1a32("Bend"), r.animClip(0).name_hash);
+    try std.testing.expectEqual(fnv1a32("Twist"), r.animClip(1).name_hash);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), r.animClip(1).duration, 1e-6);
+    const t0 = r.animTrack(0, 0, 1);
+    try std.testing.expectEqual(@as(u32, 3), t0.key_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9239), r.animValue(t0, 1, 3), 1e-4);
+    const t1c = r.animTrack(1, 0, 1);
+    try std.testing.expectEqual(@as(u32, 1), t1c.key_count);
 }
