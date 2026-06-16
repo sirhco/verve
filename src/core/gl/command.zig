@@ -42,6 +42,7 @@ pub const Tag = enum(u16) {
     end_shadow_pass = 18, // {width, height} — unbind FBO back to canvas, restore viewport
     draw_depth = 19, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr} — depth-only draw (mvp = light_vp·world)
     bind_shadow_map = 20, // {slot, shadow_handle, light_vp_ptr} — bind depth tex + set u_light_vp on active program
+    set_bones = 21, // {count, ptr} — count×mat4 bone palette → u_bones[] on the active program
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3 };
@@ -69,6 +70,7 @@ pub const variant_normal_map: u32 = 1 << 3; // requires variant_pbr; tangent-spa
 pub const variant_emissive: u32 = 1 << 4; // requires variant_pbr; emissive term
 pub const variant_shadow: u32 = 1 << 5; // requires variant_pbr; samples the shadow map (P9 slice 3)
 pub const variant_depth: u32 = 1 << 6; // depth-only shader for the shadow pass; pbr vertex layout, attrib 0 only
+pub const variant_skinned: u32 = 1 << 7; // requires variant_pbr; GPU skinning via u_bones[] palette
 
 pub const max_lights: u32 = 4;
 pub const light_stride_f32: u32 = 8; // [type(0=dir,1=point), intensity, x,y,z, r,g,b]
@@ -900,6 +902,12 @@ pub const Encoder = struct {
         self.putU32(ptr);
     }
 
+    pub fn setBones(self: *Encoder, count: u32, ptr: u32) void {
+        self.header(.set_bones, 8);
+        self.putU32(count);
+        self.putU32(ptr);
+    }
+
     /// See setLights: SET_PIPELINE must precede BIND_IBL in a frame.
     pub fn bindIbl(self: *Encoder, irr: u32, spec: u32, lut: u32, spec_mip_count: u32) void {
         self.header(.bind_ibl, 16);
@@ -1156,6 +1164,23 @@ test "golden: P3 pbr frame records" {
             "0d00" ++ "2400" ++ "01000000" ++ "02000000" ++ "0c000000" ++ "24000000" ++ "00300000" ++ "00310000" ++ "00320000" ++ "00330000" ++ "00340000" ++
             // END_FRAME (tag 6)
             "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "golden: set_bones wire record" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.setBones(3, 0x4000);
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // Record bytes (excludes the 4-byte length header, matching the other goldens):
+    //   SET_BONES  4 + 8 = 12 = 0x0c  ->  length header "0c000000"
+    try testing.expectEqualStrings(
+        "0c000000" ++ // length header: 12 record bytes
+            // SET_BONES tag=21=0x15 payload=8 count=3 ptr=0x4000
+            "1500" ++ "0800" ++ "03000000" ++ "00400000",
         hex,
     );
 }
