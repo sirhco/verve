@@ -6,6 +6,15 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`verve.gl` — detailed demo base texture** (`src/core/gl/fixture.zig`): the demo
+  cube's base-color map (`pbrCubeGlb` → `demo.vmesh`) is now a 256×256 deterministic
+  procedural texture (was 8×8 — checker × gradient × hash-noise × grid lines), giving
+  the asset pipeline a real-sized texture for the upcoming compressed-textures work.
+  `demo.vmesh` grows accordingly (the raw base blob is the thing compressed textures
+  will shrink).
+
 ## [0.5.7] - 2026-06-15
 
 ### Added
