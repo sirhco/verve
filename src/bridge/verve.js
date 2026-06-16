@@ -559,7 +559,12 @@
   // unchanged. `glHydratingVid` carries the in-flight hydrate's vid so async
   // `gl_load` callbacks can re-select the requesting instance.
   let glHydratingVid = 0;
+  // Last instance selected for a frame/event dispatch — lets a gl_load issued from
+  // a FRAME (e.g. streaming external textures) route its async callback back to the
+  // right instance, since glHydratingVid is only set during hydrate.
+  let glCurrentVid = 0;
   const glSelect = (exports, vid) => {
+    glCurrentVid = vid >>> 0;
     if (vid && exports && typeof exports.glscene_select === "function")
       exports.glscene_select(vid >>> 0);
   };
@@ -5937,7 +5942,7 @@
               // hydrated/rendered. Capture the requesting instance's vid NOW
               // (this gl_load runs synchronously inside that instance's hydrate)
               // and re-select it before delivering the callback.
-              const reqVid = glHydratingVid;
+              const reqVid = glHydratingVid || glCurrentVid;
               const deliver = (a, b) => {
                 glSelect(exports, reqVid);
                 exports[cb](a, b);

@@ -73,6 +73,7 @@ const fov_y: f32 = 1.0; // vertical fov (rad) — MUST match the proj below
 
 const vmesh_ready_export = "glscene_vmesh_ready";
 const env_ready_export = "glscene_env_ready";
+const tex_ready_export = "glscene_tex_ready";
 const frame_export = "glscene_frame";
 
 // GPU resource handles (kept distinct from IBL handles 16/17/18).
@@ -92,6 +93,10 @@ const shadow_handle: u32 = 1;
 const shadow_size: u32 = 1024;
 
 const max_submesh = 8; // material-pool cap
+const max_tex = 8; // material-texture cap (per mesh)
+
+// A worker-decoded external texture awaiting upload on the next frame.
+const TexUpload = struct { handle: u32, w: u32, h: u32, ptr: u32, len: u32, srgb: bool };
 const max_picks = 4; // mirror of gl_scene.zig max_picks
 const max_name = 64; // per-name fixed storage
 const no_hover_hash: u32 = 0xFFFF_FFFF;
@@ -203,6 +208,16 @@ const Inst = struct {
     registry: gl.Registry(32) = .{},
     resources_sent: bool = false,
     needs_replay: bool = false,
+
+    // P-compressed-textures: external (compressed) material textures stream in via
+    // gl_load (worker-decoded to [w][h]+RGBA), are queued here, and uploaded on the
+    // next frame (gl_load callbacks run outside a frame, so they can't emit GPU
+    // commands directly). Raw (in-blob) textures still upload inline in sendResources.
+    tex_scan: u32 = 0, // next texture index to consider for an external load
+    tex_loading: i32 = -1, // texture index currently in-flight (-1 = none)
+    tex_url_buf: [192]u8 = undefined, // scratch for the derived "<stem>.tex{N}.<ext>"
+    tex_up: [max_tex]TexUpload = undefined, // decoded textures awaiting createTexture
+    tex_up_n: u32 = 0,
 
     // Refs resolved once in hydrate (scoped); frame/asset callbacks run unscoped.
     canvas_handle: ?i32 = null,
@@ -538,6 +553,84 @@ export fn glscene_env_ready(ptr: u32, len: u32) void {
     inst.env_reader = gl.venv.Reader.init(bytes) catch null;
 }
 
+// ── external (compressed) texture streaming (P-compressed-textures) ──────────────
+
+fn texExtName(fmt: gl.vmesh.Format) []const u8 {
+    return switch (fmt) {
+        .raw => "bin", // unreachable for streaming (raw never externalized)
+        .png => "png",
+        .jpeg => "jpg",
+        .webp => "webp",
+    };
+}
+
+/// Derive "<stem>.tex{idx}.<ext>" from the instance's vmesh src into tex_url_buf.
+fn buildTexUrl(inst: *Inst, idx: u32, fmt: gl.vmesh.Format) []const u8 {
+    const src = inst.src_buf[0..inst.src_len];
+    const stem = if (std.mem.endsWith(u8, src, ".vmesh")) src[0 .. src.len - ".vmesh".len] else src;
+    return std.fmt.bufPrint(&inst.tex_url_buf, "{s}.tex{d}.{s}", .{ stem, idx, texExtName(fmt) }) catch "";
+}
+
+/// Kick the next external (non-raw) material texture load, scanning from tex_scan.
+/// Raw textures upload inline in sendResources, so they're skipped here.
+fn loadNextExternalTex(inst: *Inst, a: *const gl.vmesh.Reader) void {
+    while (inst.tex_scan < a.tex_count) {
+        const i = inst.tex_scan;
+        if (a.texFormat(i) == .raw) {
+            inst.tex_scan += 1;
+            continue;
+        }
+        inst.tex_scan = i + 1;
+        inst.tex_loading = @intCast(i);
+        const url = buildTexUrl(inst, i, a.texFormat(i));
+        if (url.len != 0)
+            gl_load(url.ptr, @intCast(url.len), tex_ready_export.ptr, tex_ready_export.len);
+        return;
+    }
+    inst.tex_loading = -1;
+}
+
+/// Worker-decoded external texture arrived: bytes = [w:u32 LE][h:u32 LE][RGBA…] at
+/// `ptr`. Queue it for upload on the next frame, then kick the next one. (gl_load
+/// callbacks run outside a frame, so the createTexture is deferred to drainTexUploads.)
+export fn glscene_tex_ready(ptr: u32, len: u32) void {
+    const inst = current orelse return;
+    if (inst.tex_loading < 0) return;
+    const idx: u32 = @intCast(inst.tex_loading);
+    inst.tex_loading = -1;
+    if (ptr != 0 and len >= 8 and inst.tex_up_n < max_tex) {
+        const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
+        inst.tex_up[inst.tex_up_n] = .{
+            .handle = idx + 1,
+            .w = std.mem.readInt(u32, bytes[0..4], .little),
+            .h = std.mem.readInt(u32, bytes[4..8], .little),
+            .ptr = ptr + 8,
+            .len = len - 8,
+            .srgb = if (inst.asset) |*a| a.texIsSrgb(idx) else false,
+        };
+        inst.tex_up_n += 1;
+    }
+    // ptr==0 → load/decode failed: leave the slot's default texture.
+    if (inst.asset) |*a| loadNextExternalTex(inst, a);
+}
+
+/// Drain queued external textures into createTexture commands (called each frame
+/// while assets are live). Recorded into the registry for context-restore replay.
+fn drainTexUploads(inst: *Inst, enc: *gl.Encoder) void {
+    var i: u32 = 0;
+    while (i < inst.tex_up_n) : (i += 1) {
+        const u = inst.tex_up[i];
+        if (u.srgb) {
+            enc.createTextureSrgb(u.handle, u.w, u.h, u.ptr, u.len);
+            inst.registry.recordTextureSrgb(u.handle, u.w, u.h, u.ptr, u.len);
+        } else {
+            enc.createTexture(u.handle, u.w, u.h, u.ptr, u.len);
+            inst.registry.recordTexture(u.handle, u.w, u.h, u.ptr, u.len);
+        }
+    }
+    inst.tex_up_n = 0;
+}
+
 /// (Re)build the scene graph for a freshly-read vmesh: root "model" at node 0,
 /// one child per submesh at node s+1. Also initializes the mats pool + per-
 /// submesh local AABBs from vmesh defaults.
@@ -760,6 +853,10 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             inst.registry.replay(&enc);
         }
 
+        // Upload any external (compressed) textures that finished decoding since the
+        // last frame (createTexture can't run in the gl_load callback's context).
+        if (inst.tex_up_n != 0) drainTexUploads(inst, &enc);
+
         // Process a queued pick (camera state is coherent this frame).
         if (inst.pick_pending) {
             inst.pick_pending = false;
@@ -882,6 +979,7 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
 
     var t: u32 = 0;
     while (t < a.tex_count) : (t += 1) {
+        if (a.texFormat(t) != .raw) continue; // external (compressed): streamed below
         const tex = a.texture(t);
         const ptr: u32 = @intCast(@intFromPtr(tex.rgba.ptr));
         const len: u32 = @intCast(tex.rgba.len);
@@ -893,6 +991,10 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
             inst.registry.recordTexture(t + 1, tex.width, tex.height, ptr, len);
         }
     }
+    // Kick external (compressed) material textures — fetched + worker-decoded, then
+    // uploaded on later frames by drainTexUploads. Raw textures handled inline above.
+    inst.tex_scan = 0;
+    loadNextExternalTex(inst, a);
 
     enc.createTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));
     inst.registry.recordTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));

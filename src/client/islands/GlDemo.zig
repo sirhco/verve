@@ -16,6 +16,7 @@
 //! Multi-instance: singleton statics, same documented choice as Counter.zig.
 //! Namespace by root_id if a future page ever needs two cubes or two models.
 
+const std = @import("std");
 const verve = @import("verve");
 const gl = verve.gl;
 
@@ -106,6 +107,77 @@ const lut_handle: u32 = 18;
 // Comptime PBR variant: full Cook-Torrance + IBL + tangent-space normals + emissive.
 const pbr_variant = gl.command.variant_pbr | gl.command.variant_normal_map | gl.command.variant_emissive;
 
+// P-compressed-textures: external (compressed) material textures stream in via
+// gl_load (worker-decoded to [w][h]+RGBA), queued, then uploaded on the next frame.
+const model_tex_ready_export = "glmodel_tex_ready";
+const ModelTexUpload = struct { handle: u32, w: u32, h: u32, ptr: u32, len: u32, srgb: bool };
+var model_tex_scan: u32 = 0;
+var model_tex_loading: i32 = -1;
+var model_tex_url_buf: [192]u8 = undefined;
+var model_tex_up: [8]ModelTexUpload = undefined;
+var model_tex_up_n: u32 = 0;
+
+fn modelTexExt(fmt: gl.vmesh.Format) []const u8 {
+    return switch (fmt) {
+        .raw => "bin",
+        .png => "png",
+        .jpeg => "jpg",
+        .webp => "webp",
+    };
+}
+
+/// Kick the next external (non-raw) material texture load (model_url stem is fixed).
+fn loadNextModelTex(a: *const gl.vmesh.Reader) void {
+    while (model_tex_scan < a.tex_count) {
+        const i = model_tex_scan;
+        if (a.texFormat(i) == .raw) {
+            model_tex_scan += 1;
+            continue;
+        }
+        model_tex_scan = i + 1;
+        model_tex_loading = @intCast(i);
+        const stem = model_url[0 .. model_url.len - ".vmesh".len];
+        const url = std.fmt.bufPrint(&model_tex_url_buf, "{s}.tex{d}.{s}", .{ stem, i, modelTexExt(a.texFormat(i)) }) catch "";
+        if (url.len != 0)
+            gl_load(url.ptr, @intCast(url.len), model_tex_ready_export.ptr, model_tex_ready_export.len);
+        return;
+    }
+    model_tex_loading = -1;
+}
+
+/// Worker-decoded external texture arrived: [w:u32 LE][h:u32 LE][RGBA…] at `ptr`.
+export fn glmodel_tex_ready(ptr: u32, len: u32) void {
+    if (model_tex_loading < 0) return;
+    const idx: u32 = @intCast(model_tex_loading);
+    model_tex_loading = -1;
+    if (ptr != 0 and len >= 8 and model_tex_up_n < model_tex_up.len) {
+        const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
+        model_tex_up[model_tex_up_n] = .{
+            .handle = idx + 1,
+            .w = std.mem.readInt(u32, bytes[0..4], .little),
+            .h = std.mem.readInt(u32, bytes[4..8], .little),
+            .ptr = ptr + 8,
+            .len = len - 8,
+            .srgb = if (model_asset) |*a| a.texIsSrgb(idx) else false,
+        };
+        model_tex_up_n += 1;
+    }
+    if (model_asset) |*a| loadNextModelTex(a);
+}
+
+/// Drain queued external textures into createTexture commands (called each frame).
+fn drainModelTex(enc: *gl.Encoder) void {
+    var i: u32 = 0;
+    while (i < model_tex_up_n) : (i += 1) {
+        const u = model_tex_up[i];
+        if (u.srgb)
+            enc.createTextureSrgb(u.handle, u.w, u.h, u.ptr, u.len)
+        else
+            enc.createTexture(u.handle, u.w, u.h, u.ptr, u.len);
+    }
+    model_tex_up_n = 0;
+}
+
 // ── Context-restore exports ──────────────────────────────────────────────────
 //
 // On webglcontextrestored the bridge calls `<frame_export>_restore` before
@@ -138,6 +210,10 @@ export fn glmodel_frame_restore() void {
     // (only fires when model_asset and model_env are both non-null, which
     // they will be — the asset-region bytes are still valid after restore).
     model_resources_sent = false;
+    // Re-stream external textures from scratch (the GL objects died).
+    model_tex_loading = -1;
+    model_tex_up_n = 0;
+    model_tex_scan = 0;
 }
 
 // ── hydrate ─────────────────────────────────────────────────────────────────
@@ -293,6 +369,7 @@ export fn glmodel_frame(dt_ms: f32, width: u32, height: u32) u32 {
             // base-color / emissive → sRGB (hardware decode); rest linear.
             var t: u32 = 0;
             while (t < a.tex_count) : (t += 1) {
+                if (a.texFormat(t) != .raw) continue; // external: streamed below
                 const tex = a.texture(t);
                 const ptr: u32 = @intCast(@intFromPtr(tex.rgba.ptr));
                 const len: u32 = @intCast(tex.rgba.len);
@@ -301,11 +378,18 @@ export fn glmodel_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 else
                     enc.createTexture(t + 1, tex.width, tex.height, ptr, len);
             }
+            // Kick external (compressed) textures — uploaded on later frames.
+            model_tex_scan = 0;
+            loadNextModelTex(a);
             // IBL: irradiance cube, prefiltered specular mip-chain, BRDF LUT.
             enc.createTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));
             enc.createTextureEx(spec_handle, .cube, .rgba16f, env.spec_size, env.spec_size, env.spec_mip_count, @intCast(@intFromPtr(env.specular.ptr)), @intCast(env.specular.len));
             enc.createTextureEx(lut_handle, .tex_2d, .rgba16f, env.lut_size, env.lut_size, 1, @intCast(@intFromPtr(env.lut.ptr)), @intCast(env.lut.len));
         }
+
+        // Upload external (compressed) textures that finished decoding (the gl_load
+        // callback can't emit GPU commands, so it's deferred here).
+        if (model_tex_up_n != 0) drainModelTex(&enc);
 
         // Per-draw matrices: copy out to stable statics (drawPbr records carry
         // their addresses, same stability requirement as model_mvp).
