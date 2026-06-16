@@ -23,6 +23,9 @@ pub const Vec3 = struct {
     pub fn scale(v: Vec3, s: f32) Vec3 {
         return init(v.x * s, v.y * s, v.z * s);
     }
+    pub fn lerp(a: Vec3, b: Vec3, t: f32) Vec3 {
+        return init(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
+    }
     pub fn dot(a: Vec3, b: Vec3) f32 {
         return a.x * b.x + a.y * b.y + a.z * b.z;
     }
@@ -625,4 +628,17 @@ test "Quat.slerp endpoints + midpoint + sign flip" {
     const nb = Q{ .x = -b.x, .y = -b.y, .z = -b.z, .w = -b.w };
     const mn = Q.slerp(a, nb, 0.5);
     try std.testing.expectApproxEqAbs(@abs(m.z), @abs(mn.z), 1e-4);
+}
+
+test "Vec3.lerp endpoints + midpoint" {
+    const a = Vec3.init(0, 0, 0);
+    const b = Vec3.init(2, -4, 10);
+    const e0 = Vec3.lerp(a, b, 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), e0.x, 1e-6);
+    const e1 = Vec3.lerp(a, b, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), e1.z, 1e-6);
+    const m = Vec3.lerp(a, b, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), m.x, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -2), m.y, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), m.z, 1e-6);
 }
