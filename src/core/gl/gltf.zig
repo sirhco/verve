@@ -50,6 +50,13 @@ pub const Model = struct {
     textures: []vmesh.Texture, // decoded RGBA8 via png.zig
     names: []const []const u8, // one per submesh; owning mesh's name (fallback "mesh{n}")
     external_textures: []const ExternalTex = &.{}, // textures >64×64: original bytes kept, RGBA dropped
+    // Skinning (slice 1). `skinned` is set when the glTF has a skin; then
+    // `joints`/`weights` are 1:1 with `vertices` (vertex order) and `skel` is the
+    // joint hierarchy. Empty / false for non-skinned meshes.
+    skinned: bool = false,
+    joints: []const [4]u8 = &.{}, // per-vertex joint indices (into skel)
+    weights: []const [4]u8 = &.{}, // per-vertex weights, u8 (sum 255)
+    skel: []const vmesh.Joint = &.{}, // joint list: parent + inverse_bind + bind_local
 
     pub fn deinit(self: *Model) void {
         self.arena.deinit();
@@ -174,6 +181,25 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                 .array => |a| break :blk a.items,
                 else => return error.Malformed,
             }
+        }
+        break :blk &[_]std.json.Value{};
+    };
+
+    // skins[] (skinning slice 1): when present, the mesh is skinned and we read
+    // JOINTS_0/WEIGHTS_0 per primitive + build the joint hierarchy from skins[0].
+    const skins_arr = blk: {
+        if (root.get("skins")) |sv| {
+            switch (sv) {
+                .array => |a| break :blk a.items,
+                else => return error.Malformed,
+            }
+        }
+        break :blk &[_]std.json.Value{};
+    };
+    const model_skinned = skins_arr.len > 0;
+    const nodes_arr: []const std.json.Value = blk: {
+        if (root.get("nodes")) |nv| {
+            if (nv == .array) break :blk nv.array.items;
         }
         break :blk &[_]std.json.Value{};
     };
@@ -334,6 +360,9 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
     var idx_list: std.ArrayList(u16) = .empty;
     var sub_list: std.ArrayList(vmesh.Submesh) = .empty;
     var name_list: std.ArrayList([]const u8) = .empty;
+    // Per-vertex skin data (skinning slice 1), 1:1 with `vert_list` vertices.
+    var jnt_list: std.ArrayList([4]u8) = .empty;
+    var wgt_list: std.ArrayList([4]u8) = .empty;
 
     for (meshes, 0..) |mesh_val, mesh_i| {
         const mesh_obj = switch (mesh_val) {
@@ -483,6 +512,43 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                 // uv
                 vert_list.appendAssumeCapacity(uv_f32[vi * 2 + 0]);
                 vert_list.appendAssumeCapacity(uv_f32[vi * 2 + 1]);
+            }
+
+            // ── Skin attributes (JOINTS_0 / WEIGHTS_0) ────────────────────────
+            // When the model is skinned, append one [4]u8 joint-index + one
+            // [4]u8 weight (sum 255) per vertex, in the same order as the verts
+            // appended above. A skinned primitive missing them gets a default
+            // (joint 0, weight {255,0,0,0}) so the arrays stay 1:1 with vertices.
+            if (model_skinned) {
+                try jnt_list.ensureUnusedCapacity(aa, vert_count);
+                try wgt_list.ensureUnusedCapacity(aa, vert_count);
+                const jnt_idx_opt: ?usize = if (attrs.get("JOINTS_0")) |v|
+                    @intCast(jsonInt(v) orelse return error.Malformed)
+                else
+                    null;
+                const wgt_idx_opt: ?usize = if (attrs.get("WEIGHTS_0")) |v|
+                    @intCast(jsonInt(v) orelse return error.Malformed)
+                else
+                    null;
+                if (jnt_idx_opt != null and wgt_idx_opt != null) {
+                    const jnt_u8 = try readAccessorJointsU8(accessors, buffer_views, bin, jnt_idx_opt.?, aa);
+                    const wgt_f32 = try readAccessorVec4F32(accessors, buffer_views, bin, wgt_idx_opt.?, aa);
+                    if (jnt_u8.len != vert_count or wgt_f32.len != vert_count * 4) return error.Malformed;
+                    for (0..vert_count) |vi| {
+                        jnt_list.appendAssumeCapacity(jnt_u8[vi]);
+                        wgt_list.appendAssumeCapacity(quantizeWeights(.{
+                            wgt_f32[vi * 4 + 0],
+                            wgt_f32[vi * 4 + 1],
+                            wgt_f32[vi * 4 + 2],
+                            wgt_f32[vi * 4 + 3],
+                        }));
+                    }
+                } else {
+                    for (0..vert_count) |_| {
+                        jnt_list.appendAssumeCapacity(.{ 0, 0, 0, 0 });
+                        wgt_list.appendAssumeCapacity(.{ 255, 0, 0, 0 });
+                    }
+                }
             }
 
             // Submesh index_byte_off is byte offset into the index buffer
@@ -635,6 +701,77 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         }
     }
 
+    // ── 7c. Skeleton (skins[0]) ────────────────────────────────────────────────
+    // joint list = skins[0].joints (node indices); per joint: bind_local from the
+    // node's TRS, inverse_bind from the inverseBindMatrices accessor, parent =
+    // joint-list index of the node's parent in the hierarchy (-1 if not a joint).
+    var skel_slice: []const vmesh.Joint = &.{};
+    if (model_skinned) {
+        const skin0 = switch (skins_arr[0]) {
+            .object => |o| o,
+            else => return error.Malformed,
+        };
+        const joints_val = skin0.get("joints") orelse return error.Malformed;
+        const joint_nodes = switch (joints_val) {
+            .array => |a| a.items,
+            else => return error.Malformed,
+        };
+        const jc = joint_nodes.len;
+        if (jc == 0) return error.Malformed;
+
+        const ibm_acc_val = skin0.get("inverseBindMatrices") orelse return error.Malformed;
+        const ibm_acc: usize = @intCast(jsonInt(ibm_acc_val) orelse return error.Malformed);
+        const ibm = try readAccessorF32(accessors, buffer_views, bin, ibm_acc, aa);
+        if (ibm.len != jc * 16) return error.Malformed;
+
+        // node index → parent node index (walk every node's children once).
+        const parent_of = try aa.alloc(i32, nodes_arr.len);
+        @memset(parent_of, -1);
+        for (nodes_arr, 0..) |nv, ni| {
+            const no = switch (nv) {
+                .object => |o| o,
+                else => continue,
+            };
+            if (no.get("children")) |cv| {
+                if (cv == .array) {
+                    for (cv.array.items) |c| {
+                        if (jsonInt(c)) |ci| {
+                            if (std.math.cast(usize, ci)) |cu| {
+                                if (cu < parent_of.len) parent_of[cu] = @intCast(ni);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const skel_buf = try aa.alloc(vmesh.Joint, jc);
+        for (joint_nodes, 0..) |jn_val, k| {
+            const node_idx: usize = @intCast(jsonInt(jn_val) orelse return error.Malformed);
+            if (node_idx >= nodes_arr.len) return error.Malformed;
+            const node_obj = switch (nodes_arr[node_idx]) {
+                .object => |o| o,
+                else => return error.Malformed,
+            };
+            const local = nodeLocalMatrix(node_obj);
+            // parent joint = index in joint_nodes whose node == this node's parent.
+            var parent_joint: i32 = -1;
+            const pn = parent_of[node_idx];
+            if (pn >= 0) {
+                for (joint_nodes, 0..) |jn2, k2| {
+                    if ((jsonInt(jn2) orelse continue) == pn) {
+                        parent_joint = @intCast(k2);
+                        break;
+                    }
+                }
+            }
+            var inv: [16]f32 = undefined;
+            @memcpy(&inv, ibm[k * 16 ..][0..16]);
+            skel_buf[k] = .{ .parent = parent_joint, .inverse_bind = inv, .bind_local = local.m };
+        }
+        skel_slice = skel_buf;
+    }
+
     // ── 8. Package Model ───────────────────────────────────────────────────────
     return Model{
         .arena = arena,
@@ -644,6 +781,10 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         .textures = tex_list.items,
         .names = name_list.items,
         .external_textures = try ext_list.toOwnedSlice(aa),
+        .skinned = model_skinned,
+        .joints = if (model_skinned) jnt_list.items else &.{},
+        .weights = if (model_skinned) wgt_list.items else &.{},
+        .skel = skel_slice,
     };
 }
 
@@ -882,6 +1023,79 @@ fn readAccessorVec4F32(
     };
     if (!std.mem.eql(u8, type_str, "VEC4")) return error.Unsupported;
     return readAccessorF32(accessors, buffer_views, bin, acc_idx, aa);
+}
+
+/// Read a JOINTS_0 accessor (VEC4 of u8 5121 or u16 5123) → per-vertex [4]u8.
+/// u16 indices are clamped to u8 (joint lists in slice 1 are ≤64, well within u8).
+fn readAccessorJointsU8(
+    accessors: []const std.json.Value,
+    buffer_views: []const std.json.Value,
+    bin: []const u8,
+    acc_idx: usize,
+    aa: std.mem.Allocator,
+) ![]const [4]u8 {
+    if (acc_idx >= accessors.len) return error.Malformed;
+    const acc_obj = switch (accessors[acc_idx]) {
+        .object => |o| o,
+        else => return error.Malformed,
+    };
+    const ct = jsonInt(acc_obj.get("componentType") orelse return error.Malformed) orelse return error.Malformed;
+    const count: usize = @intCast(jsonInt(acc_obj.get("count") orelse return error.Malformed) orelse return error.Malformed);
+    const type_str = switch (acc_obj.get("type") orelse return error.Malformed) {
+        .string => |s| s,
+        else => return error.Malformed,
+    };
+    if (!std.mem.eql(u8, type_str, "VEC4")) return error.Unsupported;
+
+    const bv_idx: usize = @intCast(jsonInt(acc_obj.get("bufferView") orelse return error.Malformed) orelse return error.Malformed);
+    const byte_off_in_acc: usize = if (acc_obj.get("byteOffset")) |bov|
+        @intCast(jsonInt(bov) orelse return error.Malformed)
+    else
+        0;
+    const bv_slice = try getBufferViewSlice(buffer_views, bv_idx, bin);
+
+    const comp_size: usize = switch (ct) {
+        5121 => 1, // u8
+        5123 => 2, // u16
+        else => return error.Unsupported,
+    };
+    const total = count * 4 * comp_size;
+    if (byte_off_in_acc > bv_slice.len or total > bv_slice.len - byte_off_in_acc) return error.Malformed;
+    const raw = bv_slice[byte_off_in_acc .. byte_off_in_acc + total];
+
+    const result = try aa.alloc([4]u8, count);
+    for (0..count) |i| {
+        inline for (0..4) |c| {
+            const v: u16 = if (comp_size == 1)
+                raw[i * 4 + c]
+            else
+                std.mem.readInt(u16, raw[(i * 4 + c) * 2 ..][0..2], .little);
+            result[i][c] = std.math.cast(u8, v) orelse 255;
+        }
+    }
+    return result;
+}
+
+/// Quantize a 4-weight vector (f32, ≈ sum 1) to u8 with an exact sum of 255.
+/// Rounds each to 0..255, then folds the rounding residual into the largest
+/// component so the four bytes always sum to 255 (matches the shader's /255).
+fn quantizeWeights(w: [4]f32) [4]u8 {
+    var q: [4]u16 = undefined;
+    var sum: i32 = 0;
+    for (0..4) |i| {
+        const c: f32 = @max(0.0, w[i]);
+        const r: u16 = @intFromFloat(@round(c * 255.0));
+        q[i] = @min(r, 255);
+        sum += q[i];
+    }
+    // Fold residual (255 − sum) into the largest component.
+    var max_i: usize = 0;
+    for (1..4) |i| if (q[i] > q[max_i]) {
+        max_i = i;
+    };
+    const adj: i32 = @as(i32, q[max_i]) + (255 - sum);
+    q[max_i] = @intCast(std.math.clamp(adj, 0, 255));
+    return .{ @intCast(q[0]), @intCast(q[1]), @intCast(q[2]), @intCast(q[3]) };
 }
 
 /// Read a glTF accessor as a slice of u16 (alloc-owned via aa).
@@ -1262,6 +1476,34 @@ test "node transform: rotation baked into positions and normals" {
     try testing.expectApproxEqAbs(@as(f32, 1), model.vertices[3], 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 0), model.vertices[4], 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 0), model.vertices[5], 1e-4);
+}
+
+test "parse skinnedBarGlb: skinned, joints/weights 1:1, 3-joint chain" {
+    const glb = try @import("fixture.zig").skinnedBarGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try parseGlb(testing.allocator, glb);
+    defer model.deinit();
+
+    try testing.expect(model.skinned);
+    const vert_count = model.vertices.len / 12;
+    try testing.expectEqual(@as(usize, 40), vert_count);
+    try testing.expectEqual(vert_count, model.joints.len);
+    try testing.expectEqual(vert_count, model.weights.len);
+    // 3-joint chain: root parent -1, mid parent 0, top parent 1.
+    try testing.expectEqual(@as(usize, 3), model.skel.len);
+    try testing.expectEqual(@as(i32, -1), model.skel[0].parent);
+    try testing.expectEqual(@as(i32, 0), model.skel[1].parent);
+    try testing.expectEqual(@as(i32, 1), model.skel[2].parent);
+    // mid joint inverse-bind translates by −1.5 in Y (column-major element 13).
+    try testing.expectApproxEqAbs(@as(f32, -1.5), model.skel[1].inverse_bind[13], 1e-5);
+    // mid joint bind_local translates by +1.5 in Y.
+    try testing.expectApproxEqAbs(@as(f32, 1.5), model.skel[1].bind_local[13], 1e-5);
+    // every vertex's weights sum to exactly 255, and joint indices are < 3.
+    for (model.weights, model.joints) |w, j| {
+        const sum: u32 = @as(u32, w[0]) + w[1] + w[2] + w[3];
+        try testing.expectEqual(@as(u32, 255), sum);
+        for (j) |ji| try testing.expect(ji < 3);
+    }
 }
 
 // ── test-only minimal glb builders ──────────────────────────────────────────────
