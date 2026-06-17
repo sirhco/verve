@@ -214,10 +214,12 @@ pub fn build(b: *std.Build) void {
         exe.entry = .disabled;
         exe.rdynamic = true;
         exe.import_table = true;
+        // Chunks SHARE the main client's imported linear memory; they must NOT
+        // redeclare memory limits (initial/max) — doing so makes the chunk's
+        // memory import carry no maximum and instantiation fails with a LinkError.
+        // Match the framework island-chunk build (import_memory + small stack only).
         exe.import_memory = true;
-        exe.initial_memory = 1024 * 1024;
-        exe.max_memory = 64 * 1024 * 1024;
-        exe.stack_size = 64 * 1024;
+        exe.stack_size = 4 * 1024;
 
         const out_name = b.fmt("island_{s}.wasm", .{name});
         _ = wf.addCopyFile(exe.getEmittedBin(), out_name);
