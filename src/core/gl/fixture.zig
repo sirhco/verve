@@ -1645,3 +1645,298 @@ test "studioHdr round-trips: sun texel > 10x zenith texel" {
     }
     try testing.expect(max_lum > zen_lum * 10.0);
 }
+
+// ── wind-farm fixture ──────────────────────────────────────────────────────────
+
+/// Procedural wind-farm scene for the mission-control demo.
+/// Geometry: one ground plane mesh ("ground") + 4 turbine tower meshes
+/// ("turbine0".."turbine3") spread 8 units apart along X. Each turbine has a
+/// child scene-graph node ("rotor0".."rotor3") with no mesh, positioned at the
+/// nacelle height (y=3.2) — an anim `node:rotorN.rotationZ` tween spins the
+/// rotor in the demo's island.
+///
+/// Non-skinned PBR (pos/nrm/uv, no TANGENT — gltf parser generates them).
+/// One flat metallic-gray material (baseColorFactor, no textures).
+/// Single-buffer GLB; BIN padded to 4 bytes.
+pub fn windFarmGlb(alloc: Allocator) ![]u8 {
+    // ── geometry constants ─────────────────────────────────────────────────────
+    // Ground quad: 4 verts, 6 indices
+    const g_vc: u32 = 4;
+    const g_ic: u32 = 6;
+    // Tower box per turbine: 6 faces × 4 verts = 24 verts, 36 indices
+    const t_vc: u32 = 24;
+    const t_ic: u32 = 36;
+    const turbine_count: u32 = 4;
+
+    // Per-mesh BIN sizes (bytes)
+    const g_pos_len: u32 = g_vc * 12; // VEC3 f32
+    const g_nrm_len: u32 = g_vc * 12;
+    const g_uv_len: u32 = g_vc * 8; // VEC2 f32
+    const g_idx_len: u32 = g_ic * 2; // u16
+
+    const t_pos_len: u32 = t_vc * 12;
+    const t_nrm_len: u32 = t_vc * 12;
+    const t_uv_len: u32 = t_vc * 8;
+    const t_idx_len: u32 = t_ic * 2;
+
+    // ── BIN layout: ground then turbine0..3 ──────────────────────────────────
+    const g_pos_off: u32 = 0;
+    const g_nrm_off: u32 = g_pos_off + g_pos_len;
+    const g_uv_off: u32 = g_nrm_off + g_nrm_len;
+    const g_idx_off: u32 = g_uv_off + g_uv_len;
+
+    var t_pos_off: [turbine_count]u32 = undefined;
+    var t_nrm_off: [turbine_count]u32 = undefined;
+    var t_uv_off: [turbine_count]u32 = undefined;
+    var t_idx_off: [turbine_count]u32 = undefined;
+    {
+        var cur: u32 = (g_idx_off + g_idx_len + 3) & ~@as(u32, 3);
+        for (0..turbine_count) |i| {
+            t_pos_off[i] = cur;
+            cur += t_pos_len;
+            t_nrm_off[i] = cur;
+            cur += t_nrm_len;
+            t_uv_off[i] = cur;
+            cur += t_uv_len;
+            t_idx_off[i] = cur;
+            cur += t_idx_len;
+            cur = (cur + 3) & ~@as(u32, 3);
+        }
+    }
+    const bin_total: u32 = t_idx_off[turbine_count - 1] + t_idx_len;
+    const bin_padded = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // ── write ground geometry ─────────────────────────────────────────────────
+    {
+        const gpos = [g_vc][3]f32{
+            .{ -10, 0, -10 }, .{ 10, 0, -10 }, .{ 10, 0, 10 }, .{ -10, 0, 10 },
+        };
+        var po: usize = g_pos_off;
+        for (gpos) |v| {
+            std.mem.writeInt(u32, bin[po..][0..4], @bitCast(v[0]), .little);
+            std.mem.writeInt(u32, bin[po + 4 ..][0..4], @bitCast(v[1]), .little);
+            std.mem.writeInt(u32, bin[po + 8 ..][0..4], @bitCast(v[2]), .little);
+            po += 12;
+        }
+        var no: usize = g_nrm_off;
+        const gn = [3]f32{ 0, 1, 0 };
+        for (0..g_vc) |_| {
+            std.mem.writeInt(u32, bin[no..][0..4], @bitCast(gn[0]), .little);
+            std.mem.writeInt(u32, bin[no + 4 ..][0..4], @bitCast(gn[1]), .little);
+            std.mem.writeInt(u32, bin[no + 8 ..][0..4], @bitCast(gn[2]), .little);
+            no += 12;
+        }
+        const guv = [g_vc][2]f32{ .{ 0, 0 }, .{ 4, 0 }, .{ 4, 4 }, .{ 0, 4 } };
+        var uo: usize = g_uv_off;
+        for (guv) |uv| {
+            std.mem.writeInt(u32, bin[uo..][0..4], @bitCast(uv[0]), .little);
+            std.mem.writeInt(u32, bin[uo + 4 ..][0..4], @bitCast(uv[1]), .little);
+            uo += 8;
+        }
+        var io: usize = g_idx_off;
+        for ([6]u16{ 0, 2, 1, 0, 3, 2 }) |v| {
+            std.mem.writeInt(u16, bin[io..][0..2], v, .little);
+            io += 2;
+        }
+    }
+
+    // ── write turbine tower geometry (same box shape, one per turbine) ────────
+    // Tower box: from (-0.3, 0, -0.3) to (0.3, 3.0, 0.3).
+    // 6 faces, each 4 verts. CCW winding viewed from outside (+normal dir).
+    const TFace = struct { nx: f32, ny: f32, nz: f32, v: [4][3]f32 };
+    const h: f32 = 0.3; // half-width
+    const top: f32 = 3.0;
+    const tower_faces = [6]TFace{
+        .{ .nx = 1, .ny = 0, .nz = 0, .v = .{ .{ h, 0, h }, .{ h, top, h }, .{ h, top, -h }, .{ h, 0, -h } } }, // +X
+        .{ .nx = -1, .ny = 0, .nz = 0, .v = .{ .{ -h, 0, -h }, .{ -h, top, -h }, .{ -h, top, h }, .{ -h, 0, h } } }, // -X
+        .{ .nx = 0, .ny = 1, .nz = 0, .v = .{ .{ -h, top, -h }, .{ h, top, -h }, .{ h, top, h }, .{ -h, top, h } } }, // +Y (top cap)
+        .{ .nx = 0, .ny = -1, .nz = 0, .v = .{ .{ -h, 0, h }, .{ h, 0, h }, .{ h, 0, -h }, .{ -h, 0, -h } } }, // -Y (bottom cap)
+        .{ .nx = 0, .ny = 0, .nz = 1, .v = .{ .{ -h, 0, h }, .{ -h, top, h }, .{ h, top, h }, .{ h, 0, h } } }, // +Z
+        .{ .nx = 0, .ny = 0, .nz = -1, .v = .{ .{ h, 0, -h }, .{ h, top, -h }, .{ -h, top, -h }, .{ -h, 0, -h } } }, // -Z
+    };
+    // Box face uvs (same for all faces)
+    const tuv = [4][2]f32{ .{ 0, 0 }, .{ 0, 1 }, .{ 1, 1 }, .{ 1, 0 } };
+
+    // x-positions for 4 turbines spread along X
+    const turbine_x = [turbine_count]f32{ -12, -4, 4, 12 };
+
+    for (0..turbine_count) |ti| {
+        const tx = turbine_x[ti];
+        var po: usize = t_pos_off[ti];
+        var no: usize = t_nrm_off[ti];
+        var uo: usize = t_uv_off[ti];
+        for (tower_faces) |face| {
+            for (face.v) |v| {
+                std.mem.writeInt(u32, bin[po..][0..4], @bitCast(v[0] + tx), .little);
+                std.mem.writeInt(u32, bin[po + 4 ..][0..4], @bitCast(v[1]), .little);
+                std.mem.writeInt(u32, bin[po + 8 ..][0..4], @bitCast(v[2]), .little);
+                po += 12;
+            }
+            for (0..4) |_| {
+                std.mem.writeInt(u32, bin[no..][0..4], @bitCast(face.nx), .little);
+                std.mem.writeInt(u32, bin[no + 4 ..][0..4], @bitCast(face.ny), .little);
+                std.mem.writeInt(u32, bin[no + 8 ..][0..4], @bitCast(face.nz), .little);
+                no += 12;
+            }
+            for (tuv) |uv| {
+                std.mem.writeInt(u32, bin[uo..][0..4], @bitCast(uv[0]), .little);
+                std.mem.writeInt(u32, bin[uo + 4 ..][0..4], @bitCast(uv[1]), .little);
+                uo += 8;
+            }
+        }
+        var io: usize = t_idx_off[ti];
+        for (0..6) |fi| {
+            const base: u16 = @intCast(fi * 4);
+            for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |o| {
+                std.mem.writeInt(u16, bin[io..][0..2], base + o, .little);
+                io += 2;
+            }
+        }
+    }
+
+    // ── JSON chunk ─────────────────────────────────────────────────────────────
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    try w.writeAll("{\"asset\":{\"version\":\"2.0\"},\"scene\":0,");
+    // scene: root nodes = ground (0) + 4 turbine roots (1..4)
+    try w.writeAll("\"scenes\":[{\"nodes\":[0,1,2,3,4]}],");
+
+    // nodes: ground(0), turbine0..3(1..4) with children rotor0..3(5..8)
+    try w.writeAll("\"nodes\":[");
+    try w.writeAll("{\"mesh\":0,\"name\":\"ground\"},");
+    for (0..turbine_count) |ti| {
+        const ri: u32 = @intCast(5 + ti);
+        const tx = turbine_x[ti];
+        try w.print("{{\"mesh\":{d},\"name\":\"turbine{d}\",\"translation\":[{d:.1},0.0,0.0],\"children\":[{d}]}},", .{ ti + 1, ti, tx, ri });
+    }
+    // rotor nodes (mesh-less hierarchy nodes for anim target)
+    for (0..turbine_count) |ti| {
+        if (ti < turbine_count - 1) {
+            try w.print("{{\"name\":\"rotor{d}\",\"translation\":[0.0,3.2,0.0]}},", .{ti});
+        } else {
+            try w.print("{{\"name\":\"rotor{d}\",\"translation\":[0.0,3.2,0.0]}}", .{ti});
+        }
+    }
+    try w.writeAll("],");
+
+    // meshes: ground + turbine0..3 (each one primitive, no TANGENT → parser generates)
+    try w.writeAll("\"meshes\":[");
+    try w.writeAll("{\"name\":\"ground\",\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]},");
+    for (0..turbine_count) |ti| {
+        const acc_base: u32 = @intCast(4 + ti * 4);
+        if (ti < turbine_count - 1) {
+            try w.print("{{\"name\":\"turbine{d}\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}},", .{ ti, acc_base, acc_base + 1, acc_base + 2, acc_base + 3 });
+        } else {
+            try w.print("{{\"name\":\"turbine{d}\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}}", .{ ti, acc_base, acc_base + 1, acc_base + 2, acc_base + 3 });
+        }
+    }
+    try w.writeAll("],");
+
+    // accessors: ground(0..3) + turbine0..3(4..19)
+    try w.writeAll("\"accessors\":[");
+    // ground accessors
+    try w.print("{{\"bufferView\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{g_vc});
+    try w.print("{{\"bufferView\":1,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{g_vc});
+    try w.print("{{\"bufferView\":2,\"componentType\":5126,\"count\":{d},\"type\":\"VEC2\"}},", .{g_vc});
+    try w.print("{{\"bufferView\":3,\"componentType\":5123,\"count\":{d},\"type\":\"SCALAR\"}}", .{g_ic});
+    // turbine accessors
+    for (0..turbine_count) |ti| {
+        const bv_base: u32 = @intCast(4 + ti * 4);
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}}", .{ bv_base, t_vc });
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}}", .{ bv_base + 1, t_vc });
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC2\"}}", .{ bv_base + 2, t_vc });
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5123,\"count\":{d},\"type\":\"SCALAR\"}}", .{ bv_base + 3, t_ic });
+    }
+    try w.writeAll("],");
+
+    // bufferViews: ground(0..3) + turbine0..3(4..19)
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ g_pos_off, g_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ g_nrm_off, g_nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ g_uv_off, g_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}}", .{ g_idx_off, g_idx_len });
+    for (0..turbine_count) |ti| {
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ t_pos_off[ti], t_pos_len });
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ t_nrm_off[ti], t_nrm_len });
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ t_uv_off[ti], t_uv_len });
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}}", .{ t_idx_off[ti], t_idx_len });
+    }
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+
+    // One flat PBR material (no textures — parser white-bakes missing tex_base).
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.85,0.88,0.90,1.0],\"metallicFactor\":0.1,\"roughnessFactor\":0.7}}]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── assemble GLB ───────────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42;
+    glb[goff + 1] = 0x49;
+    glb[goff + 2] = 0x4E;
+    glb[goff + 3] = 0x00;
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+    return glb;
+}
+
+// ── windFarmGlb fixture tests ──────────────────────────────────────────────────
+
+test "windFarmGlb: 4 named turbine submeshes + 4 rotor nodes, parses" {
+    const glb = try windFarmGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    // GLB container invariants
+    try testing.expectEqualSlices(u8, "glTF", glb[0..4]);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, glb[4..8], .little));
+    try testing.expectEqual(@as(u32, @intCast(glb.len)), std.mem.readInt(u32, glb[8..12], .little));
+    // parse via gltf.zig — 4 turbine submeshes in model.names
+    const gltf = @import("gltf.zig");
+    var model = try gltf.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    // model.names has 5 entries (ground + turbine0..3); 4 start with "turbine"
+    var turbines: usize = 0;
+    for (model.names) |n| {
+        if (std.mem.startsWith(u8, n, "turbine")) turbines += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), turbines);
+    // rotor nodes: not in Model (parser flattens scene graph), assert via raw JSON
+    // Note: Model has no .nodes field; rotor nodes are mesh-less hierarchy nodes.
+    const json_len = std.mem.readInt(u32, glb[12..16], .little);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len], .{});
+    defer parsed.deinit();
+    const nodes = parsed.value.object.get("nodes").?.array.items;
+    var rotors: usize = 0;
+    for (nodes) |n| {
+        const name_val = n.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+        if (std.mem.startsWith(u8, name_val.string, "rotor")) rotors += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), rotors);
+}
