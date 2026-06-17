@@ -3,7 +3,16 @@
 //!
 //! Scene graph: root "model" (node 0) → submesh nodes (node s+1, all children
 //! of root). Submesh ordering: ground=0, turbine0..3=1..4, rotor0..3=5..8.
-//! `node_rot[5..8][2]` (rotationZ) spins all 4 rotors.
+//!
+//! Rotor spin: the gltf parser BAKES each node's world transform into vertex
+//! positions. Rotor blade vertices are authored hub-local (hub at origin), but
+//! after baking the world matrix T(tx,0,0)·T(0,6,0.3) their positions are
+//! stored at world offset (tx, 6, 0.3). A plain scene-node rotation would
+//! rotate those pre-offset vertices about the world origin (wrong — they'd
+//! orbit). Instead, each rotor's model matrix is built as:
+//!   T(hub) · Rz(theta) · T(-hub)
+//! which translates the baked vertices back to the local origin, rotates, then
+//! returns them to the hub — so blades spin in place at their tower top.
 
 const verve = @import("verve");
 const gl = verve.gl;
@@ -20,6 +29,16 @@ const zoom_sens: f32 = 0.005;
 const fov_y: f32 = 1.0;
 const spin_rate: f32 = 1.2; // rotor0 rotationZ rad/s
 const vmesh_url = "/gl/windfarm.vmesh";
+
+// Hub world positions for rotor0..3 (baked by the gltf parser into blade verts).
+// turbine X positions: -12, -4, +4, +12; nacelle Y=6.0, Z=0.3.
+// Used to build T(hub)·Rz·T(-hub) pivot matrices (see file-level comment).
+const rotor_hub = [4]gl.math.Vec3{
+    gl.math.Vec3.init(-12, 6.0, 0.3),
+    gl.math.Vec3.init(-4, 6.0, 0.3),
+    gl.math.Vec3.init(4, 6.0, 0.3),
+    gl.math.Vec3.init(12, 6.0, 0.3),
+};
 const frame_export = "farmscene_frame";
 const vmesh_ready_export = "farmscene_vmesh_ready";
 
@@ -227,11 +246,30 @@ export fn farmscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         enc.setLights(1, @intCast(@intFromPtr(&light)));
 
         const pv = proj.mul(view);
+        const one3 = gl.math.Vec3.init(1, 1, 1);
+        const zero3 = gl.math.Vec3.init(0, 0, 0);
         var s: u32 = 0;
         while (s < a.submesh_count) : (s += 1) {
             if (s >= max_submesh) break;
             const sub = a.submesh(s);
-            const world_s = if (scene_built) scene.world[s + 1] else gl.math.Mat4.identity;
+            // Rotor submeshes are indices 4..7 (rotor0..3). Their blade vertices
+            // were baked by the gltf parser to world positions (tx, 6, 0.3) + hub-local
+            // offset. A plain scene rotation would spin them about the world origin.
+            // Build T(hub)·Rz(theta)·T(-hub) so rotation pivots at the hub.
+            const world_s: gl.math.Mat4 = blk: {
+                if (scene_built and s >= 4 and s <= 7) {
+                    const ri = s - 4; // rotor index 0..3
+                    const hub = rotor_hub[ri];
+                    const neg_hub = gl.math.Vec3.init(-hub.x, -hub.y, -hub.z);
+                    const theta = elapsed_s * spin_rate;
+                    const qz = gl.math.Quat.fromAxisAngle(z_axis, theta);
+                    const t_hub = gl.math.Mat4.fromTrs(hub, gl.math.Quat.identity, one3);
+                    const r_mat = gl.math.Mat4.fromTrs(zero3, qz, one3);
+                    const t_neg = gl.math.Mat4.fromTrs(neg_hub, gl.math.Quat.identity, one3);
+                    break :blk t_hub.mul(r_mat).mul(t_neg);
+                }
+                break :blk if (scene_built) scene.world[s + 1] else gl.math.Mat4.identity;
+            };
             model_mats[s] = world_s.m;
             normal9s[s] = gl.math.normalMatrix(world_s);
             mvps[s] = pv.mul(world_s).m;
