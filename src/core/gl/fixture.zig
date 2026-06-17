@@ -1649,12 +1649,18 @@ test "studioHdr round-trips: sun texel > 10x zenith texel" {
 // ── wind-farm fixture ──────────────────────────────────────────────────────────
 
 /// Procedural wind-farm scene for the mission-control demo.
+/// Coordinate scheme: tower vertices are in LOCAL space (centered at x=0, z=0).
+/// Each turbineN glTF node carries the world x translation (-12/-4/+4/+12).
+/// The rotorN child node is placed at local (0, 6.0, 0.3) — tower top + z=0.3.
+/// Blade vertices are hub-local (hub at local origin), never pre-offset to world.
+///
 /// Geometry: one ground plane mesh ("ground") + 4 turbine tower meshes
-/// ("turbine0".."turbine3") spread 8 units apart along X. Each turbine has a
-/// child scene-graph node ("rotor0".."rotor3") positioned at the nacelle height
-/// (y=3.2). Each rotor node has its own mesh ("rotor0".."rotor3") of 3 blades
-/// arranged at 120° around the hub axis — an anim `node:rotorN.rotationZ` tween
-/// spins the visible blades in the demo's island.
+/// ("turbine0".."turbine3") at x=-12,-4,+4,+12. Each tower: 0.5 wide, 6.0 tall,
+/// local x∈[-0.25,0.25], y∈[0,6], z∈[-0.25,0.25]. Each turbine has a child
+/// scene-graph node ("rotor0".."rotor3") at local (0,6,0.3) — hub at tower top.
+/// Each rotor node has its own mesh ("rotor0".."rotor3") of 3 blades (2.8 long,
+/// 0.25 wide, 0.1 deep) arranged at 120° around the hub axis, hub-local.
+/// An anim `node:rotorN.rotationZ` tween spins the visible blades in the demo's island.
 ///
 /// Non-skinned PBR (pos/nrm/uv, no TANGENT — gltf parser generates them).
 /// One flat metallic-gray material (baseColorFactor, no textures).
@@ -1777,11 +1783,17 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
     }
 
     // ── write turbine tower geometry (same box shape, one per turbine) ────────
-    // Tower box: from (-0.3, 0, -0.3) to (0.3, 3.0, 0.3).
+    // Coordinate scheme: tower vertices are authored in LOCAL space centered on
+    // the hub axis (x=0, z=0). The turbine glTF node carries the world translation
+    // to x = turbine_x[i]. The rotor child node's translation is then purely
+    // local-relative: (0, tower_top_y, 0.3) lands the hub at world (tx, tower_top_y, 0.3).
+    // IMPORTANT: do NOT add tx to vertex x — the node translation handles that.
+    //
+    // Tower box: from (-0.25, 0, -0.25) to (0.25, 6.0, 0.25), centered at x=0, z=0.
     // 6 faces, each 4 verts. CCW winding viewed from outside (+normal dir).
     const TFace = struct { nx: f32, ny: f32, nz: f32, v: [4][3]f32 };
-    const h: f32 = 0.3; // half-width
-    const top: f32 = 3.0;
+    const h: f32 = 0.25; // tower half-width (total 0.5 per spec)
+    const top: f32 = 6.0; // tower height
     const tower_faces = [6]TFace{
         .{ .nx = 1, .ny = 0, .nz = 0, .v = .{ .{ h, 0, h }, .{ h, top, h }, .{ h, top, -h }, .{ h, 0, -h } } }, // +X
         .{ .nx = -1, .ny = 0, .nz = 0, .v = .{ .{ -h, 0, -h }, .{ -h, top, -h }, .{ -h, top, h }, .{ -h, 0, h } } }, // -X
@@ -1797,13 +1809,13 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
     const turbine_x = [turbine_count]f32{ -12, -4, 4, 12 };
 
     for (0..turbine_count) |ti| {
-        const tx = turbine_x[ti];
         var po: usize = t_pos_off[ti];
         var no: usize = t_nrm_off[ti];
         var uo: usize = t_uv_off[ti];
         for (tower_faces) |face| {
             for (face.v) |v| {
-                std.mem.writeInt(u32, bin[po..][0..4], @bitCast(v[0] + tx), .little);
+                // Vertices in local space (no tx offset — node translation handles x placement)
+                std.mem.writeInt(u32, bin[po..][0..4], @bitCast(v[0]), .little);
                 std.mem.writeInt(u32, bin[po + 4 ..][0..4], @bitCast(v[1]), .little);
                 std.mem.writeInt(u32, bin[po + 8 ..][0..4], @bitCast(v[2]), .little);
                 po += 12;
@@ -1832,16 +1844,18 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
 
     // ── write rotor blade geometry (4 distinct meshes, identical geometry) ───────
     // 3 blades at 0°, 120°, 240° in local XY plane (rotor spins about Z).
-    // Each blade: a box 3.0 units long (radial), 0.15 wide (tangential), 0.05 deep (Z).
-    // Blade local space: extends from x=0.15 to x=3.15 so the hub centre clears.
-    // Rotated by angle about Z: x' = x*cos - y*sin, y' = x*sin + y*cos.
+    // Blade local space: hub is at local origin (0,0,0). Each blade (at angle 0)
+    // extends from x=0.15 (hub clearance) to x=2.95 (total ~2.8 long), 0.25 wide in Y,
+    // 0.1 deep in Z. Blade 0 points along +X; blades 1,2 are rotated 120°,240° about Z.
+    // When rotorN node is placed at (0, top_y, 0.3) relative to turbineN, rotating
+    // the node about Z sweeps all blades around the hub — blades never need a world offset.
     // Writing the same blade geometry 4 times (once per turbine) gives each its own
     // mesh so the gltf parser bakes each rotor node's transform independently.
     {
-        const blade_len: f32 = 3.0;
+        const blade_len: f32 = 2.8;
         const blade_start: f32 = 0.15; // clearance from hub centre
-        const bw: f32 = 0.075; // half-width in Y
-        const bd: f32 = 0.025; // half-depth in Z
+        const bw: f32 = 0.125; // half-width in Y (total 0.25)
+        const bd: f32 = 0.05; // half-depth in Z (total 0.1)
 
         const BFace = struct { nx: f32, ny: f32, nz: f32, v: [4][3]f32 };
         const bx0: f32 = blade_start;
@@ -1931,13 +1945,15 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
         const tx = turbine_x[ti];
         try w.print("{{\"mesh\":{d},\"name\":\"turbine{d}\",\"translation\":[{d:.1},0.0,0.0],\"children\":[{d}]}},", .{ ti + 1, ti, tx, ri });
     }
-    // rotor nodes — each references its own mesh so parser bakes its transform
+    // rotor nodes — each references its own mesh so parser bakes its transform.
+    // Translation is relative to the parent turbineN node (which is already at x=tx).
+    // Local (0, 6.0, 0.3) places the hub at world (tx, 6.0, 0.3) — tower top + slight Z.
     for (0..turbine_count) |ti| {
         const rotor_mesh_idx: u32 = @intCast(5 + ti);
         if (ti < turbine_count - 1) {
-            try w.print("{{\"mesh\":{d},\"name\":\"rotor{d}\",\"translation\":[0.0,3.2,0.0]}},", .{ rotor_mesh_idx, ti });
+            try w.print("{{\"mesh\":{d},\"name\":\"rotor{d}\",\"translation\":[0.0,6.0,0.3]}},", .{ rotor_mesh_idx, ti });
         } else {
-            try w.print("{{\"mesh\":{d},\"name\":\"rotor{d}\",\"translation\":[0.0,3.2,0.0]}}", .{ rotor_mesh_idx, ti });
+            try w.print("{{\"mesh\":{d},\"name\":\"rotor{d}\",\"translation\":[0.0,6.0,0.3]}}", .{ rotor_mesh_idx, ti });
         }
     }
     try w.writeAll("],");
