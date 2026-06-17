@@ -881,13 +881,16 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                                     0
                                 else if (std.mem.eql(u8, interp_str, "STEP"))
                                     1
+                                else if (std.mem.eql(u8, interp_str, "CUBICSPLINE"))
+                                    2
                                 else
-                                    return error.Unsupported; // CUBICSPLINE
+                                    return error.Unsupported;
                                 const in_idx: usize = @intCast(jsonInt(samp.get("input") orelse return error.Malformed) orelse return error.Malformed);
                                 const out_idx: usize = @intCast(jsonInt(samp.get("output") orelse return error.Malformed) orelse return error.Malformed);
                                 const times = try readAccessorF32(accessors, buffer_views, bin, in_idx, aa);
                                 const values = try readAccessorF32(accessors, buffer_views, bin, out_idx, aa);
-                                if (values.len != times.len * comps) return error.Malformed;
+                                const vstride: usize = if (interp == 2) 3 else 1;
+                                if (values.len != times.len * comps * vstride) return error.Malformed;
                                 if (times.len > 0 and times[times.len - 1] > clip_dur) clip_dur = times[times.len - 1];
                                 tracks[j * 3 + c] = .{ .interp = interp, .times = times, .values = values };
                             } else {
@@ -1690,6 +1693,174 @@ test "parse skinnedBarGlb: two clips (Bend + Twist) baked" {
     // root (joint 0) translation: single bind keyframe in both clips.
     try testing.expectEqual(@as(usize, 1), model.anim_clips[0].tracks[0 * 3 + 0].times.len);
     try testing.expect(model.anim_clips[0].duration > 0 and model.anim_clips[1].duration > 0);
+}
+
+test "parse CUBICSPLINE animation sampler: interp=2, values.len==2*4*3" {
+    // Build a minimal skinned GLB in-memory:
+    //   1 mesh node (skin 0) + 1 joint node (jroot).
+    //   1 skin with 1 joint, identity inverseBindMatrix.
+    //   1 animation with 1 CUBICSPLINE rotation channel on jroot.
+    //   Input accessor: 2 SCALAR f32 times.
+    //   Output accessor: 2*3=6 VEC4 f32 (inTangent/point/outTangent per key).
+    const alloc = testing.allocator;
+
+    // BIN layout:
+    //  off_pos   = 0          len=12  (1 triangle, 3×VEC3 pos — just 1 vert for simplicity; use 3)
+    //  off_nrm   = 36         len=36
+    //  off_uv    = 72         len=24
+    //  off_jnt   = 96         len=4   (1 vert JOINTS_0 u8 VEC4: 0,0,0,0)  → pad to 4
+    //  off_wgt   = 100        len=16  (1 vert WEIGHTS_0 f32 VEC4: 1,0,0,0) — wait, must match vert_count
+    // Keep it simple: 3 verts matching the triangle.
+    const vert_count: u32 = 3;
+    const index_count: u32 = 3;
+    const joint_count: u32 = 1;
+    const key_count: u32 = 2; // CUBICSPLINE times
+    const comps: u32 = 4; // VEC4 (rotation)
+
+    const off_pos: u32 = 0;
+    const len_pos: u32 = vert_count * 12;
+    const off_nrm: u32 = off_pos + len_pos;
+    const len_nrm: u32 = vert_count * 12;
+    const off_uv: u32 = off_nrm + len_nrm;
+    const len_uv: u32 = vert_count * 8;
+    const off_jnt: u32 = off_uv + len_uv;
+    const len_jnt: u32 = vert_count * 4; // u8 VEC4
+    const off_wgt: u32 = off_jnt + len_jnt;
+    const len_wgt: u32 = vert_count * 16; // f32 VEC4
+    const off_idx: u32 = off_wgt + len_wgt;
+    const len_idx: u32 = index_count * 2;
+    const off_ibm: u32 = (off_idx + len_idx + 3) & ~@as(u32, 3); // MAT4 needs 4-align
+    const len_ibm: u32 = joint_count * 64;
+    const off_atime: u32 = off_ibm + len_ibm;
+    const len_atime: u32 = key_count * 4; // 2 SCALAR f32
+    const off_arot: u32 = off_atime + len_atime;
+    const len_arot: u32 = key_count * 3 * comps * 4; // 2 keys × 3 (in/pt/out) × 4 comps × 4 bytes
+
+    const bin_total: u32 = off_arot + len_arot;
+    const bin_padded: u32 = (bin_total + 3) & ~@as(u32, 3);
+    const bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // positions (3 verts, unit triangle)
+    const pos = [_]f32{ 0, 0, 0, 1, 0, 0, 0, 1, 0 };
+    for (pos, 0..) |f, i| std.mem.writeInt(u32, bin[off_pos + i * 4 ..][0..4], @bitCast(f), .little);
+    // normals (all +Z)
+    const nrm = [_]f32{ 0, 0, 1, 0, 0, 1, 0, 0, 1 };
+    for (nrm, 0..) |f, i| std.mem.writeInt(u32, bin[off_nrm + i * 4 ..][0..4], @bitCast(f), .little);
+    // uvs (zero)
+    // joints: all 0 (u8 VEC4 already zeroed by @memset)
+    // weights: first weight = 1.0 for each vert
+    for (0..vert_count) |v| {
+        const one: f32 = 1.0;
+        std.mem.writeInt(u32, bin[off_wgt + v * 16 ..][0..4], @bitCast(one), .little);
+    }
+    // indices: 0,1,2
+    for (0..index_count) |i| std.mem.writeInt(u16, bin[off_idx + i * 2 ..][0..2], @intCast(i), .little);
+    // inverseBindMatrix: identity (already zero; just set diagonal)
+    const diag = [4]usize{ 0, 5, 10, 15 };
+    for (diag) |d| {
+        const one: f32 = 1.0;
+        std.mem.writeInt(u32, bin[off_ibm + d * 4 ..][0..4], @bitCast(one), .little);
+    }
+    // animation times: 0.0, 1.0
+    const a_times = [key_count]f32{ 0.0, 1.0 };
+    for (a_times, 0..) |t, i| std.mem.writeInt(u32, bin[off_atime + i * 4 ..][0..4], @bitCast(t), .little);
+    // animation output: 2 keys × 3 tangent slots × VEC4 — use identity quat (0,0,0,1) for all
+    for (0..key_count * 3) |slot| {
+        const base = off_arot + @as(u32, @intCast(slot)) * comps * 4;
+        const one: f32 = 1.0;
+        // w component (index 3) = 1.0; x,y,z stay 0
+        std.mem.writeInt(u32, bin[base + 3 * 4 ..][0..4], @bitCast(one), .little);
+    }
+
+    // JSON chunk
+    const json =
+        "{\"asset\":{\"version\":\"2.0\"},\"scene\":0," ++
+        "\"scenes\":[{\"nodes\":[0]}]," ++
+        "\"nodes\":[{\"mesh\":0,\"skin\":0},{\"name\":\"jroot\"}]," ++
+        "\"skins\":[{\"joints\":[1],\"inverseBindMatrices\":6}]," ++
+        "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2,\"JOINTS_0\":3,\"WEIGHTS_0\":4},\"indices\":5,\"material\":0}]}]," ++
+        "\"accessors\":[" ++
+        "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+        "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+        "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}," ++
+        "{\"bufferView\":3,\"componentType\":5121,\"count\":3,\"type\":\"VEC4\"}," ++
+        "{\"bufferView\":4,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"}," ++
+        "{\"bufferView\":5,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}," ++
+        "{\"bufferView\":6,\"componentType\":5126,\"count\":1,\"type\":\"MAT4\"}," ++
+        "{\"bufferView\":7,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"}," ++
+        "{\"bufferView\":8,\"componentType\":5126,\"count\":6,\"type\":\"VEC4\"}" ++
+        "]," ++
+        "\"bufferViews\":[" ++
+        "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36}," ++
+        "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36}," ++
+        "{\"buffer\":0,\"byteOffset\":72,\"byteLength\":24}," ++
+        "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":12}," ++
+        "{\"buffer\":0,\"byteOffset\":108,\"byteLength\":48}," ++
+        "{\"buffer\":0,\"byteOffset\":156,\"byteLength\":6}," ++
+        "{\"buffer\":0,\"byteOffset\":164,\"byteLength\":64}," ++
+        "{\"buffer\":0,\"byteOffset\":228,\"byteLength\":8}," ++
+        "{\"buffer\":0,\"byteOffset\":236,\"byteLength\":96}" ++
+        "]," ++
+        "\"buffers\":[{\"byteLength\":332}]," ++
+        "\"materials\":[{\"pbrMetallicRoughness\":{}}]," ++
+        "\"animations\":[{\"name\":\"CubicTest\"," ++
+        "\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"rotation\"}}]," ++
+        "\"samplers\":[{\"input\":7,\"output\":8,\"interpolation\":\"CUBICSPLINE\"}]}]}";
+
+    // Pad JSON to 4-byte alignment
+    const json_len: u32 = @intCast(json.len);
+    const json_pad: u32 = (4 - (json_len % 4)) % 4;
+    const json_padded = json_len + json_pad;
+
+    const glb_len: u32 = 12 + 8 + json_padded + 8 + bin_padded;
+    const glb = try alloc.alloc(u8, glb_len);
+    defer alloc.free(glb);
+    @memset(glb, 0x20); // pad bytes = space
+
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_padded, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json);
+    goff += json_padded; // already padded with 0x20
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42;
+    glb[goff + 1] = 0x49;
+    glb[goff + 2] = 0x4E;
+    glb[goff + 3] = 0x00;
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    // Verify the JSON byteOffsets actually match the computed bin layout.
+    // off_ibm must be 164 (= (156+6+1)&~3 = 164). Confirm:
+    try testing.expectEqual(@as(u32, 164), off_ibm);
+    // off_atime = 164+64 = 228; off_arot = 228+8 = 236; off_arot+len_arot = 236+96 = 332.
+    try testing.expectEqual(@as(u32, 228), off_atime);
+    try testing.expectEqual(@as(u32, 236), off_arot);
+    try testing.expectEqual(@as(u32, 332), off_arot + len_arot);
+
+    var model = try parseGlb(alloc, glb);
+    defer model.deinit();
+
+    try testing.expect(model.skinned);
+    try testing.expectEqual(@as(usize, 1), model.anim_clips.len);
+    // 1 joint × 3 channels = 3 tracks
+    try testing.expectEqual(@as(usize, 3), model.anim_clips[0].tracks.len);
+    // rotation track = channel 1 (R)
+    const rot_track = model.anim_clips[0].tracks[0 * 3 + 1];
+    try testing.expectEqual(@as(u8, 2), rot_track.interp); // CUBICSPLINE
+    try testing.expectEqual(@as(usize, 2), rot_track.times.len);
+    try testing.expectEqual(@as(usize, 2 * 4 * 3), rot_track.values.len); // 24 floats
 }
 
 // ── test-only minimal glb builders ──────────────────────────────────────────────
