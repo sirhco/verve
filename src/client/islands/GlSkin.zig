@@ -156,7 +156,18 @@ fn lowerKey(a: *const gl.vmesh.Reader, tr: gl.vmesh.TrackInfo, t: f32) u32 {
     return i;
 }
 
+// Cubic Hermite basis weights for the glTF CUBICSPLINE segment (interp==2). `s`∈[0,1] is the
+// normalized segment position, `dt` the segment duration (tangents are scaled by dt per spec):
+//   p = a·v0 + b·outTan0 + c·v1 + d·inTan1
+const Herm = struct { a: f32, b: f32, c: f32, d: f32 };
+fn hermite(s: f32, dt: f32) Herm {
+    const s2 = s * s;
+    const s3 = s2 * s;
+    return .{ .a = 2 * s3 - 3 * s2 + 1, .b = (s3 - 2 * s2 + s) * dt, .c = -2 * s3 + 3 * s2, .d = (s3 - s2) * dt };
+}
+
 /// Sample a vec3 track (translation c=0 / scale c=2) of `clip` at time t.
+/// interp: 0=LINEAR (lerp), 1=STEP (hold), 2=CUBICSPLINE (Hermite via in/out tangents).
 fn sampleVec3(a: *const gl.vmesh.Reader, clip: u32, j: u32, c: u2, t: f32) gl.math.Vec3 {
     const tr = a.animTrack(clip, j, c);
     const k0 = lowerKey(a, tr, t);
@@ -167,10 +178,19 @@ fn sampleVec3(a: *const gl.vmesh.Reader, clip: u32, j: u32, c: u2, t: f32) gl.ma
     const t1 = a.animTime(tr, k1);
     const f = if (t1 > t0) std.math.clamp((t - t0) / (t1 - t0), 0, 1) else 0;
     const v1 = gl.math.Vec3.init(a.animValue(tr, k1, 0), a.animValue(tr, k1, 1), a.animValue(tr, k1, 2));
+    if (tr.interp == 2) {
+        const h = hermite(f, t1 - t0);
+        return gl.math.Vec3.init(
+            h.a * v0.x + h.b * a.animOutTangent(tr, k0, 0) + h.c * v1.x + h.d * a.animInTangent(tr, k1, 0),
+            h.a * v0.y + h.b * a.animOutTangent(tr, k0, 1) + h.c * v1.y + h.d * a.animInTangent(tr, k1, 1),
+            h.a * v0.z + h.b * a.animOutTangent(tr, k0, 2) + h.c * v1.z + h.d * a.animInTangent(tr, k1, 2),
+        );
+    }
     return gl.math.Vec3.init(v0.x + (v1.x - v0.x) * f, v0.y + (v1.y - v0.y) * f, v0.z + (v1.z - v0.z) * f);
 }
 
-/// Sample the rotation track (c=1) of `clip` at time t (slerp, or hold for STEP).
+/// Sample the rotation track (c=1) of `clip` at time t: slerp (LINEAR), hold (STEP), or
+/// componentwise Hermite + normalize (CUBICSPLINE, per the glTF reference approach).
 fn sampleQuat(a: *const gl.vmesh.Reader, clip: u32, j: u32, t: f32) gl.math.Quat {
     const tr = a.animTrack(clip, j, 1);
     const k0 = lowerKey(a, tr, t);
@@ -181,6 +201,16 @@ fn sampleQuat(a: *const gl.vmesh.Reader, clip: u32, j: u32, t: f32) gl.math.Quat
     const t1 = a.animTime(tr, k1);
     const f = if (t1 > t0) std.math.clamp((t - t0) / (t1 - t0), 0, 1) else 0;
     const q1 = gl.math.Quat{ .x = a.animValue(tr, k1, 0), .y = a.animValue(tr, k1, 1), .z = a.animValue(tr, k1, 2), .w = a.animValue(tr, k1, 3) };
+    if (tr.interp == 2) {
+        const h = hermite(f, t1 - t0);
+        const qr = gl.math.Quat{
+            .x = h.a * q0.x + h.b * a.animOutTangent(tr, k0, 0) + h.c * q1.x + h.d * a.animInTangent(tr, k1, 0),
+            .y = h.a * q0.y + h.b * a.animOutTangent(tr, k0, 1) + h.c * q1.y + h.d * a.animInTangent(tr, k1, 1),
+            .z = h.a * q0.z + h.b * a.animOutTangent(tr, k0, 2) + h.c * q1.z + h.d * a.animInTangent(tr, k1, 2),
+            .w = h.a * q0.w + h.b * a.animOutTangent(tr, k0, 3) + h.c * q1.w + h.d * a.animInTangent(tr, k1, 3),
+        };
+        return qr.normalize();
+    }
     return gl.math.Quat.slerp(q0, q1, f);
 }
 
@@ -291,6 +321,10 @@ export fn glskin_clip0() void {
 }
 export fn glskin_clip1() void {
     pending_clip = 1;
+    mix_weight = 0;
+}
+export fn glskin_clip2() void {
+    pending_clip = 2; // CUBICSPLINE "Smooth" clip; updateBones clamps if absent
     mix_weight = 0;
 }
 export fn glskin_pause() void {
