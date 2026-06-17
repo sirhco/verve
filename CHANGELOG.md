@@ -6,6 +6,23 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **WebSocket hub binding** (`src/server/push.zig`, `src/server/main.zig`,
+  `src/bridge/verve.js`, `src/client/islands/WsDemo.zig`,
+  `src/app/{islands,routes,components}.zig`): the push hub's channels are now
+  reachable over WebSocket at `GET /push-ws?channel=` — full-duplex over one
+  socket. The connection subscribes to the channel (server→client) and every
+  frame the client sends is `push.publish`ed back to the channel, fanning out to
+  all subscribers (`push.streamChannelWs` = a per-connection broadcaster thread
+  draining the ring via the same `nextBatch`/`copyMessage` as the SSE path + a
+  read loop re-publishing inbound frames). Two bridge host fns —
+  `verveWsConnect` (inbound frames → an island export, auto-reconnect) and
+  `verveWsSend` (re-publish a message) — plus a `WsDemo` island + `/ws-demo`
+  broadcast demo (type in one tab → appears in every connected tab). Additive:
+  SSE `/push`, the `/ws` chat, and `/__verve/dev_ws` are untouched. Verified
+  two-tab headless (a message in tab A appears in tab B + A).
+
 ## [0.5.15] - 2026-06-17
 
 ### Added

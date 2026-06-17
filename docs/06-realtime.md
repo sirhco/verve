@@ -233,6 +233,33 @@ The flagship consumer is the live graph in
 resync); [`examples/viz-live/`](../examples/viz-live/README.md) is the
 minimal standalone app wiring the whole stack.
 
+### `/push-ws` — WebSocket binding for the hub (full-duplex)
+
+The same push channels are reachable over WebSocket at
+`GET /push-ws?channel=<name>` — **full-duplex over one socket**: the connection
+subscribes to the channel (server→client, live tail) AND every frame the client
+sends is `push.publish`ed back to the channel, fanning out to every subscriber
+(itself included). Server-side it's `push.streamChannelWs` (a per-connection
+broadcaster thread draining the ring via the same `nextBatch`/`copyMessage` the
+SSE path uses, plus a read loop that re-publishes inbound frames) — additive to
+SSE `/push`, the `/ws` chat, and `/__verve/dev_ws`.
+
+Client side, two bridge host fns:
+
+```zig
+// connect: inbound channel frames → an island export
+_ = verve.host("verveWsConnect",
+    "{\"channel\":\"room1\",\"island\":\"MyIsland\",\"export\":\"on_msg\"}", &out);
+// send: re-publish a message to the channel (broadcast to all subscribers)
+_ = verve.host("verveWsSend", "{\"channel\":\"room1\",\"text\":\"hello\"}", &out);
+```
+
+`verveWsConnect` opens `ws://…/push-ws?channel=`, routes each frame to
+`callIslandExport(island, export, data)`, and auto-reconnects (exponential
+backoff, live-tail resume). `verveWsSend` sends only the inner `text` over the
+wire (queued until the socket is open). The `WsDemo` island + `/ws-demo` route
+demo it: type a message in one tab, see it broadcast to every connected tab.
+
 ## Choosing between SSE and WS
 
 | | SSE | WebSocket |
