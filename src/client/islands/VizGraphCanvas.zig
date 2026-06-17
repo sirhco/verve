@@ -9,12 +9,11 @@ const cbuf = verve.viz_core.canvas_buf;
 
 extern "verve_runtime" fn viz_canvas_draw(ref_handle: i32, ptr: [*]const u8, len: u32) void;
 
-const Props = struct {
-    xs: []const f64,
-    ys: []const f64,
-    ef: []const u32,
-    et: []const u32,
-};
+// The graph is synthesized in the chunk (a deterministic ~1500-node jittered
+// grid) rather than delivered via props — the SSR→hydrate scratch buffer (8 KB)
+// can't carry a graph this size, and a perf demo needs no server-authored data.
+const GRAPH_N: u32 = 1500;
+const GRAPH_COLS: u32 = 50;
 
 const MAX_N = 4096;
 const MAX_E = 8192;
@@ -52,32 +51,45 @@ fn clampf(v: f64, lo: f64, hi: f64) f64 {
 // ── hydrate ─────────────────────────────────────────────────────────────────
 
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
+    _ = props_ptr;
+    _ = props_len;
     _ = root_id;
     canvas_handle = verve.queryRef(@as([]const u8, "vizcanvas-canvas"));
     hover = -1;
     select = -1;
     panning = false;
-    n = 0;
-    e = 0;
-    if (props_len != 0) {
-        const bytes = @as([*]const u8, @ptrFromInt(@as(usize, props_ptr)))[0..props_len];
-        if (verve.decodeProps(Props, bytes, verve.chunkArena())) |p| {
-            n = @intCast(@min(@min(p.xs.len, p.ys.len), MAX_N));
-            for (0..n) |i| {
-                xs[i] = @floatCast(p.xs[i]);
-                ys[i] = @floatCast(p.ys[i]);
-            }
-            e = @intCast(@min(@min(p.ef.len, p.et.len), MAX_E));
-            for (0..e) |i| {
-                ef[i] = if (p.ef[i] < n) p.ef[i] else 0;
-                et[i] = if (p.et[i] < n) p.et[i] else 0;
-            }
-        } else |_| {}
-    }
+    genGraph();
     fitCamera();
     if (canvas_handle != null) {
         var out: [16]u8 = undefined;
         _ = verve.host("verveRafNamed", "{\"island\":\"VizGraphCanvas\",\"export\":\"vizcanvas_tick\",\"on\":1}", &out);
+    }
+}
+
+/// Synthesize the demo graph: GRAPH_N nodes on a deterministic jittered grid,
+/// each linked to its left + upper neighbour (index-seeded; no RNG).
+fn genGraph() void {
+    n = @min(GRAPH_N, MAX_N);
+    e = 0;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const col = i % GRAPH_COLS;
+        const row = i / GRAPH_COLS;
+        const hsh = (i *% 2654435761) >> 16;
+        const jx: f32 = @as(f32, @floatFromInt(hsh % 17)) - 8;
+        const jy: f32 = @as(f32, @floatFromInt((hsh / 17) % 17)) - 8;
+        xs[i] = @as(f32, @floatFromInt(col)) * 22 + jx;
+        ys[i] = @as(f32, @floatFromInt(row)) * 22 + jy;
+        if (i > 0 and e < MAX_E) {
+            ef[e] = i;
+            et[e] = i - 1;
+            e += 1;
+        }
+        if (i >= GRAPH_COLS and e < MAX_E) {
+            ef[e] = i;
+            et[e] = i - GRAPH_COLS;
+            e += 1;
+        }
     }
 }
 
