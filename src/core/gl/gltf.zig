@@ -1675,14 +1675,15 @@ test "parse skinnedBarGlb: skinned, joints/weights 1:1, 3-joint chain" {
     }
 }
 
-test "parse skinnedBarGlb: two clips (Bend + Twist) baked" {
+test "parse skinnedBarGlb: three clips (Bend + Twist + Smooth) baked" {
     const glb = try @import("fixture.zig").skinnedBarGlb(testing.allocator);
     defer testing.allocator.free(glb);
     var model = try parseGlb(testing.allocator, glb);
     defer model.deinit();
-    try testing.expectEqual(@as(usize, 2), model.anim_clips.len);
+    try testing.expectEqual(@as(usize, 3), model.anim_clips.len);
     try testing.expectEqual(vmesh.fnv1a32("Bend"), model.anim_clips[0].name_hash);
     try testing.expectEqual(vmesh.fnv1a32("Twist"), model.anim_clips[1].name_hash);
+    try testing.expectEqual(vmesh.fnv1a32("Smooth"), model.anim_clips[2].name_hash);
     // each clip has one track per joint per channel (T,R,S)
     try testing.expectEqual(model.skel.len * 3, model.anim_clips[0].tracks.len);
     // Bend: jmid (joint 1) rotation keyed; jtop (joint 2) rotation single-key.
@@ -1690,9 +1691,14 @@ test "parse skinnedBarGlb: two clips (Bend + Twist) baked" {
     try testing.expectEqual(@as(usize, 1), model.anim_clips[0].tracks[2 * 3 + 1].times.len);
     // Twist: jtop (joint 2) rotation keyed (Bend left it single-key).
     try testing.expect(model.anim_clips[1].tracks[2 * 3 + 1].times.len >= 2);
-    // root (joint 0) translation: single bind keyframe in both clips.
+    // Smooth: jmid (joint 1) rotation is CUBICSPLINE (interp==2) with 3× values (in/point/out).
+    const sm = model.anim_clips[2].tracks[1 * 3 + 1];
+    try testing.expectEqual(@as(u8, 2), sm.interp);
+    try testing.expect(sm.times.len >= 2);
+    try testing.expectEqual(sm.times.len * 4 * 3, sm.values.len);
+    // root (joint 0) translation: single bind keyframe in every clip.
     try testing.expectEqual(@as(usize, 1), model.anim_clips[0].tracks[0 * 3 + 0].times.len);
-    try testing.expect(model.anim_clips[0].duration > 0 and model.anim_clips[1].duration > 0);
+    try testing.expect(model.anim_clips[0].duration > 0 and model.anim_clips[2].duration > 0);
 }
 
 test "parse CUBICSPLINE animation sampler: interp=2, values.len==2*4*3" {
