@@ -6,6 +6,24 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.18] - 2026-06-17
+
+### Added
+
+- **gl skeletal skinning — slice 9: CUBICSPLINE interpolation** (`src/core/gl/vmesh.zig`,
+  `src/core/gl/gltf.zig`, `src/core/gl/math.zig`, `src/client/islands/GlSkin.zig`,
+  `src/core/gl/fixture.zig`, `src/app/components.zig`): the last deferred skinning
+  interpolation mode, end to end. **vmesh v7→v8**: the per-track `interp` byte gains
+  `2=CUBICSPLINE`; for it the value blob is `key_count × 3 × comps` f32 laid out per key as
+  `[inTangent, point, outTangent]` (LINEAR/STEP unchanged → v8 byte-compatible). `Reader`
+  gains `animInTangent`/`animOutTangent`; `animValue` returns the point; `pack` + `Reader.init`
+  scale by `valueStride`. **gltf.zig** parses `"CUBICSPLINE"` (accessor count ×3, tangents
+  verbatim). **Sampler**: cubic Hermite in `sampleVec3`/`sampleQuat` (quaternion = componentwise
+  Hermite + new `Quat.normalize`). **Demo**: a 3rd clip **Smooth** (`glskin_clip2`, button
+  "Smooth") with overshoot tangents. Tested (vmesh v8 round-trip, gltf parse, Quat.normalize)
+  and verified live (headed, Freeze on): cubic ≠ linear mid-segment, identical at the shared
+  end keyframe. **No deferred skinning items remain.**
+
 ## [0.5.17] - 2026-06-17
 
 ### Added
