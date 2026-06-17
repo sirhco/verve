@@ -42,6 +42,9 @@ var speed: f32 = 1.0;
 var loop: bool = true; // playback mode: true = loop, false = play-once (clamp at end)
 var scrubbing: bool = false;
 var track_handle: ?i32 = null;
+var mix_weight: f32 = 0; // 0 = current clip pure; 1 = the (cur+1)%count clip pure
+var mixing: bool = false;
+var mix_track_handle: ?i32 = null;
 // Cross-fade (slice 4): on a clip switch, snapshot the old clip + its looped time
 // (FROZEN), and blend old→new pose over `fade_dur` real-time seconds. `pending_clip`
 // is set by the control exports and applied in updateBones (which has the Reader).
@@ -111,9 +114,12 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     fade_t = fade_dur;
     pending_clip = -1;
     scrubbing = false;
+    mix_weight = 0;
+    mixing = false;
     use_webgpu = gl_webgpu_available() != 0;
     canvas_handle = verve.queryRef(@as([]const u8, "glskin-canvas"));
     track_handle = verve.queryRef(@as([]const u8, "glskin-track"));
+    mix_track_handle = verve.queryRef(@as([]const u8, "glskin-mix"));
 
     if (canvas_handle) |h| {
         if (use_webgpu)
@@ -199,25 +205,32 @@ fn updateBones(a: *const gl.vmesh.Reader) void {
     const t = if (has_anim and dur > 0) (if (loop) @mod(elapsed_s, dur) else @min(elapsed_s, dur)) else 0;
     const blending = has_anim and fade_t < fade_dur;
     const w = if (fade_dur > 0) std.math.clamp(fade_t / fade_dur, 0, 1) else 1;
+    const mix_active = has_anim and mix_weight > 0 and ccount > 1;
+    const other = if (mix_active) (clip + 1) % ccount else clip;
+    const odur = if (mix_active) a.animClip(other).duration else 0;
+    const ot = if (mix_active and odur > 0) (if (loop) @mod(elapsed_s, odur) else @min(elapsed_s, odur)) else 0;
 
     var j: u32 = 0;
     while (j < jc) : (j += 1) {
         const joint = a.joint(j);
         const local = if (has_anim) blk: {
-            const nt = sampleVec3(a, clip, j, 0, t); // new translation
-            const nr = sampleQuat(a, clip, j, t); // new rotation
-            const ns = sampleVec3(a, clip, j, 2, t); // new scale
-            if (blending) {
-                const ot = sampleVec3(a, from_clip, j, 0, from_time);
-                const orr = sampleQuat(a, from_clip, j, from_time);
-                const os = sampleVec3(a, from_clip, j, 2, from_time);
-                break :blk gl.math.Mat4.fromTrs(
-                    gl.math.Vec3.lerp(ot, nt, w),
-                    gl.math.Quat.slerp(orr, nr, w),
-                    gl.math.Vec3.lerp(os, ns, w),
-                );
+            var bt = sampleVec3(a, clip, j, 0, t); // base translation
+            var br = sampleQuat(a, clip, j, t); // base rotation
+            var bs = sampleVec3(a, clip, j, 2, t); // base scale
+            if (blending) { // slice-4 cross-fade from the frozen old pose
+                const ft = sampleVec3(a, from_clip, j, 0, from_time);
+                const fr = sampleQuat(a, from_clip, j, from_time);
+                const fs = sampleVec3(a, from_clip, j, 2, from_time);
+                bt = gl.math.Vec3.lerp(ft, bt, w);
+                br = gl.math.Quat.slerp(fr, br, w);
+                bs = gl.math.Vec3.lerp(fs, bs, w);
             }
-            break :blk gl.math.Mat4.fromTrs(nt, nr, ns);
+            if (mix_active) { // slice-7 weighted blend with the other clip
+                bt = gl.math.Vec3.lerp(bt, sampleVec3(a, other, j, 0, ot), mix_weight);
+                br = gl.math.Quat.slerp(br, sampleQuat(a, other, j, ot), mix_weight);
+                bs = gl.math.Vec3.lerp(bs, sampleVec3(a, other, j, 2, ot), mix_weight);
+            }
+            break :blk gl.math.Mat4.fromTrs(bt, br, bs);
         } else gl.math.Mat4{ .m = joint.bind_local };
         const wm = if (joint.parent < 0)
             local
@@ -235,9 +248,11 @@ fn updateBones(a: *const gl.vmesh.Reader) void {
 
 export fn glskin_clip0() void {
     pending_clip = 0;
+    mix_weight = 0;
 }
 export fn glskin_clip1() void {
     pending_clip = 1;
+    mix_weight = 0;
 }
 export fn glskin_pause() void {
     paused = true;
@@ -291,6 +306,32 @@ export fn glskin_scrub_move() void {
 }
 export fn glskin_scrub_up() void {
     scrubbing = false;
+}
+
+// ── mix (slice 7): pointer-drag the track to weight current↔next clip blend ─────
+
+/// Map the active pointer's X (relative to the mix track's rect) → mix_weight
+/// [0,1]. Live (does NOT pause). No-ops if the track ref / rect is unavailable.
+fn mixApply() void {
+    const th = mix_track_handle orelse return;
+    const r = verve.refRect(th);
+    if (r.w <= 0) return;
+    const fx = (verve.eventCoordX() - r.x) / r.w;
+    mix_weight = @floatCast(std.math.clamp(fx, 0, 1));
+}
+
+export fn glskin_mix_down() void {
+    if (verve.eventButton() != 0) return; // primary button only
+    mixing = true;
+    verve.eventCapturePointer();
+    mixApply();
+}
+export fn glskin_mix_move() void {
+    if (!mixing) return;
+    mixApply();
+}
+export fn glskin_mix_up() void {
+    mixing = false;
 }
 
 // ── frame export ──────────────────────────────────────────────────────────────
