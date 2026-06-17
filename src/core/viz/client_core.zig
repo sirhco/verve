@@ -10,6 +10,7 @@
 //! element segment can't clobber the main client's table. Fn-pointer
 //! indices crossing into the main runtime are translated at the JS boundary.
 
+pub const canvas_buf = @import("canvas_buf.zig");
 pub const geom = @import("geom.zig");
 pub const interact = @import("interact.zig");
 pub const edge_path = @import("edge_path.zig");

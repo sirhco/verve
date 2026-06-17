@@ -3419,6 +3419,68 @@
     flushXform();
   };
 
+  // viz canvas2d render path (phase 3). Batched: the chunk packs one draw buffer
+  // (see core/viz/canvas_buf.zig) and calls this once per frame.
+  const vizCanvasCtx = new Map(); // refHandle → { canvas, ctx }
+  const vizColor = (u) => `rgba(${(u >>> 24) & 255},${(u >>> 16) & 255},${(u >>> 8) & 255},${(u & 255) / 255})`;
+  const vizCanvasDraw = (h, ptr, len) => {
+    let entry = vizCanvasCtx.get(h);
+    if (!entry) {
+      const canvas = refHandles[h];
+      if (!canvas || typeof canvas.getContext !== "function") return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      entry = { canvas, ctx };
+      vizCanvasCtx.set(h, entry);
+    }
+    const { canvas, ctx } = entry;
+    const dpr = window.devicePixelRatio || 1;
+    const cw = Math.min(4096, Math.max(1, Math.round(canvas.clientWidth * dpr)));
+    const ch = Math.min(4096, Math.max(1, Math.round(canvas.clientHeight * dpr)));
+    if (canvas.width !== cw) canvas.width = cw;
+    if (canvas.height !== ch) canvas.height = ch;
+    const dv = new DataView(memory.buffer);
+    const cam_x = dv.getFloat32(ptr, true);
+    const cam_y = dv.getFloat32(ptr + 4, true);
+    const scale = dv.getFloat32(ptr + 8, true);
+    const nc = dv.getUint32(ptr + 12, true);
+    const ec = dv.getUint32(ptr + 16, true);
+    const hover = dv.getInt32(ptr + 20, true);
+    const select = dv.getInt32(ptr + 24, true);
+    const r = dv.getFloat32(ptr + 28, true);
+    const baseCol = vizColor(dv.getUint32(ptr + 32, true));
+    const hoverCol = vizColor(dv.getUint32(ptr + 36, true));
+    const selCol = vizColor(dv.getUint32(ptr + 40, true));
+    const edgeCol = vizColor(dv.getUint32(ptr + 44, true));
+    const nodesOff = ptr + 48;
+    const edgesOff = nodesOff + nc * 8;
+    const nx = (i) => dv.getFloat32(nodesOff + i * 8, true);
+    const ny = (i) => dv.getFloat32(nodesOff + i * 8 + 4, true);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.setTransform(scale * dpr, 0, 0, scale * dpr, cam_x * dpr, cam_y * dpr);
+    ctx.strokeStyle = edgeCol;
+    ctx.lineWidth = 1 / Math.max(scale, 0.0001);
+    ctx.beginPath();
+    for (let e = 0; e < ec; e++) {
+      const a = dv.getUint32(edgesOff + e * 8, true);
+      const b = dv.getUint32(edgesOff + e * 8 + 4, true);
+      ctx.moveTo(nx(a), ny(a));
+      ctx.lineTo(nx(b), ny(b));
+    }
+    ctx.stroke();
+    ctx.fillStyle = baseCol;
+    ctx.beginPath();
+    for (let i = 0; i < nc; i++) {
+      ctx.moveTo(nx(i) + r, ny(i));
+      ctx.arc(nx(i), ny(i), r, 0, 6.283185307179586);
+    }
+    ctx.fill();
+    const dot = (i, col) => { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(nx(i), ny(i), r, 0, 6.283185307179586); ctx.fill(); };
+    if (hover >= 0 && hover < nc) dot(hover, hoverCol);
+    if (select >= 0 && select < nc) dot(select, selCol);
+  };
+
   // Phase 13F — assemble the chunk-side reactive-runtime import object
   // from the main client's matching exports. Built once after main
   // instantiation; reused for every island chunk. Missing entries pass
@@ -3442,6 +3504,7 @@
     verve_ref_set_text: exp.verve_ref_set_text,
     verve_ref_set_text_i32: exp.verve_ref_set_text_i32,
     verve_ref_set_attr: exp.verve_ref_set_attr,
+    viz_canvas_draw: (h, ptr, len) => vizCanvasDraw(h, ptr >>> 0, len >>> 0),
     verve_ref_set_value: exp.verve_ref_set_value,
     verve_ref_set_class: exp.verve_ref_set_class,
     verve_ref_focus: exp.verve_ref_focus,

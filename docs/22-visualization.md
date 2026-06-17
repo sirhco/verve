@@ -1093,5 +1093,35 @@ a later refinement.
 - **Smooth routed-edge interactivity** — the interactive island draws straight
   `<line>` edges; curved/orthogonal `<path>` edges that re-route during drag
   are static-render-only so far.
-- **Canvas draw-command path** for thousands-of-elements scale and smooth
-  high-frequency animation.
+
+## Canvas render path (phase 3)
+
+For large node-link graphs (1000s of nodes) where the SVG-DOM path's per-node
+element + attribute-mutation cost bites, a **canvas2d backend** draws the whole
+graph in ONE host call per frame. Dedicated `VizGraphCanvas` island + `/viz-canvas`;
+the SVG path is untouched (additive — pick per-element-interaction SVG for small
+graphs, canvas for scale).
+
+- **Batched draw** — the chunk packs node positions + edge indices + camera +
+  hover/select into one shared-memory buffer (frozen layout in
+  `src/core/viz/canvas_buf.zig`, round-trip tested) and calls the bridge import
+  `viz_canvas_draw(ref, ptr, len)`, which decodes it and draws to the canvas's 2D
+  context (one batched edge path + one node path, then hover/select overdraw).
+  One wasm↔JS boundary crossing per frame → scales to thousands.
+- **Buffer layout** (LE): 48 B header (`cam_x/cam_y/scale f32`, `node_count/
+  edge_count u32`, `hover/select i32`, `node_r f32`, `base/hover/select/edge`
+  colors `0xRRGGBBAA`), then `node_count × (x,y f32)`, then `edge_count × (a,b
+  u32)`.
+- **Interaction without DOM events** — canvas has no per-element events, so the
+  chunk hit-tests: `z-on-pointerdown/move/up` + `z-on-wheel` → `vizcanvas_*`
+  exports; `refRect` + `eventCoordX/Y` map the pointer to world coords (inverse
+  camera); drag pans, wheel zooms about the cursor, pointerdown picks the nearest
+  node (hover/select highlight). Reuses the shipped pointer/`refRect` substrate.
+- **Demo** (`/viz-canvas`): a ~1500-node graph synthesized in the chunk (a
+  deterministic jittered grid). Note: the SSR→hydrate props scratch is 8 KB, too
+  small to carry a graph this size — for the demo the chunk generates it locally;
+  delivering a large *server-authored* graph would use a fetch/stream transport
+  (the push/delta path), a future enhancement.
+
+Verified on both backends (canvas2d works in plain headless): renders, wheel
+zooms, drag pans, click selects (highlight) — zero console errors.

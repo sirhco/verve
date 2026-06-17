@@ -6,6 +6,23 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.viz` — canvas render path (phase 3)** (`src/core/viz/canvas_buf.zig`,
+  `src/core/viz/{viz,client_core}.zig`, `src/bridge/verve.js`,
+  `src/client/islands/VizGraphCanvas.zig`, `src/app/{islands,routes,components}.zig`):
+  a canvas2d backend for large node-link graphs (1000s of nodes) where the
+  SVG-DOM path bogs down. The chunk packs node/edge/camera into one shared-memory
+  buffer (frozen layout `canvas_buf.zig`, round-trip tested) and makes a single
+  `viz_canvas_draw(ref, ptr, len)` bridge call per frame, which draws all edges +
+  nodes + hover/select to the canvas's 2D context. Pan/zoom/hover/select via
+  manual hit-test (`z-on-pointer*`/`z-on-wheel` + `refRect`/`eventCoordX` →
+  inverse-camera → nearest node) — canvas has no per-element events. Dedicated
+  `VizGraphCanvas` island + `/viz-canvas` (a ~1500-node graph synthesized in the
+  chunk); the SVG `VizGraphInteractive` path is untouched. Verified headless:
+  renders, zooms, pans, selects (zero console errors). Node-drag + curved edges +
+  server-authored large graphs (fetch transport) deferred.
+
 ## [0.5.14] - 2026-06-17
 
 ### Added
