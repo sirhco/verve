@@ -895,10 +895,21 @@ pub fn glSkin(ctx: *const verve.Context) !*verve.Node {
         ctx.el("button").attr("z-on-click", "glskin_once").text("Once"),
     });
 
+    // Scrub track: drag to set clip time (pointer-drag → glskin_scrub_* exports).
+    // Inside the island subtree so events route to this chunk. touch-action:none
+    // so touch-drag scrubs instead of scrolling.
+    const track = ctx.div().class("gl-scrub")
+        .attr("data-ref", "glskin-track")
+        .attr("z-on-pointerdown", "glskin_scrub_down")
+        .attr("z-on-pointermove", "glskin_scrub_move")
+        .attr("z-on-pointerup", "glskin_scrub_up")
+        .attr("style", "width:100%;max-width:640px;height:18px;margin-top:6px;background:#222636;border-radius:4px;cursor:ew-resize;touch-action:none;");
+
     const inner = ctx.section().class("card").children(.{
         ctx.h2("Skinned bar — multiple clips + controls"),
         canvas,
         controls,
+        track,
     });
     const demo_island = verve.island(ctx, .{ .name = "GlSkin" }, inner);
 

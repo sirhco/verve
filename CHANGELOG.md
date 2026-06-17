@@ -6,6 +6,19 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` — skeletal skinning, slice 6 (scrub)**
+  (`src/client/islands/GlSkin.zig`, `src/app/components.zig`): a scrub bar under
+  `/gl-skin` — drag it to set the current clip's time (the bar poses to that frame
+  and stays paused). A track `<div>` with `z-on-pointerdown/move/up` drives three
+  `glskin_scrub_*` exports; `scrubApply` maps the pointer X (`eventCoordX`)
+  relative to the track's `refRect` to `elapsed_s = frac · clip.duration`, with
+  pointer capture + primary-button guard. Reuses shipped runtime APIs — **no
+  bridge/asset/format/shader/wire change** (`updateBones` untouched; scrub only
+  writes `elapsed_s` on pointer interaction). Verified on WebGPU and WebGL2
+  (headless CDP: dragging 20 %→80 % of the track moves the pose; releases paused).
+
 ## [0.5.12] - 2026-06-16
 
 ### Added
