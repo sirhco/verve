@@ -1218,8 +1218,10 @@ pub fn skinnedBarGlb(alloc: Allocator) ![]u8 {
     const len_twtop: u32 = 3 * 4 * 4;
     const off_png: u32 = off_twtop + len_twtop;
     const png_len: u32 = @intCast(png_bytes.len);
+    const off_smooth: u32 = off_png + png_len;
+    const len_smooth: u32 = 9 * 16; // CUBICSPLINE: 3 keys × (inTangent, point, outTangent) × VEC4
 
-    const bin_total: u32 = off_png + png_len;
+    const bin_total: u32 = off_smooth + len_smooth;
     const bin_padded = (bin_total + 3) & ~@as(u32, 3);
     var bin = try alloc.alloc(u8, bin_padded);
     defer alloc.free(bin);
@@ -1326,6 +1328,21 @@ pub fn skinnedBarGlb(alloc: Allocator) ![]u8 {
         }
     }
 
+    // smooth (CUBICSPLINE): jmid Z rotation, SAME points as Bend (id → rotZ(0.7) → id) but
+    // with non-zero in/out tangents so the cubic visibly OVERSHOOTS the LINEAR Bend mid-segment
+    // (lets a frozen mid-time pose-diff distinguish CUBICSPLINE from LINEAR). glTF layout per
+    // key: [inTangent.xyzw, point.xyzw, outTangent.xyzw].
+    const sm_t: f32 = 1.5; // tangent magnitude (value/sec; runtime scales by the 0.5s segment)
+    const sm_quats = [9][4]f32{
+        .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 1 }, .{ 0, 0, sm_t, 0 }, // key0 in, point(id), out
+        .{ 0, 0, sm_t, 0 }, .{ 0, 0, a_sin, a_cos }, .{ 0, 0, -sm_t, 0 }, // key1 in, point(rotZ), out
+        .{ 0, 0, -sm_t, 0 }, .{ 0, 0, 0, 1 }, .{ 0, 0, 0, 0 }, // key2 in, point(id), out
+    };
+    for (sm_quats, 0..) |q, i| {
+        const base = off_smooth + @as(u32, @intCast(i)) * 16;
+        inline for (0..4) |c| std.mem.writeInt(u32, bin[base + c * 4 ..][0..4], @bitCast(q[c]), .little);
+    }
+
     // PNG
     @memcpy(bin[off_png..][0..png_len], png_bytes);
 
@@ -1365,6 +1382,7 @@ pub fn skinnedBarGlb(alloc: Allocator) ![]u8 {
     try w.writeAll(",{\"bufferView\":8,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"}");
     try w.writeAll(",{\"bufferView\":9,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"}"); // 9 twist jmid
     try w.writeAll(",{\"bufferView\":10,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"}"); // 10 twist jtop
+    try w.writeAll(",{\"bufferView\":12,\"componentType\":5126,\"count\":9,\"type\":\"VEC4\"}"); // 11 smooth (CUBICSPLINE: 3 keys × 3 slots)
     try w.writeAll("],");
 
     // bufferViews
@@ -1380,7 +1398,8 @@ pub fn skinnedBarGlb(alloc: Allocator) ![]u8 {
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_arot, len_arot }); // 8 bend rot
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_twmid, len_twmid }); // 9 twist jmid
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_twtop, len_twtop }); // 10 twist jtop
-    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_png, png_len }); // 11 PNG
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_png, png_len }); // 11 PNG
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_smooth, len_smooth }); // 12 smooth cubicspline
     try w.writeAll("],");
 
     try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
@@ -1389,7 +1408,8 @@ pub fn skinnedBarGlb(alloc: Allocator) ![]u8 {
     try w.writeAll("\"images\":[{\"bufferView\":11,\"mimeType\":\"image/png\"}],");
     try w.writeAll("\"animations\":[" ++
         "{\"name\":\"Bend\",\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"rotation\"}}],\"samplers\":[{\"input\":7,\"output\":8,\"interpolation\":\"LINEAR\"}]}," ++
-        "{\"name\":\"Twist\",\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"rotation\"}},{\"sampler\":1,\"target\":{\"node\":3,\"path\":\"rotation\"}}],\"samplers\":[{\"input\":7,\"output\":9,\"interpolation\":\"LINEAR\"},{\"input\":7,\"output\":10,\"interpolation\":\"LINEAR\"}]}" ++
+        "{\"name\":\"Twist\",\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"rotation\"}},{\"sampler\":1,\"target\":{\"node\":3,\"path\":\"rotation\"}}],\"samplers\":[{\"input\":7,\"output\":9,\"interpolation\":\"LINEAR\"},{\"input\":7,\"output\":10,\"interpolation\":\"LINEAR\"}]}," ++
+        "{\"name\":\"Smooth\",\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"rotation\"}}],\"samplers\":[{\"input\":7,\"output\":11,\"interpolation\":\"CUBICSPLINE\"}]}" ++
         "]");
     try w.writeAll("}");
 
@@ -1592,9 +1612,9 @@ test "skinnedBarGlb: container + skin/JOINTS_0/WEIGHTS_0 present" {
     const attrs = prim.get("attributes").?.object;
     try testing.expect(attrs.get("JOINTS_0") != null);
     try testing.expect(attrs.get("WEIGHTS_0") != null);
-    // 11 accessors (pos,nrm,uv,joints,weights,indices,ibm,anim_times,bend_rot,twist_jmid,twist_jtop)
-    try testing.expectEqual(@as(usize, 11), root.get("accessors").?.array.items.len);
-    try testing.expectEqual(@as(usize, 2), root.get("animations").?.array.items.len);
+    // 12 accessors (pos,nrm,uv,joints,weights,indices,ibm,anim_times,bend_rot,twist_jmid,twist_jtop,smooth_cubic)
+    try testing.expectEqual(@as(usize, 12), root.get("accessors").?.array.items.len);
+    try testing.expectEqual(@as(usize, 3), root.get("animations").?.array.items.len);
     try testing.expect(root.get("animations") != null);
 }
 

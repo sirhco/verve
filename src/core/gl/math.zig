@@ -77,12 +77,20 @@ pub const Quat = struct {
         return .{ .x = -q.x, .y = -q.y, .z = -q.z, .w = q.w };
     }
 
+    /// Normalize the quaternion to unit length. Returns identity when length is 0.
+    pub fn normalize(q: Quat) Quat {
+        const len = @sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        if (len == 0) return Quat.identity;
+        const inv = 1.0 / len;
+        return .{ .x = q.x * inv, .y = q.y * inv, .z = q.z * inv, .w = q.w * inv };
+    }
+
     /// Spherical linear interpolation, shortest arc. Inputs need not be unit
     /// (normalized internally); returns a unit quaternion. Falls back to
     /// normalized-lerp when the endpoints are nearly parallel (avoids div-by-~0).
     pub fn slerp(a: Quat, b: Quat, t: f32) Quat {
-        const an = a.normalizeQ();
-        var bn = b.normalizeQ();
+        const an = a.normalize();
+        var bn = b.normalize();
         var d = an.x * bn.x + an.y * bn.y + an.z * bn.z + an.w * bn.w;
         if (d < 0) {
             bn = .{ .x = -bn.x, .y = -bn.y, .z = -bn.z, .w = -bn.w };
@@ -95,7 +103,7 @@ pub const Quat = struct {
                 .z = an.z + (bn.z - an.z) * t,
                 .w = an.w + (bn.w - an.w) * t,
             };
-            return r.normalizeQ();
+            return r.normalize();
         }
         const theta0 = std.math.acos(d);
         const theta = theta0 * t;
@@ -108,13 +116,6 @@ pub const Quat = struct {
             .z = an.z * s0 + bn.z * s1,
             .w = an.w * s0 + bn.w * s1,
         };
-    }
-
-    fn normalizeQ(q: Quat) Quat {
-        const len = @sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
-        if (len == 0) return Quat.identity;
-        const inv = 1.0 / len;
-        return .{ .x = q.x * inv, .y = q.y * inv, .z = q.z * inv, .w = q.w * inv };
     }
 };
 
@@ -647,6 +648,27 @@ test "Vec3.lerp endpoints + midpoint" {
     try std.testing.expectApproxEqAbs(@as(f32, 1), m.x, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -2), m.y, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 5), m.z, 1e-6);
+}
+
+test "Quat.normalize: non-unit quat normalized to length 1" {
+    // (2, 0, 0, 0) has length 2; normalize → (1, 0, 0, 0), length 1.
+    const q = Quat{ .x = 2, .y = 0, .z = 0, .w = 0 };
+    const n = q.normalize();
+    const len = @sqrt(n.x * n.x + n.y * n.y + n.z * n.z + n.w * n.w);
+    try testing.expectApproxEqAbs(@as(f32, 1), len, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1), n.x, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), n.y, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), n.z, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), n.w, 1e-6);
+    // Arbitrary non-unit quat: (3, 1, 4, 1).
+    const q2 = Quat{ .x = 3, .y = 1, .z = 4, .w = 1 };
+    const n2 = q2.normalize();
+    const len2 = @sqrt(n2.x * n2.x + n2.y * n2.y + n2.z * n2.z + n2.w * n2.w);
+    try testing.expectApproxEqAbs(@as(f32, 1), len2, 1e-6);
+    // Zero quat → identity.
+    const q0 = Quat{ .x = 0, .y = 0, .z = 0, .w = 0 };
+    const n0 = q0.normalize();
+    try testing.expectApproxEqAbs(@as(f32, 1), n0.w, 1e-6);
 }
 
 test "Quat.conjugate: q * q.conjugate() == identity for non-trivial unit quat" {

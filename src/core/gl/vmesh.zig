@@ -1,4 +1,4 @@
-//! .vmesh packed asset format v6 — writer + freestanding reader.
+//! .vmesh packed asset format v8 — writer + freestanding reader.
 //!
 //! Invariant: the byte buffer handed to `Reader.init` must itself be at least
 //! 4-byte aligned (the asset region provides 16) — section offsets only
@@ -7,7 +7,7 @@
 //!
 //! Header layout (72 bytes, all integers little-endian u32):
 //!   [0..4]   magic "VMSH"
-//!   [4..8]   version u32 = 6
+//!   [4..8]   version u32 = 8
 //!   [8..12]  vertex_count
 //!   [12..16] index_count
 //!   [16..20] submesh_count
@@ -57,7 +57,7 @@ const bvh = @import("bvh.zig");
 const command = @import("command.zig");
 
 pub const magic = "VMSH";
-pub const version: u32 = 7;
+pub const version: u32 = 8;
 pub const vertex_stride: u32 = 48; // pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40
 pub const skinned_vertex_stride: u32 = 56; // …48, then joints uint8x4 @48, weights unorm8x4 @52
 pub const header_size: u32 = 72;
@@ -76,6 +76,11 @@ pub const Anims = struct { clips: []const Clip };
 pub const ClipInfo = struct { name_hash: u32, duration: f32 };
 pub fn animComps(channel: u2) u32 {
     return if (channel == 1) 4 else 3;
+}
+/// Returns the per-key value multiplier: 3 for CUBICSPLINE (in/point/out),
+/// 1 for LINEAR and STEP. File-private helper used by pack + Reader.init.
+fn valueStride(interp: u8) u32 {
+    return if (interp == 2) 3 else 1;
 }
 pub const TrackInfo = struct { interp: u8, key_count: u32, data_off: u32, comps: u32 };
 const anim_dir_entry_size: u32 = 12;
@@ -232,8 +237,9 @@ pub fn pack(
             for (cl.tracks, 0..) |tr, ti| {
                 const comps = animComps(@intCast(ti % 3));
                 const kc: u32 = @intCast(tr.times.len);
-                std.debug.assert(tr.values.len == @as(usize, kc) * comps);
-                sect += kc * 4 + kc * comps * 4;
+                const vs = valueStride(tr.interp);
+                std.debug.assert(tr.values.len == @as(usize, kc) * comps * vs);
+                sect += kc * 4 + kc * comps * vs * 4;
             }
             cur += sect;
         }
@@ -401,10 +407,11 @@ pub fn pack(
                 while (k < kc) : (k += 1)
                     std.mem.writeInt(u32, buf[anim_off + blob_cursor + k * 4 ..][0..4], @bitCast(tr.times[k]), .little);
                 const vbase = anim_off + blob_cursor + kc * 4;
+                const vs = valueStride(tr.interp);
                 var vi: u32 = 0;
-                while (vi < kc * comps) : (vi += 1)
+                while (vi < kc * comps * vs) : (vi += 1)
                     std.mem.writeInt(u32, buf[vbase + vi * 4 ..][0..4], @bitCast(tr.values[vi]), .little);
-                blob_cursor += kc * 4 + kc * comps * 4;
+                blob_cursor += kc * 4 + kc * comps * vs * 4;
             }
             sect_cursor = blob_cursor;
         }
@@ -571,9 +578,12 @@ pub const Reader = struct {
                 while (ti < joint_count * 3) : (ti += 1) {
                     const comps: u64 = if (ti % 3 == 1) 4 else 3;
                     const e: usize = @intCast(@as(u64, anim_off) + dir_off + @as(u64, ti) * anim_dir_entry_size);
+                    const interp: u8 = bytes[e];
+                    if (interp > 2) return error.Truncated; // reject unknown interp
                     const kc: u64 = std.mem.readInt(u32, bytes[e + 4 ..][0..4], .little);
                     const data_off: u64 = std.mem.readInt(u32, bytes[e + 8 ..][0..4], .little);
-                    const need: u64 = kc * 4 + kc * comps * 4;
+                    const vs: u64 = valueStride(interp);
+                    const need: u64 = kc * 4 + kc * comps * vs * 4;
                     const abs: u64 = @as(u64, anim_off) + data_off;
                     if (abs > blen or need > blen - abs) return error.Truncated;
                 }
@@ -666,12 +676,37 @@ pub const Reader = struct {
         return @bitCast(std.mem.readInt(u32, self.bytes[off..][0..4], .little));
     }
 
-    /// Component `comp` of keyframe `i` value of track `t`. Caller must ensure
-    /// `i < t.key_count` and `comp < t.comps`.
+    /// Component `comp` of keyframe `i` point value of track `t`. For
+    /// CUBICSPLINE (interp==2) the point is the middle triple per key:
+    /// offset index = i*3*comps + comps + comp. For LINEAR/STEP:
+    /// offset index = i*comps + comp. Caller must ensure `i < t.key_count`
+    /// and `comp < t.comps`.
     pub fn animValue(self: *const Reader, t: TrackInfo, i: u32, comp: u32) f32 {
         const vbase = @as(usize, self.anim_off_) + t.data_off + @as(usize, t.key_count) * 4;
-        const off = vbase + (@as(usize, i) * t.comps + comp) * 4;
+        const idx: usize = if (t.interp == 2)
+            @as(usize, i) * 3 * t.comps + t.comps + comp
+        else
+            @as(usize, i) * t.comps + comp;
+        const off = vbase + idx * 4;
         return @bitCast(std.mem.readInt(u32, self.bytes[off..][0..4], .little));
+    }
+
+    /// In-tangent component `comp` of keyframe `i` for a CUBICSPLINE track.
+    /// Index = i*3*comps + comp. Caller must ensure track is CUBICSPLINE
+    /// (interp==2), `i < t.key_count`, and `comp < t.comps`.
+    pub fn animInTangent(self: *const Reader, t: TrackInfo, i: u32, comp: u32) f32 {
+        const vbase = @as(usize, self.anim_off_) + t.data_off + @as(usize, t.key_count) * 4;
+        const idx: usize = @as(usize, i) * 3 * t.comps + comp;
+        return @bitCast(std.mem.readInt(u32, self.bytes[vbase + idx * 4 ..][0..4], .little));
+    }
+
+    /// Out-tangent component `comp` of keyframe `i` for a CUBICSPLINE track.
+    /// Index = i*3*comps + 2*comps + comp. Caller must ensure track is CUBICSPLINE
+    /// (interp==2), `i < t.key_count`, and `comp < t.comps`.
+    pub fn animOutTangent(self: *const Reader, t: TrackInfo, i: u32, comp: u32) f32 {
+        const vbase = @as(usize, self.anim_off_) + t.data_off + @as(usize, t.key_count) * 4;
+        const idx: usize = @as(usize, i) * 3 * t.comps + 2 * t.comps + comp;
+        return @bitCast(std.mem.readInt(u32, self.bytes[vbase + idx * 4 ..][0..4], .little));
     }
 
     /// Caller must ensure `i < self.submesh_count`.
@@ -1315,8 +1350,8 @@ test "(j) v5 skinned round-trip: stride 56, 2-joint skeleton" {
     const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, null);
     defer testing.allocator.free(bytes);
 
-    // Header: version 7, skinned flag set, joint_count == 2.
-    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, bytes[4..8], .little));
+    // Header: version 8, skinned flag set, joint_count == 2.
+    try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, bytes[4..8], .little));
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[56..60], .little));
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[64..68], .little));
     // skeleton_off 16-aligned.
@@ -1344,7 +1379,96 @@ test "(j) v5 skinned round-trip: stride 56, 2-joint skeleton" {
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(verts[0..12]), r.vertices[0..48]);
 }
 
-test "vmesh v7: multi-clip table round-trips" {
+test "vmesh v8: CUBICSPLINE round-trip — in/point/out tangents + LINEAR regression" {
+    // Minimal skinned mesh: 1 vertex, 1 joint.
+    const verts = [_]f32{0} ** 12;
+    const joints_arr = [_][4]u8{.{ 0, 0, 0, 0 }};
+    const weights_arr = [_][4]u8{.{ 255, 0, 0, 0 }};
+    const skel = [_]Joint{.{ .parent = -1, .inverse_bind = Mat4Identity, .bind_local = Mat4Identity }};
+
+    // CUBICSPLINE rotation track (channel 1, comps=4), key_count=2.
+    // Per-key layout: [inTangent(4), point(4), outTangent(4)] → values len = 2*4*3 = 24.
+    // Key 0: inT=(0.1,0.2,0.3,0.4), pt=(0,0,0,1), outT=(0.5,0.6,0.7,0.8)
+    // Key 1: inT=(0.9,0.8,0.7,0.6), pt=(0,1,0,0), outT=(0.5,0.4,0.3,0.2)
+    const cs_times = [_]f32{ 0.0, 1.0 };
+    const cs_values = [_]f32{
+        // key 0
+        0.1, 0.2, 0.3, 0.4, // inTangent
+        0.0, 0.0, 0.0, 1.0, // point
+        0.5, 0.6, 0.7, 0.8, // outTangent
+        // key 1
+        0.9, 0.8, 0.7, 0.6, // inTangent
+        0.0, 1.0, 0.0, 0.0, // point
+        0.5, 0.4, 0.3, 0.2, // outTangent
+    };
+
+    // LINEAR translation track (channel 0, comps=3), key_count=2. Regression check.
+    const lin_times = [_]f32{ 0.0, 1.0 };
+    const lin_values = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 };
+
+    // STEP scale track (channel 2, comps=3), key_count=1.
+    const step_times = [_]f32{0.0};
+    const step_values = [_]f32{ 1.0, 1.0, 1.0 };
+
+    // One clip, one joint → 3 tracks (T=linear, R=cubicspline, S=step).
+    const tracks = [_]Track{
+        .{ .interp = 0, .times = &lin_times, .values = &lin_values }, // T linear
+        .{ .interp = 2, .times = &cs_times, .values = &cs_values }, // R cubicspline
+        .{ .interp = 1, .times = &step_times, .values = &step_values }, // S step
+    };
+    const clip = Clip{ .name_hash = fnv1a32("TestClip"), .duration = 1.0, .tracks = &tracks };
+    const anims = Anims{ .clips = &[_]Clip{clip} };
+
+    const bytes = try pack(testing.allocator, &verts, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints_arr, &weights_arr, &skel, anims);
+    defer testing.allocator.free(bytes);
+
+    // Version must be 8.
+    try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, bytes[4..8], .little));
+
+    const r = try Reader.init(bytes);
+    try testing.expect(r.animPresent());
+    try testing.expectEqual(@as(u32, 1), r.animClipCount());
+
+    // LINEAR track (T, channel 0): point values unchanged.
+    const tr_lin = r.animTrack(0, 0, 0);
+    try testing.expectEqual(@as(u8, 0), tr_lin.interp);
+    try testing.expectEqual(@as(u32, 2), tr_lin.key_count);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), r.animValue(tr_lin, 0, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), r.animValue(tr_lin, 1, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 6.0), r.animValue(tr_lin, 1, 2), 1e-6);
+
+    // CUBICSPLINE track (R, channel 1): point / inTangent / outTangent.
+    const tr_cs = r.animTrack(0, 0, 1);
+    try testing.expectEqual(@as(u8, 2), tr_cs.interp);
+    try testing.expectEqual(@as(u32, 2), tr_cs.key_count);
+    try testing.expectEqual(@as(u32, 4), tr_cs.comps);
+
+    // Key 0: point (0,0,0,1)
+    try testing.expectApproxEqAbs(@as(f32, 0.0), r.animValue(tr_cs, 0, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), r.animValue(tr_cs, 0, 3), 1e-6);
+    // Key 0: inTangent (0.1,0.2,0.3,0.4)
+    try testing.expectApproxEqAbs(@as(f32, 0.1), r.animInTangent(tr_cs, 0, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), r.animInTangent(tr_cs, 0, 3), 1e-6);
+    // Key 0: outTangent (0.5,0.6,0.7,0.8)
+    try testing.expectApproxEqAbs(@as(f32, 0.5), r.animOutTangent(tr_cs, 0, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), r.animOutTangent(tr_cs, 0, 3), 1e-6);
+    // Key 1: point (0,1,0,0)
+    try testing.expectApproxEqAbs(@as(f32, 0.0), r.animValue(tr_cs, 1, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), r.animValue(tr_cs, 1, 1), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), r.animValue(tr_cs, 1, 3), 1e-6);
+    // Key 1: inTangent (0.9,0.8,0.7,0.6)
+    try testing.expectApproxEqAbs(@as(f32, 0.9), r.animInTangent(tr_cs, 1, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), r.animInTangent(tr_cs, 1, 3), 1e-6);
+    // Key 1: outTangent (0.5,0.4,0.3,0.2)
+    try testing.expectApproxEqAbs(@as(f32, 0.5), r.animOutTangent(tr_cs, 1, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.2), r.animOutTangent(tr_cs, 1, 3), 1e-6);
+
+    // Time reads still work.
+    try testing.expectApproxEqAbs(@as(f32, 0.0), r.animTime(tr_cs, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), r.animTime(tr_cs, 1), 1e-6);
+}
+
+test "vmesh v8: multi-clip table round-trips" {
     const verts = [_]f32{0} ** 12;
     const joints = [_][4]u8{.{ 0, 0, 0, 0 }};
     const weights = [_][4]u8{.{ 255, 0, 0, 0 }};

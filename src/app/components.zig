@@ -939,6 +939,7 @@ pub fn glSkin(ctx: *const verve.Context) !*verve.Node {
     const controls = ctx.div().class("gl-controls").children(.{
         ctx.el("button").attr("z-on-click", "glskin_clip0").text("Bend"),
         ctx.el("button").attr("z-on-click", "glskin_clip1").text("Twist"),
+        ctx.el("button").attr("z-on-click", "glskin_clip2").text("Smooth"),
         ctx.el("button").attr("z-on-click", "glskin_pause").text("Pause"),
         ctx.el("button").attr("z-on-click", "glskin_play").text("Play"),
         ctx.el("button").attr("z-on-click", "glskin_speed_half").text("0.5×"),
