@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.15] - 2026-06-17
+
 ### Added
 
 - **`verve.viz` — canvas render path (phase 3)** (`src/core/viz/canvas_buf.zig`,
@@ -3414,7 +3416,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.14...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.15...HEAD
+[0.5.15]: https://github.com/sirhco/verve/compare/v0.5.14...v0.5.15
 [0.5.14]: https://github.com/sirhco/verve/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/sirhco/verve/compare/v0.5.12...v0.5.13
 [0.5.12]: https://github.com/sirhco/verve/compare/v0.5.11...v0.5.12
