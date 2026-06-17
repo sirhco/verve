@@ -6,6 +6,18 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` — skeletal skinning, slice 5 (loop / once mode)**
+  (`src/client/islands/GlSkin.zig`, `src/app/components.zig`): a Loop/Once
+  playback-mode toggle on `/gl-skin`. **Once** plays a clip to the end then holds
+  the last frame (clip time clamps `@min(elapsed, dur)` instead of wrapping
+  `@mod`); **Loop** (default) keeps cycling. Two no-arg control exports
+  (`glskin_loop`/`glskin_once`) wired to buttons; the slice-4 cross-fade snapshot
+  uses the same loop-aware clamp. Pure chunk-side — **no asset/format/shader/wire
+  change**; default Loop is byte-identical to slice 4. Verified on WebGPU and
+  WebGL2 (headless CDP: Once freezes past the clip end, Loop keeps cycling).
+
 ## [0.5.11] - 2026-06-16
 
 ### Added
