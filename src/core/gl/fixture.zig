@@ -1651,9 +1651,10 @@ test "studioHdr round-trips: sun texel > 10x zenith texel" {
 /// Procedural wind-farm scene for the mission-control demo.
 /// Geometry: one ground plane mesh ("ground") + 4 turbine tower meshes
 /// ("turbine0".."turbine3") spread 8 units apart along X. Each turbine has a
-/// child scene-graph node ("rotor0".."rotor3") with no mesh, positioned at the
-/// nacelle height (y=3.2) — an anim `node:rotorN.rotationZ` tween spins the
-/// rotor in the demo's island.
+/// child scene-graph node ("rotor0".."rotor3") positioned at the nacelle height
+/// (y=3.2). Each rotor node has its own mesh ("rotor0".."rotor3") of 3 blades
+/// arranged at 120° around the hub axis — an anim `node:rotorN.rotationZ` tween
+/// spins the visible blades in the demo's island.
 ///
 /// Non-skinned PBR (pos/nrm/uv, no TANGENT — gltf parser generates them).
 /// One flat metallic-gray material (baseColorFactor, no textures).
@@ -1667,6 +1668,11 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
     const t_vc: u32 = 24;
     const t_ic: u32 = 36;
     const turbine_count: u32 = 4;
+    // Rotor: 3 blades, each a 6-face box → 3×24=72 verts, 3×36=108 indices
+    // One shared mesh referenced by all 4 rotor nodes.
+    const blade_count: u32 = 3;
+    const r_vc: u32 = blade_count * 24; // 72
+    const r_ic: u32 = blade_count * 36; // 108
 
     // Per-mesh BIN sizes (bytes)
     const g_pos_len: u32 = g_vc * 12; // VEC3 f32
@@ -1679,7 +1685,12 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
     const t_uv_len: u32 = t_vc * 8;
     const t_idx_len: u32 = t_ic * 2;
 
-    // ── BIN layout: ground then turbine0..3 ──────────────────────────────────
+    const r_pos_len: u32 = r_vc * 12;
+    const r_nrm_len: u32 = r_vc * 12;
+    const r_uv_len: u32 = r_vc * 8;
+    const r_idx_len: u32 = r_ic * 2;
+
+    // ── BIN layout: ground then turbine0..3 then rotor (shared) ──────────────
     const g_pos_off: u32 = 0;
     const g_nrm_off: u32 = g_pos_off + g_pos_len;
     const g_uv_off: u32 = g_nrm_off + g_nrm_len;
@@ -1703,7 +1714,13 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
             cur = (cur + 3) & ~@as(u32, 3);
         }
     }
-    const bin_total: u32 = t_idx_off[turbine_count - 1] + t_idx_len;
+    // Rotor blade BIN section follows turbines
+    const r_pos_off: u32 = (t_idx_off[turbine_count - 1] + t_idx_len + 3) & ~@as(u32, 3);
+    const r_nrm_off: u32 = r_pos_off + r_pos_len;
+    const r_uv_off: u32 = r_nrm_off + r_nrm_len;
+    const r_idx_off: u32 = r_uv_off + r_uv_len;
+
+    const bin_total: u32 = r_idx_off + r_idx_len;
     const bin_padded = (bin_total + 3) & ~@as(u32, 3);
 
     var bin = try alloc.alloc(u8, bin_padded);
@@ -1798,16 +1815,108 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
         }
     }
 
+    // ── write rotor blade geometry (shared mesh for all rotors) ──────────────
+    // 3 blades at 0°, 120°, 240° in local XY plane (rotor spins about Z).
+    // Each blade: a box 3.0 units long (radial), 0.15 wide (tangential), 0.05 deep (Z).
+    // Blade local space: extends from x=0.15 to x=3.15 so the hub centre clears.
+    // Rotated by angle about Z: x' = x*cos - y*sin, y' = x*sin + y*cos.
+    {
+        const blade_len: f32 = 3.0;
+        const blade_start: f32 = 0.15; // clearance from hub centre
+        const bw: f32 = 0.075; // half-width in Y
+        const bd: f32 = 0.025; // half-depth in Z
+
+        // 6 faces of a blade box (in blade-local coords before rotation):
+        //   x in [blade_start, blade_start+blade_len], y in [-bw,bw], z in [-bd,bd]
+        const BFace = struct { nx: f32, ny: f32, nz: f32, v: [4][3]f32 };
+        const bx0: f32 = blade_start;
+        const bx1: f32 = blade_start + blade_len;
+        const blade_faces = [6]BFace{
+            .{ .nx = 1, .ny = 0, .nz = 0, .v = .{ .{ bx1, -bw, bd }, .{ bx1, bw, bd }, .{ bx1, bw, -bd }, .{ bx1, -bw, -bd } } }, // +X tip
+            .{ .nx = -1, .ny = 0, .nz = 0, .v = .{ .{ bx0, -bw, -bd }, .{ bx0, bw, -bd }, .{ bx0, bw, bd }, .{ bx0, -bw, bd } } }, // -X root
+            .{ .nx = 0, .ny = 1, .nz = 0, .v = .{ .{ bx0, bw, -bd }, .{ bx1, bw, -bd }, .{ bx1, bw, bd }, .{ bx0, bw, bd } } }, // +Y edge
+            .{ .nx = 0, .ny = -1, .nz = 0, .v = .{ .{ bx0, -bw, bd }, .{ bx1, -bw, bd }, .{ bx1, -bw, -bd }, .{ bx0, -bw, -bd } } }, // -Y edge
+            .{ .nx = 0, .ny = 0, .nz = 1, .v = .{ .{ bx0, -bw, bd }, .{ bx0, bw, bd }, .{ bx1, bw, bd }, .{ bx1, -bw, bd } } }, // +Z face
+            .{ .nx = 0, .ny = 0, .nz = -1, .v = .{ .{ bx1, -bw, -bd }, .{ bx1, bw, -bd }, .{ bx0, bw, -bd }, .{ bx0, -bw, -bd } } }, // -Z face
+        };
+
+        // Blade angles: 0, 120°, 240° (2π/3 apart)
+        const pi: f32 = std.math.pi;
+        const blade_angles = [blade_count]f32{ 0.0, 2.0 * pi / 3.0, 4.0 * pi / 3.0 };
+
+        var po: usize = r_pos_off;
+        var no: usize = r_nrm_off;
+        var uo: usize = r_uv_off;
+        var io: usize = r_idx_off;
+        var vtx_base: u16 = 0;
+
+        for (blade_angles) |angle| {
+            const ca: f32 = @cos(angle);
+            const sa: f32 = @sin(angle);
+            for (blade_faces) |face| {
+                // Rotate positions and normals by angle about Z
+                for (face.v) |v| {
+                    const rx: f32 = v[0] * ca - v[1] * sa;
+                    const ry: f32 = v[0] * sa + v[1] * ca;
+                    std.mem.writeInt(u32, bin[po..][0..4], @bitCast(rx), .little);
+                    std.mem.writeInt(u32, bin[po + 4 ..][0..4], @bitCast(ry), .little);
+                    std.mem.writeInt(u32, bin[po + 8 ..][0..4], @bitCast(v[2]), .little);
+                    po += 12;
+                }
+                for (0..4) |_| {
+                    const rnx: f32 = face.nx * ca - face.ny * sa;
+                    const rny: f32 = face.nx * sa + face.ny * ca;
+                    std.mem.writeInt(u32, bin[no..][0..4], @bitCast(rnx), .little);
+                    std.mem.writeInt(u32, bin[no + 4 ..][0..4], @bitCast(rny), .little);
+                    std.mem.writeInt(u32, bin[no + 8 ..][0..4], @bitCast(face.nz), .little);
+                    no += 12;
+                }
+                for (tuv) |uv| {
+                    std.mem.writeInt(u32, bin[uo..][0..4], @bitCast(uv[0]), .little);
+                    std.mem.writeInt(u32, bin[uo + 4 ..][0..4], @bitCast(uv[1]), .little);
+                    uo += 8;
+                }
+            }
+            // indices for 6 faces of this blade (24 verts per blade)
+            for (0..6) |fi| {
+                const base: u16 = vtx_base + @as(u16, @intCast(fi * 4));
+                for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |o| {
+                    std.mem.writeInt(u16, bin[io..][0..2], base + o, .little);
+                    io += 2;
+                }
+            }
+            vtx_base += 24;
+        }
+    }
+
     // ── JSON chunk ─────────────────────────────────────────────────────────────
     var json_aw: std.Io.Writer.Allocating = .init(alloc);
     defer json_aw.deinit();
     const w = &json_aw.writer;
+
+    // Mesh index layout: 0=ground, 1..4=turbine0..3, 5=rotor (shared)
+    const rotor_mesh_idx: u32 = 5;
+    // Accessor index layout:
+    //   ground: 0(pos),1(nrm),2(uv),3(idx)
+    //   turbine0..3: 4..19 (4 per turbine)
+    //   rotor: 20(pos),21(nrm),22(uv),23(idx)
+    const r_acc_pos: u32 = 4 + turbine_count * 4; // 20
+    const r_acc_nrm: u32 = r_acc_pos + 1; // 21
+    const r_acc_uv: u32 = r_acc_pos + 2; // 22
+    const r_acc_idx: u32 = r_acc_pos + 3; // 23
+    // BufferView index layout:
+    //   ground: 0..3, turbine0..3: 4..19, rotor: 20..23
+    const r_bv_pos: u32 = 4 + turbine_count * 4; // 20
+    const r_bv_nrm: u32 = r_bv_pos + 1;
+    const r_bv_uv: u32 = r_bv_pos + 2;
+    const r_bv_idx: u32 = r_bv_pos + 3;
 
     try w.writeAll("{\"asset\":{\"version\":\"2.0\"},\"scene\":0,");
     // scene: root nodes = ground (0) + 4 turbine roots (1..4)
     try w.writeAll("\"scenes\":[{\"nodes\":[0,1,2,3,4]}],");
 
     // nodes: ground(0), turbine0..3(1..4) with children rotor0..3(5..8)
+    // rotor nodes now have a mesh (the shared rotor mesh)
     try w.writeAll("\"nodes\":[");
     try w.writeAll("{\"mesh\":0,\"name\":\"ground\"},");
     for (0..turbine_count) |ti| {
@@ -1815,30 +1924,28 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
         const tx = turbine_x[ti];
         try w.print("{{\"mesh\":{d},\"name\":\"turbine{d}\",\"translation\":[{d:.1},0.0,0.0],\"children\":[{d}]}},", .{ ti + 1, ti, tx, ri });
     }
-    // rotor nodes (mesh-less hierarchy nodes for anim target)
+    // rotor nodes with blade mesh so node:rotorN.rotationZ spins visible geometry
     for (0..turbine_count) |ti| {
         if (ti < turbine_count - 1) {
-            try w.print("{{\"name\":\"rotor{d}\",\"translation\":[0.0,3.2,0.0]}},", .{ti});
+            try w.print("{{\"mesh\":{d},\"name\":\"rotor{d}\",\"translation\":[0.0,3.2,0.0]}},", .{ rotor_mesh_idx, ti });
         } else {
-            try w.print("{{\"name\":\"rotor{d}\",\"translation\":[0.0,3.2,0.0]}}", .{ti});
+            try w.print("{{\"mesh\":{d},\"name\":\"rotor{d}\",\"translation\":[0.0,3.2,0.0]}}", .{ rotor_mesh_idx, ti });
         }
     }
     try w.writeAll("],");
 
-    // meshes: ground + turbine0..3 (each one primitive, no TANGENT → parser generates)
+    // meshes: ground(0) + turbine0..3(1..4) + rotor(5, shared by all 4 rotor nodes)
     try w.writeAll("\"meshes\":[");
     try w.writeAll("{\"name\":\"ground\",\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]},");
     for (0..turbine_count) |ti| {
         const acc_base: u32 = @intCast(4 + ti * 4);
-        if (ti < turbine_count - 1) {
-            try w.print("{{\"name\":\"turbine{d}\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}},", .{ ti, acc_base, acc_base + 1, acc_base + 2, acc_base + 3 });
-        } else {
-            try w.print("{{\"name\":\"turbine{d}\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}}", .{ ti, acc_base, acc_base + 1, acc_base + 2, acc_base + 3 });
-        }
+        try w.print("{{\"name\":\"turbine{d}\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}},", .{ ti, acc_base, acc_base + 1, acc_base + 2, acc_base + 3 });
     }
+    // shared rotor mesh (3 blades as one primitive)
+    try w.print("{{\"name\":\"rotor\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}}", .{ r_acc_pos, r_acc_nrm, r_acc_uv, r_acc_idx });
     try w.writeAll("],");
 
-    // accessors: ground(0..3) + turbine0..3(4..19)
+    // accessors: ground(0..3) + turbine0..3(4..19) + rotor(20..23)
     try w.writeAll("\"accessors\":[");
     // ground accessors
     try w.print("{{\"bufferView\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{g_vc});
@@ -1853,9 +1960,14 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
         try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC2\"}}", .{ bv_base + 2, t_vc });
         try w.print(",{{\"bufferView\":{d},\"componentType\":5123,\"count\":{d},\"type\":\"SCALAR\"}}", .{ bv_base + 3, t_ic });
     }
+    // rotor accessors
+    try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}}", .{ r_bv_pos, r_vc });
+    try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}}", .{ r_bv_nrm, r_vc });
+    try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC2\"}}", .{ r_bv_uv, r_vc });
+    try w.print(",{{\"bufferView\":{d},\"componentType\":5123,\"count\":{d},\"type\":\"SCALAR\"}}", .{ r_bv_idx, r_ic });
     try w.writeAll("],");
 
-    // bufferViews: ground(0..3) + turbine0..3(4..19)
+    // bufferViews: ground(0..3) + turbine0..3(4..19) + rotor(20..23)
     try w.writeAll("\"bufferViews\":[");
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ g_pos_off, g_pos_len });
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ g_nrm_off, g_nrm_len });
@@ -1867,6 +1979,11 @@ pub fn windFarmGlb(alloc: Allocator) ![]u8 {
         try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ t_uv_off[ti], t_uv_len });
         try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}}", .{ t_idx_off[ti], t_idx_len });
     }
+    // rotor bufferViews
+    try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ r_pos_off, r_pos_len });
+    try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ r_nrm_off, r_nrm_len });
+    try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ r_uv_off, r_uv_len });
+    try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}}", .{ r_idx_off, r_idx_len });
     try w.writeAll("],");
 
     try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
@@ -1926,12 +2043,12 @@ test "windFarmGlb: 4 named turbine submeshes + 4 rotor nodes, parses" {
         if (std.mem.startsWith(u8, n, "turbine")) turbines += 1;
     }
     try testing.expectEqual(@as(usize, 4), turbines);
-    // rotor nodes: not in Model (parser flattens scene graph), assert via raw JSON
-    // Note: Model has no .nodes field; rotor nodes are mesh-less hierarchy nodes.
-    const json_len = std.mem.readInt(u32, glb[12..16], .little);
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len], .{});
+    // raw JSON parse for rotor nodes and hierarchy assertions
+    const json_len_val = std.mem.readInt(u32, glb[12..16], .little);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len_val], .{});
     defer parsed.deinit();
     const nodes = parsed.value.object.get("nodes").?.array.items;
+    // assert 4 rotor nodes exist
     var rotors: usize = 0;
     for (nodes) |n| {
         const name_val = n.object.get("name") orelse continue;
@@ -1939,4 +2056,29 @@ test "windFarmGlb: 4 named turbine submeshes + 4 rotor nodes, parses" {
         if (std.mem.startsWith(u8, name_val.string, "rotor")) rotors += 1;
     }
     try testing.expectEqual(@as(usize, 4), rotors);
+    // assert each rotor node has a mesh (blades under the rotor so rotationZ spins them)
+    for (nodes) |n| {
+        const name_val = n.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+        if (!std.mem.startsWith(u8, name_val.string, "rotor")) continue;
+        try testing.expect(n.object.get("mesh") != null);
+    }
+    // assert each turbine node's "children" includes its corresponding rotor node
+    // Node layout: ground=0, turbine0=1..turbine3=4, rotor0=5..rotor3=8
+    for (0..4) |ti| {
+        const turbine_node = nodes[1 + ti];
+        const children_val = turbine_node.object.get("children") orelse {
+            return error.TurbineHasNoChildren;
+        };
+        const children = children_val.array.items;
+        const expected_rotor_idx: i64 = @intCast(5 + ti);
+        var found = false;
+        for (children) |c| {
+            if (c == .integer and c.integer == expected_rotor_idx) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
 }
