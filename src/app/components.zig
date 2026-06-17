@@ -230,6 +230,66 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
     }).build();
 }
 
+/// verve.viz canvas render path demo — /viz-canvas. A ~1500-node procedural
+/// graph (deterministic jittered grid, index-seeded — no RNG at SSR) drawn to a
+/// single canvas2d via the VizGraphCanvas island. Pan/zoom/hover/select.
+pub fn vizCanvas(ctx: *const verve.Context) !*verve.Node {
+    const a = ctx.alloc();
+    const N: u32 = 1500;
+    const cols: u32 = 50;
+    const xs = try a.alloc(f64, N);
+    const ys = try a.alloc(f64, N);
+    var ef: std.ArrayList(u32) = .empty;
+    var et: std.ArrayList(u32) = .empty;
+    var i: u32 = 0;
+    while (i < N) : (i += 1) {
+        const col = i % cols;
+        const row = i / cols;
+        const hsh = (i *% 2654435761) >> 16;
+        const jx: f64 = @as(f64, @floatFromInt(hsh % 17)) - 8;
+        const jy: f64 = @as(f64, @floatFromInt((hsh / 17) % 17)) - 8;
+        xs[i] = @as(f64, @floatFromInt(col)) * 22 + jx;
+        ys[i] = @as(f64, @floatFromInt(row)) * 22 + jy;
+        if (i > 0) {
+            try ef.append(a, i);
+            try et.append(a, i - 1);
+        }
+        if (i >= cols) {
+            try ef.append(a, i);
+            try et.append(a, i - cols);
+        }
+    }
+    const props = try verve.encodeProps(ctx, islands.VizGraphCanvas.Props{
+        .xs = xs,
+        .ys = ys,
+        .ef = ef.items,
+        .et = et.items,
+    });
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "vizcanvas-canvas")
+            .attr("width", "640")
+            .attr("height", "420")
+            .attr("z-on-pointerdown", "vizcanvas_pointerdown")
+            .attr("z-on-pointermove", "vizcanvas_pointermove")
+            .attr("z-on-pointerup", "vizcanvas_pointerup")
+            .attr("z-on-wheel", "vizcanvas_wheel")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:32/21;display:block;background:#0d1117;border-radius:8px;touch-action:none;cursor:grab;"),
+    });
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Large graph — canvas2d render path"),
+        canvas,
+    });
+    const island = verve.island(ctx, .{ .name = "VizGraphCanvas", .props = props }, inner);
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.viz — canvas render"),
+        ctx.p().text("A ~1500-node graph drawn to a single canvas2d (vs the SVG-DOM " ++
+            "path): one batched draw call per frame. Drag to pan, wheel to zoom, " ++
+            "hover/click a node to highlight."),
+        island,
+    });
+}
+
 pub fn counter(ctx: *const verve.Context, initial: i32) !*verve.Node {
     return ctx.div().class("counter-card").children(.{
         ctx.h1("Verve Counter"),

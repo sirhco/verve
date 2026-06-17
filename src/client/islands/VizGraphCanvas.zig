@@ -5,7 +5,7 @@
 //! arrives as props; the chunk only renders + interacts.
 const std = @import("std");
 const verve = @import("verve");
-const cbuf = verve.viz.canvas_buf;
+const cbuf = verve.viz_core.canvas_buf;
 
 extern "verve_runtime" fn viz_canvas_draw(ref_handle: i32, ptr: [*]const u8, len: u32) void;
 
@@ -130,4 +130,89 @@ export fn vizcanvas_tick() i32 {
     const len = cbuf.pack(&draw_buf, hdr, xs[0..n], ys[0..n], ef[0..e], et[0..e]);
     viz_canvas_draw(h, &draw_buf, len);
     return 1; // keep the loop alive (interaction redraws)
+}
+
+// ── interaction (pan/zoom/hover/select via hit-test) ─────────────────────────
+
+/// Client (clientX/Y) → world graph coords, via the canvas rect + camera. The
+/// draw transform works in CSS-pixel space (VIEW_W/H); `refRect` is CSS px.
+fn clientToWorld(cx: f64, cy: f64, wx: *f64, wy: *f64) bool {
+    const h = canvas_handle orelse return false;
+    const r = verve.refRect(h);
+    if (r.w <= 0 or r.h <= 0) return false;
+    const px = (cx - r.x) / r.w * VIEW_W;
+    const py = (cy - r.y) / r.h * VIEW_H;
+    wx.* = (px - cam_x) / scale;
+    wy.* = (py - cam_y) / scale;
+    return true;
+}
+
+/// Nearest node within ~NODE_R (world units) of (wx,wy); -1 if none.
+fn pick(wx: f64, wy: f64) i32 {
+    const rr = (@as(f64, NODE_R) / scale) * (@as(f64, NODE_R) / scale) + 4;
+    var best: i32 = -1;
+    var bestd: f64 = rr;
+    for (0..n) |i| {
+        const dx = @as(f64, xs[i]) - wx;
+        const dy = @as(f64, ys[i]) - wy;
+        const d = dx * dx + dy * dy;
+        if (d <= bestd) {
+            bestd = d;
+            best = @intCast(i);
+        }
+    }
+    return best;
+}
+
+export fn vizcanvas_pointerdown() void {
+    if (verve.eventButton() != 0) return; // primary button only
+    verve.eventCapturePointer();
+    var wx: f64 = 0;
+    var wy: f64 = 0;
+    if (!clientToWorld(verve.eventCoordX(), verve.eventCoordY(), &wx, &wy)) return;
+    const hit = pick(wx, wy);
+    if (hit >= 0) {
+        select = hit;
+    } else {
+        panning = true;
+        last_x = verve.eventCoordX();
+        last_y = verve.eventCoordY();
+    }
+}
+
+export fn vizcanvas_pointermove() void {
+    const cx = verve.eventCoordX();
+    const cy = verve.eventCoordY();
+    if (panning) {
+        const h = canvas_handle orelse return;
+        const r = verve.refRect(h);
+        if (r.w <= 0) return;
+        cam_x += @floatCast((cx - last_x) / r.w * VIEW_W);
+        cam_y += @floatCast((cy - last_y) / r.h * VIEW_H);
+        last_x = cx;
+        last_y = cy;
+        return;
+    }
+    var wx: f64 = 0;
+    var wy: f64 = 0;
+    if (clientToWorld(cx, cy, &wx, &wy)) hover = pick(wx, wy);
+}
+
+export fn vizcanvas_pointerup() void {
+    panning = false;
+}
+
+export fn vizcanvas_wheel() void {
+    var wx: f64 = 0;
+    var wy: f64 = 0;
+    if (!clientToWorld(verve.eventCoordX(), verve.eventCoordY(), &wx, &wy)) return;
+    // world point under the cursor, in canvas px:
+    const px = wx * scale + cam_x;
+    const py = wy * scale + cam_y;
+    const factor = std.math.exp(-verve.eventDeltaY() * 0.001);
+    const nz = clampf(@as(f64, scale) * factor, MIN_Z, MAX_Z);
+    scale = @floatCast(nz);
+    // keep (wx,wy) under the same canvas px:
+    cam_x = @floatCast(px - wx * nz);
+    cam_y = @floatCast(py - wy * nz);
 }

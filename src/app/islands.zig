@@ -50,6 +50,22 @@ pub const VizGraph = struct {
     };
 };
 
+/// verve.viz canvas render path (phase 3). SSR emits `<canvas
+/// data-ref="vizcanvas-canvas">`; the chunk renders a large node-link graph to
+/// canvas2d (one batched draw call/frame) with pan/zoom/hover/select via
+/// hit-test. Source: `src/client/islands/VizGraphCanvas.zig`.
+pub const VizGraphCanvas = struct {
+    pub const props_schema: []const u8 = "{\"xs\":\"f64[]\",\"ys\":\"f64[]\",\"ef\":\"u32[]\",\"et\":\"u32[]\"}";
+
+    /// Positional codec — must match `VizGraphCanvas.zig`'s `Props` order/types.
+    pub const Props = struct {
+        xs: []const f64,
+        ys: []const f64,
+        ef: []const u32,
+        et: []const u32,
+    };
+};
+
 /// ScrollSmoother probe — streams native vs smoothed scroll position into
 /// signals (verve_sm_get end-to-end). Source: `src/client/islands/SmoothDemo.zig`.
 pub const SmoothDemo = struct {
