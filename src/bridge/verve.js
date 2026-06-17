@@ -4301,6 +4301,33 @@
     return "{}";
   };
 
+  // WebSocket hub binding (full-duplex push over /push-ws).
+  const verveWsSockets = new Map(); // channel → { ws, queue: string[], sub }
+  window.verveHost.verveWsConnect = (argsJson) => {
+    const a = JSON.parse(argsJson); // { channel, island, export }
+    if (verveWsSockets.has(a.channel)) return; // idempotent
+    const entry = { ws: null, queue: [], sub: a };
+    verveWsSockets.set(a.channel, entry);
+    const wsBase = location.origin.replace(/^http/, "ws");
+    let backoff = 1000;
+    const open = () => {
+      const ws = new WebSocket(wsBase + "/push-ws?channel=" + encodeURIComponent(a.channel));
+      entry.ws = ws;
+      ws.onopen = () => { backoff = 1000; const q = entry.queue; entry.queue = []; for (const m of q) ws.send(m); };
+      ws.onmessage = (e) => { callIslandExport(a.island, a.export, typeof e.data === "string" ? e.data : ""); };
+      ws.onclose = () => { entry.ws = null; setTimeout(open, backoff); backoff = Math.min(backoff * 2, 15000); };
+      ws.onerror = () => { try { ws.close(); } catch (_) {} };
+    };
+    open();
+  };
+  window.verveHost.verveWsSend = (argsJson) => {
+    const a = JSON.parse(argsJson); // { channel, text }
+    const entry = verveWsSockets.get(a.channel);
+    if (!entry) return;
+    if (entry.ws && entry.ws.readyState === 1) entry.ws.send(a.text);
+    else entry.queue.push(a.text);
+  };
+
   // Generic JS-driven animation loop for island chunks: `{island, export,
   // on}`. Each frame calls the chunk's NAMED export `fn () i32` (vid-scoped)
   // and continues while it returns nonzero — so a chunk can animate without
