@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.16] - 2026-06-17
+
 ### Added
 
 - **WebSocket hub binding** (`src/server/push.zig`, `src/server/main.zig`,
@@ -3433,7 +3435,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.15...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.16...HEAD
+[0.5.16]: https://github.com/sirhco/verve/compare/v0.5.15...v0.5.16
 [0.5.15]: https://github.com/sirhco/verve/compare/v0.5.14...v0.5.15
 [0.5.14]: https://github.com/sirhco/verve/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/sirhco/verve/compare/v0.5.12...v0.5.13
