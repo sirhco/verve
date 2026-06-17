@@ -259,6 +259,30 @@ pub fn vizCanvas(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// WebSocket hub demo — /ws-demo. Type a message → re-published over the
+/// "ws-demo" push channel via WS → broadcast to every connected tab.
+pub fn wsDemo(ctx: *const verve.Context) !*verve.Node {
+    const card = ctx.section().class("card").children(.{
+        ctx.h2("WebSocket hub — broadcast"),
+        ctx.el("input")
+            .attr("data-ref", "wsdemo-input")
+            .attr("placeholder", "type a message…")
+            .attr("style", "width:70%;padding:6px;margin-right:6px;"),
+        ctx.el("button").attr("z-on-click", "wsdemo_send").text("Send"),
+        ctx.el("pre")
+            .attr("data-ref", "wsdemo-log")
+            .attr("style", "min-height:160px;margin-top:10px;background:#0d1117;color:#d5d5d5;padding:10px;border-radius:6px;white-space:pre-wrap;"),
+    });
+    const island = verve.island(ctx, .{ .name = "WsDemo" }, card);
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve — WebSocket hub"),
+        ctx.p().text("Full-duplex over one socket: a message you send re-publishes " ++
+            "to the channel and fans out to every connected tab (incl. this one). " ++
+            "Open /ws-demo in two tabs to see it broadcast."),
+        island,
+    });
+}
+
 pub fn counter(ctx: *const verve.Context, initial: i32) !*verve.Node {
     return ctx.div().class("counter-card").children(.{
         ctx.h1("Verve Counter"),

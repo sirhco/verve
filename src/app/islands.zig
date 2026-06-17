@@ -60,6 +60,13 @@ pub const VizGraphCanvas = struct {
     pub const props_schema: []const u8 = "{}";
 };
 
+/// WebSocket hub demo (/ws-demo). Full-duplex push over /push-ws: a message sent
+/// in one tab broadcasts to every connected tab. Source:
+/// `src/client/islands/WsDemo.zig`.
+pub const WsDemo = struct {
+    pub const props_schema: []const u8 = "{}";
+};
+
 /// ScrollSmoother probe — streams native vs smoothed scroll position into
 /// signals (verve_sm_get end-to-end). Source: `src/client/islands/SmoothDemo.zig`.
 pub const SmoothDemo = struct {
