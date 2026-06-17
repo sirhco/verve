@@ -7,24 +7,20 @@ const verve = @import("verve");
 pub fn index(ctx: *const verve.Context) !*verve.Node {
     try ctx.setTitle("Mission Control — Wind Farm");
 
-    // Canvas element: CSS-sized, no width/height attrs to avoid resize loop.
-    // The FarmScene chunk sets the backing-store size from clientWidth×dpr.
     const canvas = ctx.el("canvas")
         .attr("data-ref", "farmscene-canvas")
-        .attr("style", "display:block;width:100%;height:100%")
+        .attr("width", "960")
+        .attr("height", "540")
+        .attr("style", "width:100%;max-width:960px;aspect-ratio:16/9;display:block;background:#121420;border-radius:8px;touch-action:none;")
         .attr("z-on-pointerdown", "farmscene_pointerdown")
         .attr("z-on-pointermove", "farmscene_pointermove")
         .attr("z-on-pointerup", "farmscene_pointerup")
         .attr("z-on-wheel", "farmscene_wheel");
 
-    const canvas_wrap = ctx.div()
-        .attr("style", "position:relative;display:block;width:100%;aspect-ratio:16/9;max-height:70vh");
-    _ = canvas_wrap.children(.{canvas});
-
     const inner = ctx.main_().class("mc-main").children(.{
         ctx.h1("Mission Control"),
         ctx.p().class("hint").text("Wind farm — drag to orbit, scroll to zoom."),
-        canvas_wrap,
+        canvas,
     });
 
     return verve.island(ctx, .{ .name = "FarmScene" }, inner);
