@@ -38,6 +38,7 @@ const delta_mod = @import("delta.zig");
 const sankey_mod = @import("sankey.zig");
 const treemap_mod = @import("treemap.zig");
 const chord_mod = @import("chord.zig");
+const canvas_buf_mod = @import("canvas_buf.zig");
 
 // ---- geometry ----
 pub const Vec2 = geom.Vec2;
@@ -143,6 +144,10 @@ pub const forceInit = force_mod.init;
 pub const interact = interact_mod;
 pub const View = interact_mod.View;
 
+// ---- canvas render path ----
+/// Frozen draw-buffer layout shared with `verve.js`'s `viz_canvas_draw`.
+pub const canvas_buf = @import("canvas_buf.zig");
+
 test {
     _ = geom;
     _ = scale;
@@ -160,5 +165,6 @@ test {
     _ = sankey_mod;
     _ = treemap_mod;
     _ = chord_mod;
+    _ = canvas_buf_mod;
     _ = @import("layout/common.zig");
 }
