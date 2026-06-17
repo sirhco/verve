@@ -6,6 +6,24 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.17] - 2026-06-17
+
+### Added
+
+- **gl skeletal skinning — slice 8** (`src/client/islands/GlSkin.zig`,
+  `src/app/components.zig`, `src/core/gl/math.zig`): three chunk-side playback
+  features on `/gl-skin`, no bridge/asset/format/shader/wire change.
+  **Ping-pong** — `loop: bool` becomes `PlayMode { loop, once, pingpong }` with a
+  `clipTime(elapsed, dur)` helper (triangle wave for ping-pong) that all clip-time
+  computations route through; button **Ping-Pong**. **True additive** — a
+  `blend_additive` flag (default off = identical to slice-7 Mix); when on, the other
+  clip's delta-from-its-rest (`t=0`) is applied on top of the base pose (T/S add, R
+  via `slerp(identity, otherₜ·conj(other₀), w)`), needing a new pure `Quat.conjugate`
+  in `gl/math.zig`; buttons **Mix** / **Additive**. **Blend masks** — per-joint
+  `jw = (mask_root and j==0) ? 0 : mix_weight` gates both blend paths so a masked
+  joint holds its base pose; buttons **Mask: All** / **Mask: Upper**. Unit-tested
+  (ping-pong triangle wave + `Quat.conjugate` round-trip). Deferred: CUBICSPLINE.
+
 ## [0.5.16] - 2026-06-17
 
 ### Added
