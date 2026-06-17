@@ -200,6 +200,94 @@ pub fn streamChannel(
     body_writer.end() catch {};
 }
 
+// ---- WebSocket binding ---------------------------------------------------
+//
+// Full-duplex variant of `streamChannel`. A per-connection broadcaster
+// thread drains the channel server→client (reusing `nextBatch`/`copyMessage`
+// exactly as the SSE loop does); the request thread runs a read loop that
+// re-publishes every inbound text/binary frame back into the same channel,
+// so any other subscriber (SSE or WS) sees it. The write mutex serializes
+// frames even though the broadcaster is the only writer — it mirrors the
+// `/ws` chat handler and keeps the door open for a future second writer.
+
+const WsPushCtx = struct {
+    io: std.Io,
+    ws: *std.http.Server.WebSocket,
+    c: *Channel,
+    write_mu: *std.atomic.Mutex,
+    shutdown: *std.atomic.Value(bool),
+};
+
+fn wsBroadcastLoop(ctx: *WsPushCtx) void {
+    const c = ctx.c;
+    var last_sent: u64 = c.head.load(.acquire);
+    var msg_buf: [MSG_MAX]u8 = undefined;
+    outer: while (!ctx.shutdown.load(.acquire)) {
+        const head = c.head.load(.acquire);
+        const batch = nextBatch(head, last_sent);
+        if (batch.resync) {
+            last_sent = head;
+        } else {
+            var seq = batch.first;
+            while (seq <= batch.last) : (seq += 1) {
+                const len = copyMessage(c, seq, &msg_buf) orelse {
+                    // Overwritten under us — force a resync pass next round.
+                    last_sent = if (head > RING) head - RING - 1 else 0;
+                    continue :outer;
+                };
+                while (!ctx.write_mu.tryLock()) std.atomic.spinLoopHint();
+                ctx.ws.writeMessage(msg_buf[0..len], .text) catch {
+                    ctx.write_mu.unlock();
+                    return;
+                };
+                ctx.write_mu.unlock();
+                last_sent = seq;
+            }
+        }
+        std.Io.sleep(ctx.io, PUSH_TICK, .awake) catch return;
+    }
+}
+
+/// Long-lived full-duplex WebSocket loop for one subscriber. The broadcaster
+/// thread streams the channel server→client; the request thread re-publishes
+/// inbound frames. Runs until the client disconnects (read fails).
+pub fn streamChannelWs(
+    io: std.Io,
+    request: *std.http.Server.Request,
+    channel_name: []const u8,
+    key: []const u8,
+) !void {
+    const c = channelFor(channel_name) orelse return error.BadChannel;
+
+    var ws = try request.respondWebSocket(.{ .key = key });
+    try ws.flush();
+
+    _ = c.subs.fetchAdd(1, .monotonic);
+    defer _ = c.subs.fetchSub(1, .monotonic);
+
+    var write_mu: std.atomic.Mutex = .unlocked;
+    var shutdown: std.atomic.Value(bool) = .init(false);
+
+    var ctx = WsPushCtx{
+        .io = io,
+        .ws = &ws,
+        .c = c,
+        .write_mu = &write_mu,
+        .shutdown = &shutdown,
+    };
+    const broadcaster = try std.Thread.spawn(.{}, wsBroadcastLoop, .{&ctx});
+    defer {
+        shutdown.store(true, .release);
+        broadcaster.join();
+    }
+
+    while (true) {
+        const msg = ws.readSmallMessage() catch break;
+        if (msg.opcode != .text and msg.opcode != .binary) continue;
+        _ = publish(channel_name, msg.data);
+    }
+}
+
 fn flush(w: *std.http.BodyWriter) !void {
     try w.writer.flush();
     try w.flush();
