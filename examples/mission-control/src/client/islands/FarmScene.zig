@@ -33,7 +33,7 @@ const fov_y: f32 = 1.0;
 const spin_rate: f32 = 1.2; // rotor0 rotationZ rad/s
 const vmesh_url = "/gl/windfarm.vmesh";
 
-// Pivot points for rotor0..3 (submesh indices 4..7). Derived once from the
+// Pivot points for rotor0..3 (submesh indices 5..8). Derived once from the
 // AABB center of each rotor submesh's baked vertex positions (see
 // computeRotorPivots). No hardcoded positions — the actual baked geometry
 // determines the hub location exactly.
@@ -136,12 +136,12 @@ fn submeshAabbCenter(a: *const gl.vmesh.Reader, sub_idx: u32) gl.math.Vec3 {
     );
 }
 
-/// Compute and cache pivots for rotor submeshes 4..7.
+/// Compute and cache pivots for rotor submeshes 5..8.
 fn computeRotorPivots(a: *const gl.vmesh.Reader) void {
     if (pivots_computed) return;
     var ri: u32 = 0;
     while (ri < 4) : (ri += 1) {
-        rotor_pivots[ri] = submeshAabbCenter(a, 4 + ri);
+        rotor_pivots[ri] = submeshAabbCenter(a, 5 + ri);
     }
     pivots_computed = true;
 }
@@ -190,7 +190,7 @@ export fn farmscene_vmesh_ready(ptr: u32, len: u32) void {
         node_rot = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
         node_rot_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
         // Derive rotor pivot points from baked geometry before first frame.
-        if (a.submesh_count >= 8) computeRotorPivots(a);
+        if (a.submesh_count >= 9) computeRotorPivots(a);
         scene_built = true;
     }
 }
@@ -302,14 +302,22 @@ export fn farmscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         while (s < a.submesh_count) : (s += 1) {
             if (s >= max_submesh) break;
             const sub = a.submesh(s);
-            // Rotor submeshes are indices 4..7 (rotor0..3). Their blade vertices
-            // were baked by the gltf parser to world positions. A plain scene
-            // rotation would spin them about the world origin. Build
-            // T(pivot)·Rz(theta)·T(-pivot) so rotation pivots at the hub, where
-            // pivot is derived from the AABB center of the baked vertex positions.
+            // Identify rotor submeshes by name (starts with "rotor") so the
+            // correct set is always rotor0..3 = submeshes 5..8 regardless of
+            // ordering. Fall back to index range 5..8 when the vmesh carries no
+            // names. Their blade vertices were baked by the gltf parser to world
+            // positions. A plain scene rotation would spin them about the world
+            // origin. Build T(pivot)·Rz(theta)·T(-pivot) so rotation pivots at
+            // the hub, where pivot is derived from the AABB center of the baked
+            // vertex positions.
+            const nm = a.name(s);
+            const is_rotor = if (nm.len > 0)
+                std.mem.startsWith(u8, nm, "rotor")
+            else
+                (s >= 5 and s <= 8);
             const world_s: gl.math.Mat4 = blk: {
-                if (scene_built and s >= 4 and s <= 7) {
-                    const ri = s - 4; // rotor index 0..3
+                if (scene_built and is_rotor) {
+                    const ri = s - 5; // rotor index 0..3
                     const hub = rotor_pivots[ri];
                     const neg_hub = gl.math.Vec3.init(-hub.x, -hub.y, -hub.z);
                     const theta = elapsed_s * spin_rate;
