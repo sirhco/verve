@@ -905,11 +905,21 @@ pub fn glSkin(ctx: *const verve.Context) !*verve.Node {
         .attr("z-on-pointerup", "glskin_scrub_up")
         .attr("style", "width:100%;max-width:640px;height:18px;margin-top:6px;background:#222636;border-radius:4px;cursor:ew-resize;touch-action:none;");
 
+    // Mix track: drag 0→100% to blend the current clip with the next clip
+    // (pointer-drag → glskin_mix_* exports). Inside the island subtree.
+    const mix = ctx.div().class("gl-mix")
+        .attr("data-ref", "glskin-mix")
+        .attr("z-on-pointerdown", "glskin_mix_down")
+        .attr("z-on-pointermove", "glskin_mix_move")
+        .attr("z-on-pointerup", "glskin_mix_up")
+        .attr("style", "width:100%;max-width:640px;height:18px;margin-top:6px;background:#2a2236;border-radius:4px;cursor:ew-resize;touch-action:none;");
+
     const inner = ctx.section().class("card").children(.{
         ctx.h2("Skinned bar — multiple clips + controls"),
         canvas,
         controls,
         track,
+        mix,
     });
     const demo_island = verve.island(ctx, .{ .name = "GlSkin" }, inner);
 
