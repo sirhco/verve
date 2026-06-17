@@ -352,6 +352,24 @@ fn handleRequest(
         return;
     }
 
+    if (std.mem.eql(u8, path, "/push-ws")) {
+        const channel = queryParam(target, "channel") orelse "";
+        if (!push.validName(channel)) {
+            try renderError(gpa, io, request, .bad_request, "Missing or invalid ?channel= (1-32 chars, [A-Za-z0-9_-]).");
+            return;
+        }
+        const upgrade = request.upgradeRequested();
+        if (upgrade != .websocket or upgrade.websocket == null) {
+            try renderError(gpa, io, request, .bad_request, "WebSocket upgrade required.");
+            return;
+        }
+        push.streamChannelWs(io, request, channel, upgrade.websocket.?) catch |err| switch (err) {
+            error.BadChannel => {},
+            else => return err,
+        };
+        return;
+    }
+
     if (std.mem.eql(u8, path, "/ws")) {
         const upgrade = request.upgradeRequested();
         if (upgrade != .websocket or upgrade.websocket == null) {
