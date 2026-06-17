@@ -2,7 +2,8 @@
 //! continuous rotor spin. Single-instance, no IBL, no shadow map.
 //!
 //! Scene graph: root "model" (node 0) → submesh nodes (node s+1, all children
-//! of root). Rotor0 is submesh 5; `node_rot[5][2]` (rotationZ) spins it.
+//! of root). Submesh ordering: ground=0, turbine0..3=1..4, rotor0..3=5..8.
+//! `node_rot[5..8][2]` (rotationZ) spins all 4 rotors.
 
 const verve = @import("verve");
 const gl = verve.gl;
@@ -168,9 +169,13 @@ export fn farmscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
     const eye = orbit.eye();
     camera_pos = .{ eye.x, eye.y, eye.z };
 
-    // Advance rotor0 (submesh 5) rotationZ.
+    // Advance rotor0..3 (submeshes 5..8) rotationZ.
+    // Ordering: ground=0, turbine0..3=1..4, rotor0..3=5..8.
     if (scene_built) {
         node_rot[5][2] = elapsed_s * spin_rate;
+        node_rot[6][2] = elapsed_s * spin_rate;
+        node_rot[7][2] = elapsed_s * spin_rate;
+        node_rot[8][2] = elapsed_s * spin_rate;
 
         // Sync node rotations into scene graph.
         var n: u32 = 0;
