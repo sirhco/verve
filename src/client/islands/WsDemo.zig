@@ -39,7 +39,7 @@ export fn wsdemo_send() void {
     @memcpy(json[0..prefix.len], prefix);
     var w: usize = prefix.len;
     for (val) |ch| {
-        if (w + 2 >= json.len) break;
+        if (w + 4 >= json.len) break; // reserve room for an escaped pair + the 2-byte suffix
         if (ch == '"' or ch == '\\') {
             json[w] = '\\';
             json[w + 1] = ch;
