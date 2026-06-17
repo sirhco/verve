@@ -40,6 +40,8 @@ var cur_clip: u32 = 0;
 var paused: bool = false;
 var speed: f32 = 1.0;
 var loop: bool = true; // playback mode: true = loop, false = play-once (clamp at end)
+var scrubbing: bool = false;
+var track_handle: ?i32 = null;
 // Cross-fade (slice 4): on a clip switch, snapshot the old clip + its looped time
 // (FROZEN), and blend old→new pose over `fade_dur` real-time seconds. `pending_clip`
 // is set by the control exports and applied in updateBones (which has the Reader).
@@ -108,8 +110,10 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     from_time = 0;
     fade_t = fade_dur;
     pending_clip = -1;
+    scrubbing = false;
     use_webgpu = gl_webgpu_available() != 0;
     canvas_handle = verve.queryRef(@as([]const u8, "glskin-canvas"));
+    track_handle = verve.queryRef(@as([]const u8, "glskin-track"));
 
     if (canvas_handle) |h| {
         if (use_webgpu)
@@ -255,6 +259,38 @@ export fn glskin_loop() void {
 }
 export fn glskin_once() void {
     loop = false;
+}
+
+// ── scrub (slice 6): pointer-drag the track to set clip time ─────────────────────
+
+/// Map the active pointer's X (relative to the scrub track's rect) → elapsed_s
+/// for the current clip. No-ops if the track ref / clip / rect is unavailable.
+fn scrubApply() void {
+    const th = track_handle orelse return;
+    const a = if (asset) |*r| r else return;
+    const ccount = a.animClipCount();
+    if (ccount == 0) return;
+    const r = verve.refRect(th);
+    if (r.w <= 0) return;
+    const fx = (verve.eventCoordX() - r.x) / r.w;
+    const frac: f32 = @floatCast(std.math.clamp(fx, 0, 1));
+    const clip = if (cur_clip < ccount) cur_clip else 0;
+    elapsed_s = frac * a.animClip(clip).duration;
+}
+
+export fn glskin_scrub_down() void {
+    if (verve.eventButton() != 0) return; // primary button only
+    scrubbing = true;
+    paused = true; // scrubbing pauses playback
+    verve.eventCapturePointer();
+    scrubApply();
+}
+export fn glskin_scrub_move() void {
+    if (!scrubbing) return;
+    scrubApply();
+}
+export fn glskin_scrub_up() void {
+    scrubbing = false;
 }
 
 // ── frame export ──────────────────────────────────────────────────────────────
