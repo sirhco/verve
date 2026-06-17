@@ -6,14 +6,17 @@
 //!
 //! Rotor spin: the gltf parser BAKES each node's world transform into vertex
 //! positions. Rotor blade vertices are authored hub-local (hub at origin), but
-//! after baking the world matrix T(tx,0,0)·T(0,6,0.3) their positions are
-//! stored at world offset (tx, 6, 0.3). A plain scene-node rotation would
-//! rotate those pre-offset vertices about the world origin (wrong — they'd
-//! orbit). Instead, each rotor's model matrix is built as:
-//!   T(hub) · Rz(theta) · T(-hub)
-//! which translates the baked vertices back to the local origin, rotates, then
-//! returns them to the hub — so blades spin in place at their tower top.
+//! after baking the world matrix the positions are stored at the world offset
+//! of the hub. A plain scene-node rotation would rotate those pre-offset
+//! vertices about the world origin (wrong — they'd orbit). Instead, each
+//! rotor's model matrix is built as:
+//!   T(pivot) · Rz(theta) · T(-pivot)
+//! where pivot = AABB center of that rotor submesh's baked vertices (derived
+//! once from the vmesh data; no hardcoded positions). This translates the
+//! baked vertices back to the local origin, rotates, then returns them — so
+//! blades spin in place centred on their tower top.
 
+const std = @import("std");
 const verve = @import("verve");
 const gl = verve.gl;
 
@@ -30,15 +33,12 @@ const fov_y: f32 = 1.0;
 const spin_rate: f32 = 1.2; // rotor0 rotationZ rad/s
 const vmesh_url = "/gl/windfarm.vmesh";
 
-// Hub world positions for rotor0..3 (baked by the gltf parser into blade verts).
-// turbine X positions: -12, -4, +4, +12; nacelle Y=6.0, Z=0.3.
-// Used to build T(hub)·Rz·T(-hub) pivot matrices (see file-level comment).
-const rotor_hub = [4]gl.math.Vec3{
-    gl.math.Vec3.init(-12, 6.0, 0.3),
-    gl.math.Vec3.init(-4, 6.0, 0.3),
-    gl.math.Vec3.init(4, 6.0, 0.3),
-    gl.math.Vec3.init(12, 6.0, 0.3),
-};
+// Pivot points for rotor0..3 (submesh indices 4..7). Derived once from the
+// AABB center of each rotor submesh's baked vertex positions (see
+// computeRotorPivots). No hardcoded positions — the actual baked geometry
+// determines the hub location exactly.
+var rotor_pivots: [4]gl.math.Vec3 = [_]gl.math.Vec3{gl.math.Vec3.init(0, 0, 0)} ** 4;
+var pivots_computed: bool = false;
 const frame_export = "farmscene_frame";
 const vmesh_ready_export = "farmscene_vmesh_ready";
 
@@ -99,6 +99,53 @@ var light: [8]f32 = .{ 0, 3.0, -0.4, -0.7, -0.6, 1, 1, 1 };
 
 var cmd_buf: [2048]u8 = undefined;
 
+// ── pivot helpers ─────────────────────────────────────────────────────────────
+
+/// Compute the AABB center of a rotor submesh's baked vertex positions.
+/// Walk every index in the submesh's index range, read pos.xyz from the
+/// stride-48 vertex buffer (pos = first 3 × f32 at offset 0), track
+/// min/max → center = (min+max)/2. Runs once after asset load.
+fn submeshAabbCenter(a: *const gl.vmesh.Reader, sub_idx: u32) gl.math.Vec3 {
+    const sub = a.submesh(sub_idx);
+    var min_x: f32 = std.math.floatMax(f32);
+    var min_y: f32 = std.math.floatMax(f32);
+    var min_z: f32 = std.math.floatMax(f32);
+    var max_x: f32 = -std.math.floatMax(f32);
+    var max_y: f32 = -std.math.floatMax(f32);
+    var max_z: f32 = -std.math.floatMax(f32);
+    const stride: usize = a.vertexStride();
+    var k: u32 = 0;
+    while (k < sub.index_count) : (k += 1) {
+        const idx_off: usize = @as(usize, sub.index_byte_off) + @as(usize, k) * 2;
+        const vi: usize = std.mem.readInt(u16, a.indices[idx_off..][0..2], .little);
+        const voff: usize = vi * stride;
+        const px: f32 = @bitCast(std.mem.readInt(u32, a.vertices[voff + 0 ..][0..4], .little));
+        const py: f32 = @bitCast(std.mem.readInt(u32, a.vertices[voff + 4 ..][0..4], .little));
+        const pz: f32 = @bitCast(std.mem.readInt(u32, a.vertices[voff + 8 ..][0..4], .little));
+        if (px < min_x) min_x = px;
+        if (py < min_y) min_y = py;
+        if (pz < min_z) min_z = pz;
+        if (px > max_x) max_x = px;
+        if (py > max_y) max_y = py;
+        if (pz > max_z) max_z = pz;
+    }
+    return gl.math.Vec3.init(
+        (min_x + max_x) * 0.5,
+        (min_y + max_y) * 0.5,
+        (min_z + max_z) * 0.5,
+    );
+}
+
+/// Compute and cache pivots for rotor submeshes 4..7.
+fn computeRotorPivots(a: *const gl.vmesh.Reader) void {
+    if (pivots_computed) return;
+    var ri: u32 = 0;
+    while (ri < 4) : (ri += 1) {
+        rotor_pivots[ri] = submeshAabbCenter(a, 4 + ri);
+    }
+    pivots_computed = true;
+}
+
 // ── hydrate ───────────────────────────────────────────────────────────────────
 
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
@@ -125,6 +172,7 @@ export fn farmscene_vmesh_ready(ptr: u32, len: u32) void {
     if (ptr == 0) return;
     const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
     asset = gl.vmesh.Reader.init(bytes) catch null;
+    pivots_computed = false;
     if (asset) |*a| {
         scene = .{};
         _ = scene.addNode(-1, "model");
@@ -141,6 +189,8 @@ export fn farmscene_vmesh_ready(ptr: u32, len: u32) void {
         }
         node_rot = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
         node_rot_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
+        // Derive rotor pivot points from baked geometry before first frame.
+        if (a.submesh_count >= 8) computeRotorPivots(a);
         scene_built = true;
     }
 }
@@ -253,13 +303,14 @@ export fn farmscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             if (s >= max_submesh) break;
             const sub = a.submesh(s);
             // Rotor submeshes are indices 4..7 (rotor0..3). Their blade vertices
-            // were baked by the gltf parser to world positions (tx, 6, 0.3) + hub-local
-            // offset. A plain scene rotation would spin them about the world origin.
-            // Build T(hub)·Rz(theta)·T(-hub) so rotation pivots at the hub.
+            // were baked by the gltf parser to world positions. A plain scene
+            // rotation would spin them about the world origin. Build
+            // T(pivot)·Rz(theta)·T(-pivot) so rotation pivots at the hub, where
+            // pivot is derived from the AABB center of the baked vertex positions.
             const world_s: gl.math.Mat4 = blk: {
                 if (scene_built and s >= 4 and s <= 7) {
                     const ri = s - 4; // rotor index 0..3
-                    const hub = rotor_hub[ri];
+                    const hub = rotor_pivots[ri];
                     const neg_hub = gl.math.Vec3.init(-hub.x, -hub.y, -hub.z);
                     const theta = elapsed_s * spin_rate;
                     const qz = gl.math.Quat.fromAxisAngle(z_axis, theta);
