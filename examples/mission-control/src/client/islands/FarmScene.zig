@@ -42,8 +42,17 @@ var asset: ?gl.vmesh.Reader = null;
 var scene_built: bool = false;
 var elapsed_s: f32 = 0;
 
-// Orbit camera
-var orbit: gl.orbit.Orbit = .{ .distance = 20, .pitch = 0.35, .yaw = 0.4 };
+// Orbit camera — framed to show all 4 turbines (farm spans X ∈ [-14,14], Y ∈ [0,6]).
+// target=(0,3,0) centers on nacelle height; distance=38 fits the ~28-unit wide farm
+// comfortably inside fov_y=1.0; yaw=0.6 gives a front-right perspective; pitch=-0.35
+// looks slightly down from above. max_distance raised to allow user zoom-out.
+var orbit: gl.orbit.Orbit = .{
+    .target = .{ .x = 0, .y = 3, .z = 0 },
+    .distance = 38,
+    .max_distance = 80,
+    .yaw = 0.6,
+    .pitch = -0.35,
+};
 var orbit_input: gl.orbit.OrbitInput = .{};
 var dragging: bool = false;
 var last_x: f64 = 0;
