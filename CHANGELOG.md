@@ -6,6 +6,21 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`verve.gl` — skeletal skinning, slice 7 (clip blend / weighted Mix)**
+  (`src/client/islands/GlSkin.zig`, `src/app/components.zig`): a Mix drag-track on
+  `/gl-skin` — drag 0→100 % to blend the current clip with the next clip
+  (`(cur+1) % clipCount`), live, per joint. `updateBones` now composes a per-joint
+  base TRS (current clip + cross-fade) then blends with the other clip's TRS
+  (`Vec3.lerp`/`Quat.slerp` by `mix_weight`) before a single `fromTrs`;
+  `mix_weight = 0` (default) is byte-identical to slice 6. A `glskin-mix` track
+  with `z-on-pointerdown/move/up` drives `glskin_mix_*` exports (`mixApply` maps
+  `refRect`+`eventCoordX` → weight, live/no-pause); switching clips resets it.
+  Weighted cross-blend (mix node), not true additive. Reuses shipped runtime APIs
+  — **no bridge/asset/format/shader/wire change**. Verified on WebGPU and WebGL2
+  (headless CDP: paused, dragging 0/50/100 % blends the pose monotonically).
+
 ## [0.5.13] - 2026-06-17
 
 ### Added
