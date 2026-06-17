@@ -4304,8 +4304,9 @@
   // WebSocket hub binding (full-duplex push over /push-ws).
   const verveWsSockets = new Map(); // channel → { ws, queue: string[], sub }
   window.verveHost.verveWsConnect = (argsJson) => {
-    const a = JSON.parse(argsJson); // { channel, island, export }
-    if (verveWsSockets.has(a.channel)) return; // idempotent
+    // verve_host_call hands a parsed object; a JS caller may pass a string.
+    const a = typeof argsJson === "string" ? JSON.parse(argsJson || "{}") : argsJson || {}; // { channel, island, export }
+    if (!a.channel || verveWsSockets.has(a.channel)) return; // idempotent
     const entry = { ws: null, queue: [], sub: a };
     verveWsSockets.set(a.channel, entry);
     const wsBase = location.origin.replace(/^http/, "ws");
@@ -4321,7 +4322,7 @@
     open();
   };
   window.verveHost.verveWsSend = (argsJson) => {
-    const a = JSON.parse(argsJson); // { channel, text }
+    const a = typeof argsJson === "string" ? JSON.parse(argsJson || "{}") : argsJson || {}; // { channel, text }
     const entry = verveWsSockets.get(a.channel);
     if (!entry) return;
     if (entry.ws && entry.ws.readyState === 1) entry.ws.send(a.text);
