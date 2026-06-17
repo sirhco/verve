@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.14] - 2026-06-17
+
 ### Added
 
 - **`verve.gl` — skeletal skinning, slice 7 (clip blend / weighted Mix)**
@@ -3395,7 +3397,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.13...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.5.14...HEAD
+[0.5.14]: https://github.com/sirhco/verve/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/sirhco/verve/compare/v0.5.12...v0.5.13
 [0.5.12]: https://github.com/sirhco/verve/compare/v0.5.11...v0.5.12
 [0.5.11]: https://github.com/sirhco/verve/compare/v0.5.10...v0.5.11
