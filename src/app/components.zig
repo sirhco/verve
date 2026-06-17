@@ -951,6 +951,8 @@ pub fn glSkin(ctx: *const verve.Context) !*verve.Node {
         ctx.el("button").attr("z-on-click", "glskin_blend_add").text("Additive"),
         ctx.el("button").attr("z-on-click", "glskin_mask_all").text("Mask: All"),
         ctx.el("button").attr("z-on-click", "glskin_mask_upper").text("Mask: Upper"),
+        ctx.el("button").attr("z-on-click", "glskin_freeze").text("Freeze"),
+        ctx.el("button").attr("z-on-click", "glskin_unfreeze").text("Unfreeze"),
     });
 
     // Scrub track: drag to set clip time (pointer-drag → glskin_scrub_* exports).

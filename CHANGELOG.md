@@ -20,9 +20,12 @@ versions follow [Semantic Versioning](https://semver.org/).
   clip's delta-from-its-rest (`t=0`) is applied on top of the base pose (T/S add, R
   via `slerp(identity, otherₜ·conj(other₀), w)`), needing a new pure `Quat.conjugate`
   in `gl/math.zig`; buttons **Mix** / **Additive**. **Blend masks** — per-joint
-  `jw = (mask_root and j==0) ? 0 : mix_weight` gates both blend paths so a masked
-  joint holds its base pose; buttons **Mask: All** / **Mask: Upper**. Unit-tested
-  (ping-pong triangle wave + `Quat.conjugate` round-trip). Deferred: CUBICSPLINE.
+  `jw = (mask_upper and j>=1) ? 0 : mix_weight` gates both blend paths so a masked joint
+  holds its base pose; the demo masks the upper chain (joints above the root); buttons **Mask: All**
+  / **Mask: Upper**. Plus a **Freeze** / **Unfreeze** debug control (`glskin_freeze`)
+  that pins the camera orbit so automated pose-diffs isolate the skinning change.
+  Unit-tested (ping-pong triangle wave + `Quat.conjugate` round-trip); additive + mask
+  verified live in a headed browser with the orbit frozen. Deferred: CUBICSPLINE.
 
 ## [0.5.16] - 2026-06-17
 
