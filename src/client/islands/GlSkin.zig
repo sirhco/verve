@@ -33,6 +33,7 @@ var canvas_handle: ?i32 = null;
 var use_webgpu: bool = false;
 var resources_sent: bool = false;
 var yaw: f32 = 0;
+var freeze: bool = false; // debug: stop the auto-orbit + pin yaw so pose diffs isolate (test harness)
 var elapsed_s: f32 = 0;
 // Playback state (slice 3): selected clip, paused, speed multiplier. Mutated by
 // the glskin_* control exports (wired to /gl-skin buttons).
@@ -47,7 +48,7 @@ var mix_weight: f32 = 0; // 0 = current clip pure; 1 = the (cur+1)%count clip pu
 var mixing: bool = false;
 var mix_track_handle: ?i32 = null;
 var blend_additive: bool = false; // false = interpolative Mix (slice 7); true = additive
-var mask_root: bool = false; // blend-mask demo: when true, root joint (j==0) ignores the blend
+var mask_upper: bool = false; // blend-mask demo: when true, the upper chain (j>=1) holds its base pose (blend masked out of it)
 // Cross-fade (slice 4): on a clip switch, snapshot the old clip + its looped time
 // (FROZEN), and blend old→new pose over `fade_dur` real-time seconds. `pending_clip`
 // is set by the control exports and applied in updateBones (which has the Reader).
@@ -107,13 +108,14 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     resources_sent = false;
     asset = null;
     yaw = 0;
+    freeze = false;
     elapsed_s = 0;
     cur_clip = 0;
     paused = false;
     speed = 1.0;
     play_mode = .loop;
     blend_additive = false;
-    mask_root = false;
+    mask_upper = false;
     from_clip = 0;
     from_time = 0;
     fade_t = fade_dur;
@@ -243,7 +245,11 @@ fn updateBones(a: *const gl.vmesh.Reader) void {
                 br = gl.math.Quat.slerp(fr, br, w);
                 bs = gl.math.Vec3.lerp(fs, bs, w);
             }
-            const jw: f32 = if (mask_root and j == 0) 0 else mix_weight;
+            // Blend mask (slice 8): when on, hold the UPPER chain (every joint above the
+            // root, j>=1) at its base pose so the blend is masked OUT of the articulated
+            // body — visibly observable (the upper bar stays in the current clip's pose
+            // while an unmasked blend would swing it toward the other clip). jw=0 → base.
+            const jw: f32 = if (mask_upper and j >= 1) 0 else mix_weight;
             if (mix_active and jw > 0) { // slice-7/8 weighted blend with the other clip
                 if (blend_additive) {
                     // additive: other clip's delta from its rest (t=0), scaled by jw, on top of base
@@ -318,10 +324,20 @@ export fn glskin_blend_add() void {
     blend_additive = true;
 }
 export fn glskin_mask_all() void {
-    mask_root = false;
+    mask_upper = false;
 }
 export fn glskin_mask_upper() void {
-    mask_root = true;
+    mask_upper = true;
+}
+// Debug (test-harness only): stop the auto-orbit and pin yaw to a fixed profile angle so a
+// pose-diff between modes isolates the skinning change (no orbit/lighting confound). Unfreeze
+// restores the orbit from the pinned angle.
+export fn glskin_freeze() void {
+    freeze = true;
+    yaw = 0.6;
+}
+export fn glskin_unfreeze() void {
+    freeze = false;
 }
 
 // ── scrub (slice 6): pointer-drag the track to set clip time ─────────────────────
@@ -395,7 +411,7 @@ export fn glskin_frame(dt_ms: f32, width: u32, height: u32) u32 {
         _ = enc0.finish();
         return @intCast(@intFromPtr(&cmd_buf));
     };
-    yaw += dt_ms * 0.0006; // slow orbit so the 3D bend reads from all sides
+    if (!freeze) yaw += dt_ms * 0.0006; // slow orbit so the 3D bend reads from all sides (debug freeze pins it)
     if (!paused) {
         elapsed_s += dt_ms * 0.001 * speed; // clip playback time (speed-scaled, looped)
         fade_t += dt_ms * 0.001; // cross-fade timer (real-time, NOT speed-scaled)
