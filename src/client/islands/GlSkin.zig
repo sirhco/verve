@@ -39,12 +39,15 @@ var elapsed_s: f32 = 0;
 var cur_clip: u32 = 0;
 var paused: bool = false;
 var speed: f32 = 1.0;
-var loop: bool = true; // playback mode: true = loop, false = play-once (clamp at end)
+const PlayMode = enum { loop, once, pingpong };
+var play_mode: PlayMode = .loop; // playback mode: loop / play-once / ping-pong
 var scrubbing: bool = false;
 var track_handle: ?i32 = null;
 var mix_weight: f32 = 0; // 0 = current clip pure; 1 = the (cur+1)%count clip pure
 var mixing: bool = false;
 var mix_track_handle: ?i32 = null;
+var blend_additive: bool = false; // false = interpolative Mix (slice 7); true = additive
+var mask_root: bool = false; // blend-mask demo: when true, root joint (j==0) ignores the blend
 // Cross-fade (slice 4): on a clip switch, snapshot the old clip + its looped time
 // (FROZEN), and blend old→new pose over `fade_dur` real-time seconds. `pending_clip`
 // is set by the control exports and applied in updateBones (which has the Reader).
@@ -108,7 +111,9 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     cur_clip = 0;
     paused = false;
     speed = 1.0;
-    loop = true;
+    play_mode = .loop;
+    blend_additive = false;
+    mask_root = false;
     from_clip = 0;
     from_time = 0;
     fade_t = fade_dur;
@@ -177,6 +182,19 @@ fn sampleQuat(a: *const gl.vmesh.Reader, clip: u32, j: u32, t: f32) gl.math.Quat
     return gl.math.Quat.slerp(q0, q1, f);
 }
 
+/// Map raw elapsed playback time to clip-local time per the active play mode.
+fn clipTime(elapsed: f32, dur: f32) f32 {
+    if (dur <= 0) return 0;
+    return switch (play_mode) {
+        .loop => @mod(elapsed, dur),
+        .once => @min(elapsed, dur),
+        .pingpong => blk: {
+            const phase = @mod(elapsed, 2 * dur);
+            break :blk if (phase <= dur) phase else 2 * dur - phase;
+        },
+    };
+}
+
 /// Recompute the bone palette. With a clip: sample each joint's T/R/S tracks at
 /// the looped time → local TRS. Without: the static bind pose (slice-1 fallback).
 /// `world = parent_world · local` (parents precede children) → `bone = world ·
@@ -193,7 +211,7 @@ fn updateBones(a: *const gl.vmesh.Reader) void {
         if (has_anim and np != cur_clip and np < ccount) {
             const old_dur = a.animClip(cur_clip).duration;
             from_clip = cur_clip;
-            from_time = if (old_dur > 0) (if (loop) @mod(elapsed_s, old_dur) else @min(elapsed_s, old_dur)) else 0;
+            from_time = clipTime(elapsed_s, old_dur);
             fade_t = 0;
             cur_clip = np;
             elapsed_s = 0;
@@ -202,13 +220,13 @@ fn updateBones(a: *const gl.vmesh.Reader) void {
 
     const clip = if (cur_clip < ccount) cur_clip else 0;
     const dur = if (has_anim) a.animClip(clip).duration else 0;
-    const t = if (has_anim and dur > 0) (if (loop) @mod(elapsed_s, dur) else @min(elapsed_s, dur)) else 0;
+    const t = if (has_anim) clipTime(elapsed_s, dur) else 0;
     const blending = has_anim and fade_t < fade_dur;
     const w = if (fade_dur > 0) std.math.clamp(fade_t / fade_dur, 0, 1) else 1;
     const mix_active = has_anim and mix_weight > 0 and ccount > 1;
     const other = if (mix_active) (clip + 1) % ccount else clip;
     const odur = if (mix_active) a.animClip(other).duration else 0;
-    const ot = if (mix_active and odur > 0) (if (loop) @mod(elapsed_s, odur) else @min(elapsed_s, odur)) else 0;
+    const ot = if (mix_active) clipTime(elapsed_s, odur) else 0;
 
     var j: u32 = 0;
     while (j < jc) : (j += 1) {
@@ -225,10 +243,25 @@ fn updateBones(a: *const gl.vmesh.Reader) void {
                 br = gl.math.Quat.slerp(fr, br, w);
                 bs = gl.math.Vec3.lerp(fs, bs, w);
             }
-            if (mix_active) { // slice-7 weighted blend with the other clip
-                bt = gl.math.Vec3.lerp(bt, sampleVec3(a, other, j, 0, ot), mix_weight);
-                br = gl.math.Quat.slerp(br, sampleQuat(a, other, j, ot), mix_weight);
-                bs = gl.math.Vec3.lerp(bs, sampleVec3(a, other, j, 2, ot), mix_weight);
+            const jw: f32 = if (mask_root and j == 0) 0 else mix_weight;
+            if (mix_active and jw > 0) { // slice-7/8 weighted blend with the other clip
+                if (blend_additive) {
+                    // additive: other clip's delta from its rest (t=0), scaled by jw, on top of base
+                    const ot0_t = sampleVec3(a, other, j, 0, 0);
+                    const ot0_s = sampleVec3(a, other, j, 2, 0);
+                    const ot0_q = sampleQuat(a, other, j, 0);
+                    const dt = sampleVec3(a, other, j, 0, ot).sub(ot0_t);
+                    const ds = sampleVec3(a, other, j, 2, ot).sub(ot0_s);
+                    const dq = sampleQuat(a, other, j, ot).mul(ot0_q.conjugate());
+                    bt = bt.add(dt.scale(jw));
+                    bs = bs.add(ds.scale(jw));
+                    br = gl.math.Quat.slerp(gl.math.Quat.identity, dq, jw).mul(br);
+                } else {
+                    // interpolative Mix (slice 7), now masked via jw
+                    bt = gl.math.Vec3.lerp(bt, sampleVec3(a, other, j, 0, ot), jw);
+                    br = gl.math.Quat.slerp(br, sampleQuat(a, other, j, ot), jw);
+                    bs = gl.math.Vec3.lerp(bs, sampleVec3(a, other, j, 2, ot), jw);
+                }
             }
             break :blk gl.math.Mat4.fromTrs(bt, br, bs);
         } else gl.math.Mat4{ .m = joint.bind_local };
@@ -270,10 +303,25 @@ export fn glskin_speed_2x() void {
     speed = 2.0;
 }
 export fn glskin_loop() void {
-    loop = true;
+    play_mode = .loop;
 }
 export fn glskin_once() void {
-    loop = false;
+    play_mode = .once;
+}
+export fn glskin_pingpong() void {
+    play_mode = .pingpong;
+}
+export fn glskin_blend_mix() void {
+    blend_additive = false;
+}
+export fn glskin_blend_add() void {
+    blend_additive = true;
+}
+export fn glskin_mask_all() void {
+    mask_root = false;
+}
+export fn glskin_mask_upper() void {
+    mask_root = true;
 }
 
 // ── scrub (slice 6): pointer-drag the track to set clip time ─────────────────────

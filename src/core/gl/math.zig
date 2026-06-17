@@ -71,6 +71,12 @@ pub const Quat = struct {
         };
     }
 
+    /// Unit-quaternion inverse: negate the vector part, keep the scalar part.
+    /// For a unit quaternion q, q.mul(q.conjugate()) == identity.
+    pub fn conjugate(q: Quat) Quat {
+        return .{ .x = -q.x, .y = -q.y, .z = -q.z, .w = q.w };
+    }
+
     /// Spherical linear interpolation, shortest arc. Inputs need not be unit
     /// (normalized internally); returns a unit quaternion. Falls back to
     /// normalized-lerp when the endpoints are nearly parallel (avoids div-by-~0).
@@ -641,4 +647,35 @@ test "Vec3.lerp endpoints + midpoint" {
     try std.testing.expectApproxEqAbs(@as(f32, 1), m.x, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -2), m.y, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 5), m.z, 1e-6);
+}
+
+test "Quat.conjugate: q * q.conjugate() == identity for non-trivial unit quat" {
+    // Use a 60° rotation about (1,1,0)/sqrt2 — non-trivial, non-axis-aligned.
+    const q = Quat.fromAxisAngle(Vec3.init(1, 1, 0).normalize(), std.math.pi / 3.0);
+    const qc = q.conjugate();
+    const r = q.mul(qc);
+    try testing.expectApproxEqAbs(@as(f32, 0), r.x, eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), r.y, eps);
+    try testing.expectApproxEqAbs(@as(f32, 0), r.z, eps);
+    try testing.expectApproxEqAbs(@as(f32, 1), r.w, eps);
+}
+
+test "ping-pong triangle wave: dur=1 maps elapsed to expected clip times" {
+    // Triangle wave: phase = elapsed mod (2*dur); result = phase <= dur ? phase : 2*dur - phase.
+    const dur: f32 = 1.0;
+    const cases = [_][2]f32{
+        .{ 0.0, 0.0 },
+        .{ 0.5, 0.5 },
+        .{ 1.0, 1.0 },
+        .{ 1.5, 0.5 },
+        .{ 2.0, 0.0 },
+        .{ 2.5, 0.5 },
+    };
+    for (cases) |c| {
+        const elapsed = c[0];
+        const expected = c[1];
+        const phase = @mod(elapsed, 2 * dur);
+        const result: f32 = if (phase <= dur) phase else 2 * dur - phase;
+        try testing.expectApproxEqAbs(expected, result, eps);
+    }
 }
