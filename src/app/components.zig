@@ -891,6 +891,8 @@ pub fn glSkin(ctx: *const verve.Context) !*verve.Node {
         ctx.el("button").attr("z-on-click", "glskin_speed_half").text("0.5×"),
         ctx.el("button").attr("z-on-click", "glskin_speed_1x").text("1×"),
         ctx.el("button").attr("z-on-click", "glskin_speed_2x").text("2×"),
+        ctx.el("button").attr("z-on-click", "glskin_loop").text("Loop"),
+        ctx.el("button").attr("z-on-click", "glskin_once").text("Once"),
     });
 
     const inner = ctx.section().class("card").children(.{
