@@ -8,3 +8,10 @@
 pub const FarmScene = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// Live telemetry dashboard: subscribes to SSE `/push?channel=metrics`,
+/// renders a power history area chart + RPM gauge + wind readout for turbine 0.
+/// Source: `src/client/islands/Dashboard.zig`.
+pub const Dashboard = struct {
+    pub const props_schema: []const u8 = "{}";
+};

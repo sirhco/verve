@@ -113,6 +113,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Metrics publisher (opt-in: only when the app declares
+    // `metricsAdvanceTick` — see `app_has_metrics_publisher`): ticks the
+    // metrics model at ~2 Hz and publishes JSON frames to the `metrics` push
+    // channel — skipped while nobody subscribes.
+    if (comptime app_has_metrics_publisher) {
+        if (std.Thread.spawn(.{}, metricsPublisherLoop, .{io})) |t| t.detach() else |err| {
+            log.err("metrics publisher spawn: {s}", .{@errorName(err)});
+        }
+    }
+
     while (true) {
         const stream = server.accept(io) catch |err| {
             log.err("accept error: {s}", .{@errorName(err)});
@@ -755,6 +765,26 @@ fn vizPublisherLoop(io: std.Io) void {
         if (push.subscriberCount("viz") == 0) continue;
         const frame = app.vizAdvanceTick(&buf) orelse continue;
         _ = push.publish("viz", frame);
+    }
+}
+
+const METRICS_PUBLISH_TICK = std.Io.Duration.fromMilliseconds(500);
+
+/// Whether the app module opts into the metrics publisher: a
+/// `pub fn metricsAdvanceTick(buf: []u8) ?[]const u8` producing a JSON frame
+/// for the `metrics` push channel at ~2 Hz.
+const app_has_metrics_publisher = @hasDecl(app, "metricsAdvanceTick");
+
+/// ~2 Hz: advance the metrics model and publish to the `metrics` push channel
+/// — skipped entirely while nobody subscribes.
+fn metricsPublisherLoop(io: std.Io) void {
+    if (comptime !app_has_metrics_publisher) return;
+    var buf: [push.MSG_MAX]u8 = undefined;
+    while (true) {
+        std.Io.sleep(io, METRICS_PUBLISH_TICK, .awake) catch return;
+        if (push.subscriberCount("metrics") == 0) continue;
+        const frame = app.metricsAdvanceTick(&buf) orelse continue;
+        _ = push.publish("metrics", frame);
     }
 }
 
