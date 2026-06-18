@@ -1897,6 +1897,7 @@ test "variant_linear_output skips ACES in PBR fragment" {
     const linear = pbrFragmentSrc(variant_pbr | variant_linear_output);
     // The standard variant tonemaps (inline ACES coefficients 2.51/2.43); the linear variant does not.
     try testing.expect(std.mem.indexOf(u8, lit, "2.51") != null);
+    try testing.expect(std.mem.indexOf(u8, linear, "2.51") == null); // ACES omitted in linear output
     try testing.expect(linear.len < lit.len); // linear omits the tonemap block
 }
 
