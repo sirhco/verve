@@ -5195,6 +5195,26 @@
     return (t && t.view) ? t.view : fallback.view;
   };
 
+  // Lazily build (and cache) a post render pipeline for a given color format.
+  // Post pipelines must match the pass's color attachment format, which varies
+  // across the chain (rgba16float bloom, rgba8unorm ldr, st.format canvas), so we
+  // create one variant per format on first draw and cache it on the shader entry
+  // keyed by format string. Returns the cached pipeline + its bind-group layouts.
+  const getOrCreatePostPipeline = (st, entry, format) => {
+    let pipe = entry.byFormat[format];
+    if (!pipe) {
+      pipe = st.device.createRenderPipeline({
+        layout: st.device.createPipelineLayout({ bindGroupLayouts: [entry.bgl0, entry.bgl1] }),
+        vertex: { module: entry.module, entryPoint: "vs_main" }, // no vertex buffers
+        fragment: { module: entry.module, entryPoint: "fs_main", targets: [{ format }] },
+        primitive: { topology: "triangle-list" },
+        // no depthStencil — fullscreen quad
+      });
+      entry.byFormat[format] = pipe;
+    }
+    return pipe;
+  };
+
   // WebGPU command-stream interpreter. Consumes the SAME binary stream as
   // glInterpret (4-byte tag/size header per command, little-endian) but drives
   // WebGPU. Slice 1 handles only the minimal unlit-cube subset (6 tags);
@@ -5234,6 +5254,7 @@
             st.lastH = h;
           }
           st.pbrSlot = 0; // reset per-draw uniform slot allocation for this frame
+          st.curTargetFormat = st.format; // canvas pass: post draws target st.format
           // Reuse the encoder if a shadow pass already opened one this frame
           // (begin_shadow_pass runs BEFORE begin_frame); else create one. Both
           // the shadow depth pass and the color pass share one encoder + submit.
@@ -5275,6 +5296,27 @@
           const variant = dv.getUint32(off + 4, true);
           const code = readStr(dv.getUint32(off + 8, true), dv.getUint32(off + 12, true));
           const module = device.createShaderModule({ code });
+          if ((variant & 0x100) !== 0) { // variant_post — fullscreen-quad post pass.
+            // All four post WGSL modules (bright/blur/composite/fxaa) share ONE
+            // layout (group0=params uniform, group1=sampler+tex0+tex1) and the
+            // vs_main/fs_main entry points; only the WGSL body differs and rides
+            // the create_shader stream. The render pipeline must match the COLOR
+            // format of the pass it draws into (rgba16float bloom / rgba8unorm ldr
+            // / st.format canvas), so we defer pipeline creation to draw time and
+            // cache per `${handle}:${format}` (getOrCreatePostPipeline below).
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }],
+            });
+            const bgl1 = device.createBindGroupLayout({
+              entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+              ],
+            });
+            st.pipelines[handle] = { module, bgl0, bgl1, kind: "post", byFormat: {} };
+            break;
+          }
           // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
           // variant_emissive = 1 << 4 — gate which group(1) texture bindings the
           // WGSL declares (wgslPbr appends tex_normal/tex_emissive conditionally;
@@ -5609,6 +5651,13 @@
             st.pipelines[handle] = null;
           } else if (kind === 3) {
             if (st.shadowMaps[handle]) { st.shadowMaps[handle].tex.destroy(); st.shadowMaps[handle] = null; }
+          } else if (kind === 4) { // render target — color + optional depth texture
+            const rt = st.renderTargets[handle];
+            if (rt) {
+              rt.tex.destroy();
+              if (rt.depthTex) rt.depthTex.destroy();
+              st.renderTargets[handle] = null;
+            }
           }
           break;
         }
@@ -5789,6 +5838,103 @@
           st.pass.setBindGroup(0, st.bg0, [base]);
           st.pass.setBindGroup(1, st.bg1);
           st.pass.drawIndexed(count);
+          break;
+        }
+        case 22: { // CREATE_RENDER_TARGET — color (+ optional depth) offscreen target.
+          // Payload (command.zig createRenderTarget, 20B): handle|w|h|fmt|flags.
+          // fmt: 0=rgba8unorm, 1=rgba16float. flags bit0 = with_depth (depth24plus).
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          const fmt = dv.getUint32(off + 12, true);
+          const flags = dv.getUint32(off + 16, true);
+          const format = fmt === 1 ? "rgba16float" : "rgba8unorm";
+          const tex = device.createTexture({
+            size: [w, h],
+            format,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+          });
+          let depthTex = null, depthView = null;
+          if (flags & 1) {
+            depthTex = device.createTexture({
+              size: [w, h],
+              format: "depth24plus",
+              usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            depthView = depthTex.createView();
+          }
+          st.renderTargets[handle] = { tex, view: tex.createView(), depthTex, depthView, w, h, format };
+          break;
+        }
+        case 23: { // BEGIN_OFFSCREEN_PASS — render into a target (reuse frame encoder).
+          // Payload (24B): target | clear_rgba(4×f32) | clear_flags.
+          const target = dv.getUint32(off, true);
+          const r = dv.getFloat32(off + 4, true);
+          const g = dv.getFloat32(off + 8, true);
+          const b = dv.getFloat32(off + 12, true);
+          const a = dv.getFloat32(off + 16, true);
+          const cf = dv.getUint32(off + 20, true);
+          const rt = st.renderTargets[target];
+          if (!rt) break;
+          if (!st.encoder) st.encoder = device.createCommandEncoder();
+          st.pass = st.encoder.beginRenderPass({
+            colorAttachments: [{
+              view: rt.view,
+              clearValue: { r, g, b, a },
+              loadOp: (cf & 1) ? "clear" : "load",
+              storeOp: "store",
+            }],
+            depthStencilAttachment: rt.depthView ? {
+              view: rt.depthView,
+              depthClearValue: 1.0,
+              depthLoadOp: (cf & 2) ? "clear" : "load",
+              depthStoreOp: "store",
+            } : undefined,
+          });
+          st.curTargetFormat = rt.format;
+          st.active = null; // force pipeline re-bind for draws in this pass
+          break;
+        }
+        case 24: { // END_OFFSCREEN_PASS — close the offscreen pass (keep encoder).
+          if (st.pass) { st.pass.end(); st.pass = null; }
+          break;
+        }
+        case 25: { // DRAW_FULLSCREEN_QUAD — post effect into the current pass.
+          // Payload (20B): shader | tex0 | tex1 | params_ptr | param_count.
+          const shHandle = dv.getUint32(off, true);
+          const t0 = dv.getUint32(off + 4, true);
+          const t1 = dv.getUint32(off + 8, true);
+          const pPtr = dv.getUint32(off + 12, true);
+          const pCount = dv.getUint32(off + 16, true);
+          const entry = st.pipelines[shHandle];
+          const src0rt = st.renderTargets[t0];
+          if (!entry || entry.kind !== "post" || !st.pass || !src0rt) break;
+          const format = st.curTargetFormat || st.format;
+          const pipe = getOrCreatePostPipeline(st, entry, format);
+          // Params UBO (16B): up to 4 f32 read from the wire (zero-padded).
+          if (!st.postUbo) {
+            st.postUbo = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          }
+          const arr = new Float32Array(4);
+          for (let i = 0; i < pCount && i < 4; i++) arr[i] = dv.getFloat32(pPtr + i * 4, true);
+          device.queue.writeBuffer(st.postUbo, 0, arr);
+          const src1 = (t1 !== 0 && st.renderTargets[t1]) ? st.renderTargets[t1].view : st.dummyTexView;
+          const bg0 = device.createBindGroup({
+            layout: entry.bgl0,
+            entries: [{ binding: 0, resource: { buffer: st.postUbo } }],
+          });
+          const bg1 = device.createBindGroup({
+            layout: entry.bgl1,
+            entries: [
+              { binding: 0, resource: st.linearSampler },
+              { binding: 1, resource: src0rt.view },
+              { binding: 2, resource: src1 },
+            ],
+          });
+          st.pass.setPipeline(pipe);
+          st.pass.setBindGroup(0, bg0);
+          st.pass.setBindGroup(1, bg1);
+          st.pass.draw(3, 1, 0, 0);
           break;
         }
         default:
@@ -6034,6 +6180,23 @@
       ibl: null, // { irr, spec, lut } texture handles set by bind_ibl (2b)
       shadowMaps: [], // { tex, view, sampler, size } by handle (create_shadow_map, 2c)
       shadow: null, // { handle } set by bind_shadow_map (2c)
+      renderTargets: [], // post: { tex, view, depthTex, depthView, w, h, format } by handle
+      curTargetFormat: null, // color format of the active pass (post pipeline keying)
+      postUbo: null, // shared 16B params UBO for draw_fullscreen_quad (lazy)
+      // Linear/clamp sampler + 1×1 dummy view for the unused tex1 post slot. Eager
+      // (cheap, always needed by the post chain when present); clamp avoids UV wrap.
+      linearSampler: gpu.device.createSampler({
+        magFilter: "linear", minFilter: "linear",
+        addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge",
+      }),
+      dummyTexView: (() => {
+        const t = gpu.device.createTexture({
+          size: [1, 1], format: "rgba8unorm",
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        gpu.device.queue.writeTexture({ texture: t }, new Uint8Array([0, 0, 0, 255]), { bytesPerRow: 4, rowsPerImage: 1 }, [1, 1]);
+        return t.createView();
+      })(),
       shadowPass: null, // active depth render pass during begin/end_shadow_pass
       defaults: gpuMakeDefaults(gpu.device),
       active: null,

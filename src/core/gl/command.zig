@@ -1106,6 +1106,11 @@ pub const PostProcess = struct {
     bloom: ?Bloom = .{},
     /// FXAA anti-aliasing on the final canvas blit.
     fxaa: bool = true,
+    /// When true, `beginPostProcess` emits the WGSL post modules
+    /// (`wgslBright`/`wgslBlur`/`wgslComposite`/`wgslFxaa`) in the create-shader
+    /// vs slot (fs slot 0/0) for the WebGPU backend, mirroring how GlScene/GlSkin
+    /// select WGSL vs GLSL via `use_webgpu`. Default (false) emits GLSL.
+    webgpu: bool = false,
 };
 
 /// Persistent state owned by the island (one static per GL canvas island).
@@ -1393,6 +1398,32 @@ pub const Encoder = struct {
 
     // ── Task 3: Post-process effect-graph API ────────────────────────
 
+    /// GLSL post shader: shared fullscreen vertex + the effect's fragment src,
+    /// tagged `variant_post` (the bridge keys bright/blur/composite/fxaa by handle).
+    fn createPostShaderGlsl(self: *Encoder, handle: u32, fs: []const u8) void {
+        self.createShader(
+            handle,
+            variant_post,
+            @truncate(@intFromPtr(fullscreenVertexSrc.ptr)),
+            @intCast(fullscreenVertexSrc.len),
+            @truncate(@intFromPtr(fs.ptr)),
+            @intCast(fs.len),
+        );
+    }
+
+    /// WGSL post shader: the WGSL module (both stages) rides the vs slot, fs 0/0 —
+    /// same wire shape GlScene/GlSkin use for `wgslPbr` on the WebGPU backend.
+    fn createPostShaderWgsl(self: *Encoder, handle: u32, wgsl: []const u8) void {
+        self.createShader(
+            handle,
+            variant_post,
+            @truncate(@intFromPtr(wgsl.ptr)),
+            @intCast(wgsl.len),
+            0,
+            0,
+        );
+    }
+
     /// Open the post-process pass for this frame.
     ///
     /// On first call (or when `width`/`height` change) emits
@@ -1419,38 +1450,20 @@ pub const Encoder = struct {
             ctx.last_h = height;
         }
         if (!ctx.created) {
-            self.createShader(
-                PostCtx.sh_bright,
-                variant_post,
-                @truncate(@intFromPtr(fullscreenVertexSrc.ptr)),
-                @intCast(fullscreenVertexSrc.len),
-                @truncate(@intFromPtr(brightFragmentSrc.ptr)),
-                @intCast(brightFragmentSrc.len),
-            );
-            self.createShader(
-                PostCtx.sh_blur,
-                variant_post,
-                @truncate(@intFromPtr(fullscreenVertexSrc.ptr)),
-                @intCast(fullscreenVertexSrc.len),
-                @truncate(@intFromPtr(blurFragmentSrc.ptr)),
-                @intCast(blurFragmentSrc.len),
-            );
-            self.createShader(
-                PostCtx.sh_composite,
-                variant_post,
-                @truncate(@intFromPtr(fullscreenVertexSrc.ptr)),
-                @intCast(fullscreenVertexSrc.len),
-                @truncate(@intFromPtr(compositeFragmentSrc.ptr)),
-                @intCast(compositeFragmentSrc.len),
-            );
-            self.createShader(
-                PostCtx.sh_fxaa,
-                variant_post,
-                @truncate(@intFromPtr(fullscreenVertexSrc.ptr)),
-                @intCast(fullscreenVertexSrc.len),
-                @truncate(@intFromPtr(fxaaFragmentSrc.ptr)),
-                @intCast(fxaaFragmentSrc.len),
-            );
+            if (opts.webgpu) {
+                // WebGPU: ship the WGSL module (both stages) in the vs slot,
+                // fs slot 0/0 — same convention GlScene/GlSkin use for wgslPbr.
+                // The bridge picks bright/blur/composite/fxaa by shader handle.
+                self.createPostShaderWgsl(PostCtx.sh_bright, wgslBright());
+                self.createPostShaderWgsl(PostCtx.sh_blur, wgslBlur());
+                self.createPostShaderWgsl(PostCtx.sh_composite, wgslComposite());
+                self.createPostShaderWgsl(PostCtx.sh_fxaa, wgslFxaa());
+            } else {
+                self.createPostShaderGlsl(PostCtx.sh_bright, brightFragmentSrc);
+                self.createPostShaderGlsl(PostCtx.sh_blur, blurFragmentSrc);
+                self.createPostShaderGlsl(PostCtx.sh_composite, compositeFragmentSrc);
+                self.createPostShaderGlsl(PostCtx.sh_fxaa, fxaaFragmentSrc);
+            }
             ctx.created = true;
         }
         // Open the scene pass into the HDR target.
