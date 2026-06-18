@@ -1090,6 +1090,54 @@ pub fn wgslFxaa() []const u8 {
     ;
 }
 
+// ── Task 3: Post-process effect-graph structs ────────────────────────
+
+/// Bloom configuration for the post-process pass.
+pub const Bloom = struct {
+    /// Luminance threshold above which pixels contribute to bloom.
+    threshold: f32 = 1.0,
+    /// Bloom intensity blended into the composite.
+    intensity: f32 = 0.6,
+};
+
+/// Options for `beginPostProcess` / `endPostProcess`.
+pub const PostProcess = struct {
+    /// Bloom effect; set to `null` to skip bright-pass + blur chain.
+    bloom: ?Bloom = .{},
+    /// FXAA anti-aliasing on the final canvas blit.
+    fxaa: bool = true,
+};
+
+/// Persistent state owned by the island (one static per GL canvas island).
+/// Holds fixed render-target / shader handles and stable param storage whose
+/// addresses are wired into the command stream; must outlive the frame.
+///
+/// Handle reservation (h_ = render target, sh_ = shader):
+///   240–247 are reserved for the post path to avoid clashing with app handles.
+pub const PostCtx = struct {
+    pub const h_scene_hdr: u32 = 240;
+    pub const h_bloom_a: u32 = 241;
+    pub const h_bloom_b: u32 = 242;
+    pub const h_ldr: u32 = 243;
+    pub const sh_bright: u32 = 244;
+    pub const sh_blur: u32 = 245;
+    pub const sh_composite: u32 = 246;
+    pub const sh_fxaa: u32 = 247;
+
+    /// True once shaders + targets have been emitted for the first time.
+    created: bool = false,
+    last_w: u32 = 0,
+    last_h: u32 = 0,
+    opts: PostProcess = .{},
+
+    // Stable param storage (wire records point at these; must outlive the frame).
+    p_bright: [4]f32 = .{ 0, 0, 0, 0 }, // [threshold, 0, 0, 0]
+    p_blur_h: [4]f32 = .{ 0, 0, 1, 0 }, // [texel.x, texel.y, dir.x=1, dir.y=0]
+    p_blur_v: [4]f32 = .{ 0, 0, 0, 1 }, // [texel.x, texel.y, dir.x=0, dir.y=1]
+    p_comp: [4]f32 = .{ 0, 0, 0, 0 }, // [intensity, 0, 0, 0]
+    p_fxaa: [4]f32 = .{ 0, 0, 0, 0 }, // [texel.x, texel.y, 0, 0]
+};
+
 pub const Encoder = struct {
     buf: []u8,
     len: usize,
@@ -1341,6 +1389,132 @@ pub const Encoder = struct {
     pub fn finish(self: *Encoder) []const u8 {
         std.mem.writeInt(u32, self.buf[0..4], @intCast(self.len - 4), .little);
         return self.buf[0..self.len];
+    }
+
+    // ── Task 3: Post-process effect-graph API ────────────────────────
+
+    /// Open the post-process pass for this frame.
+    ///
+    /// On first call (or when `width`/`height` change) emits
+    /// `createRenderTarget` × 4 and (first call only) `createShader` × 4.
+    /// Ends by opening an offscreen pass into `h_scene_hdr` — the caller
+    /// renders the scene into it, then calls `endPostProcess`.
+    pub fn beginPostProcess(self: *Encoder, ctx: *PostCtx, opts: PostProcess, width: u32, height: u32) void {
+        ctx.opts = opts;
+        const resized = width != ctx.last_w or height != ctx.last_h;
+        if (!ctx.created or resized) {
+            if (resized and ctx.created) {
+                self.deleteResource(.render_target, PostCtx.h_scene_hdr);
+                self.deleteResource(.render_target, PostCtx.h_bloom_a);
+                self.deleteResource(.render_target, PostCtx.h_bloom_b);
+                self.deleteResource(.render_target, PostCtx.h_ldr);
+            }
+            const hw = @max(1, width / 2);
+            const hh = @max(1, height / 2);
+            self.createRenderTarget(PostCtx.h_scene_hdr, width, height, .rgba16f, rt_flag_with_depth);
+            self.createRenderTarget(PostCtx.h_bloom_a, hw, hh, .rgba16f, 0);
+            self.createRenderTarget(PostCtx.h_bloom_b, hw, hh, .rgba16f, 0);
+            self.createRenderTarget(PostCtx.h_ldr, width, height, .rgba8, 0);
+            ctx.last_w = width;
+            ctx.last_h = height;
+        }
+        if (!ctx.created) {
+            self.createShader(
+                PostCtx.sh_bright,
+                variant_post,
+                @truncate(@intFromPtr(fullscreenVertexSrc.ptr)),
+                @intCast(fullscreenVertexSrc.len),
+                @truncate(@intFromPtr(brightFragmentSrc.ptr)),
+                @intCast(brightFragmentSrc.len),
+            );
+            self.createShader(
+                PostCtx.sh_blur,
+                variant_post,
+                @truncate(@intFromPtr(fullscreenVertexSrc.ptr)),
+                @intCast(fullscreenVertexSrc.len),
+                @truncate(@intFromPtr(blurFragmentSrc.ptr)),
+                @intCast(blurFragmentSrc.len),
+            );
+            self.createShader(
+                PostCtx.sh_composite,
+                variant_post,
+                @truncate(@intFromPtr(fullscreenVertexSrc.ptr)),
+                @intCast(fullscreenVertexSrc.len),
+                @truncate(@intFromPtr(compositeFragmentSrc.ptr)),
+                @intCast(compositeFragmentSrc.len),
+            );
+            self.createShader(
+                PostCtx.sh_fxaa,
+                variant_post,
+                @truncate(@intFromPtr(fullscreenVertexSrc.ptr)),
+                @intCast(fullscreenVertexSrc.len),
+                @truncate(@intFromPtr(fxaaFragmentSrc.ptr)),
+                @intCast(fxaaFragmentSrc.len),
+            );
+            ctx.created = true;
+        }
+        // Open the scene pass into the HDR target.
+        self.beginOffscreenPass(PostCtx.h_scene_hdr, .{ 0, 0, 0, 1 }, clear_flag_color | clear_flag_depth);
+    }
+
+    /// Close the scene pass and emit the full effect chain.
+    ///
+    /// Chain (bloom + fxaa):
+    ///   end_offscreen_pass (close scene)
+    ///   bright → bloom_a  (begin_offscreen_pass + draw_fullscreen_quad + end_offscreen_pass)
+    ///   blurH  → bloom_b  (begin_offscreen_pass + draw_fullscreen_quad + end_offscreen_pass)
+    ///   blurV  → bloom_a  (begin_offscreen_pass + draw_fullscreen_quad + end_offscreen_pass)
+    ///   composite → ldr   (begin_offscreen_pass + draw_fullscreen_quad + end_offscreen_pass)
+    ///   fxaa  → canvas    (begin_frame + draw_fullscreen_quad + end_frame)
+    /// Without fxaa, composite goes straight to the canvas pass.
+    pub fn endPostProcess(self: *Encoder, ctx: *PostCtx) void {
+        // Close the scene HDR pass.
+        self.endOffscreenPass();
+
+        const w = ctx.last_w;
+        const h = ctx.last_h;
+        const hw: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, w / 2)));
+        const hh: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, h / 2)));
+        const fw: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, w)));
+        const fh: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, h)));
+
+        if (ctx.opts.bloom) |b| {
+            // bright-pass: scene_hdr -> bloom_a (½-res)
+            ctx.p_bright[0] = b.threshold;
+            self.beginOffscreenPass(PostCtx.h_bloom_a, .{ 0, 0, 0, 1 }, clear_flag_color);
+            self.drawFullscreenQuad(PostCtx.sh_bright, PostCtx.h_scene_hdr, 0, @truncate(@intFromPtr(&ctx.p_bright)), 1);
+            self.endOffscreenPass();
+            // blur H: bloom_a -> bloom_b
+            ctx.p_blur_h = .{ hw, hh, 1, 0 };
+            self.beginOffscreenPass(PostCtx.h_bloom_b, .{ 0, 0, 0, 1 }, clear_flag_color);
+            self.drawFullscreenQuad(PostCtx.sh_blur, PostCtx.h_bloom_a, 0, @truncate(@intFromPtr(&ctx.p_blur_h)), 4);
+            self.endOffscreenPass();
+            // blur V: bloom_b -> bloom_a
+            ctx.p_blur_v = .{ hw, hh, 0, 1 };
+            self.beginOffscreenPass(PostCtx.h_bloom_a, .{ 0, 0, 0, 1 }, clear_flag_color);
+            self.drawFullscreenQuad(PostCtx.sh_blur, PostCtx.h_bloom_b, 0, @truncate(@intFromPtr(&ctx.p_blur_v)), 4);
+            self.endOffscreenPass();
+            ctx.p_comp[0] = b.intensity;
+        } else {
+            ctx.p_comp[0] = 0; // no bloom contribution
+        }
+
+        if (ctx.opts.fxaa) {
+            // composite (scene_hdr + bloom_a) -> ldr offscreen
+            self.beginOffscreenPass(PostCtx.h_ldr, .{ 0, 0, 0, 1 }, clear_flag_color);
+            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 1);
+            self.endOffscreenPass();
+            // fxaa: ldr -> canvas
+            ctx.p_fxaa = .{ fw, fh, 0, 0 };
+            self.beginFrame(.{ 0, 0, 0, 1 }, w, h);
+            self.drawFullscreenQuad(PostCtx.sh_fxaa, PostCtx.h_ldr, 0, @truncate(@intFromPtr(&ctx.p_fxaa)), 2);
+            self.endFrame();
+        } else {
+            // composite straight to canvas
+            self.beginFrame(.{ 0, 0, 0, 1 }, w, h);
+            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 1);
+            self.endFrame();
+        }
     }
 };
 
@@ -1916,4 +2090,89 @@ test "golden: post shader sources frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xdf6d628445b6bd9d), fnv64(wgslFxaa()));
     // linear-output PBR variant (omits tonemap+gamma; post composite pass tonemaps instead)
     try testing.expectEqual(@as(u64, 0x435aa6e4ca89a81a), fnv64(pbrFragmentSrc(variant_pbr | variant_linear_output)));
+}
+
+// ── Task 3: Post-process effect-graph sequence tests ─────────────────
+
+/// Walk the record stream and collect all Tag values in order.
+fn collectTags(stream: []const u8, out: []Tag) usize {
+    if (stream.len < 4) return 0;
+    var off: usize = 4; // skip the length header
+    var n: usize = 0;
+    while (off + 4 <= stream.len and n < out.len) {
+        const tag_raw = std.mem.readInt(u16, stream[off..][0..2], .little);
+        const size = std.mem.readInt(u16, stream[off + 2 ..][0..2], .little);
+        // Map raw u16 to Tag; skip if unknown.
+        inline for (std.meta.fields(Tag)) |f| {
+            if (f.value == tag_raw) {
+                out[n] = @enumFromInt(tag_raw);
+                n += 1;
+                break;
+            }
+        }
+        off += 4 + size;
+    }
+    return n;
+}
+
+/// Assert that `needle` appears as a contiguous subsequence inside `haystack[0..n]`.
+fn expectContainsInOrder(haystack: []const Tag, n: usize, needle: []const Tag) !void {
+    var ni: usize = 0;
+    for (haystack[0..n]) |t| {
+        if (ni < needle.len and t == needle[ni]) {
+            ni += 1;
+        }
+    }
+    if (ni != needle.len) {
+        std.debug.print("expectContainsInOrder: missing tags starting at index {d}\n", .{ni});
+        return error.MissingTagSubsequence;
+    }
+}
+
+test "beginPostProcess/endPostProcess emit the bloom+fxaa chain" {
+    var buf: [4096]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = PostCtx{};
+    enc.beginPostProcess(&ctx, .{ .bloom = .{}, .fxaa = true }, 800, 600);
+    enc.endPostProcess(&ctx);
+    const out = enc.finish();
+    var tag_buf: [64]Tag = undefined;
+    const n = collectTags(out, &tag_buf);
+    const tags = tag_buf[0..n];
+    // First frame: render targets created, then offscreen scene pass opened.
+    try expectContainsInOrder(tags, n, &.{
+        .create_render_target, // scene_hdr
+        .create_render_target, // bloom_a
+        .create_render_target, // bloom_b
+        .create_render_target, // ldr
+        .begin_offscreen_pass, // scene -> hdr
+    });
+    // endPostProcess: close scene, bloom chain, composite, then canvas fxaa pass.
+    try expectContainsInOrder(tags, n, &.{
+        .end_offscreen_pass, // close scene
+        .begin_offscreen_pass, // bright -> bloom_a
+        .draw_fullscreen_quad,
+        .begin_offscreen_pass, // blur H -> bloom_b
+        .draw_fullscreen_quad,
+        .begin_offscreen_pass, // blur V -> bloom_a
+        .draw_fullscreen_quad,
+        .begin_offscreen_pass, // composite -> ldr
+        .draw_fullscreen_quad,
+        .begin_frame, // canvas
+        .draw_fullscreen_quad, // fxaa -> canvas
+        .end_frame,
+    });
+}
+
+test "endPostProcess without fxaa composites straight to canvas" {
+    var buf: [4096]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = PostCtx{};
+    enc.beginPostProcess(&ctx, .{ .bloom = .{}, .fxaa = false }, 800, 600);
+    enc.endPostProcess(&ctx);
+    const tags_raw = enc.finish();
+    var tag_buf: [64]Tag = undefined;
+    const n = collectTags(tags_raw, &tag_buf);
+    // No ldr offscreen composite; composite draws inside a begin_frame canvas pass.
+    try expectContainsInOrder(tag_buf[0..n], n, &.{ .begin_frame, .draw_fullscreen_quad, .end_frame });
 }
