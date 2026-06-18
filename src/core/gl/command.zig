@@ -471,9 +471,12 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\  color += emissive_factor * texture(u_emissive_tex, v_uv).rgb;
         \\
     ;
-    const tail =
+    const tail_tonemap =
         \\  color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), 0.0, 1.0);
         \\  color = pow(color, vec3(1.0 / 2.2));
+        \\
+    ;
+    const tail_close =
         \\  o_frag = vec4(color, base_color.a);
         \\}
         \\
@@ -490,9 +493,105 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ lighting;
     src = src ++ (if (flags & variant_shadow != 0) combine_shadow else combine_plain);
     if (flags & variant_emissive != 0) src = src ++ emissive;
-    src = src ++ tail;
+    if (flags & variant_linear_output == 0) src = src ++ tail_tonemap;
+    src = src ++ tail_close;
     return src;
 }
+
+// ── Post-processing GLSL sources ────────────────────────────────────
+//
+// Shared fullscreen-triangle vertex + 4 post-effect fragments.
+// Paired with wgslBright/Blur/Composite/Fxaa below for WebGPU.
+
+pub const fullscreenVertexSrc: []const u8 =
+    \\#version 300 es
+    \\out vec2 v_uv;
+    \\void main() {
+    \\  // VBO-less covering triangle: ids 0,1,2 -> (-1,-1),(3,-1),(-1,3)
+    \\  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    \\  v_uv = p;
+    \\  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    \\}
+;
+
+pub const brightFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0;
+    \\uniform float u_threshold;
+    \\void main() {
+    \\  vec3 c = texture(u_tex0, v_uv).rgb;
+    \\  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    \\  frag = vec4(l > u_threshold ? c : vec3(0.0), 1.0);
+    \\}
+;
+
+pub const blurFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0;
+    \\uniform vec2 u_texel; // 1/target_size
+    \\uniform vec2 u_dir;   // (1,0) horizontal, (0,1) vertical
+    \\void main() {
+    \\  // 9-tap Gaussian (normalized weights).
+    \\  float w[5];
+    \\  w[0]=0.227027; w[1]=0.194595; w[2]=0.121622; w[3]=0.054054; w[4]=0.016216;
+    \\  vec3 acc = texture(u_tex0, v_uv).rgb * w[0];
+    \\  for (int i = 1; i < 5; i++) {
+    \\    vec2 o = u_texel * u_dir * float(i);
+    \\    acc += texture(u_tex0, v_uv + o).rgb * w[i];
+    \\    acc += texture(u_tex0, v_uv - o).rgb * w[i];
+    \\  }
+    \\  frag = vec4(acc, 1.0);
+    \\}
+;
+
+pub const compositeFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0; // scene HDR
+    \\uniform sampler2D u_tex1; // bloom
+    \\uniform float u_intensity;
+    \\vec3 aces(vec3 x) {
+    \\  const float a=2.51, b=0.03, c=2.43, d=0.59, e=0.14;
+    \\  return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
+    \\}
+    \\void main() {
+    \\  vec3 hdr = texture(u_tex0, v_uv).rgb + u_intensity * texture(u_tex1, v_uv).rgb;
+    \\  frag = vec4(aces(hdr), 1.0);
+    \\}
+;
+
+pub const fxaaFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0;
+    \\uniform vec2 u_texel;
+    \\float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+    \\void main() {
+    \\  vec3 m  = texture(u_tex0, v_uv).rgb;
+    \\  float lM = luma(m);
+    \\  float lN = luma(texture(u_tex0, v_uv + vec2(0.0, -u_texel.y)).rgb);
+    \\  float lS = luma(texture(u_tex0, v_uv + vec2(0.0,  u_texel.y)).rgb);
+    \\  float lE = luma(texture(u_tex0, v_uv + vec2( u_texel.x, 0.0)).rgb);
+    \\  float lW = luma(texture(u_tex0, v_uv + vec2(-u_texel.x, 0.0)).rgb);
+    \\  float lo = min(lM, min(min(lN, lS), min(lE, lW)));
+    \\  float hi = max(lM, max(max(lN, lS), max(lE, lW)));
+    \\  if (hi - lo < 0.10) { frag = vec4(m, 1.0); return; }
+    \\  vec2 dir = normalize(vec2((lN + lS) - 2.0*lM, (lE + lW) - 2.0*lM) + 1e-6);
+    \\  vec3 a = texture(u_tex0, v_uv + dir * u_texel).rgb;
+    \\  vec3 b = texture(u_tex0, v_uv - dir * u_texel).rgb;
+    \\  frag = vec4(0.5 * (a + b), 1.0);
+    \\}
+;
 
 // ── WebGPU PBR über-shader (P10 slice 2a) ───────────────────────────
 //
@@ -864,6 +963,130 @@ pub fn wgslDepth() []const u8 {
     \\@fragment
     \\fn fs_main() {}
     \\
+    ;
+}
+
+// ── Post-processing WGSL modules ─────────────────────────────────────
+//
+// Shared bind-group layout for all 4 post effects:
+//   @group(0) @binding(0) = params uniform (padded to 16B)
+//   @group(1) @binding(0) = sampler
+//   @group(1) @binding(1) = tex0 (primary input)
+//   @group(1) @binding(2) = tex1 (secondary; bridge binds a 1×1 dummy for single-input effects)
+// Each module includes a VBO-less fullscreen-triangle vs_main.
+
+pub fn wgslBright() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { threshold: f32, _pad: vec3<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let c = textureSample(tex0, samp, uv).rgb;
+    \\  let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    \\  return vec4<f32>(select(vec3<f32>(0.0), c, l > P.threshold), 1.0);
+    \\}
+    ;
+}
+
+pub fn wgslBlur() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { texel: vec2<f32>, dir: vec2<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let w0 = 0.227027; let w1 = 0.194595; let w2 = 0.121622; let w3 = 0.054054; let w4 = 0.016216;
+    \\  var acc = textureSample(tex0, samp, uv).rgb * w0;
+    \\  let step = P.texel * P.dir;
+    \\  acc += textureSample(tex0, samp, uv + step * 1.0).rgb * w1;
+    \\  acc += textureSample(tex0, samp, uv - step * 1.0).rgb * w1;
+    \\  acc += textureSample(tex0, samp, uv + step * 2.0).rgb * w2;
+    \\  acc += textureSample(tex0, samp, uv - step * 2.0).rgb * w2;
+    \\  acc += textureSample(tex0, samp, uv + step * 3.0).rgb * w3;
+    \\  acc += textureSample(tex0, samp, uv - step * 3.0).rgb * w3;
+    \\  acc += textureSample(tex0, samp, uv + step * 4.0).rgb * w4;
+    \\  acc += textureSample(tex0, samp, uv - step * 4.0).rgb * w4;
+    \\  return vec4<f32>(acc, 1.0);
+    \\}
+    ;
+}
+
+pub fn wgslComposite() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { intensity: f32, _pad: vec3<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\fn aces(x: vec3<f32>) -> vec3<f32> {
+    \\  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    \\  return clamp((x*(a*x+b))/(x*(c*x+d)+e), vec3<f32>(0.0), vec3<f32>(1.0));
+    \\}
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let hdr = textureSample(tex0, samp, uv).rgb + P.intensity * textureSample(tex1, samp, uv).rgb;
+    \\  return vec4<f32>(aces(hdr), 1.0);
+    \\}
+    ;
+}
+
+pub fn wgslFxaa() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { texel: vec2<f32>, _pad: vec2<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\fn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let m  = textureSample(tex0, samp, uv).rgb;
+    \\  let lM = luma(m);
+    \\  let lN = luma(textureSample(tex0, samp, uv + vec2<f32>(0.0, -P.texel.y)).rgb);
+    \\  let lS = luma(textureSample(tex0, samp, uv + vec2<f32>(0.0,  P.texel.y)).rgb);
+    \\  let lE = luma(textureSample(tex0, samp, uv + vec2<f32>( P.texel.x, 0.0)).rgb);
+    \\  let lW = luma(textureSample(tex0, samp, uv + vec2<f32>(-P.texel.x, 0.0)).rgb);
+    \\  let lo = min(lM, min(min(lN, lS), min(lE, lW)));
+    \\  let hi = max(lM, max(max(lN, lS), max(lE, lW)));
+    \\  if (hi - lo < 0.10) { return vec4<f32>(m, 1.0); }
+    \\  let dir = normalize(vec2<f32>((lN + lS) - 2.0*lM, (lE + lW) - 2.0*lM) + vec2<f32>(1e-6));
+    \\  let a = textureSample(tex0, samp, uv + dir * P.texel).rgb;
+    \\  let b = textureSample(tex0, samp, uv - dir * P.texel).rgb;
+    \\  return vec4<f32>(0.5 * (a + b), 1.0);
+    \\}
     ;
 }
 
@@ -1643,4 +1866,53 @@ test "golden: post-process wire records (tags 22-25)" {
     // end_offscreen_pass: 0B payload
     try testing.expectEqual(@as(u16, @intFromEnum(Tag.end_offscreen_pass)), readU16(out, off));
     try testing.expectEqual(@as(u16, 0), readU16(out, off + 2));
+}
+
+// ── Task 2: Post shader sources + linear-output PBR variant ─────────
+
+test "post GLSL sources: uniforms + sampler names present" {
+    // Fullscreen vertex stage uses gl_VertexID, declares no attributes.
+    try testing.expect(std.mem.indexOf(u8, fullscreenVertexSrc, "gl_VertexID") != null);
+    try testing.expect(std.mem.indexOf(u8, fullscreenVertexSrc, "in ") == null); // no vertex attributes
+
+    // bright-pass: one source sampler + threshold uniform.
+    try testing.expect(std.mem.indexOf(u8, brightFragmentSrc, "u_tex0") != null);
+    try testing.expect(std.mem.indexOf(u8, brightFragmentSrc, "u_threshold") != null);
+
+    // blur: source + texel + direction.
+    try testing.expect(std.mem.indexOf(u8, blurFragmentSrc, "u_texel") != null);
+    try testing.expect(std.mem.indexOf(u8, blurFragmentSrc, "u_dir") != null);
+
+    // composite: two samplers + intensity + ACES (tonemap lives here now).
+    try testing.expect(std.mem.indexOf(u8, compositeFragmentSrc, "u_tex0") != null);
+    try testing.expect(std.mem.indexOf(u8, compositeFragmentSrc, "u_tex1") != null);
+    try testing.expect(std.mem.indexOf(u8, compositeFragmentSrc, "u_intensity") != null);
+
+    // fxaa: source + texel.
+    try testing.expect(std.mem.indexOf(u8, fxaaFragmentSrc, "u_texel") != null);
+}
+
+test "variant_linear_output skips ACES in PBR fragment" {
+    const lit = pbrFragmentSrc(variant_pbr);
+    const linear = pbrFragmentSrc(variant_pbr | variant_linear_output);
+    // The standard variant tonemaps (inline ACES coefficients 2.51/2.43); the linear variant does not.
+    try testing.expect(std.mem.indexOf(u8, lit, "2.51") != null);
+    try testing.expect(linear.len < lit.len); // linear omits the tonemap block
+}
+
+test "golden: post shader sources frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate shader contract bump.
+    // GLSL
+    try testing.expectEqual(@as(u64, 0xd8e25fe0c5f0c5c3), fnv64(fullscreenVertexSrc));
+    try testing.expectEqual(@as(u64, 0xceff6b2f105a92ec), fnv64(brightFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x221d8b95dd9492ba), fnv64(blurFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x0ac71cffb32f57ad), fnv64(compositeFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x9d052976fb0b2105), fnv64(fxaaFragmentSrc));
+    // WGSL
+    try testing.expectEqual(@as(u64, 0xefa46fcd8c5003b6), fnv64(wgslBright()));
+    try testing.expectEqual(@as(u64, 0xb93270d3619361ca), fnv64(wgslBlur()));
+    try testing.expectEqual(@as(u64, 0xdb360b028579d531), fnv64(wgslComposite()));
+    try testing.expectEqual(@as(u64, 0xdf6d628445b6bd9d), fnv64(wgslFxaa()));
+    // linear-output PBR variant (omits tonemap+gamma; post composite pass tonemaps instead)
+    try testing.expectEqual(@as(u64, 0x435aa6e4ca89a81a), fnv64(pbrFragmentSrc(variant_pbr | variant_linear_output)));
 }
