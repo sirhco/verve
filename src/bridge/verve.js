@@ -4478,6 +4478,19 @@
     return true;
   };
 
+  // Post-process param upload: maps the f32 param array to whichever uniforms
+  // exist on the program. Unused locations are null and silently skipped.
+  // bright: p[0]=threshold; blur: p[0..1]=texel, p[2..3]=dir;
+  // composite: p[0]=intensity; fxaa: p[0..1]=texel.
+  const applyPostParams = (gl, sh, dv, ptr, count) => {
+    const p = [];
+    for (let i = 0; i < count; i++) p.push(dv.getFloat32(ptr + i * 4, true));
+    if (sh.uThreshold && count >= 1) gl.uniform1f(sh.uThreshold, p[0]);
+    if (sh.uIntensity && count >= 1) gl.uniform1f(sh.uIntensity, p[0]);
+    if (sh.uTexel && count >= 2) gl.uniform2f(sh.uTexel, p[0], p[1]);
+    if (sh.uDir && count >= 4) gl.uniform2f(sh.uDir, p[2], p[3]);
+  };
+
   const glInterpret = (st, ptr) => {
     // Fresh DataView every frame: memory.buffer detaches on wasm growth.
     const dv = new DataView(memory.buffer);
@@ -4498,6 +4511,9 @@
             dv.getFloat32(off + 8, true),
             dv.getFloat32(off + 12, true),
           );
+          // Re-enable depth test each frame: draw_fullscreen_quad (case 25) disables
+          // it for the post pass, and WebGL state persists across frames.
+          gl.enable(gl.DEPTH_TEST);
           gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
           break;
         }
@@ -4561,6 +4577,14 @@
             // uniformMatrix4fv uploads the whole mat4[] against (case 21).
             sh.skinned = (variant & 128) !== 0;
             sh.bones = sh.skinned ? gl.getUniformLocation(prog, "u_bones[0]") : null;
+          }
+          if (variant & 0x100) { // variant_post: cache post-process uniform locations
+            sh.tex0 = gl.getUniformLocation(prog, "u_tex0");
+            sh.tex1 = gl.getUniformLocation(prog, "u_tex1");
+            sh.uThreshold = gl.getUniformLocation(prog, "u_threshold");
+            sh.uTexel = gl.getUniformLocation(prog, "u_texel");
+            sh.uDir = gl.getUniformLocation(prog, "u_dir");
+            sh.uIntensity = gl.getUniformLocation(prog, "u_intensity");
           }
           st.shaders[handle] = sh;
           break;
@@ -4782,6 +4806,14 @@
               gl.deleteTexture(sm.tex);
               st.shadowMaps[handle] = null;
             }
+          } else if (kind === 4) { // render_target (FBO + color + optional depth tex)
+            const rt = st.renderTargets[handle];
+            if (rt) {
+              gl.deleteFramebuffer(rt.fbo);
+              gl.deleteTexture(rt.colorTex);
+              if (rt.depthTex) gl.deleteTexture(rt.depthTex);
+              st.renderTargets[handle] = null;
+            }
           }
           break;
         }
@@ -4862,6 +4894,104 @@
             gl.uniformMatrix4fv(st.active.bones, false, new Float32Array(memory.buffer, p, count * 16));
           break;
         }
+        case 22: { // CREATE_RENDER_TARGET {handle,width,height,format,flags}
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          const fmt = dv.getUint32(off + 12, true);   // 0=rgba8, 1=rgba16f
+          const flags = dv.getUint32(off + 16, true); // bit0 = with_depth
+          const fbo = gl.createFramebuffer();
+          gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+          const colorTex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, colorTex);
+          let internal, type;
+          if (fmt === 1) {
+            // rgba16f: requires EXT_color_buffer_float in WebGL2
+            if (!st.extColorBufferFloat) {
+              st.extColorBufferFloat = gl.getExtension("EXT_color_buffer_float");
+              if (!st.extColorBufferFloat)
+                console.warn("verve.gl: EXT_color_buffer_float unavailable — render target falling back to RGBA8");
+            }
+            if (st.extColorBufferFloat) {
+              internal = gl.RGBA16F;
+              type = gl.HALF_FLOAT;
+            } else {
+              internal = gl.RGBA8;
+              type = gl.UNSIGNED_BYTE;
+            }
+          } else {
+            internal = gl.RGBA8;
+            type = gl.UNSIGNED_BYTE;
+          }
+          gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, gl.RGBA, type, null);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, colorTex, 0);
+          let depthTex = null;
+          if (flags & 1) {
+            depthTex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, depthTex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, w, h, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depthTex, 0);
+          }
+          gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          st.renderTargets[handle] = { fbo, colorTex, depthTex, w, h };
+          break;
+        }
+        case 23: { // BEGIN_OFFSCREEN_PASS {target, clear_rgba(4×f32), clear_flags}
+          const target = dv.getUint32(off, true);
+          const r = dv.getFloat32(off + 4, true);
+          const g = dv.getFloat32(off + 8, true);
+          const b = dv.getFloat32(off + 12, true);
+          const a = dv.getFloat32(off + 16, true);
+          const cf = dv.getUint32(off + 20, true);
+          const rt = st.renderTargets[target];
+          if (!rt) break;
+          gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo);
+          gl.viewport(0, 0, rt.w, rt.h);
+          // Re-enable depth test for 3D scene passes rendered into a target
+          if (rt.depthTex) gl.enable(gl.DEPTH_TEST);
+          gl.clearColor(r, g, b, a);
+          let mask = 0;
+          if (cf & 1) mask |= gl.COLOR_BUFFER_BIT;
+          if (cf & 2) mask |= gl.DEPTH_BUFFER_BIT;
+          if (mask) gl.clear(mask);
+          st.active = null; // force re-bind of pipeline for draws in this pass
+          break;
+        }
+        case 24: { // END_OFFSCREEN_PASS {} — rebind canvas framebuffer
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          break;
+        }
+        case 25: { // DRAW_FULLSCREEN_QUAD {shader, tex0, tex1, params_ptr, param_count}
+          const shHandle = dv.getUint32(off, true);
+          const t0 = dv.getUint32(off + 4, true);
+          const t1 = dv.getUint32(off + 8, true);
+          const pPtr = dv.getUint32(off + 12, true);
+          const pCount = dv.getUint32(off + 16, true);
+          const sh = st.shaders[shHandle];
+          if (!sh) break;
+          gl.useProgram(sh.prog);
+          gl.disable(gl.DEPTH_TEST);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, st.renderTargets[t0] ? st.renderTargets[t0].colorTex : null);
+          if (sh.tex0) gl.uniform1i(sh.tex0, 0);
+          if (t1 !== 0 && st.renderTargets[t1]) {
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, st.renderTargets[t1].colorTex);
+            if (sh.tex1) gl.uniform1i(sh.tex1, 1);
+          }
+          applyPostParams(gl, sh, dv, pPtr, pCount);
+          if (!st.emptyVao) st.emptyVao = gl.createVertexArray();
+          gl.bindVertexArray(st.emptyVao);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+          break;
+        }
         default:
           break; // unknown tag: size-skip = forward compatible
       }
@@ -4881,9 +5011,18 @@
     for (const entry of st.textures) if (entry) gl.deleteTexture(entry.tex);
     for (const sh of st.shaders) if (sh) gl.deleteProgram(sh.prog);
     for (const vao of st.vaos.values()) gl.deleteVertexArray(vao);
+    for (const rt of st.renderTargets) {
+      if (rt) {
+        gl.deleteFramebuffer(rt.fbo);
+        gl.deleteTexture(rt.colorTex);
+        if (rt.depthTex) gl.deleteTexture(rt.depthTex);
+      }
+    }
+    if (st.emptyVao) { gl.deleteVertexArray(st.emptyVao); st.emptyVao = null; }
     st.buffers = [];
     st.textures = [];
     st.shaders = [];
+    st.renderTargets = [];
     st.vaos.clear();
     st.active = null;
   };
@@ -5744,7 +5883,10 @@
       shaders: [],
       textures: [],
       shadowMaps: [], // P9 slice 3: { fbo, tex, size } per handle
+      renderTargets: [], // post-processing: { fbo, colorTex, depthTex, w, h } per handle
       vaos: new Map(),
+      emptyVao: null, // lazy-created VAO for fullscreen-quad draw (case 25)
+      extColorBufferFloat: null, // EXT_color_buffer_float, enabled on first rgba16f target
       active: null,
       last: 0,
       // Poster swap: SSR may drop an <img data-gl-poster> sibling under the
