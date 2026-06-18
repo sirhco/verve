@@ -159,7 +159,13 @@ var area_buf: [(RING_LEN + 2) * 16]u8 = undefined;
 // set with (no copy — core/signal.zig), so the bytes must outlive the call.
 // Module-level statics keep them valid across later re-renders; stack buffers
 // would dangle and later reads would show garbage.
-var label_buf: [16]u8 = undefined;
+// Four separate label buffers (one per turbine) so that switching turbines
+// always gives a slice with a DIFFERENT pointer.  core/signal.zig compares
+// slices with std.meta.eql which checks pointer identity, not contents, so
+// two writes to the same buffer with the same length ("Turbine 0" → "Turbine 1"
+// are both 9 bytes) look equal and the on_set callback is skipped.  Using
+// a distinct backing array per turbine id guarantees the pointer changes.
+var label_bufs: [4][16]u8 = undefined;
 var pw_buf: [32]u8 = undefined;
 var rpm_buf: [32]u8 = undefined;
 var wind_buf: [32]u8 = undefined;
@@ -175,29 +181,19 @@ export fn metrics_apply(ptr: u32, len: u32) void {
     @memcpy(last_frame[0..last_frame_len], data[0..last_frame_len]);
 
     const power = extractF32Field(data, "power_kw") orelse return;
-    ringPush(power);
-    setSelectedLabel(); // keep the heading in sync with `selected`
-    repaintReadout(data, true);
-    repaintChart();
-}
-
-/// Set the text signals from `data` for the selected turbine. When `live` the
-/// values are written directly; on a selection change the caller instead seeds a
-/// count-up so the readout ramps to the new turbine's values.
-fn repaintReadout(data: []const u8, live: bool) void {
-    const power = extractF32Field(data, "power_kw") orelse return;
     const rpm_val = extractF32Field(data, "rpm") orelse return;
     const wind_val = extractF32Field(data, "wind_ms") orelse return;
-    if (live) {
-        setReadout(power, rpm_val, wind_val);
-    }
+    ringPush(power);
+    setSelectedLabel(); // keep the heading in sync with `selected`
+    setReadout(power, rpm_val, wind_val);
+    repaintChart();
 }
 
 /// Write the `selected_label` heading from the current `selected` id. Driven
 /// from the metrics frame path too so the heading always tracks `selected`
 /// under the same (working) vid scope the readout signals use.
 fn setSelectedLabel() void {
-    const lbl_str = std.fmt.bufPrint(&label_buf, "Turbine {d}", .{selected}) catch return;
+    const lbl_str = std.fmt.bufPrint(&label_bufs[selected], "Turbine {d}", .{selected}) catch return;
     verve.signalSetStr("selected_label", lbl_str);
 }
 
@@ -277,10 +273,11 @@ fn selectTurbine(id: u32) void {
 
     selected = id;
 
-    // Update the heading. The string Signal stores the slice it is set with
-    // (no copy — core/signal.zig), so the backing bytes must outlive the call;
-    // label_buf is module-level so the value stays valid for later re-renders.
-    const lbl_str = std.fmt.bufPrint(&label_buf, "Turbine {d}", .{id}) catch "Turbine ?";
+    // Update the heading. Uses label_bufs[id] so the slice pointer differs from
+    // the previously stored value; std.meta.eql on []const u8 compares pointer
+    // identity, so a same-length label written to the same buffer would be
+    // skipped by the signal's equality guard.
+    const lbl_str = std.fmt.bufPrint(&label_bufs[id], "Turbine {d}", .{id}) catch "Turbine ?";
     verve.signalSetStr("selected_label", lbl_str);
     ring_head = 0;
     ring_fill = 0;
