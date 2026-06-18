@@ -4,19 +4,162 @@ const std = @import("std");
 const verve = @import("verve");
 const sim = @import("sim.zig");
 
-/// SSR power-bar placeholder showing current power as a width indicator.
-/// The client island updates `data-ref="dash-power-fill"` live.
+/// Chart layout constants — must match the client island's coordinate math.
+/// Plot area: x ∈ [48, 580], y ∈ [20, 160].  Power domain: [0, 5000 kW].
+const CHART_W: f32 = 600;
+const CHART_H: f32 = 200;
+const PLOT_X0: f32 = 48;
+const PLOT_X1: f32 = 580;
+const PLOT_Y0: f32 = 160; // bottom (larger y = lower on screen)
+const PLOT_Y1: f32 = 20; // top
+const POWER_MAX: f32 = 5000;
+const RING_LEN: usize = 60;
+
+/// Map a power value to Y pixel in SVG coordinate space.
+fn powerToY(power: f32) f32 {
+    const frac = @max(0.0, @min(power / POWER_MAX, 1.0));
+    return PLOT_Y0 - frac * (PLOT_Y0 - PLOT_Y1);
+}
+
+/// Append "NNN.N" to buf starting at pos, return new pos.
+fn appendF1Ssr(buf: []u8, pos: usize, v: f32) usize {
+    const s = std.fmt.bufPrint(buf[pos..], "{d:.1}", .{v}) catch return pos;
+    return pos + s.len;
+}
+
+/// Append a single byte to buf at pos, return new pos.
+fn appendCharSsr(buf: []u8, pos: usize, c: u8) usize {
+    if (pos < buf.len) buf[pos] = c;
+    return pos + 1;
+}
+
+/// SSR rolling line/area chart skeleton for turbine 0's power history.
+/// Emits a static SVG whose `<polyline data-ref="dash-power-line">` and
+/// `<polygon data-ref="dash-power-area">` are patched live by the Dashboard
+/// client island via `verve.setRefAttr`.
 fn dashChartSsr(ctx: *const verve.Context, power_kw: f32) *verve.Node {
-    const pct: f32 = @min(power_kw / 5000.0 * 100.0, 100.0);
-    const pct_str = std.fmt.allocPrint(ctx.alloc(), "{d:.1}%", .{pct}) catch "0%";
-    const fill_style = std.fmt.allocPrint(
-        ctx.alloc(),
-        "height:100%;width:{s};background:linear-gradient(90deg,#2563eb,#7c3aed);border-radius:3px;transition:width .4s",
-        .{pct_str},
-    ) catch "height:100%;width:0%;background:#2563eb";
-    return ctx.div().class("mc-chart-bar").children(.{
-        ctx.div().attr("data-ref", "dash-power-fill").attr("style", fill_style),
+    // Build initial 60-sample flat line at the current power level.
+    var pts_buf: [RING_LEN * 16]u8 = undefined;
+    var pts_pos: usize = 0;
+    for (0..RING_LEN) |i| {
+        const fi: f32 = @floatFromInt(i);
+        const x = PLOT_X0 + fi / @as(f32, @floatFromInt(RING_LEN - 1)) * (PLOT_X1 - PLOT_X0);
+        const y = powerToY(power_kw);
+        if (i > 0) pts_pos = appendCharSsr(&pts_buf, pts_pos, ' ');
+        pts_pos = appendF1Ssr(&pts_buf, pts_pos, x);
+        pts_pos = appendCharSsr(&pts_buf, pts_pos, ',');
+        pts_pos = appendF1Ssr(&pts_buf, pts_pos, y);
+    }
+    const pts_str = pts_buf[0..pts_pos];
+
+    // Area fill polygon: same curve + two baseline corners.
+    var area_buf: [(RING_LEN + 2) * 16]u8 = undefined;
+    var area_pos: usize = 0;
+    for (0..RING_LEN) |i| {
+        const fi: f32 = @floatFromInt(i);
+        const x = PLOT_X0 + fi / @as(f32, @floatFromInt(RING_LEN - 1)) * (PLOT_X1 - PLOT_X0);
+        const y = powerToY(power_kw);
+        if (i > 0) area_pos = appendCharSsr(&area_buf, area_pos, ' ');
+        area_pos = appendF1Ssr(&area_buf, area_pos, x);
+        area_pos = appendCharSsr(&area_buf, area_pos, ',');
+        area_pos = appendF1Ssr(&area_buf, area_pos, y);
+    }
+    // right-bottom corner
+    area_pos = appendCharSsr(&area_buf, area_pos, ' ');
+    area_pos = appendF1Ssr(&area_buf, area_pos, PLOT_X1);
+    area_pos = appendCharSsr(&area_buf, area_pos, ',');
+    area_pos = appendF1Ssr(&area_buf, area_pos, PLOT_Y0);
+    // left-bottom corner
+    area_pos = appendCharSsr(&area_buf, area_pos, ' ');
+    area_pos = appendF1Ssr(&area_buf, area_pos, PLOT_X0);
+    area_pos = appendCharSsr(&area_buf, area_pos, ',');
+    area_pos = appendF1Ssr(&area_buf, area_pos, PLOT_Y0);
+    const area_pts = area_buf[0..area_pos];
+
+    const tick_vals = [_]f32{ 0, 1250, 2500, 3750, 5000 };
+
+    const svg = ctx.el("svg")
+        .attr("xmlns", "http://www.w3.org/2000/svg")
+        .attr("viewBox", "0 0 600 200")
+        .attr("width", "600")
+        .attr("height", "200")
+        .attr("style", "width:100%;max-width:600px;height:auto;display:block;overflow:visible;margin-top:.75rem");
+
+    // Grid lines + Y-axis tick labels.
+    for (tick_vals) |tv| {
+        const y_px = powerToY(tv);
+        var yb: [20]u8 = undefined;
+        var xb0: [20]u8 = undefined;
+        var xb1: [20]u8 = undefined;
+        var lyb: [20]u8 = undefined;
+        var lb: [10]u8 = undefined;
+        const y_str = std.fmt.bufPrint(&yb, "{d:.1}", .{y_px}) catch "0";
+        const x0_str = std.fmt.bufPrint(&xb0, "{d:.1}", .{PLOT_X0}) catch "48";
+        const x1_str = std.fmt.bufPrint(&xb1, "{d:.1}", .{PLOT_X1}) catch "580";
+        const ly_str = std.fmt.bufPrint(&lyb, "{d:.1}", .{y_px + 4}) catch "0";
+        const lbl = if (tv >= 1000)
+            std.fmt.bufPrint(&lb, "{d:.0}k", .{tv / 1000.0}) catch ""
+        else
+            std.fmt.bufPrint(&lb, "{d:.0}", .{tv}) catch "";
+        _ = svg.children(.{
+            ctx.el("line")
+                .attr("x1", std.fmt.allocPrint(ctx.alloc(), "{s}", .{x0_str}) catch "48")
+                .attr("y1", std.fmt.allocPrint(ctx.alloc(), "{s}", .{y_str}) catch "0")
+                .attr("x2", std.fmt.allocPrint(ctx.alloc(), "{s}", .{x1_str}) catch "580")
+                .attr("y2", std.fmt.allocPrint(ctx.alloc(), "{s}", .{y_str}) catch "0")
+                .attr("stroke", "#1e2a38")
+                .attr("stroke-width", "1"),
+            ctx.el("text")
+                .attr("x", "44")
+                .attr("y", std.fmt.allocPrint(ctx.alloc(), "{s}", .{ly_str}) catch "0")
+                .attr("text-anchor", "end")
+                .attr("font-size", "10")
+                .attr("fill", "#607080")
+                .text(std.fmt.allocPrint(ctx.alloc(), "{s}", .{lbl}) catch ""),
+        });
+    }
+
+    // X-axis baseline.
+    _ = svg.children(.{
+        ctx.el("line")
+            .attr("x1", "48").attr("y1", "160")
+            .attr("x2", "580").attr("y2", "160")
+            .attr("stroke", "#1e2a38").attr("stroke-width", "1"),
     });
+
+    // "kW" axis label.
+    _ = svg.children(.{
+        ctx.el("text")
+            .attr("x", "8").attr("y", "90")
+            .attr("text-anchor", "middle")
+            .attr("font-size", "10")
+            .attr("fill", "#607080")
+            .attr("transform", "rotate(-90,8,90)")
+            .text("kW"),
+    });
+
+    // Area fill (cosmetic background — client patches this too).
+    _ = svg.children(.{
+        ctx.el("polygon")
+            .attr("data-ref", "dash-power-area")
+            .attr("points", std.fmt.allocPrint(ctx.alloc(), "{s}", .{area_pts}) catch "")
+            .attr("fill", "#2563eb")
+            .attr("opacity", "0.18"),
+    });
+
+    // Power line — the element the client patches on every metrics frame.
+    _ = svg.children(.{
+        ctx.el("polyline")
+            .attr("data-ref", "dash-power-line")
+            .attr("points", std.fmt.allocPrint(ctx.alloc(), "{s}", .{pts_str}) catch "")
+            .attr("fill", "none")
+            .attr("stroke", "#3b82f6")
+            .attr("stroke-width", "2")
+            .attr("stroke-linejoin", "round")
+            .attr("stroke-linecap", "round"),
+    });
+
+    return svg;
 }
 
 /// Hero page: h1 title + FarmScene 3D canvas + Dashboard telemetry island.
@@ -64,8 +207,10 @@ pub fn index(ctx: *const verve.Context) !*verve.Node {
             ctx.span().text("Live via SSE "),
             ctx.code("/push?channel=metrics"),
         }),
-        // SSR chart placeholder: power bar from sim snapshot at tick 0.
-        dashChartSsr(ctx, t0.power_kw),
+        // SSR rolling line/area chart — client patches points on every metrics frame.
+        ctx.div().class("mc-power-chart").children(.{
+            dashChartSsr(ctx, t0.power_kw),
+        }),
     });
 
     const dash_island = verve.island(ctx, .{ .name = "Dashboard" }, dash_inner);
@@ -96,7 +241,7 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.mc-stat-unit{font-size:.8rem;color:#607080}
                 \\.mc-hint-live{font-size:.8rem;color:#607080;margin:.5rem 0}
                 \\code{background:#121c28;border:1px solid #1e2a38;border-radius:3px;padding:.1rem .3rem;font-size:.8em}
-                \\.mc-chart-bar{height:10px;background:#1a2535;border-radius:4px;overflow:hidden;margin-top:.5rem}
+                \\.mc-power-chart{margin-top:.5rem;background:#0a0f16;border-radius:6px;padding:.5rem}
             ),
         }),
         ctx.el("body").children(.{
