@@ -2,12 +2,19 @@
 //! change: only the windfarm.vmesh asset (no HDR/IBL environment). The
 //! FarmScene island chunk is resolved from the local override at
 //! `src/client/islands/FarmScene.zig`.
+//!
+//! Desktop target: `zig build -Ddesktop` produces a native-window binary that
+//! embeds the same server binary and opens an OS webview pointed at
+//! http://127.0.0.1:8080/ (or --port N). SSE, WS, GL assets, and the metrics
+//! sim all run inside the embedded server layer.
 
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const desktop = b.option(bool, "desktop", "Build the native-window desktop binary (OS webview wrapping the embedded HTTP server)") orelse false;
 
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -305,6 +312,103 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run the mission-control server");
     run_step.dependOn(&run_cmd.step);
+
+    // ---- Desktop target (-Ddesktop) -----------------------------------------
+    // Produces a native-window binary embedding the HTTP server. The webview
+    // navigates to http://127.0.0.1:8080/ (or --port N at runtime); all routes,
+    // SSE push, WebSocket, and GL assets are served by the embedded server.
+    if (desktop) {
+        // Desktop platform layer. Root at src/desktop/window.zig (the public
+        // facade); the comptime backend.zig dispatch selects macos/windows/linux.
+        const desktop_mod = b.createModule(.{
+            .root_source_file = b.path("../../src/desktop/window.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        // Platform-specific linkage — mirrors templates/desktop/build.zig exactly.
+        desktop_mod.link_libc = true;
+        switch (target.result.os.tag) {
+            .macos => {
+                desktop_mod.linkFramework("Cocoa", .{});
+                desktop_mod.linkFramework("WebKit", .{});
+                desktop_mod.linkFramework("Foundation", .{});
+                desktop_mod.linkFramework("UserNotifications", .{});
+                desktop_mod.linkFramework("IOKit", .{});
+                desktop_mod.linkFramework("CoreFoundation", .{});
+                desktop_mod.linkFramework("SystemConfiguration", .{});
+                desktop_mod.linkFramework("CoreServices", .{});
+                desktop_mod.linkFramework("Carbon", .{});
+                desktop_mod.linkSystemLibrary("objc", .{});
+            },
+            .windows => {
+                desktop_mod.linkSystemLibrary("Ole32", .{});
+                desktop_mod.linkSystemLibrary("OleAut32", .{});
+                desktop_mod.linkSystemLibrary("User32", .{});
+                desktop_mod.linkSystemLibrary("Shell32", .{});
+                desktop_mod.linkSystemLibrary("Shlwapi", .{});
+                desktop_mod.linkSystemLibrary("Shcore", .{});
+                desktop_mod.linkSystemLibrary("Windowscodecs", .{});
+                desktop_mod.linkSystemLibrary("Uiautomationcore", .{});
+                desktop_mod.linkSystemLibrary("Comdlg32", .{});
+                desktop_mod.linkSystemLibrary("Gdi32", .{});
+                desktop_mod.linkSystemLibrary("api-ms-win-core-winrt-l1-1-0", .{});
+                desktop_mod.linkSystemLibrary("api-ms-win-core-winrt-string-l1-1-0", .{});
+                desktop_mod.addIncludePath(b.path("../../src/desktop/win_native/include"));
+                desktop_mod.addCSourceFile(.{
+                    .file = b.path("../../src/desktop/win_native/webview2_host.cpp"),
+                    .flags = &.{
+                        "-std=c++17", "-fms-extensions", "-fno-exceptions", "-fno-rtti",
+                        "-DUNICODE",  "-D_UNICODE",
+                    },
+                });
+                const install_loader = b.addInstallBinFile(
+                    b.path("../../src/desktop/win_native/include/WebView2Loader.dll"),
+                    "WebView2Loader.dll",
+                );
+                b.getInstallStep().dependOn(&install_loader.step);
+            },
+            .linux => {
+                const use_gtk4 = b.option(bool, "gtk4", "Use GTK4 + WebKitGTK 6.0 instead of GTK3 + WebKitGTK 4.1") orelse false;
+                if (use_gtk4) {
+                    desktop_mod.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
+                    desktop_mod.linkSystemLibrary("webkitgtk-6.0", .{ .use_pkg_config = .force });
+                } else {
+                    desktop_mod.linkSystemLibrary("gtk+-3.0", .{ .use_pkg_config = .force });
+                    desktop_mod.linkSystemLibrary("webkit2gtk-4.1", .{ .use_pkg_config = .force });
+                }
+                const gtk4_opts = b.addOptions();
+                gtk4_opts.addOption(bool, "gtk4", use_gtk4);
+                desktop_mod.addOptions("desktop_options", gtk4_opts);
+            },
+            else => @panic("unsupported OS — desktop builds target macOS, Windows, or Linux"),
+        }
+
+        const desktop_exe_mod = b.createModule(.{
+            .root_source_file = b.path("src/desktop_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "desktop", .module = desktop_mod },
+                // The server module is imported as "server_main" so desktop_main.zig
+                // can call server_main.main(init) in a background thread.
+                .{ .name = "server_main", .module = server_mod },
+            },
+        });
+        desktop_exe_mod.link_libc = true;
+
+        const desktop_exe = b.addExecutable(.{
+            .name = "mission-control-desktop",
+            .root_module = desktop_exe_mod,
+        });
+        b.installArtifact(desktop_exe);
+
+        const desktop_run = b.addRunArtifact(desktop_exe);
+        desktop_run.step.dependOn(b.getInstallStep());
+        if (b.args) |args| desktop_run.addArgs(args);
+        const desktop_run_step = b.step("run-desktop", "Run the mission-control desktop app");
+        desktop_run_step.dependOn(&desktop_run.step);
+    }
 }
 
 fn fileExists(b: *std.Build, rel: []const u8) bool {
