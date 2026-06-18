@@ -1057,6 +1057,8 @@ pub fn wgslComposite() []const u8 {
 }
 
 pub fn wgslFxaa() []const u8 {
+    // Use textureSampleLevel (mip 0) for all directional samples — always
+    // uniform control flow, no early-return branch, satisfies WGSL spec.
     return
     \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
@@ -1073,19 +1075,20 @@ pub fn wgslFxaa() []const u8 {
     \\@group(1) @binding(2) var tex1: texture_2d<f32>;
     \\fn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }
     \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    \\  let m  = textureSample(tex0, samp, uv).rgb;
+    \\  let m  = textureSampleLevel(tex0, samp, uv, 0.0).rgb;
     \\  let lM = luma(m);
-    \\  let lN = luma(textureSample(tex0, samp, uv + vec2<f32>(0.0, -P.texel.y)).rgb);
-    \\  let lS = luma(textureSample(tex0, samp, uv + vec2<f32>(0.0,  P.texel.y)).rgb);
-    \\  let lE = luma(textureSample(tex0, samp, uv + vec2<f32>( P.texel.x, 0.0)).rgb);
-    \\  let lW = luma(textureSample(tex0, samp, uv + vec2<f32>(-P.texel.x, 0.0)).rgb);
+    \\  let lN = luma(textureSampleLevel(tex0, samp, uv + vec2<f32>(0.0, -P.texel.y), 0.0).rgb);
+    \\  let lS = luma(textureSampleLevel(tex0, samp, uv + vec2<f32>(0.0,  P.texel.y), 0.0).rgb);
+    \\  let lE = luma(textureSampleLevel(tex0, samp, uv + vec2<f32>( P.texel.x, 0.0), 0.0).rgb);
+    \\  let lW = luma(textureSampleLevel(tex0, samp, uv + vec2<f32>(-P.texel.x, 0.0), 0.0).rgb);
     \\  let lo = min(lM, min(min(lN, lS), min(lE, lW)));
     \\  let hi = max(lM, max(max(lN, lS), max(lE, lW)));
-    \\  if (hi - lo < 0.10) { return vec4<f32>(m, 1.0); }
+    \\  let edge = clamp((hi - lo - 0.10) * 20.0, 0.0, 1.0);
     \\  let dir = normalize(vec2<f32>((lN + lS) - 2.0*lM, (lE + lW) - 2.0*lM) + vec2<f32>(1e-6));
-    \\  let a = textureSample(tex0, samp, uv + dir * P.texel).rgb;
-    \\  let b = textureSample(tex0, samp, uv - dir * P.texel).rgb;
-    \\  return vec4<f32>(0.5 * (a + b), 1.0);
+    \\  let a = textureSampleLevel(tex0, samp, uv + dir * P.texel, 0.0).rgb;
+    \\  let b = textureSampleLevel(tex0, samp, uv - dir * P.texel, 0.0).rgb;
+    \\  let blended = mix(m, 0.5 * (a + b), edge);
+    \\  return vec4<f32>(blended, 1.0);
     \\}
     ;
 }
@@ -2100,7 +2103,7 @@ test "golden: post shader sources frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xefa46fcd8c5003b6), fnv64(wgslBright()));
     try testing.expectEqual(@as(u64, 0xb93270d3619361ca), fnv64(wgslBlur()));
     try testing.expectEqual(@as(u64, 0xdb360b028579d531), fnv64(wgslComposite()));
-    try testing.expectEqual(@as(u64, 0xdf6d628445b6bd9d), fnv64(wgslFxaa()));
+    try testing.expectEqual(@as(u64, 0xe8ac45e2d1276dfd), fnv64(wgslFxaa()));
     // linear-output PBR variant (omits tonemap+gamma; post composite pass tonemaps instead)
     try testing.expectEqual(@as(u64, 0x435aa6e4ca89a81a), fnv64(pbrFragmentSrc(variant_pbr | variant_linear_output)));
 }

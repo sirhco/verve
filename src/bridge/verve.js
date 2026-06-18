@@ -5195,22 +5195,26 @@
     return (t && t.view) ? t.view : fallback.view;
   };
 
-  // Lazily build (and cache) a post render pipeline for a given color format.
-  // Post pipelines must match the pass's color attachment format, which varies
-  // across the chain (rgba16float bloom, rgba8unorm ldr, st.format canvas), so we
-  // create one variant per format on first draw and cache it on the shader entry
-  // keyed by format string. Returns the cached pipeline + its bind-group layouts.
-  const getOrCreatePostPipeline = (st, entry, format) => {
-    let pipe = entry.byFormat[format];
+  // Lazily build (and cache) a post render pipeline for a given (format, hasDepth)
+  // combination. Post pipelines must match the pass's color attachment format AND
+  // its depth-stencil state. The final canvas pass (BEGIN_FRAME) has depth24plus;
+  // offscreen passes (BEGIN_OFFSCREEN_PASS without depth) do not. Key: "format:0/1".
+  const getOrCreatePostPipeline = (st, entry, format, hasDepth) => {
+    const key = format + (hasDepth ? ":d" : "");
+    let pipe = entry.byFormat[key];
     if (!pipe) {
-      pipe = st.device.createRenderPipeline({
+      const desc = {
         layout: st.device.createPipelineLayout({ bindGroupLayouts: [entry.bgl0, entry.bgl1] }),
         vertex: { module: entry.module, entryPoint: "vs_main" }, // no vertex buffers
         fragment: { module: entry.module, entryPoint: "fs_main", targets: [{ format }] },
         primitive: { topology: "triangle-list" },
-        // no depthStencil — fullscreen quad
-      });
-      entry.byFormat[format] = pipe;
+      };
+      // Canvas pass has depth24plus; fullscreen-quad never writes depth.
+      if (hasDepth) {
+        desc.depthStencil = { format: "depth24plus", depthWriteEnabled: false, depthCompare: "always" };
+      }
+      pipe = st.device.createRenderPipeline(desc);
+      entry.byFormat[key] = pipe;
     }
     return pipe;
   };
@@ -5255,6 +5259,7 @@
           }
           st.pbrSlot = 0; // reset per-draw uniform slot allocation for this frame
           st.curTargetFormat = st.format; // canvas pass: post draws target st.format
+          st.curPassHasDepth = true; // canvas pass always has depth24plus
           // Reuse the encoder if a shadow pass already opened one this frame
           // (begin_shadow_pass runs BEFORE begin_frame); else create one. Both
           // the shadow depth pass and the color pass share one encoder + submit.
@@ -5401,6 +5406,9 @@
             const layout = device.createPipelineLayout({
               bindGroupLayouts: [bgl0, bgl1],
             });
+            // variant_linear_output (1<<9 = 0x200): scene renders into rgba16float
+            // HDR target (post path). All other PBR variants render to canvas.
+            const pbrFragFormat = (variant & 0x200) ? "rgba16float" : st.format;
             const pipeline = device.createRenderPipeline({
               layout,
               vertex: {
@@ -5429,7 +5437,7 @@
               fragment: {
                 module,
                 entryPoint: "fs_main",
-                targets: [{ format: st.format }],
+                targets: [{ format: pbrFragFormat }],
               },
               primitive: { topology: "triangle-list", cullMode: "back" },
               depthStencil: {
@@ -5892,6 +5900,7 @@
             } : undefined,
           });
           st.curTargetFormat = rt.format;
+          st.curPassHasDepth = !!rt.depthView; // offscreen pass has depth only if the RT has one
           st.active = null; // force pipeline re-bind for draws in this pass
           break;
         }
@@ -5910,10 +5919,12 @@
           const src0rt = st.renderTargets[t0];
           if (!entry || entry.kind !== "post" || !st.pass || !src0rt) break;
           const format = st.curTargetFormat || st.format;
-          const pipe = getOrCreatePostPipeline(st, entry, format);
+          const pipe = getOrCreatePostPipeline(st, entry, format, !!st.curPassHasDepth);
           // Params UBO (16B): up to 4 f32 read from the wire (zero-padded).
           if (!st.postUbo) {
-            st.postUbo = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            // 32B: largest post Params struct is wgslBright (threshold:f32 padded
+            // to 16 + _pad:vec3 at offset 16 = 28B, rounded to 32B by WGSL).
+            st.postUbo = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
           }
           const arr = new Float32Array(4);
           for (let i = 0; i < pCount && i < 4; i++) arr[i] = dv.getFloat32(pPtr + i * 4, true);
@@ -6182,7 +6193,8 @@
       shadow: null, // { handle } set by bind_shadow_map (2c)
       renderTargets: [], // post: { tex, view, depthTex, depthView, w, h, format } by handle
       curTargetFormat: null, // color format of the active pass (post pipeline keying)
-      postUbo: null, // shared 16B params UBO for draw_fullscreen_quad (lazy)
+      curPassHasDepth: false, // true when the active render pass has a depth attachment
+      postUbo: null, // shared 32B params UBO for draw_fullscreen_quad (lazy)
       // Linear/clamp sampler + 1×1 dummy view for the unused tex1 post slot. Eager
       // (cheap, always needed by the post chain when present); clamp avoids UV wrap.
       linearSampler: gpu.device.createSampler({
