@@ -2121,3 +2121,112 @@ test "windFarmGlb: 4 named turbine submeshes + 4 rotor nodes, parses" {
         try testing.expect(found);
     }
 }
+
+// ── windFarmGlb pick-raycast tests ──────────────────────────────────────────
+// Close the construction-only verification gap from the mission-control flagship
+// (examples/mission-control FarmScene.raycastSubmesh + submeshTurbineId): the pick
+// pipeline — rayFromCamera → bvh.walk over the baked windFarmGlb geometry →
+// owning-submesh lookup → name→turbine-id — is exercised here against the real
+// asset, built via the same parseGlb → bvh.build → vmesh.pack path gl_asset_gen
+// runs at build time. The CDP harness can't drive a WebGL canvas pick (synthetic
+// mouse bypasses the compositor hit-test), so this is the authoritative check
+// that a click on a turbine resolves to the correct turbine id.
+
+const bvh = @import("bvh.zig");
+const ray = @import("ray.zig");
+const math = @import("math.zig");
+const vmesh = @import("vmesh.zig");
+const gltf_mod = @import("gltf.zig");
+
+// Mirror FarmScene.submeshTurbineId: "turbineN"/"rotorN" (N∈0..3) → N; else null.
+fn windFarmTurbineId(nm: []const u8) ?u8 {
+    const tail: ?[]const u8 =
+        if (std.mem.startsWith(u8, nm, "turbine")) nm["turbine".len..] else if (std.mem.startsWith(u8, nm, "rotor")) nm["rotor".len..] else null;
+    const t = tail orelse return null;
+    if (t.len != 1 or t[0] < '0' or t[0] > '3') return null;
+    return t[0] - '0';
+}
+
+// Mirror FarmScene.raycastSubmesh's hit→owning-submesh mapping, returning the
+// submesh's name (null on miss). Operates on the pre-pack Model arrays, which are
+// byte-identical to what vmesh.pack stores and the Reader exposes at runtime.
+fn windFarmPickName(
+    vertices: []const f32,
+    indices: []const u16,
+    submeshes: []const vmesh.Submesh,
+    names: []const []const u8,
+    nodes: []const bvh.Node,
+    tri_perm: []const u32,
+    r: ray.Ray,
+) ?[]const u8 {
+    const hit = bvh.walk(nodes, tri_perm, vertices, 12, indices, r) orelse return null;
+    const first: u32 = hit.tri_index * 3;
+    for (submeshes, 0..) |sub, s| {
+        const start = sub.index_byte_off / 2;
+        if (first >= start and first < start + sub.index_count) return names[s];
+    }
+    return null;
+}
+
+test "windFarmGlb pick: per-turbine center ray resolves to that turbine id" {
+    const a = testing.allocator;
+    const glb = try windFarmGlb(a);
+    defer a.free(glb);
+    var model = try gltf_mod.parseGlb(a, glb);
+    defer model.deinit();
+    var br = try bvh.build(a, model.vertices, 12, model.indices);
+    defer br.deinit(a);
+
+    // Towers: 0.5-wide/deep box, 6.0 tall, world x = -12/-4/+4/+12. Aim a center
+    // ray (NDC 0,0 → forward) straight down −Z at mid-tower height (y=2, safely
+    // inside [0,6]); only turbine k sits near x=tx (neighbours ≥8 units away), so
+    // each ray can hit only its own turbine.
+    const turbine_x = [4]f32{ -12, -4, 4, 12 };
+    for (turbine_x, 0..) |tx, k| {
+        const eye = math.Vec3.init(tx, 2, 25);
+        const target = math.Vec3.init(tx, 2, 0);
+        const r = ray.rayFromCamera(eye, target, math.Vec3.init(0, 1, 0), 1.0, 1.0, 0, 0);
+        const nm = windFarmPickName(model.vertices, model.indices, model.submeshes, model.names, br.nodes, br.tri_perm, r) orelse return error.PickMissedTurbine;
+        const id = windFarmTurbineId(nm) orelse return error.HitNonTurbine;
+        try testing.expectEqual(@as(u8, @intCast(k)), id);
+    }
+}
+
+test "windFarmGlb pick: ray into empty sky misses" {
+    const a = testing.allocator;
+    const glb = try windFarmGlb(a);
+    defer a.free(glb);
+    var model = try gltf_mod.parseGlb(a, glb);
+    defer model.deinit();
+    var br = try bvh.build(a, model.vertices, 12, model.indices);
+    defer br.deinit(a);
+    // Camera above the farm looking straight up — no geometry along +Y.
+    const r = ray.rayFromCamera(math.Vec3.init(0, 50, 0), math.Vec3.init(0, 51, 0), math.Vec3.init(0, 0, 1), 1.0, 1.0, 0, 0);
+    try testing.expect(windFarmPickName(model.vertices, model.indices, model.submeshes, model.names, br.nodes, br.tri_perm, r) == null);
+}
+
+test "windFarmGlb .vmesh asset exposes turbineN/rotorN names the pick maps on" {
+    const a = testing.allocator;
+    const glb = try windFarmGlb(a);
+    defer a.free(glb);
+    var model = try gltf_mod.parseGlb(a, glb);
+    defer model.deinit();
+    var br = try bvh.build(a, model.vertices, 12, model.indices);
+    defer br.deinit(a);
+    const bytes = try vmesh.pack(a, model.vertices, model.indices, model.submeshes, model.textures, br.nodes, br.tri_perm, model.names, model.skinned, model.joints, model.weights, model.skel, if (model.anim_clips.len == 0) null else vmesh.Anims{ .clips = model.anim_clips });
+    defer a.free(bytes);
+    const reader = try vmesh.Reader.init(bytes);
+    // Every turbine id 0..3 must be reachable from BOTH a turbine* and a rotor*
+    // name in the packed asset the example actually loads (submeshTurbineId's domain).
+    var turbine_seen = [_]bool{false} ** 4;
+    var rotor_seen = [_]bool{false} ** 4;
+    var s: u32 = 0;
+    while (s < reader.submesh_count) : (s += 1) {
+        const nm = reader.name(s);
+        const id = windFarmTurbineId(nm) orelse continue;
+        if (std.mem.startsWith(u8, nm, "turbine")) turbine_seen[id] = true;
+        if (std.mem.startsWith(u8, nm, "rotor")) rotor_seen[id] = true;
+    }
+    for (turbine_seen) |seen| try testing.expect(seen);
+    for (rotor_seen) |seen| try testing.expect(seen);
+}
