@@ -446,6 +446,15 @@ pub const Reader = struct {
 
     pub fn init(bytes: []const u8) error{ BadMagic, BadVersion, Truncated, BadTexIndex }!Reader {
         if (bytes.len < header_size) return error.Truncated;
+        // Capture the buffer length ONCE at entry, BEFORE the readInt header block
+        // below. Zig 0.16.0's self-hosted x86_64 backend (the Debug default on
+        // x86_64-linux) miscompiles a `bytes.len` read taken AFTER that block:
+        // the param slice's `.len` reads a stale value (observed 256 vs the real
+        // 336) → spurious error.Truncated. Confirmed a backend bug — the same code
+        // passes under `-fllvm`, and aarch64-macOS / x86_64-Windows (LLVM path)
+        // never hit it (which is why only ubuntu CI was red). Reading len here,
+        // ahead of the miscompiled region, sidesteps it.
+        const blen: u64 = bytes.len;
         if (!std.mem.eql(u8, bytes[0..4], magic)) return error.BadMagic;
         const ver = std.mem.readInt(u32, bytes[4..8], .little);
         if (ver != version) return error.BadVersion;
@@ -466,8 +475,6 @@ pub const Reader = struct {
         const skeleton_off = std.mem.readInt(u32, bytes[60..64], .little);
         const joint_count = std.mem.readInt(u32, bytes[64..68], .little);
         const anim_off = std.mem.readInt(u32, bytes[68..72], .little);
-
-        const blen: u64 = bytes.len;
 
         // Bounds-check vertex data (u64 to prevent u32 multiply wrap). Skinned
         // meshes use the wider stride-56 layout.
