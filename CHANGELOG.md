@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.19] - 2026-06-18
+
 ### Added
 
 - **gl post-processing — bloom + FXAA** (`src/core/gl/command.zig`,
@@ -24,9 +26,23 @@ versions follow [Semantic Versioning](https://semver.org/).
   Verified live (headed Chrome CDP, both backends via real `getContext` probe): bloom
   halo brightens the background outside the cube silhouette; FXAA adds anti-aliased
   fringe pixels; zero console errors.
+- **gl `windFarmGlb` fixture + per-turbine raycast pick** (`src/core/gl/fixture.zig`,
+  `src/core/gl/gltf.zig`): a procedural multi-turbine wind-farm `.vmesh` asset whose
+  `turbineN`/`rotorN` submeshes carry distinct baked names, so `node:rotorN.rotationZ`
+  spins each rotor about its own hub and BVH picking resolves the turbine under the
+  cursor. Powers the new `examples/mission-control` desktop app (FarmScene island +
+  SSE metrics dashboard + WebSocket live-viewers presence).
 
 ### Fixed
 
+- **Linux CI green — Zig 0.16 x86_64 backend miscompile in `vmesh.Reader.init`**
+  (`src/core/gl/vmesh.zig`): ubuntu-latest CI had been red for days with ~20 core
+  tests failing `error.Truncated`, x86_64-linux only (macOS/Windows green). Root cause:
+  Zig 0.16.0's self-hosted x86_64 backend (the Debug default on x86_64-linux)
+  miscompiled a `bytes.len` read taken after the header-load block — the slice `.len`
+  returned a stale value, tripping the vertex bounds check. Confirmed a backend bug
+  (the same code passes under `-fllvm`); fixed by capturing `bytes.len` at function
+  entry, ahead of the miscompiled region.
 - **gl WebGPU post-processing correctness** (`src/core/gl/command.zig`, `src/bridge/verve.js`):
   `wgslPbr` did not gate the in-shader ACES tonemap on `variant_linear_output` (the GLSL
   path did), so the WebGPU scene double-tonemapped and nothing exceeded the bloom
