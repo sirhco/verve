@@ -246,7 +246,16 @@ pub fn index(ctx: *const verve.Context) !*verve.Node {
 
     const dash_island = verve.island(ctx, .{ .name = "Dashboard" }, dash_inner);
 
+    // Presence widget — SSR placeholder shows "— live viewers" until the WS
+    // connects and the first count frame arrives.
+    const presence_inner = ctx.div().class("mc-presence").children(.{
+        ctx.span().attr("data-ref", "presence-count").text("—"),
+        ctx.span().text(" live viewers"),
+    });
+    const presence_island = verve.island(ctx, .{ .name = "Presence" }, presence_inner);
+
     return ctx.main_().class("mc-main").children(.{
+        presence_island,
         scene_island,
         dash_island,
     });
@@ -273,6 +282,8 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.mc-hint-live{font-size:.8rem;color:#607080;margin:.5rem 0}
                 \\code{background:#121c28;border:1px solid #1e2a38;border-radius:3px;padding:.1rem .3rem;font-size:.8em}
                 \\.mc-power-chart{margin-top:.5rem;background:#0a0f16;border-radius:6px;padding:.5rem}
+                \\.mc-presence{display:flex;align-items:center;gap:.4rem;font-size:.82rem;color:#607080;margin-bottom:1rem}
+                \\.mc-presence span:first-child{font-weight:600;color:#7ec8e3;font-variant-numeric:tabular-nums}
             ),
         }),
         ctx.el("body").children(.{

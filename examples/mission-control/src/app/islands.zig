@@ -15,3 +15,10 @@ pub const FarmScene = struct {
 pub const Dashboard = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// Live-viewers presence widget: connects to `/push-ws?channel=presence` via
+/// `verveWsConnect`; displays "N live viewers" updated in real time.
+/// Source: `src/client/islands/Presence.zig`.
+pub const Presence = struct {
+    pub const props_schema: []const u8 = "{}";
+};

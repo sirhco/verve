@@ -18,6 +18,14 @@ pub var last_count: std.atomic.Value(i32) = .init(0);
 /// No server functions needed for this example.
 pub const Actions = struct {};
 
+// ---- Presence publisher --------------------------------------------------
+
+/// Opt-in for the framework's presence publisher loop (presencePublisherLoop
+/// in src/server/main.zig). When true, the server polls subscriber count on
+/// the `presence` WS push channel every 250 ms and broadcasts `{"count":N}`
+/// on every change — covering both connect and disconnect events.
+pub const presenceEnabled = true;
+
 // ---- Metrics publisher ---------------------------------------------------
 
 /// Monotonically increasing tick counter; incremented each time
