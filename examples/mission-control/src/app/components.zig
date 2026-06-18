@@ -167,6 +167,7 @@ fn dashChartSsr(ctx: *const verve.Context, power_kw: f32) *verve.Node {
 
 /// Hero page: h1 title + FarmScene 3D canvas + Dashboard telemetry island.
 pub fn index(ctx: *const verve.Context) !*verve.Node {
+    const anim = verve.anim;
     try ctx.setTitle("Mission Control — Wind Farm");
 
     const canvas = ctx.el("canvas")
@@ -188,8 +189,35 @@ pub fn index(ctx: *const verve.Context) !*verve.Node {
 
     // SSR placeholder for the Dashboard island — initial values from tick 0.
     const t0 = sim.sample(0, 0);
+    const a = ctx.alloc();
     const dash_inner = ctx.section().class("mc-dashboard").children(.{
-        ctx.h2("Turbine 0 — Live Telemetry"),
+        // Heading: turbine name binds to `selected_label` (updated on pick); the
+        // "Live Telemetry" label is SplitText-animated on load. The SplitText is
+        // its OWN sibling h2 so its char-span node surgery never touches the
+        // bound `.mc-sel-label` span.
+        ctx.el("h2").children(.{
+            // Bound to `selected_label`; the Dashboard chunk updates it on pick.
+            ctx.span().class("mc-sel-label").bind("selected_label").text("Turbine 0"),
+            ctx.span().text(" — Live Telemetry"),
+        }),
+        ctx.p().class("mc-tele")
+            .text("real-time wind farm metrics")
+            .splitText(.{ .by = .chars })
+            .animate(anim.from(a, ".mc-tele .st-char")
+            .opacity(0).y(10)
+            .duration(0.4).ease(.out_cubic)
+            .stagger(.{ .each = 0.02 })),
+        // Hidden per-turbine select proxies: the page <script> clicks the one
+        // for the picked turbine, forwarding the pick into THIS island's vid via
+        // z-on-click named delegation. The id rides the EXPORT NAME (one proxy
+        // per turbine) rather than an attribute, so it never depends on the
+        // shared event-dataset scratch buffer.
+        ctx.div().class("mc-select-proxies").attr("style", "display:none").children(.{
+            ctx.div().attr("data-turbine", "0").attr("z-on-click", "dashboard_select_0"),
+            ctx.div().attr("data-turbine", "1").attr("z-on-click", "dashboard_select_1"),
+            ctx.div().attr("data-turbine", "2").attr("z-on-click", "dashboard_select_2"),
+            ctx.div().attr("data-turbine", "3").attr("z-on-click", "dashboard_select_3"),
+        }),
         ctx.div().class("mc-dash-row").children(.{
             ctx.div().class("mc-stat").children(.{
                 ctx.span().class("mc-stat-label").text("Power"),
@@ -250,6 +278,21 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
         ctx.el("body").children(.{
             body,
             ctx.script("/verve.js"),
+            // Cross-island selection glue: FarmScene dispatches a bubbling
+            // CustomEvent("mc-select", {detail:{name:"<id>"}}) on pick. We
+            // forward the id into the Dashboard island by stamping it on the
+            // hidden proxy element (data-turbine) and firing a synthetic click —
+            // verve.js's delegated z-on-click handler then runs
+            // dashboard_on_select under Dashboard's own vid. No internal API,
+            // no server round-trip. scriptInline applies the CSP nonce.
+            ctx.scriptInline(
+                \\document.addEventListener("mc-select", function (e) {
+                \\  var id = (e.detail && e.detail.name) || "0";
+                \\  var proxy = document.querySelector('.mc-select-proxies [data-turbine="' + id + '"]');
+                \\  if (!proxy) return;
+                \\  proxy.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+                \\});
+            ),
         }),
     }).build();
 }

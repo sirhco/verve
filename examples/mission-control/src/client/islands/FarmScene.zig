@@ -19,11 +19,20 @@
 const std = @import("std");
 const verve = @import("verve");
 const gl = verve.gl;
+const anim = verve.anim;
 
 extern "verve" fn gl_start(ref_handle: i32, name_ptr: [*]const u8, name_len: u32) void;
 extern "verve" fn gl_start_gpu(ref_handle: i32, name_ptr: [*]const u8, name_len: u32) void;
 extern "verve" fn gl_webgpu_available() i32;
 extern "verve" fn gl_load(url_ptr: [*]const u8, url_len: u32, cb_ptr: [*]const u8, cb_len: u32) void;
+// onPickExport: dispatch a bubbling DOM CustomEvent(name, {detail:{name}}) from
+// the element behind `ref_handle` (the canvas). The page <script> in
+// components.zig listens for "mc-select" and forwards the id into the Dashboard
+// island. No-op if the handle is stale.
+extern "verve" fn gl_emit_event(ref_handle: i32, name_ptr: [*]const u8, name_len: u32, detail_ptr: [*]const u8, detail_len: u32) void;
+
+// Cross-island selection: the DOM CustomEvent name the page glue listens for.
+const select_event = "mc-select";
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
 
@@ -76,6 +85,123 @@ var orbit_input: gl.orbit.OrbitInput = .{};
 var dragging: bool = false;
 var last_x: f64 = 0;
 var last_y: f64 = 0;
+
+// ── pick + camera-tween ─────────────────────────────────────────────────────
+// Turbine world X positions (mirror fixture.zig windFarmGlb turbine_x). Used to
+// reframe the orbit target onto the selected turbine.
+const turbine_x = [4]f32{ -12, -4, 4, 12 };
+
+// A queued click NDC awaiting a BVH raycast on the next frame (camera state is
+// only coherent inside the frame fn). down_x/down_y detect drag-vs-click.
+var pick_pending: bool = false;
+var pick_ndc_x: f32 = 0;
+var pick_ndc_y: f32 = 0;
+var down_x: f64 = 0;
+var down_y: f64 = 0;
+var down_moved: bool = false;
+
+// Camera-tween setter slot + live handle (killed before each new select).
+var setter_slot: u32 = 0;
+var cam_anim: ?verve.AnimHandle = null;
+var reduced_motion: bool = false;
+
+// Drag detected click as a real click only when the pointer barely moved.
+const click_slop: f64 = 4;
+
+fn bytesAsF32(b: []const u8) []const f32 {
+    const ptr: [*]const f32 = @ptrCast(@alignCast(b.ptr));
+    return ptr[0 .. b.len / 4];
+}
+
+fn bytesAsU16(b: []const u8) []const u16 {
+    const ptr: [*]const u16 = @ptrCast(@alignCast(b.ptr));
+    return ptr[0 .. b.len / 2];
+}
+
+/// Convert client (cx, cy) → NDC ([-1,1]², y up) via the canvas rect.
+fn clientToNdc(h: i32, cx: f64, cy: f64, nx: *f32, ny: *f32) void {
+    const r = verve.refRect(h);
+    nx.* = @floatCast(if (r.w == 0) 0 else (cx - r.x) / r.w * 2.0 - 1.0);
+    ny.* = @floatCast(if (r.h == 0) 0 else 1.0 - (cy - r.y) / r.h * 2.0);
+}
+
+/// Whole-mesh BVH raycast → owning submesh index (geometry is world-baked, so
+/// the ray stays in world space; rotors spin via a separate matrix but the
+/// static tower under each rotor still picks the turbine). Null on miss.
+fn raycastSubmesh(a: *const gl.vmesh.Reader, aspect: f32, nx: f32, ny: f32) ?u32 {
+    if (a.bvh_node_count == 0) return null;
+    const r = gl.ray.rayFromCamera(orbit.eye(), orbit.target, up_vec, fov_y, aspect, nx, ny);
+    const nodes = gl.bvh.nodesFromBytes(a.bvh_nodes);
+    const tri_perm = gl.bvh.triPermFromBytes(a.tri_perm);
+    const verts = bytesAsF32(a.vertices);
+    const idx = bytesAsU16(a.indices);
+    const hit = gl.bvh.walk(nodes, tri_perm, verts, 12, idx, r) orelse return null;
+    // Map the hit triangle's first index element to its owning submesh.
+    const first: u32 = hit.tri_index * 3;
+    var s: u32 = 0;
+    while (s < a.submesh_count) : (s += 1) {
+        const sub = a.submesh(s);
+        const start = sub.index_byte_off / 2;
+        if (first >= start and first < start + sub.index_count) return s;
+    }
+    return null;
+}
+
+/// Submesh name "turbineN"/"rotorN" → turbine id N. Ground / unnamed → null.
+fn submeshTurbineId(nm: []const u8) ?u8 {
+    const tail: ?[]const u8 =
+        if (std.mem.startsWith(u8, nm, "turbine")) nm["turbine".len..] else if (std.mem.startsWith(u8, nm, "rotor")) nm["rotor".len..] else null;
+    const t = tail orelse return null;
+    if (t.len != 1 or t[0] < '0' or t[0] > '3') return null;
+    return t[0] - '0';
+}
+
+/// FarmScene is single-instance: the anim engine's gl-setter writes camera
+/// yaw/pitch/distance straight into `orbit`. The next frame's `orbit.tick`
+/// leaves them put (zero input → zero velocity).
+fn camSetter(target_id: u32, value: f64) void {
+    const d = gl.anim_target.decode(target_id) orelse return;
+    if (d.kind != .camera) return;
+    const v: f32 = @floatCast(value);
+    switch (@as(gl.anim_target.CameraField, @enumFromInt(d.field))) {
+        .yaw => orbit.yaw = v,
+        .pitch => orbit.pitch = v,
+        .distance => orbit.distance = v,
+    }
+}
+
+/// Ease the camera to frame turbine `id`: snap the orbit target onto that
+/// turbine, then tween yaw/pitch/distance to a close, slightly-angled framing.
+fn frameTurbine(id: u8) void {
+    orbit.target = .{ .x = turbine_x[id], .y = 4, .z = 0 };
+    if (cam_anim) |h| h.kill();
+    cam_anim = null;
+    if (setter_slot == 0) return;
+
+    const yaw_id = gl.anim_target.encode(.camera, 0, @intFromEnum(gl.anim_target.CameraField.yaw));
+    const pitch_id = gl.anim_target.encode(.camera, 0, @intFromEnum(gl.anim_target.CameraField.pitch));
+    const dist_id = gl.anim_target.encode(.camera, 0, @intFromEnum(gl.anim_target.CameraField.distance));
+
+    if (reduced_motion) {
+        // Snap (no tween) under reduced motion.
+        orbit.yaw = 0.5;
+        orbit.pitch = -0.2;
+        orbit.distance = 16;
+        return;
+    }
+
+    const mark = verve.chunkArenaMark();
+    defer verve.chunkArenaReset(mark);
+    const arena = verve.chunkArena();
+
+    const t = anim.to(arena, null)
+        .glTargetRange(yaw_id, setter_slot, orbit.yaw, 0.5)
+        .glTargetRange(pitch_id, setter_slot, orbit.pitch, -0.2)
+        .glTargetRange(dist_id, setter_slot, orbit.distance, 16)
+        .duration(0.8)
+        .ease(.out_cubic);
+    cam_anim = verve.animPlay(t);
+}
 
 // Scene graph (root + up to max_submesh submesh nodes)
 var scene: gl.scene.Scene(11) = .{};
@@ -155,6 +281,9 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
 
     verve.assetReset();
     use_webgpu = gl_webgpu_available() != 0;
+    reduced_motion = verve.matchMedia("(prefers-reduced-motion: reduce)");
+    // Register the camera-tween gl-setter once (slot 0 == failure).
+    setter_slot = verve.animGlSetter(&camSetter);
     canvas_handle = verve.queryRef(@as([]const u8, "farmscene-canvas"));
 
     if (canvas_handle) |h| {
@@ -202,6 +331,9 @@ export fn farmscene_pointerdown() void {
     dragging = true;
     last_x = verve.eventCoordX();
     last_y = verve.eventCoordY();
+    down_x = last_x;
+    down_y = last_y;
+    down_moved = false;
     verve.eventCapturePointer();
 }
 
@@ -209,6 +341,7 @@ export fn farmscene_pointermove() void {
     if (!dragging) return;
     const x = verve.eventCoordX();
     const y = verve.eventCoordY();
+    if (@abs(x - down_x) > click_slop or @abs(y - down_y) > click_slop) down_moved = true;
     const dx: f32 = @floatCast(x - last_x);
     const dy: f32 = @floatCast(y - last_y);
     orbit_input.dyaw -= dx * drag_sens;
@@ -219,6 +352,13 @@ export fn farmscene_pointermove() void {
 
 export fn farmscene_pointerup() void {
     dragging = false;
+    // A near-stationary press is a pick (a real drag rotates the camera).
+    if (!down_moved) {
+        if (canvas_handle) |h| {
+            clientToNdc(h, verve.eventCoordX(), verve.eventCoordY(), &pick_ndc_x, &pick_ndc_y);
+            pick_pending = true;
+        }
+    }
 }
 
 export fn farmscene_wheel() void {
@@ -272,6 +412,21 @@ export fn farmscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
     if (asset != null) {
         const a = &asset.?;
+
+        // Process a queued pick: BVH raycast → submesh → turbine id → dispatch
+        // the cross-island selection event + ease the camera onto the turbine.
+        if (pick_pending) {
+            pick_pending = false;
+            if (raycastSubmesh(a, aspect, pick_ndc_x, pick_ndc_y)) |s| {
+                if (submeshTurbineId(a.name(s))) |id| {
+                    var idbuf: [2]u8 = undefined;
+                    const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch "0";
+                    if (canvas_handle) |h|
+                        gl_emit_event(h, select_event.ptr, select_event.len, id_str.ptr, @intCast(id_str.len));
+                    frameTurbine(id);
+                }
+            }
+        }
 
         if (!resources_sent) {
             resources_sent = true;
