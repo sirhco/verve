@@ -4478,6 +4478,19 @@
     return true;
   };
 
+  // Post-process param upload: maps the f32 param array to whichever uniforms
+  // exist on the program. Unused locations are null and silently skipped.
+  // bright: p[0]=threshold; blur: p[0..1]=texel, p[2..3]=dir;
+  // composite: p[0]=intensity; fxaa: p[0..1]=texel.
+  const applyPostParams = (gl, sh, dv, ptr, count) => {
+    const p = [];
+    for (let i = 0; i < count; i++) p.push(dv.getFloat32(ptr + i * 4, true));
+    if (sh.uThreshold && count >= 1) gl.uniform1f(sh.uThreshold, p[0]);
+    if (sh.uIntensity && count >= 1) gl.uniform1f(sh.uIntensity, p[0]);
+    if (sh.uTexel && count >= 2) gl.uniform2f(sh.uTexel, p[0], p[1]);
+    if (sh.uDir && count >= 4) gl.uniform2f(sh.uDir, p[2], p[3]);
+  };
+
   const glInterpret = (st, ptr) => {
     // Fresh DataView every frame: memory.buffer detaches on wasm growth.
     const dv = new DataView(memory.buffer);
@@ -4498,6 +4511,9 @@
             dv.getFloat32(off + 8, true),
             dv.getFloat32(off + 12, true),
           );
+          // Re-enable depth test each frame: draw_fullscreen_quad (case 25) disables
+          // it for the post pass, and WebGL state persists across frames.
+          gl.enable(gl.DEPTH_TEST);
           gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
           break;
         }
@@ -4561,6 +4577,14 @@
             // uniformMatrix4fv uploads the whole mat4[] against (case 21).
             sh.skinned = (variant & 128) !== 0;
             sh.bones = sh.skinned ? gl.getUniformLocation(prog, "u_bones[0]") : null;
+          }
+          if (variant & 0x100) { // variant_post: cache post-process uniform locations
+            sh.tex0 = gl.getUniformLocation(prog, "u_tex0");
+            sh.tex1 = gl.getUniformLocation(prog, "u_tex1");
+            sh.uThreshold = gl.getUniformLocation(prog, "u_threshold");
+            sh.uTexel = gl.getUniformLocation(prog, "u_texel");
+            sh.uDir = gl.getUniformLocation(prog, "u_dir");
+            sh.uIntensity = gl.getUniformLocation(prog, "u_intensity");
           }
           st.shaders[handle] = sh;
           break;
@@ -4782,6 +4806,14 @@
               gl.deleteTexture(sm.tex);
               st.shadowMaps[handle] = null;
             }
+          } else if (kind === 4) { // render_target (FBO + color + optional depth tex)
+            const rt = st.renderTargets[handle];
+            if (rt) {
+              gl.deleteFramebuffer(rt.fbo);
+              gl.deleteTexture(rt.colorTex);
+              if (rt.depthTex) gl.deleteTexture(rt.depthTex);
+              st.renderTargets[handle] = null;
+            }
           }
           break;
         }
@@ -4862,6 +4894,104 @@
             gl.uniformMatrix4fv(st.active.bones, false, new Float32Array(memory.buffer, p, count * 16));
           break;
         }
+        case 22: { // CREATE_RENDER_TARGET {handle,width,height,format,flags}
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          const fmt = dv.getUint32(off + 12, true);   // 0=rgba8, 1=rgba16f
+          const flags = dv.getUint32(off + 16, true); // bit0 = with_depth
+          const fbo = gl.createFramebuffer();
+          gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+          const colorTex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, colorTex);
+          let internal, type;
+          if (fmt === 1) {
+            // rgba16f: requires EXT_color_buffer_float in WebGL2
+            if (!st.extColorBufferFloat) {
+              st.extColorBufferFloat = gl.getExtension("EXT_color_buffer_float");
+              if (!st.extColorBufferFloat)
+                console.warn("verve.gl: EXT_color_buffer_float unavailable — render target falling back to RGBA8");
+            }
+            if (st.extColorBufferFloat) {
+              internal = gl.RGBA16F;
+              type = gl.HALF_FLOAT;
+            } else {
+              internal = gl.RGBA8;
+              type = gl.UNSIGNED_BYTE;
+            }
+          } else {
+            internal = gl.RGBA8;
+            type = gl.UNSIGNED_BYTE;
+          }
+          gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, gl.RGBA, type, null);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, colorTex, 0);
+          let depthTex = null;
+          if (flags & 1) {
+            depthTex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, depthTex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, w, h, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depthTex, 0);
+          }
+          gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          st.renderTargets[handle] = { fbo, colorTex, depthTex, w, h };
+          break;
+        }
+        case 23: { // BEGIN_OFFSCREEN_PASS {target, clear_rgba(4×f32), clear_flags}
+          const target = dv.getUint32(off, true);
+          const r = dv.getFloat32(off + 4, true);
+          const g = dv.getFloat32(off + 8, true);
+          const b = dv.getFloat32(off + 12, true);
+          const a = dv.getFloat32(off + 16, true);
+          const cf = dv.getUint32(off + 20, true);
+          const rt = st.renderTargets[target];
+          if (!rt) break;
+          gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fbo);
+          gl.viewport(0, 0, rt.w, rt.h);
+          // Re-enable depth test for 3D scene passes rendered into a target
+          if (rt.depthTex) gl.enable(gl.DEPTH_TEST);
+          gl.clearColor(r, g, b, a);
+          let mask = 0;
+          if (cf & 1) mask |= gl.COLOR_BUFFER_BIT;
+          if (cf & 2) mask |= gl.DEPTH_BUFFER_BIT;
+          if (mask) gl.clear(mask);
+          st.active = null; // force re-bind of pipeline for draws in this pass
+          break;
+        }
+        case 24: { // END_OFFSCREEN_PASS {} — rebind canvas framebuffer
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          break;
+        }
+        case 25: { // DRAW_FULLSCREEN_QUAD {shader, tex0, tex1, params_ptr, param_count}
+          const shHandle = dv.getUint32(off, true);
+          const t0 = dv.getUint32(off + 4, true);
+          const t1 = dv.getUint32(off + 8, true);
+          const pPtr = dv.getUint32(off + 12, true);
+          const pCount = dv.getUint32(off + 16, true);
+          const sh = st.shaders[shHandle];
+          if (!sh) break;
+          gl.useProgram(sh.prog);
+          gl.disable(gl.DEPTH_TEST);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, st.renderTargets[t0] ? st.renderTargets[t0].colorTex : null);
+          if (sh.tex0) gl.uniform1i(sh.tex0, 0);
+          if (t1 !== 0 && st.renderTargets[t1]) {
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, st.renderTargets[t1].colorTex);
+            if (sh.tex1) gl.uniform1i(sh.tex1, 1);
+          }
+          applyPostParams(gl, sh, dv, pPtr, pCount);
+          if (!st.emptyVao) st.emptyVao = gl.createVertexArray();
+          gl.bindVertexArray(st.emptyVao);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+          break;
+        }
         default:
           break; // unknown tag: size-skip = forward compatible
       }
@@ -4881,9 +5011,18 @@
     for (const entry of st.textures) if (entry) gl.deleteTexture(entry.tex);
     for (const sh of st.shaders) if (sh) gl.deleteProgram(sh.prog);
     for (const vao of st.vaos.values()) gl.deleteVertexArray(vao);
+    for (const rt of st.renderTargets) {
+      if (rt) {
+        gl.deleteFramebuffer(rt.fbo);
+        gl.deleteTexture(rt.colorTex);
+        if (rt.depthTex) gl.deleteTexture(rt.depthTex);
+      }
+    }
+    if (st.emptyVao) { gl.deleteVertexArray(st.emptyVao); st.emptyVao = null; }
     st.buffers = [];
     st.textures = [];
     st.shaders = [];
+    st.renderTargets = [];
     st.vaos.clear();
     st.active = null;
   };
@@ -4998,6 +5137,11 @@
   const PBR_STRIDE = 512; // align(448, 256)
   const DEPTH_STRIDE = 256; // one mat4 (64B) padded to the 256B dynamic-offset min
   const MAX_DRAWS = 64; // per-frame draw cap (cube+plane today; headroom for scenes)
+  // Post fullscreen draws (bright/blurH/blurV/composite/fxaa = up to 5/frame) each
+  // need their own params slot — same hazard as PBR: all draws defer to one submit,
+  // so a single shared buffer lets the last writeBuffer clobber every earlier draw.
+  const POST_STRIDE = 256; // 32B params padded to the 256B uniform-offset min
+  const MAX_POST_DRAWS = 16; // per-frame fullscreen-draw cap (5 today; headroom)
   // Lazily create the shared PBR uniform buffer (reused across frames/draws).
   const gpuEnsurePbrUniform = (st) => {
     if (!st.pbrUniform) {
@@ -5007,6 +5151,17 @@
       });
     }
     return st.pbrUniform;
+  };
+  // Lazily create the shared post-effect params buffer (one 256B slot per
+  // fullscreen draw, isolated like the PBR uniform so deferred draws don't clobber).
+  const gpuEnsurePostUniform = (st) => {
+    if (!st.postUniform) {
+      st.postUniform = st.device.createBuffer({
+        size: POST_STRIDE * MAX_POST_DRAWS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    return st.postUniform;
   };
   // Lazily create the shared bones palette uniform (64 mat4 = 4096 B), bound at
   // @group(0) @binding(1) for skinned variants. set_bones (tag 21) writes it;
@@ -5056,6 +5211,30 @@
     return (t && t.view) ? t.view : fallback.view;
   };
 
+  // Lazily build (and cache) a post render pipeline for a given (format, hasDepth)
+  // combination. Post pipelines must match the pass's color attachment format AND
+  // its depth-stencil state. The final canvas pass (BEGIN_FRAME) has depth24plus;
+  // offscreen passes (BEGIN_OFFSCREEN_PASS without depth) do not. Key: "format:0/1".
+  const getOrCreatePostPipeline = (st, entry, format, hasDepth) => {
+    const key = format + (hasDepth ? ":d" : "");
+    let pipe = entry.byFormat[key];
+    if (!pipe) {
+      const desc = {
+        layout: st.device.createPipelineLayout({ bindGroupLayouts: [entry.bgl0, entry.bgl1] }),
+        vertex: { module: entry.module, entryPoint: "vs_main" }, // no vertex buffers
+        fragment: { module: entry.module, entryPoint: "fs_main", targets: [{ format }] },
+        primitive: { topology: "triangle-list" },
+      };
+      // Canvas pass has depth24plus; fullscreen-quad never writes depth.
+      if (hasDepth) {
+        desc.depthStencil = { format: "depth24plus", depthWriteEnabled: false, depthCompare: "always" };
+      }
+      pipe = st.device.createRenderPipeline(desc);
+      entry.byFormat[key] = pipe;
+    }
+    return pipe;
+  };
+
   // WebGPU command-stream interpreter. Consumes the SAME binary stream as
   // glInterpret (4-byte tag/size header per command, little-endian) but drives
   // WebGPU. Slice 1 handles only the minimal unlit-cube subset (6 tags);
@@ -5095,10 +5274,13 @@
             st.lastH = h;
           }
           st.pbrSlot = 0; // reset per-draw uniform slot allocation for this frame
-          // Reuse the encoder if a shadow pass already opened one this frame
-          // (begin_shadow_pass runs BEFORE begin_frame); else create one. Both
-          // the shadow depth pass and the color pass share one encoder + submit.
-          if (!st.encoder) st.encoder = device.createCommandEncoder();
+          st.curTargetFormat = st.format; // canvas pass: post draws target st.format
+          st.curPassHasDepth = true; // canvas pass always has depth24plus
+          // Reuse the encoder if a shadow/offscreen pass already opened one this
+          // frame (those run BEFORE begin_frame); else create one. All passes share
+          // one encoder + submit. Reset post slot only on a genuinely new encoder so
+          // the canvas FXAA draw keeps a slot distinct from the offscreen bloom draws.
+          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; }
           st.pass = st.encoder.beginRenderPass({
             colorAttachments: [{
               view: st.ctx.getCurrentTexture().createView(),
@@ -5136,6 +5318,27 @@
           const variant = dv.getUint32(off + 4, true);
           const code = readStr(dv.getUint32(off + 8, true), dv.getUint32(off + 12, true));
           const module = device.createShaderModule({ code });
+          if ((variant & 0x100) !== 0) { // variant_post — fullscreen-quad post pass.
+            // All four post WGSL modules (bright/blur/composite/fxaa) share ONE
+            // layout (group0=params uniform, group1=sampler+tex0+tex1) and the
+            // vs_main/fs_main entry points; only the WGSL body differs and rides
+            // the create_shader stream. The render pipeline must match the COLOR
+            // format of the pass it draws into (rgba16float bloom / rgba8unorm ldr
+            // / st.format canvas), so we defer pipeline creation to draw time and
+            // cache per `${handle}:${format}` (getOrCreatePostPipeline below).
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }],
+            });
+            const bgl1 = device.createBindGroupLayout({
+              entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+              ],
+            });
+            st.pipelines[handle] = { module, bgl0, bgl1, kind: "post", byFormat: {} };
+            break;
+          }
           // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
           // variant_emissive = 1 << 4 — gate which group(1) texture bindings the
           // WGSL declares (wgslPbr appends tex_normal/tex_emissive conditionally;
@@ -5220,6 +5423,9 @@
             const layout = device.createPipelineLayout({
               bindGroupLayouts: [bgl0, bgl1],
             });
+            // variant_linear_output (1<<9 = 0x200): scene renders into rgba16float
+            // HDR target (post path). All other PBR variants render to canvas.
+            const pbrFragFormat = (variant & 0x200) ? "rgba16float" : st.format;
             const pipeline = device.createRenderPipeline({
               layout,
               vertex: {
@@ -5248,7 +5454,7 @@
               fragment: {
                 module,
                 entryPoint: "fs_main",
-                targets: [{ format: st.format }],
+                targets: [{ format: pbrFragFormat }],
               },
               primitive: { topology: "triangle-list", cullMode: "back" },
               depthStencil: {
@@ -5470,6 +5676,13 @@
             st.pipelines[handle] = null;
           } else if (kind === 3) {
             if (st.shadowMaps[handle]) { st.shadowMaps[handle].tex.destroy(); st.shadowMaps[handle] = null; }
+          } else if (kind === 4) { // render target — color + optional depth texture
+            const rt = st.renderTargets[handle];
+            if (rt) {
+              rt.tex.destroy();
+              if (rt.depthTex) rt.depthTex.destroy();
+              st.renderTargets[handle] = null;
+            }
           }
           break;
         }
@@ -5652,6 +5865,108 @@
           st.pass.drawIndexed(count);
           break;
         }
+        case 22: { // CREATE_RENDER_TARGET — color (+ optional depth) offscreen target.
+          // Payload (command.zig createRenderTarget, 20B): handle|w|h|fmt|flags.
+          // fmt: 0=rgba8unorm, 1=rgba16float. flags bit0 = with_depth (depth24plus).
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          const fmt = dv.getUint32(off + 12, true);
+          const flags = dv.getUint32(off + 16, true);
+          const format = fmt === 1 ? "rgba16float" : "rgba8unorm";
+          const tex = device.createTexture({
+            size: [w, h],
+            format,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+          });
+          let depthTex = null, depthView = null;
+          if (flags & 1) {
+            depthTex = device.createTexture({
+              size: [w, h],
+              format: "depth24plus",
+              usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            depthView = depthTex.createView();
+          }
+          st.renderTargets[handle] = { tex, view: tex.createView(), depthTex, depthView, w, h, format };
+          break;
+        }
+        case 23: { // BEGIN_OFFSCREEN_PASS — render into a target (reuse frame encoder).
+          // Payload (24B): target | clear_rgba(4×f32) | clear_flags.
+          const target = dv.getUint32(off, true);
+          const r = dv.getFloat32(off + 4, true);
+          const g = dv.getFloat32(off + 8, true);
+          const b = dv.getFloat32(off + 12, true);
+          const a = dv.getFloat32(off + 16, true);
+          const cf = dv.getUint32(off + 20, true);
+          const rt = st.renderTargets[target];
+          if (!rt) break;
+          // First pass of a post frame: new encoder → reset the post params slot.
+          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; }
+          st.pass = st.encoder.beginRenderPass({
+            colorAttachments: [{
+              view: rt.view,
+              clearValue: { r, g, b, a },
+              loadOp: (cf & 1) ? "clear" : "load",
+              storeOp: "store",
+            }],
+            depthStencilAttachment: rt.depthView ? {
+              view: rt.depthView,
+              depthClearValue: 1.0,
+              depthLoadOp: (cf & 2) ? "clear" : "load",
+              depthStoreOp: "store",
+            } : undefined,
+          });
+          st.curTargetFormat = rt.format;
+          st.curPassHasDepth = !!rt.depthView; // offscreen pass has depth only if the RT has one
+          st.active = null; // force pipeline re-bind for draws in this pass
+          break;
+        }
+        case 24: { // END_OFFSCREEN_PASS — close the offscreen pass (keep encoder).
+          if (st.pass) { st.pass.end(); st.pass = null; }
+          break;
+        }
+        case 25: { // DRAW_FULLSCREEN_QUAD — post effect into the current pass.
+          // Payload (20B): shader | tex0 | tex1 | params_ptr | param_count.
+          const shHandle = dv.getUint32(off, true);
+          const t0 = dv.getUint32(off + 4, true);
+          const t1 = dv.getUint32(off + 8, true);
+          const pPtr = dv.getUint32(off + 12, true);
+          const pCount = dv.getUint32(off + 16, true);
+          const entry = st.pipelines[shHandle];
+          const src0rt = st.renderTargets[t0];
+          if (!entry || entry.kind !== "post" || !st.pass || !src0rt) break;
+          const format = st.curTargetFormat || st.format;
+          const pipe = getOrCreatePostPipeline(st, entry, format, !!st.curPassHasDepth);
+          // Params: up to 4 f32 from the wire (zero-padded), written into this
+          // draw's own 256-aligned slot so a later draw's writeBuffer can't clobber
+          // it before the single end-of-frame submit (see POST_STRIDE note above).
+          const pubuf = gpuEnsurePostUniform(st);
+          const pslot = st.postSlot++;
+          if (pslot >= MAX_POST_DRAWS) break; // per-frame cap (silently drop extras)
+          const pbase = pslot * POST_STRIDE;
+          const arr = new Float32Array(4);
+          for (let i = 0; i < pCount && i < 4; i++) arr[i] = dv.getFloat32(pPtr + i * 4, true);
+          device.queue.writeBuffer(pubuf, pbase, arr);
+          const src1 = (t1 !== 0 && st.renderTargets[t1]) ? st.renderTargets[t1].view : st.dummyTexView;
+          const bg0 = device.createBindGroup({
+            layout: entry.bgl0,
+            entries: [{ binding: 0, resource: { buffer: pubuf, offset: pbase, size: 32 } }],
+          });
+          const bg1 = device.createBindGroup({
+            layout: entry.bgl1,
+            entries: [
+              { binding: 0, resource: st.linearSampler },
+              { binding: 1, resource: src0rt.view },
+              { binding: 2, resource: src1 },
+            ],
+          });
+          st.pass.setPipeline(pipe);
+          st.pass.setBindGroup(0, bg0);
+          st.pass.setBindGroup(1, bg1);
+          st.pass.draw(3, 1, 0, 0);
+          break;
+        }
         default:
           break; // unknown tag: size-skip = forward compatible
       }
@@ -5744,7 +6059,10 @@
       shaders: [],
       textures: [],
       shadowMaps: [], // P9 slice 3: { fbo, tex, size } per handle
+      renderTargets: [], // post-processing: { fbo, colorTex, depthTex, w, h } per handle
       vaos: new Map(),
+      emptyVao: null, // lazy-created VAO for fullscreen-quad draw (case 25)
+      extColorBufferFloat: null, // EXT_color_buffer_float, enabled on first rgba16f target
       active: null,
       last: 0,
       // Poster swap: SSR may drop an <img data-gl-poster> sibling under the
@@ -5892,6 +6210,25 @@
       ibl: null, // { irr, spec, lut } texture handles set by bind_ibl (2b)
       shadowMaps: [], // { tex, view, sampler, size } by handle (create_shadow_map, 2c)
       shadow: null, // { handle } set by bind_shadow_map (2c)
+      renderTargets: [], // post: { tex, view, depthTex, depthView, w, h, format } by handle
+      curTargetFormat: null, // color format of the active pass (post pipeline keying)
+      curPassHasDepth: false, // true when the active render pass has a depth attachment
+      postUniform: null, // slotted params buffer for draw_fullscreen_quad (lazy)
+      postSlot: 0, // per-frame fullscreen-draw slot counter (reset at encoder start)
+      // Linear/clamp sampler + 1×1 dummy view for the unused tex1 post slot. Eager
+      // (cheap, always needed by the post chain when present); clamp avoids UV wrap.
+      linearSampler: gpu.device.createSampler({
+        magFilter: "linear", minFilter: "linear",
+        addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge",
+      }),
+      dummyTexView: (() => {
+        const t = gpu.device.createTexture({
+          size: [1, 1], format: "rgba8unorm",
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        gpu.device.queue.writeTexture({ texture: t }, new Uint8Array([0, 0, 0, 255]), { bytesPerRow: 4, rowsPerImage: 1 }, [1, 1]);
+        return t.createView();
+      })(),
       shadowPass: null, // active depth render pass during begin/end_shadow_pass
       defaults: gpuMakeDefaults(gpu.device),
       active: null,

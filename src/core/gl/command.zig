@@ -43,9 +43,14 @@ pub const Tag = enum(u16) {
     draw_depth = 19, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr} — depth-only draw (mvp = light_vp·world)
     bind_shadow_map = 20, // {slot, shadow_handle, light_vp_ptr} — bind depth tex + set u_light_vp on active program
     set_bones = 21, // {count, ptr} — count×mat4 bone palette → u_bones[] on the active program
+    // ── Post-processing ─────────────────────────────────────────────────
+    create_render_target = 22, // {handle, width, height, format, flags(bit0=with_depth)} — color RT (+optional depth)
+    begin_offscreen_pass = 23, // {target_handle, clear_rgba(4 f32), clear_flags(bit0=color,bit1=depth)} — bind RT
+    end_offscreen_pass = 24, // {} — close the offscreen pass; next begin_* rebinds
+    draw_fullscreen_quad = 25, // {shader, tex0, tex1, params_ptr, param_count} — VBO-less 3-vert triangle
 };
 
-pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3 };
+pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
 
 pub const BufferKind = enum(u32) { vertex = 0, index = 1 };
 
@@ -71,6 +76,14 @@ pub const variant_emissive: u32 = 1 << 4; // requires variant_pbr; emissive term
 pub const variant_shadow: u32 = 1 << 5; // requires variant_pbr; samples the shadow map (P9 slice 3)
 pub const variant_depth: u32 = 1 << 6; // depth-only shader for the shadow pass; pbr vertex layout, attrib 0 only
 pub const variant_skinned: u32 = 1 << 7; // requires variant_pbr; GPU skinning via u_bones[] palette
+pub const variant_post: u32 = 1 << 8; // fullscreen-quad shader: no VBO, no depth test, 2 sampler+texture slots
+pub const variant_linear_output: u32 = 1 << 9; // requires variant_pbr; SKIP in-shader ACES (post path renders linear HDR)
+
+/// Render-target creation flags.
+pub const rt_flag_with_depth: u32 = 1 << 0;
+/// Offscreen-pass clear flags.
+pub const clear_flag_color: u32 = 1 << 0;
+pub const clear_flag_depth: u32 = 1 << 1;
 
 pub const max_lights: u32 = 4;
 pub const light_stride_f32: u32 = 8; // [type(0=dir,1=point), intensity, x,y,z, r,g,b]
@@ -458,9 +471,12 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\  color += emissive_factor * texture(u_emissive_tex, v_uv).rgb;
         \\
     ;
-    const tail =
+    const tail_tonemap =
         \\  color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), 0.0, 1.0);
         \\  color = pow(color, vec3(1.0 / 2.2));
+        \\
+    ;
+    const tail_close =
         \\  o_frag = vec4(color, base_color.a);
         \\}
         \\
@@ -477,9 +493,105 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ lighting;
     src = src ++ (if (flags & variant_shadow != 0) combine_shadow else combine_plain);
     if (flags & variant_emissive != 0) src = src ++ emissive;
-    src = src ++ tail;
+    if (flags & variant_linear_output == 0) src = src ++ tail_tonemap;
+    src = src ++ tail_close;
     return src;
 }
+
+// ── Post-processing GLSL sources ────────────────────────────────────
+//
+// Shared fullscreen-triangle vertex + 4 post-effect fragments.
+// Paired with wgslBright/Blur/Composite/Fxaa below for WebGPU.
+
+pub const fullscreenVertexSrc: []const u8 =
+    \\#version 300 es
+    \\out vec2 v_uv;
+    \\void main() {
+    \\  // VBO-less covering triangle: ids 0,1,2 -> (-1,-1),(3,-1),(-1,3)
+    \\  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    \\  v_uv = p;
+    \\  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    \\}
+;
+
+pub const brightFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0;
+    \\uniform float u_threshold;
+    \\void main() {
+    \\  vec3 c = texture(u_tex0, v_uv).rgb;
+    \\  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    \\  frag = vec4(l > u_threshold ? c : vec3(0.0), 1.0);
+    \\}
+;
+
+pub const blurFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0;
+    \\uniform vec2 u_texel; // 1/target_size
+    \\uniform vec2 u_dir;   // (1,0) horizontal, (0,1) vertical
+    \\void main() {
+    \\  // 9-tap Gaussian (normalized weights).
+    \\  float w[5];
+    \\  w[0]=0.227027; w[1]=0.194595; w[2]=0.121622; w[3]=0.054054; w[4]=0.016216;
+    \\  vec3 acc = texture(u_tex0, v_uv).rgb * w[0];
+    \\  for (int i = 1; i < 5; i++) {
+    \\    vec2 o = u_texel * u_dir * float(i);
+    \\    acc += texture(u_tex0, v_uv + o).rgb * w[i];
+    \\    acc += texture(u_tex0, v_uv - o).rgb * w[i];
+    \\  }
+    \\  frag = vec4(acc, 1.0);
+    \\}
+;
+
+pub const compositeFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0; // scene HDR
+    \\uniform sampler2D u_tex1; // bloom
+    \\uniform float u_intensity;
+    \\vec3 aces(vec3 x) {
+    \\  const float a=2.51, b=0.03, c=2.43, d=0.59, e=0.14;
+    \\  return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
+    \\}
+    \\void main() {
+    \\  vec3 hdr = texture(u_tex0, v_uv).rgb + u_intensity * texture(u_tex1, v_uv).rgb;
+    \\  frag = vec4(aces(hdr), 1.0);
+    \\}
+;
+
+pub const fxaaFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0;
+    \\uniform vec2 u_texel;
+    \\float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+    \\void main() {
+    \\  vec3 m  = texture(u_tex0, v_uv).rgb;
+    \\  float lM = luma(m);
+    \\  float lN = luma(texture(u_tex0, v_uv + vec2(0.0, -u_texel.y)).rgb);
+    \\  float lS = luma(texture(u_tex0, v_uv + vec2(0.0,  u_texel.y)).rgb);
+    \\  float lE = luma(texture(u_tex0, v_uv + vec2( u_texel.x, 0.0)).rgb);
+    \\  float lW = luma(texture(u_tex0, v_uv + vec2(-u_texel.x, 0.0)).rgb);
+    \\  float lo = min(lM, min(min(lN, lS), min(lE, lW)));
+    \\  float hi = max(lM, max(max(lN, lS), max(lE, lW)));
+    \\  if (hi - lo < 0.10) { frag = vec4(m, 1.0); return; }
+    \\  vec2 dir = normalize(vec2((lN + lS) - 2.0*lM, (lE + lW) - 2.0*lM) + 1e-6);
+    \\  vec3 a = texture(u_tex0, v_uv + dir * u_texel).rgb;
+    \\  vec3 b = texture(u_tex0, v_uv - dir * u_texel).rgb;
+    \\  frag = vec4(0.5 * (a + b), 1.0);
+    \\}
+;
 
 // ── WebGPU PBR über-shader (P10 slice 2a) ───────────────────────────
 //
@@ -794,9 +906,14 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  color = color + emissive_factor * textureSample(emissive_tex, samp, in.uv).rgb;
         \\
     ;
-    const fs_tail =
+    // ACES tonemap + gamma. Skipped for variant_linear_output (the post
+    // pipeline renders linear HDR offscreen and tonemaps in the composite pass).
+    const fs_tail_tonemap =
         \\  color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
         \\  color = pow(color, vec3<f32>(1.0 / 2.2));
+        \\
+    ;
+    const fs_tail_close =
         \\  return vec4<f32>(color, base_color.a);
         \\}
         \\
@@ -806,6 +923,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const em = flags & variant_emissive != 0;
     const shadow = flags & variant_shadow != 0;
     const skinned = flags & variant_skinned != 0;
+    const lin = flags & variant_linear_output != 0;
     comptime var src: []const u8 = uniforms_head;
     if (shadow) src = src ++ uniforms_shadow;
     src = src ++ uniforms_tail;
@@ -830,7 +948,8 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ fs_lighting;
     src = src ++ (if (shadow) fs_combine_shadow else fs_combine_plain);
     if (em) src = src ++ fs_emissive;
-    src = src ++ fs_tail;
+    if (!lin) src = src ++ fs_tail_tonemap;
+    src = src ++ fs_tail_close;
     return src;
 }
 
@@ -853,6 +972,186 @@ pub fn wgslDepth() []const u8 {
     \\
     ;
 }
+
+// ── Post-processing WGSL modules ─────────────────────────────────────
+//
+// Shared bind-group layout for all 4 post effects:
+//   @group(0) @binding(0) = params uniform (padded to 16B)
+//   @group(1) @binding(0) = sampler
+//   @group(1) @binding(1) = tex0 (primary input)
+//   @group(1) @binding(2) = tex1 (secondary; bridge binds a 1×1 dummy for single-input effects)
+// Each module includes a VBO-less fullscreen-triangle vs_main.
+
+pub fn wgslBright() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { threshold: f32, _pad: vec3<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let c = textureSample(tex0, samp, uv).rgb;
+    \\  let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    \\  return vec4<f32>(select(vec3<f32>(0.0), c, l > P.threshold), 1.0);
+    \\}
+    ;
+}
+
+pub fn wgslBlur() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { texel: vec2<f32>, dir: vec2<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let w0 = 0.227027; let w1 = 0.194595; let w2 = 0.121622; let w3 = 0.054054; let w4 = 0.016216;
+    \\  var acc = textureSample(tex0, samp, uv).rgb * w0;
+    \\  let step = P.texel * P.dir;
+    \\  acc += textureSample(tex0, samp, uv + step * 1.0).rgb * w1;
+    \\  acc += textureSample(tex0, samp, uv - step * 1.0).rgb * w1;
+    \\  acc += textureSample(tex0, samp, uv + step * 2.0).rgb * w2;
+    \\  acc += textureSample(tex0, samp, uv - step * 2.0).rgb * w2;
+    \\  acc += textureSample(tex0, samp, uv + step * 3.0).rgb * w3;
+    \\  acc += textureSample(tex0, samp, uv - step * 3.0).rgb * w3;
+    \\  acc += textureSample(tex0, samp, uv + step * 4.0).rgb * w4;
+    \\  acc += textureSample(tex0, samp, uv - step * 4.0).rgb * w4;
+    \\  return vec4<f32>(acc, 1.0);
+    \\}
+    ;
+}
+
+pub fn wgslComposite() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { intensity: f32, _pad: vec3<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\fn aces(x: vec3<f32>) -> vec3<f32> {
+    \\  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+    \\  return clamp((x*(a*x+b))/(x*(c*x+d)+e), vec3<f32>(0.0), vec3<f32>(1.0));
+    \\}
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let hdr = textureSample(tex0, samp, uv).rgb + P.intensity * textureSample(tex1, samp, uv).rgb;
+    \\  return vec4<f32>(aces(hdr), 1.0);
+    \\}
+    ;
+}
+
+pub fn wgslFxaa() []const u8 {
+    // Use textureSampleLevel (mip 0) for all directional samples — always
+    // uniform control flow, no early-return branch, satisfies WGSL spec.
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { texel: vec2<f32>, _pad: vec2<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\fn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let m  = textureSampleLevel(tex0, samp, uv, 0.0).rgb;
+    \\  let lM = luma(m);
+    \\  let lN = luma(textureSampleLevel(tex0, samp, uv + vec2<f32>(0.0, -P.texel.y), 0.0).rgb);
+    \\  let lS = luma(textureSampleLevel(tex0, samp, uv + vec2<f32>(0.0,  P.texel.y), 0.0).rgb);
+    \\  let lE = luma(textureSampleLevel(tex0, samp, uv + vec2<f32>( P.texel.x, 0.0), 0.0).rgb);
+    \\  let lW = luma(textureSampleLevel(tex0, samp, uv + vec2<f32>(-P.texel.x, 0.0), 0.0).rgb);
+    \\  let lo = min(lM, min(min(lN, lS), min(lE, lW)));
+    \\  let hi = max(lM, max(max(lN, lS), max(lE, lW)));
+    \\  let edge = clamp((hi - lo - 0.10) * 20.0, 0.0, 1.0);
+    \\  let dir = normalize(vec2<f32>((lN + lS) - 2.0*lM, (lE + lW) - 2.0*lM) + vec2<f32>(1e-6));
+    \\  let a = textureSampleLevel(tex0, samp, uv + dir * P.texel, 0.0).rgb;
+    \\  let b = textureSampleLevel(tex0, samp, uv - dir * P.texel, 0.0).rgb;
+    \\  let blended = mix(m, 0.5 * (a + b), edge);
+    \\  return vec4<f32>(blended, 1.0);
+    \\}
+    ;
+}
+
+// ── Task 3: Post-process effect-graph structs ────────────────────────
+
+/// Bloom configuration for the post-process pass.
+pub const Bloom = struct {
+    /// Luminance threshold above which pixels contribute to bloom.
+    threshold: f32 = 1.0,
+    /// Bloom intensity blended into the composite.
+    intensity: f32 = 0.6,
+};
+
+/// Options for `beginPostProcess` / `endPostProcess`.
+pub const PostProcess = struct {
+    /// Bloom effect; set to `null` to skip bright-pass + blur chain.
+    bloom: ?Bloom = .{},
+    /// FXAA anti-aliasing on the final canvas blit.
+    fxaa: bool = true,
+    /// When true, `beginPostProcess` emits the WGSL post modules
+    /// (`wgslBright`/`wgslBlur`/`wgslComposite`/`wgslFxaa`) in the create-shader
+    /// vs slot (fs slot 0/0) for the WebGPU backend, mirroring how GlScene/GlSkin
+    /// select WGSL vs GLSL via `use_webgpu`. Default (false) emits GLSL.
+    webgpu: bool = false,
+};
+
+/// Persistent state owned by the island (one static per GL canvas island).
+/// Holds fixed render-target / shader handles and stable param storage whose
+/// addresses are wired into the command stream; must outlive the frame.
+///
+/// Handle reservation (h_ = render target, sh_ = shader):
+///   240–247 are reserved for the post path to avoid clashing with app handles.
+pub const PostCtx = struct {
+    pub const h_scene_hdr: u32 = 240;
+    pub const h_bloom_a: u32 = 241;
+    pub const h_bloom_b: u32 = 242;
+    pub const h_ldr: u32 = 243;
+    pub const sh_bright: u32 = 244;
+    pub const sh_blur: u32 = 245;
+    pub const sh_composite: u32 = 246;
+    pub const sh_fxaa: u32 = 247;
+
+    /// True once shaders + targets have been emitted for the first time.
+    created: bool = false,
+    last_w: u32 = 0,
+    last_h: u32 = 0,
+    opts: PostProcess = .{},
+
+    // Stable param storage (wire records point at these; must outlive the frame).
+    p_bright: [4]f32 = .{ 0, 0, 0, 0 }, // [threshold, 0, 0, 0]
+    p_blur_h: [4]f32 = .{ 0, 0, 1, 0 }, // [texel.x, texel.y, dir.x=1, dir.y=0]
+    p_blur_v: [4]f32 = .{ 0, 0, 0, 1 }, // [texel.x, texel.y, dir.x=0, dir.y=1]
+    p_comp: [4]f32 = .{ 0, 0, 0, 0 }, // [intensity, 0, 0, 0]
+    p_fxaa: [4]f32 = .{ 0, 0, 0, 0 }, // [texel.x, texel.y, 0, 0]
+};
 
 pub const Encoder = struct {
     buf: []u8,
@@ -1060,6 +1359,43 @@ pub const Encoder = struct {
         self.putU32(light_vp_ptr);
     }
 
+    // ── Post-processing ─────────────────────────────────────────────────
+
+    /// Allocate a color render target (FBO + color attachment, optional depth).
+    /// `format` selects the internal texture format; `flags` may include `rt_flag_with_depth`.
+    pub fn createRenderTarget(self: *Encoder, handle: u32, width: u32, height: u32, format: TexFormat, flags: u32) void {
+        self.header(.create_render_target, 20);
+        self.putU32(handle);
+        self.putU32(width);
+        self.putU32(height);
+        self.putU32(@intFromEnum(format));
+        self.putU32(flags);
+    }
+
+    /// Bind the render target and clear per `clear_flags` (bit0=color, bit1=depth).
+    pub fn beginOffscreenPass(self: *Encoder, target_handle: u32, clear: [4]f32, clear_flags: u32) void {
+        self.header(.begin_offscreen_pass, 24);
+        self.putU32(target_handle);
+        for (clear) |c| self.putF32(c);
+        self.putU32(clear_flags);
+    }
+
+    /// Close the offscreen pass; the next begin_* restores the default framebuffer.
+    pub fn endOffscreenPass(self: *Encoder) void {
+        self.header(.end_offscreen_pass, 0);
+    }
+
+    /// Draw a VBO-less fullscreen triangle with `shader`, binding `tex0`/`tex1` to
+    /// samplers 0/1, and pointing the uniform block to `params_ptr` (`param_count` f32s).
+    pub fn drawFullscreenQuad(self: *Encoder, shader: u32, tex0: u32, tex1: u32, params_ptr: u32, param_count: u32) void {
+        self.header(.draw_fullscreen_quad, 20);
+        self.putU32(shader);
+        self.putU32(tex0);
+        self.putU32(tex1);
+        self.putU32(params_ptr);
+        self.putU32(param_count);
+    }
+
     pub fn endFrame(self: *Encoder) void {
         self.header(.end_frame, 0);
     }
@@ -1068,6 +1404,140 @@ pub const Encoder = struct {
     pub fn finish(self: *Encoder) []const u8 {
         std.mem.writeInt(u32, self.buf[0..4], @intCast(self.len - 4), .little);
         return self.buf[0..self.len];
+    }
+
+    // ── Task 3: Post-process effect-graph API ────────────────────────
+
+    /// GLSL post shader: shared fullscreen vertex + the effect's fragment src,
+    /// tagged `variant_post` (the bridge keys bright/blur/composite/fxaa by handle).
+    fn createPostShaderGlsl(self: *Encoder, handle: u32, fs: []const u8) void {
+        self.createShader(
+            handle,
+            variant_post,
+            @truncate(@intFromPtr(fullscreenVertexSrc.ptr)),
+            @intCast(fullscreenVertexSrc.len),
+            @truncate(@intFromPtr(fs.ptr)),
+            @intCast(fs.len),
+        );
+    }
+
+    /// WGSL post shader: the WGSL module (both stages) rides the vs slot, fs 0/0 —
+    /// same wire shape GlScene/GlSkin use for `wgslPbr` on the WebGPU backend.
+    fn createPostShaderWgsl(self: *Encoder, handle: u32, wgsl: []const u8) void {
+        self.createShader(
+            handle,
+            variant_post,
+            @truncate(@intFromPtr(wgsl.ptr)),
+            @intCast(wgsl.len),
+            0,
+            0,
+        );
+    }
+
+    /// Open the post-process pass for this frame.
+    ///
+    /// On first call (or when `width`/`height` change) emits
+    /// `createRenderTarget` × 4 and (first call only) `createShader` × 4.
+    /// Ends by opening an offscreen pass into `h_scene_hdr` — the caller
+    /// renders the scene into it, then calls `endPostProcess`.
+    pub fn beginPostProcess(self: *Encoder, ctx: *PostCtx, opts: PostProcess, width: u32, height: u32) void {
+        ctx.opts = opts;
+        const resized = width != ctx.last_w or height != ctx.last_h;
+        if (!ctx.created or resized) {
+            if (resized and ctx.created) {
+                self.deleteResource(.render_target, PostCtx.h_scene_hdr);
+                self.deleteResource(.render_target, PostCtx.h_bloom_a);
+                self.deleteResource(.render_target, PostCtx.h_bloom_b);
+                self.deleteResource(.render_target, PostCtx.h_ldr);
+            }
+            const hw = @max(1, width / 2);
+            const hh = @max(1, height / 2);
+            self.createRenderTarget(PostCtx.h_scene_hdr, width, height, .rgba16f, rt_flag_with_depth);
+            self.createRenderTarget(PostCtx.h_bloom_a, hw, hh, .rgba16f, 0);
+            self.createRenderTarget(PostCtx.h_bloom_b, hw, hh, .rgba16f, 0);
+            self.createRenderTarget(PostCtx.h_ldr, width, height, .rgba8, 0);
+            ctx.last_w = width;
+            ctx.last_h = height;
+        }
+        if (!ctx.created) {
+            if (opts.webgpu) {
+                // WebGPU: ship the WGSL module (both stages) in the vs slot,
+                // fs slot 0/0 — same convention GlScene/GlSkin use for wgslPbr.
+                // The bridge picks bright/blur/composite/fxaa by shader handle.
+                self.createPostShaderWgsl(PostCtx.sh_bright, wgslBright());
+                self.createPostShaderWgsl(PostCtx.sh_blur, wgslBlur());
+                self.createPostShaderWgsl(PostCtx.sh_composite, wgslComposite());
+                self.createPostShaderWgsl(PostCtx.sh_fxaa, wgslFxaa());
+            } else {
+                self.createPostShaderGlsl(PostCtx.sh_bright, brightFragmentSrc);
+                self.createPostShaderGlsl(PostCtx.sh_blur, blurFragmentSrc);
+                self.createPostShaderGlsl(PostCtx.sh_composite, compositeFragmentSrc);
+                self.createPostShaderGlsl(PostCtx.sh_fxaa, fxaaFragmentSrc);
+            }
+            ctx.created = true;
+        }
+        // Open the scene pass into the HDR target.
+        self.beginOffscreenPass(PostCtx.h_scene_hdr, .{ 0, 0, 0, 1 }, clear_flag_color | clear_flag_depth);
+    }
+
+    /// Close the scene pass and emit the full effect chain.
+    ///
+    /// Chain (bloom + fxaa):
+    ///   end_offscreen_pass (close scene)
+    ///   bright → bloom_a  (begin_offscreen_pass + draw_fullscreen_quad + end_offscreen_pass)
+    ///   blurH  → bloom_b  (begin_offscreen_pass + draw_fullscreen_quad + end_offscreen_pass)
+    ///   blurV  → bloom_a  (begin_offscreen_pass + draw_fullscreen_quad + end_offscreen_pass)
+    ///   composite → ldr   (begin_offscreen_pass + draw_fullscreen_quad + end_offscreen_pass)
+    ///   fxaa  → canvas    (begin_frame + draw_fullscreen_quad + end_frame)
+    /// Without fxaa, composite goes straight to the canvas pass.
+    pub fn endPostProcess(self: *Encoder, ctx: *PostCtx) void {
+        // Close the scene HDR pass.
+        self.endOffscreenPass();
+
+        const w = ctx.last_w;
+        const h = ctx.last_h;
+        const hw: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, w / 2)));
+        const hh: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, h / 2)));
+        const fw: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, w)));
+        const fh: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, h)));
+
+        if (ctx.opts.bloom) |b| {
+            // bright-pass: scene_hdr -> bloom_a (½-res)
+            ctx.p_bright[0] = b.threshold;
+            self.beginOffscreenPass(PostCtx.h_bloom_a, .{ 0, 0, 0, 1 }, clear_flag_color);
+            self.drawFullscreenQuad(PostCtx.sh_bright, PostCtx.h_scene_hdr, 0, @truncate(@intFromPtr(&ctx.p_bright)), 1);
+            self.endOffscreenPass();
+            // blur H: bloom_a -> bloom_b
+            ctx.p_blur_h = .{ hw, hh, 1, 0 };
+            self.beginOffscreenPass(PostCtx.h_bloom_b, .{ 0, 0, 0, 1 }, clear_flag_color);
+            self.drawFullscreenQuad(PostCtx.sh_blur, PostCtx.h_bloom_a, 0, @truncate(@intFromPtr(&ctx.p_blur_h)), 4);
+            self.endOffscreenPass();
+            // blur V: bloom_b -> bloom_a
+            ctx.p_blur_v = .{ hw, hh, 0, 1 };
+            self.beginOffscreenPass(PostCtx.h_bloom_a, .{ 0, 0, 0, 1 }, clear_flag_color);
+            self.drawFullscreenQuad(PostCtx.sh_blur, PostCtx.h_bloom_b, 0, @truncate(@intFromPtr(&ctx.p_blur_v)), 4);
+            self.endOffscreenPass();
+            ctx.p_comp[0] = b.intensity;
+        } else {
+            ctx.p_comp[0] = 0; // no bloom contribution
+        }
+
+        if (ctx.opts.fxaa) {
+            // composite (scene_hdr + bloom_a) -> ldr offscreen
+            self.beginOffscreenPass(PostCtx.h_ldr, .{ 0, 0, 0, 1 }, clear_flag_color);
+            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 1);
+            self.endOffscreenPass();
+            // fxaa: ldr -> canvas
+            ctx.p_fxaa = .{ fw, fh, 0, 0 };
+            self.beginFrame(.{ 0, 0, 0, 1 }, w, h);
+            self.drawFullscreenQuad(PostCtx.sh_fxaa, PostCtx.h_ldr, 0, @truncate(@intFromPtr(&ctx.p_fxaa)), 2);
+            self.endFrame();
+        } else {
+            // composite straight to canvas
+            self.beginFrame(.{ 0, 0, 0, 1 }, w, h);
+            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 1);
+            self.endFrame();
+        }
     }
 };
 
@@ -1543,4 +2013,200 @@ test "golden: shadow-pass frame records (tags 16-20)" {
             "0600" ++ "0000",
         hex,
     );
+}
+
+// ── Post-processing wire goldens ─────────────────────────────────────
+
+fn readU16(bytes: []const u8, off: usize) u16 {
+    return std.mem.readInt(u16, bytes[off..][0..2], .little);
+}
+
+fn readU32(bytes: []const u8, off: usize) u32 {
+    return std.mem.readInt(u32, bytes[off..][0..4], .little);
+}
+
+test "golden: post-process wire records (tags 22-25)" {
+    var buf: [256]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createRenderTarget(5, 800, 600, .rgba16f, rt_flag_with_depth);
+    enc.beginOffscreenPass(5, .{ 0, 0, 0, 1 }, clear_flag_color | clear_flag_depth);
+    enc.drawFullscreenQuad(3, 5, 0, 0x2000, 1);
+    enc.endOffscreenPass();
+    const out = enc.finish();
+
+    // record framing: [len u32][ (tag u16, size u16, payload) ... ]
+    var off: usize = 4;
+    // create_render_target: handle,w,h,format,flags = 5×u32 = 20B
+    try testing.expectEqual(@as(u16, @intFromEnum(Tag.create_render_target)), readU16(out, off));
+    try testing.expectEqual(@as(u16, 20), readU16(out, off + 2));
+    try testing.expectEqual(@as(u32, 5), readU32(out, off + 4));
+    try testing.expectEqual(@as(u32, 800), readU32(out, off + 8));
+    try testing.expectEqual(@as(u32, 600), readU32(out, off + 12));
+    try testing.expectEqual(@as(u32, @intFromEnum(TexFormat.rgba16f)), readU32(out, off + 16));
+    try testing.expectEqual(rt_flag_with_depth, readU32(out, off + 20));
+    off += 4 + 20;
+    // begin_offscreen_pass: target u32 + clear 4×f32 + clear_flags u32 = 24B
+    try testing.expectEqual(@as(u16, @intFromEnum(Tag.begin_offscreen_pass)), readU16(out, off));
+    try testing.expectEqual(@as(u16, 24), readU16(out, off + 2));
+    try testing.expectEqual(@as(u32, 5), readU32(out, off + 4));
+    try testing.expectEqual(clear_flag_color | clear_flag_depth, readU32(out, off + 24));
+    off += 4 + 24;
+    // draw_fullscreen_quad: shader,tex0,tex1,params_ptr,param_count = 20B
+    try testing.expectEqual(@as(u16, @intFromEnum(Tag.draw_fullscreen_quad)), readU16(out, off));
+    try testing.expectEqual(@as(u16, 20), readU16(out, off + 2));
+    try testing.expectEqual(@as(u32, 3), readU32(out, off + 4));
+    try testing.expectEqual(@as(u32, 5), readU32(out, off + 8));
+    try testing.expectEqual(@as(u32, 0), readU32(out, off + 12));
+    try testing.expectEqual(@as(u32, 0x2000), readU32(out, off + 16));
+    try testing.expectEqual(@as(u32, 1), readU32(out, off + 20));
+    off += 4 + 20;
+    // end_offscreen_pass: 0B payload
+    try testing.expectEqual(@as(u16, @intFromEnum(Tag.end_offscreen_pass)), readU16(out, off));
+    try testing.expectEqual(@as(u16, 0), readU16(out, off + 2));
+}
+
+// ── Task 2: Post shader sources + linear-output PBR variant ─────────
+
+test "post GLSL sources: uniforms + sampler names present" {
+    // Fullscreen vertex stage uses gl_VertexID, declares no attributes.
+    try testing.expect(std.mem.indexOf(u8, fullscreenVertexSrc, "gl_VertexID") != null);
+    try testing.expect(std.mem.indexOf(u8, fullscreenVertexSrc, "in ") == null); // no vertex attributes
+
+    // bright-pass: one source sampler + threshold uniform.
+    try testing.expect(std.mem.indexOf(u8, brightFragmentSrc, "u_tex0") != null);
+    try testing.expect(std.mem.indexOf(u8, brightFragmentSrc, "u_threshold") != null);
+
+    // blur: source + texel + direction.
+    try testing.expect(std.mem.indexOf(u8, blurFragmentSrc, "u_texel") != null);
+    try testing.expect(std.mem.indexOf(u8, blurFragmentSrc, "u_dir") != null);
+
+    // composite: two samplers + intensity + ACES (tonemap lives here now).
+    try testing.expect(std.mem.indexOf(u8, compositeFragmentSrc, "u_tex0") != null);
+    try testing.expect(std.mem.indexOf(u8, compositeFragmentSrc, "u_tex1") != null);
+    try testing.expect(std.mem.indexOf(u8, compositeFragmentSrc, "u_intensity") != null);
+
+    // fxaa: source + texel.
+    try testing.expect(std.mem.indexOf(u8, fxaaFragmentSrc, "u_texel") != null);
+}
+
+test "variant_linear_output skips ACES in PBR fragment" {
+    const lit = pbrFragmentSrc(variant_pbr);
+    const linear = pbrFragmentSrc(variant_pbr | variant_linear_output);
+    // The standard variant tonemaps (inline ACES coefficients 2.51/2.43); the linear variant does not.
+    try testing.expect(std.mem.indexOf(u8, lit, "2.51") != null);
+    try testing.expect(std.mem.indexOf(u8, linear, "2.51") == null); // ACES omitted in linear output
+    try testing.expect(linear.len < lit.len); // linear omits the tonemap block
+}
+
+test "variant_linear_output skips ACES in WGSL PBR fragment (backend parity)" {
+    const lit = wgslPbr(variant_pbr);
+    const linear = wgslPbr(variant_pbr | variant_linear_output);
+    // WGSL twin must gate the in-shader tonemap identically to the GLSL path,
+    // else the WebGPU scene double-tonemaps and nothing exceeds the bloom threshold.
+    try testing.expect(std.mem.indexOf(u8, lit, "2.51") != null);
+    try testing.expect(std.mem.indexOf(u8, linear, "2.51") == null); // ACES omitted in linear output
+    try testing.expect(linear.len < lit.len); // linear omits the tonemap block
+}
+
+test "golden: post shader sources frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate shader contract bump.
+    // GLSL
+    try testing.expectEqual(@as(u64, 0xd8e25fe0c5f0c5c3), fnv64(fullscreenVertexSrc));
+    try testing.expectEqual(@as(u64, 0xceff6b2f105a92ec), fnv64(brightFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x221d8b95dd9492ba), fnv64(blurFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x0ac71cffb32f57ad), fnv64(compositeFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x9d052976fb0b2105), fnv64(fxaaFragmentSrc));
+    // WGSL
+    try testing.expectEqual(@as(u64, 0xefa46fcd8c5003b6), fnv64(wgslBright()));
+    try testing.expectEqual(@as(u64, 0xb93270d3619361ca), fnv64(wgslBlur()));
+    try testing.expectEqual(@as(u64, 0xdb360b028579d531), fnv64(wgslComposite()));
+    try testing.expectEqual(@as(u64, 0xe8ac45e2d1276dfd), fnv64(wgslFxaa()));
+    // linear-output PBR variant (omits tonemap+gamma; post composite pass tonemaps instead)
+    try testing.expectEqual(@as(u64, 0x435aa6e4ca89a81a), fnv64(pbrFragmentSrc(variant_pbr | variant_linear_output)));
+    try testing.expectEqual(@as(u64, 0x3e109d6415bcafaf), fnv64(wgslPbr(variant_pbr | variant_linear_output)));
+}
+
+// ── Task 3: Post-process effect-graph sequence tests ─────────────────
+
+/// Walk the record stream and collect all Tag values in order.
+fn collectTags(stream: []const u8, out: []Tag) usize {
+    if (stream.len < 4) return 0;
+    var off: usize = 4; // skip the length header
+    var n: usize = 0;
+    while (off + 4 <= stream.len and n < out.len) {
+        const tag_raw = std.mem.readInt(u16, stream[off..][0..2], .little);
+        const size = std.mem.readInt(u16, stream[off + 2 ..][0..2], .little);
+        // Map raw u16 to Tag; skip if unknown.
+        inline for (std.meta.fields(Tag)) |f| {
+            if (f.value == tag_raw) {
+                out[n] = @enumFromInt(tag_raw);
+                n += 1;
+                break;
+            }
+        }
+        off += 4 + size;
+    }
+    return n;
+}
+
+/// Assert that `needle` appears as a contiguous subsequence inside `haystack[0..n]`.
+fn expectContainsInOrder(haystack: []const Tag, n: usize, needle: []const Tag) !void {
+    var ni: usize = 0;
+    for (haystack[0..n]) |t| {
+        if (ni < needle.len and t == needle[ni]) {
+            ni += 1;
+        }
+    }
+    if (ni != needle.len) {
+        std.debug.print("expectContainsInOrder: missing tags starting at index {d}\n", .{ni});
+        return error.MissingTagSubsequence;
+    }
+}
+
+test "beginPostProcess/endPostProcess emit the bloom+fxaa chain" {
+    var buf: [4096]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = PostCtx{};
+    enc.beginPostProcess(&ctx, .{ .bloom = .{}, .fxaa = true }, 800, 600);
+    enc.endPostProcess(&ctx);
+    const out = enc.finish();
+    var tag_buf: [64]Tag = undefined;
+    const n = collectTags(out, &tag_buf);
+    const tags = tag_buf[0..n];
+    // First frame: render targets created, then offscreen scene pass opened.
+    try expectContainsInOrder(tags, n, &.{
+        .create_render_target, // scene_hdr
+        .create_render_target, // bloom_a
+        .create_render_target, // bloom_b
+        .create_render_target, // ldr
+        .begin_offscreen_pass, // scene -> hdr
+    });
+    // endPostProcess: close scene, bloom chain, composite, then canvas fxaa pass.
+    try expectContainsInOrder(tags, n, &.{
+        .end_offscreen_pass, // close scene
+        .begin_offscreen_pass, // bright -> bloom_a
+        .draw_fullscreen_quad,
+        .begin_offscreen_pass, // blur H -> bloom_b
+        .draw_fullscreen_quad,
+        .begin_offscreen_pass, // blur V -> bloom_a
+        .draw_fullscreen_quad,
+        .begin_offscreen_pass, // composite -> ldr
+        .draw_fullscreen_quad,
+        .begin_frame, // canvas
+        .draw_fullscreen_quad, // fxaa -> canvas
+        .end_frame,
+    });
+}
+
+test "endPostProcess without fxaa composites straight to canvas" {
+    var buf: [4096]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = PostCtx{};
+    enc.beginPostProcess(&ctx, .{ .bloom = .{}, .fxaa = false }, 800, 600);
+    enc.endPostProcess(&ctx);
+    const tags_raw = enc.finish();
+    var tag_buf: [64]Tag = undefined;
+    const n = collectTags(tags_raw, &tag_buf);
+    // No ldr offscreen composite; composite draws inside a begin_frame canvas pass.
+    try expectContainsInOrder(tag_buf[0..n], n, &.{ .begin_frame, .draw_fullscreen_quad, .end_frame });
 }

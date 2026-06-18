@@ -146,6 +146,19 @@ pub const GlSkin = struct {
     pub const props_schema: []const u8 = "{}";
 };
 
+/// verve.gl post-processing demo (/gl-post). Renders a bright emissive PBR cube
+/// with a full bloom + FXAA pipeline. The scene shader uses
+/// `variant_pbr | variant_emissive | variant_linear_output` so it emits linear
+/// HDR; `beginPostProcess`/`endPostProcess` runs the bright-pass+blur bloom
+/// chain, composite (ACES tonemap), and FXAA anti-aliasing. Backend-detects
+/// WebGPU vs WebGL2 like GlSkin. Toggle buttons wire to `glpost_toggle_bloom`
+/// and `glpost_toggle_fxaa` chunk exports. SSR emits
+/// `<canvas data-ref="glpost-canvas">`.
+/// Source: `src/client/islands/GlPost.zig`.
+pub const GlPost = struct {
+    pub const props_schema: []const u8 = "{}";
+};
+
 /// verve.gl declarative scene (P4). Built via `ctx.glScene(.{...})` — a vmesh
 /// model + venv environment rendered with orbit camera, a directional light,
 /// optional auto-rotate, and named pickable meshes wired to closure event ids.

@@ -113,6 +113,26 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Metrics publisher (opt-in: only when the app declares
+    // `metricsAdvanceTick` — see `app_has_metrics_publisher`): ticks the
+    // metrics model at ~2 Hz and publishes JSON frames to the `metrics` push
+    // channel — skipped while nobody subscribes.
+    if (comptime app_has_metrics_publisher) {
+        if (std.Thread.spawn(.{}, metricsPublisherLoop, .{io})) |t| t.detach() else |err| {
+            log.err("metrics publisher spawn: {s}", .{@errorName(err)});
+        }
+    }
+
+    // Presence publisher (opt-in: only when the app declares
+    // `presenceEnabled = true` — see `app_has_presence`): polls subscriber
+    // count on the `presence` WS channel every 250 ms and broadcasts
+    // `{"count":N}` when it changes.
+    if (comptime app_has_presence) {
+        if (std.Thread.spawn(.{}, presencePublisherLoop, .{io})) |t| t.detach() else |err| {
+            log.err("presence publisher spawn: {s}", .{@errorName(err)});
+        }
+    }
+
     while (true) {
         const stream = server.accept(io) catch |err| {
             log.err("accept error: {s}", .{@errorName(err)});
@@ -755,6 +775,51 @@ fn vizPublisherLoop(io: std.Io) void {
         if (push.subscriberCount("viz") == 0) continue;
         const frame = app.vizAdvanceTick(&buf) orelse continue;
         _ = push.publish("viz", frame);
+    }
+}
+
+const METRICS_PUBLISH_TICK = std.Io.Duration.fromMilliseconds(500);
+
+/// Whether the app module opts into the metrics publisher: a
+/// `pub fn metricsAdvanceTick(buf: []u8) ?[]const u8` producing a JSON frame
+/// for the `metrics` push channel at ~2 Hz.
+const app_has_metrics_publisher = @hasDecl(app, "metricsAdvanceTick");
+
+/// ~2 Hz: advance the metrics model and publish to the `metrics` push channel
+/// — skipped entirely while nobody subscribes.
+fn metricsPublisherLoop(io: std.Io) void {
+    if (comptime !app_has_metrics_publisher) return;
+    var buf: [push.MSG_MAX]u8 = undefined;
+    while (true) {
+        std.Io.sleep(io, METRICS_PUBLISH_TICK, .awake) catch return;
+        if (push.subscriberCount("metrics") == 0) continue;
+        const frame = app.metricsAdvanceTick(&buf) orelse continue;
+        _ = push.publish("metrics", frame);
+    }
+}
+
+const PRESENCE_PUBLISH_TICK = std.Io.Duration.fromMilliseconds(250);
+
+/// Whether the app opts into the presence publisher: declare
+/// `pub const presenceEnabled = true` in the app module to activate. The
+/// loop polls the `presence` channel's subscriber count every 250 ms and
+/// broadcasts `{"count":N}` whenever it changes — covers both connect and
+/// disconnect (the per-connection read loop in streamChannelWs ends on
+/// disconnect, triggering the defer fetchSub, which this loop detects).
+const app_has_presence = @hasDecl(app, "presenceEnabled") and app.presenceEnabled;
+
+/// Poll `presence` channel subscriber count and broadcast `{"count":N}` on change.
+fn presencePublisherLoop(io: std.Io) void {
+    if (comptime !app_has_presence) return;
+    var last: u32 = 0xFFFFFFFF;
+    var buf: [64]u8 = undefined;
+    while (true) {
+        std.Io.sleep(io, PRESENCE_PUBLISH_TICK, .awake) catch return;
+        const count = push.subscriberCount("presence");
+        if (count == last) continue;
+        last = count;
+        const msg = std.fmt.bufPrint(&buf, "{{\"count\":{d}}}", .{count}) catch continue;
+        _ = push.publish("presence", msg);
     }
 }
 

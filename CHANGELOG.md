@@ -6,6 +6,35 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **gl post-processing — bloom + FXAA** (`src/core/gl/command.zig`,
+  `src/bridge/verve.js`, `src/client/islands/GlPost.zig`, `src/app/{routes,components,islands}.zig`,
+  `docs/24-gl.md`): a reusable offscreen post path on **both backends** (WebGL2 + WebGPU).
+  The scene renders to a linear-HDR `rgba16f` target, then a bloom (bright-pass → ½-res
+  two-pass Gaussian blur) + ACES-tonemap composite + optional FXAA chain blits to the
+  canvas. Encoder API `beginPostProcess`/`endPostProcess` + `PostCtx`; four append-only
+  wire tags (22–25: `create_render_target`, `begin/end_offscreen_pass`,
+  `draw_fullscreen_quad`) carrying `payload_size` so older interpreters size-skip them;
+  `ResKind.render_target = 4`; new variants `variant_post` and `variant_linear_output`
+  (the PBR scene shader emits linear HDR and the composite tonemaps once). Post shaders
+  (bright/blur/composite/fxaa) shipped in GLSL **and** WGSL, byte/FNV golden-frozen.
+  Fullscreen passes use a VBO-less covering triangle. Demo **`/gl-post`**: an emissive
+  cube with Bloom / FXAA / Freeze toggles. Existing P1–P11 goldens unchanged.
+  Verified live (headed Chrome CDP, both backends via real `getContext` probe): bloom
+  halo brightens the background outside the cube silhouette; FXAA adds anti-aliased
+  fringe pixels; zero console errors.
+
+### Fixed
+
+- **gl WebGPU post-processing correctness** (`src/core/gl/command.zig`, `src/bridge/verve.js`):
+  `wgslPbr` did not gate the in-shader ACES tonemap on `variant_linear_output` (the GLSL
+  path did), so the WebGPU scene double-tonemapped and nothing exceeded the bloom
+  threshold — added the gate (+ WGSL parity test + golden). WebGPU `draw_fullscreen_quad`
+  shared one params uniform buffer across all post draws; since draws defer to a single
+  submit, the last `writeBuffer` clobbered every earlier draw — each fullscreen draw now
+  writes its own 256-aligned slot, mirroring the PBR uniform path.
+
 ## [0.5.18] - 2026-06-17
 
 ### Added

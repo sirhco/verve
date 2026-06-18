@@ -1645,3 +1645,588 @@ test "studioHdr round-trips: sun texel > 10x zenith texel" {
     }
     try testing.expect(max_lum > zen_lum * 10.0);
 }
+
+// ── wind-farm fixture ──────────────────────────────────────────────────────────
+
+/// Procedural wind-farm scene for the mission-control demo.
+/// Coordinate scheme: tower vertices are in LOCAL space (centered at x=0, z=0).
+/// Each turbineN glTF node carries the world x translation (-12/-4/+4/+12).
+/// The rotorN child node is placed at local (0, 6.0, 0.3) — tower top + z=0.3.
+/// Blade vertices are hub-local (hub at local origin), never pre-offset to world.
+///
+/// Geometry: one ground plane mesh ("ground") + 4 turbine tower meshes
+/// ("turbine0".."turbine3") at x=-12,-4,+4,+12. Each tower: 0.5 wide, 6.0 tall,
+/// local x∈[-0.25,0.25], y∈[0,6], z∈[-0.25,0.25]. Each turbine has a child
+/// scene-graph node ("rotor0".."rotor3") at local (0,6,0.3) — hub at tower top.
+/// Each rotor node has its own mesh ("rotor0".."rotor3") of 3 blades (2.8 long,
+/// 0.25 wide, 0.1 deep) arranged at 120° around the hub axis, hub-local.
+/// An anim `node:rotorN.rotationZ` tween spins the visible blades in the demo's island.
+///
+/// Non-skinned PBR (pos/nrm/uv, no TANGENT — gltf parser generates them).
+/// One flat metallic-gray material (baseColorFactor, no textures).
+/// Single-buffer GLB; BIN padded to 4 bytes.
+pub fn windFarmGlb(alloc: Allocator) ![]u8 {
+    // ── geometry constants ─────────────────────────────────────────────────────
+    // Ground quad: 4 verts, 6 indices
+    const g_vc: u32 = 4;
+    const g_ic: u32 = 6;
+    // Tower box per turbine: 6 faces × 4 verts = 24 verts, 36 indices
+    const t_vc: u32 = 24;
+    const t_ic: u32 = 36;
+    const turbine_count: u32 = 4;
+    // Rotor: 3 blades, each a 6-face box → 3×24=72 verts, 3×36=108 indices
+    // 4 distinct rotor meshes (one per turbine) so the gltf parser bakes each
+    // at its own turbine's nacelle rather than "first node wins".
+    const blade_count: u32 = 3;
+    const r_vc: u32 = blade_count * 24; // 72
+    const r_ic: u32 = blade_count * 36; // 108
+
+    // Per-mesh BIN sizes (bytes)
+    const g_pos_len: u32 = g_vc * 12; // VEC3 f32
+    const g_nrm_len: u32 = g_vc * 12;
+    const g_uv_len: u32 = g_vc * 8; // VEC2 f32
+    const g_idx_len: u32 = g_ic * 2; // u16
+
+    const t_pos_len: u32 = t_vc * 12;
+    const t_nrm_len: u32 = t_vc * 12;
+    const t_uv_len: u32 = t_vc * 8;
+    const t_idx_len: u32 = t_ic * 2;
+
+    const r_pos_len: u32 = r_vc * 12;
+    const r_nrm_len: u32 = r_vc * 12;
+    const r_uv_len: u32 = r_vc * 8;
+    const r_idx_len: u32 = r_ic * 2;
+
+    // ── BIN layout: ground then turbine0..3 then rotor0..3 (4 distinct sections) ──
+    const g_pos_off: u32 = 0;
+    const g_nrm_off: u32 = g_pos_off + g_pos_len;
+    const g_uv_off: u32 = g_nrm_off + g_nrm_len;
+    const g_idx_off: u32 = g_uv_off + g_uv_len;
+
+    var t_pos_off: [turbine_count]u32 = undefined;
+    var t_nrm_off: [turbine_count]u32 = undefined;
+    var t_uv_off: [turbine_count]u32 = undefined;
+    var t_idx_off: [turbine_count]u32 = undefined;
+    {
+        var cur: u32 = (g_idx_off + g_idx_len + 3) & ~@as(u32, 3);
+        for (0..turbine_count) |i| {
+            t_pos_off[i] = cur;
+            cur += t_pos_len;
+            t_nrm_off[i] = cur;
+            cur += t_nrm_len;
+            t_uv_off[i] = cur;
+            cur += t_uv_len;
+            t_idx_off[i] = cur;
+            cur += t_idx_len;
+            cur = (cur + 3) & ~@as(u32, 3);
+        }
+    }
+    // 4 distinct rotor BIN sections (same blade geometry, separate accessors/meshes)
+    var r_pos_off: [turbine_count]u32 = undefined;
+    var r_nrm_off: [turbine_count]u32 = undefined;
+    var r_uv_off: [turbine_count]u32 = undefined;
+    var r_idx_off: [turbine_count]u32 = undefined;
+    {
+        var cur: u32 = (t_idx_off[turbine_count - 1] + t_idx_len + 3) & ~@as(u32, 3);
+        for (0..turbine_count) |i| {
+            r_pos_off[i] = cur;
+            cur += r_pos_len;
+            r_nrm_off[i] = cur;
+            cur += r_nrm_len;
+            r_uv_off[i] = cur;
+            cur += r_uv_len;
+            r_idx_off[i] = cur;
+            cur += r_idx_len;
+            cur = (cur + 3) & ~@as(u32, 3);
+        }
+    }
+
+    const bin_total: u32 = (r_idx_off[turbine_count - 1] + r_idx_len + 3) & ~@as(u32, 3);
+    const bin_padded = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // ── write ground geometry ─────────────────────────────────────────────────
+    {
+        const gpos = [g_vc][3]f32{
+            .{ -10, 0, -10 }, .{ 10, 0, -10 }, .{ 10, 0, 10 }, .{ -10, 0, 10 },
+        };
+        var po: usize = g_pos_off;
+        for (gpos) |v| {
+            std.mem.writeInt(u32, bin[po..][0..4], @bitCast(v[0]), .little);
+            std.mem.writeInt(u32, bin[po + 4 ..][0..4], @bitCast(v[1]), .little);
+            std.mem.writeInt(u32, bin[po + 8 ..][0..4], @bitCast(v[2]), .little);
+            po += 12;
+        }
+        var no: usize = g_nrm_off;
+        const gn = [3]f32{ 0, 1, 0 };
+        for (0..g_vc) |_| {
+            std.mem.writeInt(u32, bin[no..][0..4], @bitCast(gn[0]), .little);
+            std.mem.writeInt(u32, bin[no + 4 ..][0..4], @bitCast(gn[1]), .little);
+            std.mem.writeInt(u32, bin[no + 8 ..][0..4], @bitCast(gn[2]), .little);
+            no += 12;
+        }
+        const guv = [g_vc][2]f32{ .{ 0, 0 }, .{ 4, 0 }, .{ 4, 4 }, .{ 0, 4 } };
+        var uo: usize = g_uv_off;
+        for (guv) |uv| {
+            std.mem.writeInt(u32, bin[uo..][0..4], @bitCast(uv[0]), .little);
+            std.mem.writeInt(u32, bin[uo + 4 ..][0..4], @bitCast(uv[1]), .little);
+            uo += 8;
+        }
+        var io: usize = g_idx_off;
+        for ([6]u16{ 0, 2, 1, 0, 3, 2 }) |v| {
+            std.mem.writeInt(u16, bin[io..][0..2], v, .little);
+            io += 2;
+        }
+    }
+
+    // ── write turbine tower geometry (same box shape, one per turbine) ────────
+    // Coordinate scheme: tower vertices are authored in LOCAL space centered on
+    // the hub axis (x=0, z=0). The turbine glTF node carries the world translation
+    // to x = turbine_x[i]. The rotor child node's translation is then purely
+    // local-relative: (0, tower_top_y, 0.3) lands the hub at world (tx, tower_top_y, 0.3).
+    // IMPORTANT: do NOT add tx to vertex x — the node translation handles that.
+    //
+    // Tower box: from (-0.25, 0, -0.25) to (0.25, 6.0, 0.25), centered at x=0, z=0.
+    // 6 faces, each 4 verts. CCW winding viewed from outside (+normal dir).
+    const TFace = struct { nx: f32, ny: f32, nz: f32, v: [4][3]f32 };
+    const h: f32 = 0.25; // tower half-width (total 0.5 per spec)
+    const top: f32 = 6.0; // tower height
+    const tower_faces = [6]TFace{
+        .{ .nx = 1, .ny = 0, .nz = 0, .v = .{ .{ h, 0, h }, .{ h, top, h }, .{ h, top, -h }, .{ h, 0, -h } } }, // +X
+        .{ .nx = -1, .ny = 0, .nz = 0, .v = .{ .{ -h, 0, -h }, .{ -h, top, -h }, .{ -h, top, h }, .{ -h, 0, h } } }, // -X
+        .{ .nx = 0, .ny = 1, .nz = 0, .v = .{ .{ -h, top, -h }, .{ h, top, -h }, .{ h, top, h }, .{ -h, top, h } } }, // +Y (top cap)
+        .{ .nx = 0, .ny = -1, .nz = 0, .v = .{ .{ -h, 0, h }, .{ h, 0, h }, .{ h, 0, -h }, .{ -h, 0, -h } } }, // -Y (bottom cap)
+        .{ .nx = 0, .ny = 0, .nz = 1, .v = .{ .{ -h, 0, h }, .{ -h, top, h }, .{ h, top, h }, .{ h, 0, h } } }, // +Z
+        .{ .nx = 0, .ny = 0, .nz = -1, .v = .{ .{ h, 0, -h }, .{ h, top, -h }, .{ -h, top, -h }, .{ -h, 0, -h } } }, // -Z
+    };
+    // Box face uvs (same for all faces)
+    const tuv = [4][2]f32{ .{ 0, 0 }, .{ 0, 1 }, .{ 1, 1 }, .{ 1, 0 } };
+
+    // x-positions for 4 turbines spread along X
+    const turbine_x = [turbine_count]f32{ -12, -4, 4, 12 };
+
+    for (0..turbine_count) |ti| {
+        var po: usize = t_pos_off[ti];
+        var no: usize = t_nrm_off[ti];
+        var uo: usize = t_uv_off[ti];
+        for (tower_faces) |face| {
+            for (face.v) |v| {
+                // Vertices in local space (no tx offset — node translation handles x placement)
+                std.mem.writeInt(u32, bin[po..][0..4], @bitCast(v[0]), .little);
+                std.mem.writeInt(u32, bin[po + 4 ..][0..4], @bitCast(v[1]), .little);
+                std.mem.writeInt(u32, bin[po + 8 ..][0..4], @bitCast(v[2]), .little);
+                po += 12;
+            }
+            for (0..4) |_| {
+                std.mem.writeInt(u32, bin[no..][0..4], @bitCast(face.nx), .little);
+                std.mem.writeInt(u32, bin[no + 4 ..][0..4], @bitCast(face.ny), .little);
+                std.mem.writeInt(u32, bin[no + 8 ..][0..4], @bitCast(face.nz), .little);
+                no += 12;
+            }
+            for (tuv) |uv| {
+                std.mem.writeInt(u32, bin[uo..][0..4], @bitCast(uv[0]), .little);
+                std.mem.writeInt(u32, bin[uo + 4 ..][0..4], @bitCast(uv[1]), .little);
+                uo += 8;
+            }
+        }
+        var io: usize = t_idx_off[ti];
+        for (0..6) |fi| {
+            const base: u16 = @intCast(fi * 4);
+            for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |o| {
+                std.mem.writeInt(u16, bin[io..][0..2], base + o, .little);
+                io += 2;
+            }
+        }
+    }
+
+    // ── write rotor blade geometry (4 distinct meshes, identical geometry) ───────
+    // 3 blades at 0°, 120°, 240° in local XY plane (rotor spins about Z).
+    // Blade local space: hub is at local origin (0,0,0). Each blade (at angle 0)
+    // extends from x=0.15 (hub clearance) to x=2.95 (total ~2.8 long), 0.25 wide in Y,
+    // 0.1 deep in Z. Blade 0 points along +X; blades 1,2 are rotated 120°,240° about Z.
+    // When rotorN node is placed at (0, top_y, 0.3) relative to turbineN, rotating
+    // the node about Z sweeps all blades around the hub — blades never need a world offset.
+    // Writing the same blade geometry 4 times (once per turbine) gives each its own
+    // mesh so the gltf parser bakes each rotor node's transform independently.
+    {
+        const blade_len: f32 = 2.8;
+        const blade_start: f32 = 0.15; // clearance from hub centre
+        const bw: f32 = 0.125; // half-width in Y (total 0.25)
+        const bd: f32 = 0.05; // half-depth in Z (total 0.1)
+
+        const BFace = struct { nx: f32, ny: f32, nz: f32, v: [4][3]f32 };
+        const bx0: f32 = blade_start;
+        const bx1: f32 = blade_start + blade_len;
+        const blade_faces = [6]BFace{
+            .{ .nx = 1, .ny = 0, .nz = 0, .v = .{ .{ bx1, -bw, bd }, .{ bx1, bw, bd }, .{ bx1, bw, -bd }, .{ bx1, -bw, -bd } } }, // +X tip
+            .{ .nx = -1, .ny = 0, .nz = 0, .v = .{ .{ bx0, -bw, -bd }, .{ bx0, bw, -bd }, .{ bx0, bw, bd }, .{ bx0, -bw, bd } } }, // -X root
+            .{ .nx = 0, .ny = 1, .nz = 0, .v = .{ .{ bx0, bw, -bd }, .{ bx1, bw, -bd }, .{ bx1, bw, bd }, .{ bx0, bw, bd } } }, // +Y edge
+            .{ .nx = 0, .ny = -1, .nz = 0, .v = .{ .{ bx0, -bw, bd }, .{ bx1, -bw, bd }, .{ bx1, -bw, -bd }, .{ bx0, -bw, -bd } } }, // -Y edge
+            .{ .nx = 0, .ny = 0, .nz = 1, .v = .{ .{ bx0, -bw, bd }, .{ bx0, bw, bd }, .{ bx1, bw, bd }, .{ bx1, -bw, bd } } }, // +Z face
+            .{ .nx = 0, .ny = 0, .nz = -1, .v = .{ .{ bx1, -bw, -bd }, .{ bx1, bw, -bd }, .{ bx0, bw, -bd }, .{ bx0, -bw, -bd } } }, // -Z face
+        };
+
+        const pi: f32 = std.math.pi;
+        const blade_angles = [blade_count]f32{ 0.0, 2.0 * pi / 3.0, 4.0 * pi / 3.0 };
+
+        for (0..turbine_count) |ri| {
+            var po: usize = r_pos_off[ri];
+            var no: usize = r_nrm_off[ri];
+            var uo: usize = r_uv_off[ri];
+            var io: usize = r_idx_off[ri];
+            var vtx_base: u16 = 0;
+
+            for (blade_angles) |angle| {
+                const ca: f32 = @cos(angle);
+                const sa: f32 = @sin(angle);
+                for (blade_faces) |face| {
+                    for (face.v) |v| {
+                        const rx: f32 = v[0] * ca - v[1] * sa;
+                        const ry: f32 = v[0] * sa + v[1] * ca;
+                        std.mem.writeInt(u32, bin[po..][0..4], @bitCast(rx), .little);
+                        std.mem.writeInt(u32, bin[po + 4 ..][0..4], @bitCast(ry), .little);
+                        std.mem.writeInt(u32, bin[po + 8 ..][0..4], @bitCast(v[2]), .little);
+                        po += 12;
+                    }
+                    for (0..4) |_| {
+                        const rnx: f32 = face.nx * ca - face.ny * sa;
+                        const rny: f32 = face.nx * sa + face.ny * ca;
+                        std.mem.writeInt(u32, bin[no..][0..4], @bitCast(rnx), .little);
+                        std.mem.writeInt(u32, bin[no + 4 ..][0..4], @bitCast(rny), .little);
+                        std.mem.writeInt(u32, bin[no + 8 ..][0..4], @bitCast(face.nz), .little);
+                        no += 12;
+                    }
+                    for (tuv) |uv| {
+                        std.mem.writeInt(u32, bin[uo..][0..4], @bitCast(uv[0]), .little);
+                        std.mem.writeInt(u32, bin[uo + 4 ..][0..4], @bitCast(uv[1]), .little);
+                        uo += 8;
+                    }
+                }
+                for (0..6) |fi| {
+                    const base: u16 = vtx_base + @as(u16, @intCast(fi * 4));
+                    for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |o| {
+                        std.mem.writeInt(u16, bin[io..][0..2], base + o, .little);
+                        io += 2;
+                    }
+                }
+                vtx_base += 24;
+            }
+        }
+    }
+
+    // ── JSON chunk ─────────────────────────────────────────────────────────────
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    // Mesh index layout: 0=ground, 1..4=turbine0..3, 5..8=rotor0..3 (distinct)
+    // Accessor index layout:
+    //   ground: 0(pos),1(nrm),2(uv),3(idx)
+    //   turbine0..3: 4..19 (4 per turbine)
+    //   rotor0..3: 20..35 (4 per rotor: 20..23, 24..27, 28..31, 32..35)
+    const r_acc_base: u32 = 4 + turbine_count * 4; // 20
+    // BufferView index layout mirrors accessors:
+    //   ground: 0..3, turbine0..3: 4..19, rotor0..3: 20..35
+    const r_bv_base: u32 = 4 + turbine_count * 4; // 20
+
+    try w.writeAll("{\"asset\":{\"version\":\"2.0\"},\"scene\":0,");
+    // scene: root nodes = ground (0) + 4 turbine roots (1..4)
+    try w.writeAll("\"scenes\":[{\"nodes\":[0,1,2,3,4]}],");
+
+    // nodes: ground(0), turbine0..3(1..4) with children rotor0..3(5..8)
+    // each rotorN node references its own distinct mesh (5+N)
+    try w.writeAll("\"nodes\":[");
+    try w.writeAll("{\"mesh\":0,\"name\":\"ground\"},");
+    for (0..turbine_count) |ti| {
+        const ri: u32 = @intCast(5 + ti);
+        const tx = turbine_x[ti];
+        try w.print("{{\"mesh\":{d},\"name\":\"turbine{d}\",\"translation\":[{d:.1},0.0,0.0],\"children\":[{d}]}},", .{ ti + 1, ti, tx, ri });
+    }
+    // rotor nodes — each references its own mesh so parser bakes its transform.
+    // Translation is relative to the parent turbineN node (which is already at x=tx).
+    // Local (0, 6.0, 0.3) places the hub at world (tx, 6.0, 0.3) — tower top + slight Z.
+    for (0..turbine_count) |ti| {
+        const rotor_mesh_idx: u32 = @intCast(5 + ti);
+        if (ti < turbine_count - 1) {
+            try w.print("{{\"mesh\":{d},\"name\":\"rotor{d}\",\"translation\":[0.0,6.0,0.3]}},", .{ rotor_mesh_idx, ti });
+        } else {
+            try w.print("{{\"mesh\":{d},\"name\":\"rotor{d}\",\"translation\":[0.0,6.0,0.3]}}", .{ rotor_mesh_idx, ti });
+        }
+    }
+    try w.writeAll("],");
+
+    // meshes: ground(0) + turbine0..3(1..4) + rotor0..3(5..8, distinct meshes)
+    try w.writeAll("\"meshes\":[");
+    try w.writeAll("{\"name\":\"ground\",\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]},");
+    for (0..turbine_count) |ti| {
+        const acc_base: u32 = @intCast(4 + ti * 4);
+        try w.print("{{\"name\":\"turbine{d}\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}},", .{ ti, acc_base, acc_base + 1, acc_base + 2, acc_base + 3 });
+    }
+    // 4 distinct rotor meshes (same geometry, separate BIN sections)
+    for (0..turbine_count) |ri| {
+        const acc_base: u32 = r_acc_base + @as(u32, @intCast(ri)) * 4;
+        if (ri < turbine_count - 1) {
+            try w.print("{{\"name\":\"rotor{d}\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}},", .{ ri, acc_base, acc_base + 1, acc_base + 2, acc_base + 3 });
+        } else {
+            try w.print("{{\"name\":\"rotor{d}\",\"primitives\":[{{\"attributes\":{{\"POSITION\":{d},\"NORMAL\":{d},\"TEXCOORD_0\":{d}}},\"indices\":{d},\"material\":0}}]}}", .{ ri, acc_base, acc_base + 1, acc_base + 2, acc_base + 3 });
+        }
+    }
+    try w.writeAll("],");
+
+    // accessors: ground(0..3) + turbine0..3(4..19) + rotor0..3(20..35)
+    try w.writeAll("\"accessors\":[");
+    // ground accessors
+    try w.print("{{\"bufferView\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{g_vc});
+    try w.print("{{\"bufferView\":1,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{g_vc});
+    try w.print("{{\"bufferView\":2,\"componentType\":5126,\"count\":{d},\"type\":\"VEC2\"}},", .{g_vc});
+    try w.print("{{\"bufferView\":3,\"componentType\":5123,\"count\":{d},\"type\":\"SCALAR\"}}", .{g_ic});
+    // turbine accessors
+    for (0..turbine_count) |ti| {
+        const bv_base: u32 = @intCast(4 + ti * 4);
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}}", .{ bv_base, t_vc });
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}}", .{ bv_base + 1, t_vc });
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC2\"}}", .{ bv_base + 2, t_vc });
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5123,\"count\":{d},\"type\":\"SCALAR\"}}", .{ bv_base + 3, t_ic });
+    }
+    // rotor accessors (4 sets of 4)
+    for (0..turbine_count) |ri| {
+        const bv_base: u32 = r_bv_base + @as(u32, @intCast(ri)) * 4;
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}}", .{ bv_base, r_vc });
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}}", .{ bv_base + 1, r_vc });
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5126,\"count\":{d},\"type\":\"VEC2\"}}", .{ bv_base + 2, r_vc });
+        try w.print(",{{\"bufferView\":{d},\"componentType\":5123,\"count\":{d},\"type\":\"SCALAR\"}}", .{ bv_base + 3, r_ic });
+    }
+    try w.writeAll("],");
+
+    // bufferViews: ground(0..3) + turbine0..3(4..19) + rotor0..3(20..35)
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ g_pos_off, g_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ g_nrm_off, g_nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ g_uv_off, g_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}}", .{ g_idx_off, g_idx_len });
+    for (0..turbine_count) |ti| {
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ t_pos_off[ti], t_pos_len });
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ t_nrm_off[ti], t_nrm_len });
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ t_uv_off[ti], t_uv_len });
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}}", .{ t_idx_off[ti], t_idx_len });
+    }
+    // 4 rotor bufferView sets
+    for (0..turbine_count) |ri| {
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ r_pos_off[ri], r_pos_len });
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ r_nrm_off[ri], r_nrm_len });
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ r_uv_off[ri], r_uv_len });
+        try w.print(",{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}}", .{ r_idx_off[ri], r_idx_len });
+    }
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+
+    // One flat PBR material (no textures — parser white-bakes missing tex_base).
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.85,0.88,0.90,1.0],\"metallicFactor\":0.1,\"roughnessFactor\":0.7}}]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── assemble GLB ───────────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42;
+    glb[goff + 1] = 0x49;
+    glb[goff + 2] = 0x4E;
+    glb[goff + 3] = 0x00;
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+    return glb;
+}
+
+// ── windFarmGlb fixture tests ──────────────────────────────────────────────────
+
+test "windFarmGlb: 4 named turbine submeshes + 4 rotor nodes, parses" {
+    const glb = try windFarmGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    // GLB container invariants
+    try testing.expectEqualSlices(u8, "glTF", glb[0..4]);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, glb[4..8], .little));
+    try testing.expectEqual(@as(u32, @intCast(glb.len)), std.mem.readInt(u32, glb[8..12], .little));
+    // parse via gltf.zig — 4 turbine submeshes + 4 rotor submeshes in model.names
+    const gltf = @import("gltf.zig");
+    var model = try gltf.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    // model.names has 9 entries (ground + turbine0..3 + rotor0..3); 4 start with "turbine", 4 with "rotor"
+    var turbines: usize = 0;
+    var rotors_parsed: usize = 0;
+    for (model.names) |n| {
+        if (std.mem.startsWith(u8, n, "turbine")) turbines += 1;
+        if (std.mem.startsWith(u8, n, "rotor")) rotors_parsed += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), turbines);
+    try testing.expectEqual(@as(usize, 4), rotors_parsed);
+    // raw JSON parse for rotor nodes and hierarchy assertions
+    const json_len_val = std.mem.readInt(u32, glb[12..16], .little);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len_val], .{});
+    defer parsed.deinit();
+    const nodes = parsed.value.object.get("nodes").?.array.items;
+    // assert 4 rotor nodes exist
+    var rotors: usize = 0;
+    for (nodes) |n| {
+        const name_val = n.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+        if (std.mem.startsWith(u8, name_val.string, "rotor")) rotors += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), rotors);
+    // assert each rotor node has a mesh (blades under the rotor so rotationZ spins them)
+    for (nodes) |n| {
+        const name_val = n.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+        if (!std.mem.startsWith(u8, name_val.string, "rotor")) continue;
+        try testing.expect(n.object.get("mesh") != null);
+    }
+    // assert each turbine node's "children" includes its corresponding rotor node
+    // Node layout: ground=0, turbine0=1..turbine3=4, rotor0=5..rotor3=8
+    for (0..4) |ti| {
+        const turbine_node = nodes[1 + ti];
+        const children_val = turbine_node.object.get("children") orelse {
+            return error.TurbineHasNoChildren;
+        };
+        const children = children_val.array.items;
+        const expected_rotor_idx: i64 = @intCast(5 + ti);
+        var found = false;
+        for (children) |c| {
+            if (c == .integer and c.integer == expected_rotor_idx) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+}
+
+// ── windFarmGlb pick-raycast tests ──────────────────────────────────────────
+// Close the construction-only verification gap from the mission-control flagship
+// (examples/mission-control FarmScene.raycastSubmesh + submeshTurbineId): the pick
+// pipeline — rayFromCamera → bvh.walk over the baked windFarmGlb geometry →
+// owning-submesh lookup → name→turbine-id — is exercised here against the real
+// asset, built via the same parseGlb → bvh.build → vmesh.pack path gl_asset_gen
+// runs at build time. The CDP harness can't drive a WebGL canvas pick (synthetic
+// mouse bypasses the compositor hit-test), so this is the authoritative check
+// that a click on a turbine resolves to the correct turbine id.
+
+const bvh = @import("bvh.zig");
+const ray = @import("ray.zig");
+const math = @import("math.zig");
+const vmesh = @import("vmesh.zig");
+const gltf_mod = @import("gltf.zig");
+
+// Mirror FarmScene.submeshTurbineId: "turbineN"/"rotorN" (N∈0..3) → N; else null.
+fn windFarmTurbineId(nm: []const u8) ?u8 {
+    const tail: ?[]const u8 =
+        if (std.mem.startsWith(u8, nm, "turbine")) nm["turbine".len..] else if (std.mem.startsWith(u8, nm, "rotor")) nm["rotor".len..] else null;
+    const t = tail orelse return null;
+    if (t.len != 1 or t[0] < '0' or t[0] > '3') return null;
+    return t[0] - '0';
+}
+
+// Mirror FarmScene.raycastSubmesh's hit→owning-submesh mapping, returning the
+// submesh's name (null on miss). Operates on the pre-pack Model arrays, which are
+// byte-identical to what vmesh.pack stores and the Reader exposes at runtime.
+fn windFarmPickName(
+    vertices: []const f32,
+    indices: []const u16,
+    submeshes: []const vmesh.Submesh,
+    names: []const []const u8,
+    nodes: []const bvh.Node,
+    tri_perm: []const u32,
+    r: ray.Ray,
+) ?[]const u8 {
+    const hit = bvh.walk(nodes, tri_perm, vertices, 12, indices, r) orelse return null;
+    const first: u32 = hit.tri_index * 3;
+    for (submeshes, 0..) |sub, s| {
+        const start = sub.index_byte_off / 2;
+        if (first >= start and first < start + sub.index_count) return names[s];
+    }
+    return null;
+}
+
+test "windFarmGlb pick: per-turbine center ray resolves to that turbine id" {
+    const a = testing.allocator;
+    const glb = try windFarmGlb(a);
+    defer a.free(glb);
+    var model = try gltf_mod.parseGlb(a, glb);
+    defer model.deinit();
+    var br = try bvh.build(a, model.vertices, 12, model.indices);
+    defer br.deinit(a);
+
+    // Towers: 0.5-wide/deep box, 6.0 tall, world x = -12/-4/+4/+12. Aim a center
+    // ray (NDC 0,0 → forward) straight down −Z at mid-tower height (y=2, safely
+    // inside [0,6]); only turbine k sits near x=tx (neighbours ≥8 units away), so
+    // each ray can hit only its own turbine.
+    const turbine_x = [4]f32{ -12, -4, 4, 12 };
+    for (turbine_x, 0..) |tx, k| {
+        const eye = math.Vec3.init(tx, 2, 25);
+        const target = math.Vec3.init(tx, 2, 0);
+        const r = ray.rayFromCamera(eye, target, math.Vec3.init(0, 1, 0), 1.0, 1.0, 0, 0);
+        const nm = windFarmPickName(model.vertices, model.indices, model.submeshes, model.names, br.nodes, br.tri_perm, r) orelse return error.PickMissedTurbine;
+        const id = windFarmTurbineId(nm) orelse return error.HitNonTurbine;
+        try testing.expectEqual(@as(u8, @intCast(k)), id);
+    }
+}
+
+test "windFarmGlb pick: ray into empty sky misses" {
+    const a = testing.allocator;
+    const glb = try windFarmGlb(a);
+    defer a.free(glb);
+    var model = try gltf_mod.parseGlb(a, glb);
+    defer model.deinit();
+    var br = try bvh.build(a, model.vertices, 12, model.indices);
+    defer br.deinit(a);
+    // Camera above the farm looking straight up — no geometry along +Y.
+    const r = ray.rayFromCamera(math.Vec3.init(0, 50, 0), math.Vec3.init(0, 51, 0), math.Vec3.init(0, 0, 1), 1.0, 1.0, 0, 0);
+    try testing.expect(windFarmPickName(model.vertices, model.indices, model.submeshes, model.names, br.nodes, br.tri_perm, r) == null);
+}
+
+test "windFarmGlb .vmesh asset exposes turbineN/rotorN names the pick maps on" {
+    const a = testing.allocator;
+    const glb = try windFarmGlb(a);
+    defer a.free(glb);
+    var model = try gltf_mod.parseGlb(a, glb);
+    defer model.deinit();
+    var br = try bvh.build(a, model.vertices, 12, model.indices);
+    defer br.deinit(a);
+    const bytes = try vmesh.pack(a, model.vertices, model.indices, model.submeshes, model.textures, br.nodes, br.tri_perm, model.names, model.skinned, model.joints, model.weights, model.skel, if (model.anim_clips.len == 0) null else vmesh.Anims{ .clips = model.anim_clips });
+    defer a.free(bytes);
+    const reader = try vmesh.Reader.init(bytes);
+    // Every turbine id 0..3 must be reachable from BOTH a turbine* and a rotor*
+    // name in the packed asset the example actually loads (submeshTurbineId's domain).
+    var turbine_seen = [_]bool{false} ** 4;
+    var rotor_seen = [_]bool{false} ** 4;
+    var s: u32 = 0;
+    while (s < reader.submesh_count) : (s += 1) {
+        const nm = reader.name(s);
+        const id = windFarmTurbineId(nm) orelse continue;
+        if (std.mem.startsWith(u8, nm, "turbine")) turbine_seen[id] = true;
+        if (std.mem.startsWith(u8, nm, "rotor")) rotor_seen[id] = true;
+    }
+    for (turbine_seen) |seen| try testing.expect(seen);
+    for (rotor_seen) |seen| try testing.expect(seen);
+}

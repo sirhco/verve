@@ -997,6 +997,49 @@ pub fn glSkin(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl post-processing demo — /gl-post.
+/// Renders a bright emissive PBR cube with bloom + FXAA post-processing.
+/// The GlPost chunk uses `variant_pbr | variant_emissive | variant_linear_output`
+/// so the scene renders to a linear HDR offscreen target; the post pipeline
+/// runs bloom (bright-pass + blur chain) and FXAA, then composites to canvas.
+/// Toggle buttons wire to `glpost_toggle_bloom` / `glpost_toggle_fxaa` exports.
+/// Renders through WebGPU when available, else WebGL2.
+pub fn glPost(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "glpost-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#0a0b0f;border-radius:8px;"),
+    });
+
+    // Controls wired to the GlPost chunk's no-arg exports via z-on-click.
+    // Must live INSIDE the island subtree so events route to this chunk.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glpost_toggle_bloom").text("Toggle Bloom"),
+        ctx.el("button").attr("z-on-click", "glpost_toggle_fxaa").text("Toggle FXAA"),
+        ctx.el("button").attr("z-on-click", "glpost_toggle_freeze").text("Freeze"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Emissive cube — bloom + FXAA"),
+        canvas,
+        controls,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlPost" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — post-processing"),
+        ctx.p().text("A bright emissive PBR cube rendered through the full post-processing " ++
+            "pipeline. The scene shader uses variant_linear_output to emit linear HDR " ++
+            "(no in-shader tonemap); beginPostProcess/endPostProcess runs a bloom " ++
+            "bright-pass + two-pass Gaussian blur, a composite pass with ACES tonemap, " ++
+            "and optional FXAA anti-aliasing. Renders through WebGPU when available, " ++
+            "else WebGL2. Use the toggle buttons to compare bloom on/off and FXAA on/off."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a
