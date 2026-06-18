@@ -51,16 +51,19 @@ fn appendF1(buf: []u8, pos: usize, v: f32) usize {
     return pos + s.len;
 }
 
-/// Append a single ASCII char.
+/// Append a single ASCII char.  Clamps pos so overflow cannot silently corrupt output.
 fn appendChar(buf: []u8, pos: usize, c: u8) usize {
-    if (pos < buf.len) buf[pos] = c;
-    return pos + 1;
+    if (pos < buf.len) {
+        buf[pos] = c;
+        return pos + 1;
+    }
+    return pos; // buffer full — stop advancing
 }
 
-/// Build the SVG `points` attribute string for RING_LEN samples into `buf`.
-/// Returns the written slice.
-fn buildPoints(buf: []u8, n: usize) []const u8 {
-    var pos: usize = 0;
+/// Write the coordinate pairs "x0,y0 x1,y1 …" for n ring samples into buf[pos..].
+/// Returns the updated pos.
+fn appendCoords(buf: []u8, pos_in: usize, n: usize) usize {
+    var pos = pos_in;
     const denom: f32 = @floatFromInt(if (n > 1) n - 1 else 1);
     for (0..n) |i| {
         const fi: f32 = @floatFromInt(i);
@@ -71,24 +74,22 @@ fn buildPoints(buf: []u8, n: usize) []const u8 {
         pos = appendChar(buf, pos, ',');
         pos = appendF1(buf, pos, y);
     }
+    return pos;
+}
+
+/// Build the SVG `points` attribute string for RING_LEN samples into `buf`.
+/// Returns the written slice.
+fn buildPoints(buf: []u8, n: usize) []const u8 {
+    const pos = appendCoords(buf, 0, n);
     return buf[0..pos];
 }
 
 /// Build the SVG `points` attribute string for the filled area polygon.
 /// Same as buildPoints but appends the two baseline corners.
 fn buildAreaPoints(buf: []u8, n: usize) []const u8 {
-    var pos: usize = 0;
-    const denom: f32 = @floatFromInt(if (n > 1) n - 1 else 1);
-    for (0..n) |i| {
-        const fi: f32 = @floatFromInt(i);
-        const x = PLOT_X0 + fi / denom * (PLOT_X1 - PLOT_X0);
-        const y = powerToY(ringSample(i));
-        if (i > 0) pos = appendChar(buf, pos, ' ');
-        pos = appendF1(buf, pos, x);
-        pos = appendChar(buf, pos, ',');
-        pos = appendF1(buf, pos, y);
-    }
+    var pos = appendCoords(buf, 0, n);
     if (n > 0) {
+        const denom: f32 = @floatFromInt(if (n > 1) n - 1 else 1);
         // right-bottom corner
         const x_last = PLOT_X0 + @as(f32, @floatFromInt(n - 1)) / denom * (PLOT_X1 - PLOT_X0);
         pos = appendChar(buf, pos, ' ');
@@ -161,14 +162,45 @@ export fn metrics_apply(ptr: u32, len: u32) void {
     }
 }
 
-/// Scan `json` for the first occurrence of `"key":` and return the numeric
-/// value that follows. Returns null if not found or not parseable.
+/// Find the JSON object for turbine id=0 in the frame and return a slice
+/// covering just that object (from `{` to the matching `}`).
+/// Wire format: {"tick":N,"turbines":[{"id":0,...},{"id":1,...},...]}
+fn findTurbine0(json: []const u8) ?[]const u8 {
+    // Look for `"id":0` — the turbine-0 marker.
+    const marker = "\"id\":0";
+    const mid = std.mem.indexOf(u8, json, marker) orelse return null;
+
+    // Walk backwards to find the opening `{` of this object.
+    var start = mid;
+    while (start > 0) : (start -= 1) {
+        if (json[start] == '{') break;
+    }
+    if (json[start] != '{') return null;
+
+    // Walk forward to find the matching `}`.
+    var depth: usize = 0;
+    var end = start;
+    while (end < json.len) : (end += 1) {
+        if (json[end] == '{') depth += 1;
+        if (json[end] == '}') {
+            depth -= 1;
+            if (depth == 0) return json[start .. end + 1];
+        }
+    }
+    return null;
+}
+
+/// Scan a JSON object slice for `"key":` and return the numeric value that follows.
+/// Allocation-free, hand-rolled — consistent with the surrounding code style.
 fn extractF32Field(json: []const u8, key: []const u8) ?f32 {
+    // Always scope to turbine 0's object to avoid false matches in other turbines.
+    const obj = findTurbine0(json) orelse return null;
+
     var needle_buf: [64]u8 = undefined;
     const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":", .{key}) catch return null;
 
-    const pos = std.mem.indexOf(u8, json, needle) orelse return null;
-    var rest = json[pos + needle.len ..];
+    const pos = std.mem.indexOf(u8, obj, needle) orelse return null;
+    var rest = obj[pos + needle.len ..];
 
     // Skip whitespace.
     var i: usize = 0;

@@ -27,10 +27,31 @@ fn appendF1Ssr(buf: []u8, pos: usize, v: f32) usize {
     return pos + s.len;
 }
 
-/// Append a single byte to buf at pos, return new pos.
+/// Append a single byte to buf at pos, return new pos.  Clamps on overflow.
 fn appendCharSsr(buf: []u8, pos: usize, c: u8) usize {
-    if (pos < buf.len) buf[pos] = c;
-    return pos + 1;
+    if (pos < buf.len) {
+        buf[pos] = c;
+        return pos + 1;
+    }
+    return pos; // buffer full — stop advancing
+}
+
+/// Write n coordinate pairs "x0,y0 x1,y1 …" for a flat power line into buf[pos..].
+/// All samples share the same `power_kw` value (SSR initial state).
+/// Returns the updated pos.
+fn appendCoordsSsr(buf: []u8, pos_in: usize, power_kw: f32) usize {
+    var pos = pos_in;
+    const denom: f32 = @as(f32, @floatFromInt(RING_LEN - 1));
+    for (0..RING_LEN) |i| {
+        const fi: f32 = @floatFromInt(i);
+        const x = PLOT_X0 + fi / denom * (PLOT_X1 - PLOT_X0);
+        const y = powerToY(power_kw);
+        if (i > 0) pos = appendCharSsr(buf, pos, ' ');
+        pos = appendF1Ssr(buf, pos, x);
+        pos = appendCharSsr(buf, pos, ',');
+        pos = appendF1Ssr(buf, pos, y);
+    }
+    return pos;
 }
 
 /// SSR rolling line/area chart skeleton for turbine 0's power history.
@@ -40,30 +61,12 @@ fn appendCharSsr(buf: []u8, pos: usize, c: u8) usize {
 fn dashChartSsr(ctx: *const verve.Context, power_kw: f32) *verve.Node {
     // Build initial 60-sample flat line at the current power level.
     var pts_buf: [RING_LEN * 16]u8 = undefined;
-    var pts_pos: usize = 0;
-    for (0..RING_LEN) |i| {
-        const fi: f32 = @floatFromInt(i);
-        const x = PLOT_X0 + fi / @as(f32, @floatFromInt(RING_LEN - 1)) * (PLOT_X1 - PLOT_X0);
-        const y = powerToY(power_kw);
-        if (i > 0) pts_pos = appendCharSsr(&pts_buf, pts_pos, ' ');
-        pts_pos = appendF1Ssr(&pts_buf, pts_pos, x);
-        pts_pos = appendCharSsr(&pts_buf, pts_pos, ',');
-        pts_pos = appendF1Ssr(&pts_buf, pts_pos, y);
-    }
+    const pts_pos = appendCoordsSsr(&pts_buf, 0, power_kw);
     const pts_str = pts_buf[0..pts_pos];
 
     // Area fill polygon: same curve + two baseline corners.
     var area_buf: [(RING_LEN + 2) * 16]u8 = undefined;
-    var area_pos: usize = 0;
-    for (0..RING_LEN) |i| {
-        const fi: f32 = @floatFromInt(i);
-        const x = PLOT_X0 + fi / @as(f32, @floatFromInt(RING_LEN - 1)) * (PLOT_X1 - PLOT_X0);
-        const y = powerToY(power_kw);
-        if (i > 0) area_pos = appendCharSsr(&area_buf, area_pos, ' ');
-        area_pos = appendF1Ssr(&area_buf, area_pos, x);
-        area_pos = appendCharSsr(&area_buf, area_pos, ',');
-        area_pos = appendF1Ssr(&area_buf, area_pos, y);
-    }
+    var area_pos = appendCoordsSsr(&area_buf, 0, power_kw);
     // right-bottom corner
     area_pos = appendCharSsr(&area_buf, area_pos, ' ');
     area_pos = appendF1Ssr(&area_buf, area_pos, PLOT_X1);
