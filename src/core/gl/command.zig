@@ -43,9 +43,14 @@ pub const Tag = enum(u16) {
     draw_depth = 19, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr} — depth-only draw (mvp = light_vp·world)
     bind_shadow_map = 20, // {slot, shadow_handle, light_vp_ptr} — bind depth tex + set u_light_vp on active program
     set_bones = 21, // {count, ptr} — count×mat4 bone palette → u_bones[] on the active program
+    // ── Post-processing ─────────────────────────────────────────────────
+    create_render_target = 22, // {handle, width, height, format, flags(bit0=with_depth)} — color RT (+optional depth)
+    begin_offscreen_pass = 23, // {target_handle, clear_rgba(4 f32), clear_flags(bit0=color,bit1=depth)} — bind RT
+    end_offscreen_pass = 24, // {} — close the offscreen pass; next begin_* rebinds
+    draw_fullscreen_quad = 25, // {shader, tex0, tex1, params_ptr, param_count} — VBO-less 3-vert triangle
 };
 
-pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3 };
+pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
 
 pub const BufferKind = enum(u32) { vertex = 0, index = 1 };
 
@@ -71,6 +76,14 @@ pub const variant_emissive: u32 = 1 << 4; // requires variant_pbr; emissive term
 pub const variant_shadow: u32 = 1 << 5; // requires variant_pbr; samples the shadow map (P9 slice 3)
 pub const variant_depth: u32 = 1 << 6; // depth-only shader for the shadow pass; pbr vertex layout, attrib 0 only
 pub const variant_skinned: u32 = 1 << 7; // requires variant_pbr; GPU skinning via u_bones[] palette
+pub const variant_post: u32 = 1 << 8; // fullscreen-quad shader: no VBO, no depth test, 2 sampler+texture slots
+pub const variant_linear_output: u32 = 1 << 9; // requires variant_pbr; SKIP in-shader ACES (post path renders linear HDR)
+
+/// Render-target creation flags.
+pub const rt_flag_with_depth: u32 = 1 << 0;
+/// Offscreen-pass clear flags.
+pub const clear_flag_color: u32 = 1 << 0;
+pub const clear_flag_depth: u32 = 1 << 1;
 
 pub const max_lights: u32 = 4;
 pub const light_stride_f32: u32 = 8; // [type(0=dir,1=point), intensity, x,y,z, r,g,b]
@@ -1060,6 +1073,43 @@ pub const Encoder = struct {
         self.putU32(light_vp_ptr);
     }
 
+    // ── Post-processing ─────────────────────────────────────────────────
+
+    /// Allocate a color render target (FBO + color attachment, optional depth).
+    /// `format` selects the internal texture format; `flags` may include `rt_flag_with_depth`.
+    pub fn createRenderTarget(self: *Encoder, handle: u32, width: u32, height: u32, format: TexFormat, flags: u32) void {
+        self.header(.create_render_target, 20);
+        self.putU32(handle);
+        self.putU32(width);
+        self.putU32(height);
+        self.putU32(@intFromEnum(format));
+        self.putU32(flags);
+    }
+
+    /// Bind the render target and clear per `clear_flags` (bit0=color, bit1=depth).
+    pub fn beginOffscreenPass(self: *Encoder, target_handle: u32, clear: [4]f32, clear_flags: u32) void {
+        self.header(.begin_offscreen_pass, 24);
+        self.putU32(target_handle);
+        for (clear) |c| self.putF32(c);
+        self.putU32(clear_flags);
+    }
+
+    /// Close the offscreen pass; the next begin_* restores the default framebuffer.
+    pub fn endOffscreenPass(self: *Encoder) void {
+        self.header(.end_offscreen_pass, 0);
+    }
+
+    /// Draw a VBO-less fullscreen triangle with `shader`, binding `tex0`/`tex1` to
+    /// samplers 0/1, and pointing the uniform block to `params_ptr` (`param_count` f32s).
+    pub fn drawFullscreenQuad(self: *Encoder, shader: u32, tex0: u32, tex1: u32, params_ptr: u32, param_count: u32) void {
+        self.header(.draw_fullscreen_quad, 20);
+        self.putU32(shader);
+        self.putU32(tex0);
+        self.putU32(tex1);
+        self.putU32(params_ptr);
+        self.putU32(param_count);
+    }
+
     pub fn endFrame(self: *Encoder) void {
         self.header(.end_frame, 0);
     }
@@ -1543,4 +1593,54 @@ test "golden: shadow-pass frame records (tags 16-20)" {
             "0600" ++ "0000",
         hex,
     );
+}
+
+// ── Post-processing wire goldens ─────────────────────────────────────
+
+fn readU16(bytes: []const u8, off: usize) u16 {
+    return std.mem.readInt(u16, bytes[off..][0..2], .little);
+}
+
+fn readU32(bytes: []const u8, off: usize) u32 {
+    return std.mem.readInt(u32, bytes[off..][0..4], .little);
+}
+
+test "golden: post-process wire records (tags 22-25)" {
+    var buf: [256]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createRenderTarget(5, 800, 600, .rgba16f, rt_flag_with_depth);
+    enc.beginOffscreenPass(5, .{ 0, 0, 0, 1 }, clear_flag_color | clear_flag_depth);
+    enc.drawFullscreenQuad(3, 5, 0, 0x2000, 1);
+    enc.endOffscreenPass();
+    const out = enc.finish();
+
+    // record framing: [len u32][ (tag u16, size u16, payload) ... ]
+    var off: usize = 4;
+    // create_render_target: handle,w,h,format,flags = 5×u32 = 20B
+    try testing.expectEqual(@as(u16, @intFromEnum(Tag.create_render_target)), readU16(out, off));
+    try testing.expectEqual(@as(u16, 20), readU16(out, off + 2));
+    try testing.expectEqual(@as(u32, 5), readU32(out, off + 4));
+    try testing.expectEqual(@as(u32, 800), readU32(out, off + 8));
+    try testing.expectEqual(@as(u32, 600), readU32(out, off + 12));
+    try testing.expectEqual(@as(u32, @intFromEnum(TexFormat.rgba16f)), readU32(out, off + 16));
+    try testing.expectEqual(rt_flag_with_depth, readU32(out, off + 20));
+    off += 4 + 20;
+    // begin_offscreen_pass: target u32 + clear 4×f32 + clear_flags u32 = 24B
+    try testing.expectEqual(@as(u16, @intFromEnum(Tag.begin_offscreen_pass)), readU16(out, off));
+    try testing.expectEqual(@as(u16, 24), readU16(out, off + 2));
+    try testing.expectEqual(@as(u32, 5), readU32(out, off + 4));
+    try testing.expectEqual(clear_flag_color | clear_flag_depth, readU32(out, off + 24));
+    off += 4 + 24;
+    // draw_fullscreen_quad: shader,tex0,tex1,params_ptr,param_count = 20B
+    try testing.expectEqual(@as(u16, @intFromEnum(Tag.draw_fullscreen_quad)), readU16(out, off));
+    try testing.expectEqual(@as(u16, 20), readU16(out, off + 2));
+    try testing.expectEqual(@as(u32, 3), readU32(out, off + 4));
+    try testing.expectEqual(@as(u32, 5), readU32(out, off + 8));
+    try testing.expectEqual(@as(u32, 0), readU32(out, off + 12));
+    try testing.expectEqual(@as(u32, 0x2000), readU32(out, off + 16));
+    try testing.expectEqual(@as(u32, 1), readU32(out, off + 20));
+    off += 4 + 20;
+    // end_offscreen_pass: 0B payload
+    try testing.expectEqual(@as(u16, @intFromEnum(Tag.end_offscreen_pass)), readU16(out, off));
+    try testing.expectEqual(@as(u16, 0), readU16(out, off + 2));
 }
