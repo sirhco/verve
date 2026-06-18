@@ -29,6 +29,7 @@ var use_webgpu: bool = false;
 var resources_sent: bool = false;
 var bloom_on: bool = true;
 var fxaa_on: bool = true;
+var frozen: bool = false;
 var yaw: f32 = 0;
 
 // STABLE statics — wire records carry their addresses; read after frame returns.
@@ -48,6 +49,8 @@ var light: [8]f32 = .{ 0, 2.0, -0.4, -0.7, -0.5, 1, 1, 1 };
 const base_rgba = [_]u8{ 255, 255, 255, 255 };
 const mr_rgba = [_]u8{ 255, 255, 255, 255 };
 const occ_rgba = [_]u8{ 255, 255, 255, 255 };
+// 1×1 white emissive map (linear); emissive_factor(2.5) × 1.0 → HDR > bloom threshold.
+const emis_rgba = [_]u8{ 255, 255, 255, 255 };
 
 // cmd_buf sizing: createBuffer×2 (one-time ~40B) + createShader (~28B) + textures (~60B)
 // + per-frame beginPostProcess (~80B) + setPipeline (12B) + setLights (12B) +
@@ -64,6 +67,7 @@ const shader_handle: u32 = 1;
 const base_tex: u32 = 1;
 const mr_tex: u32 = 2;
 const occ_tex: u32 = 3;
+const emis_tex: u32 = 4;
 
 const frame_export = "glpost_frame";
 
@@ -77,6 +81,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     resources_sent = false;
     bloom_on = true;
     fxaa_on = true;
+    frozen = false;
     yaw = 0;
     post_ctx = .{};
     use_webgpu = gl_webgpu_available() != 0;
@@ -93,7 +98,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
 // ── frame export ──────────────────────────────────────────────────────────────
 
 export fn glpost_frame(dt_ms: f32, width: u32, height: u32) u32 {
-    yaw += dt_ms * 0.0008; // slow orbit ~0.8 rad/s
+    if (!frozen) yaw += dt_ms * 0.0008; // slow orbit ~0.8 rad/s (freeze pins orientation)
 
     const aspect = @as(f32, @floatFromInt(width)) /
         @as(f32, @floatFromInt(@max(height, 1)));
@@ -140,6 +145,7 @@ export fn glpost_frame(dt_ms: f32, width: u32, height: u32) u32 {
         enc.createTextureSrgb(base_tex, 1, 1, @intCast(@intFromPtr(&base_rgba)), @intCast(base_rgba.len));
         enc.createTexture(mr_tex, 1, 1, @intCast(@intFromPtr(&mr_rgba)), @intCast(mr_rgba.len));
         enc.createTexture(occ_tex, 1, 1, @intCast(@intFromPtr(&occ_rgba)), @intCast(occ_rgba.len));
+        enc.createTexture(emis_tex, 1, 1, @intCast(@intFromPtr(&emis_rgba)), @intCast(emis_rgba.len));
     }
 
     enc.beginPostProcess(&post_ctx, .{
@@ -152,6 +158,7 @@ export fn glpost_frame(dt_ms: f32, width: u32, height: u32) u32 {
     enc.setLights(1, @intCast(@intFromPtr(&light)));
     enc.bindTexture(gl.command.tex_slot_base, base_tex);
     enc.bindTexture(gl.command.tex_slot_mr, mr_tex);
+    enc.bindTexture(gl.command.tex_slot_emissive, emis_tex);
     enc.bindTexture(gl.command.tex_slot_occlusion, occ_tex);
     enc.drawPbr(
         vbuf_handle,
@@ -178,4 +185,8 @@ export fn glpost_toggle_bloom() void {
 
 export fn glpost_toggle_fxaa() void {
     fxaa_on = !fxaa_on;
+}
+
+export fn glpost_toggle_freeze() void {
+    frozen = !frozen;
 }

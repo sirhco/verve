@@ -906,9 +906,14 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  color = color + emissive_factor * textureSample(emissive_tex, samp, in.uv).rgb;
         \\
     ;
-    const fs_tail =
+    // ACES tonemap + gamma. Skipped for variant_linear_output (the post
+    // pipeline renders linear HDR offscreen and tonemaps in the composite pass).
+    const fs_tail_tonemap =
         \\  color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
         \\  color = pow(color, vec3<f32>(1.0 / 2.2));
+        \\
+    ;
+    const fs_tail_close =
         \\  return vec4<f32>(color, base_color.a);
         \\}
         \\
@@ -918,6 +923,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const em = flags & variant_emissive != 0;
     const shadow = flags & variant_shadow != 0;
     const skinned = flags & variant_skinned != 0;
+    const lin = flags & variant_linear_output != 0;
     comptime var src: []const u8 = uniforms_head;
     if (shadow) src = src ++ uniforms_shadow;
     src = src ++ uniforms_tail;
@@ -942,7 +948,8 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ fs_lighting;
     src = src ++ (if (shadow) fs_combine_shadow else fs_combine_plain);
     if (em) src = src ++ fs_emissive;
-    src = src ++ fs_tail;
+    if (!lin) src = src ++ fs_tail_tonemap;
+    src = src ++ fs_tail_close;
     return src;
 }
 
@@ -2091,6 +2098,16 @@ test "variant_linear_output skips ACES in PBR fragment" {
     try testing.expect(linear.len < lit.len); // linear omits the tonemap block
 }
 
+test "variant_linear_output skips ACES in WGSL PBR fragment (backend parity)" {
+    const lit = wgslPbr(variant_pbr);
+    const linear = wgslPbr(variant_pbr | variant_linear_output);
+    // WGSL twin must gate the in-shader tonemap identically to the GLSL path,
+    // else the WebGPU scene double-tonemaps and nothing exceeds the bloom threshold.
+    try testing.expect(std.mem.indexOf(u8, lit, "2.51") != null);
+    try testing.expect(std.mem.indexOf(u8, linear, "2.51") == null); // ACES omitted in linear output
+    try testing.expect(linear.len < lit.len); // linear omits the tonemap block
+}
+
 test "golden: post shader sources frozen (FNV-1a-64)" {
     // Frozen from first green run — a change here = deliberate shader contract bump.
     // GLSL
@@ -2106,6 +2123,7 @@ test "golden: post shader sources frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xe8ac45e2d1276dfd), fnv64(wgslFxaa()));
     // linear-output PBR variant (omits tonemap+gamma; post composite pass tonemaps instead)
     try testing.expectEqual(@as(u64, 0x435aa6e4ca89a81a), fnv64(pbrFragmentSrc(variant_pbr | variant_linear_output)));
+    try testing.expectEqual(@as(u64, 0x3e109d6415bcafaf), fnv64(wgslPbr(variant_pbr | variant_linear_output)));
 }
 
 // ── Task 3: Post-process effect-graph sequence tests ─────────────────

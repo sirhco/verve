@@ -5137,6 +5137,11 @@
   const PBR_STRIDE = 512; // align(448, 256)
   const DEPTH_STRIDE = 256; // one mat4 (64B) padded to the 256B dynamic-offset min
   const MAX_DRAWS = 64; // per-frame draw cap (cube+plane today; headroom for scenes)
+  // Post fullscreen draws (bright/blurH/blurV/composite/fxaa = up to 5/frame) each
+  // need their own params slot — same hazard as PBR: all draws defer to one submit,
+  // so a single shared buffer lets the last writeBuffer clobber every earlier draw.
+  const POST_STRIDE = 256; // 32B params padded to the 256B uniform-offset min
+  const MAX_POST_DRAWS = 16; // per-frame fullscreen-draw cap (5 today; headroom)
   // Lazily create the shared PBR uniform buffer (reused across frames/draws).
   const gpuEnsurePbrUniform = (st) => {
     if (!st.pbrUniform) {
@@ -5146,6 +5151,17 @@
       });
     }
     return st.pbrUniform;
+  };
+  // Lazily create the shared post-effect params buffer (one 256B slot per
+  // fullscreen draw, isolated like the PBR uniform so deferred draws don't clobber).
+  const gpuEnsurePostUniform = (st) => {
+    if (!st.postUniform) {
+      st.postUniform = st.device.createBuffer({
+        size: POST_STRIDE * MAX_POST_DRAWS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    return st.postUniform;
   };
   // Lazily create the shared bones palette uniform (64 mat4 = 4096 B), bound at
   // @group(0) @binding(1) for skinned variants. set_bones (tag 21) writes it;
@@ -5260,10 +5276,11 @@
           st.pbrSlot = 0; // reset per-draw uniform slot allocation for this frame
           st.curTargetFormat = st.format; // canvas pass: post draws target st.format
           st.curPassHasDepth = true; // canvas pass always has depth24plus
-          // Reuse the encoder if a shadow pass already opened one this frame
-          // (begin_shadow_pass runs BEFORE begin_frame); else create one. Both
-          // the shadow depth pass and the color pass share one encoder + submit.
-          if (!st.encoder) st.encoder = device.createCommandEncoder();
+          // Reuse the encoder if a shadow/offscreen pass already opened one this
+          // frame (those run BEFORE begin_frame); else create one. All passes share
+          // one encoder + submit. Reset post slot only on a genuinely new encoder so
+          // the canvas FXAA draw keeps a slot distinct from the offscreen bloom draws.
+          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; }
           st.pass = st.encoder.beginRenderPass({
             colorAttachments: [{
               view: st.ctx.getCurrentTexture().createView(),
@@ -5884,7 +5901,8 @@
           const cf = dv.getUint32(off + 20, true);
           const rt = st.renderTargets[target];
           if (!rt) break;
-          if (!st.encoder) st.encoder = device.createCommandEncoder();
+          // First pass of a post frame: new encoder → reset the post params slot.
+          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; }
           st.pass = st.encoder.beginRenderPass({
             colorAttachments: [{
               view: rt.view,
@@ -5920,19 +5938,20 @@
           if (!entry || entry.kind !== "post" || !st.pass || !src0rt) break;
           const format = st.curTargetFormat || st.format;
           const pipe = getOrCreatePostPipeline(st, entry, format, !!st.curPassHasDepth);
-          // Params UBO (16B): up to 4 f32 read from the wire (zero-padded).
-          if (!st.postUbo) {
-            // 32B: largest post Params struct is wgslBright (threshold:f32 padded
-            // to 16 + _pad:vec3 at offset 16 = 28B, rounded to 32B by WGSL).
-            st.postUbo = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-          }
+          // Params: up to 4 f32 from the wire (zero-padded), written into this
+          // draw's own 256-aligned slot so a later draw's writeBuffer can't clobber
+          // it before the single end-of-frame submit (see POST_STRIDE note above).
+          const pubuf = gpuEnsurePostUniform(st);
+          const pslot = st.postSlot++;
+          if (pslot >= MAX_POST_DRAWS) break; // per-frame cap (silently drop extras)
+          const pbase = pslot * POST_STRIDE;
           const arr = new Float32Array(4);
           for (let i = 0; i < pCount && i < 4; i++) arr[i] = dv.getFloat32(pPtr + i * 4, true);
-          device.queue.writeBuffer(st.postUbo, 0, arr);
+          device.queue.writeBuffer(pubuf, pbase, arr);
           const src1 = (t1 !== 0 && st.renderTargets[t1]) ? st.renderTargets[t1].view : st.dummyTexView;
           const bg0 = device.createBindGroup({
             layout: entry.bgl0,
-            entries: [{ binding: 0, resource: { buffer: st.postUbo } }],
+            entries: [{ binding: 0, resource: { buffer: pubuf, offset: pbase, size: 32 } }],
           });
           const bg1 = device.createBindGroup({
             layout: entry.bgl1,
@@ -6194,7 +6213,8 @@
       renderTargets: [], // post: { tex, view, depthTex, depthView, w, h, format } by handle
       curTargetFormat: null, // color format of the active pass (post pipeline keying)
       curPassHasDepth: false, // true when the active render pass has a depth attachment
-      postUbo: null, // shared 32B params UBO for draw_fullscreen_quad (lazy)
+      postUniform: null, // slotted params buffer for draw_fullscreen_quad (lazy)
+      postSlot: 0, // per-frame fullscreen-draw slot counter (reset at encoder start)
       // Linear/clamp sampler + 1×1 dummy view for the unused tex1 post slot. Eager
       // (cheap, always needed by the post chain when present); clamp avoids UV wrap.
       linearSampler: gpu.device.createSampler({

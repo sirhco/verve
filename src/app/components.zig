@@ -1018,6 +1018,7 @@ pub fn glPost(ctx: *const verve.Context) !*verve.Node {
     const controls = ctx.div().class("gl-controls").children(.{
         ctx.el("button").attr("z-on-click", "glpost_toggle_bloom").text("Toggle Bloom"),
         ctx.el("button").attr("z-on-click", "glpost_toggle_fxaa").text("Toggle FXAA"),
+        ctx.el("button").attr("z-on-click", "glpost_toggle_freeze").text("Freeze"),
     });
 
     const inner = ctx.section().class("card").children(.{
