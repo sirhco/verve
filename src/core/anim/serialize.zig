@@ -1281,6 +1281,17 @@ test "gl deferred target serializes with gh field" {
     try testing.expect(std.mem.indexOf(u8, json, "\"gl\":16777217") != null);
 }
 
+test "gl deferred node translate target serializes with gh field" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // placeholder encode(.node, 0, translate_y) = 0x03000004 = 50331652; arbitrary hash.
+    const t = tween_mod.to(a, null).glTargetRangeHashed(0x03000004, 0xCAFEBABE, 0, -1.0, 1.0);
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expect(std.mem.indexOf(u8, json, "\"gh\":3405691582") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"gl\":50331652") != null);
+}
+
 test "gl resolved target serializes WITHOUT gh (back-compat)" {
     var arena = testArena();
     defer arena.deinit();

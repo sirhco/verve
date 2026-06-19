@@ -10,6 +10,8 @@
 //!   material metallic=0  roughness=1  emissive_r=2  emissive_g=3  emissive_b=4
 //!   model    yaw=0
 //!   node     rotation_x=0  rotation_y=1  rotation_z=2
+//!            translate_x=3  translate_y=4  translate_z=5
+//!            scale_x=6      scale_y=7      scale_z=8
 //!
 //! Path grammar (resolve once at setup via resolvePath):
 //!   "camera.yaw" | "camera.pitch" | "camera.distance"
@@ -17,6 +19,8 @@
 //!   "material:<Name>.emissiveR" | "material:<Name>.emissiveG" | "material:<Name>.emissiveB"
 //!   "model.yaw"
 //!   "node:<Name>.rotationX" | "node:<Name>.rotationY" | "node:<Name>.rotationZ"
+//!   "node:<Name>.translateX" | "node:<Name>.translateY" | "node:<Name>.translateZ"
+//!   "node:<Name>.scaleX" | "node:<Name>.scaleY" | "node:<Name>.scaleZ"
 //!
 //! resolvePathStatic handles ONLY camera.* and model.* (no name-table lookup needed).
 //! Use it for SSR where no vmesh Reader is available.
@@ -32,7 +36,17 @@ pub const Kind = enum(u8) { camera = 0, material = 1, model = 2, node = 3 };
 pub const CameraField = enum(u8) { yaw = 0, pitch = 1, distance = 2 };
 pub const MaterialField = enum(u8) { metallic = 0, roughness = 1, emissive_r = 2, emissive_g = 3, emissive_b = 4 };
 pub const ModelField = enum(u8) { yaw = 0 };
-pub const NodeField = enum(u8) { rotation_x = 0, rotation_y = 1, rotation_z = 2 };
+pub const NodeField = enum(u8) {
+    rotation_x = 0,
+    rotation_y = 1,
+    rotation_z = 2,
+    translate_x = 3,
+    translate_y = 4,
+    translate_z = 5,
+    scale_x = 6,
+    scale_y = 7,
+    scale_z = 8,
+};
 
 // ── Decoded ───────────────────────────────────────────────────────────────────
 
@@ -123,6 +137,12 @@ fn nodeField(s: []const u8) ?u8 {
     if (std.mem.eql(u8, s, "rotationX")) return @intFromEnum(NodeField.rotation_x);
     if (std.mem.eql(u8, s, "rotationY")) return @intFromEnum(NodeField.rotation_y);
     if (std.mem.eql(u8, s, "rotationZ")) return @intFromEnum(NodeField.rotation_z);
+    if (std.mem.eql(u8, s, "translateX")) return @intFromEnum(NodeField.translate_x);
+    if (std.mem.eql(u8, s, "translateY")) return @intFromEnum(NodeField.translate_y);
+    if (std.mem.eql(u8, s, "translateZ")) return @intFromEnum(NodeField.translate_z);
+    if (std.mem.eql(u8, s, "scaleX")) return @intFromEnum(NodeField.scale_x);
+    if (std.mem.eql(u8, s, "scaleY")) return @intFromEnum(NodeField.scale_y);
+    if (std.mem.eql(u8, s, "scaleZ")) return @intFromEnum(NodeField.scale_z);
     return null;
 }
 
@@ -309,8 +329,8 @@ test "(b) decode rejects model field 1" {
     try testing.expectEqual(@as(?Decoded, null), decode(id));
 }
 
-test "(b) decode rejects node field 3" {
-    const id = encode(.node, 0, 3);
+test "(b) decode rejects node field 9" {
+    const id = encode(.node, 0, 9);
     try testing.expectEqual(@as(?Decoded, null), decode(id));
 }
 
@@ -604,4 +624,42 @@ test "(h) resolvePathStaticDeferred: camera/model/unknown → null" {
 test "(h) resolvePathStaticDeferred is comptime-evaluable" {
     const d = comptime resolvePathStaticDeferred("material:Cube.roughness").?;
     try testing.expectEqual(Kind.material, d.kind);
+}
+
+test "(h) resolvePathStaticDeferred: node translate/scale carry kind+field+hash" {
+    const tx = resolvePathStaticDeferred("node:rotor1.translateX") orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(Kind.node, tx.kind);
+    try testing.expectEqual(@as(u8, @intFromEnum(NodeField.translate_x)), tx.field);
+    try testing.expectEqual(vmesh.Reader.nameHash("rotor1"), tx.name_hash);
+
+    const sy = resolvePathStaticDeferred("node:rotor1.scaleY") orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(@as(u8, @intFromEnum(NodeField.scale_y)), sy.field);
+
+    const tz = resolvePathStaticDeferred("node:rotor1.translateZ") orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(@as(u8, @intFromEnum(NodeField.translate_z)), tz.field);
+}
+
+test "(c) resolvePath node:Cube.translateY / scaleX via fixture reader" {
+    const fr = try makeFixtureReader(testing.allocator);
+    defer testing.allocator.free(fr.bytes);
+    try testing.expectEqual(
+        encode(.node, 0, @intFromEnum(NodeField.translate_y)),
+        resolvePath(&fr.reader, "node:Cube.translateY") orelse return error.TestUnexpectedNull,
+    );
+    try testing.expectEqual(
+        encode(.node, 0, @intFromEnum(NodeField.scale_x)),
+        resolvePath(&fr.reader, "node:Cube.scaleX") orelse return error.TestUnexpectedNull,
+    );
+}
+
+test "(g) frozen-id regression: node translate/scale ids" {
+    // node kind=0x03, submesh 0:
+    //   translateX/Y/Z field 3/4/5 → 0x03000003 / 04 / 05
+    //   scaleX/Y/Z     field 6/7/8 → 0x03000006 / 07 / 08
+    try testing.expectEqual(@as(u32, 0x03000003), encode(.node, 0, @intFromEnum(NodeField.translate_x)));
+    try testing.expectEqual(@as(u32, 0x03000004), encode(.node, 0, @intFromEnum(NodeField.translate_y)));
+    try testing.expectEqual(@as(u32, 0x03000005), encode(.node, 0, @intFromEnum(NodeField.translate_z)));
+    try testing.expectEqual(@as(u32, 0x03000006), encode(.node, 0, @intFromEnum(NodeField.scale_x)));
+    try testing.expectEqual(@as(u32, 0x03000007), encode(.node, 0, @intFromEnum(NodeField.scale_y)));
+    try testing.expectEqual(@as(u32, 0x03000008), encode(.node, 0, @intFromEnum(NodeField.scale_z)));
 }
