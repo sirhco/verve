@@ -3,7 +3,7 @@
 //! Decode: 8-bit-depth, color type 2 (RGB) or 6 (RGBA), non-interlaced,
 //! filter types 0-4 per scanline → RGBA8 output.
 //!
-//! Encode: RGBA8 → valid PNG using filter 0 + real zlib DEFLATE (std flate).
+//! Encode: RGBA8 → valid PNG using adaptive per-scanline filters (MSAD) + real zlib DEFLATE (std flate).
 //! Fixture/demo + compressed-texture asset use.
 //!
 //! Errors: `error.Unsupported`, `error.BadSignature`, `error.Corrupt`.
@@ -31,20 +31,25 @@ pub fn decode(alloc: Allocator, bytes: []const u8) !Image {
 }
 
 /// Encode RGBA8 pixels (w × h) → PNG bytes (alloc-owned).
-/// Uses filter 0 (None) per scanline + real zlib DEFLATE (std flate).
+/// Uses adaptive per-scanline filters (MSAD) + real zlib DEFLATE (std flate).
 pub fn encodeRgba(alloc: Allocator, rgba: []const u8, w: u32, h: u32) ![]u8 {
     const stride: usize = @as(usize, w) * 4;
-    // filtered stream: 1 filter-byte (0) + stride bytes per row
+    // filtered stream: 1 filter byte + stride residual bytes per row
     const filtered_len = @as(usize, h) * (1 + stride);
     const filtered = try alloc.alloc(u8, filtered_len);
     defer alloc.free(filtered);
+    // Zero "previous row" for scanline 0 (Up/Average/Paeth reference above=0).
+    const zero_row = try alloc.alloc(u8, stride);
+    defer alloc.free(zero_row);
+    @memset(zero_row, 0);
+
     var fi: usize = 0;
     for (0..@as(usize, h)) |row| {
-        filtered[fi] = 0; // filter None
-        fi += 1;
-        const src = rgba[row * stride .. row * stride + stride];
-        @memcpy(filtered[fi .. fi + stride], src);
-        fi += stride;
+        const cur = rgba[row * stride .. row * stride + stride];
+        const prev = if (row == 0) zero_row else rgba[(row - 1) * stride .. (row - 1) * stride + stride];
+        // Adaptive per-scanline filter (MSAD): write residual after the filter byte.
+        filtered[fi] = chooseScanlineFilter(cur, prev, 4, filtered[fi + 1 .. fi + 1 + stride]);
+        fi += 1 + stride;
     }
     return buildPng(alloc, filtered, w, h, 6); // color type 6 = RGBA
 }
@@ -445,4 +450,65 @@ test "chooseScanlineFilter: deterministic (same input → same filter + residual
     const fb = chooseScanlineFilter(&cur, &prev, 4, &b);
     try testing.expectEqual(fa, fb);
     try testing.expectEqualSlices(u8, &a, &b);
+}
+
+test "encodeRgba round-trips a 16x16 gradient" {
+    var px: [16 * 16 * 4]u8 = undefined;
+    for (0..16) |y| for (0..16) |x| {
+        const o = (y * 16 + x) * 4;
+        px[o + 0] = @intCast(x * 16);
+        px[o + 1] = @intCast(y * 16);
+        px[o + 2] = @intCast((x + y) * 8);
+        px[o + 3] = 255;
+    };
+    const bytes = try encodeRgba(testing.allocator, &px, 16, 16);
+    defer testing.allocator.free(bytes);
+    var img = try decode(testing.allocator, bytes);
+    defer img.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, &px, img.rgba);
+}
+
+test "encodeRgba adaptive output is smaller than forced filter-None" {
+    // A 64x8 image whose rows are smooth horizontal ramps: Sub/Paeth filtering
+    // collapses each row to a near-constant residual, which DEFLATE crushes far
+    // better than the raw filter-None bytes.
+    const w: u32 = 64;
+    const h: u32 = 8;
+    const stride: usize = @as(usize, w) * 4;
+    var px = try testing.allocator.alloc(u8, @as(usize, h) * stride);
+    defer testing.allocator.free(px);
+    for (0..h) |y| for (0..w) |x| {
+        const o = y * stride + x * 4;
+        px[o + 0] = @intCast((x * 3) % 256);
+        px[o + 1] = @intCast((x * 3 + 40) % 256);
+        px[o + 2] = @intCast((x * 3 + 80) % 256);
+        px[o + 3] = 255;
+    };
+    const adaptive = try encodeRgba(testing.allocator, px, w, h);
+    defer testing.allocator.free(adaptive);
+
+    // Build the filter-None baseline via the same buildPng plumbing.
+    const none_stream = try testing.allocator.alloc(u8, @as(usize, h) * (1 + stride));
+    defer testing.allocator.free(none_stream);
+    var fi: usize = 0;
+    for (0..h) |row| {
+        none_stream[fi] = 0;
+        fi += 1;
+        @memcpy(none_stream[fi .. fi + stride], px[row * stride .. row * stride + stride]);
+        fi += stride;
+    }
+    const none = try buildPng(testing.allocator, none_stream, w, h, 6);
+    defer testing.allocator.free(none);
+
+    try testing.expect(adaptive.len < none.len);
+}
+
+test "encodeRgba is deterministic" {
+    var px: [8 * 8 * 4]u8 = undefined;
+    for (&px, 0..) |*p, i| p.* = @intCast((i * 13 + 7) % 256);
+    const a = try encodeRgba(testing.allocator, &px, 8, 8);
+    defer testing.allocator.free(a);
+    const b = try encodeRgba(testing.allocator, &px, 8, 8);
+    defer testing.allocator.free(b);
+    try testing.expectEqualSlices(u8, a, b);
 }
