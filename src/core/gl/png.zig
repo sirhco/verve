@@ -432,7 +432,8 @@ test "chooseScanlineFilter: Sub wins on a horizontal ramp (row 0)" {
 }
 
 test "chooseScanlineFilter: Up wins + zero residual on a vertically-constant row" {
-    // row 1 identical to row 0 → Up residual is all zeros → score 0 → Up (2).
+    // row 1 identical to row 0 → both Up and Paeth residuals are all zeros
+    // (score 0); the lowest-index tie-break picks Up (2) over Paeth (4).
     const prev = [_]u8{ 5, 9, 13, 255, 6, 10, 14, 255 };
     const cur = prev;
     var out: [8]u8 = undefined;
