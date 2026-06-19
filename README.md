@@ -1,9 +1,9 @@
 # Verve
 
-> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.5.x. Public
+> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.6.x. Public
 > APIs are not stable and **will** break between minor versions.
 > All three desktop backends (macOS, Windows, Linux GTK4) are validated
-> on real hardware (current as of v0.5.x). Known limitations: desktop auto-updater
+> on real hardware (current as of v0.6.x). Known limitations: desktop auto-updater
 > apply is macOS-only; full a11y provider not yet implemented; Linux
 > image clipboard returns `Unsupported`. Use for learning, experiments,
 > and personal projects. Not production-ready.
@@ -200,7 +200,7 @@ tour and platform support matrix.
 
 > Pre-1.0 — release artifacts are published for each tag, but
 > behavior is experimental. All three desktop backends (macOS,
-> Windows, Linux GTK4) are validated on real hardware (current as of v0.5.x).
+> Windows, Linux GTK4) are validated on real hardware (current as of v0.6.x).
 
 Tagged releases publish `verve-server` + `verve-cli` tarballs for
 five targets:
