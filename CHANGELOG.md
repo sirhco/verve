@@ -8,6 +8,17 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **SSR `material:`/`node:` gl anim targets** (`src/core/gl/anim_target.zig`,
+  `src/core/anim/{tween,serialize}.zig`, `src/client/{island_runtime,islands/GlScene}.zig`,
+  `src/bridge/verve.js`, `src/app/components.zig`): SSR-declared gl tweens can now target
+  `material:<Name>.<field>` and `node:<Name>.<field>`, not just `camera.*`/`model.*`. SSR
+  bakes the comptime-pure `{kind, field, name_hash}` (`resolvePathStaticDeferred`) and emits
+  the FNV hash as a numeric `"gh"` wire field; the client resolver (`animGlResolver` →
+  `glscene_resolve_target`) maps `name_hash → submesh index` on the first tick, caches the
+  frozen id, and applies through the existing setter path. `"gh"` appears only when
+  `name_hash != 0`, so already-resolved tweens serialize byte-identically. Frozen target-id
+  contract unchanged. The `/gl-scene` demo drives `material:Cube.metallic` + `node:Cube.rotationY`
+  from SSR.
 - **gl adaptive PNG scanline filtering** (`src/core/gl/png.zig`): `encodeRgba` now
   picks the best PNG filter (None/Sub/Up/Average/Paeth) per scanline using a
   minimum-sum-of-absolute-differences (MSAD) scoring pass, then writes the chosen
