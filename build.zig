@@ -286,6 +286,24 @@ pub fn build(b: *std.Build) void {
     const gen_mixed_glb_run = b.addRunArtifact(gen_mixed_glb_exe);
     const mixed_glb_path = gen_mixed_glb_run.addOutputFileArg("mixed.glb");
 
+    // Cutout demo GLB: a single cube ("Cutout") whose base-color texture has an
+    // alpha channel with HOLES and whose material is alphaMode:MASK (cutoff 0.5).
+    // The variant_alpha_test shader discards sub-cutoff fragments (/gl-cutout).
+    const gen_cutout_glb_mod = b.createModule(.{
+        .root_source_file = b.path("tools/gen_cutout_glb.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "verve_gl", .module = host_gl_mod },
+        },
+    });
+    const gen_cutout_glb_exe = b.addExecutable(.{
+        .name = "verve-gen-cutout-glb",
+        .root_module = gen_cutout_glb_mod,
+    });
+    const gen_cutout_glb_run = b.addRunArtifact(gen_cutout_glb_exe);
+    const cutout_glb_path = gen_cutout_glb_run.addOutputFileArg("cutout.glb");
+
     // Shadow demo GLB: a cube above a floor quad ("Cube" + "Floor"), both
     // base-color only. The floor receives the cube's directional shadow
     // (P9 slice 3, /gl-shadow demo route).
@@ -345,6 +363,13 @@ pub fn build(b: *std.Build) void {
     gl_asset_gen_mixed_run.addFileArg(mixed_glb_path);
     const mixed_dir = gl_asset_gen_mixed_run.addOutputDirectoryArg("mixed");
     gl_asset_gen_mixed_run.addArg("mixed");
+
+    // Cutout asset through the same gl_asset_gen binary (glb → vmesh). The 256²
+    // RGBA base (alpha holes) externalizes to cutout.tex0.png like demo's.
+    const gl_asset_gen_cutout_run = b.addRunArtifact(gl_asset_gen_exe);
+    gl_asset_gen_cutout_run.addFileArg(cutout_glb_path);
+    const cutout_dir = gl_asset_gen_cutout_run.addOutputDirectoryArg("cutout");
+    gl_asset_gen_cutout_run.addArg("cutout");
 
     // Shadow-demo asset through the same gl_asset_gen binary (glb → vmesh).
     const gl_asset_gen_shadow_run = b.addRunArtifact(gl_asset_gen_exe);
@@ -412,6 +437,9 @@ pub fn build(b: *std.Build) void {
     // Demo's 256² base texture is externalized as a sibling compressed PNG.
     _ = wf_gl.addCopyFile(demo_dir.path(b, "demo.tex0.png"), "demo.tex0.png");
     _ = wf_gl.addCopyFile(mixed_dir.path(b, "mixed.vmesh"), "mixed.vmesh");
+    _ = wf_gl.addCopyFile(cutout_dir.path(b, "cutout.vmesh"), "cutout.vmesh");
+    // Cutout's 256² alpha-hole base texture is externalized as a sibling PNG.
+    _ = wf_gl.addCopyFile(cutout_dir.path(b, "cutout.tex0.png"), "cutout.tex0.png");
     _ = wf_gl.addCopyFile(shadow_dir.path(b, "shadow.vmesh"), "shadow.vmesh");
     _ = wf_gl.addCopyFile(skin_dir.path(b, "skinbar.vmesh"), "skinbar.vmesh");
     _ = wf_gl.addCopyFile(windfarm_dir.path(b, "windfarm.vmesh"), "windfarm.vmesh");
@@ -424,6 +452,8 @@ pub fn build(b: *std.Build) void {
         \\    .{ .name = "demo.vmesh", .bytes = @embedFile("demo.vmesh") },
         \\    .{ .name = "demo.tex0.png", .bytes = @embedFile("demo.tex0.png") },
         \\    .{ .name = "mixed.vmesh", .bytes = @embedFile("mixed.vmesh") },
+        \\    .{ .name = "cutout.vmesh", .bytes = @embedFile("cutout.vmesh") },
+        \\    .{ .name = "cutout.tex0.png", .bytes = @embedFile("cutout.tex0.png") },
         \\    .{ .name = "shadow.vmesh", .bytes = @embedFile("shadow.vmesh") },
         \\    .{ .name = "skinbar.vmesh", .bytes = @embedFile("skinbar.vmesh") },
         \\    .{ .name = "windfarm.vmesh", .bytes = @embedFile("windfarm.vmesh") },

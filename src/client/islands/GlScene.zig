@@ -79,8 +79,8 @@ const frame_export = "glscene_frame";
 // GPU resource handles (kept distinct from IBL handles 16/17/18).
 const vbuf: u32 = 1;
 const ibuf: u32 = 2;
-// Shader handles 1..4 live in the bridge's separate `st.shaders[]` namespace
-// (distinct from buffers/textures), one per PBR variant — see shaderHandleFor.
+// Shader handles 1..4 (opaque PBR) and 6..9 (alpha-test PBR) live in the bridge's
+// `st.shaders[]` namespace (distinct from buffers/textures) — see shaderHandleFor.
 const irr_handle: u32 = 16;
 const spec_handle: u32 = 17;
 const lut_handle: u32 = 18;
@@ -101,12 +101,15 @@ const max_picks = 4; // mirror of gl_scene.zig max_picks
 const max_name = 64; // per-name fixed storage
 const no_hover_hash: u32 = 0xFFFF_FFFF;
 
-// Up to four PBR variants per mesh: variant_pbr is always set; normal_map and
-// emissive are independent sub-bits. Each maps to a fixed shader handle 1..4 in
-// the bridge's `st.shaders[]` namespace (separate from buffers/textures).
+// Up to eight PBR variants per mesh: variant_pbr is always set; normal_map,
+// emissive, and alpha_test are independent sub-bits. Opaque variants map to
+// shader handles 1..4; alpha-test variants map to handles 6..9 in the bridge's
+// `st.shaders[]` namespace (separate from buffers/textures). Handle 5 is the
+// depth-only shader; handle 1 in `st.shadowMaps[]` is the shadow map.
 const variant_pbr = gl.command.variant_pbr;
 const variant_nm = gl.command.variant_normal_map;
 const variant_em = gl.command.variant_emissive;
+const variant_at = gl.command.variant_alpha_test;
 
 // ── Props copies (decoded from SSR data-props; copied into the Inst before the
 //    chunk arena that held the decode result is reset) ─────────────────────────
@@ -209,7 +212,8 @@ const Inst = struct {
     // Single directional light from props: 8 f32 [type, intensity, x,y,z, r,g,b].
     lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 },
 
-    // GPU-resource registry for context-restore replay (cap 32; 16 worst case).
+    // GPU-resource registry for context-restore replay (cap 32; ~23 worst case
+    // with the 8 PBR/alpha-test shader variants: 2 buf + 8 shader + depth + shadow + 8 tex + 3 IBL).
     registry: gl.Registry(32) = .{},
     resources_sent: bool = false,
     needs_replay: bool = false,
@@ -271,7 +275,7 @@ fn clipFix() gl.math.Mat4 {
 // Shared transient scratch — `glscene_frame` fills it and returns its pointer;
 // the bridge walks the stream synchronously before the next frame call, so
 // instances never interleave within a tick. NOT per-instance (saves 3×4 KB).
-//   one-time create OR replay: 2×createBuffer + ≤4 PBR + 1 depth shader +
+//   one-time create OR replay: 2×createBuffer + ≤8 PBR/alpha-test + 1 depth shader +
 //     1 shadow map + 5 createTexture + 3 createTextureEx ≈ 420 B
 //   per-frame worst case (every submesh a distinct variant): depth pass 220 +
 //     beginFrame 28 + 8×160 + endFrame 4 ≈ 1532 B. Total ≈ 1952. Round to 4096.
@@ -329,13 +333,20 @@ export fn glscene_unmount(root_id: u32) void {
 
 const up_vec = gl.math.Vec3.init(0, 1, 0);
 
-/// Stable shader handle per PBR variant: pbr→1, pbr|nm→2, pbr|em→3, pbr|nm|em→4.
+/// Stable shader handle per PBR variant:
+///   opaque:     pbr→1, pbr|nm→2, pbr|em→3, pbr|nm|em→4
+///   alpha-test: pbr|at→6, pbr|nm|at→7, pbr|em|at→8, pbr|nm|em|at→9
+/// Handle 5 is the depth-only shadow shader (see depth_shader).
 fn shaderHandleFor(variant: u32) u32 {
     return switch (variant) {
         variant_pbr => 1,
         variant_pbr | variant_nm => 2,
         variant_pbr | variant_em => 3,
         variant_pbr | variant_nm | variant_em => 4,
+        variant_pbr | variant_at => 6,
+        variant_pbr | variant_nm | variant_at => 7,
+        variant_pbr | variant_em | variant_at => 8,
+        variant_pbr | variant_nm | variant_em | variant_at => 9,
         else => unreachable,
     };
 }
@@ -420,6 +431,10 @@ fn createShaderForVariant(inst: *Inst, enc: *gl.Encoder, variant: u32) void {
         variant_pbr | variant_nm => emitShader(inst, enc, variant_pbr | variant_nm),
         variant_pbr | variant_em => emitShader(inst, enc, variant_pbr | variant_em),
         variant_pbr | variant_nm | variant_em => emitShader(inst, enc, variant_pbr | variant_nm | variant_em),
+        variant_pbr | variant_at => emitShader(inst, enc, variant_pbr | variant_at),
+        variant_pbr | variant_nm | variant_at => emitShader(inst, enc, variant_pbr | variant_nm | variant_at),
+        variant_pbr | variant_em | variant_at => emitShader(inst, enc, variant_pbr | variant_em | variant_at),
+        variant_pbr | variant_nm | variant_em | variant_at => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at),
         else => unreachable,
     }
 }
@@ -653,7 +668,7 @@ fn buildScene(inst: *Inst, a: *const gl.vmesh.Reader) void {
         inst.mats[s] = .{
             sub.base_color[0], sub.base_color[1], sub.base_color[2],      sub.base_color[3],
             sub.metallic,      sub.roughness,     sub.occlusion_strength, sub.normal_scale,
-            sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        0,
+            sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        sub.alpha_cutoff,
         };
         inst.submesh_aabb[s] = submeshLocalAabb(verts_f32, indices_u16, sub.index_byte_off / 2, sub.index_count);
     }
@@ -947,7 +962,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             var s: u32 = 0;
             while (s < a.submesh_count) : (s += 1) {
                 if (s >= max_submesh) break;
-                if (a.submesh(s).alpha_mode != 0) continue;
+                if (a.submesh(s).alpha_mode == 1) continue; // Pass 1 = opaque + mask (skip blend)
                 if (!visibleAfterCull(inst, planes, s)) continue;
                 drawSubmesh(inst, a, &enc, s, gl.command.state_depth_test | gl.command.state_cull_back, &last_variant, env, pv);
             }
@@ -1065,7 +1080,7 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     inst.registry.recordBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
 
     // Create + record only the distinct shader variants the mesh actually uses.
-    var shader_seen: [5]bool = .{ false, false, false, false, false };
+    var shader_seen: [10]bool = .{false} ** 10;
     var sv: u32 = 0;
     while (sv < a.submesh_count) : (sv += 1) {
         if (sv >= max_submesh) break;

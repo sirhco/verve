@@ -79,6 +79,7 @@ pub const variant_depth: u32 = 1 << 6; // depth-only shader for the shadow pass;
 pub const variant_skinned: u32 = 1 << 7; // requires variant_pbr; GPU skinning via u_bones[] palette
 pub const variant_post: u32 = 1 << 8; // fullscreen-quad shader: no VBO, no depth test, 2 sampler+texture slots
 pub const variant_linear_output: u32 = 1 << 9; // requires variant_pbr; SKIP in-shader ACES (post path renders linear HDR)
+pub const variant_alpha_test: u32 = 1 << 10; // requires variant_pbr; MASK cutout (discard below alphaCutoff)
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -382,6 +383,10 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\  float ao_sample = texture(u_occlusion_tex, v_uv).r;
         \\
     ;
+    const alpha_test =
+        \\  if (texture(u_base_tex, v_uv).a * base_color.a < u_material[2].w) discard;
+        \\
+    ;
     const normal_nm =
         \\  vec3 n_ts = texture(u_normal_tex, v_uv).xyz * 2.0 - 1.0;
         \\  n_ts.xy *= normal_scale;
@@ -490,6 +495,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ ibl_samplers;
     if (flags & variant_shadow != 0) src = src ++ shadow_decls;
     src = src ++ main_open;
+    if (flags & variant_alpha_test != 0) src = src ++ alpha_test;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
     src = src ++ lighting;
     src = src ++ (if (flags & variant_shadow != 0) combine_shadow else combine_plain);
@@ -820,6 +826,10 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  let ao_sample = textureSample(occlusion_tex, samp, in.uv).r;
         \\
     ;
+    const fs_alpha_test =
+        \\  if (textureSample(base_tex, samp, in.uv).a * base_color.a < u.material[2].w) { discard; }
+        \\
+    ;
     const fs_normal_nm =
         \\  var n_ts = textureSample(normal_tex, samp, in.uv).xyz * 2.0 - 1.0;
         \\  n_ts = vec3<f32>(n_ts.xy * normal_scale, n_ts.z);
@@ -945,6 +955,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ helpers;
     if (shadow) src = src ++ fs_shadow_decl;
     src = src ++ fs_open;
+    if (flags & variant_alpha_test != 0) src = src ++ fs_alpha_test;
     src = src ++ (if (nm) fs_normal_nm else fs_normal_plain);
     src = src ++ fs_lighting;
     src = src ++ (if (shadow) fs_combine_shadow else fs_combine_plain);
@@ -2107,6 +2118,22 @@ test "variant_linear_output skips ACES in WGSL PBR fragment (backend parity)" {
     try testing.expect(std.mem.indexOf(u8, lit, "2.51") != null);
     try testing.expect(std.mem.indexOf(u8, linear, "2.51") == null); // ACES omitted in linear output
     try testing.expect(linear.len < lit.len); // linear omits the tonemap block
+}
+
+test "variant_alpha_test bit + GLSL discard appended only when set" {
+    try testing.expectEqual(@as(u32, 1024), variant_alpha_test);
+    const mask = pbrFragmentSrc(variant_pbr | variant_alpha_test);
+    try testing.expect(std.mem.indexOf(u8, mask, "discard") != null);
+    try testing.expect(std.mem.indexOf(u8, mask, "u_material[2].w") != null);
+    const plain = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "discard") == null);
+}
+
+test "variant_alpha_test WGSL discard appended only when set" {
+    const mask = wgslPbr(variant_pbr | variant_alpha_test);
+    try testing.expect(std.mem.indexOf(u8, mask, "discard") != null);
+    const plain = wgslPbr(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "discard") == null);
 }
 
 test "golden: post shader sources frozen (FNV-1a-64)" {

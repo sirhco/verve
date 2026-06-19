@@ -1207,6 +1207,77 @@ pub fn glSceneShadow(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-cutout: alpha-test (MASK) cutout dissolve demo. The "Cutout" cube's
+/// base-color texture has a real alpha channel with HOLES; its material is
+/// alphaMode:MASK (cutoff 0.5), so the variant_alpha_test shader DISCARDS any
+/// fragment whose sampled base-texture alpha is below the cutoff — the holes
+/// punch clean see-through cutouts with a HARD edge (opaque pass, no blend /
+/// no sort, order-independent). Unlike BLEND, the background shows straight
+/// through; there is no translucency.
+///
+/// Dissolve: scroll scrubs `material:Cutout.baseColorA` 1.0→0.0. The base-color
+/// alpha multiplies the sampled texture alpha, so as it falls more texels drop
+/// below the cutoff and the silhouette erodes. Reuses the same deferred-target
+/// idiom as /gl-scene (resolvePathStaticDeferred + encode + glTargetRangeHashed):
+/// material:/node: targets need the client-side vmesh name table, so SSR bakes
+/// the comptime {kind, field, name_hash} and the bridge resolves the submesh on
+/// the first tick.
+pub fn glSceneCutout(ctx: *const verve.Context) !*verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
+    const scene = ctx.glScene(.{
+        .src = "/gl/cutout.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3E3D%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 4, .pitch = 0.3, .yaw = 0.6 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .onPickExport("Cutout", "verve:glpick-cutout")
+        .scrub(true)
+        .build();
+
+    // SSR scroll-driven camera dolly (slot-0 static path resolves at comptime).
+    const dolly_id = comptime (verve.gl.anim_target.resolvePathStatic("camera.distance") orelse unreachable);
+
+    // SSR DEFERRED dissolve target: material:Cutout.baseColorA. The placeholder
+    // id carries kind+field (submesh bits 0); the bridge resolves name_hash →
+    // submesh index on the first tick.
+    const roty = comptime (verve.gl.anim_target.resolvePathStaticDeferred("node:Cutout.rotationY") orelse unreachable);
+    const alpha = comptime (verve.gl.anim_target.resolvePathStaticDeferred("material:Cutout.baseColorA") orelse unreachable);
+    const roty_ph = comptime verve.gl.anim_target.encode(roty.kind, 0, roty.field);
+    const alpha_ph = comptime verve.gl.anim_target.encode(alpha.kind, 0, alpha.field);
+
+    const scene_wrap = ctx.div()
+        .children(.{scene})
+        .animate(anim.to(a, null)
+        .glTargetRange(dolly_id, 0, 4.0, 3.0)
+        .glTargetRangeHashed(roty_ph, roty.name_hash, 0, -0.6, 0.6)
+        // baseColorA 1.0 → 0.0: the cutout dissolves as more fragments fall
+        // below the alpha cutoff. Stop at 0.05 so the silhouette fully erodes
+        // by the end of the scroll travel.
+        .glTargetRangeHashed(alpha_ph, alpha.name_hash, 0, 1.0, 0.05)
+        .duration(1).ease(.linear)
+        .scrollTrigger(.{
+        .trigger = "section[data-ref^=glscene-scroll-section]",
+        .start = .{ .trigger = .top, .viewport = .top },
+        .end = .{ .at = .{ .trigger = .bottom, .viewport = .top } },
+        .scrub = .{ .smooth = 0.4 },
+    }));
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — alpha-test cutout"),
+        ctx.p().text("A MASK material: the base texture's alpha channel has holes, " ++
+            "and the alpha-test shader discards fragments below the cutoff. The " ++
+            "background shows through with a HARD edge — a cutout, not a translucent blend."),
+        scene_wrap,
+        ctx.p().class("hint")
+            .text("Keep scrolling — baseColorA fades 1→0 and the cutout silhouette dissolves away."),
+        ctx.p().text("Drag to orbit · wheel to zoom · click to pick (verve:glpick-cutout). " ++
+            "Cutout renders in the opaque pass — order-independent, no depth sort."),
+    });
+}
+
 /// /gl-multi: TWO independent GlScene islands on one page (P7 multi-instance).
 /// Each `<verve-island data-name="GlScene">` gets its own per-instance state
 /// slot keyed by vid; the bridge selects the right instance before each frame /
