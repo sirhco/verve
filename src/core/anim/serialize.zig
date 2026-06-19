@@ -351,7 +351,11 @@ fn writeProps(w: *std.Io.Writer, t: *const tween_mod.Tween, surface: Surface) an
             } else {
                 try w.print("\"@gl:{d}\":{{\"gl\":{d}", .{ g.target_id, g.target_id });
             }
-            var gl_first = false; // gl(/gls) already written, so to/f gets a comma
+            // Deferred SSR target: emit the FNV name hash so the client can
+            // resolve the real submesh index. Only present when nonzero, so
+            // resolved tweens stay byte-identical to the pre-deferred wire.
+            if (g.name_hash != 0) try w.print(",\"gh\":{d}", .{g.name_hash});
+            var gl_first = false; // gl(/gls/gh) already written, so to/f gets a comma
             switch (t.kind) {
                 .to => {
                     try writeValueField(w, "to", p.to, surface, &gl_first);
@@ -1263,6 +1267,28 @@ test "golden: gl-target tween emits gl/gls/to" {
             "\"p\":{\"@gl:16777473\":{\"gl\":16777473,\"gls\":7,\"to\":0.8}}}",
         json,
     );
+}
+
+test "gl deferred target serializes with gh field" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // placeholder 0x01000001 = 16777217 (material, submesh 0, roughness),
+    // name_hash 0xDEADBEEF = 3735928559.
+    const t = tween_mod.to(a, null).glTargetRangeHashed(0x01000001, 0xDEADBEEF, 0, 0.0, 1.0);
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expect(std.mem.indexOf(u8, json, "\"gh\":3735928559") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"gl\":16777217") != null);
+}
+
+test "gl resolved target serializes WITHOUT gh (back-compat)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // name_hash 0 = resolved target → no "gh" field.
+    const t = tween_mod.to(a, null).glTargetRangeHashed(0x01000001, 0, 0, 0.0, 1.0);
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expect(std.mem.indexOf(u8, json, "\"gh\"") == null);
 }
 
 test "golden: gl-target-from emits f alongside to" {
