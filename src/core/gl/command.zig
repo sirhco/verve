@@ -57,6 +57,7 @@ pub const BufferKind = enum(u32) { vertex = 0, index = 1 };
 /// SET_PIPELINE state bits.
 pub const state_depth_test: u32 = 1 << 0;
 pub const state_cull_back: u32 = 1 << 1;
+pub const state_blend: u32 = 1 << 2; // src-alpha over; depth-write off (transparency)
 
 /// CREATE_SHADER variant bits.
 pub const variant_vertex_color: u32 = 1 << 0;
@@ -2209,4 +2210,8 @@ test "endPostProcess without fxaa composites straight to canvas" {
     const n = collectTags(tags_raw, &tag_buf);
     // No ldr offscreen composite; composite draws inside a begin_frame canvas pass.
     try expectContainsInOrder(tag_buf[0..n], n, &.{ .begin_frame, .draw_fullscreen_quad, .end_frame });
+}
+
+test "state_blend bit value" {
+    try testing.expectEqual(@as(u32, 4), state_blend);
 }

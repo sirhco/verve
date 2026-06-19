@@ -935,44 +935,64 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         const pv = clipFix().mul(proj).mul(view);
         // World-space frustum planes for this frame's camera (P9 slice 2).
         const planes = gl.cull.frustumPlanes(pv);
+        // Two-pass draw (alpha transparency). Pass 1: opaque submeshes in vmesh
+        // order, depth-write on — byte-identical to the historical single-pass
+        // stream when every submesh is opaque. Pass 2: transparent submeshes
+        // sorted back-to-front with state_blend.
+
+        // Pass 1: opaque (alpha_mode == 0).
         // Sentinel 0 is never a valid variant (variant_pbr always set).
         var last_variant: u32 = 0;
-        var s: u32 = 0;
-        while (s < a.submesh_count) : (s += 1) {
-            if (s >= max_submesh) break;
-            // Cull before the variant/pipeline block (lazy SET_PIPELINE keeps the
-            // wire stream-order rule intact for the first DRAWN submesh).
-            const wbox = gl.cull.worldAabb(inst.submesh_aabb[s], inst.scene.world[s + 1]);
-            if (!gl.cull.aabbInFrustum(planes, wbox)) continue;
-            const sub = a.submesh(s);
-            const v = a.submeshVariant(s);
-            if (v != last_variant) {
-                enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_back);
-                enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
-                enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-                enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
-                last_variant = v;
+        {
+            var s: u32 = 0;
+            while (s < a.submesh_count) : (s += 1) {
+                if (s >= max_submesh) break;
+                if (a.submesh(s).alpha_mode != 0) continue;
+                if (!visibleAfterCull(inst, planes, s)) continue;
+                drawSubmesh(inst, a, &enc, s, gl.command.state_depth_test | gl.command.state_cull_back, &last_variant, env, pv);
             }
-            const world_s = inst.scene.world[s + 1];
-            inst.model_mats[s] = world_s.m;
-            inst.normal9s[s] = gl.math.normalMatrix(world_s);
-            inst.mvps[s] = pv.mul(world_s).m;
-            enc.bindTexture(0, texHandle(sub.tex_base));
-            enc.bindTexture(1, texHandle(sub.tex_mr));
-            enc.bindTexture(2, texHandle(sub.tex_normal));
-            enc.bindTexture(3, texHandle(sub.tex_emissive));
-            enc.bindTexture(4, texHandle(sub.tex_occlusion));
-            enc.drawPbr(
-                vbuf,
-                ibuf,
-                sub.index_byte_off,
-                sub.index_count,
-                @intCast(@intFromPtr(&inst.mvps[s])),
-                @intCast(@intFromPtr(&inst.model_mats[s])),
-                @intCast(@intFromPtr(&inst.normal9s[s])),
-                @intCast(@intFromPtr(&inst.mats[s])),
-                @intCast(@intFromPtr(&inst.camera_pos)),
-            );
+        }
+
+        // Pass 2: transparent (alpha_mode == 1) — sorted far→near, blend on.
+        var tcount: u32 = 0;
+        var tidx: [max_submesh]u32 = undefined;
+        var tkey: [max_submesh]f32 = undefined;
+        {
+            var s: u32 = 0;
+            while (s < a.submesh_count) : (s += 1) {
+                if (s >= max_submesh) break;
+                if (a.submesh(s).alpha_mode != 1) continue;
+                if (!visibleAfterCull(inst, planes, s)) continue;
+                const wbox = gl.cull.worldAabb(inst.submesh_aabb[s], inst.scene.world[s + 1]);
+                const cx = (wbox.min.x + wbox.max.x) * 0.5 - inst.camera_pos[0];
+                const cy = (wbox.min.y + wbox.max.y) * 0.5 - inst.camera_pos[1];
+                const cz = (wbox.min.z + wbox.max.z) * 0.5 - inst.camera_pos[2];
+                tidx[tcount] = s;
+                tkey[tcount] = cx * cx + cy * cy + cz * cz; // squared distance
+                tcount += 1;
+            }
+        }
+        // Selection sort by DESCENDING key (farthest first = back-to-front).
+        {
+            var i: u32 = 0;
+            while (i < tcount) : (i += 1) {
+                var maxj: u32 = i;
+                var j: u32 = i + 1;
+                while (j < tcount) : (j += 1) {
+                    if (tkey[j] > tkey[maxj]) maxj = j;
+                }
+                if (maxj != i) {
+                    std.mem.swap(f32, &tkey[i], &tkey[maxj]);
+                    std.mem.swap(u32, &tidx[i], &tidx[maxj]);
+                }
+            }
+        }
+        var tlast_variant: u32 = 0;
+        {
+            var i: u32 = 0;
+            while (i < tcount) : (i += 1) {
+                drawSubmesh(inst, a, &enc, tidx[i], gl.command.state_depth_test | gl.command.state_cull_back | gl.command.state_blend, &tlast_variant, env, pv);
+            }
         }
         enc.endFrame();
     } else {
@@ -982,6 +1002,59 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
     }
     _ = enc.finish();
     return @intCast(@intFromPtr(&cmd_buf));
+}
+
+/// Frustum-cull test for submesh `s` against this frame's world-space planes.
+/// Factored verbatim from the historical single-pass draw loop.
+fn visibleAfterCull(inst: *Inst, planes: [6]gl.cull.Plane, s: u32) bool {
+    const wbox = gl.cull.worldAabb(inst.submesh_aabb[s], inst.scene.world[s + 1]);
+    return gl.cull.aabbInFrustum(planes, wbox);
+}
+
+/// Emit the draw commands for a single submesh `s` with the given pipeline
+/// `state` word. Lazily re-emits SET_PIPELINE (+ lights/IBL/shadow rebind) when
+/// the variant changes vs `last_variant.*`. `pv` is the clip-space proj*view.
+/// Factored verbatim from the historical single-pass draw loop — opaque output
+/// is byte-identical to the old stream.
+fn drawSubmesh(
+    inst: *Inst,
+    a: *const gl.vmesh.Reader,
+    enc: *gl.Encoder,
+    s: u32,
+    state: u32,
+    last_variant: *u32,
+    env: *const gl.venv.Reader,
+    pv: gl.math.Mat4,
+) void {
+    const sub = a.submesh(s);
+    const v = a.submeshVariant(s);
+    if (v != last_variant.*) {
+        enc.setPipeline(shaderHandleFor(v), state);
+        enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
+        enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+        enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+        last_variant.* = v;
+    }
+    const world_s = inst.scene.world[s + 1];
+    inst.model_mats[s] = world_s.m;
+    inst.normal9s[s] = gl.math.normalMatrix(world_s);
+    inst.mvps[s] = pv.mul(world_s).m;
+    enc.bindTexture(0, texHandle(sub.tex_base));
+    enc.bindTexture(1, texHandle(sub.tex_mr));
+    enc.bindTexture(2, texHandle(sub.tex_normal));
+    enc.bindTexture(3, texHandle(sub.tex_emissive));
+    enc.bindTexture(4, texHandle(sub.tex_occlusion));
+    enc.drawPbr(
+        vbuf,
+        ibuf,
+        sub.index_byte_off,
+        sub.index_count,
+        @intCast(@intFromPtr(&inst.mvps[s])),
+        @intCast(@intFromPtr(&inst.model_mats[s])),
+        @intCast(@intFromPtr(&inst.normal9s[s])),
+        @intCast(@intFromPtr(&inst.mats[s])),
+        @intCast(@intFromPtr(&inst.camera_pos)),
+    );
 }
 
 /// One-time GPU resource upload, mirrored into `inst.registry` for restore replay.
@@ -1190,6 +1263,7 @@ fn applyAnimTarget(inst: *Inst, id: u32, value: f32) void {
                 .base_color_r => inst.mats[s][0] = value,
                 .base_color_g => inst.mats[s][1] = value,
                 .base_color_b => inst.mats[s][2] = value,
+                .base_color_a => inst.mats[s][3] = value,
             }
         },
         .model => switch (@as(gl.anim_target.ModelField, @enumFromInt(d.field))) {
