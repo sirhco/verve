@@ -4625,6 +4625,14 @@
             gl.enable(gl.CULL_FACE);
             gl.cullFace(gl.BACK);
           } else gl.disable(gl.CULL_FACE);
+          if (state & 4) { // state_blend: src-alpha over; depth-write off
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+            gl.depthMask(false);
+          } else {
+            gl.disable(gl.BLEND);
+            gl.depthMask(true);
+          }
           break;
         }
         case 5: { // DRAW — P1 unlit path; byte offset always 0, no color uniform
@@ -5450,7 +5458,7 @@
             // variant_linear_output (1<<9 = 0x200): scene renders into rgba16float
             // HDR target (post path). All other PBR variants render to canvas.
             const pbrFragFormat = (variant & 0x200) ? "rgba16float" : st.format;
-            const pipeline = device.createRenderPipeline({
+            const pbrDesc = {
               layout,
               vertex: {
                 module,
@@ -5486,9 +5494,33 @@
                 depthWriteEnabled: true,
                 depthCompare: "less",
               },
+            };
+            const pipeline = device.createRenderPipeline(pbrDesc);
+            // Blend variant: same module/layout/depth-format/color-format as the
+            // opaque pipeline — only src-alpha-over blend + depth-write-off differ.
+            // Selected by SET_PIPELINE when state_blend (state & 4) is set (Task 4).
+            const pipelineBlend = device.createRenderPipeline({
+              ...pbrDesc,
+              fragment: {
+                module,
+                entryPoint: "fs_main",
+                targets: [{
+                  format: pbrFragFormat,
+                  blend: {
+                    color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+                    alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+                  },
+                }],
+              },
+              depthStencil: {
+                format: "depth24plus",
+                depthWriteEnabled: false,
+                depthCompare: "less",
+              },
             });
             st.pipelines[handle] = {
               pipeline,
+              pipelineBlend,
               bgl0,
               bgl1,
               kind: "pbr",
@@ -5529,11 +5561,15 @@
           st.pipelines[handle] = { pipeline, kind: "unlit" };
           break;
         }
-        case 4: { // SET_PIPELINE — state ignored in slice 1
+        case 4: { // SET_PIPELINE — state word selects opaque vs blend variant
           const handle = dv.getUint32(off, true);
+          const state = dv.getUint32(off + 4, true);
           const entry = st.pipelines[handle];
           if (entry && st.pass) {
-            st.pass.setPipeline(entry.pipeline);
+            // state_blend (state & 4): bind the depth-write-off blend variant when
+            // present; fall back to the opaque pipeline if no blend variant exists.
+            const pipe = (state & 4 && entry.pipelineBlend) ? entry.pipelineBlend : entry.pipeline;
+            st.pass.setPipeline(pipe);
             st.active = entry;
           }
           break;
@@ -5695,7 +5731,8 @@
           } else if (kind === 1) {
             if (st.textures[handle]) { st.textures[handle].tex.destroy(); st.textures[handle] = null; }
           } else if (kind === 2) {
-            // Pipelines have no .destroy() (GC-only); drop the ref + clear active.
+            // Pipelines have no .destroy() (GC-only); drop the entry ref (which
+            // GC's both pipeline + pipelineBlend variants) + clear active.
             if (st.active === st.pipelines[handle]) st.active = null;
             st.pipelines[handle] = null;
           } else if (kind === 3) {
