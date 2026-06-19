@@ -189,6 +189,10 @@ const Inst = struct {
     scene_built: bool = false,
     node_rot: [max_submesh][3]f32 = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh,
     node_rot_applied: [max_submesh][3]f32 = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh,
+    node_pos: [max_submesh][3]f32 = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh,
+    node_pos_applied: [max_submesh][3]f32 = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh,
+    node_scale: [max_submesh][3]f32 = [_][3]f32{.{ 1, 1, 1 }} ** max_submesh,
+    node_scale_applied: [max_submesh][3]f32 = [_][3]f32{.{ 1, 1, 1 }} ** max_submesh,
     model_yaw_applied: f32 = 0,
 
     // Per-submesh draw pools — each drawPbr points at a STABLE distinct slot;
@@ -655,6 +659,8 @@ fn buildScene(inst: *Inst, a: *const gl.vmesh.Reader) void {
     }
     inst.model_yaw_applied = 0;
     inst.node_rot_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
+    inst.node_pos_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
+    inst.node_scale_applied = [_][3]f32{.{ 1, 1, 1 }} ** max_submesh;
     inst.scene_built = true;
 }
 
@@ -720,11 +726,20 @@ export fn glscene_frame_restore() void {
 
 // ── pick raycast ──────────────────────────────────────────────────────────────
 
-/// True when every per-submesh node Euler rotation is zero — the common no-anim
-/// case that unlocks the cheap single-walk raycast paths.
-fn nodeRotIdentity(inst: *const Inst) bool {
+/// True when every per-submesh node transform is identity (zero Euler rotation,
+/// zero translation, unit scale) — the common no-anim case that unlocks the
+/// cheap single-walk raycast paths. A non-identity translate/scale (even with
+/// zero rotation) must take the inverse-transform path so picks stay aligned
+/// with the animated node.
+fn nodeXformIdentity(inst: *const Inst) bool {
     for (inst.node_rot) |r| {
         if (r[0] != 0 or r[1] != 0 or r[2] != 0) return false;
+    }
+    for (inst.node_pos) |p| {
+        if (p[0] != 0 or p[1] != 0 or p[2] != 0) return false;
+    }
+    for (inst.node_scale) |sc| {
+        if (sc[0] != 1 or sc[1] != 1 or sc[2] != 1) return false;
     }
     return true;
 }
@@ -740,7 +755,7 @@ fn raycastSubmesh(inst: *const Inst, a: *const gl.vmesh.Reader, aspect: f32, ndc
     const verts_f32 = bytesAsF32(a.vertices);
     const indices_u16 = bytesAsU16(a.indices);
 
-    const rot_identity = nodeRotIdentity(inst);
+    const rot_identity = nodeXformIdentity(inst);
     if (!inst.scene_built or (inst.model_yaw == 0 and rot_identity)) {
         const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, 12, indices_u16, r) orelse return null;
         return submeshOfTri(a, hit.tri_index);
@@ -835,6 +850,21 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             if (r[0] != ra[0] or r[1] != ra[1] or r[2] != ra[2]) {
                 inst.scene.setRotation(n + 1, nodeQuat(r));
                 inst.node_rot_applied[n] = r;
+            }
+        }
+        var pn: u32 = 0;
+        while (pn + 1 < inst.scene.count) : (pn += 1) {
+            const p = inst.node_pos[pn];
+            const pa = inst.node_pos_applied[pn];
+            if (p[0] != pa[0] or p[1] != pa[1] or p[2] != pa[2]) {
+                inst.scene.setPosition(pn + 1, gl.math.Vec3.init(p[0], p[1], p[2]));
+                inst.node_pos_applied[pn] = p;
+            }
+            const sc = inst.node_scale[pn];
+            const sca = inst.node_scale_applied[pn];
+            if (sc[0] != sca[0] or sc[1] != sca[1] or sc[2] != sca[2]) {
+                inst.scene.setScale(pn + 1, gl.math.Vec3.init(sc[0], sc[1], sc[2]));
+                inst.node_scale_applied[pn] = sc;
             }
         }
         inst.scene.updateWorld();
@@ -1163,8 +1193,19 @@ fn applyAnimTarget(inst: *Inst, id: u32, value: f32) void {
             .yaw => inst.model_yaw = value,
         },
         .node => {
-            if (d.submesh >= max_submesh) return;
-            inst.node_rot[d.submesh][d.field] = value;
+            const s: usize = d.submesh;
+            if (s >= max_submesh) return;
+            switch (@as(gl.anim_target.NodeField, @enumFromInt(d.field))) {
+                .rotation_x => inst.node_rot[s][0] = value,
+                .rotation_y => inst.node_rot[s][1] = value,
+                .rotation_z => inst.node_rot[s][2] = value,
+                .translate_x => inst.node_pos[s][0] = value,
+                .translate_y => inst.node_pos[s][1] = value,
+                .translate_z => inst.node_pos[s][2] = value,
+                .scale_x => inst.node_scale[s][0] = value,
+                .scale_y => inst.node_scale[s][1] = value,
+                .scale_z => inst.node_scale[s][2] = value,
+            }
         },
     }
 }

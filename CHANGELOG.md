@@ -19,6 +19,15 @@ versions follow [Semantic Versioning](https://semver.org/).
   `name_hash != 0`, so already-resolved tweens serialize byte-identically. Frozen target-id
   contract unchanged. The `/gl-scene` demo drives `material:Cube.metallic` + `node:Cube.rotationY`
   from SSR.
+- **gl node translate/scale anim targets** (`src/core/gl/anim_target.zig`,
+  `src/client/islands/GlScene.zig`, `src/app/components.zig`): six new frozen node-kind
+  target fields — `translateX/Y/Z` (ids `0x03000003`–`05`) and `scaleX/Y/Z` (ids
+  `0x03000006`–`08`) — extend the P6 node vocabulary beyond rotation. The runtime applies
+  them as absolute-overwrite `setPosition`/`setScale` each frame, composing with the node's
+  existing rotation. Non-uniform scale makes cross-node pick `t` approximate. The `/gl-scene`
+  SSR scrub demo now also drives `node:Cube.translateY` (−0.4 → 0.4) and `node:Cube.scaleX`
+  (0.7 → 1.3) via `resolvePathStaticDeferred` + `glTargetRangeHashed`. Frozen ids are
+  append-only; pre-existing ids unchanged.
 - **gl adaptive PNG scanline filtering** (`src/core/gl/png.zig`): `encodeRgba` now
   picks the best PNG filter (None/Sub/Up/Average/Paeth) per scanline using a
   minimum-sum-of-absolute-differences (MSAD) scoring pass, then writes the chosen

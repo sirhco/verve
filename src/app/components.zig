@@ -1076,22 +1076,31 @@ pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
     // placeholder id carries kind+field with submesh bits 0.
     const metallic = comptime (verve.gl.anim_target.resolvePathStaticDeferred("material:Cube.metallic") orelse unreachable);
     const roty = comptime (verve.gl.anim_target.resolvePathStaticDeferred("node:Cube.rotationY") orelse unreachable);
+    const transy = comptime (verve.gl.anim_target.resolvePathStaticDeferred("node:Cube.translateY") orelse unreachable);
+    const sclx = comptime (verve.gl.anim_target.resolvePathStaticDeferred("node:Cube.scaleX") orelse unreachable);
     const metallic_ph = comptime verve.gl.anim_target.encode(metallic.kind, 0, metallic.field);
     const roty_ph = comptime verve.gl.anim_target.encode(roty.kind, 0, roty.field);
+    const transy_ph = comptime verve.gl.anim_target.encode(transy.kind, 0, transy.field);
+    const sclx_ph = comptime verve.gl.anim_target.encode(sclx.kind, 0, sclx.field);
 
     // SSR dolly tween: setter slot 0 = the page-default gl setter the bridge
     // resolves at hydration. Targets are disjoint from the island's scrub
     // timeline (island = yaw/roughness/rotationX/emissiveR; SSR = distance +
-    // deferred metallic + deferred rotationY) so writes never collide. The tween
-    // is hung on a wrapper that CONTAINS the island's 300vh section so the
-    // ScrollTrigger selector (SSR cannot serialize ref handles) resolves within
-    // scope — a selector on a sibling element would query an empty subtree.
+    // deferred metallic + deferred rotationY + deferred translateY + deferred
+    // scaleX) so writes never collide. Note: translateY/scaleX are absolute
+    // overwrites (not delta) and non-uniform scale makes cross-node pick-t
+    // approximate when multiple node targets share the same scroll range. The
+    // tween is hung on a wrapper that CONTAINS the island's 300vh section so
+    // the ScrollTrigger selector (SSR cannot serialize ref handles) resolves
+    // within scope — a selector on a sibling element would query an empty subtree.
     const scene_wrap = ctx.div()
         .children(.{scene})
         .animate(anim.to(a, null)
         .glTargetRange(dolly_id, 0, 4.0, 2.5)
         .glTargetRangeHashed(metallic_ph, metallic.name_hash, 0, 0.0, 1.0)
         .glTargetRangeHashed(roty_ph, roty.name_hash, 0, -0.6, 0.6)
+        .glTargetRangeHashed(transy_ph, transy.name_hash, 0, -0.4, 0.4)
+        .glTargetRangeHashed(sclx_ph, sclx.name_hash, 0, 0.7, 1.3)
         .duration(1).ease(.linear)
         .scrollTrigger(.{
         .trigger = "section[data-ref^=glscene-scroll-section]",
