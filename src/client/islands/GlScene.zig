@@ -158,6 +158,7 @@ const Inst = struct {
 
     // Scrub timeline (Task 9).
     anim_setter_slot: u32 = 0,
+    anim_resolver_slot: u32 = 0,
     scrub_built: bool = false,
     scrub_anim_id: u32 = 0,
 
@@ -1043,6 +1044,27 @@ const trampolines = blk: {
     break :blk t;
 };
 
+/// Per-instance deferred-target resolver trampoline. Maps a deferred SSR target
+/// (placeholder id + FNV name_hash) to a frozen id by looking up the submesh
+/// index in THIS instance's loaded vmesh name table. Returns 0 when the mesh
+/// isn't loaded yet or the name is absent — the bridge skips and retries.
+fn makeResolverTrampoline(comptime slot: usize) fn (u32, u32) u32 {
+    return struct {
+        fn f(placeholder_id: u32, name_hash: u32) u32 {
+            const inst = &instances[slot];
+            const a = if (inst.asset) |*as| as else return 0;
+            const idx = a.findName(name_hash) orelse return 0;
+            const d = gl.anim_target.decode(placeholder_id) orelse return 0;
+            return gl.anim_target.encode(d.kind, @intCast(idx), d.field);
+        }
+    }.f;
+}
+const resolver_trampolines = blk: {
+    var t: [MAX_INSTANCES]*const fn (u32, u32) u32 = undefined;
+    for (0..MAX_INSTANCES) |i| t[i] = &makeResolverTrampoline(i);
+    break :blk t;
+};
+
 /// Build the scroll-scrubbed turntable + roughness-ramp timeline. Runs ONCE per
 /// instance, after the vmesh Reader is available (so `material:<Name>` resolves).
 fn buildScrubTimeline(inst: *Inst) void {
@@ -1060,6 +1082,11 @@ fn buildScrubTimeline(inst: *Inst) void {
         inst.anim_setter_slot = verve.animGlSetter(trampolines[slotIndex(inst)]);
     const slot = inst.anim_setter_slot;
     if (slot == 0) return; // setter registration failed → no scrub
+
+    // Register THIS instance's deferred-target resolver (page-default) once, so
+    // SSR-declared material:/node: tweens can resolve name_hash → submesh index.
+    if (inst.anim_resolver_slot == 0)
+        inst.anim_resolver_slot = verve.animGlResolver(resolver_trampolines[slotIndex(inst)]);
 
     const mark = verve.chunkArenaMark();
     defer verve.chunkArenaReset(mark);
@@ -1147,4 +1174,15 @@ fn applyAnimTarget(inst: *Inst, id: u32, value: f32) void {
 pub export fn glscene_anim_set(target_id: u32, value: f64) void {
     const inst = current orelse return;
     applyAnimTarget(inst, target_id, @floatCast(value));
+}
+
+/// Resolve a deferred material:/node: target: map name_hash → submesh index via
+/// the loaded vmesh name table and re-encode to a frozen id. Returns 0 when the
+/// mesh isn't loaded yet or the name is absent (the bridge skips and retries).
+pub export fn glscene_resolve_target(placeholder_id: u32, name_hash: u32) u32 {
+    const inst = current orelse return 0;
+    const a = if (inst.asset) |*as| as else return 0;
+    const idx = a.findName(name_hash) orelse return 0;
+    const d = gl.anim_target.decode(placeholder_id) orelse return 0;
+    return gl.anim_target.encode(d.kind, @intCast(idx), d.field);
 }
