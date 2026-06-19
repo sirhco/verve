@@ -217,6 +217,53 @@ fn paethPredictor(a: u8, b: u8, c: u8) u8 {
     return c;
 }
 
+/// Signed magnitude of a residual byte (libpng MSAD metric): a small +/- value
+/// near 0 or 256 scores low, mid-range scores high.
+fn sad(b: u8) u16 {
+    const u: u16 = b;
+    return @min(u, 256 - u);
+}
+
+/// Residual of byte `i` of scanline `cur` under PNG filter `f` (0..4), given the
+/// previous ORIGINAL row `prev` and bytes-per-pixel `bpp`. Inverse of the
+/// decoder's reconstruction (png.zig:185). All arithmetic wraps.
+fn filterByte(f: u8, cur: []const u8, prev: []const u8, i: usize, bpp: usize) u8 {
+    const x = cur[i];
+    const left: u8 = if (i >= bpp) cur[i - bpp] else 0;
+    const above: u8 = prev[i];
+    const upleft: u8 = if (i >= bpp) prev[i - bpp] else 0;
+    return switch (f) {
+        0 => x, // None
+        1 => x -% left, // Sub
+        2 => x -% above, // Up
+        3 => x -% @as(u8, @intCast((@as(u16, left) + @as(u16, above)) / 2)), // Average
+        4 => x -% paethPredictor(left, above, upleft), // Paeth
+        else => unreachable,
+    };
+}
+
+/// Choose the PNG filter (0..4) for one scanline by Minimum Sum of Absolute
+/// Differences, write the chosen residual into `out` (out.len == cur.len), and
+/// return the filter type. `prev` = previous original row (zero slice on row 0).
+/// Tie → lowest filter index (deterministic).
+fn chooseScanlineFilter(cur: []const u8, prev: []const u8, bpp: usize, out: []u8) u8 {
+    var best_f: u8 = 0;
+    var best_score: u64 = std.math.maxInt(u64);
+    var f: u8 = 0;
+    while (f < 5) : (f += 1) {
+        var score: u64 = 0;
+        var i: usize = 0;
+        while (i < cur.len) : (i += 1) score += sad(filterByte(f, cur, prev, i, bpp));
+        if (score < best_score) {
+            best_score = score;
+            best_f = f;
+        }
+    }
+    var i: usize = 0;
+    while (i < cur.len) : (i += 1) out[i] = filterByte(best_f, cur, prev, i, bpp);
+    return best_f;
+}
+
 // ── encode ────────────────────────────────────────────────────────────────────
 
 /// Build a PNG from pre-filtered scanline data.
@@ -362,4 +409,40 @@ test "decode applies sub/up/average/paeth filters" {
 
 test "decode rejects garbage" {
     try testing.expectError(error.BadSignature, decode(testing.allocator, "notapng"));
+}
+
+test "chooseScanlineFilter: Sub wins on a horizontal ramp (row 0)" {
+    // 4 RGBA pixels, R=G=B stepping +10, A=255; prev row all zeros (row 0).
+    // None residual grows (10..40); Sub residual is the constant +10 delta
+    // (and Paeth degenerates to Sub when above/upleft are 0) → Sub (index 1)
+    // wins the tie by lowest index.
+    const cur = [_]u8{ 10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255, 40, 40, 40, 255 };
+    const prev = [_]u8{0} ** 16;
+    var out: [16]u8 = undefined;
+    const f = chooseScanlineFilter(&cur, &prev, 4, &out);
+    try testing.expectEqual(@as(u8, 1), f); // Sub
+    // Sub residual: px0 = cur (left=0); px1.. = cur - left = (10,10,10,0)
+    try testing.expectEqual(@as(u8, 10), out[4]); // px1 R = 20 - 10
+    try testing.expectEqual(@as(u8, 0), out[7]); // px1 A = 255 - 255 (wrap)
+}
+
+test "chooseScanlineFilter: Up wins + zero residual on a vertically-constant row" {
+    // row 1 identical to row 0 → Up residual is all zeros → score 0 → Up (2).
+    const prev = [_]u8{ 5, 9, 13, 255, 6, 10, 14, 255 };
+    const cur = prev;
+    var out: [8]u8 = undefined;
+    const f = chooseScanlineFilter(&cur, &prev, 4, &out);
+    try testing.expectEqual(@as(u8, 2), f); // Up
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 8), &out);
+}
+
+test "chooseScanlineFilter: deterministic (same input → same filter + residual)" {
+    const cur = [_]u8{ 3, 200, 17, 255, 40, 12, 99, 255 };
+    const prev = [_]u8{ 1, 190, 20, 255, 35, 30, 80, 255 };
+    var a: [8]u8 = undefined;
+    var b: [8]u8 = undefined;
+    const fa = chooseScanlineFilter(&cur, &prev, 4, &a);
+    const fb = chooseScanlineFilter(&cur, &prev, 4, &b);
+    try testing.expectEqual(fa, fb);
+    try testing.expectEqualSlices(u8, &a, &b);
 }
