@@ -6,6 +6,15 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **gl adaptive PNG scanline filtering** (`src/core/gl/png.zig`): `encodeRgba` now
+  picks the best PNG filter (None/Sub/Up/Average/Paeth) per scanline using a
+  minimum-sum-of-absolute-differences (MSAD) scoring pass, then writes the chosen
+  filtered row to DEFLATE. The demo's externalized `demo.tex0.png` shrank from
+  ~10 799 B (filter-None) to ~6 014 B — a 44 % reduction with no decode-side change
+  (existing round-trip tests confirm identical RGBA output).
+
 ## [0.5.19] - 2026-06-18
 
 ### Added
