@@ -1263,6 +1263,7 @@ fn applyAnimTarget(inst: *Inst, id: u32, value: f32) void {
                 .base_color_r => inst.mats[s][0] = value,
                 .base_color_g => inst.mats[s][1] = value,
                 .base_color_b => inst.mats[s][2] = value,
+                .base_color_a => inst.mats[s][3] = value,
             }
         },
         .model => switch (@as(gl.anim_target.ModelField, @enumFromInt(d.field))) {
