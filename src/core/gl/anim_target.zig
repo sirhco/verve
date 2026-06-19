@@ -34,7 +34,7 @@ const vmesh = @import("vmesh.zig");
 
 pub const Kind = enum(u8) { camera = 0, material = 1, model = 2, node = 3 };
 pub const CameraField = enum(u8) { yaw = 0, pitch = 1, distance = 2 };
-pub const MaterialField = enum(u8) { metallic = 0, roughness = 1, emissive_r = 2, emissive_g = 3, emissive_b = 4 };
+pub const MaterialField = enum(u8) { metallic = 0, roughness = 1, emissive_r = 2, emissive_g = 3, emissive_b = 4, base_color_r = 5, base_color_g = 6, base_color_b = 7 };
 pub const ModelField = enum(u8) { yaw = 0 };
 pub const NodeField = enum(u8) {
     rotation_x = 0,
@@ -130,6 +130,9 @@ fn materialField(s: []const u8) ?u8 {
     if (std.mem.eql(u8, s, "emissiveR")) return @intFromEnum(MaterialField.emissive_r);
     if (std.mem.eql(u8, s, "emissiveG")) return @intFromEnum(MaterialField.emissive_g);
     if (std.mem.eql(u8, s, "emissiveB")) return @intFromEnum(MaterialField.emissive_b);
+    if (std.mem.eql(u8, s, "baseColorR")) return @intFromEnum(MaterialField.base_color_r);
+    if (std.mem.eql(u8, s, "baseColorG")) return @intFromEnum(MaterialField.base_color_g);
+    if (std.mem.eql(u8, s, "baseColorB")) return @intFromEnum(MaterialField.base_color_b);
     return null;
 }
 
@@ -319,8 +322,8 @@ test "(b) decode rejects camera field 3" {
     try testing.expectEqual(@as(?Decoded, null), decode(id));
 }
 
-test "(b) decode rejects material field 5" {
-    const id = encode(.material, 0, 5);
+test "(b) decode rejects material field 8" {
+    const id = encode(.material, 0, 8);
     try testing.expectEqual(@as(?Decoded, null), decode(id));
 }
 
@@ -662,4 +665,34 @@ test "(g) frozen-id regression: node translate/scale ids" {
     try testing.expectEqual(@as(u32, 0x03000006), encode(.node, 0, @intFromEnum(NodeField.scale_x)));
     try testing.expectEqual(@as(u32, 0x03000007), encode(.node, 0, @intFromEnum(NodeField.scale_y)));
     try testing.expectEqual(@as(u32, 0x03000008), encode(.node, 0, @intFromEnum(NodeField.scale_z)));
+}
+
+test "(h) resolvePathStaticDeferred: material baseColor carries kind+field+hash" {
+    const r = resolvePathStaticDeferred("material:Cube.baseColorR") orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(Kind.material, r.kind);
+    try testing.expectEqual(@as(u8, @intFromEnum(MaterialField.base_color_r)), r.field);
+    try testing.expectEqual(vmesh.Reader.nameHash("Cube"), r.name_hash);
+
+    const b = resolvePathStaticDeferred("material:Cube.baseColorB") orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(@as(u8, @intFromEnum(MaterialField.base_color_b)), b.field);
+}
+
+test "(c) resolvePath material:Cube.baseColorR / baseColorG via fixture reader" {
+    const fr = try makeFixtureReader(testing.allocator);
+    defer testing.allocator.free(fr.bytes);
+    try testing.expectEqual(
+        encode(.material, 0, @intFromEnum(MaterialField.base_color_r)),
+        resolvePath(&fr.reader, "material:Cube.baseColorR") orelse return error.TestUnexpectedNull,
+    );
+    try testing.expectEqual(
+        encode(.material, 0, @intFromEnum(MaterialField.base_color_g)),
+        resolvePath(&fr.reader, "material:Cube.baseColorG") orelse return error.TestUnexpectedNull,
+    );
+}
+
+test "(g) frozen-id regression: material baseColor ids" {
+    // material kind=0x01, submesh 0: baseColorR/G/B field 5/6/7 → 0x01000005 / 06 / 07
+    try testing.expectEqual(@as(u32, 0x01000005), encode(.material, 0, @intFromEnum(MaterialField.base_color_r)));
+    try testing.expectEqual(@as(u32, 0x01000006), encode(.material, 0, @intFromEnum(MaterialField.base_color_g)));
+    try testing.expectEqual(@as(u32, 0x01000007), encode(.material, 0, @intFromEnum(MaterialField.base_color_b)));
 }

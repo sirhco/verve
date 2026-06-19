@@ -1187,6 +1187,9 @@ fn applyAnimTarget(inst: *Inst, id: u32, value: f32) void {
                 .emissive_r => inst.mats[s][8] = value,
                 .emissive_g => inst.mats[s][9] = value,
                 .emissive_b => inst.mats[s][10] = value,
+                .base_color_r => inst.mats[s][0] = value,
+                .base_color_g => inst.mats[s][1] = value,
+                .base_color_b => inst.mats[s][2] = value,
             }
         },
         .model => switch (@as(gl.anim_target.ModelField, @enumFromInt(d.field))) {
