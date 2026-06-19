@@ -1079,7 +1079,7 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     inst.registry.recordBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
 
     // Create + record only the distinct shader variants the mesh actually uses.
-    var shader_seen: [5]bool = .{ false, false, false, false, false };
+    var shader_seen: [10]bool = .{false} ** 10;
     var sv: u32 = 0;
     while (sv < a.submesh_count) : (sv += 1) {
         if (sv >= max_submesh) break;
