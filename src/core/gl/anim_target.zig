@@ -108,6 +108,46 @@ fn resolveCameraModel(path: []const u8) ?u32 {
     return null;
 }
 
+// ── shared material/node field parsing ────────────────────────────────────────
+
+fn materialField(s: []const u8) ?u8 {
+    if (std.mem.eql(u8, s, "metallic")) return @intFromEnum(MaterialField.metallic);
+    if (std.mem.eql(u8, s, "roughness")) return @intFromEnum(MaterialField.roughness);
+    if (std.mem.eql(u8, s, "emissiveR")) return @intFromEnum(MaterialField.emissive_r);
+    if (std.mem.eql(u8, s, "emissiveG")) return @intFromEnum(MaterialField.emissive_g);
+    if (std.mem.eql(u8, s, "emissiveB")) return @intFromEnum(MaterialField.emissive_b);
+    return null;
+}
+
+fn nodeField(s: []const u8) ?u8 {
+    if (std.mem.eql(u8, s, "rotationX")) return @intFromEnum(NodeField.rotation_x);
+    if (std.mem.eql(u8, s, "rotationY")) return @intFromEnum(NodeField.rotation_y);
+    if (std.mem.eql(u8, s, "rotationZ")) return @intFromEnum(NodeField.rotation_z);
+    return null;
+}
+
+pub const Deferred = struct { kind: Kind, field: u8, name_hash: u32 };
+
+/// Reader-free resolver for SSR material:/node: targets. Parses the field and
+/// computes the FNV name hash (both pure); the submesh INDEX is resolved on the
+/// client via Reader.findName. Returns null for camera/model (use resolvePathStatic)
+/// and for any unknown path/field.
+pub fn resolvePathStaticDeferred(path: []const u8) ?Deferred {
+    if (std.mem.startsWith(u8, path, "material:")) {
+        const rest = path["material:".len..];
+        const dot = std.mem.lastIndexOfScalar(u8, rest, '.') orelse return null;
+        const f = materialField(rest[dot + 1 ..]) orelse return null;
+        return Deferred{ .kind = .material, .field = f, .name_hash = vmesh.Reader.nameHash(rest[0..dot]) };
+    }
+    if (std.mem.startsWith(u8, path, "node:")) {
+        const rest = path["node:".len..];
+        const dot = std.mem.lastIndexOfScalar(u8, rest, '.') orelse return null;
+        const f = nodeField(rest[dot + 1 ..]) orelse return null;
+        return Deferred{ .kind = .node, .field = f, .name_hash = vmesh.Reader.nameHash(rest[0..dot]) };
+    }
+    return null;
+}
+
 // ── resolvePath ───────────────────────────────────────────────────────────────
 
 /// Resolve a frozen path string to a target id.  Call once at setup.
@@ -126,14 +166,7 @@ pub fn resolvePath(reader: *const vmesh.Reader, path: []const u8) ?u32 {
         const field_str = rest[dot + 1 ..];
 
         // Resolve material field.
-        const mat_field: u8 = blk: {
-            if (std.mem.eql(u8, field_str, "metallic")) break :blk @intFromEnum(MaterialField.metallic);
-            if (std.mem.eql(u8, field_str, "roughness")) break :blk @intFromEnum(MaterialField.roughness);
-            if (std.mem.eql(u8, field_str, "emissiveR")) break :blk @intFromEnum(MaterialField.emissive_r);
-            if (std.mem.eql(u8, field_str, "emissiveG")) break :blk @intFromEnum(MaterialField.emissive_g);
-            if (std.mem.eql(u8, field_str, "emissiveB")) break :blk @intFromEnum(MaterialField.emissive_b);
-            return null;
-        };
+        const mat_field: u8 = materialField(field_str) orelse return null;
 
         // Look up name in the vmesh name table.
         const hash = vmesh.Reader.nameHash(name_str);
@@ -151,12 +184,7 @@ pub fn resolvePath(reader: *const vmesh.Reader, path: []const u8) ?u32 {
         const field_str = rest[dot + 1 ..];
 
         // Resolve node field.
-        const node_field: u8 = blk: {
-            if (std.mem.eql(u8, field_str, "rotationX")) break :blk @intFromEnum(NodeField.rotation_x);
-            if (std.mem.eql(u8, field_str, "rotationY")) break :blk @intFromEnum(NodeField.rotation_y);
-            if (std.mem.eql(u8, field_str, "rotationZ")) break :blk @intFromEnum(NodeField.rotation_z);
-            return null;
-        };
+        const node_field: u8 = nodeField(field_str) orelse return null;
 
         // Look up name in the vmesh name table.
         const hash = vmesh.Reader.nameHash(name_str);
@@ -545,4 +573,35 @@ test "(g) frozen-id regression: resolvePath new P6 paths via fixture reader" {
     try testing.expectEqual(@as(?u32, 0x01000002), resolvePath(&fr.reader, "material:Cube.emissiveR"));
     try testing.expectEqual(@as(?u32, 0x01000003), resolvePath(&fr.reader, "material:Cube.emissiveG"));
     try testing.expectEqual(@as(?u32, 0x01000004), resolvePath(&fr.reader, "material:Cube.emissiveB"));
+}
+
+// ── (h) resolvePathStaticDeferred (reader-free material:/node:) ───────────────
+
+test "(h) resolvePathStaticDeferred: material/node carry kind+field+hash" {
+    const m = resolvePathStaticDeferred("material:Cube.roughness") orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(Kind.material, m.kind);
+    try testing.expectEqual(@as(u8, @intFromEnum(MaterialField.roughness)), m.field);
+    try testing.expectEqual(vmesh.Reader.nameHash("Cube"), m.name_hash);
+
+    const e = resolvePathStaticDeferred("material:Cube.emissiveG") orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(@as(u8, @intFromEnum(MaterialField.emissive_g)), e.field);
+
+    const n = resolvePathStaticDeferred("node:rotor1.rotationZ") orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(Kind.node, n.kind);
+    try testing.expectEqual(@as(u8, @intFromEnum(NodeField.rotation_z)), n.field);
+    try testing.expectEqual(vmesh.Reader.nameHash("rotor1"), n.name_hash);
+}
+
+test "(h) resolvePathStaticDeferred: camera/model/unknown → null" {
+    const nulls = [_][]const u8{
+        "camera.yaw",          "model.yaw",     "material:Cube.bogus",
+        "node:Cube.rotationW", "material:Cube", "banana",
+        "",
+    };
+    for (nulls) |p| try testing.expectEqual(@as(?Deferred, null), resolvePathStaticDeferred(p));
+}
+
+test "(h) resolvePathStaticDeferred is comptime-evaluable" {
+    const d = comptime resolvePathStaticDeferred("material:Cube.roughness").?;
+    try testing.expectEqual(Kind.material, d.kind);
 }
