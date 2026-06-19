@@ -8,6 +8,21 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **gl alpha-test cutout (MASK)** (`src/core/gl/vmesh.zig`, `src/core/gl/gltf.zig`,
+  `src/core/gl/command.zig`, `src/client/islands/GlScene.zig`, `src/core/gl/fixture.zig`,
+  `tools/gen_cutout_glb.zig`, `build.zig`, `src/app/components.zig`, `src/app/routes.zig`,
+  `docs/24-gl.md`): per-submesh alpha-test cutout (glTF `alphaMode:"MASK"`) on both
+  backends. vmesh v10 adds `alpha_cutoff: f32` per submesh (offset 76, struct grows to
+  80 B; default 0.5). The glTF parser maps `"alphaMode":"MASK"` → `alpha_mode=2` and reads
+  `alphaCutoff`. The new `variant_alpha_test` shader bit (`1<<10`) gates a `discard` when
+  the sampled base-texture alpha × base-color alpha falls below the cutoff (transported in
+  `mats[s][11]`). MASK draws in the **opaque pass** (predicate `alpha_mode != 1`) —
+  order-independent, no blend, no sort — so cutout holes show the background with a hard
+  edge. New `pbrCubeCutoutGlb` fixture (a `Cutout` cube with an alpha-hole base texture +
+  MASK material) drives a new `/gl-cutout` route: an SSR scrub dissolves the cutout by
+  animating the deferred `material:Cutout.baseColorA` 1.0 → 0.05 (more fragments fall below
+  the cutoff as alpha drops). Non-goals: cutout shadows (depth pass renders a solid
+  silhouette), `doubleSided`, animating `alphaCutoff` directly.
 - **gl alpha-blend transparency + `baseColorA` anim target** (`src/core/gl/vmesh.zig`,
   `src/core/gl/gltf.zig`, `src/core/gl/command.zig`, `src/client/islands/GlScene.zig`,
   `src/core/gl/anim_target.zig`, `src/core/gl/fixture.zig`, `src/app/components.zig`,

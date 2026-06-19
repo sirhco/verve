@@ -610,6 +610,264 @@ pub fn pbrCubeGlb(alloc: Allocator, opts: struct { with_tangents: bool = true })
     return glb;
 }
 
+// ── alpha-test cutout cube fixture (MASK) ────────────────────────────────────────
+
+/// Single-cube glb whose base-color texture carries a REAL alpha channel with
+/// HOLES (zero-alpha texels) and whose material is `"alphaMode":"MASK"` with
+/// `"alphaCutoff":0.5`. The `variant_alpha_test` shader discards any fragment
+/// whose sampled base-texture alpha is below the cutoff, so the holes punch
+/// clean see-through cutouts (hard edge, no translucency).
+///
+/// Hole pattern: a 32-px diagonal-stripe grid (zero alpha along the stripes)
+/// plus a punched circular center, so the cutout is unmistakable from any
+/// viewing angle. The non-hole texels keep alpha=255 (fully kept).
+///
+/// Mesh name "Cutout" (node "CutoutCube") so name-based animation targets the
+/// submesh as `material:Cutout.baseColorA`; the /gl-cutout dissolve scrub
+/// drives baseColorA 1.0→0.0 (the base-color alpha multiplies the sampled
+/// texture alpha → as it falls, more texels drop below the cutoff and the
+/// silhouette erodes). NO tangents are baked: the asset-gen tool generates
+/// them, matching demo/mixed/shadow.
+pub fn pbrCubeCutoutGlb(alloc: Allocator) ![]u8 {
+    // ── 1. Build the base-color map with alpha holes (256×256 RGBA) ────────────
+    const base_dim: u32 = 256;
+    const base_map = try alloc.alloc(u8, base_dim * base_dim * 4);
+    defer alloc.free(base_map);
+    {
+        const cx: i64 = @intCast(base_dim / 2);
+        const cy: i64 = @intCast(base_dim / 2);
+        // Punched-center radius² (≈ 1/6 of the half-extent) — a clean round hole.
+        const r: i64 = @intCast(base_dim / 6);
+        const r2: i64 = r * r;
+        var y: u32 = 0;
+        while (y < base_dim) : (y += 1) {
+            var x: u32 = 0;
+            while (x < base_dim) : (x += 1) {
+                const idx = (y * base_dim + x) * 4;
+                // Opaque checkerboard base color (warm/cool cells) so the kept
+                // texels read clearly against the punched holes.
+                const cell = ((x / 32) + (y / 32)) % 2 == 0;
+                base_map[idx + 0] = if (cell) 230 else 60;
+                base_map[idx + 1] = if (cell) 90 else 170;
+                base_map[idx + 2] = if (cell) 60 else 210;
+                // Alpha HOLES: diagonal-stripe grid + punched circular center.
+                // Stripe holes: an 8-px-wide zero-alpha band every 32 px along
+                // the (x+y) diagonal → an unmistakable lattice of cutouts.
+                const diag: u32 = (x +% y) % 32;
+                const on_stripe = diag < 8;
+                // Center hole: texels inside the circle are punched out.
+                const dx: i64 = @as(i64, @intCast(x)) - cx;
+                const dy: i64 = @as(i64, @intCast(y)) - cy;
+                const in_center = (dx * dx + dy * dy) < r2;
+                base_map[idx + 3] = if (on_stripe or in_center) 0 else 255;
+            }
+        }
+    }
+
+    // ── The four 8×8 PBR side maps (same scheme as pbrCubeGlb) ─────────────────
+    var mr_map: [8 * 8 * 4]u8 = undefined;
+    var nrm_map: [8 * 8 * 4]u8 = undefined;
+    var emi_map: [8 * 8 * 4]u8 = undefined;
+    var occ_map: [8 * 8 * 4]u8 = undefined;
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            mr_map[idx + 0] = 0;
+            mr_map[idx + 1] = @intCast(col * 255 / 7);
+            mr_map[idx + 2] = @intCast(row * 255 / 7);
+            mr_map[idx + 3] = 255;
+            const groove: bool = ((row + col) % 4) < 2;
+            nrm_map[idx + 0] = if (groove) 160 else 96;
+            nrm_map[idx + 1] = if (groove) 96 else 160;
+            nrm_map[idx + 2] = 255;
+            nrm_map[idx + 3] = 255;
+            const bright = (row >= 3 and row <= 4 and col >= 3 and col <= 4);
+            emi_map[idx + 0] = if (bright) 255 else 0;
+            emi_map[idx + 1] = if (bright) 255 else 0;
+            emi_map[idx + 2] = if (bright) 255 else 0;
+            emi_map[idx + 3] = 255;
+            const oc: u8 = @intCast(128 + (row + col) * 127 / 14);
+            occ_map[idx + 0] = oc;
+            occ_map[idx + 1] = oc;
+            occ_map[idx + 2] = oc;
+            occ_map[idx + 3] = 255;
+        }
+    }
+
+    const base_png = try png.encodeRgba(alloc, base_map, base_dim, base_dim);
+    defer alloc.free(base_png);
+    const mr_png = try png.encodeRgba(alloc, &mr_map, 8, 8);
+    defer alloc.free(mr_png);
+    const nrm_png = try png.encodeRgba(alloc, &nrm_map, 8, 8);
+    defer alloc.free(nrm_png);
+    const emi_png = try png.encodeRgba(alloc, &emi_map, 8, 8);
+    defer alloc.free(emi_png);
+    const occ_png = try png.encodeRgba(alloc, &occ_map, 8, 8);
+    defer alloc.free(occ_png);
+
+    const pngs = [5][]const u8{ base_png, mr_png, nrm_png, emi_png, occ_png };
+
+    // ── 2. BIN layout (NO tangents — asset-gen generates them) ─────────────────
+    const p_pos_off: u32 = 0;
+    const p_pos_len: u32 = 24 * 3 * 4; // 288
+    const p_nrm_off: u32 = p_pos_off + p_pos_len;
+    const p_nrm_len: u32 = 24 * 3 * 4; // 288
+    const p_uv_off: u32 = p_nrm_off + p_nrm_len;
+    const p_uv_len: u32 = 24 * 2 * 4; // 192
+    const p_idx_off: u32 = p_uv_off + p_uv_len;
+    const p_idx_len: u32 = 36 * 2; // 72
+    var png_offs: [5]u32 = undefined;
+    var cursor: u32 = (p_idx_off + p_idx_len + 3) & ~@as(u32, 3);
+    for (pngs, 0..) |p, i| {
+        png_offs[i] = cursor;
+        cursor += @intCast(p.len);
+        cursor = (cursor + 3) & ~@as(u32, 3);
+    }
+    const bin_total: u32 = cursor;
+    const bin_padded = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    var off: usize = p_pos_off;
+    for (faces) |face| {
+        for (face.v) |v| {
+            std.mem.writeInt(u32, bin[off..][0..4], @bitCast(v[0]), .little);
+            std.mem.writeInt(u32, bin[off + 4 ..][0..4], @bitCast(v[1]), .little);
+            std.mem.writeInt(u32, bin[off + 8 ..][0..4], @bitCast(v[2]), .little);
+            off += 12;
+        }
+    }
+    off = p_nrm_off;
+    for (faces) |face| {
+        for (0..4) |_| {
+            std.mem.writeInt(u32, bin[off..][0..4], @bitCast(face.nx), .little);
+            std.mem.writeInt(u32, bin[off + 4 ..][0..4], @bitCast(face.ny), .little);
+            std.mem.writeInt(u32, bin[off + 8 ..][0..4], @bitCast(face.nz), .little);
+            off += 12;
+        }
+    }
+    off = p_uv_off;
+    for (faces) |_| {
+        for (face_uvs) |uv| {
+            std.mem.writeInt(u32, bin[off..][0..4], @bitCast(uv[0]), .little);
+            std.mem.writeInt(u32, bin[off + 4 ..][0..4], @bitCast(uv[1]), .little);
+            off += 8;
+        }
+    }
+    off = p_idx_off;
+    for (0..6) |face_i| {
+        const base: u16 = @intCast(face_i * 4);
+        const tri_offsets = [6]u16{ 0, 1, 2, 0, 2, 3 };
+        for (tri_offsets) |o| {
+            std.mem.writeInt(u16, bin[off..][0..2], base + o, .little);
+            off += 2;
+        }
+    }
+    for (pngs, 0..) |p, i| {
+        @memcpy(bin[png_offs[i]..][0..p.len], p);
+    }
+
+    // ── 3. JSON ────────────────────────────────────────────────────────────────
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    // accessors: 0=POSITION 1=NORMAL 2=UV 3=indices. bufferViews mirror then 5 PNG.
+    const bv_count_geom: u32 = 4;
+
+    try w.writeAll("{");
+    try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0]}],");
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"CutoutCube\"}],");
+    try w.writeAll("\"meshes\":[{\"name\":\"Cutout\",\"primitives\":[{\"attributes\":{");
+    try w.writeAll("\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2");
+    try w.writeAll("},\"indices\":3,\"material\":0}]}],");
+
+    try w.writeAll("\"accessors\":[");
+    try w.writeAll("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[-1.0,-1.0,-1.0],\"max\":[1.0,1.0,1.0]},");
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"}");
+    try w.writeAll("],");
+
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ p_pos_off, p_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ p_nrm_off, p_nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ p_uv_off, p_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ p_idx_off, p_idx_len });
+    for (pngs, 0..) |p, i| {
+        try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ png_offs[i], p.len });
+        if (i + 1 < pngs.len) try w.writeAll(",");
+    }
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+    try w.writeAll("\"materials\":[{");
+    try w.writeAll("\"pbrMetallicRoughness\":{");
+    try w.writeAll("\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
+    try w.writeAll("\"baseColorTexture\":{\"index\":0},");
+    try w.writeAll("\"metallicFactor\":1.0,\"roughnessFactor\":1.0,");
+    try w.writeAll("\"metallicRoughnessTexture\":{\"index\":1}");
+    try w.writeAll("},");
+    try w.writeAll("\"normalTexture\":{\"index\":2,\"scale\":1.0},");
+    try w.writeAll("\"emissiveTexture\":{\"index\":3},");
+    try w.writeAll("\"emissiveFactor\":[1.0,1.0,1.0],");
+    try w.writeAll("\"occlusionTexture\":{\"index\":4,\"strength\":0.8},");
+    try w.writeAll("\"alphaMode\":\"MASK\",\"alphaCutoff\":0.5");
+    try w.writeAll("}],");
+    try w.writeAll("\"textures\":[");
+    for (0..5) |i| {
+        try w.print("{{\"source\":{d}}}", .{i});
+        if (i + 1 < 5) try w.writeAll(",");
+    }
+    try w.writeAll("],");
+    try w.writeAll("\"images\":[");
+    for (0..5) |i| {
+        try w.print("{{\"bufferView\":{d},\"mimeType\":\"image/png\"}}", .{bv_count_geom + @as(u32, @intCast(i))});
+        if (i + 1 < 5) try w.writeAll(",");
+    }
+    try w.writeAll("]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) {
+        try w.writeByte(0x20);
+    }
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── 4. Assemble GLB ───────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42; // B
+    glb[goff + 1] = 0x49; // I
+    glb[goff + 2] = 0x4E; // N
+    glb[goff + 3] = 0x00; // \0
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    return glb;
+}
+
 // ── mixed-material cube fixture (P9 shader-variant fan-out) ──────────────────────
 
 /// Two-cube, two-material, two-mesh glb that forces per-submesh shader
@@ -1586,6 +1844,42 @@ test "pbrCubeGlb with_tangents=false: no TANGENT accessor" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len], .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 4), parsed.value.object.get("accessors").?.array.items.len);
+}
+
+// ── pbrCubeCutoutGlb (MASK alpha-test) fixture tests ────────────────────────────
+
+test "pbrCubeCutoutGlb: container + MASK material + alpha holes" {
+    const glb = try pbrCubeCutoutGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    try pbrGlbInvariants(glb);
+
+    const json_len = std.mem.readInt(u32, glb[12..16], .little);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len], .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    // No tangents → 4 accessors (pos, normal, uv, indices).
+    try testing.expectEqual(@as(usize, 4), root.get("accessors").?.array.items.len);
+    // Mesh name must be "Cutout" (the addressable submesh name).
+    const mesh = root.get("meshes").?.array.items[0].object;
+    try testing.expectEqualStrings("Cutout", mesh.get("name").?.string);
+    // Material is MASK with cutoff 0.5.
+    const mat = root.get("materials").?.array.items[0].object;
+    try testing.expectEqualStrings("MASK", mat.get("alphaMode").?.string);
+    try testing.expectEqual(@as(f64, 0.5), mat.get("alphaCutoff").?.float);
+}
+
+test "pbrCubeCutoutGlb: round-trips through gltf parse → alpha_mode 2 + cutoff" {
+    const glb = try pbrCubeCutoutGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try gltf_mod.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    try testing.expect(model.submeshes.len >= 1);
+    // alphaMode "MASK" → alpha_mode == 2; alphaCutoff 0.5.
+    try testing.expectEqual(@as(u32, 2), model.submeshes[0].alpha_mode);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), model.submeshes[0].alpha_cutoff, 1e-6);
+    // Submesh name is "Cutout".
+    try testing.expect(model.names.len >= 1);
+    try testing.expectEqualStrings("Cutout", model.names[0]);
 }
 
 // ── skinnedBarGlb fixture tests ─────────────────────────────────────────────────
