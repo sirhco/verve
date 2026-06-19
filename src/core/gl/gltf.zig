@@ -582,6 +582,7 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
             var tex_emissive: i32 = -1;
             var tex_occlusion: i32 = -1;
             var alpha_mode: u32 = 0;
+            var alpha_cutoff: f32 = 0.5;
 
             if (prim_obj.get("material")) |mat_val| {
                 const mat_idx: usize = @intCast(jsonInt(mat_val) orelse return error.Malformed);
@@ -633,9 +634,15 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                     }
                     // occlusionTexture (+strength, key "strength")
                     tex_occlusion = try readTextureInfo(mat_obj.get("occlusionTexture"), &occlusion_strength);
-                    // alphaMode: "BLEND" → 1, else (OPAQUE/MASK/absent) → 0. (MASK deferred.)
+                    // alphaMode: "BLEND"→1, "MASK"→2, else (OPAQUE/absent)→0.
                     if (mat_obj.get("alphaMode")) |am| {
-                        if (am == .string and std.mem.eql(u8, am.string, "BLEND")) alpha_mode = 1;
+                        if (am == .string) {
+                            if (std.mem.eql(u8, am.string, "BLEND")) alpha_mode = 1 else if (std.mem.eql(u8, am.string, "MASK")) alpha_mode = 2;
+                        }
+                    }
+                    // alphaCutoff: glTF default 0.5 when absent.
+                    if (mat_obj.get("alphaCutoff")) |ac| {
+                        alpha_cutoff = jsonFloat(ac) orelse 0.5;
                     }
                 }
             }
@@ -655,6 +662,7 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                 .tex_emissive = tex_emissive,
                 .tex_occlusion = tex_occlusion,
                 .alpha_mode = alpha_mode,
+                .alpha_cutoff = alpha_cutoff,
             });
             try name_list.append(aa, mesh_name);
         }
@@ -1932,6 +1940,68 @@ test "gltf parses alphaMode BLEND → alpha_mode 1" {
         defer model.deinit();
         try testing.expectEqual(@as(usize, 1), model.submeshes.len);
         try testing.expectEqual(@as(u32, 0), model.submeshes[0].alpha_mode);
+    }
+}
+
+test "gltf parses alphaMode MASK + alphaCutoff" {
+    const alloc = testing.allocator;
+    const pos = [_]f32{ 0, 0, 0, 1, 0, 0, 0, 1, 0 };
+    const nrm = [_]f32{ 0, 0, 1, 0, 0, 1, 0, 0, 1 };
+    const uv = [_]f32{ 0, 0, 1, 0, 0, 1 };
+    const idx = [_]u16{ 0, 1, 2 };
+
+    // Case 1: "alphaMode":"MASK","alphaCutoff":0.3 → alpha_mode==2, alpha_cutoff==0.3.
+    {
+        const json =
+            "{\"asset\":{\"version\":\"2.0\"}," ++
+            "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}]," ++
+            "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}]," ++
+            "\"accessors\":[" ++
+            "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+            "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+            "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}," ++
+            "{\"bufferView\":3,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}]," ++
+            "\"bufferViews\":[" ++
+            "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36}," ++
+            "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36}," ++
+            "{\"buffer\":0,\"byteOffset\":72,\"byteLength\":24}," ++
+            "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":6,\"target\":34963}]," ++
+            "\"buffers\":[{\"byteLength\":102}]," ++
+            "\"materials\":[{\"alphaMode\":\"MASK\",\"alphaCutoff\":0.3,\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}]}";
+        const glb = try assembleGlb(alloc, json, &pos, &nrm, &uv, &idx, null);
+        defer alloc.free(glb);
+        var model = try parseGlb(alloc, glb);
+        defer model.deinit();
+        try testing.expectEqual(@as(usize, 1), model.submeshes.len);
+        try testing.expectEqual(@as(u32, 2), model.submeshes[0].alpha_mode);
+        try testing.expectApproxEqAbs(@as(f32, 0.3), model.submeshes[0].alpha_cutoff, 1e-6);
+    }
+
+    // Case 2: "alphaMode":"MASK" with NO alphaCutoff → alpha_cutoff==0.5 (glTF default).
+    {
+        const json =
+            "{\"asset\":{\"version\":\"2.0\"}," ++
+            "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}]," ++
+            "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}]," ++
+            "\"accessors\":[" ++
+            "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+            "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+            "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}," ++
+            "{\"bufferView\":3,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}]," ++
+            "\"bufferViews\":[" ++
+            "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36}," ++
+            "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36}," ++
+            "{\"buffer\":0,\"byteOffset\":72,\"byteLength\":24}," ++
+            "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":6,\"target\":34963}]," ++
+            "\"buffers\":[{\"byteLength\":102}]," ++
+            "\"materials\":[{\"alphaMode\":\"MASK\",\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}]}";
+        const glb = try assembleGlb(alloc, json, &pos, &nrm, &uv, &idx, null);
+        defer alloc.free(glb);
+        var model = try parseGlb(alloc, glb);
+        defer model.deinit();
+        try testing.expectEqual(@as(usize, 1), model.submeshes.len);
+        try testing.expectEqual(@as(u32, 2), model.submeshes[0].alpha_mode);
+        try testing.expectApproxEqAbs(@as(f32, 0.5), model.submeshes[0].alpha_cutoff, 1e-6);
     }
 }
 
