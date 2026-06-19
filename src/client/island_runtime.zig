@@ -792,6 +792,7 @@ extern "verve_runtime" fn verve_anim_seek_label(handle: u32, name_ptr: [*]const 
 extern "verve_runtime" fn verve_anim_register_dyn(handler_idx: u32) u32;
 extern "verve_runtime" fn verve_anim_register_mod(handler_idx: u32) u32;
 extern "verve_runtime" fn verve_anim_register_setter(idx: u32) u32;
+extern "verve_runtime" fn verve_anim_register_gl_resolver(idx: u32) u32;
 extern "verve_runtime" fn verve_ref_set_style(handle: i32, name_ptr: [*]const u8, name_len: u32, val_ptr: [*]const u8, val_len: u32) void;
 
 /// Live animation handle. Plain u32 id into the bridge registry — copy
@@ -919,6 +920,15 @@ pub fn animModFn(prop: []const u8, f: *const fn (f64) f64) anim.Modifier {
 /// `setter_slot`. Mirror of animDyn/animModFn.
 pub fn animGlSetter(f: *const fn (u32, f64) void) u32 {
     return verve_anim_register_setter(@intCast(@intFromPtr(f)));
+}
+
+/// Register a deferred-target resolver `fn(placeholder_id, name_hash) u32` for
+/// SSR `material:`/`node:` gl tweens. The bridge calls it once per deferred
+/// target to map name_hash → submesh index (returning a frozen id), then caches
+/// the result. Returns 0 when the mesh isn't loaded or the name is absent — the
+/// bridge skips the write and retries next tick. Mirror of animGlSetter.
+pub fn animGlResolver(f: *const fn (u32, u32) u32) u32 {
+    return verve_anim_register_gl_resolver(@intCast(@intFromPtr(f)));
 }
 
 // ---- ScrollTrigger / Observer (verve.anim phase 2) -------------------------

@@ -1010,6 +1010,8 @@
   // Page-default gl setter slot: last island to call verve_anim_register_setter wins.
   // Timelines parsed before the gl island hydrates use this at write time (P7: per-island).
   let defaultGlSlot = 0;
+  // Page-default gl deferred-target resolver slot (SSR material:/node: tweens).
+  let defaultGlResolver = 0;
 
   const buildMods = (mods) => {
     const byProp = {};
@@ -1367,6 +1369,10 @@
     kind: "gl",
     gl: spec.gl >>> 0,
     gls: spec.gls >>> 0,
+    // Deferred SSR target: FNV name hash (0 = already resolved). Resolved once
+    // on the first tick via the gl resolver, then cached back into `gl`.
+    gh: spec.gh >>> 0,
+    glr: 0, // per-instance resolver slot (0 = use page-default resolver)
     from: typeof spec.f === "number" ? spec.f : 0,
     to: typeof spec.to === "number" ? spec.to : 0,
     unit: null,
@@ -1394,6 +1400,18 @@
       // outlives its island is benign: chunk instances and their statics
       // persist for the page life, and unmount stops the gl frame loop, so
       // a stale setter writes inert statics, never the GPU (P7: per-island).
+      // Deferred SSR target (material:/node:): resolve name_hash → frozen id
+      // once, via the registered gl resolver, then cache it. Unresolved (no
+      // resolver yet, or mesh not loaded / name absent) → drop + retry next tick.
+      if (st.gh !== 0) {
+        const resolver = st.glr || defaultGlResolver;
+        if (!resolver) return;
+        const real =
+          indirectFunctionTable.get(resolver >>> 0)(st.gl >>> 0, st.gh >>> 0) >>> 0;
+        if (!real) return;
+        st.gl = real;
+        st.gh = 0;
+      }
       const slot = st.gls || defaultGlSlot;
       if (!slot) return;
       let v = st.from + (st.to - st.from) * easeFn(phase);
@@ -4139,6 +4157,12 @@
         const slot = translate(idx);
         // last-registered gl setter is the page default for SSR gl tweens (P7: per-island)
         defaultGlSlot = slot;
+        return slot;
+      },
+      verve_anim_register_gl_resolver: (idx) => {
+        const slot = translate(idx);
+        // page-default resolver for SSR deferred material:/node: gl tweens
+        defaultGlResolver = slot;
         return slot;
       },
       // Observer handler crosses as a chunk-private fn-table index —

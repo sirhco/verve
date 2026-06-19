@@ -1070,17 +1070,28 @@ pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
     // at comptime — `orelse unreachable` is a const-assert on a frozen literal.
     const dolly_id = comptime (verve.gl.anim_target.resolvePathStatic("camera.distance") orelse unreachable);
 
+    // SSR DEFERRED targets: material:/node: need the vmesh name table (only on
+    // the client), so SSR bakes the comptime-pure {kind, field, name_hash} and
+    // the bridge resolves name_hash → submesh index on the first tick. The
+    // placeholder id carries kind+field with submesh bits 0.
+    const metallic = comptime (verve.gl.anim_target.resolvePathStaticDeferred("material:Cube.metallic") orelse unreachable);
+    const roty = comptime (verve.gl.anim_target.resolvePathStaticDeferred("node:Cube.rotationY") orelse unreachable);
+    const metallic_ph = comptime verve.gl.anim_target.encode(metallic.kind, 0, metallic.field);
+    const roty_ph = comptime verve.gl.anim_target.encode(roty.kind, 0, roty.field);
+
     // SSR dolly tween: setter slot 0 = the page-default gl setter the bridge
-    // resolves at hydration; it targets camera.distance only, coexisting with
-    // the island's scrub timeline (disjoint targets: island = yaw/roughness/
-    // rotationX/emissiveR; SSR = distance). The tween is hung on a wrapper that
-    // CONTAINS the island's 300vh section so the ScrollTrigger selector (SSR
-    // cannot serialize ref handles) resolves within scope — a selector on a
-    // sibling element would query an empty subtree and never trigger.
+    // resolves at hydration. Targets are disjoint from the island's scrub
+    // timeline (island = yaw/roughness/rotationX/emissiveR; SSR = distance +
+    // deferred metallic + deferred rotationY) so writes never collide. The tween
+    // is hung on a wrapper that CONTAINS the island's 300vh section so the
+    // ScrollTrigger selector (SSR cannot serialize ref handles) resolves within
+    // scope — a selector on a sibling element would query an empty subtree.
     const scene_wrap = ctx.div()
         .children(.{scene})
         .animate(anim.to(a, null)
         .glTargetRange(dolly_id, 0, 4.0, 2.5)
+        .glTargetRangeHashed(metallic_ph, metallic.name_hash, 0, 0.0, 1.0)
+        .glTargetRangeHashed(roty_ph, roty.name_hash, 0, -0.6, 0.6)
         .duration(1).ease(.linear)
         .scrollTrigger(.{
         .trigger = "section[data-ref^=glscene-scroll-section]",

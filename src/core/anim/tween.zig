@@ -12,10 +12,15 @@ const scroll = @import("scroll.zig");
 /// glTarget / glTargetFrom. The JS engine calls the setter per frame instead
 /// of writing DOM.
 pub const GlTarget = struct {
-    /// From `gl.anim_target.encode` / `gl.anim_target.resolvePath`.
+    /// From `gl.anim_target.encode` / `gl.anim_target.resolvePath`. For a
+    /// deferred SSR target (`name_hash != 0`) this is a PLACEHOLDER id whose
+    /// submesh bits are 0; the client resolves the real index from name_hash.
     target_id: u32,
     /// Translated indirect-table slot from `verve.animGlSetter`.
     setter_slot: u32,
+    /// FNV name hash for a deferred material:/node: SSR target. 0 = already
+    /// resolved (camera/model/indexed) — serializes byte-identically to before.
+    name_hash: u32 = 0,
 };
 
 pub const PropEntry = struct {
@@ -381,6 +386,73 @@ pub const Tween = struct {
             .to = .{ .num = to_val },
             .from = .{ .num = from_val },
             .gl = .{ .target_id = target_id, .setter_slot = setter_slot },
+        };
+        if (self.steps.items.len > 0) {
+            const last = &self.steps.items[self.steps.items.len - 1];
+            last.props.append(self.alloc, entry) catch |e| {
+                self.err = e;
+            };
+            return self;
+        }
+        self.props.append(self.alloc, entry) catch |e| {
+            self.err = e;
+        };
+        return self;
+    }
+
+    /// Deferred-target variant of `glTarget`: `placeholder_id` carries kind+field
+    /// (submesh bits 0), `name_hash` lets the client resolve the real submesh
+    /// index. Used by SSR for `material:`/`node:` targets.
+    pub fn glTargetHashed(self: *Tween, placeholder_id: u32, name_hash: u32, setter_slot: u32, to_val: f64) *Tween {
+        if (self.err != null) return self;
+        const entry: PropEntry = .{
+            .name = "@gl",
+            .to = .{ .num = to_val },
+            .gl = .{ .target_id = placeholder_id, .setter_slot = setter_slot, .name_hash = name_hash },
+        };
+        if (self.steps.items.len > 0) {
+            const last = &self.steps.items[self.steps.items.len - 1];
+            last.props.append(self.alloc, entry) catch |e| {
+                self.err = e;
+            };
+            return self;
+        }
+        self.props.append(self.alloc, entry) catch |e| {
+            self.err = e;
+        };
+        return self;
+    }
+
+    /// Deferred-target variant of `glTargetFrom`. See `glTargetHashed`.
+    pub fn glTargetFromHashed(self: *Tween, placeholder_id: u32, name_hash: u32, setter_slot: u32, from_val: f64) *Tween {
+        if (self.err != null) return self;
+        const entry: PropEntry = .{
+            .name = "@gl",
+            .to = .{ .num = 0 },
+            .from = .{ .num = from_val },
+            .gl = .{ .target_id = placeholder_id, .setter_slot = setter_slot, .name_hash = name_hash },
+        };
+        if (self.steps.items.len > 0) {
+            const last = &self.steps.items[self.steps.items.len - 1];
+            last.props.append(self.alloc, entry) catch |e| {
+                self.err = e;
+            };
+            return self;
+        }
+        self.props.append(self.alloc, entry) catch |e| {
+            self.err = e;
+        };
+        return self;
+    }
+
+    /// Deferred-target variant of `glTargetRange`. See `glTargetHashed`.
+    pub fn glTargetRangeHashed(self: *Tween, placeholder_id: u32, name_hash: u32, setter_slot: u32, from_val: f64, to_val: f64) *Tween {
+        if (self.err != null) return self;
+        const entry: PropEntry = .{
+            .name = "@gl",
+            .to = .{ .num = to_val },
+            .from = .{ .num = from_val },
+            .gl = .{ .target_id = placeholder_id, .setter_slot = setter_slot, .name_hash = name_hash },
         };
         if (self.steps.items.len > 0) {
             const last = &self.steps.items[self.steps.items.len - 1];
