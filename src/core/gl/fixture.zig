@@ -556,7 +556,8 @@ pub fn pbrCubeGlb(alloc: Allocator, opts: struct { with_tangents: bool = true })
     try w.writeAll("\"normalTexture\":{\"index\":2,\"scale\":1.0},");
     try w.writeAll("\"emissiveTexture\":{\"index\":3},");
     try w.writeAll("\"emissiveFactor\":[1.0,1.0,1.0],");
-    try w.writeAll("\"occlusionTexture\":{\"index\":4,\"strength\":0.8}");
+    try w.writeAll("\"occlusionTexture\":{\"index\":4,\"strength\":0.8},");
+    try w.writeAll("\"alphaMode\":\"BLEND\"");
     try w.writeAll("}],");
     // textures point at image i (source); image i points at bufferView bv_count_geom+i
     try w.writeAll("\"textures\":[");

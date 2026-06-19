@@ -1079,17 +1079,19 @@ pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
     const transy = comptime (verve.gl.anim_target.resolvePathStaticDeferred("node:Cube.translateY") orelse unreachable);
     const sclx = comptime (verve.gl.anim_target.resolvePathStaticDeferred("node:Cube.scaleX") orelse unreachable);
     const basecol = comptime (verve.gl.anim_target.resolvePathStaticDeferred("material:Cube.baseColorR") orelse unreachable);
+    const alpha = comptime (verve.gl.anim_target.resolvePathStaticDeferred("material:Cube.baseColorA") orelse unreachable);
     const metallic_ph = comptime verve.gl.anim_target.encode(metallic.kind, 0, metallic.field);
     const roty_ph = comptime verve.gl.anim_target.encode(roty.kind, 0, roty.field);
     const transy_ph = comptime verve.gl.anim_target.encode(transy.kind, 0, transy.field);
     const sclx_ph = comptime verve.gl.anim_target.encode(sclx.kind, 0, sclx.field);
     const basecol_ph = comptime verve.gl.anim_target.encode(basecol.kind, 0, basecol.field);
+    const alpha_ph = comptime verve.gl.anim_target.encode(alpha.kind, 0, alpha.field);
 
     // SSR dolly tween: setter slot 0 = the page-default gl setter the bridge
     // resolves at hydration. Targets are disjoint from the island's scrub
     // timeline (island = yaw/roughness/rotationX/emissiveR; SSR = distance +
     // deferred metallic + deferred rotationY + deferred translateY + deferred
-    // scaleX + deferred baseColorR) so writes never collide. Note:
+    // scaleX + deferred baseColorR + deferred baseColorA) so writes never collide. Note:
     // translateY/scaleX are absolute overwrites (not delta) and non-uniform
     // scale makes cross-node pick-t approximate when multiple node targets share
     // the same scroll range. The tween is hung on a wrapper that CONTAINS the
@@ -1105,6 +1107,7 @@ pub fn glScenePage(ctx: *const verve.Context) !*verve.Node {
         .glTargetRangeHashed(transy_ph, transy.name_hash, 0, -0.4, 0.4)
         .glTargetRangeHashed(sclx_ph, sclx.name_hash, 0, 0.7, 1.3)
         .glTargetRangeHashed(basecol_ph, basecol.name_hash, 0, 1.0, 0.2)
+        .glTargetRangeHashed(alpha_ph, alpha.name_hash, 0, 1.0, 0.25)
         .duration(1).ease(.linear)
         .scrollTrigger(.{
         .trigger = "section[data-ref^=glscene-scroll-section]",

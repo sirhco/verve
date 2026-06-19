@@ -8,6 +8,20 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **gl alpha-blend transparency + `baseColorA` anim target** (`src/core/gl/vmesh.zig`,
+  `src/core/gl/gltf.zig`, `src/core/gl/command.zig`, `src/client/islands/GlScene.zig`,
+  `src/core/gl/anim_target.zig`, `src/core/gl/fixture.zig`, `src/app/components.zig`,
+  `docs/24-gl.md`): per-submesh alpha-blend transparency on both backends (WebGL2 +
+  WebGPU). vmesh v9 adds `alpha_mode: u32` per submesh (0=OPAQUE, 1=BLEND; back-compat).
+  The glTF parser maps `"alphaMode":"BLEND"` → `alpha_mode=1`; the draw loop makes two
+  passes (opaque then transparent, with back-to-front centroid sort) and sets the new
+  `state_blend` pipeline bit (`1<<2`). WebGL2 enables `SRC_ALPHA / ONE_MINUS_SRC_ALPHA`
+  blending + disables depth writes for the transparent pass; WebGPU selects a pre-compiled
+  blend pipeline variant. A new frozen anim target `material:<Name>.baseColorA` (id
+  `0x01000008`, field 8) writes `mats[s][3]` as the per-submesh alpha factor. The
+  `/gl-scene` demo cube (`pbrCubeGlb` fixture) is marked `BLEND` and gains a deferred
+  SSR `material:Cube.baseColorA` scrub (1.0 → 0.25) — the cube fades as the user scrolls.
+  Non-goals: `MASK`/`alphaCutoff`, `doubleSided`, intra-submesh triangle sort.
 - **gl material `baseColor` RGB anim targets** (`src/core/gl/anim_target.zig`,
   `src/client/islands/GlScene.zig`, `src/app/components.zig`): three new frozen
   `material (1)` fields — `baseColorR/G/B` (ids `0x01000005`–`07`, field values 5–7)
