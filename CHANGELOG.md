@@ -8,6 +8,14 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **gl material `baseColor` RGB anim targets** (`src/core/gl/anim_target.zig`,
+  `src/client/islands/GlScene.zig`, `src/app/components.zig`): three new frozen
+  `material (1)` fields — `baseColorR/G/B` (ids `0x01000005`–`07`, field values 5–7)
+  — let tweens multiply the textured albedo RGB on any named submesh. The runtime
+  writes into `mats[s][0..2]` (streamed to `draw_pbr` next frame, exactly like the
+  existing emissive arms). Alpha (transparency) is deferred to a future phase. The
+  `/gl-scene` SSR scrub demo gains a `material:Cube.baseColorR` deferred target
+  (1.0 → 0.2) via `resolvePathStaticDeferred` + `glTargetRangeHashed`.
 - **SSR `material:`/`node:` gl anim targets** (`src/core/gl/anim_target.zig`,
   `src/core/anim/{tween,serialize}.zig`, `src/client/{island_runtime,islands/GlScene}.zig`,
   `src/bridge/verve.js`, `src/app/components.zig`): SSR-declared gl tweens can now target
