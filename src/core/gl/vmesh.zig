@@ -836,14 +836,16 @@ pub const Reader = struct {
 
     /// Returns the CREATE_SHADER variant bitset for submesh `s`.
     /// Always sets `variant_pbr`; additionally sets `variant_normal_map` when
-    /// the submesh has a normal-map texture (`tex_normal >= 0`) and
-    /// `variant_emissive` when it has an emissive texture (`tex_emissive >= 0`).
+    /// the submesh has a normal-map texture (`tex_normal >= 0`),
+    /// `variant_emissive` when it has an emissive texture (`tex_emissive >= 0`),
+    /// and `variant_alpha_test` when `alpha_mode == 2` (MASK).
     /// Caller must ensure `s < self.submesh_count`.
     pub fn submeshVariant(self: *const Reader, s: u32) u32 {
         const sub = self.submesh(s);
         var bits: u32 = command.variant_pbr;
         if (sub.tex_normal >= 0) bits |= command.variant_normal_map;
         if (sub.tex_emissive >= 0) bits |= command.variant_emissive;
+        if (sub.alpha_mode == 2) bits |= command.variant_alpha_test;
         return bits;
     }
 };
@@ -1553,4 +1555,18 @@ test "vmesh v10: submesh alpha_cutoff round-trips" {
     try testing.expectEqual(@as(u32, 80), submesh_size);
     try testing.expectEqual(@as(u32, 2), reader.submesh(0).alpha_mode);
     try testing.expectEqual(@as(f32, 0.3), reader.submesh(0).alpha_cutoff);
+}
+
+test "(i) submeshVariant: alpha_mode 2 adds variant_alpha_test" {
+    const verts = [_]f32{0} ** 12;
+    const idx = [_]u16{ 0, 0, 0 };
+    var subs = [_]Submesh{
+        .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .alpha_mode = 2, .alpha_cutoff = 0.5 },
+        .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .alpha_mode = 0, .alpha_cutoff = 0.5 },
+    };
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    defer testing.allocator.free(bytes);
+    const reader = try Reader.init(bytes);
+    try testing.expect(reader.submeshVariant(0) & command.variant_alpha_test != 0);
+    try testing.expect(reader.submeshVariant(1) & command.variant_alpha_test == 0);
 }

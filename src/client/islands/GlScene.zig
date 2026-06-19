@@ -653,7 +653,7 @@ fn buildScene(inst: *Inst, a: *const gl.vmesh.Reader) void {
         inst.mats[s] = .{
             sub.base_color[0], sub.base_color[1], sub.base_color[2],      sub.base_color[3],
             sub.metallic,      sub.roughness,     sub.occlusion_strength, sub.normal_scale,
-            sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        0,
+            sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        sub.alpha_cutoff,
         };
         inst.submesh_aabb[s] = submeshLocalAabb(verts_f32, indices_u16, sub.index_byte_off / 2, sub.index_count);
     }
@@ -947,7 +947,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             var s: u32 = 0;
             while (s < a.submesh_count) : (s += 1) {
                 if (s >= max_submesh) break;
-                if (a.submesh(s).alpha_mode != 0) continue;
+                if (a.submesh(s).alpha_mode == 1) continue; // Pass 1 = opaque + mask (skip blend)
                 if (!visibleAfterCull(inst, planes, s)) continue;
                 drawSubmesh(inst, a, &enc, s, gl.command.state_depth_test | gl.command.state_cull_back, &last_variant, env, pv);
             }
