@@ -212,7 +212,8 @@ const Inst = struct {
     // Single directional light from props: 8 f32 [type, intensity, x,y,z, r,g,b].
     lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 },
 
-    // GPU-resource registry for context-restore replay (cap 32; 16 worst case).
+    // GPU-resource registry for context-restore replay (cap 32; ~23 worst case
+    // with the 8 PBR/alpha-test shader variants: 2 buf + 8 shader + depth + shadow + 8 tex + 3 IBL).
     registry: gl.Registry(32) = .{},
     resources_sent: bool = false,
     needs_replay: bool = false,
