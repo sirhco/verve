@@ -4538,6 +4538,10 @@
           // Re-enable depth test each frame: draw_fullscreen_quad (case 25) disables
           // it for the post pass, and WebGL state persists across frames.
           gl.enable(gl.DEPTH_TEST);
+          // Restore depth mask: transparent SET_PIPELINE sets depthMask(false) and
+          // WebGL state persists across frames — gl.clear(DEPTH_BUFFER_BIT) no-ops
+          // when the mask is false, breaking depth each frame after a blend pass.
+          gl.depthMask(true);
           gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
           break;
         }
@@ -4879,6 +4883,8 @@
           if (!sm || !sh) break;
           gl.bindFramebuffer(gl.FRAMEBUFFER, sm.fbo);
           gl.viewport(0, 0, size, size);
+          // Restore depth mask so the depth-only clear actually writes.
+          gl.depthMask(true);
           gl.clear(gl.DEPTH_BUFFER_BIT);
           gl.useProgram(sh.prog);
           st.active = sh;
@@ -4989,6 +4995,8 @@
           // Re-enable depth test for 3D scene passes rendered into a target
           if (rt.depthTex) gl.enable(gl.DEPTH_TEST);
           gl.clearColor(r, g, b, a);
+          // Restore depth mask so DEPTH_BUFFER_BIT clear actually writes.
+          gl.depthMask(true);
           let mask = 0;
           if (cf & 1) mask |= gl.COLOR_BUFFER_BIT;
           if (cf & 2) mask |= gl.DEPTH_BUFFER_BIT;
