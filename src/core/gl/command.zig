@@ -48,6 +48,7 @@ pub const Tag = enum(u16) {
     begin_offscreen_pass = 23, // {target_handle, clear_rgba(4 f32), clear_flags(bit0=color,bit1=depth)} — bind RT
     end_offscreen_pass = 24, // {} — close the offscreen pass; next begin_* rebinds
     draw_fullscreen_quad = 25, // {shader, tex0, tex1, params_ptr, param_count} — VBO-less 3-vert triangle
+    draw_depth_at = 26, // {shader, vbuf, ibuf, index_byte_off, index_count, mvp_ptr, material_ptr} — alpha-tested depth draw (MASK shadows)
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -1429,6 +1430,20 @@ pub const Encoder = struct {
         self.putU32(mvp_ptr);
     }
 
+    /// Alpha-tested depth draw (MASK cutout shadows): binds `shader` (the depth-at
+    /// program), reads the base texture (bound via bind_texture slot 0) + `u_material`
+    /// (from `material_ptr`), discards below the cutoff. `mvp_ptr` = light_vp·world.
+    pub fn drawDepthAt(self: *Encoder, shader: u32, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, mvp_ptr: u32, material_ptr: u32) void {
+        self.header(.draw_depth_at, 28);
+        self.putU32(shader);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(mvp_ptr);
+        self.putU32(material_ptr);
+    }
+
     /// Bind the shadow map to `slot` and set `u_light_vp` on the active program.
     /// Like setLights / bindIbl, must be re-emitted after each SET_PIPELINE since
     /// it writes a uniform on the currently active program.
@@ -2324,4 +2339,16 @@ test "depthAt shaders: UV + discard + base/material; plain depth frozen" {
     try testing.expect(std.mem.indexOf(u8, w, "textureSample") != null);
     // plain depth fragment unchanged (no discard).
     try testing.expect(std.mem.indexOf(u8, depthFragmentSrc(), "discard") == null);
+}
+
+test "drawDepthAt encodes tag 26 + 7 u32 payload" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.drawDepthAt(10, 1, 2, 48, 36, 0x1000, 0x2000);
+    // Buffer layout: [0..4) = reserved length header; record starts at 4.
+    // [4..6) = tag u16, [6..8) = payload_size u16, [8..36) = 7×u32 payload.
+    try testing.expectEqual(@as(u16, 26), std.mem.readInt(u16, buf[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, buf[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, buf[8..12], .little)); // shader
+    try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, buf[32..36], .little)); // material_ptr (7th u32)
 }
