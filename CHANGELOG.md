@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-20
+
 ### Added
 
 - **gl doubleSided materials** (`src/core/gl/fixture.zig`, `tools/gen_double_glb.zig`,
@@ -3612,7 +3614,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/sirhco/verve/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/sirhco/verve/compare/v0.5.19...v0.6.0
 [0.5.16]: https://github.com/sirhco/verve/compare/v0.5.15...v0.5.16
 [0.5.15]: https://github.com/sirhco/verve/compare/v0.5.14...v0.5.15
