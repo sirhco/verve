@@ -59,6 +59,7 @@ pub const BufferKind = enum(u32) { vertex = 0, index = 1 };
 pub const state_depth_test: u32 = 1 << 0;
 pub const state_cull_back: u32 = 1 << 1;
 pub const state_blend: u32 = 1 << 2; // src-alpha over; depth-write off (transparency)
+pub const state_cull_front: u32 = 1 << 3; // enable CULL_FACE + cullFace(FRONT) — renders back faces (double-sided BLEND back pass)
 
 /// CREATE_SHADER variant bits.
 pub const variant_vertex_color: u32 = 1 << 0;
@@ -437,6 +438,10 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\  vec3 N = normalize(v_normal);
         \\
     ;
+    const ds_flip =
+        \\  N = gl_FrontFacing ? N : -N;
+        \\
+    ;
     const lighting =
         \\  vec3 V = normalize(u_camera_pos - v_world_pos);
         \\  float NdotV = max(dot(N, V), 0.0);
@@ -536,6 +541,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ main_open;
     if (flags & variant_alpha_test != 0) src = src ++ alpha_test;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
+    if (flags & variant_double_sided != 0) src = src ++ ds_flip;
     src = src ++ lighting;
     src = src ++ (if (flags & variant_shadow != 0) combine_shadow else combine_plain);
     if (flags & variant_emissive != 0) src = src ++ emissive;
@@ -865,6 +871,21 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  let ao_sample = textureSample(occlusion_tex, samp, in.uv).r;
         \\
     ;
+    const fs_open_ds =
+        \\@fragment
+        \\fn fs_main(in: VSOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
+        \\  let base_color = u.material[0];
+        \\  let mr = textureSample(mr_tex, samp, in.uv).rgb;
+        \\  let metallic = u.material[1].x * mr.b;
+        \\  let roughness = clamp(u.material[1].y * mr.g, 0.045, 1.0);
+        \\  let occlusion_strength = u.material[1].z;
+        \\  let normal_scale = u.material[1].w;
+        \\  let emissive_factor = u.material[2].rgb;
+        \\  let base_sample = textureSample(base_tex, samp, in.uv).rgb;
+        \\  let albedo = base_sample * base_color.rgb;
+        \\  let ao_sample = textureSample(occlusion_tex, samp, in.uv).r;
+        \\
+    ;
     const fs_alpha_test =
         \\  if (textureSample(base_tex, samp, in.uv).a * base_color.a < u.material[2].w) { discard; }
         \\
@@ -876,8 +897,23 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  let N = normalize(TBN * n_ts);
         \\
     ;
+    const fs_normal_nm_ds =
+        \\  var n_ts = textureSample(normal_tex, samp, in.uv).xyz * 2.0 - 1.0;
+        \\  n_ts = vec3<f32>(n_ts.xy * normal_scale, n_ts.z);
+        \\  let TBN = mat3x3<f32>(normalize(in.tangent), normalize(in.bitangent), normalize(in.normal));
+        \\  var N = normalize(TBN * n_ts);
+        \\
+    ;
     const fs_normal_plain =
         \\  let N = normalize(in.normal);
+        \\
+    ;
+    const fs_normal_plain_ds =
+        \\  var N = normalize(in.normal);
+        \\
+    ;
+    const fs_ds_flip =
+        \\  N = select(-N, N, front_facing);
         \\
     ;
     const fs_lighting =
@@ -974,6 +1010,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const shadow = flags & variant_shadow != 0;
     const skinned = flags & variant_skinned != 0;
     const lin = flags & variant_linear_output != 0;
+    const ds = flags & variant_double_sided != 0;
     comptime var src: []const u8 = uniforms_head;
     if (shadow) src = src ++ uniforms_shadow;
     src = src ++ uniforms_tail;
@@ -993,9 +1030,10 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ (if (skinned) vs_tail_skinned else vs_tail);
     src = src ++ helpers;
     if (shadow) src = src ++ fs_shadow_decl;
-    src = src ++ fs_open;
+    src = src ++ (if (ds) fs_open_ds else fs_open);
     if (flags & variant_alpha_test != 0) src = src ++ fs_alpha_test;
-    src = src ++ (if (nm) fs_normal_nm else fs_normal_plain);
+    src = src ++ (if (nm) (if (ds) fs_normal_nm_ds else fs_normal_nm) else (if (ds) fs_normal_plain_ds else fs_normal_plain));
+    if (ds) src = src ++ fs_ds_flip;
     src = src ++ fs_lighting;
     src = src ++ (if (shadow) fs_combine_shadow else fs_combine_plain);
     if (em) src = src ++ fs_emissive;
@@ -2352,4 +2390,16 @@ test "drawDepthAt encodes tag 26 + 7 u32 payload" {
     try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, buf[6..8], .little)); // payload_size
     try testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, buf[8..12], .little)); // shader
     try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, buf[32..36], .little)); // material_ptr (7th u32)
+}
+
+test "variant_double_sided flips normal; non-DS frozen; state_cull_front" {
+    try testing.expectEqual(@as(u32, 8), state_cull_front);
+    const ds = pbrFragmentSrc(variant_pbr | variant_double_sided);
+    try testing.expect(std.mem.indexOf(u8, ds, "gl_FrontFacing") != null);
+    const plain = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "gl_FrontFacing") == null);
+    const wds = wgslPbr(variant_pbr | variant_double_sided);
+    try testing.expect(std.mem.indexOf(u8, wds, "front_facing") != null);
+    const wplain = wgslPbr(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, wplain, "front_facing") == null);
 }
