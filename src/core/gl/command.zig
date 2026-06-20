@@ -306,6 +306,43 @@ pub fn depthFragmentSrc() []const u8 {
     ;
 }
 
+/// Depth-alpha-test vertex shader for the shadow pass. Like depthVertexSrc but
+/// also passes UV to the fragment stage so the fragment can sample the base
+/// texture and discard transparent pixels. Vertex layout: pos at location 0
+/// (offset 0), UV at location 1 (offset 40) — matching the PBR stride-48 VBO.
+pub fn depthAtVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\layout(location = 1) in vec2 a_uv;
+    \\uniform mat4 u_mvp;
+    \\out vec2 v_uv;
+    \\void main() {
+    \\  v_uv = a_uv;
+    \\  gl_Position = u_mvp * vec4(a_pos, 1.0);
+    \\}
+    \\
+    ;
+}
+
+/// Depth-alpha-test fragment shader. Discards pixels where
+/// baseTexAlpha × base_color.a < alphaTestCutoff so the shadow map records
+/// holes in cutout (MASK) geometry. u_material[0].w = base_color.a (dissolve),
+/// u_material[2].w = alpha cutoff.
+pub fn depthAtFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\uniform sampler2D u_base_tex;
+    \\uniform vec4 u_material[3];
+    \\void main() {
+    \\  if (texture(u_base_tex, v_uv).a * u_material[0].w < u_material[2].w) discard;
+    \\}
+    \\
+    ;
+}
+
 pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     comptime pbrCheck(flags);
     const head =
@@ -981,6 +1018,37 @@ pub fn wgslDepth() []const u8 {
     \\}
     \\@fragment
     \\fn fs_main() {}
+    \\
+    ;
+}
+
+/// Depth-alpha-test WGSL for the WebGPU shadow pass. Parallel to
+/// depthAtVertexSrc/depthAtFragmentSrc (GLSL). Samples the base texture and
+/// discards pixels below the alpha cutoff so cutout (MASK) shadows have holes.
+pub fn wgslDepthAt() []const u8 {
+    return
+    \\struct U {
+    \\  mvp: mat4x4<f32>,
+    \\  material: array<vec4<f32>, 3>,
+    \\};
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\@group(0) @binding(1) var base_tex: texture_2d<f32>;
+    \\@group(0) @binding(2) var samp: sampler;
+    \\struct VsOut {
+    \\  @builtin(position) pos: vec4<f32>,
+    \\  @location(0) uv: vec2<f32>,
+    \\};
+    \\@vertex
+    \\fn vs_main(@location(0) a_pos: vec3<f32>, @location(1) a_uv: vec2<f32>) -> VsOut {
+    \\  var out: VsOut;
+    \\  out.uv = a_uv;
+    \\  out.pos = u.mvp * vec4<f32>(a_pos, 1.0);
+    \\  return out;
+    \\}
+    \\@fragment
+    \\fn fs_main(in: VsOut) {
+    \\  if (textureSample(base_tex, samp, in.uv).a * u.material[0].w < u.material[2].w) { discard; }
+    \\}
     \\
     ;
 }
@@ -2241,4 +2309,19 @@ test "endPostProcess without fxaa composites straight to canvas" {
 
 test "state_blend bit value" {
     try testing.expectEqual(@as(u32, 4), state_blend);
+}
+
+test "depthAt shaders: UV + discard + base/material; plain depth frozen" {
+    const gv = depthAtVertexSrc();
+    try testing.expect(std.mem.indexOf(u8, gv, "a_uv") != null);
+    try testing.expect(std.mem.indexOf(u8, gv, "v_uv = a_uv") != null);
+    const gf = depthAtFragmentSrc();
+    try testing.expect(std.mem.indexOf(u8, gf, "discard") != null);
+    try testing.expect(std.mem.indexOf(u8, gf, "u_base_tex") != null);
+    try testing.expect(std.mem.indexOf(u8, gf, "u_material[2].w") != null);
+    const w = wgslDepthAt();
+    try testing.expect(std.mem.indexOf(u8, w, "discard") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "textureSample") != null);
+    // plain depth fragment unchanged (no discard).
+    try testing.expect(std.mem.indexOf(u8, depthFragmentSrc(), "discard") == null);
 }
