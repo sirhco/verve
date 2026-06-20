@@ -2904,3 +2904,19 @@ pub fn pbrDoubleGlb(alloc: Allocator) ![]u8 {
 
     return glb;
 }
+
+// ── pbrDoubleGlb fixture tests ────────────────────────────────────────────────
+
+test "pbrDoubleGlb: double-sided MASK quad round-trips through gltf parse" {
+    const glb = try pbrDoubleGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try gltf_mod.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    try testing.expect(model.submeshes.len >= 1);
+    // Submesh 0 is "DoubleSided": alphaMode "MASK" → alpha_mode == 2, doubleSided:true → double_sided == 1.
+    try testing.expectEqual(@as(u32, 2), model.submeshes[0].alpha_mode);
+    try testing.expectEqual(@as(u32, 1), model.submeshes[0].double_sided);
+    // Submesh name is "DoubleSided".
+    try testing.expect(model.names.len >= 1);
+    try testing.expectEqualStrings("DoubleSided", model.names[0]);
+}
