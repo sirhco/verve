@@ -13,7 +13,9 @@ versions follow [Semantic Versioning](https://semver.org/).
   per-submesh double-sided rendering (glTF `"doubleSided":true`) on both backends.
   Opaque/MASK submeshes use cull-off; BLEND submeshes use two back/front passes.
   The `variant_double_sided` (`1<<11`) shader bit flips the surface normal on back
-  faces (`gl_FrontFacing` / `front_facing`). New `/gl-double` demo.
+  faces (`gl_FrontFacing` / `front_facing`). New `/gl-double` demo: a doubleSided
+  MASK cutout quad beside a translucent doubleSided BLEND card — both verified via
+  CDP on WebGL2 and WebGPU (lit/visible from both sides, BLEND composites correctly).
 
 - **gl MASK cutout shadows** (`src/core/gl/command.zig`, `src/client/islands/GlScene.zig`,
   `src/core/gl/fixture.zig`, `src/bridge/verve.js`, `docs/24-gl.md`): a MASK submesh now
