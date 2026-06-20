@@ -4625,7 +4625,10 @@
           st.active = sh;
           if (state & 1) gl.enable(gl.DEPTH_TEST);
           else gl.disable(gl.DEPTH_TEST);
-          if (state & 2) {
+          if (state & 8) { // state_cull_front
+            gl.enable(gl.CULL_FACE);
+            gl.cullFace(gl.FRONT);
+          } else if (state & 2) { // state_cull_back
             gl.enable(gl.CULL_FACE);
             gl.cullFace(gl.BACK);
           } else gl.disable(gl.CULL_FACE);
@@ -5612,31 +5615,50 @@
               },
             };
             const pipeline = device.createRenderPipeline(pbrDesc);
+            // Blend fragment target (shared across all blend pipeline variants).
+            const blendFragTargets = [{
+              format: pbrFragFormat,
+              blend: {
+                color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              },
+            }];
+            const blendDepthStencil = {
+              format: "depth24plus",
+              depthWriteEnabled: false,
+              depthCompare: "less",
+            };
             // Blend variant: same module/layout/depth-format/color-format as the
             // opaque pipeline — only src-alpha-over blend + depth-write-off differ.
-            // Selected by SET_PIPELINE when state_blend (state & 4) is set (Task 4).
+            // Selected by SET_PIPELINE when state_blend (state & 4) is set.
+            // Single-sided blend uses cull-back (same as pbrDesc opaque).
+            // Double-sided blend needs TWO pipelines: cull-front (back faces) and
+            // cull-back (front faces), selected by state_cull_front/state_cull_back.
             const pipelineBlend = device.createRenderPipeline({
               ...pbrDesc,
-              fragment: {
-                module,
-                entryPoint: "fs_main",
-                targets: [{
-                  format: pbrFragFormat,
-                  blend: {
-                    color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
-                    alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-                  },
-                }],
-              },
-              depthStencil: {
-                format: "depth24plus",
-                depthWriteEnabled: false,
-                depthCompare: "less",
-              },
+              fragment: { module, entryPoint: "fs_main", targets: blendFragTargets },
+              depthStencil: blendDepthStencil,
             });
+            // Double-sided blend cull pipelines (only created when doubleSided).
+            // pipelineBlendFront: state_cull_front (8) → draws back faces.
+            // pipelineBlendBack:  state_cull_back  (2) → draws front faces.
+            const pipelineBlendFront = doubleSided ? device.createRenderPipeline({
+              ...pbrDesc,
+              primitive: { topology: "triangle-list", cullMode: "front" },
+              fragment: { module, entryPoint: "fs_main", targets: blendFragTargets },
+              depthStencil: blendDepthStencil,
+            }) : null;
+            const pipelineBlendBack = doubleSided ? device.createRenderPipeline({
+              ...pbrDesc,
+              primitive: { topology: "triangle-list", cullMode: "back" },
+              fragment: { module, entryPoint: "fs_main", targets: blendFragTargets },
+              depthStencil: blendDepthStencil,
+            }) : null;
             st.pipelines[handle] = {
               pipeline,
               pipelineBlend,
+              pipelineBlendFront,
+              pipelineBlendBack,
               bgl0,
               bgl1,
               kind: "pbr",
@@ -5682,9 +5704,21 @@
           const state = dv.getUint32(off + 4, true);
           const entry = st.pipelines[handle];
           if (entry && st.pass) {
-            // state_blend (state & 4): bind the depth-write-off blend variant when
-            // present; fall back to the opaque pipeline if no blend variant exists.
-            const pipe = (state & 4 && entry.pipelineBlend) ? entry.pipelineBlend : entry.pipeline;
+            // state_blend (state & 4): blend variant. For double-sided blend,
+            // state_cull_front (8) selects pipelineBlendFront (back faces drawn),
+            // state_cull_back (2) selects pipelineBlendBack (front faces drawn).
+            // Non-double-sided blend uses pipelineBlend (cull-back inherited from pbrDesc).
+            // Fall back to opaque pipeline if no blend variant exists.
+            let pipe = entry.pipeline;
+            if (state & 4) {
+              if (state & 8 && entry.pipelineBlendFront) {
+                pipe = entry.pipelineBlendFront;
+              } else if (state & 2 && entry.pipelineBlendBack) {
+                pipe = entry.pipelineBlendBack;
+              } else if (entry.pipelineBlend) {
+                pipe = entry.pipelineBlend;
+              }
+            }
             st.pass.setPipeline(pipe);
             st.active = entry;
           }

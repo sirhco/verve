@@ -1055,7 +1055,45 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         {
             var i: u32 = 0;
             while (i < tcount) : (i += 1) {
-                drawSubmesh(inst, a, &enc, tidx[i], gl.command.state_depth_test | gl.command.state_cull_back | gl.command.state_blend, &tlast_variant, env, pv);
+                const s = tidx[i];
+                const sub = a.submesh(s);
+                if (sub.double_sided != 0) {
+                    // Double-sided BLEND: two-pass — back faces (cull front) then
+                    // front faces (cull back) for correct over-blend compositing.
+                    // Both passes share the same variant; state word differs so each
+                    // needs its own SET_PIPELINE + full lights/IBL/shadow re-emit.
+                    const v = a.submeshVariant(s);
+                    const world_s = inst.scene.world[s + 1];
+                    inst.model_mats[s] = world_s.m;
+                    inst.normal9s[s] = gl.math.normalMatrix(world_s);
+                    inst.mvps[s] = pv.mul(world_s).m;
+                    // Pass A: cull front → back faces drawn.
+                    enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_front | gl.command.state_blend);
+                    enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
+                    enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+                    enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+                    enc.bindTexture(0, texHandle(sub.tex_base));
+                    enc.bindTexture(1, texHandle(sub.tex_mr));
+                    enc.bindTexture(2, texHandle(sub.tex_normal));
+                    enc.bindTexture(3, texHandle(sub.tex_emissive));
+                    enc.bindTexture(4, texHandle(sub.tex_occlusion));
+                    enc.drawPbr(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.mvps[s])), @intCast(@intFromPtr(&inst.model_mats[s])), @intCast(@intFromPtr(&inst.normal9s[s])), @intCast(@intFromPtr(&inst.mats[s])), @intCast(@intFromPtr(&inst.camera_pos)));
+                    // Pass B: cull back → front faces drawn.
+                    enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_back | gl.command.state_blend);
+                    enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
+                    enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+                    enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+                    enc.bindTexture(0, texHandle(sub.tex_base));
+                    enc.bindTexture(1, texHandle(sub.tex_mr));
+                    enc.bindTexture(2, texHandle(sub.tex_normal));
+                    enc.bindTexture(3, texHandle(sub.tex_emissive));
+                    enc.bindTexture(4, texHandle(sub.tex_occlusion));
+                    enc.drawPbr(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.mvps[s])), @intCast(@intFromPtr(&inst.model_mats[s])), @intCast(@intFromPtr(&inst.normal9s[s])), @intCast(@intFromPtr(&inst.mats[s])), @intCast(@intFromPtr(&inst.camera_pos)));
+                    // Force re-bind for next submesh (state changed; variant may match).
+                    tlast_variant = 0;
+                } else {
+                    drawSubmesh(inst, a, &enc, s, gl.command.state_depth_test | gl.command.state_cull_back | gl.command.state_blend, &tlast_variant, env, pv);
+                }
             }
         }
         enc.endFrame();
