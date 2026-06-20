@@ -5522,6 +5522,7 @@
             const hasEmissive = (variant & 0x10) !== 0;
             const hasShadow = (variant & 0x20) !== 0;
             const skinned = (variant & 0x80) !== 0; // variant_skinned
+            const doubleSided = (variant & 0x800) !== 0; // variant_double_sided
             // group(0): binding 0 is the per-draw uniform (dynamic offset),
             // visible to VERTEX|FRAGMENT (wgslPbr: @group(0) @binding(0)
             // var<uniform> u: U). Skinned variants ALSO declare a bones uniform
@@ -5601,7 +5602,9 @@
                 entryPoint: "fs_main",
                 targets: [{ format: pbrFragFormat }],
               },
-              primitive: { topology: "triangle-list", cullMode: "back" },
+              // double-sided (variant_double_sided = 1<<11): render both faces;
+              // single-sided: cull back faces (standard winding).
+              primitive: { topology: "triangle-list", cullMode: doubleSided ? "none" : "back" },
               depthStencil: {
                 format: "depth24plus",
                 depthWriteEnabled: true,

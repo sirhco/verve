@@ -111,6 +111,7 @@ const variant_pbr = gl.command.variant_pbr;
 const variant_nm = gl.command.variant_normal_map;
 const variant_em = gl.command.variant_emissive;
 const variant_at = gl.command.variant_alpha_test;
+const variant_ds = gl.command.variant_double_sided;
 
 // ── Props copies (decoded from SSR data-props; copied into the Inst before the
 //    chunk arena that held the decode result is reset) ─────────────────────────
@@ -213,9 +214,9 @@ const Inst = struct {
     // Single directional light from props: 8 f32 [type, intensity, x,y,z, r,g,b].
     lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 },
 
-    // GPU-resource registry for context-restore replay (cap 32; ~24 worst case
-    // with the 8 PBR/alpha-test shader variants: 2 buf + 8 shader + depth + depth_at + shadow + 8 tex + 3 IBL).
-    registry: gl.Registry(32) = .{},
+    // GPU-resource registry for context-restore replay (cap 48; ~32 worst case
+    // with the 16 PBR/alpha-test/double-sided shader variants: 2 buf + 16 shader + depth + depth_at + shadow + 8 tex + 3 IBL).
+    registry: gl.Registry(48) = .{},
     resources_sent: bool = false,
     needs_replay: bool = false,
 
@@ -335,9 +336,10 @@ export fn glscene_unmount(root_id: u32) void {
 const up_vec = gl.math.Vec3.init(0, 1, 0);
 
 /// Stable shader handle per PBR variant:
-///   opaque:     pbr→1, pbr|nm→2, pbr|em→3, pbr|nm|em→4
-///   alpha-test: pbr|at→6, pbr|nm|at→7, pbr|em|at→8, pbr|nm|em|at→9
-/// Handle 5 is the depth-only shadow shader (see depth_shader).
+///   opaque:          pbr→1, pbr|nm→2, pbr|em→3, pbr|nm|em→4
+///   alpha-test:      pbr|at→6, pbr|nm|at→7, pbr|em|at→8, pbr|nm|em|at→9
+///   double-sided:    pbr|ds→11..pbr|nm|em|at|ds→18
+/// Handle 5 = depth-only shadow shader; handle 10 = alpha-tested depth shader.
 fn shaderHandleFor(variant: u32) u32 {
     return switch (variant) {
         variant_pbr => 1,
@@ -348,6 +350,14 @@ fn shaderHandleFor(variant: u32) u32 {
         variant_pbr | variant_nm | variant_at => 7,
         variant_pbr | variant_em | variant_at => 8,
         variant_pbr | variant_nm | variant_em | variant_at => 9,
+        variant_pbr | variant_ds => 11,
+        variant_pbr | variant_nm | variant_ds => 12,
+        variant_pbr | variant_em | variant_ds => 13,
+        variant_pbr | variant_nm | variant_em | variant_ds => 14,
+        variant_pbr | variant_at | variant_ds => 15,
+        variant_pbr | variant_nm | variant_at | variant_ds => 16,
+        variant_pbr | variant_em | variant_at | variant_ds => 17,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds => 18,
         else => unreachable,
     };
 }
@@ -436,6 +446,14 @@ fn createShaderForVariant(inst: *Inst, enc: *gl.Encoder, variant: u32) void {
         variant_pbr | variant_nm | variant_at => emitShader(inst, enc, variant_pbr | variant_nm | variant_at),
         variant_pbr | variant_em | variant_at => emitShader(inst, enc, variant_pbr | variant_em | variant_at),
         variant_pbr | variant_nm | variant_em | variant_at => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at),
+        variant_pbr | variant_ds => emitShader(inst, enc, variant_pbr | variant_ds),
+        variant_pbr | variant_nm | variant_ds => emitShader(inst, enc, variant_pbr | variant_nm | variant_ds),
+        variant_pbr | variant_em | variant_ds => emitShader(inst, enc, variant_pbr | variant_em | variant_ds),
+        variant_pbr | variant_nm | variant_em | variant_ds => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_ds),
+        variant_pbr | variant_at | variant_ds => emitShader(inst, enc, variant_pbr | variant_at | variant_ds),
+        variant_pbr | variant_nm | variant_at | variant_ds => emitShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_ds),
+        variant_pbr | variant_em | variant_at | variant_ds => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds),
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds),
         else => unreachable,
     }
 }
@@ -948,6 +966,9 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         const light_vp = clipFix().mul(lightSpaceMatrix(inst, a));
         inst.light_vp_mat = light_vp.m;
         enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
+        // NOTE: double-sided shadows use back-cull this phase — drawDepth/drawDepthAt
+        // carry no per-draw state word, so cull is baked into the depth pipeline.
+        // A thin double-sided surface may under-shadow from one side; future work.
         {
             // Phase A: opaque + blend (alpha_mode != 2) — plain position-only depth.
             var sd: u32 = 0;
@@ -987,9 +1008,12 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             var s: u32 = 0;
             while (s < a.submesh_count) : (s += 1) {
                 if (s >= max_submesh) break;
-                if (a.submesh(s).alpha_mode == 1) continue; // Pass 1 = opaque + mask (skip blend)
+                const sub1 = a.submesh(s);
+                if (sub1.alpha_mode == 1) continue; // Pass 1 = opaque + mask (skip blend)
                 if (!visibleAfterCull(inst, planes, s)) continue;
-                drawSubmesh(inst, a, &enc, s, gl.command.state_depth_test | gl.command.state_cull_back, &last_variant, env, pv);
+                // single-sided → cull back; double-sided → cull off (both faces).
+                const cull: u32 = if (sub1.double_sided != 0) 0 else gl.command.state_cull_back;
+                drawSubmesh(inst, a, &enc, s, gl.command.state_depth_test | cull, &last_variant, env, pv);
             }
         }
 
@@ -1105,7 +1129,7 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     inst.registry.recordBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
 
     // Create + record only the distinct shader variants the mesh actually uses.
-    var shader_seen: [10]bool = .{false} ** 10;
+    var shader_seen: [19]bool = .{false} ** 19;
     var sv: u32 = 0;
     while (sv < a.submesh_count) : (sv += 1) {
         if (sv >= max_submesh) break;
