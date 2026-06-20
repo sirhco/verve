@@ -2646,6 +2646,10 @@ test "windFarmGlb .vmesh asset exposes turbineN/rotorN names the pick maps on" {
 ///    Texture: an 8×8 checkerboard with every 4th column punched transparent.
 ///  - mesh 1 "Floor": a horizontal plane at y=-1.5. Material: opaque, single-
 ///    sided (default). 8×8 neutral-grey texture.
+///  - mesh 2 "DoubleBlend": an upright quad offset +X, face normal +Z.
+///    Material: `alphaMode:"BLEND"`, `doubleSided:true`, baseColorFactor alpha
+///    0.5 (translucent) — exercises the two-pass back-then-front cull path.
+///    Reuses the grey floor texture.
 ///
 /// The fixture is intentionally lean (8×8 PNG blobs, 4 vertices per mesh) so
 /// gl_asset_gen processes it quickly at build time.
@@ -2696,9 +2700,18 @@ pub fn pbrDoubleGlb(alloc: Allocator) ![]u8 {
     const fl_uv_len: u32 = 32;
     const fl_idx_off: u32 = fl_uv_off + fl_uv_len;
     const fl_idx_len: u32 = 12;
+    // DS BLEND card (mesh 2), aligned to 4 after the floor indices.
+    const bl_pos_off: u32 = (fl_idx_off + fl_idx_len + 3) & ~@as(u32, 3);
+    const bl_pos_len: u32 = 48;
+    const bl_nrm_off: u32 = bl_pos_off + bl_pos_len;
+    const bl_nrm_len: u32 = 48;
+    const bl_uv_off: u32 = bl_nrm_off + bl_nrm_len;
+    const bl_uv_len: u32 = 32;
+    const bl_idx_off: u32 = bl_uv_off + bl_uv_len;
+    const bl_idx_len: u32 = 12;
 
     var png_offs: [2]u32 = undefined;
-    var cursor: u32 = (fl_idx_off + fl_idx_len + 3) & ~@as(u32, 3);
+    var cursor: u32 = (bl_idx_off + bl_idx_len + 3) & ~@as(u32, 3);
     for (pngs, 0..) |p, i| {
         png_offs[i] = cursor;
         cursor += @intCast(p.len);
@@ -2787,6 +2800,44 @@ pub fn pbrDoubleGlb(alloc: Allocator) ![]u8 {
         }
     }
 
+    // DS BLEND card: upright quad offset +X (beside the MASK quad), face normal +Z.
+    {
+        const pos = [4][3]f32{
+            .{ 2.5, -1.5, 0 },
+            .{ 5.5, -1.5, 0 },
+            .{ 5.5, 1.5, 0 },
+            .{ 2.5, 1.5, 0 },
+        };
+        var o: usize = bl_pos_off;
+        for (pos) |v| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(v[0]), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(v[1]), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(v[2]), .little);
+            o += 12;
+        }
+        // Normals: all (0,0,1)
+        o = bl_nrm_off;
+        for (0..4) |_| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(@as(f32, 0)), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(@as(f32, 0)), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(@as(f32, 1)), .little);
+            o += 12;
+        }
+        const uvs = [4][2]f32{ .{ 0, 1 }, .{ 1, 1 }, .{ 1, 0 }, .{ 0, 0 } };
+        o = bl_uv_off;
+        for (uvs) |uv| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(uv[0]), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(uv[1]), .little);
+            o += 8;
+        }
+        // Indices: CCW from front (+Z side)
+        o = bl_idx_off;
+        for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |idx| {
+            std.mem.writeInt(u16, bin[o..][0..2], idx, .little);
+            o += 2;
+        }
+    }
+
     for (pngs, 0..) |p, i| {
         @memcpy(bin[png_offs[i]..][0..p.len], p);
     }
@@ -2796,22 +2847,26 @@ pub fn pbrDoubleGlb(alloc: Allocator) ![]u8 {
     defer json_aw.deinit();
     const w = &json_aw.writer;
 
-    // accessors: DS 0=POS 1=NRM 2=UV 3=idx; Floor 4=POS 5=NRM 6=UV 7=idx.
-    // bufferViews: 8 geom + 2 PNG.
-    const bv_count_geom: u32 = 8;
+    // accessors: DS 0=POS 1=NRM 2=UV 3=idx; Floor 4=POS 5=NRM 6=UV 7=idx;
+    // BLEND card 8=POS 9=NRM 10=UV 11=idx.
+    // bufferViews: 12 geom + 2 PNG.
+    const bv_count_geom: u32 = 12;
 
     try w.writeAll("{");
     try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
     try w.writeAll("\"scene\":0,");
-    try w.writeAll("\"scenes\":[{\"nodes\":[0,1]}],");
-    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"DsNode\"},{\"mesh\":1,\"name\":\"FloorNode\"}],");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0,1,2]}],");
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"DsNode\"},{\"mesh\":1,\"name\":\"FloorNode\"},{\"mesh\":2,\"name\":\"BlendNode\"}],");
     try w.writeAll("\"meshes\":[");
     try w.writeAll("{\"name\":\"DoubleSided\",\"primitives\":[{\"attributes\":{");
     try w.writeAll("\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2");
     try w.writeAll("},\"indices\":3,\"material\":0}]},");
     try w.writeAll("{\"name\":\"Floor\",\"primitives\":[{\"attributes\":{");
     try w.writeAll("\"POSITION\":4,\"NORMAL\":5,\"TEXCOORD_0\":6");
-    try w.writeAll("},\"indices\":7,\"material\":1}]}");
+    try w.writeAll("},\"indices\":7,\"material\":1}]},");
+    try w.writeAll("{\"name\":\"DoubleBlend\",\"primitives\":[{\"attributes\":{");
+    try w.writeAll("\"POSITION\":8,\"NORMAL\":9,\"TEXCOORD_0\":10");
+    try w.writeAll("},\"indices\":11,\"material\":2}]}");
     try w.writeAll("],");
 
     try w.writeAll("\"accessors\":[");
@@ -2822,7 +2877,11 @@ pub fn pbrDoubleGlb(alloc: Allocator) ![]u8 {
     try w.print("{{\"bufferView\":4,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"min\":[-4.0,-1.5,-4.0],\"max\":[4.0,-1.5,4.0]}},", .{});
     try w.writeAll("{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
     try w.writeAll("{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC2\"},");
-    try w.writeAll("{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"}");
+    try w.writeAll("{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"},");
+    try w.print("{{\"bufferView\":8,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"min\":[2.5,-1.5,0.0],\"max\":[5.5,1.5,0.0]}},", .{});
+    try w.writeAll("{\"bufferView\":9,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":10,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":11,\"byteOffset\":0,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"}");
     try w.writeAll("],");
 
     try w.writeAll("\"bufferViews\":[");
@@ -2834,6 +2893,10 @@ pub fn pbrDoubleGlb(alloc: Allocator) ![]u8 {
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ fl_nrm_off, fl_nrm_len });
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ fl_uv_off, fl_uv_len });
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ fl_idx_off, fl_idx_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bl_pos_off, bl_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bl_nrm_off, bl_nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bl_uv_off, bl_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ bl_idx_off, bl_idx_len });
     for (pngs, 0..) |p, i| {
         try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ png_offs[i], p.len });
         if (i + 1 < pngs.len) try w.writeAll(",");
@@ -2844,6 +2907,7 @@ pub fn pbrDoubleGlb(alloc: Allocator) ![]u8 {
 
     // material 0: MASK double-sided quad.
     // material 1: OPAQUE floor (single-sided, default cull-back).
+    // material 2: BLEND double-sided card (translucent, two-pass back/front).
     try w.writeAll("\"materials\":[{");
     try w.writeAll("\"pbrMetallicRoughness\":{");
     try w.writeAll("\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
@@ -2854,6 +2918,13 @@ pub fn pbrDoubleGlb(alloc: Allocator) ![]u8 {
     try w.writeAll("},{");
     try w.writeAll("\"pbrMetallicRoughness\":{\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
     try w.writeAll("\"baseColorTexture\":{\"index\":1},\"metallicFactor\":0.0,\"roughnessFactor\":1.0}");
+    try w.writeAll("},{");
+    try w.writeAll("\"pbrMetallicRoughness\":{");
+    try w.writeAll("\"baseColorFactor\":[0.4,0.7,1.0,0.5],");
+    try w.writeAll("\"baseColorTexture\":{\"index\":1},");
+    try w.writeAll("\"metallicFactor\":0.0,\"roughnessFactor\":0.5");
+    try w.writeAll("},");
+    try w.writeAll("\"alphaMode\":\"BLEND\",\"doubleSided\":true");
     try w.writeAll("}],");
 
     try w.writeAll("\"textures\":[");
@@ -2919,4 +2990,9 @@ test "pbrDoubleGlb: double-sided MASK quad round-trips through gltf parse" {
     // Submesh name is "DoubleSided".
     try testing.expect(model.names.len >= 1);
     try testing.expectEqualStrings("DoubleSided", model.names[0]);
+    // Submesh 2 is "DoubleBlend": alphaMode "BLEND" → alpha_mode == 1, doubleSided:true → double_sided == 1.
+    try testing.expect(model.submeshes.len >= 3);
+    try testing.expectEqual(@as(u32, 1), model.submeshes[2].alpha_mode);
+    try testing.expectEqual(@as(u32, 1), model.submeshes[2].double_sided);
+    try testing.expectEqualStrings("DoubleBlend", model.names[2]);
 }

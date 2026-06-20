@@ -1319,14 +1319,17 @@ pub fn glSceneDouble(ctx: *const verve.Context) !*verve.Node {
     return ctx.main_().class("home gl-scene-page").children(.{
         ctx.h1("verve.gl — doubleSided materials"),
         ctx.p().text("An upright MASK quad with " ++
-            "\"doubleSided\":true in its glTF material. The variant_double_sided " ++
+            "\"doubleSided\":true in its glTF material, beside a translucent " ++
+            "doubleSided BLEND card. The variant_double_sided " ++
             "shader flips the surface normal on back faces (gl_FrontFacing / " ++
-            "front_facing), so the quad is correctly lit from both sides as the " ++
-            "camera auto-rotates past it — no dark back face, no culled geometry."),
+            "front_facing), so both are correctly lit from both sides as the " ++
+            "camera auto-rotates past them — no dark back face, no culled geometry."),
         scene_wrap,
         ctx.p().class("hint")
-            .text("The quad auto-rotates. Back face = same color, different specular " ++
-            "direction. The floor is single-sided (opaque, default cull-back)."),
+            .text("Both quads auto-rotate. Back face = same color, different specular " ++
+            "direction. The BLEND card draws back faces then front faces (two-pass " ++
+            "cull) so it composites correctly from either side. The floor is " ++
+            "single-sided (opaque, default cull-back)."),
         ctx.p().text("Drag to orbit · wheel to zoom. Both WebGL2 and WebGPU backends " ++
             "render double-sided surfaces identically."),
     });
