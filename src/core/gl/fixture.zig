@@ -2635,3 +2635,272 @@ test "windFarmGlb .vmesh asset exposes turbineN/rotorN names the pick maps on" {
     for (turbine_seen) |seen| try testing.expect(seen);
     for (rotor_seen) |seen| try testing.expect(seen);
 }
+
+// ── double-sided material fixture ────────────────────────────────────────────
+
+/// Minimal GLB that exercises per-submesh double-sided rendering.
+///
+/// Two meshes:
+///  - mesh 0 "DoubleSided": an upright quad at the origin, face normal +Z.
+///    Material: `alphaMode:"MASK"`, `alphaCutoff:0.5`, `doubleSided:true`.
+///    Texture: an 8×8 checkerboard with every 4th column punched transparent.
+///  - mesh 1 "Floor": a horizontal plane at y=-1.5. Material: opaque, single-
+///    sided (default). 8×8 neutral-grey texture.
+///
+/// The fixture is intentionally lean (8×8 PNG blobs, 4 vertices per mesh) so
+/// gl_asset_gen processes it quickly at build time.
+pub fn pbrDoubleGlb(alloc: Allocator) ![]u8 {
+    // ── 1. Textures ───────────────────────────────────────────────────────────
+    // DS quad: 8×8 checkerboard, every 4th column (x%4==0) punched alpha=0.
+    var ds_map: [8 * 8 * 4]u8 = undefined;
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            const warm = (row + col) % 2 == 0;
+            ds_map[idx + 0] = if (warm) 220 else 60;
+            ds_map[idx + 1] = if (warm) 100 else 160;
+            ds_map[idx + 2] = if (warm) 60 else 220;
+            ds_map[idx + 3] = if (col % 4 == 0) 0 else 255;
+        }
+    }
+    // Floor: flat neutral grey, fully opaque.
+    var fl_map: [8 * 8 * 4]u8 = undefined;
+    for (&fl_map) |*b| b.* = 180;
+    // Force alpha=255 for floor every 4th byte.
+    var fi: usize = 3;
+    while (fi < fl_map.len) : (fi += 4) fl_map[fi] = 255;
+
+    const ds_png = try png.encodeRgba(alloc, &ds_map, 8, 8);
+    defer alloc.free(ds_png);
+    const fl_png = try png.encodeRgba(alloc, &fl_map, 8, 8);
+    defer alloc.free(fl_png);
+
+    const pngs = [2][]const u8{ ds_png, fl_png };
+
+    // ── 2. BIN layout ────────────────────────────────────────────────────────
+    // DS quad geometry (mesh 0), then Floor geometry (mesh 1), then the 2 PNGs.
+    const ds_pos_off: u32 = 0;
+    const ds_pos_len: u32 = 4 * 3 * 4; // 48
+    const ds_nrm_off: u32 = ds_pos_off + ds_pos_len; // 48
+    const ds_nrm_len: u32 = 48;
+    const ds_uv_off: u32 = ds_nrm_off + ds_nrm_len; // 96
+    const ds_uv_len: u32 = 4 * 2 * 4; // 32
+    const ds_idx_off: u32 = ds_uv_off + ds_uv_len; // 128
+    const ds_idx_len: u32 = 6 * 2; // 12
+    // align to 4 → 144
+    const fl_pos_off: u32 = (ds_idx_off + ds_idx_len + 3) & ~@as(u32, 3);
+    const fl_pos_len: u32 = 48;
+    const fl_nrm_off: u32 = fl_pos_off + fl_pos_len;
+    const fl_nrm_len: u32 = 48;
+    const fl_uv_off: u32 = fl_nrm_off + fl_nrm_len;
+    const fl_uv_len: u32 = 32;
+    const fl_idx_off: u32 = fl_uv_off + fl_uv_len;
+    const fl_idx_len: u32 = 12;
+
+    var png_offs: [2]u32 = undefined;
+    var cursor: u32 = (fl_idx_off + fl_idx_len + 3) & ~@as(u32, 3);
+    for (pngs, 0..) |p, i| {
+        png_offs[i] = cursor;
+        cursor += @intCast(p.len);
+        cursor = (cursor + 3) & ~@as(u32, 3);
+    }
+    const bin_total: u32 = cursor;
+    const bin_padded = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // DS quad: upright at origin, face normal +Z.
+    {
+        const pos = [4][3]f32{
+            .{ -1.5, -1.5, 0 },
+            .{ 1.5, -1.5, 0 },
+            .{ 1.5, 1.5, 0 },
+            .{ -1.5, 1.5, 0 },
+        };
+        var o: usize = ds_pos_off;
+        for (pos) |v| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(v[0]), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(v[1]), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(v[2]), .little);
+            o += 12;
+        }
+        // Normals: all (0,0,1)
+        o = ds_nrm_off;
+        for (0..4) |_| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(@as(f32, 0)), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(@as(f32, 0)), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(@as(f32, 1)), .little);
+            o += 12;
+        }
+        // UVs: bottom-left origin (glTF convention)
+        const uvs = [4][2]f32{ .{ 0, 1 }, .{ 1, 1 }, .{ 1, 0 }, .{ 0, 0 } };
+        o = ds_uv_off;
+        for (uvs) |uv| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(uv[0]), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(uv[1]), .little);
+            o += 8;
+        }
+        // Indices: CCW from front (+Z side)
+        o = ds_idx_off;
+        for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |idx| {
+            std.mem.writeInt(u16, bin[o..][0..2], idx, .little);
+            o += 2;
+        }
+    }
+
+    // Floor: horizontal plane at y=-1.5.
+    {
+        const pos = [4][3]f32{
+            .{ -4, -1.5, -4 },
+            .{ 4, -1.5, -4 },
+            .{ 4, -1.5, 4 },
+            .{ -4, -1.5, 4 },
+        };
+        var o: usize = fl_pos_off;
+        for (pos) |v| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(v[0]), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(v[1]), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(v[2]), .little);
+            o += 12;
+        }
+        // Normals: all (0,1,0)
+        o = fl_nrm_off;
+        for (0..4) |_| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(@as(f32, 0)), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(@as(f32, 1)), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(@as(f32, 0)), .little);
+            o += 12;
+        }
+        const uvs = [4][2]f32{ .{ 0, 0 }, .{ 2, 0 }, .{ 2, 2 }, .{ 0, 2 } };
+        o = fl_uv_off;
+        for (uvs) |uv| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(uv[0]), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(uv[1]), .little);
+            o += 8;
+        }
+        o = fl_idx_off;
+        for ([6]u16{ 0, 2, 1, 0, 3, 2 }) |idx| {
+            std.mem.writeInt(u16, bin[o..][0..2], idx, .little);
+            o += 2;
+        }
+    }
+
+    for (pngs, 0..) |p, i| {
+        @memcpy(bin[png_offs[i]..][0..p.len], p);
+    }
+
+    // ── 3. JSON ────────────────────────────────────────────────────────────────
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    // accessors: DS 0=POS 1=NRM 2=UV 3=idx; Floor 4=POS 5=NRM 6=UV 7=idx.
+    // bufferViews: 8 geom + 2 PNG.
+    const bv_count_geom: u32 = 8;
+
+    try w.writeAll("{");
+    try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0,1]}],");
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"DsNode\"},{\"mesh\":1,\"name\":\"FloorNode\"}],");
+    try w.writeAll("\"meshes\":[");
+    try w.writeAll("{\"name\":\"DoubleSided\",\"primitives\":[{\"attributes\":{");
+    try w.writeAll("\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2");
+    try w.writeAll("},\"indices\":3,\"material\":0}]},");
+    try w.writeAll("{\"name\":\"Floor\",\"primitives\":[{\"attributes\":{");
+    try w.writeAll("\"POSITION\":4,\"NORMAL\":5,\"TEXCOORD_0\":6");
+    try w.writeAll("},\"indices\":7,\"material\":1}]}");
+    try w.writeAll("],");
+
+    try w.writeAll("\"accessors\":[");
+    try w.print("{{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"min\":[-1.5,-1.5,0.0],\"max\":[1.5,1.5,0.0]}},", .{});
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"},");
+    try w.print("{{\"bufferView\":4,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"min\":[-4.0,-1.5,-4.0],\"max\":[4.0,-1.5,4.0]}},", .{});
+    try w.writeAll("{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"}");
+    try w.writeAll("],");
+
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ ds_pos_off, ds_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ ds_nrm_off, ds_nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ ds_uv_off, ds_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ ds_idx_off, ds_idx_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ fl_pos_off, fl_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ fl_nrm_off, fl_nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ fl_uv_off, fl_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ fl_idx_off, fl_idx_len });
+    for (pngs, 0..) |p, i| {
+        try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ png_offs[i], p.len });
+        if (i + 1 < pngs.len) try w.writeAll(",");
+    }
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+
+    // material 0: MASK double-sided quad.
+    // material 1: OPAQUE floor (single-sided, default cull-back).
+    try w.writeAll("\"materials\":[{");
+    try w.writeAll("\"pbrMetallicRoughness\":{");
+    try w.writeAll("\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
+    try w.writeAll("\"baseColorTexture\":{\"index\":0},");
+    try w.writeAll("\"metallicFactor\":0.0,\"roughnessFactor\":0.8");
+    try w.writeAll("},");
+    try w.writeAll("\"alphaMode\":\"MASK\",\"alphaCutoff\":0.5,\"doubleSided\":true");
+    try w.writeAll("},{");
+    try w.writeAll("\"pbrMetallicRoughness\":{\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
+    try w.writeAll("\"baseColorTexture\":{\"index\":1},\"metallicFactor\":0.0,\"roughnessFactor\":1.0}");
+    try w.writeAll("}],");
+
+    try w.writeAll("\"textures\":[");
+    for (0..2) |i| {
+        try w.print("{{\"source\":{d}}}", .{i});
+        if (i + 1 < 2) try w.writeAll(",");
+    }
+    try w.writeAll("],");
+
+    try w.writeAll("\"images\":[");
+    for (0..2) |i| {
+        try w.print("{{\"bufferView\":{d},\"mimeType\":\"image/png\"}}", .{bv_count_geom + @as(u32, @intCast(i))});
+        if (i + 1 < 2) try w.writeAll(",");
+    }
+    try w.writeAll("]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── 4. Assemble GLB ───────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42; // B
+    glb[goff + 1] = 0x49; // I
+    glb[goff + 2] = 0x4E; // N
+    glb[goff + 3] = 0x00; // \0
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    return glb;
+}

@@ -8,6 +8,13 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **gl doubleSided materials** (`src/core/gl/fixture.zig`, `tools/gen_double_glb.zig`,
+  `build.zig`, `src/app/components.zig`, `src/app/routes.zig`, `docs/24-gl.md`):
+  per-submesh double-sided rendering (glTF `"doubleSided":true`) on both backends.
+  Opaque/MASK submeshes use cull-off; BLEND submeshes use two back/front passes.
+  The `variant_double_sided` (`1<<11`) shader bit flips the surface normal on back
+  faces (`gl_FrontFacing` / `front_facing`). New `/gl-double` demo.
+
 - **gl MASK cutout shadows** (`src/core/gl/command.zig`, `src/client/islands/GlScene.zig`,
   `src/core/gl/fixture.zig`, `src/bridge/verve.js`, `docs/24-gl.md`): a MASK submesh now
   casts a **hole-accurate, dissolve-correct** shadow on both backends. A sibling depth-at

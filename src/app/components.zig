@@ -1278,6 +1278,60 @@ pub fn glSceneCutout(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-double: doubleSided material demo. An upright MASK quad with
+/// doubleSided:true is visible from both sides as the camera auto-rotates
+/// past it — back-face normals are flipped by the variant_double_sided shader
+/// so the surface stays lit from both directions rather than going dark or
+/// vanishing. The floor plane is single-sided (OPAQUE, cull-back default).
+///
+/// Orbit: the scene auto-rotates so the camera passes through both the front
+/// (+Z) and back (-Z) faces of the quad. The back face appears identically
+/// colored and lit (normal-flipped PBR). Drag to orbit or wheel to zoom.
+pub fn glSceneDouble(ctx: *const verve.Context) !*verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
+    const scene = ctx.glScene(.{
+        .src = "/gl/double.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EDouble-Sided%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 5.0, .pitch = 0.25, .yaw = 0.5 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .autoRotate(0.4)
+        .build();
+
+    // Scroll-driven dolly so the user can pull back and see the full quad.
+    const dolly_id = comptime (verve.gl.anim_target.resolvePathStatic("camera.distance") orelse unreachable);
+
+    const scene_wrap = ctx.div()
+        .children(.{scene})
+        .animate(anim.to(a, null)
+        .glTargetRange(dolly_id, 0, 5.0, 3.0)
+        .duration(1).ease(.linear)
+        .scrollTrigger(.{
+        .trigger = "section[data-ref^=glscene-scroll-section]",
+        .start = .{ .trigger = .top, .viewport = .top },
+        .end = .{ .at = .{ .trigger = .bottom, .viewport = .top } },
+        .scrub = .{ .smooth = 0.4 },
+    }));
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — doubleSided materials"),
+        ctx.p().text("An upright MASK quad with " ++
+            "\"doubleSided\":true in its glTF material. The variant_double_sided " ++
+            "shader flips the surface normal on back faces (gl_FrontFacing / " ++
+            "front_facing), so the quad is correctly lit from both sides as the " ++
+            "camera auto-rotates past it — no dark back face, no culled geometry."),
+        scene_wrap,
+        ctx.p().class("hint")
+            .text("The quad auto-rotates. Back face = same color, different specular " ++
+            "direction. The floor is single-sided (opaque, default cull-back)."),
+        ctx.p().text("Drag to orbit · wheel to zoom. Both WebGL2 and WebGPU backends " ++
+            "render double-sided surfaces identically."),
+    });
+}
+
 /// /gl-multi: TWO independent GlScene islands on one page (P7 multi-instance).
 /// Each `<verve-island data-name="GlScene">` gets its own per-instance state
 /// slot keyed by vid; the bridge selects the right instance before each frame /
