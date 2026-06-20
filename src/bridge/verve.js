@@ -5032,6 +5032,55 @@
           gl.drawArrays(gl.TRIANGLES, 0, 3);
           break;
         }
+        case 26: { // DRAW_DEPTH_AT — alpha-tested depth draw (MASK cutout shadows)
+          // Payload (command.zig Encoder.drawDepthAt, 28B / 7 u32):
+          //   shader | vbuf | ibuf | idx_byte_off | count | mvp_ptr | material_ptr.
+          // The depth-at program (created as shader handle 10 by the chunk) samples
+          // u_base_tex (unit 0 — bound by the preceding bind_texture(0,…)) and
+          // discards holes via u_material before writing depth. Self-contained
+          // attribute layout: pos=loc 0 @0, uv=loc 1 @40 over the stride-48 buffer.
+          const shHandle = dv.getUint32(off, true);
+          const vh = dv.getUint32(off + 4, true);
+          const ih = dv.getUint32(off + 8, true);
+          const byteOff = dv.getUint32(off + 12, true);
+          const count = dv.getUint32(off + 16, true);
+          const mvpPtr = dv.getUint32(off + 20, true);
+          const materialPtr = dv.getUint32(off + 24, true);
+          const sh = st.shaders[shHandle];
+          const vb = st.buffers[vh];
+          const ib = st.buffers[ih];
+          if (!sh || !vb || !ib) break;
+          gl.useProgram(sh.prog);
+          st.active = sh;
+          // Cache the depth-at uniform locations on first use (createShader only
+          // pre-resolves u_mvp for this variant; material + sampler are queried here).
+          if (sh.material === undefined) {
+            sh.material = gl.getUniformLocation(sh.prog, "u_material");
+            sh.baseTex = gl.getUniformLocation(sh.prog, "u_base_tex");
+          }
+          if (sh.baseTex) gl.uniform1i(sh.baseTex, 0); // sample bind_texture(0,…) at unit 0
+          gl.uniformMatrix4fv(sh.mvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
+          if (sh.material)
+            gl.uniform4fv(sh.material, new Float32Array(memory.buffer, materialPtr, 12));
+          // Dedicated VAO: pos (loc 0 @0) + uv (loc 1 @40) over stride 48. Keyed
+          // distinctly ("dat") so it never collides with the PBR/depth VAOs.
+          const datKey = `${vh}:${ih}:dat`;
+          let datVao = st.vaos.get(datKey);
+          if (!datVao) {
+            datVao = gl.createVertexArray();
+            gl.bindVertexArray(datVao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);
+            gl.enableVertexAttribArray(1);
+            gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 48, 40);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
+            st.vaos.set(datKey, datVao);
+          }
+          gl.bindVertexArray(datVao);
+          gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
         default:
           break; // unknown tag: size-skip = forward compatible
       }
@@ -5233,6 +5282,19 @@
     }
     return st.depthUniform;
   };
+  // Lazily create the depth-at uniform (per draw: mvp 64B + material 48B = 112B,
+  // padded to the DEPTH_STRIDE 256B dynamic-offset slot). The bind group is built
+  // per draw_depth_at (binding 1 = base texture view varies), so only the buffer
+  // is cached here. Reused across frames; dropped on device loss.
+  const gpuEnsureDepthAtUniform = (st) => {
+    if (!st.depthAtUniform) {
+      st.depthAtUniform = st.device.createBuffer({
+        size: DEPTH_STRIDE * MAX_DRAWS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    return st.depthAtUniform;
+  };
   // Resolve a material slot (0=base,1=mr,2=normal,3=emissive,4=occlusion — the
   // bind_texture wire numbering) to a texture view, falling back to a device
   // default per gpuMakeDefaults' documented mapping. IBL slots (irradiance/
@@ -5384,6 +5446,49 @@
           // WGSL declares (wgslPbr appends tex_normal/tex_emissive conditionally;
           // tex_base + tex_ibl are unconditional).
           if ((variant & 0x40) !== 0) { // variant_depth = 1 << 6 — shadow depth pass
+            if ((variant & 0x400) !== 0) { // + variant_alpha_test (1 << 10) → depth-at
+              // Depth-at pipeline (wgslDepthAt): alpha-tested depth draw for MASK
+              // cutout shadows. Vertex carries pos + uv; the fragment samples the
+              // base texture and discards holes before writing depth. group(0):
+              //   binding 0 = per-draw uniform {mvp(64B), material[3](48B)} (dynamic
+              //   offset), binding 1 = base texture view, binding 2 = sampler.
+              const bgl0 = device.createBindGroupLayout({
+                entries: [
+                  {
+                    binding: 0,
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer: { type: "uniform", hasDynamicOffset: true },
+                  },
+                  { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+                  { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+                ],
+              });
+              const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
+              const pipeline = device.createRenderPipeline({
+                layout,
+                vertex: {
+                  module,
+                  entryPoint: "vs_main",
+                  buffers: [{
+                    arrayStride: 48, // stride-48 layout: pos @0, uv @40
+                    attributes: [
+                      { shaderLocation: 0, offset: 0, format: "float32x3" },
+                      { shaderLocation: 1, offset: 40, format: "float32x2" },
+                    ],
+                  }],
+                },
+                // Matches the plain depth pipeline: front-face cull, depth32float,
+                // depth-write on, 'less' compare. No color target.
+                primitive: { topology: "triangle-list", cullMode: "front" },
+                depthStencil: {
+                  format: "depth32float",
+                  depthWriteEnabled: true,
+                  depthCompare: "less",
+                },
+              });
+              st.pipelines[handle] = { pipeline, bgl0, kind: "depthAt" };
+              break;
+            }
             // Depth-only pipeline (wgslDepth): position-only vertex, NO color
             // target, renders into the depth32float shadow map. Front-face cull
             // pushes self-shadow acne behind geometry (mirrors the WebGL2 path).
@@ -5792,6 +5897,7 @@
           });
           st.active = depthPipe;
           st.depthSlot = 0; // reset per-draw depth-uniform slot allocation
+          st.depthAtSlot = 0; // depth-at draws use a separate buffer + slot counter
           gpuEnsureDepthUniform(st, depthPipe);
           break;
         }
@@ -5818,6 +5924,45 @@
           st.shadowPass.setVertexBuffer(0, vb.buf);
           st.shadowPass.setIndexBuffer(ib.buf, "uint16", byteOff);
           st.shadowPass.setBindGroup(0, st.depthBindGroup, [dbase]);
+          st.shadowPass.drawIndexed(count);
+          break;
+        }
+        case 26: { // DRAW_DEPTH_AT — alpha-tested depth draw (MASK cutout shadows).
+          // Payload (command.zig Encoder.drawDepthAt, 28B / 7 u32):
+          //   shader | vbuf | ibuf | idx_byte_off | count | mvp_ptr | material_ptr.
+          // Selects the depth-at pipeline (handle from the payload — created as
+          // shader handle 10), writes {mvp, material} into its own dynamic-offset
+          // uniform slot, and binds the base texture (slot 0, from the preceding
+          // bind_texture) + a sampler so the fragment can discard cutout holes.
+          const datPipe = st.pipelines[dv.getUint32(off, true)];
+          const vb = st.buffers[dv.getUint32(off + 4, true)];
+          const ib = st.buffers[dv.getUint32(off + 8, true)];
+          const byteOff = dv.getUint32(off + 12, true);
+          const count = dv.getUint32(off + 16, true);
+          const mvpPtr = dv.getUint32(off + 20, true);
+          const materialPtr = dv.getUint32(off + 24, true);
+          if (!datPipe || datPipe.kind !== "depthAt" || !vb || !ib || !st.shadowPass) break;
+          const dslot = st.depthAtSlot++;
+          if (dslot >= MAX_DRAWS) break; // per-pass draw cap
+          const dbase = dslot * DEPTH_STRIDE;
+          const ubuf = gpuEnsureDepthAtUniform(st);
+          // Slot layout (wgslDepthAt U): mvp mat4x4 @0 (64B), material vec4[3] @64 (48B).
+          device.queue.writeBuffer(ubuf, dbase, new Float32Array(memory.buffer, mvpPtr, 16));
+          device.queue.writeBuffer(ubuf, dbase + 64, new Float32Array(memory.buffer, materialPtr, 12));
+          // Base texture (bind_texture slot 0) + the default filtering sampler.
+          const baseView = gpuSlotView(st, 0, st.defaults.white2d);
+          const bg = device.createBindGroup({
+            layout: datPipe.bgl0,
+            entries: [
+              { binding: 0, resource: { buffer: ubuf, offset: 0, size: 112 } },
+              { binding: 1, resource: baseView },
+              { binding: 2, resource: st.defaults.sampler },
+            ],
+          });
+          st.shadowPass.setPipeline(datPipe.pipeline);
+          st.shadowPass.setVertexBuffer(0, vb.buf);
+          st.shadowPass.setIndexBuffer(ib.buf, "uint16", byteOff);
+          st.shadowPass.setBindGroup(0, bg, [dbase]);
           st.shadowPass.drawIndexed(count);
           break;
         }
@@ -6309,6 +6454,8 @@
       bonesBuf: null, // shared bones palette uniform (lazy; 64 mat4) — skinned
       depthUniform: null, // shadow depth-pass uniform (lazy; one mat4)
       depthBindGroup: null, // cached depth-pass bind group (2c)
+      depthAtUniform: null, // depth-at (MASK cutout) uniform (lazy; mvp+material)
+      depthAtSlot: 0, // per-pass depth-at draw counter (reset at begin_shadow_pass)
       bg0: null, // cached group(0) bind group (uniform)
       bg0Layout: null,
       bg1: null, // cached group(1) bind group (sampler + textures)
@@ -6396,6 +6543,7 @@
       st.bindGroup = null;
       st.depthUniform = null;
       st.depthBindGroup = null;
+      st.depthAtUniform = null;
       st.bg0 = null;
       st.bg0Layout = null;
       st.bg1 = null;

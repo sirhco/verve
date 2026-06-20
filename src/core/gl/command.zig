@@ -48,6 +48,7 @@ pub const Tag = enum(u16) {
     begin_offscreen_pass = 23, // {target_handle, clear_rgba(4 f32), clear_flags(bit0=color,bit1=depth)} — bind RT
     end_offscreen_pass = 24, // {} — close the offscreen pass; next begin_* rebinds
     draw_fullscreen_quad = 25, // {shader, tex0, tex1, params_ptr, param_count} — VBO-less 3-vert triangle
+    draw_depth_at = 26, // {shader, vbuf, ibuf, index_byte_off, index_count, mvp_ptr, material_ptr} — alpha-tested depth draw (MASK shadows)
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -302,6 +303,43 @@ pub fn depthFragmentSrc() []const u8 {
     \\#version 300 es
     \\precision highp float;
     \\void main() {}
+    \\
+    ;
+}
+
+/// Depth-alpha-test vertex shader for the shadow pass. Like depthVertexSrc but
+/// also passes UV to the fragment stage so the fragment can sample the base
+/// texture and discard transparent pixels. Vertex layout: pos at location 0
+/// (offset 0), UV at location 1 (offset 40) — matching the PBR stride-48 VBO.
+pub fn depthAtVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\layout(location = 1) in vec2 a_uv;
+    \\uniform mat4 u_mvp;
+    \\out vec2 v_uv;
+    \\void main() {
+    \\  v_uv = a_uv;
+    \\  gl_Position = u_mvp * vec4(a_pos, 1.0);
+    \\}
+    \\
+    ;
+}
+
+/// Depth-alpha-test fragment shader. Discards pixels where
+/// baseTexAlpha × base_color.a < alphaTestCutoff so the shadow map records
+/// holes in cutout (MASK) geometry. u_material[0].w = base_color.a (dissolve),
+/// u_material[2].w = alpha cutoff.
+pub fn depthAtFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\uniform sampler2D u_base_tex;
+    \\uniform vec4 u_material[3];
+    \\void main() {
+    \\  if (texture(u_base_tex, v_uv).a * u_material[0].w < u_material[2].w) discard;
+    \\}
     \\
     ;
 }
@@ -985,6 +1023,37 @@ pub fn wgslDepth() []const u8 {
     ;
 }
 
+/// Depth-alpha-test WGSL for the WebGPU shadow pass. Parallel to
+/// depthAtVertexSrc/depthAtFragmentSrc (GLSL). Samples the base texture and
+/// discards pixels below the alpha cutoff so cutout (MASK) shadows have holes.
+pub fn wgslDepthAt() []const u8 {
+    return
+    \\struct U {
+    \\  mvp: mat4x4<f32>,
+    \\  material: array<vec4<f32>, 3>,
+    \\};
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\@group(0) @binding(1) var base_tex: texture_2d<f32>;
+    \\@group(0) @binding(2) var samp: sampler;
+    \\struct VsOut {
+    \\  @builtin(position) pos: vec4<f32>,
+    \\  @location(0) uv: vec2<f32>,
+    \\};
+    \\@vertex
+    \\fn vs_main(@location(0) a_pos: vec3<f32>, @location(1) a_uv: vec2<f32>) -> VsOut {
+    \\  var out: VsOut;
+    \\  out.uv = a_uv;
+    \\  out.pos = u.mvp * vec4<f32>(a_pos, 1.0);
+    \\  return out;
+    \\}
+    \\@fragment
+    \\fn fs_main(in: VsOut) {
+    \\  if (textureSample(base_tex, samp, in.uv).a * u.material[0].w < u.material[2].w) { discard; }
+    \\}
+    \\
+    ;
+}
+
 // ── Post-processing WGSL modules ─────────────────────────────────────
 //
 // Shared bind-group layout for all 4 post effects:
@@ -1359,6 +1428,20 @@ pub const Encoder = struct {
         self.putU32(index_byte_off);
         self.putU32(index_count);
         self.putU32(mvp_ptr);
+    }
+
+    /// Alpha-tested depth draw (MASK cutout shadows): binds `shader` (the depth-at
+    /// program), reads the base texture (bound via bind_texture slot 0) + `u_material`
+    /// (from `material_ptr`), discards below the cutoff. `mvp_ptr` = light_vp·world.
+    pub fn drawDepthAt(self: *Encoder, shader: u32, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, mvp_ptr: u32, material_ptr: u32) void {
+        self.header(.draw_depth_at, 28);
+        self.putU32(shader);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(mvp_ptr);
+        self.putU32(material_ptr);
     }
 
     /// Bind the shadow map to `slot` and set `u_light_vp` on the active program.
@@ -2241,4 +2324,31 @@ test "endPostProcess without fxaa composites straight to canvas" {
 
 test "state_blend bit value" {
     try testing.expectEqual(@as(u32, 4), state_blend);
+}
+
+test "depthAt shaders: UV + discard + base/material; plain depth frozen" {
+    const gv = depthAtVertexSrc();
+    try testing.expect(std.mem.indexOf(u8, gv, "a_uv") != null);
+    try testing.expect(std.mem.indexOf(u8, gv, "v_uv = a_uv") != null);
+    const gf = depthAtFragmentSrc();
+    try testing.expect(std.mem.indexOf(u8, gf, "discard") != null);
+    try testing.expect(std.mem.indexOf(u8, gf, "u_base_tex") != null);
+    try testing.expect(std.mem.indexOf(u8, gf, "u_material[2].w") != null);
+    const w = wgslDepthAt();
+    try testing.expect(std.mem.indexOf(u8, w, "discard") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "textureSample") != null);
+    // plain depth fragment unchanged (no discard).
+    try testing.expect(std.mem.indexOf(u8, depthFragmentSrc(), "discard") == null);
+}
+
+test "drawDepthAt encodes tag 26 + 7 u32 payload" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.drawDepthAt(10, 1, 2, 48, 36, 0x1000, 0x2000);
+    // Buffer layout: [0..4) = reserved length header; record starts at 4.
+    // [4..6) = tag u16, [6..8) = payload_size u16, [8..36) = 7×u32 payload.
+    try testing.expectEqual(@as(u16, 26), std.mem.readInt(u16, buf[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, buf[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, buf[8..12], .little)); // shader
+    try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, buf[32..36], .little)); // material_ptr (7th u32)
 }

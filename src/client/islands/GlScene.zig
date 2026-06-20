@@ -89,6 +89,7 @@ const lut_handle: u32 = 18;
 // handle 5 (above the four PBR variants 1..4); the shadow map is handle 1 in the
 // bridge's separate `st.shadowMaps[]` namespace.
 const depth_shader: u32 = 5;
+const depth_at_shader: u32 = 10; // alpha-tested depth shader for MASK cutout shadows
 const shadow_handle: u32 = 1;
 const shadow_size: u32 = 1024;
 
@@ -212,8 +213,8 @@ const Inst = struct {
     // Single directional light from props: 8 f32 [type, intensity, x,y,z, r,g,b].
     lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 },
 
-    // GPU-resource registry for context-restore replay (cap 32; ~23 worst case
-    // with the 8 PBR/alpha-test shader variants: 2 buf + 8 shader + depth + shadow + 8 tex + 3 IBL).
+    // GPU-resource registry for context-restore replay (cap 32; ~24 worst case
+    // with the 8 PBR/alpha-test shader variants: 2 buf + 8 shader + depth + depth_at + shadow + 8 tex + 3 IBL).
     registry: gl.Registry(32) = .{},
     resources_sent: bool = false,
     needs_replay: bool = false,
@@ -467,6 +468,19 @@ fn emitDepthShader(inst: *Inst, enc: *gl.Encoder) void {
     const fs = gl.command.depthFragmentSrc();
     enc.createShader(depth_shader, gl.command.variant_depth, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
     inst.registry.recordShader(depth_shader, gl.command.variant_depth, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+}
+
+fn emitDepthAtShader(inst: *Inst, enc: *gl.Encoder) void {
+    if (use_webgpu) {
+        const w = gl.command.wgslDepthAt();
+        enc.createShader(depth_at_shader, gl.command.variant_depth | gl.command.variant_alpha_test, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        inst.registry.recordShader(depth_at_shader, gl.command.variant_depth | gl.command.variant_alpha_test, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        return;
+    }
+    const vs = gl.command.depthAtVertexSrc();
+    const fs = gl.command.depthAtFragmentSrc();
+    enc.createShader(depth_at_shader, gl.command.variant_depth | gl.command.variant_alpha_test, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    inst.registry.recordShader(depth_at_shader, gl.command.variant_depth | gl.command.variant_alpha_test, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
 }
 
 // ── hydrate ──────────────────────────────────────────────────────────────────
@@ -935,12 +949,23 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         inst.light_vp_mat = light_vp.m;
         enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
         {
+            // Phase A: opaque + blend (alpha_mode != 2) — plain position-only depth.
             var sd: u32 = 0;
             while (sd < a.submesh_count) : (sd += 1) {
                 if (sd >= max_submesh) break;
                 const sub = a.submesh(sd);
                 inst.depth_mvps[sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
+                if (sub.alpha_mode == 2) continue;
                 enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])));
+            }
+            // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
+            sd = 0;
+            while (sd < a.submesh_count) : (sd += 1) {
+                if (sd >= max_submesh) break;
+                const sub = a.submesh(sd);
+                if (sub.alpha_mode != 2) continue;
+                enc.bindTexture(0, texHandle(sub.tex_base));
+                enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])), @intCast(@intFromPtr(&inst.mats[sd])));
             }
         }
         enc.endShadowPass(width, height);
@@ -1093,6 +1118,14 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
 
     // Shadow-pass resources (P9 slice 3): the depth-only shader + depth target.
     emitDepthShader(inst, enc);
+    var has_mask = false;
+    {
+        var mi: u32 = 0;
+        while (mi < a.submesh_count and mi < max_submesh) : (mi += 1) {
+            if (a.submesh(mi).alpha_mode == 2) has_mask = true;
+        }
+    }
+    if (has_mask) emitDepthAtShader(inst, enc);
     enc.createShadowMap(shadow_handle, shadow_size);
     inst.registry.recordShadowMap(shadow_handle, shadow_size);
 
