@@ -1,4 +1,4 @@
-//! .vmesh packed asset format v10 — writer + freestanding reader.
+//! .vmesh packed asset format v11 — writer + freestanding reader.
 //!
 //! Invariant: the byte buffer handed to `Reader.init` must itself be at least
 //! 4-byte aligned (the asset region provides 16) — section offsets only
@@ -7,7 +7,7 @@
 //!
 //! Header layout (72 bytes, all integers little-endian u32):
 //!   [0..4]   magic "VMSH"
-//!   [4..8]   version u32 = 10
+//!   [4..8]   version u32 = 11
 //!   [8..12]  vertex_count
 //!   [12..16] index_count
 //!   [16..20] submesh_count
@@ -24,13 +24,13 @@
 //!   [60..64] skeleton_off (16-aligned; 0 allowed ONLY if joint_count == 0)
 //!   [64..68] joint_count
 //!   [68..72] anim_off (16-aligned; 0 = no animation clip)
-//! submesh table @68, submesh_count × 80 bytes:
+//! submesh table @68, submesh_count × 84 bytes:
 //!   index_byte_off u32 @0, index_count u32 @4,
 //!   base_color f32×4 @8, metallic f32 @24, roughness f32 @28,
 //!   emissive f32×3 @32, occlusion_strength f32 @44, normal_scale f32 @48,
 //!   tex_base i32 @52, tex_mr i32 @56, tex_normal i32 @60,
 //!   tex_emissive i32 @64, tex_occlusion i32 @68, alpha_mode u32 @72,
-//!   alpha_cutoff f32 @76
+//!   alpha_cutoff f32 @76, double_sided u32 @80
 //! texture table @tex_table_off, texture_count × 20 bytes:
 //!   width u32, height u32, data_off u32 (into tex blob), data_len u32,
 //!   format u32 (Format enum; 0 = raw)
@@ -58,11 +58,11 @@ const bvh = @import("bvh.zig");
 const command = @import("command.zig");
 
 pub const magic = "VMSH";
-pub const version: u32 = 10;
+pub const version: u32 = 11;
 pub const vertex_stride: u32 = 48; // pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40
 pub const skinned_vertex_stride: u32 = 56; // …48, then joints uint8x4 @48, weights unorm8x4 @52
 pub const header_size: u32 = 72;
-pub const submesh_size: u32 = 80;
+pub const submesh_size: u32 = 84;
 pub const tex_entry_size: u32 = 20;
 pub const name_entry_size: u32 = 12;
 pub const joint_entry_size: u32 = 132; // parent i32 (4) + inverse_bind 16f32 (64) + bind_local 16f32 (64)
@@ -118,6 +118,7 @@ pub const Submesh = struct {
     tex_occlusion: i32,
     alpha_mode: u32 = 0, // 0=opaque, 1=blend, 2=mask. vmesh v9.
     alpha_cutoff: f32 = 0.5, // MASK alpha-test threshold. vmesh v10.
+    double_sided: u32 = 0, // glTF doubleSided (0/1). vmesh v11.
 };
 
 pub const Texture = struct {
@@ -306,6 +307,8 @@ pub fn pack(
         std.mem.writeInt(u32, buf[off + 72 ..][0..4], s.alpha_mode, .little);
         // @76: alpha_cutoff (vmesh v10)
         std.mem.writeInt(u32, buf[off + 76 ..][0..4], @bitCast(s.alpha_cutoff), .little);
+        // @80: double_sided (vmesh v11)
+        std.mem.writeInt(u32, buf[off + 80 ..][0..4], s.double_sided, .little);
     }
 
     // Write texture table
@@ -753,6 +756,7 @@ pub const Reader = struct {
             .tex_occlusion = std.mem.readInt(i32, raw[68..72], .little),
             .alpha_mode = std.mem.readInt(u32, raw[72..76], .little),
             .alpha_cutoff = @bitCast(std.mem.readInt(u32, raw[76..80], .little)),
+            .double_sided = std.mem.readInt(u32, raw[80..84], .little),
         };
     }
 
@@ -1368,8 +1372,8 @@ test "(j) v5 skinned round-trip: stride 56, 2-joint skeleton" {
     const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, null);
     defer testing.allocator.free(bytes);
 
-    // Header: version 10, skinned flag set, joint_count == 2.
-    try testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, bytes[4..8], .little));
+    // Header: version 11, skinned flag set, joint_count == 2.
+    try testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, bytes[4..8], .little));
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[56..60], .little));
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[64..68], .little));
     // skeleton_off 16-aligned.
@@ -1440,8 +1444,8 @@ test "vmesh v9: CUBICSPLINE round-trip — in/point/out tangents + LINEAR regres
     const bytes = try pack(testing.allocator, &verts, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints_arr, &weights_arr, &skel, anims);
     defer testing.allocator.free(bytes);
 
-    // Version must be 10.
-    try testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, bytes[4..8], .little));
+    // Version must be 11.
+    try testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, bytes[4..8], .little));
 
     const r = try Reader.init(bytes);
     try testing.expect(r.animPresent());
@@ -1537,8 +1541,8 @@ test "vmesh v10: submesh alpha_mode round-trips" {
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 10), version);
-    try testing.expectEqual(@as(u32, 80), submesh_size);
+    try testing.expectEqual(@as(u32, 11), version);
+    try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 1), reader.submesh(0).alpha_mode);
 }
 
@@ -1551,8 +1555,8 @@ test "vmesh v10: submesh alpha_cutoff round-trips" {
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 10), version);
-    try testing.expectEqual(@as(u32, 80), submesh_size);
+    try testing.expectEqual(@as(u32, 11), version);
+    try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 2), reader.submesh(0).alpha_mode);
     try testing.expectEqual(@as(f32, 0.3), reader.submesh(0).alpha_cutoff);
 }
@@ -1569,4 +1573,18 @@ test "(i) submeshVariant: alpha_mode 2 adds variant_alpha_test" {
     const reader = try Reader.init(bytes);
     try testing.expect(reader.submeshVariant(0) & command.variant_alpha_test != 0);
     try testing.expect(reader.submeshVariant(1) & command.variant_alpha_test == 0);
+}
+
+test "vmesh v11: submesh double_sided round-trips" {
+    const verts = [_]f32{0} ** 12;
+    const idx = [_]u16{ 0, 0, 0 };
+    var subs = [_]Submesh{
+        .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .alpha_mode = 0, .alpha_cutoff = 0.5, .double_sided = 1 },
+    };
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    defer testing.allocator.free(bytes);
+    const reader = try Reader.init(bytes);
+    try testing.expectEqual(@as(u32, 11), version);
+    try testing.expectEqual(@as(u32, 84), submesh_size);
+    try testing.expectEqual(@as(u32, 1), reader.submesh(0).double_sided);
 }
