@@ -850,6 +850,7 @@ pub const Reader = struct {
         if (sub.tex_normal >= 0) bits |= command.variant_normal_map;
         if (sub.tex_emissive >= 0) bits |= command.variant_emissive;
         if (sub.alpha_mode == 2) bits |= command.variant_alpha_test;
+        if (sub.double_sided != 0) bits |= command.variant_double_sided;
         return bits;
     }
 };
@@ -1587,4 +1588,18 @@ test "vmesh v11: submesh double_sided round-trips" {
     try testing.expectEqual(@as(u32, 11), version);
     try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 1), reader.submesh(0).double_sided);
+}
+
+test "(i) submeshVariant: double_sided adds variant_double_sided" {
+    const verts = [_]f32{0} ** 12;
+    const idx = [_]u16{ 0, 0, 0 };
+    var subs = [_]Submesh{
+        .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .double_sided = 1 },
+        .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .double_sided = 0 },
+    };
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    defer testing.allocator.free(bytes);
+    const reader = try Reader.init(bytes);
+    try testing.expect(reader.submeshVariant(0) & command.variant_double_sided != 0);
+    try testing.expect(reader.submeshVariant(1) & command.variant_double_sided == 0);
 }

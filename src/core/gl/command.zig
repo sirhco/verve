@@ -81,6 +81,7 @@ pub const variant_skinned: u32 = 1 << 7; // requires variant_pbr; GPU skinning v
 pub const variant_post: u32 = 1 << 8; // fullscreen-quad shader: no VBO, no depth test, 2 sampler+texture slots
 pub const variant_linear_output: u32 = 1 << 9; // requires variant_pbr; SKIP in-shader ACES (post path renders linear HDR)
 pub const variant_alpha_test: u32 = 1 << 10; // requires variant_pbr; MASK cutout (discard below alphaCutoff)
+pub const variant_double_sided: u32 = 1 << 11; // requires variant_pbr; render both faces, flip back-face normal
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;

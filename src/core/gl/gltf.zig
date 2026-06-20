@@ -583,6 +583,7 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
             var tex_occlusion: i32 = -1;
             var alpha_mode: u32 = 0;
             var alpha_cutoff: f32 = 0.5;
+            var double_sided: u32 = 0;
 
             if (prim_obj.get("material")) |mat_val| {
                 const mat_idx: usize = @intCast(jsonInt(mat_val) orelse return error.Malformed);
@@ -644,6 +645,10 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                     if (mat_obj.get("alphaCutoff")) |ac| {
                         alpha_cutoff = jsonFloat(ac) orelse 0.5;
                     }
+                    // doubleSided: false by default.
+                    if (mat_obj.get("doubleSided")) |ds| {
+                        if (ds == .bool and ds.bool) double_sided = 1;
+                    }
                 }
             }
 
@@ -663,6 +668,7 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                 .tex_occlusion = tex_occlusion,
                 .alpha_mode = alpha_mode,
                 .alpha_cutoff = alpha_cutoff,
+                .double_sided = double_sided,
             });
             try name_list.append(aa, mesh_name);
         }
@@ -2002,6 +2008,66 @@ test "gltf parses alphaMode MASK + alphaCutoff" {
         try testing.expectEqual(@as(usize, 1), model.submeshes.len);
         try testing.expectEqual(@as(u32, 2), model.submeshes[0].alpha_mode);
         try testing.expectApproxEqAbs(@as(f32, 0.5), model.submeshes[0].alpha_cutoff, 1e-6);
+    }
+}
+
+test "gltf parses doubleSided" {
+    const alloc = testing.allocator;
+    const pos = [_]f32{ 0, 0, 0, 1, 0, 0, 0, 1, 0 };
+    const nrm = [_]f32{ 0, 0, 1, 0, 0, 1, 0, 0, 1 };
+    const uv = [_]f32{ 0, 0, 1, 0, 0, 1 };
+    const idx = [_]u16{ 0, 1, 2 };
+
+    // Case 1: material has "doubleSided":true → submesh double_sided must be 1.
+    {
+        const json =
+            "{\"asset\":{\"version\":\"2.0\"}," ++
+            "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}]," ++
+            "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}]," ++
+            "\"accessors\":[" ++
+            "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+            "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+            "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}," ++
+            "{\"bufferView\":3,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}]," ++
+            "\"bufferViews\":[" ++
+            "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36}," ++
+            "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36}," ++
+            "{\"buffer\":0,\"byteOffset\":72,\"byteLength\":24}," ++
+            "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":6,\"target\":34963}]," ++
+            "\"buffers\":[{\"byteLength\":102}]," ++
+            "\"materials\":[{\"doubleSided\":true,\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}]}";
+        const glb = try assembleGlb(alloc, json, &pos, &nrm, &uv, &idx, null);
+        defer alloc.free(glb);
+        var model = try parseGlb(alloc, glb);
+        defer model.deinit();
+        try testing.expectEqual(@as(usize, 1), model.submeshes.len);
+        try testing.expectEqual(@as(u32, 1), model.submeshes[0].double_sided);
+    }
+
+    // Case 2: material has no doubleSided → submesh double_sided must be 0 (default).
+    {
+        const json =
+            "{\"asset\":{\"version\":\"2.0\"}," ++
+            "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}]," ++
+            "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}]," ++
+            "\"accessors\":[" ++
+            "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+            "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+            "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}," ++
+            "{\"bufferView\":3,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}]," ++
+            "\"bufferViews\":[" ++
+            "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36}," ++
+            "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36}," ++
+            "{\"buffer\":0,\"byteOffset\":72,\"byteLength\":24}," ++
+            "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":6,\"target\":34963}]," ++
+            "\"buffers\":[{\"byteLength\":102}]," ++
+            "\"materials\":[{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}]}";
+        const glb = try assembleGlb(alloc, json, &pos, &nrm, &uv, &idx, null);
+        defer alloc.free(glb);
+        var model = try parseGlb(alloc, glb);
+        defer model.deinit();
+        try testing.expectEqual(@as(usize, 1), model.submeshes.len);
+        try testing.expectEqual(@as(u32, 0), model.submeshes[0].double_sided);
     }
 }
 
