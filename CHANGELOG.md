@@ -6,6 +6,22 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **gl MASK cutout shadows** (`src/core/gl/command.zig`, `src/client/islands/GlScene.zig`,
+  `src/core/gl/fixture.zig`, `src/bridge/verve.js`, `docs/24-gl.md`): a MASK submesh now
+  casts a **hole-accurate, dissolve-correct** shadow on both backends. A sibling depth-at
+  shader (`depthAtVertexSrc`/`depthAtFragmentSrc` GLSL, `wgslDepthAt` WGSL; shader-handle
+  10) forwards UV and runs the same base-texture-alpha × `baseColorA` discard against the
+  cutoff (`u_material[2].w`) as the color pass, so the depth (shadow) pass reproduces the
+  cutout's perforations. New append-only wire tag `draw_depth_at` (26) carries the MVP +
+  material pointer; `Encoder.drawDepthAt` emits it and both bridges build a dedicated
+  depth-at pipeline / bind group. The shadow loop is two-phase (plain `draw_depth`, then
+  MASK `draw_depth_at`); scenes with no MASK submesh are byte-identical. The `/gl-cutout`
+  fixture gains a large **opaque receiver plane** (`ReceiverPlane`) below the cube so the
+  perforated shadow is visible and erodes as `material:Cutout.baseColorA` dissolves.
+  Remaining non-goals: `doubleSided`, translucent (BLEND) shadows.
+
 ## [0.6.0] - 2026-06-19
 
 ### Added

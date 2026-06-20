@@ -694,6 +694,23 @@ pub fn pbrCubeCutoutGlb(alloc: Allocator) ![]u8 {
         }
     }
 
+    // ── Receiver-plane base map (8×8 neutral floor). The directional light
+    // casts the cube's hole-accurate shadow onto this opaque plane so the
+    // cutout shadow is actually VISIBLE in the /gl-cutout scene. A faint
+    // checker reads the shadow clearly against the floor. ──────────────────────
+    var floor_map: [8 * 8 * 4]u8 = undefined;
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            const lightcell = (row + col) % 2 == 0;
+            const f: u8 = if (lightcell) 205 else 185;
+            floor_map[idx + 0] = f;
+            floor_map[idx + 1] = f;
+            floor_map[idx + 2] = @intCast(@as(u16, f) + 8);
+            floor_map[idx + 3] = 255;
+        }
+    }
+
     const base_png = try png.encodeRgba(alloc, base_map, base_dim, base_dim);
     defer alloc.free(base_png);
     const mr_png = try png.encodeRgba(alloc, &mr_map, 8, 8);
@@ -704,10 +721,15 @@ pub fn pbrCubeCutoutGlb(alloc: Allocator) ![]u8 {
     defer alloc.free(emi_png);
     const occ_png = try png.encodeRgba(alloc, &occ_map, 8, 8);
     defer alloc.free(occ_png);
+    const floor_png = try png.encodeRgba(alloc, &floor_map, 8, 8);
+    defer alloc.free(floor_png);
 
-    const pngs = [5][]const u8{ base_png, mr_png, nrm_png, emi_png, occ_png };
+    const pngs = [6][]const u8{ base_png, mr_png, nrm_png, emi_png, occ_png, floor_png };
 
     // ── 2. BIN layout (NO tangents — asset-gen generates them) ─────────────────
+    // Cube geometry first (mesh 0 "Cutout"), then the receiver-plane quad
+    // geometry (mesh 1 "ReceiverPlane"), then the six PNGs. The floor's 8×8 map
+    // (<64×64) stays in-blob; only the cube's 256² base externalizes to tex0.
     const p_pos_off: u32 = 0;
     const p_pos_len: u32 = 24 * 3 * 4; // 288
     const p_nrm_off: u32 = p_pos_off + p_pos_len;
@@ -716,8 +738,16 @@ pub fn pbrCubeCutoutGlb(alloc: Allocator) ![]u8 {
     const p_uv_len: u32 = 24 * 2 * 4; // 192
     const p_idx_off: u32 = p_uv_off + p_uv_len;
     const p_idx_len: u32 = 36 * 2; // 72
-    var png_offs: [5]u32 = undefined;
-    var cursor: u32 = (p_idx_off + p_idx_len + 3) & ~@as(u32, 3);
+    // Receiver plane: 4-vertex quad.
+    const fl_pos_off: u32 = (p_idx_off + p_idx_len + 3) & ~@as(u32, 3);
+    const fl_geom_len: u32 = 4 * 3 * 4; // 48 (pos / nrm)
+    const fl_nrm_off: u32 = fl_pos_off + fl_geom_len;
+    const fl_uv_off: u32 = fl_nrm_off + fl_geom_len;
+    const fl_uv_len: u32 = 4 * 2 * 4; // 32
+    const fl_idx_off: u32 = fl_uv_off + fl_uv_len;
+    const fl_idx_len: u32 = 6 * 2; // 12
+    var png_offs: [6]u32 = undefined;
+    var cursor: u32 = (fl_idx_off + fl_idx_len + 3) & ~@as(u32, 3);
     for (pngs, 0..) |p, i| {
         png_offs[i] = cursor;
         cursor += @intCast(p.len);
@@ -765,6 +795,45 @@ pub fn pbrCubeCutoutGlb(alloc: Allocator) ![]u8 {
             off += 2;
         }
     }
+
+    // Receiver plane: a large +Y-facing quad at y = -1.5 spanning [-6,6] on X/Z,
+    // just below the cube (extent ±1). The directional light (dir ≈ down/away)
+    // projects the cube's alpha-tested shadow onto it. Winding chosen so the
+    // up-facing side survives back-face culling.
+    {
+        const fy: f32 = -1.5;
+        const s: f32 = 6.0;
+        const fpos = [4][3]f32{
+            .{ -s, fy, -s }, .{ s, fy, -s }, .{ s, fy, s }, .{ -s, fy, s },
+        };
+        var po: usize = fl_pos_off;
+        for (fpos) |v| {
+            std.mem.writeInt(u32, bin[po..][0..4], @bitCast(v[0]), .little);
+            std.mem.writeInt(u32, bin[po + 4 ..][0..4], @bitCast(v[1]), .little);
+            std.mem.writeInt(u32, bin[po + 8 ..][0..4], @bitCast(v[2]), .little);
+            po += 12;
+        }
+        var no: usize = fl_nrm_off;
+        for (0..4) |_| {
+            std.mem.writeInt(u32, bin[no..][0..4], @bitCast(@as(f32, 0)), .little);
+            std.mem.writeInt(u32, bin[no + 4 ..][0..4], @bitCast(@as(f32, 1)), .little);
+            std.mem.writeInt(u32, bin[no + 8 ..][0..4], @bitCast(@as(f32, 0)), .little);
+            no += 12;
+        }
+        const fuv = [4][2]f32{ .{ 0, 0 }, .{ 4, 0 }, .{ 4, 4 }, .{ 0, 4 } };
+        var uo: usize = fl_uv_off;
+        for (fuv) |uv| {
+            std.mem.writeInt(u32, bin[uo..][0..4], @bitCast(uv[0]), .little);
+            std.mem.writeInt(u32, bin[uo + 4 ..][0..4], @bitCast(uv[1]), .little);
+            uo += 8;
+        }
+        var io: usize = fl_idx_off;
+        for ([6]u16{ 0, 2, 1, 0, 3, 2 }) |o| {
+            std.mem.writeInt(u16, bin[io..][0..2], o, .little);
+            io += 2;
+        }
+    }
+
     for (pngs, 0..) |p, i| {
         @memcpy(bin[png_offs[i]..][0..p.len], p);
     }
@@ -774,23 +843,36 @@ pub fn pbrCubeCutoutGlb(alloc: Allocator) ![]u8 {
     defer json_aw.deinit();
     const w = &json_aw.writer;
 
-    // accessors: 0=POSITION 1=NORMAL 2=UV 3=indices. bufferViews mirror then 5 PNG.
-    const bv_count_geom: u32 = 4;
+    // accessors: cube 0=POSITION 1=NORMAL 2=UV 3=indices; receiver plane
+    // 4=POSITION 5=NORMAL 6=UV 7=indices. bufferViews mirror those 8 geom views,
+    // then the 6 PNG views. The image bufferViews start after the geom views.
+    const bv_count_geom: u32 = 8;
 
     try w.writeAll("{");
     try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
     try w.writeAll("\"scene\":0,");
-    try w.writeAll("\"scenes\":[{\"nodes\":[0]}],");
-    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"CutoutCube\"}],");
-    try w.writeAll("\"meshes\":[{\"name\":\"Cutout\",\"primitives\":[{\"attributes\":{");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0,1]}],");
+    // Node 0 keeps the original name "CutoutCube" (the addressable submesh). Node
+    // 1 is the opaque shadow receiver.
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"CutoutCube\"},{\"mesh\":1,\"name\":\"ReceiverPlane\"}],");
+    try w.writeAll("\"meshes\":[");
+    try w.writeAll("{\"name\":\"Cutout\",\"primitives\":[{\"attributes\":{");
     try w.writeAll("\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2");
-    try w.writeAll("},\"indices\":3,\"material\":0}]}],");
+    try w.writeAll("},\"indices\":3,\"material\":0}]},");
+    try w.writeAll("{\"name\":\"ReceiverPlane\",\"primitives\":[{\"attributes\":{");
+    try w.writeAll("\"POSITION\":4,\"NORMAL\":5,\"TEXCOORD_0\":6");
+    try w.writeAll("},\"indices\":7,\"material\":1}]}");
+    try w.writeAll("],");
 
     try w.writeAll("\"accessors\":[");
     try w.writeAll("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[-1.0,-1.0,-1.0],\"max\":[1.0,1.0,1.0]},");
     try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
     try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
-    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"}");
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"},");
+    try w.writeAll("{\"bufferView\":4,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"min\":[-6.0,-1.5,-6.0],\"max\":[6.0,-1.5,6.0]},");
+    try w.writeAll("{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"}");
     try w.writeAll("],");
 
     try w.writeAll("\"bufferViews\":[");
@@ -798,6 +880,10 @@ pub fn pbrCubeCutoutGlb(alloc: Allocator) ![]u8 {
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ p_nrm_off, p_nrm_len });
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ p_uv_off, p_uv_len });
     try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ p_idx_off, p_idx_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ fl_pos_off, fl_geom_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ fl_nrm_off, fl_geom_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ fl_uv_off, fl_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ fl_idx_off, fl_idx_len });
     for (pngs, 0..) |p, i| {
         try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ png_offs[i], p.len });
         if (i + 1 < pngs.len) try w.writeAll(",");
@@ -805,6 +891,9 @@ pub fn pbrCubeCutoutGlb(alloc: Allocator) ![]u8 {
     try w.writeAll("],");
 
     try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+    // material 0: the MASK cutout cube (unchanged). material 1: the OPAQUE
+    // receiver plane (default alphaMode → alpha_mode 0 → draws in the opaque
+    // pass and receives the cube's cast shadow). Floor texture is source 5.
     try w.writeAll("\"materials\":[{");
     try w.writeAll("\"pbrMetallicRoughness\":{");
     try w.writeAll("\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
@@ -817,17 +906,20 @@ pub fn pbrCubeCutoutGlb(alloc: Allocator) ![]u8 {
     try w.writeAll("\"emissiveFactor\":[1.0,1.0,1.0],");
     try w.writeAll("\"occlusionTexture\":{\"index\":4,\"strength\":0.8},");
     try w.writeAll("\"alphaMode\":\"MASK\",\"alphaCutoff\":0.5");
+    try w.writeAll("},{");
+    try w.writeAll("\"pbrMetallicRoughness\":{\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
+    try w.writeAll("\"baseColorTexture\":{\"index\":5},\"metallicFactor\":0.0,\"roughnessFactor\":1.0}");
     try w.writeAll("}],");
     try w.writeAll("\"textures\":[");
-    for (0..5) |i| {
+    for (0..6) |i| {
         try w.print("{{\"source\":{d}}}", .{i});
-        if (i + 1 < 5) try w.writeAll(",");
+        if (i + 1 < 6) try w.writeAll(",");
     }
     try w.writeAll("],");
     try w.writeAll("\"images\":[");
-    for (0..5) |i| {
+    for (0..6) |i| {
         try w.print("{{\"bufferView\":{d},\"mimeType\":\"image/png\"}}", .{bv_count_geom + @as(u32, @intCast(i))});
-        if (i + 1 < 5) try w.writeAll(",");
+        if (i + 1 < 6) try w.writeAll(",");
     }
     try w.writeAll("]");
     try w.writeAll("}");
@@ -1851,21 +1943,39 @@ test "pbrCubeGlb with_tangents=false: no TANGENT accessor" {
 test "pbrCubeCutoutGlb: container + MASK material + alpha holes" {
     const glb = try pbrCubeCutoutGlb(testing.allocator);
     defer testing.allocator.free(glb);
-    try pbrGlbInvariants(glb);
+    // GLB container invariants (the shared pbrGlbInvariants helper is specific to
+    // the single-mesh, 5-image cube fixtures; the cutout scene now also carries
+    // the opaque receiver plane → 6 images/textures + 2 materials).
+    try testing.expectEqualSlices(u8, "glTF", glb[0..4]);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, glb[4..8], .little));
+    try testing.expectEqual(@as(u32, @intCast(glb.len)), std.mem.readInt(u32, glb[8..12], .little));
+    try testing.expectEqualSlices(u8, "JSON", glb[16..20]);
 
     const json_len = std.mem.readInt(u32, glb[12..16], .little);
+    try testing.expectEqual(@as(u32, 0), json_len % 4);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, glb[20 .. 20 + json_len], .{});
     defer parsed.deinit();
     const root = parsed.value.object;
-    // No tangents → 4 accessors (pos, normal, uv, indices).
-    try testing.expectEqual(@as(usize, 4), root.get("accessors").?.array.items.len);
-    // Mesh name must be "Cutout" (the addressable submesh name).
-    const mesh = root.get("meshes").?.array.items[0].object;
-    try testing.expectEqualStrings("Cutout", mesh.get("name").?.string);
-    // Material is MASK with cutoff 0.5.
-    const mat = root.get("materials").?.array.items[0].object;
+    // No tangents. Cube (pos, normal, uv, indices) + receiver plane
+    // (pos, normal, uv, indices) → 8 accessors.
+    try testing.expectEqual(@as(usize, 8), root.get("accessors").?.array.items.len);
+    // Mesh 0 name must still be "Cutout" (the addressable submesh name); mesh 1
+    // is the opaque shadow receiver.
+    const meshes = root.get("meshes").?.array.items;
+    try testing.expectEqual(@as(usize, 2), meshes.len);
+    try testing.expectEqualStrings("Cutout", meshes[0].object.get("name").?.string);
+    try testing.expectEqualStrings("ReceiverPlane", meshes[1].object.get("name").?.string);
+    // Material 0 is the MASK cutout (cutoff 0.5); material 1 the opaque receiver.
+    const mats = root.get("materials").?.array.items;
+    try testing.expectEqual(@as(usize, 2), mats.len);
+    const mat = mats[0].object;
     try testing.expectEqualStrings("MASK", mat.get("alphaMode").?.string);
     try testing.expectEqual(@as(f64, 0.5), mat.get("alphaCutoff").?.float);
+    // The receiver plane has no alphaMode key → defaults to OPAQUE.
+    try testing.expect(mats[1].object.get("alphaMode") == null);
+    // Six PNG maps (cube's 5 PBR maps + the floor base) → 6 images/textures.
+    try testing.expectEqual(@as(usize, 6), root.get("images").?.array.items.len);
+    try testing.expectEqual(@as(usize, 6), root.get("textures").?.array.items.len);
 }
 
 test "pbrCubeCutoutGlb: round-trips through gltf parse → alpha_mode 2 + cutoff" {
