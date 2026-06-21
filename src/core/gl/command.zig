@@ -49,6 +49,7 @@ pub const Tag = enum(u16) {
     end_offscreen_pass = 24, // {} — close the offscreen pass; next begin_* rebinds
     draw_fullscreen_quad = 25, // {shader, tex0, tex1, params_ptr, param_count} — VBO-less 3-vert triangle
     draw_depth_at = 26, // {shader, vbuf, ibuf, index_byte_off, index_count, mvp_ptr, material_ptr} — alpha-tested depth draw (MASK shadows)
+    draw_pbr_instanced = 27, // {vbuf, ibuf, off, count, instance_ptr, instance_count, vp_ptr, material_ptr, camera_ptr}
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -83,6 +84,7 @@ pub const variant_post: u32 = 1 << 8; // fullscreen-quad shader: no VBO, no dept
 pub const variant_linear_output: u32 = 1 << 9; // requires variant_pbr; SKIP in-shader ACES (post path renders linear HDR)
 pub const variant_alpha_test: u32 = 1 << 10; // requires variant_pbr; MASK cutout (discard below alphaCutoff)
 pub const variant_double_sided: u32 = 1 << 11; // requires variant_pbr; render both faces, flip back-face normal
+pub const variant_instanced: u32 = 1 << 12; // requires variant_pbr; per-instance model (attr 4-7) + color (attr 8); non-skinned
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -273,8 +275,38 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\  v_light_pos = u_light_vp * u_model * vec4(a_pos, 1.0);
         \\
     ;
+    // Instanced (variant_instanced): per-instance mat4 model columns as vertex
+    // attributes (loc 4-7) + per-instance color (loc 8); u_vp replaces u_mvp/u_model.
+    // All non-instanced bytes stay byte-identical; this block is appended ONLY under the gate.
+    const inst_decl =
+        \\uniform mat4 u_vp;
+        \\layout(location = 4) in vec4 a_inst_model0;
+        \\layout(location = 5) in vec4 a_inst_model1;
+        \\layout(location = 6) in vec4 a_inst_model2;
+        \\layout(location = 7) in vec4 a_inst_model3;
+        \\layout(location = 8) in vec4 a_inst_color;
+        \\out vec4 v_inst_color;
+        \\
+    ;
+    const inst_body =
+        \\void main() {
+        \\  mat4 model = mat4(a_inst_model0, a_inst_model1, a_inst_model2, a_inst_model3);
+        \\  vec4 world_pos4 = model * vec4(a_pos, 1.0);
+        \\  v_world_pos = world_pos4.xyz;
+        \\  v_normal = normalize(mat3(model) * a_normal);
+        \\  v_uv = a_uv;
+        \\  v_inst_color = a_inst_color;
+        \\  gl_Position = u_vp * world_pos4;
+        \\}
+        \\
+    ;
     const skinned = flags & variant_skinned != 0;
     comptime var src: []const u8 = head;
+    if (flags & variant_instanced != 0) {
+        src = src ++ inst_decl;
+        src = src ++ inst_body;
+        return src;
+    }
     if (flags & variant_normal_map != 0) src = src ++ nm_outs;
     if (flags & variant_shadow != 0) src = src ++ shadow_outs;
     if (skinned) src = src ++ skin_decl;
@@ -354,6 +386,20 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\in vec3 v_world_pos;
         \\in vec3 v_normal;
         \\in vec2 v_uv;
+        \\
+    ;
+    const inst_in =
+        \\in vec4 v_inst_color;
+        \\
+    ;
+    // Per-instance tint. `main_open` already derived `albedo = base_sample *
+    // base_color` from the UNtinted base_color, so albedo (the term lighting
+    // actually consumes) must be re-tinted here too — tinting base_color alone
+    // would only affect its alpha. Matches the WGSL path, which folds inst_color
+    // into base_color BEFORE computing albedo.
+    const inst_tint =
+        \\  base_color *= v_inst_color;
+        \\  albedo *= v_inst_color.rgb;
         \\
     ;
     const nm_ins =
@@ -532,6 +578,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\
     ;
     comptime var src: []const u8 = head;
+    if (flags & variant_instanced != 0) src = src ++ inst_in;
     if (flags & variant_normal_map != 0) src = src ++ nm_ins;
     src = src ++ uniforms;
     if (flags & variant_normal_map != 0) src = src ++ nm_sampler;
@@ -539,6 +586,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ ibl_samplers;
     if (flags & variant_shadow != 0) src = src ++ shadow_decls;
     src = src ++ main_open;
+    if (flags & variant_instanced != 0) src = src ++ inst_tint;
     if (flags & variant_alpha_test != 0) src = src ++ alpha_test;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
     if (flags & variant_double_sided != 0) src = src ++ ds_flip;
@@ -678,6 +726,12 @@ pub const fxaaFragmentSrc: []const u8 =
 pub fn wgslPbr(comptime flags: u32) []const u8 {
     comptime pbrCheck(flags);
     if (flags & variant_depth != 0) @compileError("wgslPbr: variant_depth uses wgslDepth(), not wgslPbr");
+    // variant_instanced appends `vp: mat4x4<f32>` at byte offset 384 — the same
+    // slot variant_shadow uses for `light_vp`.  The two are mutually exclusive in
+    // v1 (instanced draws are non-shadow receivers).  Enforce it here so a future
+    // caller cannot silently produce a broken WGSL U struct.
+    if (flags & variant_instanced != 0 and flags & variant_shadow != 0)
+        @compileError("wgslPbr: variant_instanced + variant_shadow unsupported in v1 (vp/light_vp slot collision at offset 384)");
 
     // ── Uniform block + group(0) ────────────────────────────────────
     // Split so variant_shadow can append `light_vp` (offset 384, after the f32
@@ -696,6 +750,12 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     ;
     const uniforms_shadow =
         \\  light_vp: mat4x4<f32>,
+        \\
+    ;
+    // Instanced (variant_instanced): view-projection only (model comes from
+    // per-instance vertex attributes loc 4-7).
+    const uniforms_vp =
+        \\  vp: mat4x4<f32>,
         \\
     ;
     const uniforms_tail =
@@ -761,6 +821,11 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     ;
     const vsout_shadow =
         \\  @location(5) light_pos: vec4<f32>,
+        \\
+    ;
+    // Instanced: per-instance color varying (next free location after shadow's 5).
+    const vsout_inst_color =
+        \\  @location(6) inst_color: vec4<f32>,
         \\
     ;
     const vsout_tail =
@@ -831,6 +896,34 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    // Instanced vs_main: reads per-instance mat4 model (col-major rows at loc 4-7)
+    // + per-instance color (loc 8); reconstructs model, transforms position/normal,
+    // writes inst_color varying. u.vp (view-proj) replaces u.mvp + u.model.
+    const vs_head_instanced =
+        \\@vertex
+        \\fn vs_main(
+        \\  @location(0) a_pos: vec3<f32>,
+        \\  @location(1) a_normal: vec3<f32>,
+        \\  @location(2) a_tangent: vec4<f32>,
+        \\  @location(3) a_uv: vec2<f32>,
+        \\  @location(4) inst_m0: vec4<f32>,
+        \\  @location(5) inst_m1: vec4<f32>,
+        \\  @location(6) inst_m2: vec4<f32>,
+        \\  @location(7) inst_m3: vec4<f32>,
+        \\  @location(8) inst_color: vec4<f32>,
+        \\) -> VSOut {
+        \\  var out: VSOut;
+        \\  let model = mat4x4<f32>(inst_m0, inst_m1, inst_m2, inst_m3);
+        \\  let world_pos4 = model * vec4<f32>(a_pos, 1.0);
+        \\  out.world_pos = world_pos4.xyz;
+        \\  out.normal = normalize(mat3x3<f32>(model[0].xyz, model[1].xyz, model[2].xyz) * a_normal);
+        \\  out.uv = a_uv;
+        \\  out.inst_color = inst_color;
+        \\  out.pos = u.vp * world_pos4;
+        \\  return out;
+        \\}
+        \\
+    ;
     // ── fragment helpers (Cook-Torrance) ────────────────────────────
     const helpers =
         \\const PI: f32 = 3.14159265359;
@@ -888,6 +981,22 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     ;
     const fs_alpha_test =
         \\  if (textureSample(base_tex, samp, in.uv).a * base_color.a < u.material[2].w) { discard; }
+        \\
+    ;
+    // Instanced fs_open: base_color is tinted by the per-instance color varying.
+    const fs_open_instanced =
+        \\@fragment
+        \\fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+        \\  let base_color = u.material[0] * in.inst_color;
+        \\  let mr = textureSample(mr_tex, samp, in.uv).rgb;
+        \\  let metallic = u.material[1].x * mr.b;
+        \\  let roughness = clamp(u.material[1].y * mr.g, 0.045, 1.0);
+        \\  let occlusion_strength = u.material[1].z;
+        \\  let normal_scale = u.material[1].w;
+        \\  let emissive_factor = u.material[2].rgb;
+        \\  let base_sample = textureSample(base_tex, samp, in.uv).rgb;
+        \\  let albedo = base_sample * base_color.rgb;
+        \\  let ao_sample = textureSample(occlusion_tex, samp, in.uv).r;
         \\
     ;
     const fs_normal_nm =
@@ -1011,8 +1120,10 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const skinned = flags & variant_skinned != 0;
     const lin = flags & variant_linear_output != 0;
     const ds = flags & variant_double_sided != 0;
+    const inst = flags & variant_instanced != 0;
     comptime var src: []const u8 = uniforms_head;
     if (shadow) src = src ++ uniforms_shadow;
+    if (inst) src = src ++ uniforms_vp;
     src = src ++ uniforms_tail;
     if (skinned) src = src ++ uniforms_bones;
     src = src ++ samp ++ tex_base;
@@ -1023,14 +1134,19 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ vsout_head;
     if (nm) src = src ++ vsout_nm;
     if (shadow) src = src ++ vsout_shadow;
+    if (inst) src = src ++ vsout_inst_color;
     src = src ++ vsout_tail;
-    src = src ++ (if (skinned) vs_head_skinned else vs_head);
-    if (nm) src = src ++ (if (skinned) vs_nm_skinned else vs_nm);
-    if (shadow) src = src ++ vs_shadow;
-    src = src ++ (if (skinned) vs_tail_skinned else vs_tail);
+    if (inst) {
+        src = src ++ vs_head_instanced;
+    } else {
+        src = src ++ (if (skinned) vs_head_skinned else vs_head);
+        if (nm) src = src ++ (if (skinned) vs_nm_skinned else vs_nm);
+        if (shadow) src = src ++ vs_shadow;
+        src = src ++ (if (skinned) vs_tail_skinned else vs_tail);
+    }
     src = src ++ helpers;
     if (shadow) src = src ++ fs_shadow_decl;
-    src = src ++ (if (ds) fs_open_ds else fs_open);
+    src = src ++ (if (inst) fs_open_instanced else (if (ds) fs_open_ds else fs_open));
     if (flags & variant_alpha_test != 0) src = src ++ fs_alpha_test;
     src = src ++ (if (nm) (if (ds) fs_normal_nm_ds else fs_normal_nm) else (if (ds) fs_normal_plain_ds else fs_normal_plain));
     if (ds) src = src ++ fs_ds_flip;
@@ -1481,6 +1597,22 @@ pub const Encoder = struct {
         self.putU32(index_count);
         self.putU32(mvp_ptr);
         self.putU32(material_ptr);
+    }
+
+    /// Instanced PBR draw: N copies of a mesh in one call. Per-instance model
+    /// matrix columns (loc 4-7) + color (loc 8) come from `instance_ptr`;
+    /// `vp_ptr` is the view-projection matrix (replaces per-draw u_mvp/u_model).
+    pub fn drawPbrInstanced(self: *Encoder, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, instance_ptr: u32, instance_count: u32, vp_ptr: u32, material_ptr: u32, camera_ptr: u32) void {
+        self.header(.draw_pbr_instanced, 36);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(instance_ptr);
+        self.putU32(instance_count);
+        self.putU32(vp_ptr);
+        self.putU32(material_ptr);
+        self.putU32(camera_ptr);
     }
 
     /// Bind the shadow map to `slot` and set `u_light_vp` on the active program.
@@ -2402,4 +2534,62 @@ test "variant_double_sided flips normal; non-DS frozen; state_cull_front" {
     try testing.expect(std.mem.indexOf(u8, wds, "front_facing") != null);
     const wplain = wgslPbr(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, wplain, "front_facing") == null);
+}
+
+// ── Task 3 (instancing): variant_instanced + draw_pbr_instanced ──────
+
+test "variant_instanced shader + draw_pbr_instanced tag; non-instanced frozen" {
+    try testing.expectEqual(@as(u32, 1 << 12), variant_instanced);
+    try testing.expectEqual(@as(u8, 27), @intFromEnum(Tag.draw_pbr_instanced));
+    const ins = pbrVertexSrc(variant_pbr | variant_instanced);
+    try testing.expect(std.mem.indexOf(u8, ins, "location = 4") != null); // instance mat4 attr
+    const plain = pbrVertexSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "location = 4") == null); // non-instanced unchanged
+    const wins = wgslPbr(variant_pbr | variant_instanced);
+    try testing.expect(std.mem.indexOf(u8, wins, "@location(8)") != null); // instance color
+}
+
+test "variant_instanced GLSL: instance attribs + u_vp present; non-instanced absent" {
+    const ins_vs = pbrVertexSrc(variant_pbr | variant_instanced);
+    try testing.expect(std.mem.indexOf(u8, ins_vs, "a_inst_model0") != null);
+    try testing.expect(std.mem.indexOf(u8, ins_vs, "a_inst_color") != null);
+    try testing.expect(std.mem.indexOf(u8, ins_vs, "u_vp") != null);
+    try testing.expect(std.mem.indexOf(u8, ins_vs, "v_inst_color") != null);
+    const ins_fs = pbrFragmentSrc(variant_pbr | variant_instanced);
+    try testing.expect(std.mem.indexOf(u8, ins_fs, "v_inst_color") != null);
+    // Non-instanced GLSL must not leak any instancing declarations.
+    const plain_vs = pbrVertexSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain_vs, "a_inst_model0") == null);
+    try testing.expect(std.mem.indexOf(u8, plain_vs, "u_vp") == null);
+    const plain_fs = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain_fs, "v_inst_color") == null);
+}
+
+test "variant_instanced WGSL: inst_color varying + u.vp present; non-instanced absent" {
+    const wins = wgslPbr(variant_pbr | variant_instanced);
+    try testing.expect(std.mem.indexOf(u8, wins, "inst_color") != null);
+    try testing.expect(std.mem.indexOf(u8, wins, "u.vp") != null);
+    try testing.expect(std.mem.indexOf(u8, wins, "@location(8)") != null);
+    // Non-instanced WGSL must not carry instancing machinery.
+    const wplain = wgslPbr(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, wplain, "inst_color") == null);
+    try testing.expect(std.mem.indexOf(u8, wplain, "u.vp") == null);
+}
+
+test "drawPbrInstanced encodes tag 27 + 9 u32 payload (36 bytes)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.drawPbrInstanced(1, 2, 48, 36, 0x1000, 10, 0x2000, 0x3000, 0x4000);
+    // record starts at offset 4 (after length header)
+    try testing.expectEqual(@as(u16, 27), std.mem.readInt(u16, buf[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 36), std.mem.readInt(u16, buf[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, buf[8..12], .little)); // vbuf
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, buf[12..16], .little)); // ibuf
+    try testing.expectEqual(@as(u32, 48), std.mem.readInt(u32, buf[16..20], .little)); // index_byte_off
+    try testing.expectEqual(@as(u32, 36), std.mem.readInt(u32, buf[20..24], .little)); // index_count
+    try testing.expectEqual(@as(u32, 0x1000), std.mem.readInt(u32, buf[24..28], .little)); // instance_ptr
+    try testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, buf[28..32], .little)); // instance_count
+    try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, buf[32..36], .little)); // vp_ptr
+    try testing.expectEqual(@as(u32, 0x3000), std.mem.readInt(u32, buf[36..40], .little)); // material_ptr
+    try testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, buf[40..44], .little)); // camera_ptr
 }

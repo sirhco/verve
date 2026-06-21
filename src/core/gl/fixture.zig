@@ -2618,7 +2618,7 @@ test "windFarmGlb .vmesh asset exposes turbineN/rotorN names the pick maps on" {
     defer model.deinit();
     var br = try bvh.build(a, model.vertices, 12, model.indices);
     defer br.deinit(a);
-    const bytes = try vmesh.pack(a, model.vertices, model.indices, model.submeshes, model.textures, br.nodes, br.tri_perm, model.names, model.skinned, model.joints, model.weights, model.skel, if (model.anim_clips.len == 0) null else vmesh.Anims{ .clips = model.anim_clips });
+    const bytes = try vmesh.pack(a, model.vertices, model.indices, model.submeshes, model.textures, br.nodes, br.tri_perm, model.names, model.skinned, model.joints, model.weights, model.skel, if (model.anim_clips.len == 0) null else vmesh.Anims{ .clips = model.anim_clips }, &.{}, 0);
     defer a.free(bytes);
     const reader = try vmesh.Reader.init(bytes);
     // Every turbine id 0..3 must be reachable from BOTH a turbine* and a rotor*
@@ -3215,4 +3215,303 @@ test "cubeGridGlb: N-cube grid round-trips with unique names + distinct position
     // Names are unique (first != last) and follow the Cube_r{R}_c{C} convention.
     try testing.expect(!std.mem.eql(u8, model.names[0], model.names[48]));
     try testing.expect(std.mem.startsWith(u8, model.names[0], "Cube_r"));
+}
+
+// ── cubeFieldGlb fixture (GPU instancing demo) ───────────────────────────────
+
+/// 16×16 = 256 instances of a single unit cube, encoded via EXT_mesh_gpu_instancing.
+/// One mesh + one node with the extension. Each instance has:
+///   TRANSLATION : grid (spacing 2.5, centered at origin)
+///   ROTATION    : small per-instance yaw quaternion
+///   SCALE       : uniform 0.4
+///   _COLOR_0    : hue-varied palette (red→green→blue cycle by index)
+///
+/// Accessors layout in BIN (after geom + PNG):
+///   [inst_trans_off]  256 × VEC3  f32  (TRANSLATION)
+///   [inst_rot_off]    256 × VEC4  f32  (ROTATION xyzw)
+///   [inst_scale_off]  256 × VEC3  f32  (SCALE)
+///   [inst_color_off]  256 × VEC4  f32  (_COLOR_0)
+pub fn cubeFieldGlb(alloc: Allocator) ![]u8 {
+    const INST_COUNT: u32 = 256; // 16×16 grid
+    const GRID_W: u32 = 16;
+    const spacing: f32 = 2.5;
+    const center: f32 = @as(f32, @floatFromInt(GRID_W - 1)) * spacing * 0.5; // 18.75
+
+    // ── 1. Shared base-colour texture (8×8 checkerboard, reuse BIN constants) ──
+    var checker = [_]u8{0} ** (8 * 8 * 4);
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            const light = (row + col) % 2 == 0;
+            checker[idx + 0] = if (light) @as(u8, 220) else 60;
+            checker[idx + 1] = if (light) @as(u8, 200) else 80;
+            checker[idx + 2] = if (light) @as(u8, 240) else 160;
+            checker[idx + 3] = 255;
+        }
+    }
+    const tex_png = try png.encodeRgba(alloc, &checker, 8, 8);
+    defer alloc.free(tex_png);
+
+    // ── 2. BIN layout ─────────────────────────────────────────────────────────
+    // Geom section: pos@0, nrm@288, uv@576, idx@768. PNG at bv_png_off=840.
+    // Instance accessors start after PNG, 4-byte aligned.
+    const png_len: u32 = @intCast(tex_png.len);
+    const inst_trans_off: u32 = (bv_png_off + png_len + 3) & ~@as(u32, 3);
+    const inst_trans_len: u32 = INST_COUNT * 3 * 4; // 256 × VEC3 f32
+    const inst_rot_off: u32 = inst_trans_off + inst_trans_len;
+    const inst_rot_len: u32 = INST_COUNT * 4 * 4; // 256 × VEC4 f32
+    const inst_scale_off: u32 = inst_rot_off + inst_rot_len;
+    const inst_scale_len: u32 = INST_COUNT * 3 * 4; // 256 × VEC3 f32
+    const inst_color_off: u32 = inst_scale_off + inst_scale_len;
+    const inst_color_len: u32 = INST_COUNT * 4 * 4; // 256 × VEC4 f32
+    const bin_total: u32 = inst_color_off + inst_color_len;
+    const bin_padded: u32 = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // POSITION (shared 24-vertex cube, same as texturedCubeGlb)
+    {
+        var o: usize = bv_pos_off;
+        for (faces) |face| {
+            for (face.v) |v| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(v[0]), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(v[1]), .little);
+                std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(v[2]), .little);
+                o += 12;
+            }
+        }
+    }
+    // NORMAL
+    {
+        var o: usize = bv_nrm_off;
+        for (faces) |face| {
+            for (0..4) |_| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(face.nx), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(face.ny), .little);
+                std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(face.nz), .little);
+                o += 12;
+            }
+        }
+    }
+    // TEXCOORD_0
+    {
+        var o: usize = bv_uv_off;
+        for (faces) |_| {
+            for (face_uvs) |uv| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(uv[0]), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(uv[1]), .little);
+                o += 8;
+            }
+        }
+    }
+    // indices: 6 faces × 6 indices = 36 u16
+    {
+        var o: usize = bv_idx_off;
+        for (0..6) |fi| {
+            const base: u16 = @intCast(fi * 4);
+            for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |v| {
+                std.mem.writeInt(u16, bin[o..][0..2], base + v, .little);
+                o += 2;
+            }
+        }
+    }
+    // PNG
+    @memcpy(bin[bv_png_off..][0..tex_png.len], tex_png);
+
+    // TRANSLATION: 16×16 grid, spacing 2.5, y=0
+    {
+        var o: usize = inst_trans_off;
+        for (0..INST_COUNT) |i| {
+            const row: u32 = @intCast(i / GRID_W);
+            const col: u32 = @intCast(i % GRID_W);
+            const tx: f32 = @as(f32, @floatFromInt(col)) * spacing - center;
+            const tz: f32 = @as(f32, @floatFromInt(row)) * spacing - center;
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(tx), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(@as(f32, 0.0)), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(tz), .little);
+            o += 12;
+        }
+    }
+    // ROTATION: small per-instance yaw quaternion (axis=+Y, angle = i * 0.15 rad)
+    {
+        var o: usize = inst_rot_off;
+        for (0..INST_COUNT) |i| {
+            const angle: f32 = @as(f32, @floatFromInt(i)) * 0.15;
+            const half: f32 = angle * 0.5;
+            const s: f32 = @sin(half);
+            const c: f32 = @cos(half);
+            // xyzw: x=0, y=sin(half), z=0, w=cos(half)
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(@as(f32, 0.0)), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(s), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(@as(f32, 0.0)), .little);
+            std.mem.writeInt(u32, bin[o + 12 ..][0..4], @bitCast(c), .little);
+            o += 16;
+        }
+    }
+    // SCALE: uniform 0.4 for all instances
+    {
+        var o: usize = inst_scale_off;
+        for (0..INST_COUNT) |_| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(@as(f32, 0.4)), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(@as(f32, 0.4)), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(@as(f32, 0.4)), .little);
+            o += 12;
+        }
+    }
+    // _COLOR_0: hue-varied palette cycling red→green→blue by index
+    {
+        var o: usize = inst_color_off;
+        for (0..INST_COUNT) |i| {
+            // 3-segment hue cycle: first 86 → red→green, next 86 → green→blue, rest → blue→red
+            const t: f32 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(INST_COUNT));
+            const h: f32 = t * 3.0; // 0..3
+            const seg: u32 = @intFromFloat(@floor(h));
+            const f: f32 = h - @floor(h);
+            var r: f32 = 0.0;
+            var g: f32 = 0.0;
+            var bv: f32 = 0.0;
+            switch (seg % 3) {
+                0 => {
+                    r = 1.0 - f;
+                    g = f;
+                    bv = 0.2;
+                },
+                1 => {
+                    r = 0.2;
+                    g = 1.0 - f;
+                    bv = f;
+                },
+                else => {
+                    r = f;
+                    g = 0.2;
+                    bv = 1.0 - f;
+                },
+            }
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(r), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(g), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(bv), .little);
+            std.mem.writeInt(u32, bin[o + 12 ..][0..4], @bitCast(@as(f32, 1.0)), .little);
+            o += 16;
+        }
+    }
+
+    // ── 3. JSON ────────────────────────────────────────────────────────────────
+    // Accessor indices:
+    //   0=POS  1=NRM  2=UV  3=IDX  4=TRANS  5=ROT  6=SCALE  7=COLOR
+    // BufferView indices:
+    //   0=pos  1=nrm  2=uv  3=idx  4=png  5=trans  6=rot  7=scale  8=color
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    try w.writeAll("{");
+    try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"extensionsUsed\":[\"EXT_mesh_gpu_instancing\"],");
+    try w.writeAll("\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0]}],");
+
+    // Single node with EXT_mesh_gpu_instancing
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"CubeField\",");
+    try w.writeAll("\"extensions\":{\"EXT_mesh_gpu_instancing\":{\"attributes\":{");
+    try w.writeAll("\"TRANSLATION\":4,\"ROTATION\":5,\"SCALE\":6,\"_COLOR_0\":7");
+    try w.writeAll("}}}}],");
+
+    // Single mesh
+    try w.writeAll("\"meshes\":[{\"name\":\"CubeFieldMesh\",\"primitives\":[{");
+    try w.writeAll("\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},");
+    try w.writeAll("\"indices\":3,\"material\":0}]}],");
+
+    // 8 accessors: geom (0-3) + instance (4-7)
+    try w.writeAll("\"accessors\":[");
+    // 0: POSITION
+    try w.writeAll("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[-1.0,-1.0,-1.0],\"max\":[1.0,1.0,1.0]},");
+    // 1: NORMAL
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
+    // 2: TEXCOORD_0
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
+    // 3: indices
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"},");
+    // 4: TRANSLATION
+    try w.print("{{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{INST_COUNT});
+    // 5: ROTATION
+    try w.print("{{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC4\"}},", .{INST_COUNT});
+    // 6: SCALE
+    try w.print("{{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{INST_COUNT});
+    // 7: _COLOR_0
+    try w.print("{{\"bufferView\":8,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC4\"}}", .{INST_COUNT});
+    try w.writeAll("],");
+
+    // 9 bufferViews: geom (0-3) + png (4) + instance (5-8)
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_pos_off, bv_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_nrm_off, bv_nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_uv_off, bv_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ bv_idx_off, bv_idx_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_png_off, png_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ inst_trans_off, inst_trans_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ inst_rot_off, inst_rot_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ inst_scale_off, inst_scale_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ inst_color_off, inst_color_len });
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+
+    // Material
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{");
+    try w.writeAll("\"baseColorTexture\":{\"index\":0},");
+    try w.writeAll("\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
+    try w.writeAll("\"metallicFactor\":0.0,\"roughnessFactor\":0.8");
+    try w.writeAll("}}],");
+
+    try w.writeAll("\"textures\":[{\"source\":0}],");
+    try w.print("\"images\":[{{\"bufferView\":4,\"mimeType\":\"image/png\"}}]", .{});
+    try w.writeAll("}");
+
+    // pad JSON to 4-byte alignment
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── 4. Assemble GLB ───────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42; // B
+    glb[goff + 1] = 0x49; // I
+    glb[goff + 2] = 0x4E; // N
+    glb[goff + 3] = 0x00; // \0
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    return glb;
+}
+
+// ── cubeFieldGlb fixture tests ────────────────────────────────────────────────
+
+test "cubeFieldGlb: 256 instances round-trip via EXT_mesh_gpu_instancing" {
+    const glb = try cubeFieldGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try gltf_mod.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    try testing.expectEqual(@as(u32, 256), model.instance_count);
+    // first and last instance colors differ (varied field)
+    try testing.expect(model.instances.len == 256 * 20);
 }

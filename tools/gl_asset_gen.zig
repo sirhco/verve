@@ -126,6 +126,8 @@ fn convertGlb(
         model.weights,
         model.skel,
         if (model.anim_clips.len == 0) null else gl.vmesh.Anims{ .clips = model.anim_clips },
+        model.instances, // EXT_mesh_gpu_instancing → vmesh instances section
+        model.instance_count,
     );
     defer alloc.free(vmesh_bytes);
 

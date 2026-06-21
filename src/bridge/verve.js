@@ -4631,6 +4631,9 @@
             sh.uDir = gl.getUniformLocation(prog, "u_dir");
             sh.uIntensity = gl.getUniformLocation(prog, "u_intensity");
           }
+          if (variant & 0x1000) { // variant_instanced: u_vp replaces u_mvp/u_model
+            sh.vp = gl.getUniformLocation(prog, "u_vp");
+          }
           st.shaders[handle] = sh;
           break;
         }
@@ -4822,6 +4825,70 @@
           if (st.active.cameraPos)
             gl.uniform3fv(st.active.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
+        case 27: { // DRAW_PBR_INSTANCED — N instances via per-instance attr mat4+color
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const instancePtr = dv.getUint32(off + 16, true);
+          const instanceCount = dv.getUint32(off + 20, true);
+          const vpPtr = dv.getUint32(off + 24, true);
+          const materialPtr = dv.getUint32(off + 28, true);
+          const cameraPtr = dv.getUint32(off + 32, true);
+          if (!st.buffers[vh] || !st.buffers[ih] || !st.active) break;
+          // Ensure a persistent ARRAY_BUFFER for per-instance data (80 B/instance:
+          // 16 f32 mat4 col-major + 4 f32 color rgba). Lazy-create, then stream.
+          if (!st.instanceBuf) st.instanceBuf = gl.createBuffer();
+          gl.bindBuffer(gl.ARRAY_BUFFER, st.instanceBuf);
+          gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(memory.buffer, instancePtr, instanceCount * 80), gl.DYNAMIC_DRAW);
+          // bindVaoFor uses st.active.variant as the cache key; variant_instanced
+          // (0x1000) produces a distinct key from non-instanced PBR, so existing
+          // VAOs are untouched. After binding the keyed VAO we layer the instance
+          // attribs (4-8) on top: they are stored in the VAO as part of creation.
+          const gl2 = st.gl;
+          const vb = st.buffers[vh];
+          const ib = st.buffers[ih];
+          const iVariant = st.active.variant;
+          const iKey = `${vh}:${ih}:${iVariant}`;
+          let iVao = st.vaos.get(iKey);
+          if (!iVao) {
+            iVao = gl2.createVertexArray();
+            gl2.bindVertexArray(iVao);
+            // Core mesh attribs 0-3: PBR layout stride 48 (non-skinned instanced only)
+            gl2.bindBuffer(gl2.ARRAY_BUFFER, vb.buf);
+            gl2.enableVertexAttribArray(0);
+            gl2.vertexAttribPointer(0, 3, gl2.FLOAT, false, 48, 0);   // pos
+            gl2.enableVertexAttribArray(1);
+            gl2.vertexAttribPointer(1, 3, gl2.FLOAT, false, 48, 12);  // normal
+            gl2.enableVertexAttribArray(2);
+            gl2.vertexAttribPointer(2, 4, gl2.FLOAT, false, 48, 24);  // tangent
+            gl2.enableVertexAttribArray(3);
+            gl2.vertexAttribPointer(3, 2, gl2.FLOAT, false, 48, 40);  // uv
+            gl2.bindBuffer(gl2.ELEMENT_ARRAY_BUFFER, ib.buf);
+            // Per-instance attribs from instanceBuf: mat4 columns at loc 4-7,
+            // color rgba at loc 8. stride=80, divisor=1 for all.
+            gl2.bindBuffer(gl2.ARRAY_BUFFER, st.instanceBuf);
+            for (let i = 0; i < 4; i++) {
+              gl2.enableVertexAttribArray(4 + i);
+              gl2.vertexAttribPointer(4 + i, 4, gl2.FLOAT, false, 80, i * 16);
+              gl2.vertexAttribDivisor(4 + i, 1);
+            }
+            gl2.enableVertexAttribArray(8);
+            gl2.vertexAttribPointer(8, 4, gl2.FLOAT, false, 80, 64);
+            gl2.vertexAttribDivisor(8, 1);
+            st.vaos.set(iKey, iVao);
+          }
+          gl2.bindVertexArray(iVao);
+          // Per-draw uniforms: u_vp (view·proj), material, cameraPos — no u_mvp/u_model.
+          if (st.active.vp)
+            gl2.uniformMatrix4fv(st.active.vp, false, new Float32Array(memory.buffer, vpPtr, 16));
+          if (st.active.material)
+            gl2.uniform4fv(st.active.material, new Float32Array(memory.buffer, materialPtr, 12));
+          if (st.active.cameraPos)
+            gl2.uniform3fv(st.active.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
+          gl2.drawElementsInstanced(gl2.TRIANGLES, count, gl2.UNSIGNED_SHORT, byteOff, instanceCount);
           break;
         }
         case 14: { // DELETE_RESOURCE — frees one GPU object; slot may be reused after
@@ -5128,6 +5195,7 @@
       }
     }
     if (st.emptyVao) { gl.deleteVertexArray(st.emptyVao); st.emptyVao = null; }
+    if (st.instanceBuf) { gl.deleteBuffer(st.instanceBuf); st.instanceBuf = null; }
     st.buffers = [];
     st.textures = [];
     st.shaders = [];
@@ -5534,6 +5602,104 @@
               },
             });
             st.pipelines[handle] = { pipeline, bgl0, kind: "depth" };
+            break;
+          }
+          // variant_instanced (1<<12 = 0x1000): PBR with slot-1 per-instance buffer.
+          // Must be checked BEFORE the generic isPbr block so the pipeline is built
+          // with two vertex.buffers and stored as kind "pbr-instanced". FRESH
+          // descriptor literals — does NOT touch pbrDesc or the non-instanced pipeline.
+          if ((variant & 0x1000) !== 0) {
+            // Guard: instanced + shadow (0x1020) share offset 384 in the WGSL U
+            // struct (vp vs light_vp) — unsupported in v1.  Fail loud, not garbage.
+            if ((variant & 0x1020) === 0x1020) {
+              console.error("gl: variant_instanced|variant_shadow (0x" + variant.toString(16) + ") unsupported — vp/light_vp collision at U offset 384; skipping pipeline build");
+              break;
+            }
+            const hasNormal = (variant & 0x8) !== 0;
+            const hasEmissive = (variant & 0x10) !== 0;
+            const hasShadow = (variant & 0x20) !== 0;
+            const doubleSided = (variant & 0x800) !== 0;
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform", hasDynamicOffset: true },
+              }],
+            });
+            const FRAG = GPUShaderStage.FRAGMENT;
+            const tex2d = { sampleType: "float", viewDimension: "2d" };
+            const texCube = { sampleType: "float", viewDimension: "cube" };
+            const g1 = [
+              { binding: 0, visibility: FRAG, sampler: { type: "filtering" } },
+              { binding: 1, visibility: FRAG, texture: tex2d }, // base
+              { binding: 2, visibility: FRAG, texture: tex2d }, // metallic-roughness
+            ];
+            if (hasNormal) g1.push({ binding: 3, visibility: FRAG, texture: tex2d });
+            if (hasEmissive) g1.push({ binding: 4, visibility: FRAG, texture: tex2d });
+            g1.push({ binding: 5, visibility: FRAG, texture: tex2d }); // occlusion
+            g1.push({ binding: 6, visibility: FRAG, texture: texCube }); // irradiance
+            g1.push({ binding: 7, visibility: FRAG, texture: texCube }); // prefiltered
+            g1.push({ binding: 8, visibility: FRAG, texture: tex2d }); // brdf_lut
+            if (hasShadow) {
+              g1.push({ binding: 9, visibility: FRAG, texture: { sampleType: "depth", viewDimension: "2d" } });
+              g1.push({ binding: 10, visibility: FRAG, sampler: { type: "comparison" } });
+            }
+            const bgl1 = device.createBindGroupLayout({ entries: g1 });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
+            const pbrFragFormat = (variant & 0x200) ? "rgba16float" : st.format;
+            // Two vertex.buffers: slot 0 = mesh (stride 48, non-skinned attribs 0-3),
+            // slot 1 = per-instance (stride 80, stepMode "instance", attrs 4-8).
+            const instDesc = {
+              layout,
+              vertex: {
+                module,
+                entryPoint: "vs_main",
+                buffers: [
+                  {
+                    arrayStride: 48,
+                    attributes: [
+                      { shaderLocation: 0, offset: 0,  format: "float32x3" }, // pos
+                      { shaderLocation: 1, offset: 12, format: "float32x3" }, // normal
+                      { shaderLocation: 2, offset: 24, format: "float32x4" }, // tangent
+                      { shaderLocation: 3, offset: 40, format: "float32x2" }, // uv
+                    ],
+                  },
+                  {
+                    arrayStride: 80,
+                    stepMode: "instance",
+                    attributes: [
+                      { shaderLocation: 4, offset: 0,  format: "float32x4" }, // mat col 0
+                      { shaderLocation: 5, offset: 16, format: "float32x4" }, // mat col 1
+                      { shaderLocation: 6, offset: 32, format: "float32x4" }, // mat col 2
+                      { shaderLocation: 7, offset: 48, format: "float32x4" }, // mat col 3
+                      { shaderLocation: 8, offset: 64, format: "float32x4" }, // color rgba
+                    ],
+                  },
+                ],
+              },
+              fragment: {
+                module,
+                entryPoint: "fs_main",
+                targets: [{ format: pbrFragFormat }],
+              },
+              primitive: { topology: "triangle-list", cullMode: doubleSided ? "none" : "back" },
+              depthStencil: {
+                format: "depth24plus",
+                depthWriteEnabled: true,
+                depthCompare: "less",
+              },
+            };
+            const pipeline = device.createRenderPipeline(instDesc);
+            st.pipelines[handle] = {
+              pipeline,
+              bgl0,
+              bgl1,
+              kind: "pbr-instanced",
+              flags: variant,
+              hasNormal,
+              hasEmissive,
+              hasShadow,
+            };
             break;
           }
           const isPbr = (variant & 0x4) !== 0;
@@ -6133,6 +6299,97 @@
           st.pass.drawIndexed(count);
           break;
         }
+        case 27: { // DRAW_PBR_INSTANCED — N instances via per-instance attr mat4+color.
+          // Payload (command.zig draw_pbr_instanced, 36B / 9 u32):
+          //   vbuf | ibuf | idx_byte_off | count | instance_ptr | instance_count |
+          //   vp_ptr | material_ptr | camera_ptr.
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const instancePtr = dv.getUint32(off + 16, true);
+          const instanceCount = dv.getUint32(off + 20, true);
+          const vpPtr = dv.getUint32(off + 24, true);
+          const materialPtr = dv.getUint32(off + 28, true);
+          const cameraPtr = dv.getUint32(off + 32, true);
+          const vb = st.buffers[vh];
+          const ib = st.buffers[ih];
+          const active = st.active;
+          if (!vb || !ib || !active || active.kind !== "pbr-instanced" || !st.pass) break;
+          // ── Persistent instance vertex buffer — lazy create, resize-on-demand. ──
+          const instBytes = instanceCount * 80;
+          if (!st.instanceBuf || st.instanceBuf.size < instBytes) {
+            if (st.instanceBuf) st.instanceBuf.destroy();
+            st.instanceBuf = device.createBuffer({
+              size: instBytes,
+              usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            });
+          }
+          device.queue.writeBuffer(st.instanceBuf, 0, memory.buffer, instancePtr, instBytes);
+          // ── Per-draw uniform slot (PBR_U layout, instanced U adds vp @ 384). ──
+          // The instanced WGSL U struct has all standard fields (mvp, model, …)
+          // plus `vp: mat4x4<f32>` appended at offset 384 (same as PBR_U.lightVp).
+          // We only write the fields the shader actually reads: vp, material, camera.
+          const ubuf = gpuEnsurePbrUniform(st);
+          const slot = st.pbrSlot++;
+          if (slot >= MAX_DRAWS) break;
+          const base = slot * PBR_STRIDE;
+          // vp (view-proj): u.vp — offset 384 (= PBR_U.lightVp in the JS table).
+          device.queue.writeBuffer(ubuf, base + PBR_U.lightVp, new Float32Array(memory.buffer, vpPtr, 16));
+          // material: 3×vec4 = 12 f32.
+          device.queue.writeBuffer(ubuf, base + PBR_U.material, new Float32Array(memory.buffer, materialPtr, 12));
+          // camera_pos: vec3 (3 f32, 4th byte is pad).
+          device.queue.writeBuffer(ubuf, base + PBR_U.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
+          // Per-frame cached uniforms (lights / IBL mips).
+          if (st.frameLights && st.frameLights.length) {
+            device.queue.writeBuffer(ubuf, base + PBR_U.lights, st.frameLights);
+          }
+          device.queue.writeBuffer(ubuf, base + PBR_U.lightCount, new Int32Array([st.frameLightCount | 0]));
+          device.queue.writeBuffer(ubuf, base + PBR_U.prefMips, new Float32Array([st.framePrefMips || 0]));
+          // ── Bind group 0: dynamic-offset uniform. Instanced has no bones. ──
+          if (!st.bg0 || st.bg0Layout !== active.bgl0) {
+            st.bg0 = device.createBindGroup({
+              layout: active.bgl0,
+              entries: [{ binding: 0, resource: { buffer: ubuf, offset: 0, size: PBR_U.size } }],
+            });
+            st.bg0Layout = active.bgl0;
+          }
+          // ── Bind group 1: sampler + textures (same logic as non-instanced). ──
+          if (st.bg1Dirty || !st.bg1 || st.bg1Layout !== active.bgl1) {
+            const d = st.defaults;
+            const e = [{ binding: 0, resource: d.sampler }];
+            e.push({ binding: 1, resource: gpuSlotView(st, 0, d.white2d) }); // base
+            e.push({ binding: 2, resource: gpuSlotView(st, 1, d.white2d) }); // mr
+            if (active.hasNormal) {
+              e.push({ binding: 3, resource: gpuSlotView(st, 2, d.white2d) }); // normal
+            }
+            if (active.hasEmissive) {
+              e.push({ binding: 4, resource: gpuSlotView(st, 3, d.black2d) }); // emissive
+            }
+            e.push({ binding: 5, resource: gpuSlotView(st, 4, d.white2d) }); // occlusion
+            const ibl = st.ibl;
+            e.push({ binding: 6, resource: gpuIblView(st, ibl?.irr, d.blackCube) }); // irradiance
+            e.push({ binding: 7, resource: gpuIblView(st, ibl?.spec, d.blackCube) }); // prefiltered
+            e.push({ binding: 8, resource: gpuIblView(st, ibl?.lut, d.black2d) }); // brdf_lut
+            if (active.hasShadow) {
+              const sm = st.shadow ? st.shadowMaps[st.shadow.handle] : null;
+              e.push({ binding: 9, resource: (sm && sm.view) ? sm.view : d.shadowTex.view });
+              e.push({ binding: 10, resource: (sm && sm.sampler) ? sm.sampler : d.shadowSampler });
+            }
+            st.bg1 = device.createBindGroup({ layout: active.bgl1, entries: e });
+            st.bg1Layout = active.bgl1;
+            st.bg1Dirty = false;
+          }
+          // ── Draw: mesh at slot 0, instance data at slot 1. ──
+          st.pass.setPipeline(active.pipeline);
+          st.pass.setVertexBuffer(0, vb.buf);
+          st.pass.setVertexBuffer(1, st.instanceBuf);
+          st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
+          st.pass.setBindGroup(0, st.bg0, [base]);
+          st.pass.setBindGroup(1, st.bg1);
+          st.pass.drawIndexed(count, instanceCount);
+          break;
+        }
         case 22: { // CREATE_RENDER_TARGET — color (+ optional depth) offscreen target.
           // Payload (command.zig createRenderTarget, 20B): handle|w|h|fmt|flags.
           // fmt: 0=rgba8unorm, 1=rgba16float. flags bit0 = with_depth (depth24plus).
@@ -6330,6 +6587,7 @@
       renderTargets: [], // post-processing: { fbo, colorTex, depthTex, w, h } per handle
       vaos: new Map(),
       emptyVao: null, // lazy-created VAO for fullscreen-quad draw (case 25)
+      instanceBuf: null, // lazy-created ARRAY_BUFFER for per-instance mat4+color (case 27)
       extColorBufferFloat: null, // EXT_color_buffer_float, enabled on first rgba16f target
       active: null,
       last: 0,
@@ -6506,6 +6764,7 @@
       pass: null,
       uniformBuf: null,
       bindGroup: null,
+      instanceBuf: null, // lazy GPUBuffer (VERTEX|COPY_DST) for per-instance mat4+color (case 27)
       pbrUniform: null, // shared PBR uniform buffer (lazy; PBR_U.size bytes)
       bonesBuf: null, // shared bones palette uniform (lazy; 64 mat4) — skinned
       depthUniform: null, // shadow depth-pass uniform (lazy; one mat4)
@@ -6595,6 +6854,7 @@
       st.shadowMaps = [];
       st.ibl = null;
       st.shadow = null;
+      st.instanceBuf = null; // GPU vertex buffer for per-instance data (no .destroy — dead device)
       st.pbrUniform = null;
       st.bonesBuf = null;
       st.uniformBuf = null; // slice-1 basic-draw path's persistent buffer

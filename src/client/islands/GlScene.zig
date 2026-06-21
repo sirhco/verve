@@ -112,6 +112,10 @@ const variant_nm = gl.command.variant_normal_map;
 const variant_em = gl.command.variant_emissive;
 const variant_at = gl.command.variant_alpha_test;
 const variant_ds = gl.command.variant_double_sided;
+const variant_inst = gl.command.variant_instanced; // T6: GPU instancing
+
+// GPU instancing (v1): per-instance mat4(16) + color(4) = 20 f32 = 80 B each.
+const max_instances = 1024;
 
 // ── Props copies (decoded from SSR data-props; copied into the Inst before the
 //    chunk arena that held the decode result is reset) ─────────────────────────
@@ -246,6 +250,15 @@ const Inst = struct {
     cull_main_culled: u32 = 0,
     cull_shadow_drawn: u32 = 0,
     cull_shadow_culled: u32 = 0,
+
+    // GPU instancing (T6): per-instance mat4(16)+color(4) = 20 f32, animated per frame.
+    // Lives in Inst (static) NOT on the frame stack — 1024×80 B = 80 KB would overflow
+    // the 64 KB chunk stack (same lesson as the frustum-cull OOB).
+    instance_scratch: [max_instances][20]f32 = undefined,
+    // view·proj for the instanced shader (pv, no model baked in).
+    vp_mat: [16]f32 = undefined,
+    // Accumulated frame time (ms) for instanced animation (wraps at ~1h; fine for animation).
+    inst_time_ms: f32 = 0,
 };
 
 const MAX_INSTANCES = 4;
@@ -380,6 +393,7 @@ fn shaderHandleFor(variant: u32) u32 {
         variant_pbr | variant_nm | variant_at | variant_ds => 16,
         variant_pbr | variant_em | variant_at | variant_ds => 17,
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds => 18,
+        variant_pbr | variant_inst => 19, // T6: GPU instancing (non-shadow; handle 19)
         else => unreachable,
     };
 }
@@ -476,6 +490,7 @@ fn createShaderForVariant(inst: *Inst, enc: *gl.Encoder, variant: u32) void {
         variant_pbr | variant_nm | variant_at | variant_ds => emitShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_ds),
         variant_pbr | variant_em | variant_at | variant_ds => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds),
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds),
+        variant_pbr | variant_inst => emitInstancedShader(inst, enc), // T6
         else => unreachable,
     }
 }
@@ -521,6 +536,23 @@ fn emitDepthAtShader(inst: *Inst, enc: *gl.Encoder) void {
     const fs = gl.command.depthAtFragmentSrc();
     enc.createShader(depth_at_shader, gl.command.variant_depth | gl.command.variant_alpha_test, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
     inst.registry.recordShader(depth_at_shader, gl.command.variant_depth | gl.command.variant_alpha_test, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+}
+
+// T6: Instanced shader — must NOT add variant_shadow (vp/light_vp slot collision →
+// @compileError in both GLSL and WGSL paths). Handle 19, variant_pbr|variant_inst only.
+fn emitInstancedShader(inst: *Inst, enc: *gl.Encoder) void {
+    const handle = shaderHandleFor(variant_pbr | variant_inst);
+    const v = variant_pbr | variant_inst;
+    if (use_webgpu) {
+        const w = gl.command.wgslPbr(v);
+        enc.createShader(handle, v, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        inst.registry.recordShader(handle, v, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        return;
+    }
+    const vs = gl.command.pbrVertexSrc(v);
+    const fs = gl.command.pbrFragmentSrc(v);
+    enc.createShader(handle, v, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    inst.registry.recordShader(handle, v, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
 }
 
 // ── hydrate ──────────────────────────────────────────────────────────────────
@@ -1040,6 +1072,53 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // Reset per-frame main-pass cull counters (T3). Shadow counters reset above (T4).
         inst.cull_main_drawn = 0;
         inst.cull_main_culled = 0;
+
+        // ── T6: Instanced draw path ───────────────────────────────────────────
+        // When the asset carries an instances section (instanceCount > 0), emit ONE
+        // draw_pbr_instanced for mesh 0 INSTEAD of the per-submesh loop.
+        // Non-instanced assets (instanceCount == 0) fall through byte-identical.
+        const inst_n = a.instanceCount();
+        if (inst_n > 0 and a.submesh_count > 0) {
+            inst.inst_time_ms += dt_ms;
+            const t_s: f32 = inst.inst_time_ms / 1000.0;
+            const n = @min(inst_n, max_instances);
+            // Seed from baked blob (instanceCount × 80 B = 20 f32 each).
+            const blob = a.instances();
+            const blob_f32: [*]const f32 = @ptrCast(@alignCast(blob.ptr));
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                // Copy baked mat4 + color (20 f32) into scratch.
+                const src = blob_f32[i * 20 ..][0..20];
+                inst.instance_scratch[i] = src.*;
+                // Animate: add a per-instance vertical wave to the translation column
+                // (column 3 = indices 12,13,14 in col-major mat4).  Each instance
+                // oscillates at a unique phase so CDP can observe motion.
+                const phase: f32 = @as(f32, @floatFromInt(i)) * 0.7;
+                inst.instance_scratch[i][13] += @sin(t_s * 2.0 + phase) * 0.15;
+            }
+            // Store VP (pv = clipFix·proj·view; no model baked in → IS the VP).
+            inst.vp_mat = pv.m;
+            // Bind sequence mirrors drawSubmesh: setPipeline→setLights→bindIbl→
+            // bindShadowMap→bindTexture 0-4→drawPbrInstanced.
+            const sub0 = a.submesh(0);
+            enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst), gl.command.state_depth_test | gl.command.state_cull_back);
+            enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
+            enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+            enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+            enc.bindTexture(0, texHandle(sub0.tex_base));
+            enc.bindTexture(1, texHandle(sub0.tex_mr));
+            enc.bindTexture(2, texHandle(sub0.tex_normal));
+            enc.bindTexture(3, texHandle(sub0.tex_emissive));
+            enc.bindTexture(4, texHandle(sub0.tex_occlusion));
+            enc.drawPbrInstanced(vbuf, ibuf, sub0.index_byte_off, sub0.index_count, @intCast(@intFromPtr(&inst.instance_scratch)), n, @intCast(@intFromPtr(&inst.vp_mat)), @intCast(@intFromPtr(&inst.mats[0])), @intCast(@intFromPtr(&inst.camera_pos)));
+            enc.endFrame();
+            // finish() stamps the cmd_buf length header (buf[0..4]); without it the
+            // bridge reads a stale length and truncates the frame before this draw.
+            _ = enc.finish();
+            return @intCast(@intFromPtr(&cmd_buf));
+        }
+        // ── end T6 instanced path (non-instanced falls through) ───────────────
+
         // Two-pass draw (alpha transparency). Pass 1: opaque submeshes in vmesh
         // order, depth-write on — byte-identical to the historical single-pass
         // stream when every submesh is opaque. Pass 2: transparent submeshes
@@ -1237,7 +1316,7 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     inst.registry.recordBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
 
     // Create + record only the distinct shader variants the mesh actually uses.
-    var shader_seen: [19]bool = .{false} ** 19;
+    var shader_seen: [20]bool = .{false} ** 20; // [20]: slot 19 = variant_pbr|variant_inst (T6)
     var sv: u32 = 0;
     while (sv < a.submesh_count) : (sv += 1) {
         if (sv >= max_submesh) break;
@@ -1246,6 +1325,12 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
         if (shader_seen[handle]) continue;
         shader_seen[handle] = true;
         createShaderForVariant(inst, enc, variant);
+    }
+
+    // T6: emit the instanced shader if this mesh carries an instances section.
+    if (a.instanceCount() > 0 and !shader_seen[19]) {
+        emitInstancedShader(inst, enc);
+        shader_seen[19] = true;
     }
 
     // Shadow-pass resources (P9 slice 3): the depth-only shader + depth target.

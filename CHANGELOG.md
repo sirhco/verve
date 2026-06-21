@@ -6,6 +6,17 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **gl GPU instancing** (`src/core/gl/fixture.zig`, `tools/gen_cubefield_glb.zig`,
+  `build.zig`, `src/app/*`, `docs/24-gl.md`): GPU instancing via
+  `EXT_mesh_gpu_instancing`. `cubeFieldGlb` builds a 16×16 = 256-instance GLB
+  (TRANSLATION/ROTATION/SCALE/_COLOR_0 per instance). `gen_cubefield_glb.zig`
+  bakes it to `cubefield.vmesh` at build time. `/gl-instanced` demo serves 256
+  hue-varied cubes in one `draw_pbr_instanced` (wire tag 27) call on both WebGL2
+  and WebGPU backends. Deferred: per-instance culling, instanced shadows,
+  skinned+instanced, non-uniform-scale normals.
+
 ## [0.6.3] - 2026-06-21
 
 ### Changed
