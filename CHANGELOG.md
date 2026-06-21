@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-20
+
 ### Added
 
 - **gl frustum-culling completion** (`src/client/islands/GlScene.zig`,
@@ -3632,7 +3634,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/sirhco/verve/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/sirhco/verve/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/sirhco/verve/compare/v0.5.19...v0.6.0
 [0.5.16]: https://github.com/sirhco/verve/compare/v0.5.15...v0.5.16
