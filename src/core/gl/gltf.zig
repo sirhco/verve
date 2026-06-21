@@ -61,6 +61,12 @@ pub const Model = struct {
     // Each clip's `tracks` is directory order (joint-major, then channel
     // T=0/R=1/S=2), length == skel.len*3; one baked track per joint per channel.
     anim_clips: []const vmesh.Clip = &.{},
+    // GPU instancing (Task 2). Set when the first node in `nodes[]` carries the
+    // EXT_mesh_gpu_instancing extension. `instances` is a flat []f32 with
+    // instance_count × 20 floats (16 for the col-major mat4, then 4 for rgba).
+    // Absent extension → instance_count == 0 and instances == &.{}.
+    instance_count: u32 = 0,
+    instances: []const f32 = &.{},
 
     pub fn deinit(self: *Model) void {
         self.arena.deinit();
@@ -940,6 +946,100 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         }
     }
 
+    // ── 7e. EXT_mesh_gpu_instancing ───────────────────────────────────────────
+    // Walk nodes[]; the FIRST node carrying the extension wins (v1 — "first node
+    // wins" matching the existing name / world-matrix fallback policy). Read
+    // TRANSLATION (VEC3), ROTATION (VEC4 quat), SCALE (VEC3) per-instance
+    // accessors (each optional → identity component) and optionally _COLOR_0
+    // (VEC4, default [1,1,1,1]). Compose mat4_i = T·R·S via math.Mat4.fromTrs —
+    // the same compose used by nodeLocalMatrix / accumulateWorld above, ensuring
+    // column-major convention consistency. Output: model.instances flat []f32,
+    // instance_count × 20 f32: 16 mat4 then 4 rgba.
+    var inst_count: u32 = 0;
+    var inst_slice: []const f32 = &.{};
+    for (nodes_arr) |node_val| {
+        const node_obj2 = switch (node_val) {
+            .object => |o| o,
+            else => continue,
+        };
+        const ext_val = node_obj2.get("extensions") orelse continue;
+        const ext_obj = switch (ext_val) {
+            .object => |o| o,
+            else => continue,
+        };
+        const gpu_ext = ext_obj.get("EXT_mesh_gpu_instancing") orelse continue;
+        const gpu_obj = switch (gpu_ext) {
+            .object => |o| o,
+            else => continue,
+        };
+        const inst_attrs_val = gpu_obj.get("attributes") orelse continue;
+        const inst_attrs = switch (inst_attrs_val) {
+            .object => |o| o,
+            else => continue,
+        };
+
+        // Read optional per-instance attribute accessors.
+        const trans_opt: ?[]const f32 = if (inst_attrs.get("TRANSLATION")) |v|
+            try readAccessorF32(accessors, buffer_views, bin, @intCast(jsonInt(v) orelse return error.Malformed), aa)
+        else
+            null;
+        const rot_opt: ?[]const f32 = if (inst_attrs.get("ROTATION")) |v|
+            try readAccessorF32(accessors, buffer_views, bin, @intCast(jsonInt(v) orelse return error.Malformed), aa)
+        else
+            null;
+        const scale_opt: ?[]const f32 = if (inst_attrs.get("SCALE")) |v|
+            try readAccessorF32(accessors, buffer_views, bin, @intCast(jsonInt(v) orelse return error.Malformed), aa)
+        else
+            null;
+        const color_opt: ?[]const f32 = if (inst_attrs.get("_COLOR_0")) |v|
+            try readAccessorF32(accessors, buffer_views, bin, @intCast(jsonInt(v) orelse return error.Malformed), aa)
+        else
+            null;
+
+        // Determine instance count from whichever accessor is present.
+        const n: u32 = blk: {
+            if (trans_opt) |t| break :blk @intCast(t.len / 3);
+            if (rot_opt) |r| break :blk @intCast(r.len / 4);
+            if (scale_opt) |s| break :blk @intCast(s.len / 3);
+            if (color_opt) |c| break :blk @intCast(c.len / 4);
+            break :blk 0;
+        };
+        if (n == 0) break; // extension present but no attributes → skip
+
+        // Allocate flat instances buffer: n × 20 f32.
+        const inst_buf = try aa.alloc(f32, n * 20);
+        for (0..n) |k| {
+            // Per-instance TRS — defaults: t=(0,0,0), r=identity, s=(1,1,1).
+            const t = math.Vec3.init(
+                if (trans_opt) |tr| tr[k * 3 + 0] else 0,
+                if (trans_opt) |tr| tr[k * 3 + 1] else 0,
+                if (trans_opt) |tr| tr[k * 3 + 2] else 0,
+            );
+            const rq = math.Quat{
+                .x = if (rot_opt) |rr| rr[k * 4 + 0] else 0,
+                .y = if (rot_opt) |rr| rr[k * 4 + 1] else 0,
+                .z = if (rot_opt) |rr| rr[k * 4 + 2] else 0,
+                .w = if (rot_opt) |rr| rr[k * 4 + 3] else 1,
+            };
+            const sc = math.Vec3.init(
+                if (scale_opt) |ss| ss[k * 3 + 0] else 1,
+                if (scale_opt) |ss| ss[k * 3 + 1] else 1,
+                if (scale_opt) |ss| ss[k * 3 + 2] else 1,
+            );
+            // Compose mat4 = T·R·S (column-major, same as nodeLocalMatrix).
+            const mat = math.Mat4.fromTrs(t, rq, sc);
+            @memcpy(inst_buf[k * 20 ..][0..16], &mat.m);
+            // Per-instance color — default (1,1,1,1) when absent.
+            inst_buf[k * 20 + 16] = if (color_opt) |cc| cc[k * 4 + 0] else 1;
+            inst_buf[k * 20 + 17] = if (color_opt) |cc| cc[k * 4 + 1] else 1;
+            inst_buf[k * 20 + 18] = if (color_opt) |cc| cc[k * 4 + 2] else 1;
+            inst_buf[k * 20 + 19] = if (color_opt) |cc| cc[k * 4 + 3] else 1;
+        }
+        inst_count = n;
+        inst_slice = inst_buf;
+        break; // first EXT node wins
+    }
+
     // ── 8. Package Model ───────────────────────────────────────────────────────
     return Model{
         .arena = arena,
@@ -954,6 +1054,8 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         .weights = if (model_skinned) wgt_list.items else &.{},
         .skel = skel_slice,
         .anim_clips = anim_clips_slice,
+        .instance_count = inst_count,
+        .instances = inst_slice,
     };
 }
 
@@ -1535,6 +1637,8 @@ test "parse pbrCubeMixedMaterialGlb: 2 submeshes, variant fan-out (full vs base-
         &.{},
         &.{},
         null,
+        &.{},
+        0,
     );
     defer testing.allocator.free(bytes);
     const r = try vmesh.Reader.init(bytes);
@@ -2069,6 +2173,180 @@ test "gltf parses doubleSided" {
         try testing.expectEqual(@as(usize, 1), model.submeshes.len);
         try testing.expectEqual(@as(u32, 0), model.submeshes[0].double_sided);
     }
+}
+
+test "gltf parses EXT_mesh_gpu_instancing" {
+    // GLB: one triangle mesh; node 0 has extensions.EXT_mesh_gpu_instancing with
+    //   attributes TRANSLATION (2 instances: [0,0,0],[2,0,0]) and _COLOR_0
+    //   ([1,1,1,1],[1,0,0,1]).
+    // BIN layout:
+    //   off_pos   = 0     len=36   (3 verts × VEC3 f32)
+    //   off_nrm   = 36    len=36
+    //   off_uv    = 72    len=24   (3 verts × VEC2 f32)
+    //   off_idx   = 96    len=6    (3 × u16)
+    //   pad to 4  = 2     → 104
+    //   off_trans = 104   len=24   (2 × VEC3 f32)
+    //   off_color = 128   len=32   (2 × VEC4 f32)
+    //   total = 160
+    const alloc = testing.allocator;
+
+    const off_pos: u32 = 0;
+    const off_nrm: u32 = 36;
+    const off_idx: u32 = 96; // 6 bytes → 102 → pad 2 → 104
+    const off_trans: u32 = 104; // 2 × VEC3 f32 = 24 bytes
+    const off_color: u32 = 128; // 2 × VEC4 f32 = 32 bytes
+    const bin_total: u32 = 160;
+    const bin_padded: u32 = (bin_total + 3) & ~@as(u32, 3);
+
+    const bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // POSITION: 3 verts forming a triangle
+    const pos_data = [_]f32{ 0, 0, 0, 1, 0, 0, 0, 1, 0 };
+    for (pos_data, 0..) |f, i| std.mem.writeInt(u32, bin[off_pos + i * 4 ..][0..4], @bitCast(f), .little);
+
+    // NORMAL: all +Z
+    const nrm_data = [_]f32{ 0, 0, 1, 0, 0, 1, 0, 0, 1 };
+    for (nrm_data, 0..) |f, i| std.mem.writeInt(u32, bin[off_nrm + i * 4 ..][0..4], @bitCast(f), .little);
+
+    // TEXCOORD_0: zeroes (already zero)
+
+    // indices: 0, 1, 2
+    std.mem.writeInt(u16, bin[off_idx..][0..2], 0, .little);
+    std.mem.writeInt(u16, bin[off_idx + 2 ..][0..2], 1, .little);
+    std.mem.writeInt(u16, bin[off_idx + 4 ..][0..2], 2, .little);
+
+    // TRANSLATION: instance 0 = (0,0,0), instance 1 = (2,0,0)
+    const trans_data = [_]f32{ 0, 0, 0, 2, 0, 0 };
+    for (trans_data, 0..) |f, i| std.mem.writeInt(u32, bin[off_trans + i * 4 ..][0..4], @bitCast(f), .little);
+
+    // _COLOR_0: instance 0 = (1,1,1,1), instance 1 = (1,0,0,1)
+    const color_data = [_]f32{ 1, 1, 1, 1, 1, 0, 0, 1 };
+    for (color_data, 0..) |f, i| std.mem.writeInt(u32, bin[off_color + i * 4 ..][0..4], @bitCast(f), .little);
+
+    // JSON: mesh node with EXT_mesh_gpu_instancing on node 0.
+    // Accessors: 0=POSITION(VEC3), 1=NORMAL(VEC3), 2=TEXCOORD_0(VEC2), 3=indices(SCALAR u16),
+    //            4=TRANSLATION(VEC3), 5=_COLOR_0(VEC4).
+    const json =
+        "{\"asset\":{\"version\":\"2.0\"},\"scene\":0," ++
+        "\"scenes\":[{\"nodes\":[0]}]," ++
+        "\"nodes\":[{\"mesh\":0,\"extensions\":{\"EXT_mesh_gpu_instancing\":{\"attributes\":{\"TRANSLATION\":4,\"_COLOR_0\":5}}}}]," ++
+        "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}]," ++
+        "\"accessors\":[" ++
+        "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+        "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," ++
+        "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}," ++
+        "{\"bufferView\":3,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}," ++
+        "{\"bufferView\":4,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}," ++
+        "{\"bufferView\":5,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}" ++
+        "]," ++
+        "\"bufferViews\":[" ++
+        "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36}," ++
+        "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36}," ++
+        "{\"buffer\":0,\"byteOffset\":72,\"byteLength\":24}," ++
+        "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":6}," ++
+        "{\"buffer\":0,\"byteOffset\":104,\"byteLength\":24}," ++
+        "{\"buffer\":0,\"byteOffset\":128,\"byteLength\":32}" ++
+        "]," ++
+        "\"buffers\":[{\"byteLength\":160}]," ++
+        "\"materials\":[{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}]}";
+
+    const json_len: u32 = @intCast(json.len);
+    const json_pad: u32 = (4 - (json_len % 4)) % 4;
+    const json_padded: u32 = json_len + json_pad;
+    const glb_len: u32 = 12 + 8 + json_padded + 8 + bin_padded;
+    const glb = try alloc.alloc(u8, glb_len);
+    defer alloc.free(glb);
+    @memset(glb, 0x20);
+
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_padded, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json);
+    goff += json_padded;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42;
+    glb[goff + 1] = 0x49;
+    glb[goff + 2] = 0x4E;
+    glb[goff + 3] = 0x00;
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    var model = try parseGlb(alloc, glb);
+    defer model.deinit();
+
+    // 2 instances from the EXT_mesh_gpu_instancing accessor count.
+    try testing.expectEqual(@as(u32, 2), model.instance_count);
+    // instances flat array: 2 × 20 f32 = 40 f32 total.
+    try testing.expectEqual(@as(usize, 40), model.instances.len);
+
+    // Instance 0: translation (0,0,0) + identity rotation + scale (1,1,1)
+    //   → mat4 = identity. Column 3 (translation column) = (0,0,0,1).
+    //   col-major mat4: index 12=tx, 13=ty, 14=tz, 15=1.
+    //   color = (1,1,1,1).
+    const inst0 = model.instances[0..20];
+    // diagonal = 1 (identity scale+rot)
+    try testing.expectApproxEqAbs(@as(f32, 1), inst0[0], 1e-5); // m[0]
+    try testing.expectApproxEqAbs(@as(f32, 1), inst0[5], 1e-5); // m[5]
+    try testing.expectApproxEqAbs(@as(f32, 1), inst0[10], 1e-5); // m[10]
+    try testing.expectApproxEqAbs(@as(f32, 1), inst0[15], 1e-5); // m[15]
+    // translation column
+    try testing.expectApproxEqAbs(@as(f32, 0), inst0[12], 1e-5); // tx
+    try testing.expectApproxEqAbs(@as(f32, 0), inst0[13], 1e-5); // ty
+    try testing.expectApproxEqAbs(@as(f32, 0), inst0[14], 1e-5); // tz
+    // color
+    try testing.expectApproxEqAbs(@as(f32, 1), inst0[16], 1e-5); // r
+    try testing.expectApproxEqAbs(@as(f32, 1), inst0[17], 1e-5); // g
+    try testing.expectApproxEqAbs(@as(f32, 1), inst0[18], 1e-5); // b
+    try testing.expectApproxEqAbs(@as(f32, 1), inst0[19], 1e-5); // a
+
+    // Instance 1: translation (2,0,0) + identity rotation + scale (1,1,1)
+    //   → col 3 = (2,0,0,1). color = (1,0,0,1).
+    const inst1 = model.instances[20..40];
+    try testing.expectApproxEqAbs(@as(f32, 1), inst1[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1), inst1[5], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1), inst1[10], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 2), inst1[12], 1e-5); // tx = 2
+    try testing.expectApproxEqAbs(@as(f32, 0), inst1[13], 1e-5); // ty = 0
+    try testing.expectApproxEqAbs(@as(f32, 0), inst1[14], 1e-5); // tz = 0
+    try testing.expectApproxEqAbs(@as(f32, 1), inst1[15], 1e-5); // m[15] = 1
+    // color (1,0,0,1)
+    try testing.expectApproxEqAbs(@as(f32, 1), inst1[16], 1e-5); // r=1
+    try testing.expectApproxEqAbs(@as(f32, 0), inst1[17], 1e-5); // g=0
+    try testing.expectApproxEqAbs(@as(f32, 0), inst1[18], 1e-5); // b=0
+    try testing.expectApproxEqAbs(@as(f32, 1), inst1[19], 1e-5); // a=1
+
+    // Round-trip through vmesh pack → reader: instance_count preserved.
+    const vmesh_bytes = try vmesh.pack(
+        alloc,
+        model.vertices,
+        model.indices,
+        model.submeshes,
+        model.textures,
+        &.{},
+        &.{},
+        model.names,
+        false,
+        &.{},
+        &.{},
+        &.{},
+        null,
+        model.instances,
+        model.instance_count,
+    );
+    defer alloc.free(vmesh_bytes);
+    const r = try vmesh.Reader.init(vmesh_bytes);
+    try testing.expectEqual(@as(u32, 2), r.instanceCount());
 }
 
 // ── test-only minimal glb builders ──────────────────────────────────────────────
