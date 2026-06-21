@@ -1361,6 +1361,37 @@ pub fn glSceneCull(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-instanced: 16×16 = 256 cubes drawn in a single instanced draw call.
+/// The vmesh carries EXT_mesh_gpu_instancing data (TRANSLATION/ROTATION/SCALE/
+/// _COLOR_0 per instance). GlScene emits one draw_pbr_instanced command; the
+/// bridge issues a single drawArraysInstanced / drawIndexedIndirect for all 256.
+pub fn glSceneInstanced(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/cubefield.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EGPU Instancing%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 30.0, .pitch = 0.55, .yaw = 0.5 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .autoRotate(0.15)
+        .build();
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — GPU instancing"),
+        ctx.p().text("A 16×16 field of 256 hue-varied cubes rendered in a single " ++
+            "instanced draw call. Per-instance TRANSLATION, ROTATION, SCALE, and " ++
+            "_COLOR_0 attributes are stored in the vmesh instances section " ++
+            "(decoded from EXT_mesh_gpu_instancing in the source GLB). GlScene " ++
+            "emits one draw_pbr_instanced command; both WebGL2 and WebGPU backends " ++
+            "dispatch a single instanced draw for all 256 cubes."),
+        ctx.div().attr("data-ref", "glinstanced-hint").class("hint")
+            .text("256 cubes · 1 instanced draw call · hue palette cycles red→green→blue"),
+        scene,
+        ctx.p().text("Drag to orbit · wheel to zoom. All 256 cubes are drawn in one " ++
+            "GPU call via variant_instanced + draw_pbr_instanced (wire tag 27)."),
+    });
+}
+
 /// /gl-multi: TWO independent GlScene islands on one page (P7 multi-instance).
 /// Each `<verve-island data-name="GlScene">` gets its own per-instance state
 /// slot keyed by vid; the bridge selects the right instance before each frame /
