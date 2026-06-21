@@ -975,26 +975,45 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // shadowFactor uses ndc.z directly).
         const light_vp = clipFix().mul(lightSpaceMatrix(inst, a));
         inst.light_vp_mat = light_vp.m;
+        // Light-frustum planes for shadow-caster culling (T4). Culling against the
+        // LIGHT frustum (not the camera) so off-screen casters that cast into view
+        // are not incorrectly dropped.
+        const lplanes = gl.cull.frustumPlanes(light_vp);
+        inst.cull_shadow_drawn = 0;
+        inst.cull_shadow_culled = 0;
         enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
         // NOTE: double-sided shadows use back-cull this phase — drawDepth/drawDepthAt
         // carry no per-draw state word, so cull is baked into the depth pipeline.
         // A thin double-sided surface may under-shadow from one side; future work.
         {
             // Phase A: opaque + blend (alpha_mode != 2) — plain position-only depth.
+            // depth_mvps is computed for ALL submeshes (cheap) so Phase B can reuse it.
+            // Cull check happens here for ALL submeshes; culled ones skip both phases.
             var sd: u32 = 0;
             while (sd < a.submesh_count) : (sd += 1) {
                 if (sd >= max_submesh) break;
                 const sub = a.submesh(sd);
                 inst.depth_mvps[sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
-                if (sub.alpha_mode == 2) continue;
+                const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
+                    inst.cull_shadow_culled += 1;
+                    continue;
+                }
+                if (sub.alpha_mode == 2) continue; // MASK: drawn in Phase B
+                inst.cull_shadow_drawn += 1;
                 enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])));
             }
             // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
+            // Re-tests light frustum (same deterministic result as Phase A); only
+            // MASK submeshes that passed Phase A's frustum check reach drawDepthAt.
             sd = 0;
             while (sd < a.submesh_count) : (sd += 1) {
                 if (sd >= max_submesh) break;
                 const sub = a.submesh(sd);
                 if (sub.alpha_mode != 2) continue;
+                const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // already counted in Phase A
+                inst.cull_shadow_drawn += 1;
                 enc.bindTexture(0, texHandle(sub.tex_base));
                 enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])), @intCast(@intFromPtr(&inst.mats[sd])));
             }
@@ -1006,11 +1025,9 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         const pv = clipFix().mul(proj).mul(view);
         // World-space frustum planes for this frame's camera (P9 slice 2).
         const planes = gl.cull.frustumPlanes(pv);
-        // Reset per-frame cull counters (T3). Shadow counters set in T4.
+        // Reset per-frame main-pass cull counters (T3). Shadow counters reset above (T4).
         inst.cull_main_drawn = 0;
         inst.cull_main_culled = 0;
-        inst.cull_shadow_drawn = 0;
-        inst.cull_shadow_culled = 0;
         // Two-pass draw (alpha transparency). Pass 1: opaque submeshes in vmesh
         // order, depth-write on — byte-identical to the historical single-pass
         // stream when every submesh is opaque. Pass 2: transparent submeshes

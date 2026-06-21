@@ -164,3 +164,21 @@ test "golden: worldAabb of 45°-Y-rotated unit cube, translated +x10" {
     try testing.expectApproxEqAbs(-ext, wb.min.z, eps);
     try testing.expectApproxEqAbs(ext, wb.max.z, eps);
 }
+
+test "light-frustum cull: out-of-volume AABB culled, in-volume kept" {
+    // Orthographic light volume roughly [-5,5]^3 looking down -Z from z=10.
+    const proj = math.Mat4.ortho(-5, 5, -5, 5, 0.1, 20);
+    const view = math.Mat4.lookAt(
+        math.Vec3.init(0, 0, 10),
+        math.Vec3.init(0, 0, 0),
+        math.Vec3.init(0, 1, 0),
+    );
+    const light_vp = proj.mul(view);
+    const planes = frustumPlanes(light_vp);
+    // AABB centered at origin — fully inside the [-5,5]^3 light volume.
+    const inside = Aabb{ .min = math.Vec3.init(-1, -1, -1), .max = math.Vec3.init(1, 1, 1) };
+    // AABB far off to x=20..22 — well outside the x[-5,5] light frustum.
+    const outside = Aabb{ .min = math.Vec3.init(20, 20, -1), .max = math.Vec3.init(22, 22, 1) };
+    try testing.expect(aabbInFrustum(planes, inside));
+    try testing.expect(!aabbInFrustum(planes, outside));
+}
