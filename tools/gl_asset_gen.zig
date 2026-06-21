@@ -126,6 +126,8 @@ fn convertGlb(
         model.weights,
         model.skel,
         if (model.anim_clips.len == 0) null else gl.vmesh.Anims{ .clips = model.anim_clips },
+        &[_]f32{}, // instances — none in asset-gen output
+        0,         // instance_count
     );
     defer alloc.free(vmesh_bytes);
 

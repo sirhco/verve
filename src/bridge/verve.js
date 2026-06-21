@@ -4631,6 +4631,9 @@
             sh.uDir = gl.getUniformLocation(prog, "u_dir");
             sh.uIntensity = gl.getUniformLocation(prog, "u_intensity");
           }
+          if (variant & 0x1000) { // variant_instanced: u_vp replaces u_mvp/u_model
+            sh.vp = gl.getUniformLocation(prog, "u_vp");
+          }
           st.shaders[handle] = sh;
           break;
         }
@@ -4822,6 +4825,70 @@
           if (st.active.cameraPos)
             gl.uniform3fv(st.active.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
+        case 27: { // DRAW_PBR_INSTANCED — N instances via per-instance attr mat4+color
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const instancePtr = dv.getUint32(off + 16, true);
+          const instanceCount = dv.getUint32(off + 20, true);
+          const vpPtr = dv.getUint32(off + 24, true);
+          const materialPtr = dv.getUint32(off + 28, true);
+          const cameraPtr = dv.getUint32(off + 32, true);
+          if (!st.buffers[vh] || !st.buffers[ih] || !st.active) break;
+          // Ensure a persistent ARRAY_BUFFER for per-instance data (80 B/instance:
+          // 16 f32 mat4 col-major + 4 f32 color rgba). Lazy-create, then stream.
+          if (!st.instanceBuf) st.instanceBuf = gl.createBuffer();
+          gl.bindBuffer(gl.ARRAY_BUFFER, st.instanceBuf);
+          gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(memory.buffer, instancePtr, instanceCount * 80), gl.DYNAMIC_DRAW);
+          // bindVaoFor uses st.active.variant as the cache key; variant_instanced
+          // (0x1000) produces a distinct key from non-instanced PBR, so existing
+          // VAOs are untouched. After binding the keyed VAO we layer the instance
+          // attribs (4-8) on top: they are stored in the VAO as part of creation.
+          const gl2 = st.gl;
+          const vb = st.buffers[vh];
+          const ib = st.buffers[ih];
+          const iVariant = st.active.variant;
+          const iKey = `${vh}:${ih}:${iVariant}`;
+          let iVao = st.vaos.get(iKey);
+          if (!iVao) {
+            iVao = gl2.createVertexArray();
+            gl2.bindVertexArray(iVao);
+            // Core mesh attribs 0-3: PBR layout stride 48 (non-skinned instanced only)
+            gl2.bindBuffer(gl2.ARRAY_BUFFER, vb.buf);
+            gl2.enableVertexAttribArray(0);
+            gl2.vertexAttribPointer(0, 3, gl2.FLOAT, false, 48, 0);   // pos
+            gl2.enableVertexAttribArray(1);
+            gl2.vertexAttribPointer(1, 3, gl2.FLOAT, false, 48, 12);  // normal
+            gl2.enableVertexAttribArray(2);
+            gl2.vertexAttribPointer(2, 4, gl2.FLOAT, false, 48, 24);  // tangent
+            gl2.enableVertexAttribArray(3);
+            gl2.vertexAttribPointer(3, 2, gl2.FLOAT, false, 48, 40);  // uv
+            gl2.bindBuffer(gl2.ELEMENT_ARRAY_BUFFER, ib.buf);
+            // Per-instance attribs from instanceBuf: mat4 columns at loc 4-7,
+            // color rgba at loc 8. stride=80, divisor=1 for all.
+            gl2.bindBuffer(gl2.ARRAY_BUFFER, st.instanceBuf);
+            for (let i = 0; i < 4; i++) {
+              gl2.enableVertexAttribArray(4 + i);
+              gl2.vertexAttribPointer(4 + i, 4, gl2.FLOAT, false, 80, i * 16);
+              gl2.vertexAttribDivisor(4 + i, 1);
+            }
+            gl2.enableVertexAttribArray(8);
+            gl2.vertexAttribPointer(8, 4, gl2.FLOAT, false, 80, 64);
+            gl2.vertexAttribDivisor(8, 1);
+            st.vaos.set(iKey, iVao);
+          }
+          gl2.bindVertexArray(iVao);
+          // Per-draw uniforms: u_vp (view·proj), material, cameraPos — no u_mvp/u_model.
+          if (st.active.vp)
+            gl2.uniformMatrix4fv(st.active.vp, false, new Float32Array(memory.buffer, vpPtr, 16));
+          if (st.active.material)
+            gl2.uniform4fv(st.active.material, new Float32Array(memory.buffer, materialPtr, 12));
+          if (st.active.cameraPos)
+            gl2.uniform3fv(st.active.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
+          gl2.drawElementsInstanced(gl2.TRIANGLES, count, gl2.UNSIGNED_SHORT, byteOff, instanceCount);
           break;
         }
         case 14: { // DELETE_RESOURCE — frees one GPU object; slot may be reused after
@@ -5128,6 +5195,7 @@
       }
     }
     if (st.emptyVao) { gl.deleteVertexArray(st.emptyVao); st.emptyVao = null; }
+    if (st.instanceBuf) { gl.deleteBuffer(st.instanceBuf); st.instanceBuf = null; }
     st.buffers = [];
     st.textures = [];
     st.shaders = [];
@@ -6330,6 +6398,7 @@
       renderTargets: [], // post-processing: { fbo, colorTex, depthTex, w, h } per handle
       vaos: new Map(),
       emptyVao: null, // lazy-created VAO for fullscreen-quad draw (case 25)
+      instanceBuf: null, // lazy-created ARRAY_BUFFER for per-instance mat4+color (case 27)
       extColorBufferFloat: null, // EXT_color_buffer_float, enabled on first rgba16f target
       active: null,
       last: 0,
