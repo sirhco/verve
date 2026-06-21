@@ -1,13 +1,13 @@
-//! .vmesh packed asset format v11 — writer + freestanding reader.
+//! .vmesh packed asset format v12 — writer + freestanding reader.
 //!
 //! Invariant: the byte buffer handed to `Reader.init` must itself be at least
 //! 4-byte aligned (the asset region provides 16) — section offsets only
 //! preserve alignment relative to the buffer base, and
 //! `bvh.nodesFromBytes`/`triPermFromBytes` assert on the absolute pointer.
 //!
-//! Header layout (72 bytes, all integers little-endian u32):
+//! Header layout (76 bytes, all integers little-endian u32):
 //!   [0..4]   magic "VMSH"
-//!   [4..8]   version u32 = 11
+//!   [4..8]   version u32 = 12
 //!   [8..12]  vertex_count
 //!   [12..16] index_count
 //!   [16..20] submesh_count
@@ -24,6 +24,7 @@
 //!   [60..64] skeleton_off (16-aligned; 0 allowed ONLY if joint_count == 0)
 //!   [64..68] joint_count
 //!   [68..72] anim_off (16-aligned; 0 = no animation clip)
+//!   [72..76] instance_off (16-aligned; 0 = no instances)
 //! submesh table @68, submesh_count × 84 bytes:
 //!   index_byte_off u32 @0, index_count u32 @4,
 //!   base_color f32×4 @8, metallic f32 @24, roughness f32 @28,
@@ -58,10 +59,10 @@ const bvh = @import("bvh.zig");
 const command = @import("command.zig");
 
 pub const magic = "VMSH";
-pub const version: u32 = 11;
+pub const version: u32 = 12;
 pub const vertex_stride: u32 = 48; // pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40
 pub const skinned_vertex_stride: u32 = 56; // …48, then joints uint8x4 @48, weights unorm8x4 @52
-pub const header_size: u32 = 72;
+pub const header_size: u32 = 76;
 pub const submesh_size: u32 = 84;
 pub const tex_entry_size: u32 = 20;
 pub const name_entry_size: u32 = 12;
@@ -157,6 +158,8 @@ pub fn pack(
     weights: []const [4]u8,
     skel: []const Joint,
     anim: ?Anims,
+    instances: []const f32, // instance_count × 20 f32 (mat4 + color); empty = no section
+    instance_count: u32,
 ) ![]u8 {
     // Validate BVH section coupling.
     if (bvh_nodes.len > 0) {
@@ -186,9 +189,10 @@ pub fn pack(
     const bvh_node_count: u32 = @intCast(bvh_nodes.len);
     const name_count: u32 = @intCast(names.len);
 
-    // Layout: header(68) → submesh_table → tex_table → [align16] → vertices →
+    // Layout: header(76) → submesh_table → tex_table → [align16] → vertices →
     //   [align4] → indices → [align4] → tex_blob → [align16] → bvh_nodes →
-    //   tri_perm → [align4] → name_table → name_blob → [align16] → skeleton
+    //   tri_perm → [align4] → name_table → name_blob → [align16] → skeleton →
+    //   [align16] → anim → [align16] → instances
     const submesh_table_off: u32 = header_size;
     const tex_table_off: u32 = submesh_table_off + submesh_count * submesh_size;
     const after_tex_table: u32 = tex_table_off + texture_count * tex_entry_size;
@@ -252,7 +256,17 @@ pub fn pack(
     const anim_off: u32 = if (anim == null) 0 else alignUp(after_skeleton, 16);
     const after_anim: u32 = if (anim == null) after_skeleton else anim_off + anim_total;
 
-    const total_size: u32 = after_anim;
+    // Instances section (16-aligned): [instance_count u32][pad to 16][instance_count × 80 B].
+    // Absent when instance_count == 0.
+    const instance_off: u32 = if (instance_count == 0) 0 else alignUp(after_anim, 16);
+    const instance_section_bytes: u32 = if (instance_count == 0) 0 else blk: {
+        // Header word (4 B) + pad to 16 + instance blob
+        const inst_blob: u32 = instance_count * 80;
+        break :blk 16 + inst_blob; // 4 B count + 12 B pad = 16 B prefix
+    };
+    const after_instances: u32 = if (instance_count == 0) after_anim else instance_off + instance_section_bytes;
+
+    const total_size: u32 = after_instances;
     const buf = try alloc.alloc(u8, total_size);
     @memset(buf, 0);
 
@@ -275,8 +289,9 @@ pub fn pack(
     std.mem.writeInt(u32, buf[60..64], skeleton_off, .little);
     std.mem.writeInt(u32, buf[64..68], joint_count, .little);
     std.mem.writeInt(u32, buf[68..72], anim_off, .little);
+    std.mem.writeInt(u32, buf[72..76], instance_off, .little);
 
-    // Write submesh table @68 (right after the header)
+    // Write submesh table right after the header
     for (submeshes, 0..) |s, i| {
         const off: u32 = submesh_table_off + @as(u32, @intCast(i)) * submesh_size;
         // @0: index_byte_off, @4: index_count
@@ -386,6 +401,16 @@ pub fn pack(
         }
     }
 
+    // Write instances section: [instance_count u32 @0][pad to 16][instance_count × 80 B blob].
+    // Each instance is 20 f32 = mat4 (16 f32, col-major) + color rgba (4 f32) = 80 B.
+    if (instance_count > 0) {
+        std.mem.writeInt(u32, buf[instance_off..][0..4], instance_count, .little);
+        // Prefix is exactly 16 B (4 B count + 12 B zero pad, already zeroed by @memset).
+        const blob_dst = instance_off + 16;
+        const inst_bytes = std.mem.sliceAsBytes(instances);
+        @memcpy(buf[blob_dst..][0..inst_bytes.len], inst_bytes);
+    }
+
     // Write animation section: clip_count u32 @0, flags u32 @4, clip table @8
     // (clip_count × 16B), then per-clip directory (joint_count*3 × 12B) + blobs.
     if (anim) |an| {
@@ -452,6 +477,7 @@ pub const Reader = struct {
     skinned: bool,
     joint_count_: u32,
     anim_off_: u32,
+    instance_off_: u32,
     bytes: []const u8,
 
     pub fn init(bytes: []const u8) error{ BadMagic, BadVersion, Truncated, BadTexIndex }!Reader {
@@ -485,6 +511,7 @@ pub const Reader = struct {
         const skeleton_off = std.mem.readInt(u32, bytes[60..64], .little);
         const joint_count = std.mem.readInt(u32, bytes[64..68], .little);
         const anim_off = std.mem.readInt(u32, bytes[68..72], .little);
+        const instance_off = std.mem.readInt(u32, bytes[72..76], .little);
 
         // Bounds-check vertex data (u64 to prevent u32 multiply wrap). Skinned
         // meshes use the wider stride-56 layout.
@@ -607,6 +634,18 @@ pub const Reader = struct {
             }
         }
 
+        // ── Instances section ────────────────────────────────────────────────
+        // instance_off == 0 → no instances. When present, validate alignment
+        // and that the header word + blob fit in the buffer.
+        if (instance_off != 0) {
+            if (instance_off % 16 != 0) return error.Truncated;
+            if (@as(u64, instance_off) + 16 > blen) return error.Truncated;
+            const inst_count_sec = std.mem.readInt(u32, bytes[instance_off..][0..4], .little);
+            const need_inst: u64 = @as(u64, inst_count_sec) * 80;
+            const inst_blob_start: u64 = @as(u64, instance_off) + 16;
+            if (inst_blob_start > blen or need_inst > blen - inst_blob_start) return error.Truncated;
+        }
+
         return Reader{
             .vertex_count = vertex_count,
             .index_count = index_count,
@@ -623,6 +662,7 @@ pub const Reader = struct {
             .skinned = skinned,
             .joint_count_ = joint_count,
             .anim_off_ = anim_off,
+            .instance_off_ = instance_off,
             .bytes = bytes,
         };
     }
@@ -724,6 +764,21 @@ pub const Reader = struct {
         const vbase = @as(usize, self.anim_off_) + t.data_off + @as(usize, t.key_count) * 4;
         const idx: usize = @as(usize, i) * 3 * t.comps + 2 * t.comps + comp;
         return @bitCast(std.mem.readInt(u32, self.bytes[vbase + idx * 4 ..][0..4], .little));
+    }
+
+    /// Number of GPU instances stored in the instances section. 0 when absent.
+    pub fn instanceCount(self: *const Reader) u32 {
+        if (self.instance_off_ == 0) return 0;
+        return std.mem.readInt(u32, self.bytes[self.instance_off_..][0..4], .little);
+    }
+
+    /// Raw instances blob: `instanceCount() × 80 B` (mat4 col-major f32×16 then
+    /// color rgba f32×4). Empty slice when no instances section present.
+    pub fn instances(self: *const Reader) []const u8 {
+        if (self.instance_off_ == 0) return self.bytes[0..0];
+        const cnt = std.mem.readInt(u32, self.bytes[self.instance_off_..][0..4], .little);
+        const blob_start: usize = @intCast(@as(u64, self.instance_off_) + 16);
+        return self.bytes[blob_start..][0 .. @as(usize, cnt) * 80];
     }
 
     /// Caller must ensure `i < self.submesh_count`.
@@ -894,7 +949,7 @@ test "round-trip: one submesh (full PBR fields), one texture" {
         .{ .width = 1, .height = 1, .rgba = &fill },
         .{ .width = 1, .height = 1, .rgba = &fill },
     };
-    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
 
     const r = try Reader.init(bytes);
@@ -931,7 +986,7 @@ test "round-trip: one submesh (full PBR fields), one texture" {
 test "alignment: vertex_off 16-aligned, index/tex 4-aligned" {
     const verts = [_]f32{0} ** 12;
     const idx = [_]u16{0};
-    const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
     const vo = std.mem.readInt(u32, bytes[24..28], .little);
     const io = std.mem.readInt(u32, bytes[28..32], .little);
@@ -940,7 +995,7 @@ test "alignment: vertex_off 16-aligned, index/tex 4-aligned" {
 }
 
 test "reader rejects hostile counts (u32 overflow)" {
-    var buf = [_]u8{0} ** 72;
+    var buf = [_]u8{0} ** 80;
     @memcpy(buf[0..4], magic);
     std.mem.writeInt(u32, buf[4..8], version, .little);
     std.mem.writeInt(u32, buf[8..12], 0x8000_0000, .little); // vertex_count: *48 wraps
@@ -962,7 +1017,7 @@ test "reader rejects hostile counts (u32 overflow)" {
 }
 
 test "reader rejects bad magic and truncation" {
-    var junk = [_]u8{0} ** 72;
+    var junk = [_]u8{0} ** 80;
     try testing.expectError(error.BadMagic, Reader.init(&junk));
     @memcpy(junk[0..4], magic);
     std.mem.writeInt(u32, junk[4..8], 99, .little);
@@ -973,7 +1028,7 @@ test "reader rejects bad magic and truncation" {
 test "reader rejects v1 and v2 buffers (BadVersion)" {
     // Build valid-looking old-version buffers (version word = 1, then 2) →
     // both must get BadVersion now that the reader only accepts v6.
-    var buf = [_]u8{0} ** 72;
+    var buf = [_]u8{0} ** 80;
     @memcpy(buf[0..4], magic);
     // zero vertex/index/submesh/tex counts, offsets pointing into buf
     std.mem.writeInt(u32, buf[24..28], 56, .little); // vertex_off
@@ -1037,7 +1092,7 @@ test "(a) v3 round-trip: 2 BVH nodes, tri_perm, names" {
     const perm = [_]u32{0}; // index_count/3 == 1
     const names = [_][]const u8{ "Cube", "Lid" };
 
-    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &perm, &names, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &perm, &names, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
 
     const r = try Reader.init(bytes);
@@ -1060,7 +1115,7 @@ test "(a) v3 round-trip: 2 BVH nodes, tri_perm, names" {
 }
 
 test "(b) v3 zero-BVH zero-names → valid, empty slices" {
-    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
 
     const r = try Reader.init(bytes);
@@ -1096,7 +1151,7 @@ test "(c) v3 section offsets: bvh_off %16==0, name_table_off %4==0" {
     };
     const perm = [_]u32{0};
     const names = [_][]const u8{"Solo"};
-    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &perm, &names, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &perm, &names, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
 
     const bvh_off = std.mem.readInt(u32, bytes[40..44], .little);
@@ -1107,7 +1162,7 @@ test "(c) v3 section offsets: bvh_off %16==0, name_table_off %4==0" {
 
 test "(d) v3 hostile sections → Truncated / empty (no panic)" {
     // Start from a valid zero-section v3 file, then corrupt the header.
-    const base = try pack(testing.allocator, &v3_verts, &v3_idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const base = try pack(testing.allocator, &v3_verts, &v3_idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(base);
 
     // bvh_node_count *32 wraps u32.
@@ -1161,7 +1216,7 @@ test "(d) v3 hostile sections → Truncated / empty (no panic)" {
             .tex_occlusion = -1,
         }};
         const names = [_][]const u8{"X"};
-        const buf = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &.{}, &.{}, &names, false, &.{}, &.{}, &.{}, null);
+        const buf = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &.{}, &.{}, &names, false, &.{}, &.{}, &.{}, null, &.{}, 0);
         defer testing.allocator.free(buf);
         const r0 = try Reader.init(buf);
         try testing.expectEqualStrings("X", r0.name(0)); // sanity: valid first
@@ -1194,7 +1249,7 @@ test "(h) texIsSrgb: base/emissive → sRGB, mr/normal/occlusion → linear" {
         .tex_emissive = 2, // sRGB
         .tex_occlusion = -1,
     }};
-    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
     const r = try Reader.init(bytes);
     try testing.expect(r.texIsSrgb(0)); // base-color
@@ -1223,20 +1278,20 @@ test "(g) v3 rejects out-of-range submesh tex index (BadTexIndex)" {
     }};
     // Sanity: the in-range version parses fine.
     {
-        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
         defer testing.allocator.free(bytes);
         _ = try Reader.init(bytes);
     }
     // tex index == tex_count (1) → out of range → reject.
     {
-        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
         defer testing.allocator.free(bytes);
         std.mem.writeInt(i32, bytes[header_size + 56 ..][0..4], 1, .little); // tex_mr @56
         try testing.expectError(error.BadTexIndex, Reader.init(bytes));
     }
     // tex index < -1 (e.g. -2, not the missing-sentinel) → reject.
     {
-        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+        const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &good, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
         defer testing.allocator.free(bytes);
         std.mem.writeInt(i32, bytes[header_size + 52 ..][0..4], -2, .little); // tex_base @52
         try testing.expectError(error.BadTexIndex, Reader.init(bytes));
@@ -1281,11 +1336,11 @@ test "(f) v3 SizeMismatch: bad tri_perm len; names len mismatch" {
     };
     // tri_perm must be index_count/3 == 1; give it 2 → SizeMismatch.
     const bad_perm = [_]u32{ 0, 1 };
-    try testing.expectError(error.SizeMismatch, pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &bad_perm, &.{}, false, &.{}, &.{}, &.{}, null));
+    try testing.expectError(error.SizeMismatch, pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &nodes, &bad_perm, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0));
 
     // names.len == 1 with 2 submeshes → SizeMismatch.
     const one_name = [_][]const u8{"only"};
-    try testing.expectError(error.SizeMismatch, pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &.{}, &.{}, &one_name, false, &.{}, &.{}, &.{}, null));
+    try testing.expectError(error.SizeMismatch, pack(testing.allocator, &v3_verts, &v3_idx, &subs, &.{}, &.{}, &.{}, &one_name, false, &.{}, &.{}, &.{}, null, &.{}, 0));
 }
 
 // ── submeshVariant ────────────────────────────────────────────────────────────
@@ -1327,7 +1382,7 @@ test "(i) submeshVariant: all four tex_normal × tex_emissive combinations" {
         make(-1, -1), // neither
     };
 
-    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &v3_verts, &v3_idx, &subs, &texs, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
     const r = try Reader.init(bytes);
 
@@ -1370,11 +1425,11 @@ test "(j) v5 skinned round-trip: stride 56, 2-joint skeleton" {
         },
     };
 
-    const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, null);
+    const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, null, &.{}, 0);
     defer testing.allocator.free(bytes);
 
     // Header: version 11, skinned flag set, joint_count == 2.
-    try testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, bytes[4..8], .little));
+    try testing.expectEqual(@as(u32, 12), std.mem.readInt(u32, bytes[4..8], .little));
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[56..60], .little));
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[64..68], .little));
     // skeleton_off 16-aligned.
@@ -1442,11 +1497,11 @@ test "vmesh v9: CUBICSPLINE round-trip — in/point/out tangents + LINEAR regres
     const clip = Clip{ .name_hash = fnv1a32("TestClip"), .duration = 1.0, .tracks = &tracks };
     const anims = Anims{ .clips = &[_]Clip{clip} };
 
-    const bytes = try pack(testing.allocator, &verts, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints_arr, &weights_arr, &skel, anims);
+    const bytes = try pack(testing.allocator, &verts, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints_arr, &weights_arr, &skel, anims, &.{}, 0);
     defer testing.allocator.free(bytes);
 
     // Version must be 11.
-    try testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, bytes[4..8], .little));
+    try testing.expectEqual(@as(u32, 12), std.mem.readInt(u32, bytes[4..8], .little));
 
     const r = try Reader.init(bytes);
     try testing.expect(r.animPresent());
@@ -1518,7 +1573,7 @@ test "vmesh v9: multi-clip table round-trips" {
         .{ .name_hash = fnv1a32("Twist"), .duration = 2.0, .tracks = &c1 },
     };
     const anims = Anims{ .clips = &clips };
-    const bytes = try pack(std.testing.allocator, &verts, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, anims);
+    const bytes = try pack(std.testing.allocator, &verts, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, anims, &.{}, 0);
     defer std.testing.allocator.free(bytes);
     var r = try Reader.init(bytes);
     try std.testing.expect(r.animPresent());
@@ -1539,10 +1594,10 @@ test "vmesh v10: submesh alpha_mode round-trips" {
     var subs = [_]Submesh{
         .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .alpha_mode = 1 },
     };
-    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 11), version);
+    try testing.expectEqual(@as(u32, 12), version);
     try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 1), reader.submesh(0).alpha_mode);
 }
@@ -1553,10 +1608,10 @@ test "vmesh v10: submesh alpha_cutoff round-trips" {
     var subs = [_]Submesh{
         .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .alpha_mode = 2, .alpha_cutoff = 0.3 },
     };
-    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 11), version);
+    try testing.expectEqual(@as(u32, 12), version);
     try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 2), reader.submesh(0).alpha_mode);
     try testing.expectEqual(@as(f32, 0.3), reader.submesh(0).alpha_cutoff);
@@ -1569,7 +1624,7 @@ test "(i) submeshVariant: alpha_mode 2 adds variant_alpha_test" {
         .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .alpha_mode = 2, .alpha_cutoff = 0.5 },
         .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .alpha_mode = 0, .alpha_cutoff = 0.5 },
     };
-    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
     try testing.expect(reader.submeshVariant(0) & command.variant_alpha_test != 0);
@@ -1582,10 +1637,10 @@ test "vmesh v11: submesh double_sided round-trips" {
     var subs = [_]Submesh{
         .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .alpha_mode = 0, .alpha_cutoff = 0.5, .double_sided = 1 },
     };
-    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 11), version);
+    try testing.expectEqual(@as(u32, 12), version);
     try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 1), reader.submesh(0).double_sided);
 }
@@ -1597,9 +1652,35 @@ test "(i) submeshVariant: double_sided adds variant_double_sided" {
         .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .double_sided = 1 },
         .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1, .double_sided = 0 },
     };
-    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null);
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
     try testing.expect(reader.submeshVariant(0) & command.variant_double_sided != 0);
     try testing.expect(reader.submeshVariant(1) & command.variant_double_sided == 0);
+}
+
+test "vmesh v12: instances section round-trips" {
+    const verts = [_]f32{0} ** 12;
+    const idx = [_]u16{ 0, 0, 0 };
+    var subs = [_]Submesh{
+        .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 1, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1 },
+    };
+    // two instances: identity@white, translate(2,0,0)@red
+    // Each row: 16 f32 mat4 (col-major) then 4 f32 color rgba = 20 f32 = 80 B.
+    // inst 0: identity mat4, white color (1,1,1,1)
+    // inst 1: translate(2,0,0) mat4 (col3 x=2), red color (1,0,0,1)
+    const insts = [_]f32{
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1,
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 2, 0, 0, 1, 1, 0, 0, 1,
+    };
+    const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &insts, 2);
+    defer testing.allocator.free(bytes);
+    const reader = try Reader.init(bytes);
+    try testing.expectEqual(@as(u32, 12), version);
+    try testing.expectEqual(@as(u32, 2), reader.instanceCount());
+    const blob = reader.instances();
+    try testing.expectEqual(@as(usize, 2 * 80), blob.len);
+    // instance 1 color.r == 1, color.g == 0 (red) — bytes at offset 80 + 64 = 144
+    const c1g = std.mem.readInt(u32, blob[80 + 64 + 4 ..][0..4], .little);
+    try testing.expectEqual(@as(f32, 0), @as(f32, @bitCast(c1g)));
 }
