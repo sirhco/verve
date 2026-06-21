@@ -279,11 +279,11 @@ fn clipFix() gl.math.Mat4 {
 // instances never interleave within a tick. NOT per-instance (saves 3×4 KB).
 //   one-time create OR replay: 2×createBuffer + ≤16 PBR/alpha-test/DS shader variants +
 //     1 depth + 1 depth_at shader + 1 shadow map + 5 createTexture + 3 createTextureEx ≈ 420 B
-//   per-frame worst case (128 submeshes, every one a distinct double-sided BLEND variant):
-//     shadow pass: begin(16) + 128×drawDepth(24) + 128×(bindTex(12)+drawDepthAt(32)) + end(12) = 8732 B
-//     main pass:   beginFrame(28) + 128×2×(setPipeline+setLights+bindIbl+bindShadowMap+5×bindTex+drawPbr)(160) + endFrame(4) = 41020 B
-//     total ≈ 49752 B. Use compile-time expression: 4 + max_submesh * 320 + 64 (double-sided worst).
-const cmd_buf_cap: usize = 4 + max_submesh * 320 + 64;
+//   per-frame worst case (128 submeshes, every one double-sided BLEND in main + MASK in shadow):
+//     main:   beginFrame(28) + N×2×160 (double-sided BLEND, 320/submesh) + endFrame(4)
+//     shadow: beginShadowPass(16) + N×44 (MASK: bindTexture(12)+drawDepthAt(32)) + endShadowPass(12)
+//     + 64 slop → 4 + 128×364 + (28+4+16+12) + 64 = 46,720 B
+const cmd_buf_cap: usize = 4 + max_submesh * (320 + 44) + (28 + 4 + 16 + 12) + 64;
 var cmd_buf: [cmd_buf_cap]u8 = undefined;
 
 fn findSlot(vid: u32) ?*Inst {
