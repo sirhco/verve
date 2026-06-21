@@ -5609,6 +5609,12 @@
           // with two vertex.buffers and stored as kind "pbr-instanced". FRESH
           // descriptor literals — does NOT touch pbrDesc or the non-instanced pipeline.
           if ((variant & 0x1000) !== 0) {
+            // Guard: instanced + shadow (0x1020) share offset 384 in the WGSL U
+            // struct (vp vs light_vp) — unsupported in v1.  Fail loud, not garbage.
+            if ((variant & 0x1020) === 0x1020) {
+              console.error("gl: variant_instanced|variant_shadow (0x" + variant.toString(16) + ") unsupported — vp/light_vp collision at U offset 384; skipping pipeline build");
+              break;
+            }
             const hasNormal = (variant & 0x8) !== 0;
             const hasEmissive = (variant & 0x10) !== 0;
             const hasShadow = (variant & 0x20) !== 0;
