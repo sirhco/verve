@@ -6,6 +6,15 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-06-21
+
+### Changed
+
+- **CI: GitHub Actions bumped off Node 20** (`.github/workflows/{ci,desktop,release}.yml`):
+  `actions/checkout` v4→v7, `actions/upload-artifact` v4→v7, `actions/download-artifact`
+  v4→v8, `softprops/action-gh-release` v2→v3 — all on node24 runtimes, clearing the
+  Node.js 20 deprecation warnings. `mlugg/setup-zig` stays at v2 (no node24 release yet).
+
 ## [0.6.2] - 2026-06-20
 
 ### Added
@@ -3634,7 +3643,8 @@ runtime dependencies.
   siblings cover production today; revisit when a vetted
   pure-Zig brotli encoder lands.
 
-[Unreleased]: https://github.com/sirhco/verve/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/sirhco/verve/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/sirhco/verve/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/sirhco/verve/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/sirhco/verve/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/sirhco/verve/compare/v0.5.19...v0.6.0
