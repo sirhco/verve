@@ -2996,3 +2996,223 @@ test "pbrDoubleGlb: double-sided MASK quad round-trips through gltf parse" {
     try testing.expectEqual(@as(u32, 1), model.submeshes[2].double_sided);
     try testing.expectEqualStrings("DoubleBlend", model.names[2]);
 }
+
+// ── 7×7 cube-grid fixture (frustum-cull demo) ────────────────────────────────
+
+/// 7×7 grid of 49 unit cubes sharing a single BIN geometry block.
+/// Each cube is its own glTF mesh+node; distinctness comes from each node's
+/// `translation` ([col*spacing - center, 0, row*spacing - center]).  All 49
+/// meshes reference the SAME 4 geometry bufferViews (POSITION / NORMAL /
+/// TEXCOORD_0 / indices), so the BIN is tiny.  One shared opaque material.
+/// Named `Cube_r{R}_c{C}` for R,C in 0..6.
+pub fn cubeGridGlb(alloc: Allocator) ![]u8 {
+    const GRID_W: u32 = 7;
+    const GRID_N: u32 = GRID_W * GRID_W; // 49
+    const spacing: f32 = 3.0;
+    const center: f32 = @as(f32, @floatFromInt(GRID_W - 1)) * spacing * 0.5; // 9.0
+
+    // ── 1. Shared base-colour texture (8×8 checkerboard) ─────────────────────
+    var checker: [8 * 8 * 4]u8 = undefined;
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            const light = (row + col) % 2 == 0;
+            checker[idx + 0] = if (light) @as(u8, 180) else 60;
+            checker[idx + 1] = if (light) @as(u8, 200) else 80;
+            checker[idx + 2] = if (light) @as(u8, 240) else 160;
+            checker[idx + 3] = 255;
+        }
+    }
+    const tex_png = try png.encodeRgba(alloc, &checker, 8, 8);
+    defer alloc.free(tex_png);
+
+    // ── 2. BIN layout — shared geometry + PNG ────────────────────────────────
+    // Re-use the top-level bv_* constants: pos@0, nrm@288, uv@576, idx@768.
+    // PNG immediately after index data (at bv_png_off = 840).
+    const png_len: u32 = @intCast(tex_png.len);
+    const bin_total: u32 = bv_png_off + png_len;
+    const bin_padded: u32 = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // POSITION (same as texturedCubeGlb)
+    {
+        var o: usize = bv_pos_off;
+        for (faces) |face| {
+            for (face.v) |v| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(v[0]), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(v[1]), .little);
+                std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(v[2]), .little);
+                o += 12;
+            }
+        }
+    }
+    // NORMAL
+    {
+        var o: usize = bv_nrm_off;
+        for (faces) |face| {
+            for (0..4) |_| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(face.nx), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(face.ny), .little);
+                std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(face.nz), .little);
+                o += 12;
+            }
+        }
+    }
+    // TEXCOORD_0
+    {
+        var o: usize = bv_uv_off;
+        for (faces) |_| {
+            for (face_uvs) |uv| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(uv[0]), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(uv[1]), .little);
+                o += 8;
+            }
+        }
+    }
+    // indices: 6 faces × 2 triangles = 12 triangles, 36 u16
+    {
+        var o: usize = bv_idx_off;
+        for (0..6) |fi| {
+            const base: u16 = @intCast(fi * 4);
+            for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |v| {
+                std.mem.writeInt(u16, bin[o..][0..2], base + v, .little);
+                o += 2;
+            }
+        }
+    }
+    // PNG
+    @memcpy(bin[bv_png_off..][0..tex_png.len], tex_png);
+
+    // ── 3. JSON ───────────────────────────────────────────────────────────────
+    // Layout:
+    //   accessors  [0]=POS [1]=NRM [2]=UV [3]=IDX  (4 total, shared by all meshes)
+    //   bufferViews[0]=pos [1]=nrm [2]=uv [3]=idx [4]=png  (5 total)
+    //   meshes     [0..48]: each "Cube_r{R}_c{C}" primitive → acc 0/1/2/3 / mat 0
+    //   nodes      [0..48]: each {mesh:i, name:"Cube_r{R}_c{C}", translation:[x,0,z]}
+    //   scenes     [{nodes:[0..48]}]
+    //   materials  [0]: opaque, single-sided, shared base-colour texture
+    //   textures   [0]
+    //   images     [0]
+
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    const bv_png_idx: u32 = 4; // bufferView index for the PNG
+
+    try w.writeAll("{");
+    try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"scene\":0,");
+
+    // scene nodes array: [0,1,...,48]
+    try w.writeAll("\"scenes\":[{\"nodes\":[");
+    for (0..GRID_N) |i| {
+        if (i > 0) try w.writeByte(',');
+        try w.print("{d}", .{i});
+    }
+    try w.writeAll("]}],");
+
+    // nodes: each has mesh + name + translation
+    try w.writeAll("\"nodes\":[");
+    for (0..GRID_N) |i| {
+        const row: u32 = @intCast(i / GRID_W);
+        const col: u32 = @intCast(i % GRID_W);
+        const tx: f32 = @as(f32, @floatFromInt(col)) * spacing - center;
+        const tz: f32 = @as(f32, @floatFromInt(row)) * spacing - center;
+        if (i > 0) try w.writeByte(',');
+        try w.print("{{\"mesh\":{d},\"name\":\"Cube_r{d}_c{d}\",\"translation\":[{d:.4},{d:.4},{d:.4}]}}", .{ i, row, col, tx, @as(f32, 0.0), tz });
+    }
+    try w.writeAll("],");
+
+    // meshes: all reference the SAME 4 accessors (0=POS,1=NRM,2=UV,3=IDX)
+    try w.writeAll("\"meshes\":[");
+    for (0..GRID_N) |i| {
+        const row: u32 = @intCast(i / GRID_W);
+        const col: u32 = @intCast(i % GRID_W);
+        if (i > 0) try w.writeByte(',');
+        try w.print("{{\"name\":\"Cube_r{d}_c{d}\",\"primitives\":[{{\"attributes\":{{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2}},\"indices\":3,\"material\":0}}]}}", .{ row, col });
+    }
+    try w.writeAll("],");
+
+    // 4 shared accessors
+    try w.writeAll("\"accessors\":[");
+    try w.writeAll("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[-1.0,-1.0,-1.0],\"max\":[1.0,1.0,1.0]},");
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"}");
+    try w.writeAll("],");
+
+    // 5 bufferViews (4 geom + 1 png)
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_pos_off, bv_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_nrm_off, bv_nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_uv_off, bv_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ bv_idx_off, bv_idx_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ bv_png_off, png_len });
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+
+    // 1 shared material: opaque, single-sided
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{");
+    try w.writeAll("\"baseColorTexture\":{\"index\":0},");
+    try w.writeAll("\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
+    try w.writeAll("\"metallicFactor\":0.0,\"roughnessFactor\":0.8");
+    try w.writeAll("}}],");
+
+    try w.writeAll("\"textures\":[{\"source\":0}],");
+    try w.print("\"images\":[{{\"bufferView\":{d},\"mimeType\":\"image/png\"}}]", .{bv_png_idx});
+    try w.writeAll("}");
+
+    // pad JSON to 4-byte alignment
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── 4. Assemble GLB ───────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42; // B
+    glb[goff + 1] = 0x49; // I
+    glb[goff + 2] = 0x4E; // N
+    glb[goff + 3] = 0x00; // \0
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    return glb;
+}
+
+// ── cubeGridGlb fixture tests ─────────────────────────────────────────────────
+
+test "cubeGridGlb: N-cube grid round-trips with unique names + distinct positions" {
+    const glb = try cubeGridGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try gltf_mod.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    // 7x7 = 49 cube submeshes.
+    try testing.expectEqual(@as(usize, 49), model.submeshes.len);
+    try testing.expectEqual(@as(usize, 49), model.names.len);
+    // Names are unique (first != last) and follow the Cube_r{R}_c{C} convention.
+    try testing.expect(!std.mem.eql(u8, model.names[0], model.names[48]));
+    try testing.expect(std.mem.startsWith(u8, model.names[0], "Cube_r"));
+}
