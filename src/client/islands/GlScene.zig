@@ -93,7 +93,7 @@ const depth_at_shader: u32 = 10; // alpha-tested depth shader for MASK cutout sh
 const shadow_handle: u32 = 1;
 const shadow_size: u32 = 1024;
 
-const max_submesh = 8; // material-pool cap
+const max_submesh = 128; // per-instance pool cap (was 8); sizes Scene + all Inst pools
 const max_tex = 8; // material-texture cap (per mesh)
 
 // A worker-decoded external texture awaiting upload on the next frame.
@@ -277,11 +277,14 @@ fn clipFix() gl.math.Mat4 {
 // Shared transient scratch — `glscene_frame` fills it and returns its pointer;
 // the bridge walks the stream synchronously before the next frame call, so
 // instances never interleave within a tick. NOT per-instance (saves 3×4 KB).
-//   one-time create OR replay: 2×createBuffer + ≤8 PBR/alpha-test + 1 depth shader +
-//     1 shadow map + 5 createTexture + 3 createTextureEx ≈ 420 B
-//   per-frame worst case (every submesh a distinct variant): depth pass 220 +
-//     beginFrame 28 + 8×160 + endFrame 4 ≈ 1532 B. Total ≈ 1952. Round to 4096.
-var cmd_buf: [4096]u8 = undefined;
+//   one-time create OR replay: 2×createBuffer + ≤16 PBR/alpha-test/DS shader variants +
+//     1 depth + 1 depth_at shader + 1 shadow map + 5 createTexture + 3 createTextureEx ≈ 420 B
+//   per-frame worst case (128 submeshes, every one a distinct double-sided BLEND variant):
+//     shadow pass: begin(16) + 128×drawDepth(24) + 128×(bindTex(12)+drawDepthAt(32)) + end(12) = 8732 B
+//     main pass:   beginFrame(28) + 128×2×(setPipeline+setLights+bindIbl+bindShadowMap+5×bindTex+drawPbr)(160) + endFrame(4) = 41020 B
+//     total ≈ 49752 B. Use compile-time expression: 4 + max_submesh * 320 + 64 (double-sided worst).
+const cmd_buf_cap: usize = 4 + max_submesh * 320 + 64;
+var cmd_buf: [cmd_buf_cap]u8 = undefined;
 
 fn findSlot(vid: u32) ?*Inst {
     for (&instances) |*it| {
