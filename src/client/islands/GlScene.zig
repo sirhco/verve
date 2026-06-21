@@ -233,6 +233,13 @@ const Inst = struct {
     // Refs resolved once in hydrate (scoped); frame/asset callbacks run unscoped.
     canvas_handle: ?i32 = null,
     scroll_section_handle: ?i32 = null,
+
+    // Per-frame frustum-cull counters (T3). Reset at frame start; shadow fields
+    // incremented in T4. Exported via glscene_cull_stats().
+    cull_main_drawn: u32 = 0,
+    cull_main_culled: u32 = 0,
+    cull_shadow_drawn: u32 = 0,
+    cull_shadow_culled: u32 = 0,
 };
 
 const MAX_INSTANCES = 4;
@@ -999,6 +1006,11 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         const pv = clipFix().mul(proj).mul(view);
         // World-space frustum planes for this frame's camera (P9 slice 2).
         const planes = gl.cull.frustumPlanes(pv);
+        // Reset per-frame cull counters (T3). Shadow counters set in T4.
+        inst.cull_main_drawn = 0;
+        inst.cull_main_culled = 0;
+        inst.cull_shadow_drawn = 0;
+        inst.cull_shadow_culled = 0;
         // Two-pass draw (alpha transparency). Pass 1: opaque submeshes in vmesh
         // order, depth-write on — byte-identical to the historical single-pass
         // stream when every submesh is opaque. Pass 2: transparent submeshes
@@ -1013,9 +1025,13 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 if (s >= max_submesh) break;
                 const sub1 = a.submesh(s);
                 if (sub1.alpha_mode == 1) continue; // Pass 1 = opaque + mask (skip blend)
-                if (!visibleAfterCull(inst, planes, s)) continue;
+                if (!visibleAfterCull(inst, planes, s)) {
+                    inst.cull_main_culled += 1;
+                    continue;
+                }
                 // single-sided → cull back; double-sided → cull off (both faces).
                 const cull: u32 = if (sub1.double_sided != 0) 0 else gl.command.state_cull_back;
+                inst.cull_main_drawn += 1;
                 drawSubmesh(inst, a, &enc, s, gl.command.state_depth_test | cull, &last_variant, env, pv);
             }
         }
@@ -1029,7 +1045,10 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             while (s < a.submesh_count) : (s += 1) {
                 if (s >= max_submesh) break;
                 if (a.submesh(s).alpha_mode != 1) continue;
-                if (!visibleAfterCull(inst, planes, s)) continue;
+                if (!visibleAfterCull(inst, planes, s)) {
+                    inst.cull_main_culled += 1;
+                    continue;
+                }
                 const wbox = gl.cull.worldAabb(inst.submesh_aabb[s], inst.scene.world[s + 1]);
                 const cx = (wbox.min.x + wbox.max.x) * 0.5 - inst.camera_pos[0];
                 const cy = (wbox.min.y + wbox.max.y) * 0.5 - inst.camera_pos[1];
@@ -1060,6 +1079,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             while (i < tcount) : (i += 1) {
                 const s = tidx[i];
                 const sub = a.submesh(s);
+                inst.cull_main_drawn += 1; // count once per submesh, not per cull-front/back pass
                 if (sub.double_sided != 0) {
                     // Double-sided BLEND: two-pass — back faces (cull front) then
                     // front faces (cull back) for correct over-blend compositing.
@@ -1114,6 +1134,24 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 fn visibleAfterCull(inst: *Inst, planes: [6]gl.cull.Plane, s: u32) bool {
     const wbox = gl.cull.worldAabb(inst.submesh_aabb[s], inst.scene.world[s + 1]);
     return gl.cull.aabbInFrustum(planes, wbox);
+}
+
+/// Return the four per-frame cull counters for the active instance as a packed
+/// u32 so JS can read them in a single wasm call.
+///
+/// Encoding (each field fits in a byte — max submesh count is 128 < 256):
+///   bits  7:0  — cull_main_drawn
+///   bits 15:8  — cull_main_culled
+///   bits 23:16 — cull_shadow_drawn   (populated in T4)
+///   bits 31:24 — cull_shadow_culled  (populated in T4)
+///
+/// Returns 0 when no instance is selected (guard; same pattern as glscene_frame).
+export fn glscene_cull_stats() u32 {
+    const inst = current orelse return 0;
+    return (inst.cull_main_drawn & 0xff) |
+        ((inst.cull_main_culled & 0xff) << 8) |
+        ((inst.cull_shadow_drawn & 0xff) << 16) |
+        ((inst.cull_shadow_culled & 0xff) << 24);
 }
 
 /// Emit the draw commands for a single submesh `s` with the given pipeline
