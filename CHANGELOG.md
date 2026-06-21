@@ -6,6 +6,24 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **gl frustum-culling completion** (`src/client/islands/GlScene.zig`,
+  `src/core/gl/fixture.zig`, `tools/gen_cubegrid_glb.zig`, `build.zig`,
+  `src/bridge/verve.js`, `src/app/*`, `docs/24-gl.md`): completes P9 per-submesh
+  frustum culling. Adds shadow-pass light-frustum culling (depth pass skips casters
+  outside the light frustum), a per-frame drawn/culled HUD, scene capacity raised
+  to `max_submesh = 128`, and a `/gl-cull` demo (7×7 cube grid) where the camera
+  cull visibly fires. Verified via CDP on both backends.
+
+### Fixed
+
+- **gl chunk wasm stack overflow** (`build.zig`, `src/client/islands/GlScene.zig`):
+  raising `max_submesh` to 128 overflowed the 4 KB per-chunk wasm stack on the
+  click/hover pick path (the gl frame's matrix locals plus BVH raycast recursion),
+  trapping with "memory access out of bounds". Stack raised to 64 KB and the
+  Pass-2 sort scratch moved off the frame stack into `Inst`.
+
 ## [0.6.1] - 2026-06-20
 
 ### Added
