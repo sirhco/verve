@@ -210,6 +210,12 @@ const Inst = struct {
     depth_mvps: [max_submesh][16]f32 = undefined, // P9 slice 3 shadow pass
     light_vp_mat: [16]f32 = undefined,
     mats: [max_submesh][12]f32 = undefined, // per-submesh material block
+    // Pass-2 transparency sort scratch. Kept in Inst (static), NOT on the
+    // frame stack: the chunk wasm stack is only 4 KB (build.zig stack_size),
+    // and at max_submesh=128 these two arrays are 1 KB — on the stack they
+    // overflow it once the pick/hover raycast call chain adds depth.
+    tidx: [max_submesh]u32 = undefined,
+    tkey: [max_submesh]f32 = undefined,
 
     // Single directional light from props: 8 f32 [type, intensity, x,y,z, r,g,b].
     lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 },
@@ -1055,8 +1061,8 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
         // Pass 2: transparent (alpha_mode == 1) — sorted far→near, blend on.
         var tcount: u32 = 0;
-        var tidx: [max_submesh]u32 = undefined;
-        var tkey: [max_submesh]f32 = undefined;
+        const tidx = &inst.tidx;
+        const tkey = &inst.tkey;
         {
             var s: u32 = 0;
             while (s < a.submesh_count) : (s += 1) {
