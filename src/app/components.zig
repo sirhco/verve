@@ -1364,7 +1364,8 @@ pub fn glSceneCull(ctx: *const verve.Context) !*verve.Node {
 /// /gl-instanced: 16×16 = 256 cubes drawn in a single instanced draw call.
 /// The vmesh carries EXT_mesh_gpu_instancing data (TRANSLATION/ROTATION/SCALE/
 /// _COLOR_0 per instance). GlScene emits one draw_pbr_instanced command; the
-/// bridge issues a single drawArraysInstanced / drawIndexedIndirect for all 256.
+/// bridge issues a single drawElementsInstanced (WebGL2) / drawIndexed(count, N)
+/// (WebGPU) for all 256.
 pub fn glSceneInstanced(ctx: *const verve.Context) !*verve.Node {
     const scene = ctx.glScene(.{
         .src = "/gl/cubefield.vmesh",

@@ -1110,7 +1110,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             enc.bindTexture(2, texHandle(sub0.tex_normal));
             enc.bindTexture(3, texHandle(sub0.tex_emissive));
             enc.bindTexture(4, texHandle(sub0.tex_occlusion));
-            enc.drawPbrInstanced(vbuf, ibuf, 0, sub0.index_count, @intCast(@intFromPtr(&inst.instance_scratch)), n, @intCast(@intFromPtr(&inst.vp_mat)), @intCast(@intFromPtr(&inst.mats[0])), @intCast(@intFromPtr(&inst.camera_pos)));
+            enc.drawPbrInstanced(vbuf, ibuf, sub0.index_byte_off, sub0.index_count, @intCast(@intFromPtr(&inst.instance_scratch)), n, @intCast(@intFromPtr(&inst.vp_mat)), @intCast(@intFromPtr(&inst.mats[0])), @intCast(@intFromPtr(&inst.camera_pos)));
             enc.endFrame();
             // finish() stamps the cmd_buf length header (buf[0..4]); without it the
             // bridge reads a stale length and truncates the frame before this draw.
