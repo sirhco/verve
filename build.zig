@@ -182,9 +182,10 @@ pub fn build(b: *std.Build) void {
         // memory for it; the main runtime avoids it (`__heap_base` ≥ stack
         // ceiling). Sized for the heaviest chunk: the gl frame builds many
         // Mat4 locals (proj/view/pv/clipFix/light_vp + per-draw transforms)
-        // and the pick/hover path recurses through the BVH raycast — 4 KB
-        // overflowed on click once max_submesh grew the scene pools (the
-        // overflow corrupted live data → "memory access out of bounds").
+        // and the pick/hover path adds the BVH raycast call chain (iterative,
+        // bounded depth) — 4 KB overflowed on click once max_submesh grew the
+        // scene pools (the overflow corrupted live data → "memory access out
+        // of bounds").
         exe.stack_size = 64 * 1024;
 
         const out_name = b.fmt("island_{s}.wasm", .{name});

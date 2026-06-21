@@ -211,9 +211,9 @@ const Inst = struct {
     light_vp_mat: [16]f32 = undefined,
     mats: [max_submesh][12]f32 = undefined, // per-submesh material block
     // Pass-2 transparency sort scratch. Kept in Inst (static), NOT on the
-    // frame stack: the chunk wasm stack is only 4 KB (build.zig stack_size),
-    // and at max_submesh=128 these two arrays are 1 KB — on the stack they
-    // overflow it once the pick/hover raycast call chain adds depth.
+    // frame stack: at max_submesh=128 these two arrays are 1 KB, and keeping
+    // the frame's stack frame lean regardless of capacity avoids re-pressuring
+    // the per-chunk wasm stack (build.zig stack_size) as max_submesh grows.
     tidx: [max_submesh]u32 = undefined,
     tkey: [max_submesh]f32 = undefined,
 
@@ -292,10 +292,16 @@ fn clipFix() gl.math.Mat4 {
 // instances never interleave within a tick. NOT per-instance (saves 3×4 KB).
 //   one-time create OR replay: 2×createBuffer + ≤16 PBR/alpha-test/DS shader variants +
 //     1 depth + 1 depth_at shader + 1 shadow map + 5 createTexture + 3 createTextureEx ≈ 420 B
-//   per-frame worst case (128 submeshes, every one double-sided BLEND in main + MASK in shadow):
+//   per-frame bound (320 = double-sided BLEND main draw, 44 = MASK shadow draw):
 //     main:   beginFrame(28) + N×2×160 (double-sided BLEND, 320/submesh) + endFrame(4)
 //     shadow: beginShadowPass(16) + N×44 (MASK: bindTexture(12)+drawDepthAt(32)) + endShadowPass(12)
 //     + 64 slop → 4 + 128×364 + (28+4+16+12) + 64 = 46,720 B
+//   320 (BLEND main) and 44 (MASK shadow) can't BOTH come from one submesh
+//   (alpha_mode is one value: BLEND main pairs with plain depth=24, MASK shadow
+//   pairs with a 160 main draw), so 320+44 is deliberately over-conservative —
+//   the real per-submesh max is ~344. The ~2.6 KB of slack also absorbs the
+//   one-time ~420 B sendResources create/replay burst that shares this buffer
+//   on the first frame.
 const cmd_buf_cap: usize = 4 + max_submesh * (320 + 44) + (28 + 4 + 16 + 12) + 64;
 var cmd_buf: [cmd_buf_cap]u8 = undefined;
 
