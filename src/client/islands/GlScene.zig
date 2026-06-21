@@ -93,7 +93,7 @@ const depth_at_shader: u32 = 10; // alpha-tested depth shader for MASK cutout sh
 const shadow_handle: u32 = 1;
 const shadow_size: u32 = 1024;
 
-const max_submesh = 8; // material-pool cap
+const max_submesh = 128; // per-instance pool cap (was 8); sizes Scene + all Inst pools
 const max_tex = 8; // material-texture cap (per mesh)
 
 // A worker-decoded external texture awaiting upload on the next frame.
@@ -210,6 +210,12 @@ const Inst = struct {
     depth_mvps: [max_submesh][16]f32 = undefined, // P9 slice 3 shadow pass
     light_vp_mat: [16]f32 = undefined,
     mats: [max_submesh][12]f32 = undefined, // per-submesh material block
+    // Pass-2 transparency sort scratch. Kept in Inst (static), NOT on the
+    // frame stack: at max_submesh=128 these two arrays are 1 KB, and keeping
+    // the frame's stack frame lean regardless of capacity avoids re-pressuring
+    // the per-chunk wasm stack (build.zig stack_size) as max_submesh grows.
+    tidx: [max_submesh]u32 = undefined,
+    tkey: [max_submesh]f32 = undefined,
 
     // Single directional light from props: 8 f32 [type, intensity, x,y,z, r,g,b].
     lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 },
@@ -233,6 +239,13 @@ const Inst = struct {
     // Refs resolved once in hydrate (scoped); frame/asset callbacks run unscoped.
     canvas_handle: ?i32 = null,
     scroll_section_handle: ?i32 = null,
+
+    // Per-frame frustum-cull counters (T3). Reset at frame start; shadow fields
+    // incremented in T4. Exported via glscene_cull_stats().
+    cull_main_drawn: u32 = 0,
+    cull_main_culled: u32 = 0,
+    cull_shadow_drawn: u32 = 0,
+    cull_shadow_culled: u32 = 0,
 };
 
 const MAX_INSTANCES = 4;
@@ -277,11 +290,20 @@ fn clipFix() gl.math.Mat4 {
 // Shared transient scratch — `glscene_frame` fills it and returns its pointer;
 // the bridge walks the stream synchronously before the next frame call, so
 // instances never interleave within a tick. NOT per-instance (saves 3×4 KB).
-//   one-time create OR replay: 2×createBuffer + ≤8 PBR/alpha-test + 1 depth shader +
-//     1 shadow map + 5 createTexture + 3 createTextureEx ≈ 420 B
-//   per-frame worst case (every submesh a distinct variant): depth pass 220 +
-//     beginFrame 28 + 8×160 + endFrame 4 ≈ 1532 B. Total ≈ 1952. Round to 4096.
-var cmd_buf: [4096]u8 = undefined;
+//   one-time create OR replay: 2×createBuffer + ≤16 PBR/alpha-test/DS shader variants +
+//     1 depth + 1 depth_at shader + 1 shadow map + 5 createTexture + 3 createTextureEx ≈ 420 B
+//   per-frame bound (320 = double-sided BLEND main draw, 44 = MASK shadow draw):
+//     main:   beginFrame(28) + N×2×160 (double-sided BLEND, 320/submesh) + endFrame(4)
+//     shadow: beginShadowPass(16) + N×44 (MASK: bindTexture(12)+drawDepthAt(32)) + endShadowPass(12)
+//     + 64 slop → 4 + 128×364 + (28+4+16+12) + 64 = 46,720 B
+//   320 (BLEND main) and 44 (MASK shadow) can't BOTH come from one submesh
+//   (alpha_mode is one value: BLEND main pairs with plain depth=24, MASK shadow
+//   pairs with a 160 main draw), so 320+44 is deliberately over-conservative —
+//   the real per-submesh max is ~344. The ~2.6 KB of slack also absorbs the
+//   one-time ~420 B sendResources create/replay burst that shares this buffer
+//   on the first frame.
+const cmd_buf_cap: usize = 4 + max_submesh * (320 + 44) + (28 + 4 + 16 + 12) + 64;
+var cmd_buf: [cmd_buf_cap]u8 = undefined;
 
 fn findSlot(vid: u32) ?*Inst {
     for (&instances) |*it| {
@@ -965,26 +987,45 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // shadowFactor uses ndc.z directly).
         const light_vp = clipFix().mul(lightSpaceMatrix(inst, a));
         inst.light_vp_mat = light_vp.m;
+        // Light-frustum planes for shadow-caster culling (T4). Culling against the
+        // LIGHT frustum (not the camera) so off-screen casters that cast into view
+        // are not incorrectly dropped.
+        const lplanes = gl.cull.frustumPlanes(light_vp);
+        inst.cull_shadow_drawn = 0;
+        inst.cull_shadow_culled = 0;
         enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
         // NOTE: double-sided shadows use back-cull this phase — drawDepth/drawDepthAt
         // carry no per-draw state word, so cull is baked into the depth pipeline.
         // A thin double-sided surface may under-shadow from one side; future work.
         {
             // Phase A: opaque + blend (alpha_mode != 2) — plain position-only depth.
+            // depth_mvps is computed for ALL submeshes (cheap) so Phase B can reuse it.
+            // Cull check happens here for ALL submeshes; culled ones skip both phases.
             var sd: u32 = 0;
             while (sd < a.submesh_count) : (sd += 1) {
                 if (sd >= max_submesh) break;
                 const sub = a.submesh(sd);
                 inst.depth_mvps[sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
-                if (sub.alpha_mode == 2) continue;
+                const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
+                    inst.cull_shadow_culled += 1;
+                    continue;
+                }
+                if (sub.alpha_mode == 2) continue; // MASK: drawn in Phase B
+                inst.cull_shadow_drawn += 1;
                 enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])));
             }
             // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
+            // Re-tests light frustum (same deterministic result as Phase A); only
+            // MASK submeshes that passed Phase A's frustum check reach drawDepthAt.
             sd = 0;
             while (sd < a.submesh_count) : (sd += 1) {
                 if (sd >= max_submesh) break;
                 const sub = a.submesh(sd);
                 if (sub.alpha_mode != 2) continue;
+                const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // already counted in Phase A
+                inst.cull_shadow_drawn += 1;
                 enc.bindTexture(0, texHandle(sub.tex_base));
                 enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])), @intCast(@intFromPtr(&inst.mats[sd])));
             }
@@ -996,6 +1037,9 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         const pv = clipFix().mul(proj).mul(view);
         // World-space frustum planes for this frame's camera (P9 slice 2).
         const planes = gl.cull.frustumPlanes(pv);
+        // Reset per-frame main-pass cull counters (T3). Shadow counters reset above (T4).
+        inst.cull_main_drawn = 0;
+        inst.cull_main_culled = 0;
         // Two-pass draw (alpha transparency). Pass 1: opaque submeshes in vmesh
         // order, depth-write on — byte-identical to the historical single-pass
         // stream when every submesh is opaque. Pass 2: transparent submeshes
@@ -1010,23 +1054,30 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 if (s >= max_submesh) break;
                 const sub1 = a.submesh(s);
                 if (sub1.alpha_mode == 1) continue; // Pass 1 = opaque + mask (skip blend)
-                if (!visibleAfterCull(inst, planes, s)) continue;
+                if (!visibleAfterCull(inst, planes, s)) {
+                    inst.cull_main_culled += 1;
+                    continue;
+                }
                 // single-sided → cull back; double-sided → cull off (both faces).
                 const cull: u32 = if (sub1.double_sided != 0) 0 else gl.command.state_cull_back;
+                inst.cull_main_drawn += 1;
                 drawSubmesh(inst, a, &enc, s, gl.command.state_depth_test | cull, &last_variant, env, pv);
             }
         }
 
         // Pass 2: transparent (alpha_mode == 1) — sorted far→near, blend on.
         var tcount: u32 = 0;
-        var tidx: [max_submesh]u32 = undefined;
-        var tkey: [max_submesh]f32 = undefined;
+        const tidx = &inst.tidx;
+        const tkey = &inst.tkey;
         {
             var s: u32 = 0;
             while (s < a.submesh_count) : (s += 1) {
                 if (s >= max_submesh) break;
                 if (a.submesh(s).alpha_mode != 1) continue;
-                if (!visibleAfterCull(inst, planes, s)) continue;
+                if (!visibleAfterCull(inst, planes, s)) {
+                    inst.cull_main_culled += 1;
+                    continue;
+                }
                 const wbox = gl.cull.worldAabb(inst.submesh_aabb[s], inst.scene.world[s + 1]);
                 const cx = (wbox.min.x + wbox.max.x) * 0.5 - inst.camera_pos[0];
                 const cy = (wbox.min.y + wbox.max.y) * 0.5 - inst.camera_pos[1];
@@ -1057,6 +1108,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             while (i < tcount) : (i += 1) {
                 const s = tidx[i];
                 const sub = a.submesh(s);
+                inst.cull_main_drawn += 1; // count once per submesh, not per cull-front/back pass
                 if (sub.double_sided != 0) {
                     // Double-sided BLEND: two-pass — back faces (cull front) then
                     // front faces (cull back) for correct over-blend compositing.
@@ -1111,6 +1163,24 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 fn visibleAfterCull(inst: *Inst, planes: [6]gl.cull.Plane, s: u32) bool {
     const wbox = gl.cull.worldAabb(inst.submesh_aabb[s], inst.scene.world[s + 1]);
     return gl.cull.aabbInFrustum(planes, wbox);
+}
+
+/// Return the four per-frame cull counters for the active instance as a packed
+/// u32 so JS can read them in a single wasm call.
+///
+/// Encoding (each field fits in a byte — max submesh count is 128 < 256):
+///   bits  7:0  — cull_main_drawn
+///   bits 15:8  — cull_main_culled
+///   bits 23:16 — cull_shadow_drawn   (populated in T4)
+///   bits 31:24 — cull_shadow_culled  (populated in T4)
+///
+/// Returns 0 when no instance is selected (guard; same pattern as glscene_frame).
+export fn glscene_cull_stats() u32 {
+    const inst = current orelse return 0;
+    return (inst.cull_main_drawn & 0xff) |
+        ((inst.cull_main_culled & 0xff) << 8) |
+        ((inst.cull_shadow_drawn & 0xff) << 16) |
+        ((inst.cull_shadow_culled & 0xff) << 24);
 }
 
 /// Emit the draw commands for a single submesh `s` with the given pipeline

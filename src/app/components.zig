@@ -1335,6 +1335,32 @@ pub fn glSceneDouble(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-cull: 7×7 = 49-cube dense grid for frustum-cull stress testing.
+/// Cubes are spaced 3 units apart so portions of the grid leave the frustum as
+/// the camera orbits/zooms, exercising the per-submesh cull path.
+pub fn glSceneCull(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/cubegrid.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EFrustum Cull%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 20.0, .pitch = 0.45, .yaw = 0.5 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .autoRotate(0.2)
+        .build();
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — frustum culling"),
+        ctx.p().text("A 7×7 grid of 49 unit cubes (spacing 3 units). As the camera orbits " ++
+            "or zooms in, cubes outside the view frustum are skipped by the per-submesh " ++
+            "frustum-cull pass — no draw call is issued for off-screen geometry."),
+        ctx.div().attr("data-ref", "glcull-hud").class("hint"),
+        scene,
+        ctx.p().text("Drag to orbit · wheel to zoom. Cubes leaving the frustum are culled " ++
+            "before any draw call reaches the GPU."),
+    });
+}
+
 /// /gl-multi: TWO independent GlScene islands on one page (P7 multi-instance).
 /// Each `<verve-island data-name="GlScene">` gets its own per-instance state
 /// slot keyed by vid; the bridge selects the right instance before each frame /

@@ -573,6 +573,23 @@
     return isl ? parseInt(isl.getAttribute("data-vid"), 10) || 0 : 0;
   };
 
+  // T3: Write per-frame frustum-cull stats into the [data-ref="glcull-hud"] element.
+  // Encoding: glscene_cull_stats() returns drawn|(culled<<8)|(sdraw<<16)|(scull<<24).
+  // Guard: no-op when the element is absent (every demo except /gl-cull).
+  // glscene_select has already been called before the frame export, so `current`
+  // in wasm is the right instance when this runs synchronously after the frame.
+  const glCullHudUpdate = (exports) => {
+    if (typeof exports.glscene_cull_stats !== "function") return;
+    const hudEl = document.querySelector('[data-ref="glcull-hud"]');
+    if (!hudEl) return;
+    const packed = exports.glscene_cull_stats() >>> 0;
+    const d  = packed & 0xff;
+    const c  = (packed >>> 8) & 0xff;
+    const sd = (packed >>> 16) & 0xff;
+    const sc = (packed >>> 24) & 0xff;
+    hudEl.textContent = `drawn ${d} / culled ${c} / ${d + c} · shadow ${sd}/${sc}`;
+  };
+
   const dispatchEventId = (e, attr, prevent) => {
     const node = e.target.closest(`[${attr}]`);
     if (!node) return false;
@@ -6385,6 +6402,8 @@
           if (st.poster) st.poster.style.display = "none";
           st.posterHidden = true;
         }
+        // T3: cull HUD — only present on /gl-cull; no-op on all other demos.
+        glCullHudUpdate(st.exports);
       } catch (err) {
         // A corrupt stream/pointer must not kill the loop silently.
         console.error("verve.gl: interpreter fault, loop stopped:", err, err && err.stack);
@@ -6543,6 +6562,8 @@
       }
       try {
         gpuInterpret(st, ptr);
+        // T3: cull HUD — only present on /gl-cull; no-op on all other demos.
+        glCullHudUpdate(st.exports);
       } catch (err) {
         console.error("verve.gl: WebGPU interpreter fault, loop stopped:", err);
         glSinks.delete(sink);
