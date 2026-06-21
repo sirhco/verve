@@ -392,8 +392,14 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\in vec4 v_inst_color;
         \\
     ;
+    // Per-instance tint. `main_open` already derived `albedo = base_sample *
+    // base_color` from the UNtinted base_color, so albedo (the term lighting
+    // actually consumes) must be re-tinted here too — tinting base_color alone
+    // would only affect its alpha. Matches the WGSL path, which folds inst_color
+    // into base_color BEFORE computing albedo.
     const inst_tint =
         \\  base_color *= v_inst_color;
+        \\  albedo *= v_inst_color.rgb;
         \\
     ;
     const nm_ins =
