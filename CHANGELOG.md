@@ -14,11 +14,20 @@ versions follow [Semantic Versioning](https://semver.org/).
   `variant_fog = 1 << 13`; 8-scalar `FogParams` layout `[mode, r,g,b, near,far,
   density, _pad]`. Fog is applied after PBR lighting, before tonemap; radial
   distance (spherical, not planar). Both WebGL2 and WebGPU backends. `/gl-fog`
-  demo: 49-cube grid with linear fog `near=6 far=42`, fog colour matching the
-  clear colour so distant cubes dissolve into the background. Fog params travel via
-  `data-glfog` canvas attribute rather than `Props` — Props is frozen at 14 fields
-  to avoid a Zig 0.16 wasm `decodeProps` codegen miscompile that blanks GlScene
-  pages when the struct grows.
+  demo: 49-cube grid with linear fog `near=8 far=34`, soft blue-grey haze so far
+  cubes fade out. Fog params travel via a `data-glfog` canvas attribute rather
+  than `Props` (Props kept at 14 fields, conservatively guarded by a comptime
+  assert).
+- **Fix — island chunk-data memory window** (`build.zig`): island chunks share
+  the main client's linear memory and the linker writes each chunk's data
+  segments (the gl chunk's comptime PBR/fog shader strings) into the region
+  below the main client's static data. The full fog shader-variant set grew the
+  GlScene chunk's data to ~1.07 MiB, crossing the main client's 1 MiB default
+  stack/data boundary and silently corrupting the main client on instantiation —
+  every GlScene page rendered blank with no console error. Raised the main client
+  `stack_size` to 4 MiB so the chunk-data window is ~4 MiB. (This, not the
+  previously-suspected `decodeProps` field-count limit, was the real cause of the
+  blank GlScene pages.)
 
 ## [0.6.4] - 2026-06-21
 

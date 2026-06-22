@@ -1405,7 +1405,7 @@ pub fn glSceneFog(ctx: *const verve.Context) !*verve.Node {
     })
         .camera(.{ .distance = 22.0, .pitch = 0.35, .yaw = 0.4 })
         .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
-        .fog(.{ .mode = .linear, .color = .{ 0.05, 0.06, 0.09 }, .near = 6.0, .far = 42.0 })
+        .fog(.{ .mode = .linear, .color = .{ 0.42, 0.5, 0.62 }, .near = 8.0, .far = 34.0 })
         .autoRotate(0.15)
         .build();
 

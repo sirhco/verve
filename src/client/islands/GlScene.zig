@@ -136,10 +136,11 @@ const Props = struct {
     pick_event_ids: []const u32,
     scrub: bool, // scroll-scrub mode (Task 9); wired to timeline in Task 9
     pick_export_names: []const []const u8, // P8 onPickExport: per-slot DOM event name ("" = none)
-    // NOTE: NO fog field. Any field added to this struct makes the wasm
-    // decodeProps miscompile → blank canvas. Fog arrives via the canvas
-    // `data-glfog` attribute (refGetAttr), parsed in hydrate. MUST mirror
-    // src/core/gl_scene.zig Props exactly (14 fields).
+    // NOTE: NO fog field. Fog arrives via the canvas `data-glfog` attribute
+    // (refGetAttr), parsed in hydrate — NOT through Props. This MUST mirror
+    // src/core/gl_scene.zig Props exactly (14 fields); see the fuller note
+    // there (the blank GlScene pages were the chunk-data memory window in
+    // build.zig, not a decodeProps miscompile).
 };
 
 comptime {

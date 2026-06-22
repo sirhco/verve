@@ -36,16 +36,21 @@ pub const Props = struct {
     pick_event_ids: []const u32, // parallel closure ids (0 = none)
     scrub: bool, // scroll-scrub mode (Task 9); when true auto_rotate is forced 0
     pick_export_names: []const []const u8, // parallel DOM-event names ("" = none) — P8 onPickExport
-    // NOTE: fog is deliberately NOT a Props field. Adding ANY field to this
-    // struct (flat, nested, or slice) makes the chunk's wasm `decodeProps`
-    // miscompile (Zig 0.16 wasm codegen) and silently fail hydration → every
-    // GlScene page renders blank. Fog travels instead as a `data-glfog`
-    // attribute on the canvas, read in the chunk via `refGetAttr` (see build()
-    // and GlScene.zig hydrate). Keep this struct at exactly these 14 fields.
+    // NOTE: fog is deliberately NOT a Props field. Fog travels instead as a
+    // `data-glfog` attribute on the canvas, read in the chunk via `refGetAttr`
+    // (see build() and GlScene.zig hydrate). This was originally adopted on the
+    // belief that growing Props tripped a wasm `decodeProps` miscompile — but
+    // the blank GlScene pages were ultimately traced to the chunk-data memory
+    // window (build.zig main-client stack_size), NOT decodeProps. The
+    // data-glfog transport is kept (it works and is shipped); the assert below
+    // is a conservative guard that the codec round-trips this exact shape.
+    // If you ever revisit moving fog into Props, re-verify hydration on a real
+    // GlScene page first.
 };
 
 comptime {
-    // Fog must never enter Props (wasm decodeProps miscompile at 15+ fields).
+    // Conservative guard: the SSR codec and the chunk-side Props mirror must
+    // agree on this exact 14-field shape (see the NOTE above).
     std.debug.assert(@typeInfo(Props).@"struct".fields.len == 14);
 }
 
