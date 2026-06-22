@@ -50,6 +50,7 @@ pub const Tag = enum(u16) {
     draw_fullscreen_quad = 25, // {shader, tex0, tex1, params_ptr, param_count} — VBO-less 3-vert triangle
     draw_depth_at = 26, // {shader, vbuf, ibuf, index_byte_off, index_count, mvp_ptr, material_ptr} — alpha-tested depth draw (MASK shadows)
     draw_pbr_instanced = 27, // {vbuf, ibuf, off, count, instance_ptr, instance_count, vp_ptr, material_ptr, camera_ptr}
+    set_fog = 28, // {ptr -> 8 f32 FogParams}
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -85,6 +86,7 @@ pub const variant_linear_output: u32 = 1 << 9; // requires variant_pbr; SKIP in-
 pub const variant_alpha_test: u32 = 1 << 10; // requires variant_pbr; MASK cutout (discard below alphaCutoff)
 pub const variant_double_sided: u32 = 1 << 11; // requires variant_pbr; render both faces, flip back-face normal
 pub const variant_instanced: u32 = 1 << 12; // requires variant_pbr; per-instance model (attr 4-7) + color (attr 8); non-skinned
+pub const variant_fog: u32 = 1 << 13; // requires variant_pbr; distance fog mix before tonemap
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -94,6 +96,7 @@ pub const clear_flag_depth: u32 = 1 << 1;
 
 pub const max_lights: u32 = 4;
 pub const light_stride_f32: u32 = 8; // [type(0=dir,1=point), intensity, x,y,z, r,g,b]
+pub const fog_params_f32: u32 = 8; // [mode, r,g,b, near, far, density, _pad]
 pub const material_len_f32: u32 = 12; // base_color rgba | metallic, roughness, occlusion_strength, normal_scale | emissive rgb, 0
 
 pub const tex_slot_base: u32 = 0;
@@ -1513,6 +1516,12 @@ pub const Encoder = struct {
         self.putU32(ptr);
     }
 
+    /// Encode a set_fog command: ptr -> 8 f32 FogParams [mode, r,g,b, near, far, density, _pad].
+    pub fn setFog(self: *Encoder, ptr: u32) void {
+        self.header(.set_fog, 4);
+        self.putU32(ptr);
+    }
+
     pub fn setBones(self: *Encoder, count: u32, ptr: u32) void {
         self.header(.set_bones, 8);
         self.putU32(count);
@@ -2592,4 +2601,20 @@ test "drawPbrInstanced encodes tag 27 + 9 u32 payload (36 bytes)" {
     try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, buf[32..36], .little)); // vp_ptr
     try testing.expectEqual(@as(u32, 0x3000), std.mem.readInt(u32, buf[36..40], .little)); // material_ptr
     try testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, buf[40..44], .little)); // camera_ptr
+}
+
+test "fog: variant bit + set_fog tag + setFog encoding" {
+    try testing.expectEqual(@as(u32, 1 << 13), variant_fog);
+    try testing.expectEqual(@as(u8, 28), @intFromEnum(Tag.set_fog));
+    try testing.expectEqual(@as(u32, 8), fog_params_f32);
+
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.setFog(0x4000);
+    const stream = enc.finish();
+    // length header (4) + record header (4) + ptr (4) = 12
+    try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, stream[0..4], .little));
+    try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, stream[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, stream[6..8], .little)); // payload size
+    try testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, stream[8..12], .little)); // ptr
 }
