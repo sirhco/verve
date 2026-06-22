@@ -1639,6 +1639,7 @@ test "parse pbrCubeMixedMaterialGlb: 2 submeshes, variant fan-out (full vs base-
         null,
         &.{},
         0,
+        null,
     );
     defer testing.allocator.free(bytes);
     const r = try vmesh.Reader.init(bytes);
@@ -2343,6 +2344,7 @@ test "gltf parses EXT_mesh_gpu_instancing" {
         null,
         model.instances,
         model.instance_count,
+        null,
     );
     defer alloc.free(vmesh_bytes);
     const r = try vmesh.Reader.init(vmesh_bytes);

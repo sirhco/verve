@@ -2618,7 +2618,7 @@ test "windFarmGlb .vmesh asset exposes turbineN/rotorN names the pick maps on" {
     defer model.deinit();
     var br = try bvh.build(a, model.vertices, 12, model.indices);
     defer br.deinit(a);
-    const bytes = try vmesh.pack(a, model.vertices, model.indices, model.submeshes, model.textures, br.nodes, br.tri_perm, model.names, model.skinned, model.joints, model.weights, model.skel, if (model.anim_clips.len == 0) null else vmesh.Anims{ .clips = model.anim_clips }, &.{}, 0);
+    const bytes = try vmesh.pack(a, model.vertices, model.indices, model.submeshes, model.textures, br.nodes, br.tri_perm, model.names, model.skinned, model.joints, model.weights, model.skel, if (model.anim_clips.len == 0) null else vmesh.Anims{ .clips = model.anim_clips }, &.{}, 0, null);
     defer a.free(bytes);
     const reader = try vmesh.Reader.init(bytes);
     // Every turbine id 0..3 must be reachable from BOTH a turbine* and a rotor*
