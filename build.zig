@@ -111,6 +111,19 @@ pub fn build(b: *std.Build) void {
     // client's own entries ("function signature mismatch" once a chunk's
     // address-taken set grew past the slots main happened not to call).
     wasm.import_table = true;
+    // Chunk-data window. Island chunks share this client's linear memory
+    // (`import_memory`) and the linker writes each chunk's data segments
+    // (notably the gl chunk's comptime PBR/fog shader strings) into the
+    // region BELOW this client's own static data — i.e. into the unused
+    // lower portion of this client's stack. With the default 1 MiB stack,
+    // that window was [64 KiB, 1 MiB]; the GlScene chunk's data grew to
+    // ~1.07 MiB once it carried the full fog shader-variant set, crossing
+    // 1 MiB into this client's static data and silently corrupting it on
+    // instantiation (every GlScene page blank, no console error). Reserve
+    // a 4 MiB stack so the chunk-data window is [64 KiB, 4 MiB] — ample
+    // headroom for the heaviest chunk while this client's own stack usage
+    // stays in the KiB range at the top.
+    wasm.stack_size = 4 * 1024 * 1024;
 
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(wasm.getEmittedBin(), "client.wasm");

@@ -50,6 +50,7 @@ pub const Tag = enum(u16) {
     draw_fullscreen_quad = 25, // {shader, tex0, tex1, params_ptr, param_count} — VBO-less 3-vert triangle
     draw_depth_at = 26, // {shader, vbuf, ibuf, index_byte_off, index_count, mvp_ptr, material_ptr} — alpha-tested depth draw (MASK shadows)
     draw_pbr_instanced = 27, // {vbuf, ibuf, off, count, instance_ptr, instance_count, vp_ptr, material_ptr, camera_ptr}
+    set_fog = 28, // {ptr -> 8 f32 FogParams}
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -85,6 +86,7 @@ pub const variant_linear_output: u32 = 1 << 9; // requires variant_pbr; SKIP in-
 pub const variant_alpha_test: u32 = 1 << 10; // requires variant_pbr; MASK cutout (discard below alphaCutoff)
 pub const variant_double_sided: u32 = 1 << 11; // requires variant_pbr; render both faces, flip back-face normal
 pub const variant_instanced: u32 = 1 << 12; // requires variant_pbr; per-instance model (attr 4-7) + color (attr 8); non-skinned
+pub const variant_fog: u32 = 1 << 13; // requires variant_pbr; distance fog mix before tonemap
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -94,6 +96,7 @@ pub const clear_flag_depth: u32 = 1 << 1;
 
 pub const max_lights: u32 = 4;
 pub const light_stride_f32: u32 = 8; // [type(0=dir,1=point), intensity, x,y,z, r,g,b]
+pub const fog_params_f32: u32 = 8; // [mode, r,g,b, near, far, density, _pad]
 pub const material_len_f32: u32 = 12; // base_color rgba | metallic, roughness, occlusion_strength, normal_scale | emissive rgb, 0
 
 pub const tex_slot_base: u32 = 0;
@@ -455,6 +458,27 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    const fog_uniforms =
+        \\uniform vec4 u_fog0; // [mode, color.r, color.g, color.b]
+        \\uniform vec4 u_fog1; // [near, far, density, _pad]
+        \\
+    ;
+    const fog_mix =
+        \\  float fog_dist = length(u_camera_pos - v_world_pos);
+        \\  float fog_factor = 1.0;
+        \\  if (u_fog0.x > 0.5) {
+        \\    if (u_fog0.x < 1.5) {
+        \\      fog_factor = (u_fog1.y - fog_dist) / max(u_fog1.y - u_fog1.x, 1e-4);
+        \\    } else if (u_fog0.x < 2.5) {
+        \\      fog_factor = exp(-u_fog1.z * fog_dist);
+        \\    } else {
+        \\      float fd = u_fog1.z * fog_dist;
+        \\      fog_factor = exp(-fd * fd);
+        \\    }
+        \\    color = mix(u_fog0.yzw, color, clamp(fog_factor, 0.0, 1.0));
+        \\  }
+        \\
+    ;
     const main_open =
         \\void main() {
         \\  vec4 base_color = u_material[0];
@@ -584,6 +608,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     if (flags & variant_normal_map != 0) src = src ++ nm_sampler;
     if (flags & variant_emissive != 0) src = src ++ em_sampler;
     src = src ++ ibl_samplers;
+    if (flags & variant_fog != 0) src = src ++ fog_uniforms;
     if (flags & variant_shadow != 0) src = src ++ shadow_decls;
     src = src ++ main_open;
     if (flags & variant_instanced != 0) src = src ++ inst_tint;
@@ -593,6 +618,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ lighting;
     src = src ++ (if (flags & variant_shadow != 0) combine_shadow else combine_plain);
     if (flags & variant_emissive != 0) src = src ++ emissive;
+    if (flags & variant_fog != 0) src = src ++ fog_mix;
     if (flags & variant_linear_output == 0) src = src ++ tail_tonemap;
     src = src ++ tail_close;
     return src;
@@ -771,6 +797,15 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  m: array<mat4x4<f32>, 64>,
         \\};
         \\@group(0) @binding(1) var<uniform> bones: Bones;
+        \\
+    ;
+    // Fog parameters (variant_fog). A SEPARATE group(0) binding at @binding(2).
+    const uniforms_fog =
+        \\struct Fog {
+        \\  a: vec4<f32>, // [mode, color.r, color.g, color.b]
+        \\  b: vec4<f32>, // [near, far, density, _pad]
+        \\};
+        \\@group(0) @binding(2) var<uniform> fog: Fog;
         \\
     ;
     // ── group(1) texture + sampler bindings (varied by variant) ─────
@@ -1101,6 +1136,23 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  color = color + emissive_factor * textureSample(emissive_tex, samp, in.uv).rgb;
         \\
     ;
+    // Fog mix (variant_fog). Applied after emissive, before tonemap.
+    const fs_fog_mix =
+        \\  let fog_dist = length(u.camera_pos - in.world_pos);
+        \\  var fog_factor = 1.0;
+        \\  if (fog.a.x > 0.5) {
+        \\    if (fog.a.x < 1.5) {
+        \\      fog_factor = (fog.b.y - fog_dist) / max(fog.b.y - fog.b.x, 1e-4);
+        \\    } else if (fog.a.x < 2.5) {
+        \\      fog_factor = exp(-fog.b.z * fog_dist);
+        \\    } else {
+        \\      let fd = fog.b.z * fog_dist;
+        \\      fog_factor = exp(-fd * fd);
+        \\    }
+        \\    color = mix(fog.a.yzw, color, clamp(fog_factor, 0.0, 1.0));
+        \\  }
+        \\
+    ;
     // ACES tonemap + gamma. Skipped for variant_linear_output (the post
     // pipeline renders linear HDR offscreen and tonemaps in the composite pass).
     const fs_tail_tonemap =
@@ -1126,6 +1178,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (inst) src = src ++ uniforms_vp;
     src = src ++ uniforms_tail;
     if (skinned) src = src ++ uniforms_bones;
+    if (flags & variant_fog != 0) src = src ++ uniforms_fog;
     src = src ++ samp ++ tex_base;
     if (nm) src = src ++ tex_normal;
     if (em) src = src ++ tex_emissive;
@@ -1153,6 +1206,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ fs_lighting;
     src = src ++ (if (shadow) fs_combine_shadow else fs_combine_plain);
     if (em) src = src ++ fs_emissive;
+    if (flags & variant_fog != 0) src = src ++ fs_fog_mix;
     if (!lin) src = src ++ fs_tail_tonemap;
     src = src ++ fs_tail_close;
     return src;
@@ -1510,6 +1564,12 @@ pub const Encoder = struct {
     pub fn setLights(self: *Encoder, count: u32, ptr: u32) void {
         self.header(.set_lights, 8);
         self.putU32(count);
+        self.putU32(ptr);
+    }
+
+    /// Encode a set_fog command: ptr -> 8 f32 FogParams [mode, r,g,b, near, far, density, _pad].
+    pub fn setFog(self: *Encoder, ptr: u32) void {
+        self.header(.set_fog, 4);
         self.putU32(ptr);
     }
 
@@ -2390,6 +2450,15 @@ test "variant_alpha_test WGSL discard appended only when set" {
     try testing.expect(std.mem.indexOf(u8, plain, "discard") == null);
 }
 
+test "fog WGSL: fog binding + mix; non-fog frozen" {
+    const w = wgslPbr(variant_pbr | variant_fog);
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(2) var<uniform> fog: Fog;") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "mix(fog.a.yzw, color") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fog.a.x > 0.5") != null); // mode-0 no-op guard
+    const plain = wgslPbr(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "fog: Fog") == null);
+}
+
 test "golden: post shader sources frozen (FNV-1a-64)" {
     // Frozen from first green run — a change here = deliberate shader contract bump.
     // GLSL
@@ -2592,4 +2661,30 @@ test "drawPbrInstanced encodes tag 27 + 9 u32 payload (36 bytes)" {
     try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, buf[32..36], .little)); // vp_ptr
     try testing.expectEqual(@as(u32, 0x3000), std.mem.readInt(u32, buf[36..40], .little)); // material_ptr
     try testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, buf[40..44], .little)); // camera_ptr
+}
+
+test "fog: variant bit + set_fog tag + setFog encoding" {
+    try testing.expectEqual(@as(u32, 1 << 13), variant_fog);
+    try testing.expectEqual(@as(u8, 28), @intFromEnum(Tag.set_fog));
+    try testing.expectEqual(@as(u32, 8), fog_params_f32);
+
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.setFog(0x4000);
+    const stream = enc.finish();
+    // length header (4) + record header (4) + ptr (4) = 12
+    try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, stream[0..4], .little));
+    try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, stream[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, stream[6..8], .little)); // payload size
+    try testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, stream[8..12], .little)); // ptr
+}
+
+test "fog GLSL: fog variant has u_fog uniforms + mix; non-fog frozen" {
+    const f = pbrFragmentSrc(variant_pbr | variant_fog);
+    try testing.expect(std.mem.indexOf(u8, f, "u_fog0") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "u_fog1") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "mix(u_fog0.yzw, color") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "u_fog0.x > 0.5") != null); // mode-0 no-op guard
+    const plain = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "u_fog0") == null);
 }

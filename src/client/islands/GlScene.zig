@@ -113,6 +113,7 @@ const variant_em = gl.command.variant_emissive;
 const variant_at = gl.command.variant_alpha_test;
 const variant_ds = gl.command.variant_double_sided;
 const variant_inst = gl.command.variant_instanced; // T6: GPU instancing
+const variant_fog = gl.command.variant_fog; // distance fog mix before tonemap
 
 // GPU instancing (v1): per-instance mat4(16) + color(4) = 20 f32 = 80 B each.
 const max_instances = 1024;
@@ -135,7 +136,16 @@ const Props = struct {
     pick_event_ids: []const u32,
     scrub: bool, // scroll-scrub mode (Task 9); wired to timeline in Task 9
     pick_export_names: []const []const u8, // P8 onPickExport: per-slot DOM event name ("" = none)
+    // NOTE: NO fog field. Fog arrives via the canvas `data-glfog` attribute
+    // (refGetAttr), parsed in hydrate — NOT through Props. This MUST mirror
+    // src/core/gl_scene.zig Props exactly (14 fields); see the fuller note
+    // there (the blank GlScene pages were the chunk-data memory window in
+    // build.zig, not a decodeProps miscompile).
 };
+
+comptime {
+    std.debug.assert(@typeInfo(Props).@"struct".fields.len == 14);
+}
 
 // ── Per-instance state ─────────────────────────────────────────────────────────
 //
@@ -224,9 +234,13 @@ const Inst = struct {
     // Single directional light from props: 8 f32 [type, intensity, x,y,z, r,g,b].
     lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 },
 
-    // GPU-resource registry for context-restore replay (cap 48; ~32 worst case
-    // with the 16 PBR/alpha-test/double-sided shader variants: 2 buf + 16 shader + depth + depth_at + shadow + 8 tex + 3 IBL).
-    registry: gl.Registry(48) = .{},
+    // Distance fog (mode,r,g,b,near,far,density,_pad). Default off.
+    fog_params: [8]f32 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    fog_enabled: bool = false,
+
+    // GPU-resource registry for context-restore replay (cap 64; fog adds 17 more
+    // shader variants: 2 buf + 33 shader + depth + depth_at + shadow + 8 tex + 3 IBL).
+    registry: gl.Registry(64) = .{},
     resources_sent: bool = false,
     needs_replay: bool = false,
 
@@ -394,6 +408,24 @@ fn shaderHandleFor(variant: u32) u32 {
         variant_pbr | variant_em | variant_at | variant_ds => 17,
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds => 18,
         variant_pbr | variant_inst => 19, // T6: GPU instancing (non-shadow; handle 19)
+        // Fog variants (base+fog → 20–27, ds+fog → 28–35, instanced+fog → 36):
+        variant_pbr | variant_fog => 20,
+        variant_pbr | variant_nm | variant_fog => 21,
+        variant_pbr | variant_em | variant_fog => 22,
+        variant_pbr | variant_nm | variant_em | variant_fog => 23,
+        variant_pbr | variant_at | variant_fog => 24,
+        variant_pbr | variant_nm | variant_at | variant_fog => 25,
+        variant_pbr | variant_em | variant_at | variant_fog => 26,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_fog => 27,
+        variant_pbr | variant_ds | variant_fog => 28,
+        variant_pbr | variant_nm | variant_ds | variant_fog => 29,
+        variant_pbr | variant_em | variant_ds | variant_fog => 30,
+        variant_pbr | variant_nm | variant_em | variant_ds | variant_fog => 31,
+        variant_pbr | variant_at | variant_ds | variant_fog => 32,
+        variant_pbr | variant_nm | variant_at | variant_ds | variant_fog => 33,
+        variant_pbr | variant_em | variant_at | variant_ds | variant_fog => 34,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_fog => 35,
+        variant_pbr | variant_inst | variant_fog => 36,
         else => unreachable,
     };
 }
@@ -491,6 +523,24 @@ fn createShaderForVariant(inst: *Inst, enc: *gl.Encoder, variant: u32) void {
         variant_pbr | variant_em | variant_at | variant_ds => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds),
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds),
         variant_pbr | variant_inst => emitInstancedShader(inst, enc), // T6
+        // Fog variants (handles 20–35 via emitShader, 36 via emitInstancedShader):
+        variant_pbr | variant_fog => emitShader(inst, enc, variant_pbr | variant_fog),
+        variant_pbr | variant_nm | variant_fog => emitShader(inst, enc, variant_pbr | variant_nm | variant_fog),
+        variant_pbr | variant_em | variant_fog => emitShader(inst, enc, variant_pbr | variant_em | variant_fog),
+        variant_pbr | variant_nm | variant_em | variant_fog => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_fog),
+        variant_pbr | variant_at | variant_fog => emitShader(inst, enc, variant_pbr | variant_at | variant_fog),
+        variant_pbr | variant_nm | variant_at | variant_fog => emitShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_fog),
+        variant_pbr | variant_em | variant_at | variant_fog => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_fog),
+        variant_pbr | variant_nm | variant_em | variant_at | variant_fog => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_fog),
+        variant_pbr | variant_ds | variant_fog => emitShader(inst, enc, variant_pbr | variant_ds | variant_fog),
+        variant_pbr | variant_nm | variant_ds | variant_fog => emitShader(inst, enc, variant_pbr | variant_nm | variant_ds | variant_fog),
+        variant_pbr | variant_em | variant_ds | variant_fog => emitShader(inst, enc, variant_pbr | variant_em | variant_ds | variant_fog),
+        variant_pbr | variant_nm | variant_em | variant_ds | variant_fog => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_ds | variant_fog),
+        variant_pbr | variant_at | variant_ds | variant_fog => emitShader(inst, enc, variant_pbr | variant_at | variant_ds | variant_fog),
+        variant_pbr | variant_nm | variant_at | variant_ds | variant_fog => emitShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_ds | variant_fog),
+        variant_pbr | variant_em | variant_at | variant_ds | variant_fog => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds | variant_fog),
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_fog => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_fog),
+        variant_pbr | variant_inst | variant_fog => emitInstancedShader(inst, enc), // fog-aware instanced (handle 36)
         else => unreachable,
     }
 }
@@ -539,10 +589,18 @@ fn emitDepthAtShader(inst: *Inst, enc: *gl.Encoder) void {
 }
 
 // T6: Instanced shader — must NOT add variant_shadow (vp/light_vp slot collision →
-// @compileError in both GLSL and WGSL paths). Handle 19, variant_pbr|variant_inst only.
+// @compileError in both GLSL and WGSL paths). Handle 19 without fog, 36 with fog.
+// Uses a comptime-branched helper to keep the variant comptime-known for wgslPbr/pbrVertexSrc.
 fn emitInstancedShader(inst: *Inst, enc: *gl.Encoder) void {
-    const handle = shaderHandleFor(variant_pbr | variant_inst);
-    const v = variant_pbr | variant_inst;
+    if (inst.fog_enabled) {
+        emitInstancedShaderVariant(inst, enc, variant_pbr | variant_inst | variant_fog);
+    } else {
+        emitInstancedShaderVariant(inst, enc, variant_pbr | variant_inst);
+    }
+}
+
+fn emitInstancedShaderVariant(inst: *Inst, enc: *gl.Encoder, comptime v: u32) void {
+    const handle = shaderHandleFor(v);
     if (use_webgpu) {
         const w = gl.command.wgslPbr(v);
         enc.createShader(handle, v, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
@@ -556,6 +614,22 @@ fn emitInstancedShader(inst: *Inst, enc: *gl.Encoder) void {
 }
 
 // ── hydrate ──────────────────────────────────────────────────────────────────
+
+// Parse a "mode,r,g,b,near,far,density" fog attribute into inst.fog_params.
+// Tolerant: needs ≥7 comma fields, else leaves fog off.
+fn parseFog(inst: *Inst, s: []const u8) void {
+    var vals: [7]f32 = .{ 0, 0, 0, 0, 0, 0, 0 };
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        if (n >= 7) break;
+        vals[n] = std.fmt.parseFloat(f32, tok) catch return;
+        n += 1;
+    }
+    if (n < 7 or vals[0] == 0) return;
+    inst.fog_params = .{ vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], 0 };
+    inst.fog_enabled = true;
+}
 
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     // First instance of a fresh population owns the page asset-region reset.
@@ -628,6 +702,14 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     // each instance resolves its OWN `glscene-canvas__v{vid}` handle.
     inst.canvas_handle = verve.queryRef(@as([]const u8, "glscene-canvas"));
     inst.scroll_section_handle = verve.queryRef(@as([]const u8, "glscene-scroll-section"));
+
+    // Fog rides on the canvas `data-glfog` attribute (NOT Props — see Props
+    // note). Format: "mode,r,g,b,near,far,density". Absent → fog stays off.
+    if (inst.canvas_handle) |ch| {
+        var fbuf: [512]u8 = undefined;
+        const fa = verve.refGetAttr(ch, "data-glfog", &fbuf);
+        if (fa.len != 0) parseFog(inst, fa);
+    }
 
     // Kick the asset fetches (geometry + prefiltered IBL).
     if (inst.src_len != 0)
@@ -1101,10 +1183,11 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             // Bind sequence mirrors drawSubmesh: setPipeline→setLights→bindIbl→
             // bindShadowMap→bindTexture 0-4→drawPbrInstanced.
             const sub0 = a.submesh(0);
-            enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst), gl.command.state_depth_test | gl.command.state_cull_back);
+            enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
             enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
             enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
             enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+            if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
             enc.bindTexture(0, texHandle(sub0.tex_base));
             enc.bindTexture(1, texHandle(sub0.tex_mr));
             enc.bindTexture(2, texHandle(sub0.tex_normal));
@@ -1193,7 +1276,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     // front faces (cull back) for correct over-blend compositing.
                     // Both passes share the same variant; state word differs so each
                     // needs its own SET_PIPELINE + full lights/IBL/shadow re-emit.
-                    const v = a.submeshVariant(s);
+                    const v = a.submeshVariant(s) | (if (inst.fog_enabled) variant_fog else 0);
                     const world_s = inst.scene.world[s + 1];
                     inst.model_mats[s] = world_s.m;
                     inst.normal9s[s] = gl.math.normalMatrix(world_s);
@@ -1203,6 +1286,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
                     enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+                    if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
                     enc.bindTexture(0, texHandle(sub.tex_base));
                     enc.bindTexture(1, texHandle(sub.tex_mr));
                     enc.bindTexture(2, texHandle(sub.tex_normal));
@@ -1214,6 +1298,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
                     enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+                    if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
                     enc.bindTexture(0, texHandle(sub.tex_base));
                     enc.bindTexture(1, texHandle(sub.tex_mr));
                     enc.bindTexture(2, texHandle(sub.tex_normal));
@@ -1278,12 +1363,13 @@ fn drawSubmesh(
     pv: gl.math.Mat4,
 ) void {
     const sub = a.submesh(s);
-    const v = a.submeshVariant(s);
+    const v = a.submeshVariant(s) | (if (inst.fog_enabled) variant_fog else 0);
     if (v != last_variant.*) {
         enc.setPipeline(shaderHandleFor(v), state);
         enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
         enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
         enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+        if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
         last_variant.* = v;
     }
     const world_s = inst.scene.world[s + 1];
@@ -1316,11 +1402,12 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     inst.registry.recordBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
 
     // Create + record only the distinct shader variants the mesh actually uses.
-    var shader_seen: [20]bool = .{false} ** 20; // [20]: slot 19 = variant_pbr|variant_inst (T6)
+    // [37]: slots 20–35 = base/ds fog variants; slot 36 = instanced+fog (T7).
+    var shader_seen: [37]bool = .{false} ** 37;
     var sv: u32 = 0;
     while (sv < a.submesh_count) : (sv += 1) {
         if (sv >= max_submesh) break;
-        const variant = a.submeshVariant(sv);
+        const variant = a.submeshVariant(sv) | (if (inst.fog_enabled) variant_fog else 0);
         const handle = shaderHandleFor(variant);
         if (shader_seen[handle]) continue;
         shader_seen[handle] = true;
@@ -1328,9 +1415,11 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     }
 
     // T6: emit the instanced shader if this mesh carries an instances section.
-    if (a.instanceCount() > 0 and !shader_seen[19]) {
+    // Use fog-aware handle (19 without fog, 36 with fog).
+    const inst_handle: usize = shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0));
+    if (a.instanceCount() > 0 and !shader_seen[inst_handle]) {
         emitInstancedShader(inst, enc);
-        shader_seen[19] = true;
+        shader_seen[inst_handle] = true;
     }
 
     // Shadow-pass resources (P9 slice 3): the depth-only shader + depth target.
@@ -1568,4 +1657,33 @@ pub export fn glscene_resolve_target(placeholder_id: u32, name_hash: u32) u32 {
     const idx = a.findName(name_hash) orelse return 0;
     const d = gl.anim_target.decode(placeholder_id) orelse return 0;
     return gl.anim_target.encode(d.kind, @intCast(idx), d.field);
+}
+
+test "fog handle table covers every emitted fog combo" {
+    const combos = [_]u32{
+        variant_pbr | variant_fog,
+        variant_pbr | variant_nm | variant_fog,
+        variant_pbr | variant_em | variant_fog,
+        variant_pbr | variant_nm | variant_em | variant_fog,
+        variant_pbr | variant_at | variant_fog,
+        variant_pbr | variant_nm | variant_at | variant_fog,
+        variant_pbr | variant_em | variant_at | variant_fog,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_fog,
+        variant_pbr | variant_ds | variant_fog,
+        variant_pbr | variant_nm | variant_ds | variant_fog,
+        variant_pbr | variant_em | variant_ds | variant_fog,
+        variant_pbr | variant_nm | variant_em | variant_ds | variant_fog,
+        variant_pbr | variant_at | variant_ds | variant_fog,
+        variant_pbr | variant_nm | variant_at | variant_ds | variant_fog,
+        variant_pbr | variant_em | variant_at | variant_ds | variant_fog,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_fog,
+        variant_pbr | variant_inst | variant_fog,
+    };
+    var seen = [_]bool{false} ** 64;
+    for (combos) |v| {
+        const h = shaderHandleFor(v);
+        try std.testing.expect(h >= 20 and h < seen.len);
+        try std.testing.expect(!seen[h]); // distinct
+        seen[h] = true;
+    }
 }
