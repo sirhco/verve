@@ -4634,6 +4634,10 @@
           if (variant & 0x1000) { // variant_instanced: u_vp replaces u_mvp/u_model
             sh.vp = gl.getUniformLocation(prog, "u_vp");
           }
+          if (variant & 0x2000) { // variant_fog: distance fog uniforms
+            sh.fog0 = gl.getUniformLocation(prog, "u_fog0");
+            sh.fog1 = gl.getUniformLocation(prog, "u_fog1");
+          }
           st.shaders[handle] = sh;
           break;
         }
@@ -5166,6 +5170,13 @@
           }
           gl.bindVertexArray(datVao);
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
+        case 28: { // SET_FOG — set fog uniforms on the active program (per-program; follows SET_PIPELINE)
+          const ptr = dv.getUint32(off, true);
+          const f = new Float32Array(memory.buffer, ptr, 8);
+          if (st.active && st.active.fog0) gl.uniform4f(st.active.fog0, f[0], f[1], f[2], f[3]);
+          if (st.active && st.active.fog1) gl.uniform4f(st.active.fog1, f[4], f[5], f[6], 0);
           break;
         }
         default:
