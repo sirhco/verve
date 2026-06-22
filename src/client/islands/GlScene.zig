@@ -136,7 +136,15 @@ const Props = struct {
     pick_event_ids: []const u32,
     scrub: bool, // scroll-scrub mode (Task 9); wired to timeline in Task 9
     pick_export_names: []const []const u8, // P8 onPickExport: per-slot DOM event name ("" = none)
+    // NOTE: NO fog field. Any field added to this struct makes the wasm
+    // decodeProps miscompile → blank canvas. Fog arrives via the canvas
+    // `data-glfog` attribute (refGetAttr), parsed in hydrate. MUST mirror
+    // src/core/gl_scene.zig Props exactly (14 fields).
 };
+
+comptime {
+    std.debug.assert(@typeInfo(Props).@"struct".fields.len == 14);
+}
 
 // ── Per-instance state ─────────────────────────────────────────────────────────
 //
@@ -606,6 +614,22 @@ fn emitInstancedShaderVariant(inst: *Inst, enc: *gl.Encoder, comptime v: u32) vo
 
 // ── hydrate ──────────────────────────────────────────────────────────────────
 
+// Parse a "mode,r,g,b,near,far,density" fog attribute into inst.fog_params.
+// Tolerant: needs ≥7 comma fields, else leaves fog off.
+fn parseFog(inst: *Inst, s: []const u8) void {
+    var vals: [7]f32 = .{ 0, 0, 0, 0, 0, 0, 0 };
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        if (n >= 7) break;
+        vals[n] = std.fmt.parseFloat(f32, tok) catch return;
+        n += 1;
+    }
+    if (n < 7 or vals[0] == 0) return;
+    inst.fog_params = .{ vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], 0 };
+    inst.fog_enabled = true;
+}
+
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     // First instance of a fresh population owns the page asset-region reset.
     // Subsequent instances SHARE the region (resetting would free their assets).
@@ -677,6 +701,14 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     // each instance resolves its OWN `glscene-canvas__v{vid}` handle.
     inst.canvas_handle = verve.queryRef(@as([]const u8, "glscene-canvas"));
     inst.scroll_section_handle = verve.queryRef(@as([]const u8, "glscene-scroll-section"));
+
+    // Fog rides on the canvas `data-glfog` attribute (NOT Props — see Props
+    // note). Format: "mode,r,g,b,near,far,density". Absent → fog stays off.
+    if (inst.canvas_handle) |ch| {
+        var fbuf: [512]u8 = undefined;
+        const fa = verve.refGetAttr(ch, "data-glfog", &fbuf);
+        if (fa.len != 0) parseFog(inst, fa);
+    }
 
     // Kick the asset fetches (geometry + prefiltered IBL).
     if (inst.src_len != 0)

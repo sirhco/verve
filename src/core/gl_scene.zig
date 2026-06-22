@@ -36,7 +36,18 @@ pub const Props = struct {
     pick_event_ids: []const u32, // parallel closure ids (0 = none)
     scrub: bool, // scroll-scrub mode (Task 9); when true auto_rotate is forced 0
     pick_export_names: []const []const u8, // parallel DOM-event names ("" = none) — P8 onPickExport
+    // NOTE: fog is deliberately NOT a Props field. Adding ANY field to this
+    // struct (flat, nested, or slice) makes the chunk's wasm `decodeProps`
+    // miscompile (Zig 0.16 wasm codegen) and silently fail hydration → every
+    // GlScene page renders blank. Fog travels instead as a `data-glfog`
+    // attribute on the canvas, read in the chunk via `refGetAttr` (see build()
+    // and GlScene.zig hydrate). Keep this struct at exactly these 14 fields.
 };
+
+comptime {
+    // Fog must never enter Props (wasm decodeProps miscompile at 15+ fields).
+    std.debug.assert(@typeInfo(Props).@"struct".fields.len == 14);
+}
 
 /// Max number of `.onPick(...)` registrations accumulated per scene.
 pub const max_picks = 4;
@@ -61,6 +72,15 @@ pub const LightOpts = struct {
     intensity: f32 = 3,
 };
 
+pub const FogMode = enum(u32) { none = 0, linear = 1, exp = 2, exp2 = 3 };
+pub const FogOpts = struct {
+    mode: FogMode = .none,
+    color: [3]f32 = .{ 0.5, 0.6, 0.7 },
+    near: f32 = 1,
+    far: f32 = 50,
+    density: f32 = 0.05,
+};
+
 /// Fluent builder. Returned by `ctx.glScene`; finalize with `.build()`.
 /// All setters return `*GlSceneBuilder` so calls chain; `build()` returns
 /// the island-wrapped `*verve.Node` (or a poison node carrying the error,
@@ -72,6 +92,7 @@ pub const GlSceneBuilder = struct {
     lgt: LightOpts = .{},
     auto_rotate_rad: f32 = 0,
     scrub_on: bool = false,
+    fog_opts: FogOpts = .{},
     pick_names_buf: [max_picks][]const u8 = undefined,
     pick_ids_buf: [max_picks]u32 = undefined,
     pick_export_buf: [max_picks][]const u8 = undefined,
@@ -97,6 +118,12 @@ pub const GlSceneBuilder = struct {
     /// so auto_rotate is forced to 0 at build() to avoid conflicting drives.
     pub fn scrub(self: *GlSceneBuilder, on: bool) *GlSceneBuilder {
         self.scrub_on = on;
+        return self;
+    }
+
+    /// Distance fog. `mode = .none` (default) disables fog entirely.
+    pub fn fog(self: *GlSceneBuilder, f: FogOpts) *GlSceneBuilder {
+        self.fog_opts = f;
         return self;
     }
 
@@ -167,6 +194,23 @@ pub const GlSceneBuilder = struct {
             return poison;
         };
 
+        // Fog travels OUTSIDE Props (see the Props note) as a comma-joined
+        // `data-glfog` attribute the chunk reads via refGetAttr: mode,r,g,b,
+        // near,far,density. Only emitted when fog is enabled.
+        const fog_attr: ?[]const u8 = if (self.fog_opts.mode == .none) null else std.fmt.allocPrint(
+            self.ctx.allocator,
+            "{d},{d},{d},{d},{d},{d},{d}",
+            .{
+                @intFromEnum(self.fog_opts.mode),
+                self.fog_opts.color[0],
+                self.fog_opts.color[1],
+                self.fog_opts.color[2],
+                self.fog_opts.near,
+                self.fog_opts.far,
+                self.fog_opts.density,
+            },
+        ) catch null;
+
         // The canvas MUST be CSS-sized (decoupled from its width/height
         // attributes): the gl loop sets the backing-store size from
         // clientWidth×dpr each frame, and an unstyled canvas would grow its
@@ -180,6 +224,7 @@ pub const GlSceneBuilder = struct {
             .onPointerUp("glscene_pointerup")
             .onWheel("glscene_wheel")
             .onClick("glscene_click");
+        if (fog_attr) |fa| _ = canvas.attr("data-glfog", fa);
 
         const inner_wrapper = self.ctx.div()
             .attr("style", "position:relative;display:block;width:100%;height:100%");
@@ -509,4 +554,26 @@ test "glScene scrub(false) emits NO scroll section" {
     try testing.expect(std.mem.indexOf(u8, html, "glscene-scroll-section") == null);
     try testing.expect(std.mem.indexOf(u8, html, "height:300vh") == null);
     try testing.expect(std.mem.indexOf(u8, html, "position:sticky") == null);
+}
+
+test "glScene .fog emits data-glfog attribute" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .fog(.{ .mode = .linear, .color = .{ 0.5, 0.6, 0.7 }, .near = 8, .far = 40 })
+        .build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glfog=\"1,0.5,0.6,0.7,8,40,") != null);
+}
+
+test "glScene fog defaults to none (no data-glfog)" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glfog") == null);
 }
