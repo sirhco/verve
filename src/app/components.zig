@@ -1393,6 +1393,34 @@ pub fn glSceneInstanced(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-fog: 7×7 = 49-cube receding grid with distance fog enabled.
+/// Linear fog from near=6 to far=42 with a dark blue-grey fog colour (0.05,0.06,0.09)
+/// that matches the scene clear colour — distant cubes dissolve into the background.
+/// Fog applies after PBR lighting, before tonemap, on both WebGL2 and WebGPU.
+pub fn glSceneFog(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/cubegrid.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%230d0f17'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EFog%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 22.0, .pitch = 0.35, .yaw = 0.4 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .fog(.{ .mode = .linear, .color = .{ 0.05, 0.06, 0.09 }, .near = 6.0, .far = 42.0 })
+        .autoRotate(0.15)
+        .build();
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — distance fog"),
+        ctx.p().text("Linear distance fog: near cubes are fully lit, far cubes dissolve " ++
+            "into the fog colour. Fog is applied after PBR lighting, before tonemap — " ++
+            "the same result on WebGL2 and WebGPU backends."),
+        scene,
+        ctx.p().text("Modes: linear (near→far ramp), exp, exp2 (density falloff). " ++
+            "Set via .fog(.{ .mode, .color, .near, .far, .density }). " ++
+            "Drag to orbit · wheel to zoom."),
+    });
+}
+
 /// /gl-multi: TWO independent GlScene islands on one page (P7 multi-instance).
 /// Each `<verve-island data-name="GlScene">` gets its own per-instance state
 /// slot keyed by vid; the bridge selects the right instance before each frame /

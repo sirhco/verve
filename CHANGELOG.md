@@ -6,6 +6,20 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **gl distance fog** (`src/core/gl_scene.zig`, `src/app/*`, `docs/24-gl.md`):
+  distance fog via `.fog(.{ .mode, .color, .near, .far, .density })` on
+  `GlSceneBuilder`. Four modes: `none`, `linear`, `exp`, `exp2`. Wire tag 28;
+  `variant_fog = 1 << 13`; 8-scalar `FogParams` layout `[mode, r,g,b, near,far,
+  density, _pad]`. Fog is applied after PBR lighting, before tonemap; radial
+  distance (spherical, not planar). Both WebGL2 and WebGPU backends. `/gl-fog`
+  demo: 49-cube grid with linear fog `near=6 far=42`, fog colour matching the
+  clear colour so distant cubes dissolve into the background. Fog params travel via
+  `data-glfog` canvas attribute rather than `Props` — Props is frozen at 14 fields
+  to avoid a Zig 0.16 wasm `decodeProps` codegen miscompile that blanks GlScene
+  pages when the struct grows.
+
 ## [0.6.4] - 2026-06-21
 
 ### Added
