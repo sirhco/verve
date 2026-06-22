@@ -271,6 +271,63 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    // Morph-target uniforms (variant_morph): sampler2D texture (RGBA16F,
+    // width=vertex_count, height=target_count*2), per-active-target indices +
+    // weights, and the count of active targets (≤ morph_max_active = 8).
+    const morph_uniforms =
+        \\uniform highp sampler2D u_morph_tex;
+        \\uniform int u_morph_idx[8];
+        \\uniform float u_morph_wt[8];
+        \\uniform int u_morph_count;
+        \\
+    ;
+    // Morph body_open: opens void main(), accumulates morph deltas into m_pos/
+    // m_nrm (frozen texel convention: row 2*t=POS, 2*t+1=NORM, x=gl_VertexID),
+    // then transforms the morphed locals.  Replaces body_open on the morph path.
+    const body_open_morph =
+        \\void main() {
+        \\  vec3 m_pos = a_pos;
+        \\  vec3 m_nrm = a_normal;
+        \\  for (int i = 0; i < u_morph_count; i++) {
+        \\    int t = u_morph_idx[i];
+        \\    float w = u_morph_wt[i];
+        \\    m_pos += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t), 0).xyz;
+        \\    m_nrm += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t + 1), 0).xyz;
+        \\  }
+        \\  v_world_pos = (u_model * vec4(m_pos, 1.0)).xyz;
+        \\  v_normal = u_normal_mat * m_nrm;
+        \\  v_uv = a_uv;
+        \\
+    ;
+    // Morph+skinned body_open: accumulate morphed locals, then skin them.
+    const body_open_skinned_morph =
+        \\void main() {
+        \\  vec3 m_pos = a_pos;
+        \\  vec3 m_nrm = a_normal;
+        \\  for (int i = 0; i < u_morph_count; i++) {
+        \\    int t = u_morph_idx[i];
+        \\    float w = u_morph_wt[i];
+        \\    m_pos += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t), 0).xyz;
+        \\    m_nrm += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t + 1), 0).xyz;
+        \\  }
+        \\  mat4 skin = a_weights.x * u_bones[a_joints.x] + a_weights.y * u_bones[a_joints.y] + a_weights.z * u_bones[a_joints.z] + a_weights.w * u_bones[a_joints.w];
+        \\  v_world_pos = (u_model * (skin * vec4(m_pos, 1.0))).xyz;
+        \\  v_normal = u_normal_mat * (mat3(skin) * m_nrm);
+        \\  v_uv = a_uv;
+        \\
+    ;
+    // Morph body_close: feeds m_pos into gl_Position (non-skinned).
+    const body_close_morph =
+        \\  gl_Position = u_mvp * vec4(m_pos, 1.0);
+        \\}
+        \\
+    ;
+    // Morph+skinned body_close: feeds morphed+skinned position into gl_Position.
+    const body_close_skinned_morph =
+        \\  gl_Position = u_mvp * (skin * vec4(m_pos, 1.0));
+        \\}
+        \\
+    ;
     // Shadow-receiver additions (variant_shadow): light-space clip position
     // forwarded to the fragment shader for the depth comparison.
     const shadow_outs =
@@ -280,6 +337,11 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
     ;
     const shadow_body =
         \\  v_light_pos = u_light_vp * u_model * vec4(a_pos, 1.0);
+        \\
+    ;
+    // Shadow body on the morph path: use morphed m_pos for the light-space clip.
+    const shadow_body_morph =
+        \\  v_light_pos = u_light_vp * u_model * vec4(m_pos, 1.0);
         \\
     ;
     // Instanced (variant_instanced): per-instance mat4 model columns as vertex
@@ -308,6 +370,7 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\
     ;
     const skinned = flags & variant_skinned != 0;
+    const morphed = flags & variant_morph != 0;
     comptime var src: []const u8 = head;
     if (flags & variant_instanced != 0) {
         src = src ++ inst_decl;
@@ -317,10 +380,27 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
     if (flags & variant_normal_map != 0) src = src ++ nm_outs;
     if (flags & variant_shadow != 0) src = src ++ shadow_outs;
     if (skinned) src = src ++ skin_decl;
-    src = src ++ (if (skinned) body_open_skinned else body_open);
+    if (morphed) src = src ++ morph_uniforms;
+    if (morphed and skinned) {
+        src = src ++ body_open_skinned_morph;
+    } else if (morphed) {
+        src = src ++ body_open_morph;
+    } else if (skinned) {
+        src = src ++ body_open_skinned;
+    } else {
+        src = src ++ body_open;
+    }
     if (flags & variant_normal_map != 0) src = src ++ (if (skinned) nm_body_skinned else nm_body);
-    if (flags & variant_shadow != 0) src = src ++ shadow_body;
-    src = src ++ (if (skinned) body_close_skinned else body_close);
+    if (flags & variant_shadow != 0) src = src ++ (if (morphed) shadow_body_morph else shadow_body);
+    if (morphed and skinned) {
+        src = src ++ body_close_skinned_morph;
+    } else if (morphed) {
+        src = src ++ body_close_morph;
+    } else if (skinned) {
+        src = src ++ body_close_skinned;
+    } else {
+        src = src ++ body_close;
+    }
     return src;
 }
 
@@ -2729,4 +2809,16 @@ test "fog GLSL: fog variant has u_fog uniforms + mix; non-fog frozen" {
     try testing.expect(std.mem.indexOf(u8, f, "u_fog0.x > 0.5") != null); // mode-0 no-op guard
     const plain = pbrFragmentSrc(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, plain, "u_fog0") == null);
+}
+
+// ── Task 4 (morph): variant_morph GLSL vertex path ───────────────────────────
+
+test "morph GLSL: variant emits morph uniforms + texelFetch loop; non-morph frozen" {
+    const v = pbrVertexSrc(variant_pbr | variant_morph);
+    try testing.expect(std.mem.indexOf(u8, v, "u_morph_tex") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "u_morph_count") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "texelFetch") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "u_morph_idx") != null);
+    const plain = pbrVertexSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "u_morph_tex") == null);
 }
