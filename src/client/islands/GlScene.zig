@@ -114,9 +114,17 @@ const variant_at = gl.command.variant_alpha_test;
 const variant_ds = gl.command.variant_double_sided;
 const variant_inst = gl.command.variant_instanced; // T6: GPU instancing
 const variant_fog = gl.command.variant_fog; // distance fog mix before tonemap
+const variant_morph = gl.command.variant_morph; // M7: morph-target blending
 
 // GPU instancing (v1): per-instance mat4(16) + color(4) = 20 f32 = 80 B each.
 const max_instances = 1024;
+
+// M7: morph targets. max_morph_targets sizes the per-instance weight array in
+// Inst (static pool, not stack). 64 covers all known real-world rigs.
+const max_morph_targets: u32 = 64;
+// Morph data texture handle (M7). Separate from material textures (1..8) and
+// IBL (16..18). No collision with shader handles (distinct namespace).
+const morph_tex_handle: u32 = 19;
 
 // ── Props copies (decoded from SSR data-props; copied into the Inst before the
 //    chunk arena that held the decode result is reset) ─────────────────────────
@@ -238,9 +246,10 @@ const Inst = struct {
     fog_params: [8]f32 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     fog_enabled: bool = false,
 
-    // GPU-resource registry for context-restore replay (cap 64; fog adds 17 more
-    // shader variants: 2 buf + 33 shader + depth + depth_at + shadow + 8 tex + 3 IBL).
-    registry: gl.Registry(64) = .{},
+    // GPU-resource registry for context-restore replay (cap 80; morph adds 16 more
+    // shader variants + 1 morph tex: 2 buf + 36 shader + depth + depth_at + shadow
+    // + 8 tex + 1 morph_tex + 3 IBL = 54 max; 80 gives comfortable headroom).
+    registry: gl.Registry(80) = .{},
     resources_sent: bool = false,
     needs_replay: bool = false,
 
@@ -273,6 +282,16 @@ const Inst = struct {
     vp_mat: [16]f32 = undefined,
     // Accumulated frame time (ms) for instanced animation (wraps at ~1h; fine for animation).
     inst_time_ms: f32 = 0,
+
+    // M7: morph-target state. Lives in Inst (static pool) — NOT on the frame
+    // stack. morph_weights is indexed by target; active set is the top-8 by
+    // |weight|. Zeroed by default (Inst{} = no morph animation).
+    morph_enabled: bool = false,
+    morph_weights: [max_morph_targets]f32 = .{0} ** max_morph_targets,
+    morph_active_idx: [8]u32 = .{0} ** 8,
+    morph_active_wt: [8]f32 = .{0} ** 8,
+    morph_count: u32 = 0,
+    morph_tex_recorded: bool = false, // true once createMorphTex emitted (for restore)
 };
 
 const MAX_INSTANCES = 4;
@@ -426,6 +445,24 @@ fn shaderHandleFor(variant: u32) u32 {
         variant_pbr | variant_em | variant_at | variant_ds | variant_fog => 34,
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_fog => 35,
         variant_pbr | variant_inst | variant_fog => 36,
+        // Morph variants (base+morph → 37–44, ds+morph → 45–52):
+        // No instanced+morph (both backends @compileError) and no skinned+morph.
+        variant_pbr | variant_morph => 37,
+        variant_pbr | variant_nm | variant_morph => 38,
+        variant_pbr | variant_em | variant_morph => 39,
+        variant_pbr | variant_nm | variant_em | variant_morph => 40,
+        variant_pbr | variant_at | variant_morph => 41,
+        variant_pbr | variant_nm | variant_at | variant_morph => 42,
+        variant_pbr | variant_em | variant_at | variant_morph => 43,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_morph => 44,
+        variant_pbr | variant_ds | variant_morph => 45,
+        variant_pbr | variant_nm | variant_ds | variant_morph => 46,
+        variant_pbr | variant_em | variant_ds | variant_morph => 47,
+        variant_pbr | variant_nm | variant_em | variant_ds | variant_morph => 48,
+        variant_pbr | variant_at | variant_ds | variant_morph => 49,
+        variant_pbr | variant_nm | variant_at | variant_ds | variant_morph => 50,
+        variant_pbr | variant_em | variant_at | variant_ds | variant_morph => 51,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_morph => 52,
         else => unreachable,
     };
 }
@@ -541,6 +578,23 @@ fn createShaderForVariant(inst: *Inst, enc: *gl.Encoder, variant: u32) void {
         variant_pbr | variant_em | variant_at | variant_ds | variant_fog => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds | variant_fog),
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_fog => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_fog),
         variant_pbr | variant_inst | variant_fog => emitInstancedShader(inst, enc), // fog-aware instanced (handle 36)
+        // Morph variants (handles 37–52 via emitShader; no instanced+morph):
+        variant_pbr | variant_morph => emitShader(inst, enc, variant_pbr | variant_morph),
+        variant_pbr | variant_nm | variant_morph => emitShader(inst, enc, variant_pbr | variant_nm | variant_morph),
+        variant_pbr | variant_em | variant_morph => emitShader(inst, enc, variant_pbr | variant_em | variant_morph),
+        variant_pbr | variant_nm | variant_em | variant_morph => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_morph),
+        variant_pbr | variant_at | variant_morph => emitShader(inst, enc, variant_pbr | variant_at | variant_morph),
+        variant_pbr | variant_nm | variant_at | variant_morph => emitShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_morph),
+        variant_pbr | variant_em | variant_at | variant_morph => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_morph),
+        variant_pbr | variant_nm | variant_em | variant_at | variant_morph => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_morph),
+        variant_pbr | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_ds | variant_morph),
+        variant_pbr | variant_nm | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_nm | variant_ds | variant_morph),
+        variant_pbr | variant_em | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_em | variant_ds | variant_morph),
+        variant_pbr | variant_nm | variant_em | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_ds | variant_morph),
+        variant_pbr | variant_at | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_at | variant_ds | variant_morph),
+        variant_pbr | variant_nm | variant_at | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_ds | variant_morph),
+        variant_pbr | variant_em | variant_at | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds | variant_morph),
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_morph),
         else => unreachable,
     }
 }
@@ -1065,6 +1119,14 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         } else if (inst.needs_replay) {
             inst.needs_replay = false;
             inst.registry.replay(&enc);
+            // M7: Registry has no recordMorphTex entry; re-emit createMorphTex
+            // manually after replay when morph is present.
+            if (inst.morph_tex_recorded) {
+                const morph_vertex_count = a.morphVertexCount();
+                const morph_target_count = a.morphTargetCount();
+                const deltas = a.morphDeltas();
+                enc.createMorphTex(morph_tex_handle, morph_vertex_count, morph_target_count * 2, @intCast(@intFromPtr(deltas.ptr)), @intCast(deltas.len));
+            }
         }
 
         // Upload any external (compressed) textures that finished decoding since the
@@ -1092,6 +1154,80 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             } else if (inst.hover_name_hash != no_hover_hash) {
                 inst.hover_name_hash = no_hover_hash;
                 if (canvasRef(inst)) |h| verve.setRefAttr(h, "data-gl-hover", "");
+            }
+        }
+
+        // M7: advance per-frame time clock (shared with instanced animation).
+        // Done here (unconditionally) so morph weight playback works on non-instanced
+        // meshes. The instanced path does NOT re-advance — it reads inst_time_ms below.
+        inst.inst_time_ms += dt_ms;
+
+        // M7: sample morph weight tracks and compute the top-8 active set.
+        // Uses the same scalar LINEAR/STEP sampling pattern as skinning bone tracks.
+        // Morph weights default to 0; only updated when a weight clip is present.
+        if (inst.morph_enabled) {
+            const t_s: f32 = inst.inst_time_ms / 1000.0;
+            const n_targets = @min(a.morphTargetCount(), max_morph_targets);
+            var ti: u32 = 0;
+            while (ti < n_targets) : (ti += 1) {
+                if (a.morphWeightTrack(ti)) |trk| {
+                    const kc = trk.key_count;
+                    if (kc == 0) continue;
+                    // Find bracketing keyframes (clamp-to-end).
+                    const t0 = a.morphWeightTime(trk, 0);
+                    const t1 = a.morphWeightTime(trk, kc - 1);
+                    if (t_s <= t0 or kc == 1) {
+                        inst.morph_weights[ti] = a.morphWeightValue(trk, 0);
+                    } else if (t_s >= t1) {
+                        inst.morph_weights[ti] = a.morphWeightValue(trk, kc - 1);
+                    } else {
+                        // Binary search for the interval.
+                        var lo: u32 = 0;
+                        var hi: u32 = kc - 1;
+                        while (hi - lo > 1) {
+                            const mid = lo + (hi - lo) / 2;
+                            if (a.morphWeightTime(trk, mid) <= t_s) lo = mid else hi = mid;
+                        }
+                        const ta = a.morphWeightTime(trk, lo);
+                        const tb = a.morphWeightTime(trk, hi);
+                        const span = tb - ta;
+                        const frac: f32 = if (span > 0) (t_s - ta) / span else 0;
+                        const va = a.morphWeightValue(trk, lo);
+                        const vb = a.morphWeightValue(trk, hi);
+                        // STEP interp = 1: hold lo value; LINEAR = 0: lerp.
+                        inst.morph_weights[ti] = if (trk.interp == 1) va else va + (vb - va) * frac;
+                    }
+                }
+            }
+            // Select the top-8 by |weight| into the active set.
+            // Initialise with the first `n` candidates; then displace the
+            // weakest if a later target is stronger.
+            inst.morph_count = 0;
+            var wi: u32 = 0;
+            while (wi < n_targets) : (wi += 1) {
+                const w = inst.morph_weights[wi];
+                const aw = if (w < 0) -w else w;
+                if (inst.morph_count < 8) {
+                    inst.morph_active_idx[inst.morph_count] = wi;
+                    inst.morph_active_wt[inst.morph_count] = w;
+                    inst.morph_count += 1;
+                } else {
+                    // Find the slot with the smallest |weight| in the active set.
+                    var min_slot: u32 = 0;
+                    var min_aw: f32 = if (inst.morph_active_wt[0] < 0) -inst.morph_active_wt[0] else inst.morph_active_wt[0];
+                    var ms: u32 = 1;
+                    while (ms < 8) : (ms += 1) {
+                        const caw = if (inst.morph_active_wt[ms] < 0) -inst.morph_active_wt[ms] else inst.morph_active_wt[ms];
+                        if (caw < min_aw) {
+                            min_aw = caw;
+                            min_slot = ms;
+                        }
+                    }
+                    if (aw > min_aw) {
+                        inst.morph_active_idx[min_slot] = wi;
+                        inst.morph_active_wt[min_slot] = w;
+                    }
+                }
             }
         }
 
@@ -1161,7 +1297,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // Non-instanced assets (instanceCount == 0) fall through byte-identical.
         const inst_n = a.instanceCount();
         if (inst_n > 0 and a.submesh_count > 0) {
-            inst.inst_time_ms += dt_ms;
+            // inst_time_ms already advanced above (unconditional, for morph + instanced).
             const t_s: f32 = inst.inst_time_ms / 1000.0;
             const n = @min(inst_n, max_instances);
             // Seed from baked blob (instanceCount × 80 B = 20 f32 each).
@@ -1276,7 +1412,9 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     // front faces (cull back) for correct over-blend compositing.
                     // Both passes share the same variant; state word differs so each
                     // needs its own SET_PIPELINE + full lights/IBL/shadow re-emit.
-                    const v = a.submeshVariant(s) | (if (inst.fog_enabled) variant_fog else 0);
+                    const v = a.submeshVariant(s) |
+                        (if (inst.fog_enabled) variant_fog else 0) |
+                        (if (inst.morph_enabled) variant_morph else 0);
                     const world_s = inst.scene.world[s + 1];
                     inst.model_mats[s] = world_s.m;
                     inst.normal9s[s] = gl.math.normalMatrix(world_s);
@@ -1287,6 +1425,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
                     enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
+                    if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
                     enc.bindTexture(0, texHandle(sub.tex_base));
                     enc.bindTexture(1, texHandle(sub.tex_mr));
                     enc.bindTexture(2, texHandle(sub.tex_normal));
@@ -1299,6 +1438,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
                     enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
+                    if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
                     enc.bindTexture(0, texHandle(sub.tex_base));
                     enc.bindTexture(1, texHandle(sub.tex_mr));
                     enc.bindTexture(2, texHandle(sub.tex_normal));
@@ -1363,13 +1503,16 @@ fn drawSubmesh(
     pv: gl.math.Mat4,
 ) void {
     const sub = a.submesh(s);
-    const v = a.submeshVariant(s) | (if (inst.fog_enabled) variant_fog else 0);
+    const v = a.submeshVariant(s) |
+        (if (inst.fog_enabled) variant_fog else 0) |
+        (if (inst.morph_enabled) variant_morph else 0);
     if (v != last_variant.*) {
         enc.setPipeline(shaderHandleFor(v), state);
         enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
         enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
         enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
         if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
+        if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
         last_variant.* = v;
     }
     const world_s = inst.scene.world[s + 1];
@@ -1401,13 +1544,20 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     enc.createBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
     inst.registry.recordBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
 
+    // M7: detect morph presence from the vmesh and set inst.morph_enabled.
+    const morph_target_count = a.morphTargetCount();
+    inst.morph_enabled = morph_target_count > 0;
+
     // Create + record only the distinct shader variants the mesh actually uses.
-    // [37]: slots 20–35 = base/ds fog variants; slot 36 = instanced+fog (T7).
-    var shader_seen: [37]bool = .{false} ** 37;
+    // [53]: slots 20–35 = base/ds fog variants; slot 36 = instanced+fog;
+    //        slots 37–52 = base/ds morph variants (M7).
+    var shader_seen: [53]bool = .{false} ** 53;
     var sv: u32 = 0;
     while (sv < a.submesh_count) : (sv += 1) {
         if (sv >= max_submesh) break;
-        const variant = a.submeshVariant(sv) | (if (inst.fog_enabled) variant_fog else 0);
+        const variant = a.submeshVariant(sv) |
+            (if (inst.fog_enabled) variant_fog else 0) |
+            (if (inst.morph_enabled) variant_morph else 0);
         const handle = shaderHandleFor(variant);
         if (shader_seen[handle]) continue;
         shader_seen[handle] = true;
@@ -1415,11 +1565,24 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     }
 
     // T6: emit the instanced shader if this mesh carries an instances section.
-    // Use fog-aware handle (19 without fog, 36 with fog).
+    // Use fog-aware handle (19 without fog, 36 with fog). Morph+instanced is
+    // not supported (both backends @compileError) so no variant_morph here.
     const inst_handle: usize = shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0));
     if (a.instanceCount() > 0 and !shader_seen[inst_handle]) {
         emitInstancedShader(inst, enc);
         shader_seen[inst_handle] = true;
+    }
+
+    // M7: create the morph data texture (ONCE — width=vertexCount, height=targetCount*2).
+    // The morph deltas blob (f16 POSITION+NORMAL interleaved) lives in the asset
+    // region for the page lifetime, so the recorded pointer stays valid.
+    // Registry has no recordMorphTex; instead inst.morph_tex_recorded flags the
+    // restore path in glscene_frame to re-emit createMorphTex after registry.replay.
+    if (inst.morph_enabled) {
+        const morph_vertex_count = a.morphVertexCount();
+        const deltas = a.morphDeltas();
+        enc.createMorphTex(morph_tex_handle, morph_vertex_count, morph_target_count * 2, @intCast(@intFromPtr(deltas.ptr)), @intCast(deltas.len));
+        inst.morph_tex_recorded = true;
     }
 
     // Shadow-pass resources (P9 slice 3): the depth-only shader + depth target.
@@ -1685,5 +1848,41 @@ test "fog handle table covers every emitted fog combo" {
         try std.testing.expect(h >= 20 and h < seen.len);
         try std.testing.expect(!seen[h]); // distinct
         seen[h] = true;
+    }
+}
+
+test "morph handle table covers every emitted morph combo" {
+    // M7: 16 morph variants (8 base + 8 ds); no instanced+morph (compileError).
+    // shaderHandleFor and createShaderForVariant MUST cover the same set.
+    const combos = [_]u32{
+        variant_pbr | variant_morph,
+        variant_pbr | variant_nm | variant_morph,
+        variant_pbr | variant_em | variant_morph,
+        variant_pbr | variant_nm | variant_em | variant_morph,
+        variant_pbr | variant_at | variant_morph,
+        variant_pbr | variant_nm | variant_at | variant_morph,
+        variant_pbr | variant_em | variant_at | variant_morph,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_morph,
+        variant_pbr | variant_ds | variant_morph,
+        variant_pbr | variant_nm | variant_ds | variant_morph,
+        variant_pbr | variant_em | variant_ds | variant_morph,
+        variant_pbr | variant_nm | variant_em | variant_ds | variant_morph,
+        variant_pbr | variant_at | variant_ds | variant_morph,
+        variant_pbr | variant_nm | variant_at | variant_ds | variant_morph,
+        variant_pbr | variant_em | variant_at | variant_ds | variant_morph,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_morph,
+    };
+    // Morph handles are 37–52; use a seen array sized to cover that range.
+    var seen = [_]bool{false} ** 53;
+    for (combos) |v| {
+        const h = shaderHandleFor(v);
+        try std.testing.expect(h >= 37 and h < seen.len);
+        try std.testing.expect(!seen[h]); // distinct
+        seen[h] = true;
+    }
+    // All 16 morph handles must be assigned (37..52 inclusive).
+    var hi: u32 = 37;
+    while (hi <= 52) : (hi += 1) {
+        try std.testing.expect(seen[hi]);
     }
 }
