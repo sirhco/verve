@@ -3504,6 +3504,201 @@ pub fn cubeFieldGlb(alloc: Allocator) ![]u8 {
     return glb;
 }
 
+// ── morphGlb fixture ──────────────────────────────────────────────────────────
+// A minimal quad mesh (4 verts, 6 indices) with 2 morph targets and a LINEAR
+// weight animation "MorphAnim". Used to test gltf morph parsing + vmesh round-trip.
+pub fn morphGlb(alloc: Allocator) ![]u8 {
+    // ── BIN layout ────────────────────────────────────────────────────────────
+    // off_pos   =   0  4 * 3 * 4 = 48 bytes (POSITION VEC3 f32)
+    // off_nrm   =  48  4 * 3 * 4 = 48 bytes (NORMAL VEC3 f32)
+    // off_uv    =  96  4 * 2 * 4 = 32 bytes (TEXCOORD_0 VEC2 f32)
+    // off_idx   = 128  6 * 2 = 12 bytes (indices u16)  → ends at 140, already 4-aligned
+    // off_t0pos = 140  target 0 POSITION deltas: 4*3*4 = 48 bytes
+    // off_t0nrm = 188  target 0 NORMAL deltas:   4*3*4 = 48 bytes
+    // off_t1pos = 236  target 1 POSITION deltas: 4*3*4 = 48 bytes
+    // off_t1nrm = 284  target 1 NORMAL deltas:   4*3*4 = 48 bytes
+    // off_times = 332  anim input times: 2*4 = 8 bytes
+    // off_wts   = 340  anim weights output: 4*4 = 16 bytes
+    // bin_total = 356  (already 4-aligned)
+    const off_pos: usize = 0;
+    const off_nrm: usize = 48;
+    const off_uv: usize = 96;
+    const off_idx: usize = 128;
+    const off_t0pos: usize = 140;
+    const off_t0nrm: usize = 188;
+    const off_t1pos: usize = 236;
+    const off_t1nrm: usize = 284;
+    const off_times: usize = 332;
+    const off_wts: usize = 340;
+    const bin_total: usize = 356;
+
+    var bin = try alloc.alloc(u8, bin_total);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // Helper: write f32 as little-endian u32 bits
+    const wf32 = struct {
+        fn w(b: []u8, off: usize, v: f32) void {
+            std.mem.writeInt(u32, b[off..][0..4], @bitCast(v), .little);
+        }
+    }.w;
+
+    // POSITION: (0,0,0),(1,0,0),(0,1,0),(1,1,0)
+    wf32(bin, off_pos + 0, 0.0);
+    wf32(bin, off_pos + 4, 0.0);
+    wf32(bin, off_pos + 8, 0.0);
+    wf32(bin, off_pos + 12, 1.0);
+    wf32(bin, off_pos + 16, 0.0);
+    wf32(bin, off_pos + 20, 0.0);
+    wf32(bin, off_pos + 24, 0.0);
+    wf32(bin, off_pos + 28, 1.0);
+    wf32(bin, off_pos + 32, 0.0);
+    wf32(bin, off_pos + 36, 1.0);
+    wf32(bin, off_pos + 40, 1.0);
+    wf32(bin, off_pos + 44, 0.0);
+
+    // NORMAL: all (0,0,1)
+    for (0..4) |vi| {
+        wf32(bin, off_nrm + vi * 12 + 0, 0.0);
+        wf32(bin, off_nrm + vi * 12 + 4, 0.0);
+        wf32(bin, off_nrm + vi * 12 + 8, 1.0);
+    }
+
+    // TEXCOORD_0: (0,0),(1,0),(0,1),(1,1)
+    wf32(bin, off_uv + 0, 0.0);
+    wf32(bin, off_uv + 4, 0.0);
+    wf32(bin, off_uv + 8, 1.0);
+    wf32(bin, off_uv + 12, 0.0);
+    wf32(bin, off_uv + 16, 0.0);
+    wf32(bin, off_uv + 20, 1.0);
+    wf32(bin, off_uv + 24, 1.0);
+    wf32(bin, off_uv + 28, 1.0);
+
+    // INDICES: [0,1,2, 1,3,2]
+    const idx_vals = [_]u16{ 0, 1, 2, 1, 3, 2 };
+    for (idx_vals, 0..) |v, i| {
+        std.mem.writeInt(u16, bin[off_idx + i * 2 ..][0..2], v, .little);
+    }
+
+    // Target 0 POSITION deltas: vertex 0 = (+0.5, 0, 0), others zero
+    wf32(bin, off_t0pos + 0, 0.5); // v0.x
+    // all others remain 0 (memset)
+
+    // Target 0 NORMAL deltas: all zero (memset)
+    _ = off_t0nrm; // already zero
+
+    // Target 1 POSITION deltas: vertex 1 = (0, +0.25, 0), others zero
+    wf32(bin, off_t1pos + 12 + 4, 0.25); // v1.y (v1 offset = 1*12, .y = +4)
+
+    // Target 1 NORMAL deltas: all zero (memset)
+    _ = off_t1nrm; // already zero
+
+    // Anim times: [0.0, 1.0]
+    wf32(bin, off_times + 0, 0.0);
+    wf32(bin, off_times + 4, 1.0);
+
+    // Anim weights output (target_count=2 per keyframe): [0.0, 0.0, 1.0, 0.5]
+    // k0=[0.0,0.0] → flat[0]=0.0, flat[1]=0.0
+    // k1=[1.0,0.5] → flat[2]=1.0, flat[3]=0.5
+    wf32(bin, off_wts + 0, 0.0);
+    wf32(bin, off_wts + 4, 0.0);
+    wf32(bin, off_wts + 8, 1.0);
+    wf32(bin, off_wts + 12, 0.5);
+
+    // ── JSON ──────────────────────────────────────────────────────────────────
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    try w.writeAll("{\"asset\":{\"version\":\"2.0\"},\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}],");
+    try w.writeAll("\"meshes\":[{\"primitives\":[{");
+    try w.writeAll("\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},");
+    try w.writeAll("\"indices\":3,\"material\":0,");
+    try w.writeAll("\"targets\":[{\"POSITION\":4,\"NORMAL\":5},{\"POSITION\":6,\"NORMAL\":7}]");
+    try w.writeAll("}]}],");
+
+    // 10 accessors
+    try w.writeAll("\"accessors\":[");
+    // 0: POSITION
+    try w.writeAll("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    // 1: NORMAL
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    // 2: TEXCOORD_0
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC2\"},");
+    // 3: indices
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"},");
+    // 4: target 0 POSITION
+    try w.writeAll("{\"bufferView\":4,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    // 5: target 0 NORMAL
+    try w.writeAll("{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    // 6: target 1 POSITION
+    try w.writeAll("{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    // 7: target 1 NORMAL
+    try w.writeAll("{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    // 8: anim times
+    try w.writeAll("{\"bufferView\":8,\"byteOffset\":0,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},");
+    // 9: anim weights output
+    try w.writeAll("{\"bufferView\":9,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"SCALAR\"}");
+    try w.writeAll("],");
+
+    // 10 bufferViews
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ 0, 48 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ 48, 48 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ 96, 32 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ 128, 12 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ 140, 48 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ 188, 48 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ 236, 48 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ 284, 48 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ 332, 8 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ 340, 16 });
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}],");
+    try w.writeAll("\"animations\":[{\"name\":\"MorphAnim\",");
+    try w.writeAll("\"channels\":[{\"sampler\":0,\"target\":{\"node\":0,\"path\":\"weights\"}}],");
+    try w.writeAll("\"samplers\":[{\"input\":8,\"output\":9,\"interpolation\":\"LINEAR\"}]}]");
+    try w.writeAll("}");
+
+    // pad JSON to 4-byte alignment
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── Assemble GLB ──────────────────────────────────────────────────────────
+    const bin_padded: u32 = @intCast((bin_total + 3) & ~@as(usize, 3));
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42; // B
+    glb[goff + 1] = 0x49; // I
+    glb[goff + 2] = 0x4E; // N
+    glb[goff + 3] = 0x00; // \0
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_total], bin);
+
+    return glb;
+}
+
 // ── cubeFieldGlb fixture tests ────────────────────────────────────────────────
 
 test "cubeFieldGlb: 256 instances round-trip via EXT_mesh_gpu_instancing" {
