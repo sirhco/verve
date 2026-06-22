@@ -4638,6 +4638,14 @@
             sh.fog0 = gl.getUniformLocation(prog, "u_fog0");
             sh.fog1 = gl.getUniformLocation(prog, "u_fog1");
           }
+          if (variant & 0x4000) { // variant_morph: morph-target sampler + weight uniforms
+            // u_morph_tex is bound to a fixed unit (9); set it once at link time.
+            const morphLoc = gl.getUniformLocation(prog, "u_morph_tex");
+            if (morphLoc) gl.uniform1i(morphLoc, 9);
+            sh.morphIdx   = gl.getUniformLocation(prog, "u_morph_idx[0]");
+            sh.morphWt    = gl.getUniformLocation(prog, "u_morph_wt[0]");
+            sh.morphCount = gl.getUniformLocation(prog, "u_morph_count");
+          }
           st.shaders[handle] = sh;
           break;
         }
@@ -5179,6 +5187,87 @@
           if (st.active && st.active.fog1) gl.uniform4f(st.active.fog1, f[4], f[5], f[6], 0);
           break;
         }
+        case 29: { // SET_MORPH_WEIGHTS — upload idx/wt/count uniforms + bind morph texture (unit 9)
+          // Payload (command.zig Encoder.setMorphWeights, 12B): count | idx_ptr | wt_ptr.
+          // idx_ptr → count u32 indices; wt_ptr → count f32 weights.  Pad both to 8
+          // entries before uploading (the GLSL arrays are fixed-size 8).
+          const count   = dv.getUint32(off, true);
+          const idxPtr  = dv.getUint32(off + 4, true);
+          const wtPtr   = dv.getUint32(off + 8, true);
+          const sh = st.active;
+          if (!sh) break;
+          if (sh.morphIdx) {
+            const idx = new Int32Array(8);
+            const src = new Uint32Array(memory.buffer, idxPtr, count);
+            for (let i = 0; i < count; i++) idx[i] = src[i];
+            gl.uniform1iv(sh.morphIdx, idx);
+          }
+          if (sh.morphWt) {
+            const wt = new Float32Array(8);
+            const src = new Float32Array(memory.buffer, wtPtr, count);
+            for (let i = 0; i < count; i++) wt[i] = src[i];
+            gl.uniform1fv(sh.morphWt, wt);
+          }
+          if (sh.morphCount) gl.uniform1i(sh.morphCount, count);
+          // Bind the morph texture for this scene handle (stored by the active
+          // shader's morphHandle, set in CREATE_MORPH_TEX via st.morphTex).
+          if (st.morphTex) {
+            gl.activeTexture(gl.TEXTURE9);
+            gl.bindTexture(gl.TEXTURE_2D, st.morphTex);
+          }
+          break;
+        }
+        case 30: { // CREATE_MORPH_TEX — build float morph-target texture (RGBA16F).
+          // Payload (command.zig Encoder.createMorphTex, 20B):
+          //   handle | width (=vertex_count) | height (=target_count*2) | ptr | byte_len.
+          // Source blob (M2 layout, f16): target-major then vertex-major.
+          // Per (t, v): 3 f16 POSITION then 3 f16 NORMAL (6 u16 per record).
+          // Texture row layout: row 2t = POSITION deltas, row 2t+1 = NORMAL deltas.
+          // Repack: texel(v, 2t)   = blob[(t*vertCount + v)*6 + 0..2] (+ 0 alpha)
+          //         texel(v, 2t+1) = blob[(t*vertCount + v)*6 + 3..5] (+ 0 alpha)
+          const handle   = dv.getUint32(off, true);
+          const vertCount = dv.getUint32(off + 4, true);  // width
+          const height    = dv.getUint32(off + 8, true);  // target_count * 2
+          const blobPtr   = dv.getUint32(off + 12, true);
+          // byte_len at off+16 — informational; we derive sizes from w/h.
+          const targCount = height >>> 1; // height = target_count * 2
+          // Source: u16 halves (f16). 6 u16 per (t,v) record.
+          const blob = new Uint16Array(memory.buffer, blobPtr, targCount * vertCount * 6);
+          // Destination: RGBA16F → 4 u16 per texel. Width=vertCount, Height=height.
+          const pixels = new Uint16Array(vertCount * height * 4);
+          for (let t = 0; t < targCount; t++) {
+            for (let v = 0; v < vertCount; v++) {
+              const srcBase = (t * vertCount + v) * 6;
+              // POSITION row (row = 2*t)
+              const posRow = t * 2;
+              const posDst = (posRow * vertCount + v) * 4;
+              pixels[posDst + 0] = blob[srcBase + 0];
+              pixels[posDst + 1] = blob[srcBase + 1];
+              pixels[posDst + 2] = blob[srcBase + 2];
+              pixels[posDst + 3] = 0; // alpha pad
+              // NORMAL row (row = 2*t+1)
+              const nrmRow = t * 2 + 1;
+              const nrmDst = (nrmRow * vertCount + v) * 4;
+              pixels[nrmDst + 0] = blob[srcBase + 3];
+              pixels[nrmDst + 1] = blob[srcBase + 4];
+              pixels[nrmDst + 2] = blob[srcBase + 5];
+              pixels[nrmDst + 3] = 0; // alpha pad
+            }
+          }
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, vertCount, height, 0,
+            gl.RGBA, gl.HALF_FLOAT, pixels);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.bindTexture(gl.TEXTURE_2D, null);
+          // Store by handle so SET_MORPH_WEIGHTS can bind it at unit 9.
+          st.morphTextures[handle] = tex;
+          st.morphTex = tex; // active morph texture (most recently created)
+          break;
+        }
         default:
           break; // unknown tag: size-skip = forward compatible
       }
@@ -5207,6 +5296,9 @@
     }
     if (st.emptyVao) { gl.deleteVertexArray(st.emptyVao); st.emptyVao = null; }
     if (st.instanceBuf) { gl.deleteBuffer(st.instanceBuf); st.instanceBuf = null; }
+    for (const tex of st.morphTextures) if (tex) gl.deleteTexture(tex);
+    st.morphTextures = [];
+    st.morphTex = null;
     st.buffers = [];
     st.textures = [];
     st.shaders = [];
@@ -5754,6 +5846,23 @@
                 buffer: { type: "uniform" },
               });
             }
+            const hasMorph = (variant & 0x4000) !== 0; // variant_morph: morph-target UBO + texture
+            if (hasMorph) {
+              // binding 3: morph weights UBO (80 bytes: idx[8] + wt[8] + count + pad),
+              // VERTEX-visible (the vertex shader applies morph deltas).
+              bgl0Entries.push({
+                binding: 3,
+                visibility: GPUShaderStage.VERTEX,
+                buffer: { type: "uniform" },
+              });
+              // binding 4: morph-target data texture (RGBA16F, 2D),
+              // VERTEX-visible (vertex shader fetches deltas via textureLoad).
+              bgl0Entries.push({
+                binding: 4,
+                visibility: GPUShaderStage.VERTEX,
+                texture: { sampleType: "unfilterable-float", viewDimension: "2d" },
+              });
+            }
             const bgl0 = device.createBindGroupLayout({ entries: bgl0Entries });
             // group(1): sampler@0 + per-slot textures. Binding numbers + types
             // EXACTLY match wgslPbr's @group(1) decls. base@1, mr@2 always;
@@ -5878,6 +5987,7 @@
               hasShadow,
               skinned,
               hasFog,
+              hasMorph,
             };
             break;
           }
@@ -6290,6 +6400,16 @@
               if (!st.fogBuf) st.fogBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
               bg0Entries.push({ binding: 2, resource: { buffer: st.fogBuf } });
             }
+            // binding 3: morph weights UBO (80B), binding 4: morph texture (VERTEX-visible).
+            // Layout has bindings 3+4 iff hasMorph — must match bgl0 exactly.
+            if (active.hasMorph) {
+              if (!st.morphBuf) st.morphBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+              const mte = st.morphTexView;
+              if (mte) {
+                bg0Entries.push({ binding: 3, resource: { buffer: st.morphBuf } });
+                bg0Entries.push({ binding: 4, resource: mte });
+              }
+            }
             st.bg0 = device.createBindGroup({ layout: active.bgl0, entries: bg0Entries });
             st.bg0Layout = active.bgl0;
           }
@@ -6539,6 +6659,84 @@
           device.queue.writeBuffer(st.fogBuf, 0, memory.buffer, dv.getUint32(off, true), 32);
           break;
         }
+        case 29: { // SET_MORPH_WEIGHTS (WebGPU) — write 80-byte UBO at group(0) binding(3).
+          // Payload (command.zig Encoder.setMorphWeights, 12B): count | idx_ptr | wt_ptr.
+          // UBO layout (80 bytes): idx 8×i32 @0 (as 2×vec4i), wt 8×f32 @32 (as 2×vec4),
+          // count i32 @64, pad 12 to 80 bytes total.
+          const count  = dv.getUint32(off, true);
+          const idxPtr = dv.getUint32(off + 4, true);
+          const wtPtr  = dv.getUint32(off + 8, true);
+          if (!st.morphBuf) st.morphBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          // idx: 8 i32 at offset 0 (pad unused with 0)
+          const idx = new Int32Array(8);
+          const idxSrc = new Uint32Array(memory.buffer, idxPtr, Math.min(count, 8));
+          for (let i = 0; i < Math.min(count, 8); i++) idx[i] = idxSrc[i];
+          device.queue.writeBuffer(st.morphBuf, 0, idx.buffer, 0, 32);
+          // wt: 8 f32 at offset 32 (pad unused with 0)
+          const wt = new Float32Array(8);
+          const wtSrc = new Float32Array(memory.buffer, wtPtr, Math.min(count, 8));
+          for (let i = 0; i < Math.min(count, 8); i++) wt[i] = wtSrc[i];
+          device.queue.writeBuffer(st.morphBuf, 32, wt.buffer, 0, 32);
+          // count: i32 at offset 64 (4B, then 12B pad implicit to end of 80B buffer)
+          device.queue.writeBuffer(st.morphBuf, 64, new Int32Array([count]).buffer, 0, 4);
+          // Invalidate bg0 so the next DRAW_PBR rebuilds it with fresh morphBuf data.
+          st.bg0Layout = null;
+          break;
+        }
+        case 30: { // CREATE_MORPH_TEX (WebGPU) — build rgba16float morph-target texture.
+          // Payload (command.zig Encoder.createMorphTex, 20B):
+          //   handle | width (=vertex_count) | height (=target_count*2) | ptr | byte_len.
+          // Source blob (M2 layout, f16): target-major then vertex-major.
+          // Per (t, v): 3 f16 POSITION then 3 f16 NORMAL (6 u16 per record).
+          // Texture row layout: row 2t = POSITION deltas, row 2t+1 = NORMAL deltas.
+          // Repack scatter: texel(v, 2t)   = blob[(t*vertCount + v)*6 + 0..2] (+ 0 alpha)
+          //                 texel(v, 2t+1) = blob[(t*vertCount + v)*6 + 3..5] (+ 0 alpha)
+          const handle    = dv.getUint32(off, true);
+          const vertCount = dv.getUint32(off + 4, true);  // width
+          const height    = dv.getUint32(off + 8, true);  // target_count * 2
+          const blobPtr   = dv.getUint32(off + 12, true);
+          // byte_len at off+16 — informational.
+          const targCount = height >>> 1;
+          const blob = new Uint16Array(memory.buffer, blobPtr, targCount * vertCount * 6);
+          // Repack into RGBA16F row-major: 4 u16 per texel.
+          const pixels = new Uint16Array(vertCount * height * 4);
+          for (let t = 0; t < targCount; t++) {
+            for (let v = 0; v < vertCount; v++) {
+              const srcBase = (t * vertCount + v) * 6;
+              // POSITION row (row = 2*t)
+              const posRow = t * 2;
+              const posDst = (posRow * vertCount + v) * 4;
+              pixels[posDst + 0] = blob[srcBase + 0];
+              pixels[posDst + 1] = blob[srcBase + 1];
+              pixels[posDst + 2] = blob[srcBase + 2];
+              pixels[posDst + 3] = 0; // alpha pad
+              // NORMAL row (row = 2*t+1)
+              const nrmRow = t * 2 + 1;
+              const nrmDst = (nrmRow * vertCount + v) * 4;
+              pixels[nrmDst + 0] = blob[srcBase + 3];
+              pixels[nrmDst + 1] = blob[srcBase + 4];
+              pixels[nrmDst + 2] = blob[srcBase + 5];
+              pixels[nrmDst + 3] = 0; // alpha pad
+            }
+          }
+          const tex = device.createTexture({
+            size: [vertCount, height],
+            format: "rgba16float",
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+          });
+          device.queue.writeTexture(
+            { texture: tex },
+            pixels.buffer,
+            { bytesPerRow: vertCount * 8, rowsPerImage: height }, // 8 bytes per RGBA16F texel
+            [vertCount, height],
+          );
+          const view = tex.createView();
+          st.textures[handle] = { tex, view, w: vertCount, h: height };
+          st.morphTexView = view; // active morph texture view for bg0 binding 4
+          // Invalidate bg0 so next DRAW_PBR rebuilds with the new texture view.
+          st.bg0Layout = null;
+          break;
+        }
         default:
           break; // unknown tag: size-skip = forward compatible
       }
@@ -6635,6 +6833,8 @@
       vaos: new Map(),
       emptyVao: null, // lazy-created VAO for fullscreen-quad draw (case 25)
       instanceBuf: null, // lazy-created ARRAY_BUFFER for per-instance mat4+color (case 27)
+      morphTextures: [], // morph-target RGBA16F textures (case 30), indexed by handle
+      morphTex: null, // active morph texture bound to TEXTURE9 (most recently created)
       extColorBufferFloat: null, // EXT_color_buffer_float, enabled on first rgba16f target
       active: null,
       last: 0,
@@ -6813,6 +7013,8 @@
       bindGroup: null,
       instanceBuf: null, // lazy GPUBuffer (VERTEX|COPY_DST) for per-instance mat4+color (case 27)
       fogBuf: null, // lazy 32-byte UBO (UNIFORM|COPY_DST) for distance fog (case 28/binding 2)
+      morphBuf: null, // lazy 80-byte UBO (UNIFORM|COPY_DST) for morph weights (case 29/binding 3)
+      morphTexView: null, // GPUTextureView for morph-target data texture (case 30/binding 4)
       pbrUniform: null, // shared PBR uniform buffer (lazy; PBR_U.size bytes)
       bonesBuf: null, // shared bones palette uniform (lazy; 64 mat4) — skinned
       depthUniform: null, // shadow depth-pass uniform (lazy; one mat4)
@@ -6904,6 +7106,8 @@
       st.shadow = null;
       st.instanceBuf = null; // GPU vertex buffer for per-instance data (no .destroy — dead device)
       if (st.fogBuf) { st.fogBuf.destroy?.(); st.fogBuf = null; }
+      if (st.morphBuf) { st.morphBuf.destroy?.(); st.morphBuf = null; }
+      st.morphTexView = null;
       st.pbrUniform = null;
       st.bonesBuf = null;
       st.uniformBuf = null; // slice-1 basic-draw path's persistent buffer

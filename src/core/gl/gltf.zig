@@ -67,6 +67,11 @@ pub const Model = struct {
     // Absent extension → instance_count == 0 and instances == &.{}.
     instance_count: u32 = 0,
     instances: []const f32 = &.{},
+    // Morph (Task 3). Present when the first primitive of the first mesh has
+    // `targets`. target_count and vertex_count from the primitive. deltas is
+    // arena-allocated (f16 bytes). weight_clip is the first weights animation
+    // channel, or null.
+    morph: ?vmesh.MorphData = null,
 
     pub fn deinit(self: *Model) void {
         self.arena.deinit();
@@ -76,6 +81,32 @@ pub const Model = struct {
 
 pub fn parseGlb(alloc: std.mem.Allocator, bytes: []const u8) !Model {
     return parseGlbImpl(alloc, bytes);
+}
+
+/// Parse a GLB and pack it into vmesh bytes. Convenience wrapper for tests and
+/// the asset pipeline when no BVH / instancing is needed.
+pub fn toVmesh(alloc: std.mem.Allocator, glb_bytes: []const u8) ![]u8 {
+    var model = try parseGlb(alloc, glb_bytes);
+    defer model.deinit();
+    const anim: ?vmesh.Anims = if (model.anim_clips.len > 0) .{ .clips = model.anim_clips } else null;
+    return vmesh.pack(
+        alloc,
+        model.vertices,
+        model.indices,
+        model.submeshes,
+        model.textures,
+        &.{},
+        &.{},
+        model.names,
+        model.skinned,
+        model.joints,
+        model.weights,
+        model.skel,
+        anim,
+        model.instances,
+        model.instance_count,
+        model.morph,
+    );
 }
 
 // ── error set ──────────────────────────────────────────────────────────────────
@@ -680,6 +711,173 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         }
     }
 
+    // ── 7a-morph. Morph targets (Task 3) ──────────────────────────────────────
+    // Parse first mesh / first primitive's targets[] (if present). Build the
+    // f16 delta blob (target-major, vertex-major: 3 f16 pos + 3 f16 nrm per vertex).
+    // Then scan animations[] for a "weights" channel to build the weight Clip.
+    var morph_data: ?vmesh.MorphData = null;
+    if (meshes.len > 0) blk: {
+        const first_mesh = switch (meshes[0]) {
+            .object => |o| o,
+            else => break :blk,
+        };
+        const first_prims_val = first_mesh.get("primitives") orelse break :blk;
+        const first_prims = switch (first_prims_val) {
+            .array => |a| a.items,
+            else => break :blk,
+        };
+        if (first_prims.len == 0) break :blk;
+        const first_prim = switch (first_prims[0]) {
+            .object => |o| o,
+            else => break :blk,
+        };
+        const targets_val = first_prim.get("targets") orelse break :blk;
+        const targets = switch (targets_val) {
+            .array => |a| a.items,
+            else => break :blk,
+        };
+        if (targets.len == 0) break :blk;
+
+        // vertex_count from the first primitive's POSITION accessor
+        const first_attrs = switch (first_prim.get("attributes") orelse break :blk) {
+            .object => |o| o,
+            else => break :blk,
+        };
+        const first_pos_idx: usize = @intCast(jsonInt(first_attrs.get("POSITION") orelse break :blk) orelse break :blk);
+        const first_pos = try readAccessorF32(accessors, buffer_views, bin, first_pos_idx, aa);
+        const vc: u32 = @intCast(first_pos.len / 3);
+        const tc: u32 = @intCast(targets.len);
+
+        // Build delta blob: target-major, vertex-major; 3 f16 pos + 3 f16 nrm per vertex
+        const delta_bytes = @as(usize, tc) * @as(usize, vc) * 6 * 2;
+        const delta_buf = try aa.alloc(u8, delta_bytes);
+        @memset(delta_buf, 0);
+
+        for (targets, 0..) |tgt_val, ti| {
+            const tgt = switch (tgt_val) {
+                .object => |o| o,
+                else => continue,
+            };
+            const tgt_off = ti * @as(usize, vc) * 12; // bytes offset for this target
+
+            // POSITION deltas
+            const dp: []const f32 = if (tgt.get("POSITION")) |pv|
+                try readAccessorF32(accessors, buffer_views, bin, @intCast(jsonInt(pv) orelse return error.Malformed), aa)
+            else
+                &.{};
+
+            // NORMAL deltas (optional; zero if absent)
+            const dn: []const f32 = if (tgt.get("NORMAL")) |nv|
+                try readAccessorF32(accessors, buffer_views, bin, @intCast(jsonInt(nv) orelse return error.Malformed), aa)
+            else
+                &.{};
+
+            for (0..vc) |vi| {
+                const voff = tgt_off + vi * 12;
+                // 3 f16 position
+                inline for (0..3) |ci| {
+                    const val: f32 = if (dp.len > vi * 3 + ci) dp[vi * 3 + ci] else 0;
+                    const h: u16 = @bitCast(@as(f16, @floatCast(val)));
+                    std.mem.writeInt(u16, delta_buf[voff + ci * 2 ..][0..2], h, .little);
+                }
+                // 3 f16 normal
+                inline for (0..3) |ci| {
+                    const val: f32 = if (dn.len > vi * 3 + ci) dn[vi * 3 + ci] else 0;
+                    const h: u16 = @bitCast(@as(f16, @floatCast(val)));
+                    std.mem.writeInt(u16, delta_buf[voff + 6 + ci * 2 ..][0..2], h, .little);
+                }
+            }
+        }
+
+        // Weight animation: scan animations[] for a channel with path=="weights"
+        var weight_clip: ?vmesh.Clip = null;
+        if (root.get("animations")) |anims_val| {
+            if (anims_val == .array) {
+                outer: for (anims_val.array.items, 0..) |anim_val, ai| {
+                    const anim_obj2 = switch (anim_val) {
+                        .object => |o| o,
+                        else => continue,
+                    };
+                    const chs = switch (anim_obj2.get("channels") orelse continue) {
+                        .array => |a| a.items,
+                        else => continue,
+                    };
+                    const samps = switch (anim_obj2.get("samplers") orelse continue) {
+                        .array => |a| a.items,
+                        else => continue,
+                    };
+                    for (chs) |ch_val2| {
+                        const ch2 = switch (ch_val2) {
+                            .object => |o| o,
+                            else => continue,
+                        };
+                        const tgt2 = switch (ch2.get("target") orelse continue) {
+                            .object => |o| o,
+                            else => continue,
+                        };
+                        const path2 = switch (tgt2.get("path") orelse continue) {
+                            .string => |s| s,
+                            else => continue,
+                        };
+                        if (!std.mem.eql(u8, path2, "weights")) continue;
+                        const si: usize = @intCast(jsonInt(ch2.get("sampler") orelse continue) orelse continue);
+                        if (si >= samps.len) continue;
+                        const samp2 = switch (samps[si]) {
+                            .object => |o| o,
+                            else => continue,
+                        };
+                        const interp_str2 = if (samp2.get("interpolation")) |iv| (switch (iv) {
+                            .string => |s| s,
+                            else => return error.Malformed,
+                        }) else "LINEAR";
+                        const interp2: u8 = if (std.mem.eql(u8, interp_str2, "LINEAR"))
+                            0
+                        else if (std.mem.eql(u8, interp_str2, "STEP"))
+                            1
+                        else if (std.mem.eql(u8, interp_str2, "CUBICSPLINE"))
+                            2
+                        else
+                            return error.Unsupported;
+                        const in_idx2: usize = @intCast(jsonInt(samp2.get("input") orelse return error.Malformed) orelse return error.Malformed);
+                        const out_idx2: usize = @intCast(jsonInt(samp2.get("output") orelse return error.Malformed) orelse return error.Malformed);
+                        const times2 = try readAccessorF32(accessors, buffer_views, bin, in_idx2, aa);
+                        const flat_wts = try readAccessorF32(accessors, buffer_views, bin, out_idx2, aa);
+                        const key_count = times2.len;
+                        const vstride2: usize = if (interp2 == 2) 3 else 1;
+                        if (flat_wts.len != key_count * tc * vstride2) return error.Malformed;
+                        // Build one Track per target: track i has values flat_wts[(k*vstride+s)*tc+i] for each k,s
+                        const tracks2 = try aa.alloc(vmesh.Track, tc);
+                        var clip_dur2: f32 = 0;
+                        if (times2.len > 0 and times2[times2.len - 1] > clip_dur2)
+                            clip_dur2 = times2[times2.len - 1];
+                        for (0..tc) |tii| {
+                            const tvals = try aa.alloc(f32, key_count * vstride2);
+                            for (0..key_count) |ki| {
+                                for (0..vstride2) |vi2| {
+                                    tvals[ki * vstride2 + vi2] = flat_wts[(ki * vstride2 + vi2) * tc + tii];
+                                }
+                            }
+                            tracks2[tii] = .{ .interp = interp2, .times = times2, .values = tvals };
+                        }
+                        const name_hash2: u32 = if (anim_obj2.get("name")) |nv2| (switch (nv2) {
+                            .string => |s| vmesh.fnv1a32(s),
+                            else => vmesh.fnv1a32(try std.fmt.allocPrint(aa, "clip{d}", .{ai})),
+                        }) else vmesh.fnv1a32(try std.fmt.allocPrint(aa, "clip{d}", .{ai}));
+                        weight_clip = .{ .name_hash = name_hash2, .duration = clip_dur2, .tracks = tracks2 };
+                        break :outer;
+                    }
+                }
+            }
+        }
+
+        morph_data = vmesh.MorphData{
+            .target_count = tc,
+            .vertex_count = vc,
+            .deltas = delta_buf,
+            .weight_clip = weight_clip,
+        };
+    }
+
     // ── 7b. Neutral-texture baking ─────────────────────────────────────────────
     // tex_base, tex_mr, tex_occlusion: always white-neutral-baked when unset
     //   (the base PBR path always samples these slots).
@@ -1056,6 +1254,7 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         .anim_clips = anim_clips_slice,
         .instance_count = inst_count,
         .instances = inst_slice,
+        .morph = morph_data,
     };
 }
 
@@ -1639,6 +1838,7 @@ test "parse pbrCubeMixedMaterialGlb: 2 submeshes, variant fan-out (full vs base-
         null,
         &.{},
         0,
+        null,
     );
     defer testing.allocator.free(bytes);
     const r = try vmesh.Reader.init(bytes);
@@ -2343,6 +2543,7 @@ test "gltf parses EXT_mesh_gpu_instancing" {
         null,
         model.instances,
         model.instance_count,
+        null,
     );
     defer alloc.free(vmesh_bytes);
     const r = try vmesh.Reader.init(vmesh_bytes);
@@ -2512,4 +2713,70 @@ fn assembleGlb(
     goff += 4;
     @memcpy(glb[goff..][0..bin_padded], bin);
     return glb;
+}
+
+test "glTF morph: parse targets + weights into vmesh MorphData" {
+    const fixture = @import("fixture.zig");
+    const glb = try fixture.morphGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    const bytes = try toVmesh(testing.allocator, glb);
+    defer testing.allocator.free(bytes);
+    var r = try vmesh.Reader.init(bytes);
+    try testing.expectEqual(@as(u32, 2), r.morphTargetCount());
+    try testing.expectEqual(@as(u32, 4), r.morphVertexCount());
+
+    // spot-check target 0, vertex 0, POSITION.x delta == 0.5 (f16 → compare as f16)
+    const deltas = r.morphDeltas();
+    // target 0, vertex 0, component 0 (POSITION.x): byte offset 0
+    const raw_x: u16 = std.mem.readInt(u16, deltas[0..2], .little);
+    const fx: f32 = @floatCast(@as(f16, @bitCast(raw_x)));
+    try testing.expectApproxEqAbs(@as(f32, 0.5), fx, 1e-3);
+    // weight clip: 2 tracks (one per target), key_count == 2
+    const wt0 = r.morphWeightTrack(0);
+    try testing.expect(wt0 != null);
+    try testing.expectEqual(@as(u32, 2), wt0.?.key_count);
+    const wt1 = r.morphWeightTrack(1);
+    try testing.expect(wt1 != null);
+    try testing.expectEqual(@as(u32, 2), wt1.?.key_count);
+}
+
+// Regression test for C1: gl_asset_gen convertGlb was passing null for the
+// morph argument to vmesh.pack, discarding the parsed MorphData. This test
+// exercises the same call chain (parseGlb → bvh.build → vmesh.pack(model.morph))
+// that convertGlb uses, so a reversion to null would break it immediately.
+test "gl_asset_gen path: morphDemoGlb morph section survives parseGlb + pack (C1 regression)" {
+    const bvh = @import("bvh.zig");
+    const fixture = @import("fixture.zig");
+    const glb = try fixture.morphDemoGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    // BVH build (same path as convertGlb).
+    var bvh_result = try bvh.build(testing.allocator, model.vertices, 12, model.indices);
+    defer bvh_result.deinit(testing.allocator);
+    // Pack with model.morph — the bug was passing null here instead.
+    const anim: ?vmesh.Anims = if (model.anim_clips.len > 0) .{ .clips = model.anim_clips } else null;
+    const bytes = try vmesh.pack(
+        testing.allocator,
+        model.vertices,
+        model.indices,
+        model.submeshes,
+        model.textures,
+        bvh_result.nodes,
+        bvh_result.tri_perm,
+        model.names,
+        model.skinned,
+        model.joints,
+        model.weights,
+        model.skel,
+        anim,
+        model.instances,
+        model.instance_count,
+        model.morph, // must NOT be null — this is what C1 broke
+    );
+    defer testing.allocator.free(bytes);
+    var r = try vmesh.Reader.init(bytes);
+    // morphDemoGlb: 5×5 plane → 25 vertices, 3 targets (Bulge/Wave/Twist)
+    try testing.expectEqual(@as(u32, 3), r.morphTargetCount());
+    try testing.expectEqual(@as(u32, 25), r.morphVertexCount());
 }

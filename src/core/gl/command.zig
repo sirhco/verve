@@ -51,6 +51,8 @@ pub const Tag = enum(u16) {
     draw_depth_at = 26, // {shader, vbuf, ibuf, index_byte_off, index_count, mvp_ptr, material_ptr} — alpha-tested depth draw (MASK shadows)
     draw_pbr_instanced = 27, // {vbuf, ibuf, off, count, instance_ptr, instance_count, vp_ptr, material_ptr, camera_ptr}
     set_fog = 28, // {ptr -> 8 f32 FogParams}
+    set_morph_weights = 29, // {count, idx_ptr -> count u32, wt_ptr -> count f32}
+    create_morph_tex = 30, // {handle, width, height, ptr -> f16 deltas, byte_len}
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -87,6 +89,7 @@ pub const variant_alpha_test: u32 = 1 << 10; // requires variant_pbr; MASK cutou
 pub const variant_double_sided: u32 = 1 << 11; // requires variant_pbr; render both faces, flip back-face normal
 pub const variant_instanced: u32 = 1 << 12; // requires variant_pbr; per-instance model (attr 4-7) + color (attr 8); non-skinned
 pub const variant_fog: u32 = 1 << 13; // requires variant_pbr; distance fog mix before tonemap
+pub const variant_morph: u32 = 1 << 14; // requires variant_pbr; texture-blended POSITION+NORMAL morph deltas
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -97,6 +100,7 @@ pub const clear_flag_depth: u32 = 1 << 1;
 pub const max_lights: u32 = 4;
 pub const light_stride_f32: u32 = 8; // [type(0=dir,1=point), intensity, x,y,z, r,g,b]
 pub const fog_params_f32: u32 = 8; // [mode, r,g,b, near, far, density, _pad]
+pub const morph_max_active: u32 = 8; // K: max simultaneously-active morph influences
 pub const material_len_f32: u32 = 12; // base_color rgba | metallic, roughness, occlusion_strength, normal_scale | emissive rgb, 0
 
 pub const tex_slot_base: u32 = 0;
@@ -267,6 +271,40 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    // Morph-target uniforms (variant_morph): sampler2D texture (RGBA16F,
+    // width=vertex_count, height=target_count*2), per-active-target indices +
+    // weights, and the count of active targets (≤ morph_max_active = 8).
+    const morph_uniforms =
+        \\uniform highp sampler2D u_morph_tex;
+        \\uniform int u_morph_idx[8];
+        \\uniform float u_morph_wt[8];
+        \\uniform int u_morph_count;
+        \\
+    ;
+    // Morph body_open: opens void main(), accumulates morph deltas into m_pos/
+    // m_nrm (frozen texel convention: row 2*t=POS, 2*t+1=NORM, x=gl_VertexID),
+    // then transforms the morphed locals.  Replaces body_open on the morph path.
+    const body_open_morph =
+        \\void main() {
+        \\  vec3 m_pos = a_pos;
+        \\  vec3 m_nrm = a_normal;
+        \\  for (int i = 0; i < u_morph_count; i++) {
+        \\    int t = u_morph_idx[i];
+        \\    float w = u_morph_wt[i];
+        \\    m_pos += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t), 0).xyz;
+        \\    m_nrm += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t + 1), 0).xyz;
+        \\  }
+        \\  v_world_pos = (u_model * vec4(m_pos, 1.0)).xyz;
+        \\  v_normal = u_normal_mat * m_nrm;
+        \\  v_uv = a_uv;
+        \\
+    ;
+    // Morph body_close: feeds m_pos into gl_Position (non-skinned).
+    const body_close_morph =
+        \\  gl_Position = u_mvp * vec4(m_pos, 1.0);
+        \\}
+        \\
+    ;
     // Shadow-receiver additions (variant_shadow): light-space clip position
     // forwarded to the fragment shader for the depth comparison.
     const shadow_outs =
@@ -276,6 +314,11 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
     ;
     const shadow_body =
         \\  v_light_pos = u_light_vp * u_model * vec4(a_pos, 1.0);
+        \\
+    ;
+    // Shadow body on the morph path: use morphed m_pos for the light-space clip.
+    const shadow_body_morph =
+        \\  v_light_pos = u_light_vp * u_model * vec4(m_pos, 1.0);
         \\
     ;
     // Instanced (variant_instanced): per-instance mat4 model columns as vertex
@@ -304,19 +347,34 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\
     ;
     const skinned = flags & variant_skinned != 0;
+    const morphed = flags & variant_morph != 0;
     comptime var src: []const u8 = head;
     if (flags & variant_instanced != 0) {
         src = src ++ inst_decl;
         src = src ++ inst_body;
         return src;
     }
+    if (morphed and skinned) @compileError("variant_morph + variant_skinned not supported this slice");
     if (flags & variant_normal_map != 0) src = src ++ nm_outs;
     if (flags & variant_shadow != 0) src = src ++ shadow_outs;
     if (skinned) src = src ++ skin_decl;
-    src = src ++ (if (skinned) body_open_skinned else body_open);
+    if (morphed) src = src ++ morph_uniforms;
+    if (morphed) {
+        src = src ++ body_open_morph;
+    } else if (skinned) {
+        src = src ++ body_open_skinned;
+    } else {
+        src = src ++ body_open;
+    }
     if (flags & variant_normal_map != 0) src = src ++ (if (skinned) nm_body_skinned else nm_body);
-    if (flags & variant_shadow != 0) src = src ++ shadow_body;
-    src = src ++ (if (skinned) body_close_skinned else body_close);
+    if (flags & variant_shadow != 0) src = src ++ (if (morphed) shadow_body_morph else shadow_body);
+    if (morphed) {
+        src = src ++ body_close_morph;
+    } else if (skinned) {
+        src = src ++ body_close_skinned;
+    } else {
+        src = src ++ body_close;
+    }
     return src;
 }
 
@@ -808,6 +866,52 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\@group(0) @binding(2) var<uniform> fog: Fog;
         \\
     ;
+    // Morph-target parameters (variant_morph). SEPARATE group(0) bindings at
+    // @binding(3) (UBO) and @binding(4) (texture), both VERTEX-visible.
+    // UBO layout (std140-compatible, 80 bytes):
+    //   offset   0: idx: array<vec4<i32>, 2>  → 2×16 bytes = 32 bytes (8 i32 slots)
+    //   offset  32: wt:  array<vec4<f32>, 2>  → 2×16 bytes = 32 bytes (8 f32 slots)
+    //   offset  64: count: i32                → 4 bytes (followed by 12 bytes implicit pad)
+    // Access: morph.idx[i / 4][i % 4]  morph.wt[i / 4][i % 4]  morph.count
+    // M6 writes the UBO matching this exact layout.
+    const uniforms_morph =
+        \\struct Morph { idx: array<vec4<i32>, 2>, wt: array<vec4<f32>, 2>, count: i32 };
+        \\@group(0) @binding(3) var<uniform> morph: Morph;
+        \\@group(0) @binding(4) var u_morph_tex: texture_2d<f32>;
+        \\
+    ;
+    // Morph vertex function: adds @builtin(vertex_index) input, accumulates
+    // POSITION + NORMAL deltas, then transforms the morphed locals.
+    // vtx_index drives textureLoad (x-coord = vertex index, y-coord = 2*t or 2*t+1).
+    const vs_head_morph =
+        \\@vertex
+        \\fn vs_main(
+        \\  @location(0) a_pos: vec3<f32>,
+        \\  @location(1) a_normal: vec3<f32>,
+        \\  @location(2) a_tangent: vec4<f32>,
+        \\  @location(3) a_uv: vec2<f32>,
+        \\  @builtin(vertex_index) vtx_index: u32,
+        \\) -> VSOut {
+        \\  var out: VSOut;
+        \\  var m_pos = a_pos;
+        \\  var m_nrm = a_normal;
+        \\  for (var i = 0; i < morph.count; i = i + 1) {
+        \\    let t = morph.idx[i / 4][i % 4];
+        \\    let w = morph.wt[i / 4][i % 4];
+        \\    m_pos = m_pos + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 2 * t), 0).xyz;
+        \\    m_nrm = m_nrm + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 2 * t + 1), 0).xyz;
+        \\  }
+        \\  out.world_pos = (u.model * vec4<f32>(m_pos, 1.0)).xyz;
+        \\  out.normal = u.normal_mat * m_nrm;
+        \\  out.uv = a_uv;
+        \\
+    ;
+    const vs_tail_morph =
+        \\  out.pos = u.mvp * vec4<f32>(m_pos, 1.0);
+        \\  return out;
+        \\}
+        \\
+    ;
     // ── group(1) texture + sampler bindings (varied by variant) ─────
     const samp =
         \\@group(1) @binding(0) var samp: sampler;
@@ -917,6 +1021,11 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     ;
     const vs_shadow =
         \\  out.light_pos = u.light_vp * u.model * vec4<f32>(a_pos, 1.0);
+        \\
+    ;
+    // Shadow path on the morph variant: use the morphed m_pos (parity with GLSL shadow_body_morph).
+    const vs_shadow_morph =
+        \\  out.light_pos = u.light_vp * u.model * vec4<f32>(m_pos, 1.0);
         \\
     ;
     const vs_tail =
@@ -1170,15 +1279,18 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const em = flags & variant_emissive != 0;
     const shadow = flags & variant_shadow != 0;
     const skinned = flags & variant_skinned != 0;
+    const morphed = flags & variant_morph != 0;
     const lin = flags & variant_linear_output != 0;
     const ds = flags & variant_double_sided != 0;
     const inst = flags & variant_instanced != 0;
+    if (morphed and skinned) @compileError("variant_morph + variant_skinned not supported this slice");
     comptime var src: []const u8 = uniforms_head;
     if (shadow) src = src ++ uniforms_shadow;
     if (inst) src = src ++ uniforms_vp;
     src = src ++ uniforms_tail;
     if (skinned) src = src ++ uniforms_bones;
     if (flags & variant_fog != 0) src = src ++ uniforms_fog;
+    if (morphed) src = src ++ uniforms_morph;
     src = src ++ samp ++ tex_base;
     if (nm) src = src ++ tex_normal;
     if (em) src = src ++ tex_emissive;
@@ -1191,6 +1303,11 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ vsout_tail;
     if (inst) {
         src = src ++ vs_head_instanced;
+    } else if (morphed and !skinned) {
+        src = src ++ vs_head_morph;
+        if (nm) src = src ++ vs_nm;
+        if (shadow) src = src ++ vs_shadow_morph;
+        src = src ++ vs_tail_morph;
     } else {
         src = src ++ (if (skinned) vs_head_skinned else vs_head);
         if (nm) src = src ++ (if (skinned) vs_nm_skinned else vs_nm);
@@ -1571,6 +1688,26 @@ pub const Encoder = struct {
     pub fn setFog(self: *Encoder, ptr: u32) void {
         self.header(.set_fog, 4);
         self.putU32(ptr);
+    }
+
+    /// Encode set_morph_weights: the active morph influence set (≤ morph_max_active).
+    /// idx_ptr -> count u32 target indices; wt_ptr -> count f32 weights.
+    pub fn setMorphWeights(self: *Encoder, count: u32, idx_ptr: u32, wt_ptr: u32) void {
+        self.header(.set_morph_weights, 12);
+        self.putU32(count);
+        self.putU32(idx_ptr);
+        self.putU32(wt_ptr);
+    }
+
+    /// Encode create_morph_tex: build the morph data texture from f16 POSITION+NORMAL
+    /// deltas. ptr -> byte_len bytes of half-float delta payload (vmesh morph section).
+    pub fn createMorphTex(self: *Encoder, handle: u32, width: u32, height: u32, ptr: u32, byte_len: u32) void {
+        self.header(.create_morph_tex, 20);
+        self.putU32(handle);
+        self.putU32(width);
+        self.putU32(height);
+        self.putU32(ptr);
+        self.putU32(byte_len);
     }
 
     pub fn setBones(self: *Encoder, count: u32, ptr: u32) void {
@@ -2679,6 +2816,24 @@ test "fog: variant bit + set_fog tag + setFog encoding" {
     try testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, stream[8..12], .little)); // ptr
 }
 
+test "morph: variant bit + tags + encoder payloads" {
+    try testing.expectEqual(@as(u32, 1 << 14), variant_morph);
+    try testing.expectEqual(@as(u8, 29), @intFromEnum(Tag.set_morph_weights));
+    try testing.expectEqual(@as(u8, 30), @intFromEnum(Tag.create_morph_tex));
+    try testing.expectEqual(@as(u32, 8), morph_max_active);
+
+    var buf: [128]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.setMorphWeights(2, 0x1000, 0x2000);
+    const s = enc.finish();
+    // length header (4) + record header (tag u16 + size u16 = 4) + 3 u32 payload.
+    try testing.expectEqual(@as(u16, 29), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 12), std.mem.readInt(u16, s[6..8], .little)); // payload size
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, s[8..12], .little));
+    try testing.expectEqual(@as(u32, 0x1000), std.mem.readInt(u32, s[12..16], .little));
+    try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, s[16..20], .little));
+}
+
 test "fog GLSL: fog variant has u_fog uniforms + mix; non-fog frozen" {
     const f = pbrFragmentSrc(variant_pbr | variant_fog);
     try testing.expect(std.mem.indexOf(u8, f, "u_fog0") != null);
@@ -2687,4 +2842,28 @@ test "fog GLSL: fog variant has u_fog uniforms + mix; non-fog frozen" {
     try testing.expect(std.mem.indexOf(u8, f, "u_fog0.x > 0.5") != null); // mode-0 no-op guard
     const plain = pbrFragmentSrc(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, plain, "u_fog0") == null);
+}
+
+// ── Task 4 (morph): variant_morph GLSL vertex path ───────────────────────────
+
+test "morph GLSL: variant emits morph uniforms + texelFetch loop; non-morph frozen" {
+    const v = pbrVertexSrc(variant_pbr | variant_morph);
+    try testing.expect(std.mem.indexOf(u8, v, "u_morph_tex") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "u_morph_count") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "texelFetch") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "u_morph_idx") != null);
+    const plain = pbrVertexSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "u_morph_tex") == null);
+}
+
+// ── Task 5 (morph): variant_morph WGSL vertex path ───────────────────────────
+
+test "morph WGSL: variant emits morph binding + textureLoad; non-morph frozen" {
+    const w = wgslPbr(variant_pbr | variant_morph);
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(4)") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "u_morph_tex") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "textureLoad") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "morph.count") != null);
+    const plain = wgslPbr(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "u_morph_tex") == null);
 }

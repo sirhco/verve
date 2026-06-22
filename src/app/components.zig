@@ -1421,6 +1421,52 @@ pub fn glSceneFog(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl morph-targets demo — /gl-morph.
+/// A 5×5 subdivided plane with 3 morph targets (Bulge/Wave/Twist) and a
+/// baked LINEAR weight animation that cycles through the targets. The
+/// GlScene island reads morph.vmesh, decodes the morph texture (RGBA16F,
+/// width=vertex_count, height=target_count*2) and plays the baked clip.
+/// A runtime weight-slider scrubs target 0 (Bulge) independently of the clip.
+pub fn glSceneMorph(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/morph.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%230d0f17'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EMorph%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 3.5, .pitch = 0.7, .yaw = 0.4 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.5 })
+        .autoRotate(0.2)
+        .build();
+
+    // Controls wired to GlScene chunk exports via z-on-click. Must live INSIDE
+    // the island subtree (scene IS the <verve-island> node) so the bridge can
+    // resolve chunkExports["GlScene"][action].
+    // glmorph_bulge_on: locks target 0 to 1.0, overriding the baked clip.
+    // glmorph_reset:    releases the runtime lock; baked clip resumes target 0.
+    _ = scene.children(.{
+        ctx.div().class("gl-controls").children(.{
+            ctx.el("button").attr("z-on-click", "glmorph_bulge_on").text("Bulge +"),
+            ctx.el("button").attr("z-on-click", "glmorph_reset").text("Reset"),
+        }),
+    });
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — morph targets (blend shapes)"),
+        ctx.p().text("A 5×5 subdivided plane with three blend shapes: Bulge (centre " ++
+            "pushed up), Wave (sine deformation along X), and Twist (rotation around Y " ++
+            "proportional to Z). A baked LINEAR weight animation cycles Wave and Twist; " ++
+            "Bulge is left to the runtime control below. The morph texture is RGBA16F " ++
+            "(width=vertex_count, height=target_count×2), sampled per-vertex in the " ++
+            "shader (variant_morph = 1<<14). Renders on WebGL2 and WebGPU."),
+        scene,
+        ctx.p().text("The baked clip animates Wave and Twist. \u{201c}Bulge +\u{201d} " ++
+            "drives target 0 at runtime (morph_runtime_set[0]=true), adding a centre " ++
+            "bulge on top of the ongoing animation; \u{201c}Reset\u{201d} releases it. " ++
+            "Runtime weights override the baked clip per index. " ++
+            "Deferred: skinned+morph, TANGENT deltas, >8 active targets."),
+    });
+}
+
 /// /gl-multi: TWO independent GlScene islands on one page (P7 multi-instance).
 /// Each `<verve-island data-name="GlScene">` gets its own per-instance state
 /// slot keyed by vid; the bridge selects the right instance before each frame /
