@@ -1517,6 +1517,23 @@ export fn glscene_cull_stats() u32 {
         ((inst.cull_shadow_culled & 0xff) << 24);
 }
 
+// ── /gl-morph runtime controls ────────────────────────────────────────────────
+
+/// Lock target 0 (Bulge) to weight 1.0 at runtime, overriding the baked clip
+/// for that index while the clip continues animating targets 1 and 2.
+export fn glmorph_bulge_on() void {
+    const inst = current orelse return;
+    inst.morph_weights[0] = 1.0;
+    inst.morph_runtime_set[0] = true;
+}
+
+/// Release the runtime lock on target 0; the baked clip resumes animating it.
+export fn glmorph_reset() void {
+    const inst = current orelse return;
+    inst.morph_weights[0] = 0.0;
+    inst.morph_runtime_set[0] = false;
+}
+
 /// Emit the draw commands for a single submesh `s` with the given pipeline
 /// `state` word. Lazily re-emits SET_PIPELINE (+ lights/IBL/shadow rebind) when
 /// the variant changes vs `last_variant.*`. `pv` is the clip-space proj*view.

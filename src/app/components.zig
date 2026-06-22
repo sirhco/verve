@@ -1435,9 +1435,20 @@ pub fn glSceneMorph(ctx: *const verve.Context) !*verve.Node {
     })
         .camera(.{ .distance = 3.5, .pitch = 0.7, .yaw = 0.4 })
         .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.5 })
-        .morphWeights(&.{ 0.0, 0.0, 0.0 })
         .autoRotate(0.2)
         .build();
+
+    // Controls wired to GlScene chunk exports via z-on-click. Must live INSIDE
+    // the island subtree (scene IS the <verve-island> node) so the bridge can
+    // resolve chunkExports["GlScene"][action].
+    // glmorph_bulge_on: locks target 0 to 1.0, overriding the baked clip.
+    // glmorph_reset:    releases the runtime lock; baked clip resumes target 0.
+    _ = scene.children(.{
+        ctx.div().class("gl-controls").children(.{
+            ctx.el("button").attr("z-on-click", "glmorph_bulge_on").text("Bulge +"),
+            ctx.el("button").attr("z-on-click", "glmorph_reset").text("Reset"),
+        }),
+    });
 
     return ctx.main_().class("home gl-scene-page").children(.{
         ctx.h1("verve.gl — morph targets (blend shapes)"),
@@ -1448,9 +1459,12 @@ pub fn glSceneMorph(ctx: *const verve.Context) !*verve.Node {
             "height=target_count×2), sampled per-vertex in the shader " ++
             "(variant_morph = 1<<14). Renders on WebGL2 and WebGPU."),
         scene,
-        ctx.p().text("Morph weights travel via data-glmorph (CSV); the baked clip " ++
-            "animates via morph:<i> anim target paths. Deferred: skinned+morph, " ++
-            "TANGENT deltas, >8 active targets, CUBICSPLINE Hermite easing."),
+        ctx.p().text("The baked clip animates all three targets via morph:<i> anim " ++
+            "target paths. \u{201c}Bulge +\u{201d} overrides target 0 at runtime " ++
+            "(morph_runtime_set[0]=true), locking Bulge to full weight while the " ++
+            "clip continues animating Wave and Twist. \u{201c}Reset\u{201d} releases " ++
+            "the lock so the clip resumes all three. " ++
+            "Deferred: skinned+morph, TANGENT deltas, >8 active targets."),
     });
 }
 
