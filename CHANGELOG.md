@@ -28,6 +28,16 @@ versions follow [Semantic Versioning](https://semver.org/).
   `stack_size` to 4 MiB so the chunk-data window is ~4 MiB. (This, not the
   previously-suspected `decodeProps` field-count limit, was the real cause of the
   blank GlScene pages.)
+- **gl morph targets / blend shapes** (`src/core/gl/fixture.zig`,
+  `tools/gen_morph_glb.zig`, `build.zig`, `src/app/*`, `docs/24-gl.md`):
+  morph targets (blend shapes) via `variant_morph = 1<<14`. `morphDemoGlb`
+  builds a 5×5 subdivided plane with 3 targets (Bulge/Wave/Twist) and a
+  LINEAR weight animation "MorphDemoAnim". `gen_morph_glb.zig` bakes it to
+  `morph.vmesh` at build time. Wire tags 29 (`set_morph_weights`) / 30
+  (`create_morph_tex`); morph RGBA16F texture (width=vertex_count,
+  height=target_count×2). Initial weights via `data-glmorph`; anim path
+  `morph:<i>` (id `0x02000000|i`). Props stays 14 fields. `/gl-morph` demo:
+  subdivided plane cycling Bulge→Wave→Twist. Both WebGL2 and WebGPU backends.
 
 ## [0.6.4] - 2026-06-21
 
