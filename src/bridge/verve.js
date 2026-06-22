@@ -5630,13 +5630,20 @@
             const hasEmissive = (variant & 0x10) !== 0;
             const hasShadow = (variant & 0x20) !== 0;
             const doubleSided = (variant & 0x800) !== 0;
-            const bgl0 = device.createBindGroupLayout({
-              entries: [{
-                binding: 0,
-                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                buffer: { type: "uniform", hasDynamicOffset: true },
-              }],
-            });
+            const hasFog = (variant & 0x2000) !== 0; // variant_fog: distance fog uniform
+            const instBgl0Entries = [{
+              binding: 0,
+              visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+              buffer: { type: "uniform", hasDynamicOffset: true },
+            }];
+            if (hasFog) {
+              instBgl0Entries.push({
+                binding: 2,
+                visibility: GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform" },
+              });
+            }
+            const bgl0 = device.createBindGroupLayout({ entries: instBgl0Entries });
             const FRAG = GPUShaderStage.FRAGMENT;
             const tex2d = { sampleType: "float", viewDimension: "2d" };
             const texCube = { sampleType: "float", viewDimension: "cube" };
@@ -5710,6 +5717,7 @@
               hasNormal,
               hasEmissive,
               hasShadow,
+              hasFog,
             };
             break;
           }
@@ -5735,6 +5743,14 @@
               bgl0Entries.push({
                 binding: 1,
                 visibility: GPUShaderStage.VERTEX,
+                buffer: { type: "uniform" },
+              });
+            }
+            const hasFog = (variant & 0x2000) !== 0; // variant_fog: distance fog uniform
+            if (hasFog) {
+              bgl0Entries.push({
+                binding: 2,
+                visibility: GPUShaderStage.FRAGMENT,
                 buffer: { type: "uniform" },
               });
             }
@@ -5861,6 +5877,7 @@
               hasEmissive,
               hasShadow,
               skinned,
+              hasFog,
             };
             break;
           }
@@ -6267,6 +6284,12 @@
             if (active.skinned) {
               bg0Entries.push({ binding: 1, resource: { buffer: gpuEnsureBones(st) } });
             }
+            // binding 2: fog UBO (static, FRAGMENT-only). Created lazily; SET_FOG
+            // also creates it on first call. Layout has binding 2 iff hasFog.
+            if (active.hasFog) {
+              if (!st.fogBuf) st.fogBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+              bg0Entries.push({ binding: 2, resource: { buffer: st.fogBuf } });
+            }
             st.bg0 = device.createBindGroup({ layout: active.bgl0, entries: bg0Entries });
             st.bg0Layout = active.bgl0;
           }
@@ -6359,9 +6382,14 @@
           device.queue.writeBuffer(ubuf, base + PBR_U.prefMips, new Float32Array([st.framePrefMips || 0]));
           // ── Bind group 0: dynamic-offset uniform. Instanced has no bones. ──
           if (!st.bg0 || st.bg0Layout !== active.bgl0) {
+            const bg0Entries = [{ binding: 0, resource: { buffer: ubuf, offset: 0, size: PBR_U.size } }];
+            if (active.hasFog) {
+              if (!st.fogBuf) st.fogBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+              bg0Entries.push({ binding: 2, resource: { buffer: st.fogBuf } });
+            }
             st.bg0 = device.createBindGroup({
               layout: active.bgl0,
-              entries: [{ binding: 0, resource: { buffer: ubuf, offset: 0, size: PBR_U.size } }],
+              entries: bg0Entries,
             });
             st.bg0Layout = active.bgl0;
           }
@@ -6501,6 +6529,14 @@
           st.pass.setBindGroup(0, bg0);
           st.pass.setBindGroup(1, bg1);
           st.pass.draw(3, 1, 0, 0);
+          break;
+        }
+        case 28: { // SET_FOG (WebGPU) — write the 8 f32 fog UBO at group(0) binding(2).
+          // Payload (4B): ptr → 8 f32 (Fog.a: vec4, Fog.b: vec4 = 32B total).
+          // Lazily creates st.fogBuf on first call; SET_FOG may arrive before the
+          // first draw if the frame order is set_fog → set_pipeline → draw_pbr.
+          if (!st.fogBuf) st.fogBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          device.queue.writeBuffer(st.fogBuf, 0, memory.buffer, dv.getUint32(off, true), 32);
           break;
         }
         default:
@@ -6776,6 +6812,7 @@
       uniformBuf: null,
       bindGroup: null,
       instanceBuf: null, // lazy GPUBuffer (VERTEX|COPY_DST) for per-instance mat4+color (case 27)
+      fogBuf: null, // lazy 32-byte UBO (UNIFORM|COPY_DST) for distance fog (case 28/binding 2)
       pbrUniform: null, // shared PBR uniform buffer (lazy; PBR_U.size bytes)
       bonesBuf: null, // shared bones palette uniform (lazy; 64 mat4) — skinned
       depthUniform: null, // shadow depth-pass uniform (lazy; one mat4)
@@ -6866,6 +6903,7 @@
       st.ibl = null;
       st.shadow = null;
       st.instanceBuf = null; // GPU vertex buffer for per-instance data (no .destroy — dead device)
+      if (st.fogBuf) { st.fogBuf.destroy?.(); st.fogBuf = null; }
       st.pbrUniform = null;
       st.bonesBuf = null;
       st.uniformBuf = null; // slice-1 basic-draw path's persistent buffer
