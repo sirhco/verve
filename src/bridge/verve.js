@@ -5717,10 +5717,10 @@
           // with two vertex.buffers and stored as kind "pbr-instanced". FRESH
           // descriptor literals — does NOT touch pbrDesc or the non-instanced pipeline.
           if ((variant & 0x1000) !== 0) {
-            // Guard: instanced + shadow (0x1020) share offset 384 in the WGSL U
+            // Guard: instanced + shadow (0x1020) share offset 512 in the WGSL U
             // struct (vp vs light_vp) — unsupported in v1.  Fail loud, not garbage.
             if ((variant & 0x1020) === 0x1020) {
-              console.error("gl: variant_instanced|variant_shadow (0x" + variant.toString(16) + ") unsupported — vp/light_vp collision at U offset 384; skipping pipeline build");
+              console.error("gl: variant_instanced|variant_shadow (0x" + variant.toString(16) + ") unsupported — vp/light_vp collision at U offset 512; skipping pipeline build");
               break;
             }
             const hasNormal = (variant & 0x8) !== 0;
@@ -6486,15 +6486,15 @@
             });
           }
           device.queue.writeBuffer(st.instanceBuf, 0, memory.buffer, instancePtr, instBytes);
-          // ── Per-draw uniform slot (PBR_U layout, instanced U adds vp @ 384). ──
+          // ── Per-draw uniform slot (PBR_U layout, instanced U adds vp @ 512). ──
           // The instanced WGSL U struct has all standard fields (mvp, model, …)
-          // plus `vp: mat4x4<f32>` appended at offset 384 (same as PBR_U.lightVp).
+          // plus `vp: mat4x4<f32>` appended at offset 512 (same as PBR_U.lightVp).
           // We only write the fields the shader actually reads: vp, material, camera.
           const ubuf = gpuEnsurePbrUniform(st);
           const slot = st.pbrSlot++;
           if (slot >= MAX_DRAWS) break;
           const base = slot * PBR_STRIDE;
-          // vp (view-proj): u.vp — offset 384 (= PBR_U.lightVp in the JS table).
+          // vp (view-proj): u.vp — offset 512 (= PBR_U.lightVp in the JS table).
           device.queue.writeBuffer(ubuf, base + PBR_U.lightVp, new Float32Array(memory.buffer, vpPtr, 16));
           // material: 3×vec4 = 12 f32.
           device.queue.writeBuffer(ubuf, base + PBR_U.material, new Float32Array(memory.buffer, materialPtr, 12));
