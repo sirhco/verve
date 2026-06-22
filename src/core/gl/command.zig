@@ -51,6 +51,8 @@ pub const Tag = enum(u16) {
     draw_depth_at = 26, // {shader, vbuf, ibuf, index_byte_off, index_count, mvp_ptr, material_ptr} — alpha-tested depth draw (MASK shadows)
     draw_pbr_instanced = 27, // {vbuf, ibuf, off, count, instance_ptr, instance_count, vp_ptr, material_ptr, camera_ptr}
     set_fog = 28, // {ptr -> 8 f32 FogParams}
+    set_morph_weights = 29, // {count, idx_ptr -> count u32, wt_ptr -> count f32}
+    create_morph_tex = 30, // {handle, width, height, ptr -> f16 deltas, byte_len}
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -87,6 +89,7 @@ pub const variant_alpha_test: u32 = 1 << 10; // requires variant_pbr; MASK cutou
 pub const variant_double_sided: u32 = 1 << 11; // requires variant_pbr; render both faces, flip back-face normal
 pub const variant_instanced: u32 = 1 << 12; // requires variant_pbr; per-instance model (attr 4-7) + color (attr 8); non-skinned
 pub const variant_fog: u32 = 1 << 13; // requires variant_pbr; distance fog mix before tonemap
+pub const variant_morph: u32 = 1 << 14; // requires variant_pbr; texture-blended POSITION+NORMAL morph deltas
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -97,6 +100,7 @@ pub const clear_flag_depth: u32 = 1 << 1;
 pub const max_lights: u32 = 4;
 pub const light_stride_f32: u32 = 8; // [type(0=dir,1=point), intensity, x,y,z, r,g,b]
 pub const fog_params_f32: u32 = 8; // [mode, r,g,b, near, far, density, _pad]
+pub const morph_max_active: u32 = 8; // K: max simultaneously-active morph influences
 pub const material_len_f32: u32 = 12; // base_color rgba | metallic, roughness, occlusion_strength, normal_scale | emissive rgb, 0
 
 pub const tex_slot_base: u32 = 0;
@@ -1573,6 +1577,26 @@ pub const Encoder = struct {
         self.putU32(ptr);
     }
 
+    /// Encode set_morph_weights: the active morph influence set (≤ morph_max_active).
+    /// idx_ptr -> count u32 target indices; wt_ptr -> count f32 weights.
+    pub fn setMorphWeights(self: *Encoder, count: u32, idx_ptr: u32, wt_ptr: u32) void {
+        self.header(.set_morph_weights, 12);
+        self.putU32(count);
+        self.putU32(idx_ptr);
+        self.putU32(wt_ptr);
+    }
+
+    /// Encode create_morph_tex: build the morph data texture from f16 POSITION+NORMAL
+    /// deltas. ptr -> byte_len bytes of half-float delta payload (vmesh morph section).
+    pub fn createMorphTex(self: *Encoder, handle: u32, width: u32, height: u32, ptr: u32, byte_len: u32) void {
+        self.header(.create_morph_tex, 20);
+        self.putU32(handle);
+        self.putU32(width);
+        self.putU32(height);
+        self.putU32(ptr);
+        self.putU32(byte_len);
+    }
+
     pub fn setBones(self: *Encoder, count: u32, ptr: u32) void {
         self.header(.set_bones, 8);
         self.putU32(count);
@@ -2677,6 +2701,24 @@ test "fog: variant bit + set_fog tag + setFog encoding" {
     try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, stream[4..6], .little)); // tag
     try testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, stream[6..8], .little)); // payload size
     try testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, stream[8..12], .little)); // ptr
+}
+
+test "morph: variant bit + tags + encoder payloads" {
+    try testing.expectEqual(@as(u32, 1 << 14), variant_morph);
+    try testing.expectEqual(@as(u8, 29), @intFromEnum(Tag.set_morph_weights));
+    try testing.expectEqual(@as(u8, 30), @intFromEnum(Tag.create_morph_tex));
+    try testing.expectEqual(@as(u32, 8), morph_max_active);
+
+    var buf: [128]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.setMorphWeights(2, 0x1000, 0x2000);
+    const s = enc.finish();
+    // length header (4) + record header (tag u16 + size u16 = 4) + 3 u32 payload.
+    try testing.expectEqual(@as(u16, 29), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 12), std.mem.readInt(u16, s[6..8], .little)); // payload size
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, s[8..12], .little));
+    try testing.expectEqual(@as(u32, 0x1000), std.mem.readInt(u32, s[12..16], .little));
+    try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, s[16..20], .little));
 }
 
 test "fog GLSL: fog variant has u_fog uniforms + mix; non-fog frozen" {
