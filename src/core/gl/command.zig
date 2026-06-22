@@ -892,6 +892,52 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\@group(0) @binding(2) var<uniform> fog: Fog;
         \\
     ;
+    // Morph-target parameters (variant_morph). SEPARATE group(0) bindings at
+    // @binding(3) (UBO) and @binding(4) (texture), both VERTEX-visible.
+    // UBO layout (std140-compatible, 128 bytes):
+    //   offset   0: idx: array<vec4<i32>, 2>  → 2×16 bytes = 32 bytes (8 i32 slots)
+    //   offset  32: wt:  array<vec4<f32>, 2>  → 2×16 bytes = 32 bytes (8 f32 slots)
+    //   offset  64: count: i32                → 4 bytes (followed by 12 bytes implicit pad)
+    // Access: morph.idx[i / 4][i % 4]  morph.wt[i / 4][i % 4]  morph.count
+    // M6 writes the UBO matching this exact layout.
+    const uniforms_morph =
+        \\struct Morph { idx: array<vec4<i32>, 2>, wt: array<vec4<f32>, 2>, count: i32 };
+        \\@group(0) @binding(3) var<uniform> morph: Morph;
+        \\@group(0) @binding(4) var u_morph_tex: texture_2d<f32>;
+        \\
+    ;
+    // Morph vertex function: adds @builtin(vertex_index) input, accumulates
+    // POSITION + NORMAL deltas, then transforms the morphed locals.
+    // vtx_index drives textureLoad (x-coord = vertex index, y-coord = 2*t or 2*t+1).
+    const vs_head_morph =
+        \\@vertex
+        \\fn vs_main(
+        \\  @location(0) a_pos: vec3<f32>,
+        \\  @location(1) a_normal: vec3<f32>,
+        \\  @location(2) a_tangent: vec4<f32>,
+        \\  @location(3) a_uv: vec2<f32>,
+        \\  @builtin(vertex_index) vtx_index: u32,
+        \\) -> VSOut {
+        \\  var out: VSOut;
+        \\  var m_pos = a_pos;
+        \\  var m_nrm = a_normal;
+        \\  for (var i = 0; i < morph.count; i = i + 1) {
+        \\    let t = morph.idx[i / 4][i % 4];
+        \\    let w = morph.wt[i / 4][i % 4];
+        \\    m_pos = m_pos + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 2 * t), 0).xyz;
+        \\    m_nrm = m_nrm + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 2 * t + 1), 0).xyz;
+        \\  }
+        \\  out.world_pos = (u.model * vec4<f32>(m_pos, 1.0)).xyz;
+        \\  out.normal = u.normal_mat * m_nrm;
+        \\  out.uv = a_uv;
+        \\
+    ;
+    const vs_tail_morph =
+        \\  out.pos = u.mvp * vec4<f32>(m_pos, 1.0);
+        \\  return out;
+        \\}
+        \\
+    ;
     // ── group(1) texture + sampler bindings (varied by variant) ─────
     const samp =
         \\@group(1) @binding(0) var samp: sampler;
@@ -1254,6 +1300,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const em = flags & variant_emissive != 0;
     const shadow = flags & variant_shadow != 0;
     const skinned = flags & variant_skinned != 0;
+    const morphed = flags & variant_morph != 0;
     const lin = flags & variant_linear_output != 0;
     const ds = flags & variant_double_sided != 0;
     const inst = flags & variant_instanced != 0;
@@ -1263,6 +1310,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ uniforms_tail;
     if (skinned) src = src ++ uniforms_bones;
     if (flags & variant_fog != 0) src = src ++ uniforms_fog;
+    if (morphed) src = src ++ uniforms_morph;
     src = src ++ samp ++ tex_base;
     if (nm) src = src ++ tex_normal;
     if (em) src = src ++ tex_emissive;
@@ -1275,6 +1323,11 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ vsout_tail;
     if (inst) {
         src = src ++ vs_head_instanced;
+    } else if (morphed and !skinned) {
+        src = src ++ vs_head_morph;
+        if (nm) src = src ++ vs_nm;
+        if (shadow) src = src ++ vs_shadow;
+        src = src ++ vs_tail_morph;
     } else {
         src = src ++ (if (skinned) vs_head_skinned else vs_head);
         if (nm) src = src ++ (if (skinned) vs_nm_skinned else vs_nm);
@@ -2820,5 +2873,17 @@ test "morph GLSL: variant emits morph uniforms + texelFetch loop; non-morph froz
     try testing.expect(std.mem.indexOf(u8, v, "texelFetch") != null);
     try testing.expect(std.mem.indexOf(u8, v, "u_morph_idx") != null);
     const plain = pbrVertexSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "u_morph_tex") == null);
+}
+
+// ── Task 5 (morph): variant_morph WGSL vertex path ───────────────────────────
+
+test "morph WGSL: variant emits morph binding + textureLoad; non-morph frozen" {
+    const w = wgslPbr(variant_pbr | variant_morph);
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(4)") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "u_morph_tex") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "textureLoad") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "morph.count") != null);
+    const plain = wgslPbr(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, plain, "u_morph_tex") == null);
 }
