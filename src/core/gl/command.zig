@@ -458,6 +458,27 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    const fog_uniforms =
+        \\uniform vec4 u_fog0; // [mode, color.r, color.g, color.b]
+        \\uniform vec4 u_fog1; // [near, far, density, _pad]
+        \\
+    ;
+    const fog_mix =
+        \\  float fog_dist = length(u_camera_pos - v_world_pos);
+        \\  float fog_factor = 1.0;
+        \\  if (u_fog0.x > 0.5) {
+        \\    if (u_fog0.x < 1.5) {
+        \\      fog_factor = (u_fog1.y - fog_dist) / max(u_fog1.y - u_fog1.x, 1e-4);
+        \\    } else if (u_fog0.x < 2.5) {
+        \\      fog_factor = exp(-u_fog1.z * fog_dist);
+        \\    } else {
+        \\      float fd = u_fog1.z * fog_dist;
+        \\      fog_factor = exp(-fd * fd);
+        \\    }
+        \\    color = mix(u_fog0.yzw, color, clamp(fog_factor, 0.0, 1.0));
+        \\  }
+        \\
+    ;
     const main_open =
         \\void main() {
         \\  vec4 base_color = u_material[0];
@@ -587,6 +608,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     if (flags & variant_normal_map != 0) src = src ++ nm_sampler;
     if (flags & variant_emissive != 0) src = src ++ em_sampler;
     src = src ++ ibl_samplers;
+    if (flags & variant_fog != 0) src = src ++ fog_uniforms;
     if (flags & variant_shadow != 0) src = src ++ shadow_decls;
     src = src ++ main_open;
     if (flags & variant_instanced != 0) src = src ++ inst_tint;
@@ -596,6 +618,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ lighting;
     src = src ++ (if (flags & variant_shadow != 0) combine_shadow else combine_plain);
     if (flags & variant_emissive != 0) src = src ++ emissive;
+    if (flags & variant_fog != 0) src = src ++ fog_mix;
     if (flags & variant_linear_output == 0) src = src ++ tail_tonemap;
     src = src ++ tail_close;
     return src;
@@ -2617,4 +2640,14 @@ test "fog: variant bit + set_fog tag + setFog encoding" {
     try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, stream[4..6], .little)); // tag
     try testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, stream[6..8], .little)); // payload size
     try testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, stream[8..12], .little)); // ptr
+}
+
+test "fog GLSL: fog variant has u_fog uniforms + mix; non-fog frozen" {
+    const f = pbrFragmentSrc(variant_pbr | variant_fog);
+    try testing.expect(std.mem.indexOf(u8, f, "u_fog0") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "u_fog1") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "mix(u_fog0.yzw, color") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "u_fog0.x > 0.5") != null); // mode-0 no-op guard
+    const plain = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "u_fog0") == null);
 }
