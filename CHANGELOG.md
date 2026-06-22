@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-06-21
+
 ### Added
 
 - **gl GPU instancing** (`src/core/gl/fixture.zig`, `tools/gen_cubefield_glb.zig`,
@@ -16,6 +18,27 @@ versions follow [Semantic Versioning](https://semver.org/).
   hue-varied cubes in one `draw_pbr_instanced` (wire tag 27) call on both WebGL2
   and WebGPU backends. Deferred: per-instance culling, instanced shadows,
   skinned+instanced, non-uniform-scale normals.
+
+### Fixed
+
+- **gl instanced frame truncation** (`src/client/islands/GlScene.zig`): the
+  instanced draw path returned `&cmd_buf` without `enc.finish()`, leaving the
+  command-stream length header unstamped. The bridge read a stale length and
+  truncated every frame before the instanced draw — blank canvas on both
+  backends. Now stamps the header before returning.
+- **gl instanced per-instance color on WebGL2** (`src/core/gl/command.zig`): the
+  GLSL `inst_tint` multiplied the per-instance color into `base_color` *after*
+  `albedo` was already derived from the untinted color, so the tint never reached
+  the lit result (washed cubes on WebGL2; WebGPU already folded it in before
+  `albedo`). Now tints `albedo` too — backend parity restored.
+- **client: event dispatch `RuntimeError: null function`** (`src/client/event_state.zig`):
+  every event on a handler element with a `data-*` attribute trapped, because
+  `std.json.parseFromSlice` over a runtime slice in the `--import-table` main
+  client calls an address-taken parser callback whose imported-table slot is
+  unpopulated. Most visible on gl pages (the canvas's `data-ref` fires on every
+  pointer move/drag). `targetAttr` now scans the staged flat dataset object with a
+  hand-rolled string reader — no `std.json`, no allocator, no function pointers on
+  this path. The chunk-facing `verve_json_*` surface is unaffected.
 
 ## [0.6.3] - 2026-06-21
 
