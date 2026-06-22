@@ -799,6 +799,15 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\@group(0) @binding(1) var<uniform> bones: Bones;
         \\
     ;
+    // Fog parameters (variant_fog). A SEPARATE group(0) binding at @binding(2).
+    const uniforms_fog =
+        \\struct Fog {
+        \\  a: vec4<f32>, // [mode, color.r, color.g, color.b]
+        \\  b: vec4<f32>, // [near, far, density, _pad]
+        \\};
+        \\@group(0) @binding(2) var<uniform> fog: Fog;
+        \\
+    ;
     // ── group(1) texture + sampler bindings (varied by variant) ─────
     const samp =
         \\@group(1) @binding(0) var samp: sampler;
@@ -1127,6 +1136,23 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  color = color + emissive_factor * textureSample(emissive_tex, samp, in.uv).rgb;
         \\
     ;
+    // Fog mix (variant_fog). Applied after emissive, before tonemap.
+    const fs_fog_mix =
+        \\  let fog_dist = length(u.camera_pos - in.world_pos);
+        \\  var fog_factor = 1.0;
+        \\  if (fog.a.x > 0.5) {
+        \\    if (fog.a.x < 1.5) {
+        \\      fog_factor = (fog.b.y - fog_dist) / max(fog.b.y - fog.b.x, 1e-4);
+        \\    } else if (fog.a.x < 2.5) {
+        \\      fog_factor = exp(-fog.b.z * fog_dist);
+        \\    } else {
+        \\      let fd = fog.b.z * fog_dist;
+        \\      fog_factor = exp(-fd * fd);
+        \\    }
+        \\    color = mix(fog.a.yzw, color, clamp(fog_factor, 0.0, 1.0));
+        \\  }
+        \\
+    ;
     // ACES tonemap + gamma. Skipped for variant_linear_output (the post
     // pipeline renders linear HDR offscreen and tonemaps in the composite pass).
     const fs_tail_tonemap =
@@ -1152,6 +1178,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (inst) src = src ++ uniforms_vp;
     src = src ++ uniforms_tail;
     if (skinned) src = src ++ uniforms_bones;
+    if (flags & variant_fog != 0) src = src ++ uniforms_fog;
     src = src ++ samp ++ tex_base;
     if (nm) src = src ++ tex_normal;
     if (em) src = src ++ tex_emissive;
@@ -1179,6 +1206,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ fs_lighting;
     src = src ++ (if (shadow) fs_combine_shadow else fs_combine_plain);
     if (em) src = src ++ fs_emissive;
+    if (flags & variant_fog != 0) src = src ++ fs_fog_mix;
     if (!lin) src = src ++ fs_tail_tonemap;
     src = src ++ fs_tail_close;
     return src;
@@ -2420,6 +2448,15 @@ test "variant_alpha_test WGSL discard appended only when set" {
     try testing.expect(std.mem.indexOf(u8, mask, "discard") != null);
     const plain = wgslPbr(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, plain, "discard") == null);
+}
+
+test "fog WGSL: fog binding + mix; non-fog frozen" {
+    const w = wgslPbr(variant_pbr | variant_fog);
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(2) var<uniform> fog: Fog;") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "mix(fog.a.yzw, color") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fog.a.x > 0.5") != null); // mode-0 no-op guard
+    const plain = wgslPbr(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "fog: Fog") == null);
 }
 
 test "golden: post shader sources frozen (FNV-1a-64)" {
