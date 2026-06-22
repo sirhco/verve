@@ -292,6 +292,9 @@ const Inst = struct {
     morph_active_wt: [8]f32 = .{0} ** 8,
     morph_count: u32 = 0,
     morph_tex_recorded: bool = false, // true once createMorphTex emitted (for restore)
+    // M8: per-index runtime-set flag. When set, the per-frame baked-clip advance
+    // skips that index so runtime tweens (or parseMorph seeds) are not clobbered.
+    morph_runtime_set: [max_morph_targets]bool = .{false} ** max_morph_targets,
 };
 
 const MAX_INSTANCES = 4;
@@ -685,6 +688,22 @@ fn parseFog(inst: *Inst, s: []const u8) void {
     inst.fog_enabled = true;
 }
 
+// Parse a "w0,w1,…" morph-weight attribute into inst.morph_weights[0..].
+// Seeds up to max_morph_targets weights and marks each as runtime-set so the
+// per-frame baked-clip advance does not overwrite them.  Tolerant: extra
+// tokens are ignored; parse errors for a token leave that index at 0.
+fn parseMorph(inst: *Inst, s: []const u8) void {
+    var n: u32 = 0;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        if (n >= max_morph_targets) break;
+        const w = std.fmt.parseFloat(f32, tok) catch 0.0;
+        inst.morph_weights[n] = w;
+        inst.morph_runtime_set[n] = true;
+        n += 1;
+    }
+}
+
 export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     // First instance of a fresh population owns the page asset-region reset.
     // Subsequent instances SHARE the region (resetting would free their assets).
@@ -763,6 +782,15 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         var fbuf: [512]u8 = undefined;
         const fa = verve.refGetAttr(ch, "data-glfog", &fbuf);
         if (fa.len != 0) parseFog(inst, fa);
+    }
+
+    // Morph weights ride on the canvas `data-glmorph` attribute (NOT Props).
+    // Format: "w0,w1,…".  Seeds inst.morph_weights and marks runtime-set so the
+    // per-frame baked-clip advance does not overwrite these initial values.
+    if (inst.canvas_handle) |ch| {
+        var mbuf: [512]u8 = undefined;
+        const ma = verve.refGetAttr(ch, "data-glmorph", &mbuf);
+        if (ma.len != 0) parseMorph(inst, ma);
     }
 
     // Kick the asset fetches (geometry + prefiltered IBL).
@@ -1170,6 +1198,8 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             const n_targets = @min(a.morphTargetCount(), max_morph_targets);
             var ti: u32 = 0;
             while (ti < n_targets) : (ti += 1) {
+                // M8: skip indices locked by a runtime set (parseMorph or anim tween).
+                if (inst.morph_runtime_set[ti]) continue;
                 if (a.morphWeightTrack(ti)) |trk| {
                     const kc = trk.key_count;
                     if (kc == 0) continue;
@@ -1800,6 +1830,15 @@ fn applyAnimTarget(inst: *Inst, id: u32, value: f32) void {
                 .scale_y => inst.node_scale[s][1] = value,
                 .scale_z => inst.node_scale[s][2] = value,
             }
+        },
+        .morph => {
+            // field is the morph target index (0–255); cap to max_morph_targets.
+            const idx: usize = d.field;
+            if (idx >= max_morph_targets) return;
+            inst.morph_weights[idx] = value;
+            // Mark as runtime-set so the per-frame baked-clip advance skips this
+            // index and the runtime value is not clobbered each frame.
+            inst.morph_runtime_set[idx] = true;
         },
     }
 }

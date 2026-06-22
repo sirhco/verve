@@ -98,6 +98,7 @@ pub const GlSceneBuilder = struct {
     auto_rotate_rad: f32 = 0,
     scrub_on: bool = false,
     fog_opts: FogOpts = .{},
+    morph_weights_buf: []const f32 = &.{},
     pick_names_buf: [max_picks][]const u8 = undefined,
     pick_ids_buf: [max_picks]u32 = undefined,
     pick_export_buf: [max_picks][]const u8 = undefined,
@@ -129,6 +130,14 @@ pub const GlSceneBuilder = struct {
     /// Distance fog. `mode = .none` (default) disables fog entirely.
     pub fn fog(self: *GlSceneBuilder, f: FogOpts) *GlSceneBuilder {
         self.fog_opts = f;
+        return self;
+    }
+
+    /// Seed morph-target weights for static or initial values.  Transported
+    /// outside Props via `data-glmorph` (CSV "w0,w1,…") so Props stays 14
+    /// fields.  An empty slice emits no attribute.
+    pub fn morphWeights(self: *GlSceneBuilder, weights: []const f32) *GlSceneBuilder {
+        self.morph_weights_buf = weights;
         return self;
     }
 
@@ -230,6 +239,24 @@ pub const GlSceneBuilder = struct {
             .onWheel("glscene_wheel")
             .onClick("glscene_click");
         if (fog_attr) |fa| _ = canvas.attr("data-glfog", fa);
+
+        // Morph weights travel OUTSIDE Props as a comma-joined `data-glmorph`
+        // attribute ("w0,w1,…") the chunk reads via refGetAttr + parseMorph.
+        // Only emitted when the slice is non-empty.
+        if (self.morph_weights_buf.len > 0) {
+            // Build CSV into a stack buffer (64 weights × ~16 chars ≈ 1024 B).
+            var mbuf: [1024]u8 = undefined;
+            var pos: usize = 0;
+            for (self.morph_weights_buf, 0..) |wt, wi| {
+                const sep: []const u8 = if (wi != 0) "," else "";
+                const chunk = std.fmt.bufPrint(mbuf[pos..], "{s}{d}", .{ sep, wt }) catch break;
+                pos += chunk.len;
+            }
+            if (pos > 0) {
+                const morph_attr = std.fmt.allocPrint(self.ctx.allocator, "{s}", .{mbuf[0..pos]}) catch null;
+                if (morph_attr) |ma| _ = canvas.attr("data-glmorph", ma);
+            }
+        }
 
         const inner_wrapper = self.ctx.div()
             .attr("style", "position:relative;display:block;width:100%;height:100%");
@@ -581,4 +608,26 @@ test "glScene fog defaults to none (no data-glfog)" {
     const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
     const html = try renderHtml(scene, arena.allocator());
     try testing.expect(std.mem.indexOf(u8, html, "data-glfog") == null);
+}
+
+test "glScene .morphWeights emits data-glmorph attribute" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .morphWeights(&.{ 0.0, 0.5 })
+        .build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glmorph=\"0,0.5\"") != null);
+}
+
+test "glScene no .morphWeights call emits no data-glmorph" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glmorph") == null);
 }

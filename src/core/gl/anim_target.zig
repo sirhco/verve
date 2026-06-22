@@ -21,6 +21,7 @@
 //!   "node:<Name>.rotationX" | "node:<Name>.rotationY" | "node:<Name>.rotationZ"
 //!   "node:<Name>.translateX" | "node:<Name>.translateY" | "node:<Name>.translateZ"
 //!   "node:<Name>.scaleX" | "node:<Name>.scaleY" | "node:<Name>.scaleZ"
+//!   "morph:<index>"  (index 0–255; submesh always 0)
 //!
 //! resolvePathStatic handles ONLY camera.* and model.* (no name-table lookup needed).
 //! Use it for SSR where no vmesh Reader is available.
@@ -32,7 +33,7 @@ const vmesh = @import("vmesh.zig");
 
 // ── enumerations ──────────────────────────────────────────────────────────────
 
-pub const Kind = enum(u8) { camera = 0, material = 1, model = 2, node = 3 };
+pub const Kind = enum(u8) { camera = 0, material = 1, model = 2, node = 3, morph = 4 };
 pub const CameraField = enum(u8) { yaw = 0, pitch = 1, distance = 2 };
 pub const MaterialField = enum(u8) { metallic = 0, roughness = 1, emissive_r = 2, emissive_g = 3, emissive_b = 4, base_color_r = 5, base_color_g = 6, base_color_b = 7, base_color_a = 8 };
 pub const ModelField = enum(u8) { yaw = 0 };
@@ -81,6 +82,9 @@ pub fn decode(id: u32) ?Decoded {
         },
         .node => {
             _ = enumFromIntChecked(NodeField, field) orelse return null;
+        },
+        .morph => {
+            // field is the morph target index (0–255); all values valid.
         },
     }
     return Decoded{ .kind = kind, .submesh = submesh, .field = field };
@@ -217,6 +221,13 @@ pub fn resolvePath(reader: *const vmesh.Reader, path: []const u8) ?u32 {
         return encode(.node, submesh, node_field);
     }
 
+    // "morph:<index>"  (field = morph target index 0–255; submesh always 0)
+    if (std.mem.startsWith(u8, path, "morph:")) {
+        const idx_str = path["morph:".len..];
+        const idx = std.fmt.parseInt(u8, idx_str, 10) catch return null;
+        return encode(.morph, 0, idx);
+    }
+
     return null;
 }
 
@@ -312,10 +323,19 @@ test "(a) encode/decode round-trip: material emissive fields" {
 
 // ── (b) decode rejects invalid ids ───────────────────────────────────────────
 
-test "(b) decode rejects kind 4" {
-    // kind=4 is unknown (0–3 are now valid)
-    const id: u32 = (4 << 24) | 0;
+test "(b) decode rejects kind 5" {
+    // kind=5 is unknown (0–4 are now valid: camera/material/model/node/morph)
+    const id: u32 = (5 << 24) | 0;
     try testing.expectEqual(@as(?Decoded, null), decode(id));
+}
+
+test "(b) decode accepts morph kind 4" {
+    // kind=4 is morph; field is an arbitrary target index (0–255)
+    const id = encode(.morph, 0, 3);
+    const d = decode(id) orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(Kind.morph, d.kind);
+    try testing.expectEqual(@as(u16, 0), d.submesh);
+    try testing.expectEqual(@as(u8, 3), d.field);
 }
 
 test "(b) decode rejects camera field 3" {
@@ -725,4 +745,39 @@ test "(c) resolvePath material:Cube.baseColorA via fixture reader" {
 
 test "(g) frozen-id regression: material baseColorA id" {
     try testing.expectEqual(@as(u32, 0x01000008), encode(.material, 0, @intFromEnum(MaterialField.base_color_a)));
+}
+
+// ── (i) morph target ─────────────────────────────────────────────────────────
+
+test "(i) resolvePath morph:3 returns encode(.morph, 0, 3)" {
+    const fr = try makeFixtureReader(testing.allocator);
+    defer testing.allocator.free(fr.bytes);
+    const id = resolvePath(&fr.reader, "morph:3") orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(encode(.morph, 0, 3), id);
+}
+
+test "(i) resolvePath morph:0 round-trip decode kind=morph field=0" {
+    const fr = try makeFixtureReader(testing.allocator);
+    defer testing.allocator.free(fr.bytes);
+    const id = resolvePath(&fr.reader, "morph:0") orelse return error.TestUnexpectedNull;
+    const d = decode(id) orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(Kind.morph, d.kind);
+    try testing.expectEqual(@as(u16, 0), d.submesh);
+    try testing.expectEqual(@as(u8, 0), d.field);
+}
+
+test "(i) frozen-id regression: morph:0 = 0x04000000, morph:3 = 0x04000003" {
+    // morph kind=0x04, submesh=0x0000, field=index
+    try testing.expectEqual(@as(u32, 0x04000000), encode(.morph, 0, 0));
+    try testing.expectEqual(@as(u32, 0x04000003), encode(.morph, 0, 3));
+}
+
+test "(i) resolvePath morph: unknown / bad index → null" {
+    const fr = try makeFixtureReader(testing.allocator);
+    defer testing.allocator.free(fr.bytes);
+    // "morph:" with no digits or non-numeric → null
+    try testing.expectEqual(@as(?u32, null), resolvePath(&fr.reader, "morph:"));
+    try testing.expectEqual(@as(?u32, null), resolvePath(&fr.reader, "morph:abc"));
+    // index > 255 → null (u8 parse overflow)
+    try testing.expectEqual(@as(?u32, null), resolvePath(&fr.reader, "morph:256"));
 }
