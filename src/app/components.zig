@@ -1394,8 +1394,8 @@ pub fn glSceneInstanced(ctx: *const verve.Context) !*verve.Node {
 }
 
 /// /gl-fog: 7×7 = 49-cube receding grid with distance fog enabled.
-/// Linear fog from near=6 to far=42 with a dark blue-grey fog colour (0.05,0.06,0.09)
-/// that matches the scene clear colour — distant cubes dissolve into the background.
+/// Linear fog from near=8 to far=34 with a soft blue-grey fog colour (0.42,0.5,0.62)
+/// so near cubes stay crisp and farther cubes fade into the haze.
 /// Fog applies after PBR lighting, before tonemap, on both WebGL2 and WebGPU.
 pub fn glSceneFog(ctx: *const verve.Context) !*verve.Node {
     const scene = ctx.glScene(.{
