@@ -299,32 +299,9 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\  v_uv = a_uv;
         \\
     ;
-    // Morph+skinned body_open: accumulate morphed locals, then skin them.
-    const body_open_skinned_morph =
-        \\void main() {
-        \\  vec3 m_pos = a_pos;
-        \\  vec3 m_nrm = a_normal;
-        \\  for (int i = 0; i < u_morph_count; i++) {
-        \\    int t = u_morph_idx[i];
-        \\    float w = u_morph_wt[i];
-        \\    m_pos += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t), 0).xyz;
-        \\    m_nrm += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t + 1), 0).xyz;
-        \\  }
-        \\  mat4 skin = a_weights.x * u_bones[a_joints.x] + a_weights.y * u_bones[a_joints.y] + a_weights.z * u_bones[a_joints.z] + a_weights.w * u_bones[a_joints.w];
-        \\  v_world_pos = (u_model * (skin * vec4(m_pos, 1.0))).xyz;
-        \\  v_normal = u_normal_mat * (mat3(skin) * m_nrm);
-        \\  v_uv = a_uv;
-        \\
-    ;
     // Morph body_close: feeds m_pos into gl_Position (non-skinned).
     const body_close_morph =
         \\  gl_Position = u_mvp * vec4(m_pos, 1.0);
-        \\}
-        \\
-    ;
-    // Morph+skinned body_close: feeds morphed+skinned position into gl_Position.
-    const body_close_skinned_morph =
-        \\  gl_Position = u_mvp * (skin * vec4(m_pos, 1.0));
         \\}
         \\
     ;
@@ -377,13 +354,12 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         src = src ++ inst_body;
         return src;
     }
+    if (morphed and skinned) @compileError("variant_morph + variant_skinned not supported this slice");
     if (flags & variant_normal_map != 0) src = src ++ nm_outs;
     if (flags & variant_shadow != 0) src = src ++ shadow_outs;
     if (skinned) src = src ++ skin_decl;
     if (morphed) src = src ++ morph_uniforms;
-    if (morphed and skinned) {
-        src = src ++ body_open_skinned_morph;
-    } else if (morphed) {
+    if (morphed) {
         src = src ++ body_open_morph;
     } else if (skinned) {
         src = src ++ body_open_skinned;
@@ -392,9 +368,7 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
     }
     if (flags & variant_normal_map != 0) src = src ++ (if (skinned) nm_body_skinned else nm_body);
     if (flags & variant_shadow != 0) src = src ++ (if (morphed) shadow_body_morph else shadow_body);
-    if (morphed and skinned) {
-        src = src ++ body_close_skinned_morph;
-    } else if (morphed) {
+    if (morphed) {
         src = src ++ body_close_morph;
     } else if (skinned) {
         src = src ++ body_close_skinned;
@@ -894,7 +868,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     ;
     // Morph-target parameters (variant_morph). SEPARATE group(0) bindings at
     // @binding(3) (UBO) and @binding(4) (texture), both VERTEX-visible.
-    // UBO layout (std140-compatible, 128 bytes):
+    // UBO layout (std140-compatible, 80 bytes):
     //   offset   0: idx: array<vec4<i32>, 2>  → 2×16 bytes = 32 bytes (8 i32 slots)
     //   offset  32: wt:  array<vec4<f32>, 2>  → 2×16 bytes = 32 bytes (8 f32 slots)
     //   offset  64: count: i32                → 4 bytes (followed by 12 bytes implicit pad)
@@ -1047,6 +1021,11 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     ;
     const vs_shadow =
         \\  out.light_pos = u.light_vp * u.model * vec4<f32>(a_pos, 1.0);
+        \\
+    ;
+    // Shadow path on the morph variant: use the morphed m_pos (parity with GLSL shadow_body_morph).
+    const vs_shadow_morph =
+        \\  out.light_pos = u.light_vp * u.model * vec4<f32>(m_pos, 1.0);
         \\
     ;
     const vs_tail =
@@ -1304,6 +1283,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const lin = flags & variant_linear_output != 0;
     const ds = flags & variant_double_sided != 0;
     const inst = flags & variant_instanced != 0;
+    if (morphed and skinned) @compileError("variant_morph + variant_skinned not supported this slice");
     comptime var src: []const u8 = uniforms_head;
     if (shadow) src = src ++ uniforms_shadow;
     if (inst) src = src ++ uniforms_vp;
@@ -1326,7 +1306,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     } else if (morphed and !skinned) {
         src = src ++ vs_head_morph;
         if (nm) src = src ++ vs_nm;
-        if (shadow) src = src ++ vs_shadow;
+        if (shadow) src = src ++ vs_shadow_morph;
         src = src ++ vs_tail_morph;
     } else {
         src = src ++ (if (skinned) vs_head_skinned else vs_head);
