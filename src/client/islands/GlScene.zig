@@ -1203,25 +1203,25 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 if (a.morphWeightTrack(ti)) |trk| {
                     const kc = trk.key_count;
                     if (kc == 0) continue;
-                    // Find bracketing keyframes (clamp-to-end).
+                    // Loop the clip: wrap the sample time into [t0, t1) by the
+                    // clip duration (default looping, like skinning clips).
                     const t0 = a.morphWeightTime(trk, 0);
                     const t1 = a.morphWeightTime(trk, kc - 1);
-                    if (t_s <= t0 or kc == 1) {
+                    const tl: f32 = if (t1 > t0) t0 + @mod(t_s - t0, t1 - t0) else t_s;
+                    if (kc == 1) {
                         inst.morph_weights[ti] = a.morphWeightValue(trk, 0);
-                    } else if (t_s >= t1) {
-                        inst.morph_weights[ti] = a.morphWeightValue(trk, kc - 1);
                     } else {
-                        // Binary search for the interval.
+                        // Binary search for the interval containing the looped time.
                         var lo: u32 = 0;
                         var hi: u32 = kc - 1;
                         while (hi - lo > 1) {
                             const mid = lo + (hi - lo) / 2;
-                            if (a.morphWeightTime(trk, mid) <= t_s) lo = mid else hi = mid;
+                            if (a.morphWeightTime(trk, mid) <= tl) lo = mid else hi = mid;
                         }
                         const ta = a.morphWeightTime(trk, lo);
                         const tb = a.morphWeightTime(trk, hi);
                         const span = tb - ta;
-                        const frac: f32 = if (span > 0) (t_s - ta) / span else 0;
+                        const frac: f32 = if (span > 0) (tl - ta) / span else 0;
                         const va = a.morphWeightValue(trk, lo);
                         const vb = a.morphWeightValue(trk, hi);
                         // STEP interp = 1: hold lo value; LINEAR = 0: lerp.

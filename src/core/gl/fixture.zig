@@ -3847,8 +3847,11 @@ pub fn morphDemoGlb(alloc: Allocator) ![]u8 {
     wf32(bin, off_times + 12, 3.0);
 
     // ── Anim weights: 4 keyframes × 3 targets = 12 scalars ───────────────────
-    // k0: [0,0,0]  k1: [1,0,0]  k2: [0,1,0]  k3: [0,0,1]
-    const anim_weights = [12]f32{ 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    // The baked clip animates ONLY Wave (target 1) and Twist (target 2); Bulge
+    // (target 0) stays 0 so it is purely runtime-controlled by the /gl-morph
+    // "Bulge +" button (otherwise the baked Bulge pulse masks the runtime lock).
+    // k0: [0,0,0]  k1: [0,1,0]  k2: [0,0,1]  k3: [0,0,0]
+    const anim_weights = [12]f32{ 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
     for (anim_weights, 0..) |wt, wi| {
         wf32(bin, off_wts + wi * 4, wt);
     }

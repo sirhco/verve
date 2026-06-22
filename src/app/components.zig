@@ -1454,16 +1454,15 @@ pub fn glSceneMorph(ctx: *const verve.Context) !*verve.Node {
         ctx.h1("verve.gl — morph targets (blend shapes)"),
         ctx.p().text("A 5×5 subdivided plane with three blend shapes: Bulge (centre " ++
             "pushed up), Wave (sine deformation along X), and Twist (rotation around Y " ++
-            "proportional to Z). A baked LINEAR weight animation cycles through each " ++
-            "target in sequence. The morph texture is RGBA16F (width=vertex_count, " ++
-            "height=target_count×2), sampled per-vertex in the shader " ++
-            "(variant_morph = 1<<14). Renders on WebGL2 and WebGPU."),
+            "proportional to Z). A baked LINEAR weight animation cycles Wave and Twist; " ++
+            "Bulge is left to the runtime control below. The morph texture is RGBA16F " ++
+            "(width=vertex_count, height=target_count×2), sampled per-vertex in the " ++
+            "shader (variant_morph = 1<<14). Renders on WebGL2 and WebGPU."),
         scene,
-        ctx.p().text("The baked clip animates all three targets via morph:<i> anim " ++
-            "target paths. \u{201c}Bulge +\u{201d} overrides target 0 at runtime " ++
-            "(morph_runtime_set[0]=true), locking Bulge to full weight while the " ++
-            "clip continues animating Wave and Twist. \u{201c}Reset\u{201d} releases " ++
-            "the lock so the clip resumes all three. " ++
+        ctx.p().text("The baked clip animates Wave and Twist. \u{201c}Bulge +\u{201d} " ++
+            "drives target 0 at runtime (morph_runtime_set[0]=true), adding a centre " ++
+            "bulge on top of the ongoing animation; \u{201c}Reset\u{201d} releases it. " ++
+            "Runtime weights override the baked clip per index. " ++
             "Deferred: skinned+morph, TANGENT deltas, >8 active targets."),
     });
 }
