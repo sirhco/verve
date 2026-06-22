@@ -2724,6 +2724,7 @@ test "glTF morph: parse targets + weights into vmesh MorphData" {
     var r = try vmesh.Reader.init(bytes);
     try testing.expectEqual(@as(u32, 2), r.morphTargetCount());
     try testing.expectEqual(@as(u32, 4), r.morphVertexCount());
+
     // spot-check target 0, vertex 0, POSITION.x delta == 0.5 (f16 → compare as f16)
     const deltas = r.morphDeltas();
     // target 0, vertex 0, component 0 (POSITION.x): byte offset 0
@@ -2737,4 +2738,45 @@ test "glTF morph: parse targets + weights into vmesh MorphData" {
     const wt1 = r.morphWeightTrack(1);
     try testing.expect(wt1 != null);
     try testing.expectEqual(@as(u32, 2), wt1.?.key_count);
+}
+
+// Regression test for C1: gl_asset_gen convertGlb was passing null for the
+// morph argument to vmesh.pack, discarding the parsed MorphData. This test
+// exercises the same call chain (parseGlb → bvh.build → vmesh.pack(model.morph))
+// that convertGlb uses, so a reversion to null would break it immediately.
+test "gl_asset_gen path: morphDemoGlb morph section survives parseGlb + pack (C1 regression)" {
+    const bvh = @import("bvh.zig");
+    const fixture = @import("fixture.zig");
+    const glb = try fixture.morphDemoGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    // BVH build (same path as convertGlb).
+    var bvh_result = try bvh.build(testing.allocator, model.vertices, 12, model.indices);
+    defer bvh_result.deinit(testing.allocator);
+    // Pack with model.morph — the bug was passing null here instead.
+    const anim: ?vmesh.Anims = if (model.anim_clips.len > 0) .{ .clips = model.anim_clips } else null;
+    const bytes = try vmesh.pack(
+        testing.allocator,
+        model.vertices,
+        model.indices,
+        model.submeshes,
+        model.textures,
+        bvh_result.nodes,
+        bvh_result.tri_perm,
+        model.names,
+        model.skinned,
+        model.joints,
+        model.weights,
+        model.skel,
+        anim,
+        model.instances,
+        model.instance_count,
+        model.morph, // must NOT be null — this is what C1 broke
+    );
+    defer testing.allocator.free(bytes);
+    var r = try vmesh.Reader.init(bytes);
+    // morphDemoGlb: 5×5 plane → 25 vertices, 3 targets (Bulge/Wave/Twist)
+    try testing.expectEqual(@as(u32, 3), r.morphTargetCount());
+    try testing.expectEqual(@as(u32, 25), r.morphVertexCount());
 }
