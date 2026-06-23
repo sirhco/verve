@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-06-23
+
 ### Added
 
 - **gl omnidirectional point-light shadows** (`src/core/gl/command.zig`,
