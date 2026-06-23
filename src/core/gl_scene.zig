@@ -86,6 +86,27 @@ pub const FogOpts = struct {
     density: f32 = 0.05,
 };
 
+/// Light kind encoded in the `data-gllights` CSV (type column).
+pub const LightKind = enum(u32) { directional = 0, point = 1, spot = 2 };
+
+/// Describes one light for the `data-gllights` out-of-band attribute.
+/// `casts_shadow` is reserved for S5 and is NOT serialized into the CSV
+/// (S4 emits SSR attrs only; shadow map upload is a later task).
+pub const Light = struct {
+    kind: LightKind = .directional,
+    pos: [3]f32 = .{ 0, 0, 0 },
+    dir: [3]f32 = .{ 0, -1, 0 },
+    color: [3]f32 = .{ 1, 1, 1 },
+    intensity: f32 = 1,
+    inner_deg: f32 = 20,
+    outer_deg: f32 = 30,
+    range: f32 = 0, // 0 = no cutoff
+    casts_shadow: bool = false,
+};
+
+/// Maximum number of lights accumulated per scene (matches shader UBO capacity).
+pub const max_lights = 4;
+
 /// Fluent builder. Returned by `ctx.glScene`; finalize with `.build()`.
 /// All setters return `*GlSceneBuilder` so calls chain; `build()` returns
 /// the island-wrapped `*verve.Node` (or a poison node carrying the error,
@@ -99,6 +120,8 @@ pub const GlSceneBuilder = struct {
     scrub_on: bool = false,
     fog_opts: FogOpts = .{},
     morph_weights_buf: []const f32 = &.{},
+    lights_buf: [max_lights]Light = undefined,
+    light_count: usize = 0,
     pick_names_buf: [max_picks][]const u8 = undefined,
     pick_ids_buf: [max_picks]u32 = undefined,
     pick_export_buf: [max_picks][]const u8 = undefined,
@@ -138,6 +161,35 @@ pub const GlSceneBuilder = struct {
     /// fields.  An empty slice emits no attribute.
     pub fn morphWeights(self: *GlSceneBuilder, weights: []const f32) *GlSceneBuilder {
         self.morph_weights_buf = weights;
+        return self;
+    }
+
+    /// Set all lights at once (up to `max_lights`; extra entries are dropped).
+    /// Transported outside Props via `data-gllights` so Props stays 14 fields.
+    pub fn lights(self: *GlSceneBuilder, ls: []const Light) *GlSceneBuilder {
+        const n = @min(ls.len, max_lights);
+        @memcpy(self.lights_buf[0..n], ls[0..n]);
+        self.light_count = n;
+        return self;
+    }
+
+    /// Append one spot light (forces `kind = .spot`). Drops when cap reached.
+    pub fn spotLight(self: *GlSceneBuilder, l: Light) *GlSceneBuilder {
+        if (self.light_count >= max_lights) return self;
+        var sl = l;
+        sl.kind = .spot;
+        self.lights_buf[self.light_count] = sl;
+        self.light_count += 1;
+        return self;
+    }
+
+    /// Append one point light (forces `kind = .point`). Drops when cap reached.
+    pub fn pointLight(self: *GlSceneBuilder, l: Light) *GlSceneBuilder {
+        if (self.light_count >= max_lights) return self;
+        var pl = l;
+        pl.kind = .point;
+        self.lights_buf[self.light_count] = pl;
+        self.light_count += 1;
         return self;
     }
 
@@ -255,6 +307,47 @@ pub const GlSceneBuilder = struct {
             if (pos > 0) {
                 const morph_attr = std.fmt.allocPrint(self.ctx.allocator, "{s}", .{mbuf[0..pos]}) catch null;
                 if (morph_attr) |ma| _ = canvas.attr("data-glmorph", ma);
+            }
+        }
+
+        // Lights travel OUTSIDE Props as a semicolon-separated list of 14-value
+        // comma-separated records (type,intensity,px,py,pz,dx,dy,dz,r,g,b,
+        // range,cosIn,cosOut). Only emitted when at least one light was added.
+        // dir is normalized; inner_deg/outer_deg are converted to cos of the
+        // half-angle. S5 parseLights reads this EXACT layout — field order frozen.
+        if (self.light_count > 0) {
+            const deg2rad = std.math.pi / 180.0;
+            // Upper bound per light: 14 fields × 20 chars + 13 commas + 1 semi ≈ 295 B.
+            // 4 lights × 295 = 1180; round up to 1280 for safety.
+            var lbuf: [1280]u8 = undefined;
+            var lpos: usize = 0;
+            for (self.lights_buf[0..self.light_count], 0..) |lgt, li| {
+                const d = normalize3(lgt.dir);
+                const cos_in = @cos(lgt.inner_deg * deg2rad);
+                const cos_out = @cos(lgt.outer_deg * deg2rad);
+                const sep: []const u8 = if (li != 0) ";" else "";
+                const lchunk = std.fmt.bufPrint(lbuf[lpos..], "{s}{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d}", .{
+                    sep,
+                    @intFromEnum(lgt.kind),
+                    lgt.intensity,
+                    lgt.pos[0],
+                    lgt.pos[1],
+                    lgt.pos[2],
+                    d[0],
+                    d[1],
+                    d[2],
+                    lgt.color[0],
+                    lgt.color[1],
+                    lgt.color[2],
+                    lgt.range,
+                    cos_in,
+                    cos_out,
+                }) catch break;
+                lpos += lchunk.len;
+            }
+            if (lpos > 0) {
+                const lights_attr = std.fmt.allocPrint(self.ctx.allocator, "{s}", .{lbuf[0..lpos]}) catch null;
+                if (lights_attr) |la| _ = canvas.attr("data-gllights", la);
             }
         }
 
@@ -630,4 +723,37 @@ test "glScene no .morphWeights call emits no data-glmorph" {
     const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
     const html = try renderHtml(scene, arena.allocator());
     try testing.expect(std.mem.indexOf(u8, html, "data-glmorph") == null);
+}
+
+test "glScene .spotLight emits data-gllights" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .spotLight(.{
+            .pos = .{ 0, 3, 0 },
+            .dir = .{ 0, -1, 0 },
+            .intensity = 5,
+            .inner_deg = 15,
+            .outer_deg = 25,
+            .casts_shadow = true,
+        })
+        .build();
+    const html = try renderHtml(scene, arena.allocator());
+    // type=2 (spot), intensity=5, pos 0,3,0 at the start of the record.
+    try testing.expect(std.mem.indexOf(u8, html, "data-gllights=\"2,5,0,3,0,") != null);
+    // cos(15°) ≈ 0.9659; cos(25°) ≈ 0.9063 — check first 4 digits of each.
+    try testing.expect(std.mem.indexOf(u8, html, "0.9659") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "0.9063") != null);
+}
+
+test "glScene no lights emits no data-gllights" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-gllights") == null);
 }
