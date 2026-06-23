@@ -6,18 +6,19 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.7.1] - 2026-06-22
-
 ### Added
 
-- **gl point-light shadow demo** (`src/app/components.zig`, `src/app/routes.zig`,
-  `docs/24-gl.md`): `/gl-point` route + `glScenePoint` component. Reuses
-  `shadow.vmesh` (cube + floor) and `studio.venv`. One point caster
-  (`casts_shadow = true`, `intensity = 40`, `range = 18`) positioned at
-  `{1.5, 3.0, 1.5}` radiates shadows omnidirectionally via the 6-face RGBA8
-  distance atlas (`variant_shadow_point = 1<<15`); a dim fill directional keeps
-  the unlit side visible. Docs updated: Shadows section expanded with point-shadow
-  description; parity-status moves point-light shadows from Deferred → Shipped.
+- **gl omnidirectional point-light shadows** (`src/core/gl/command.zig`,
+  `src/bridge/verve.js`, `src/client/islands/GlScene.zig`, `src/app/*`,
+  `docs/24-gl.md`): a point light designated `casts_shadow = true` now casts an
+  omnidirectional shadow. The 6 cube directions render their linear distance-from-
+  light into one RGBA8 2D atlas (1536×1024, a 3×2 grid of 512² tiles, distance
+  packed via float→RGBA8); the `variant_shadow_point = 1<<15` receiver picks the
+  face from the light→fragment direction, unpacks the stored distance, and does a
+  tile-clamped manual 3×3 PCF compare. Extends the single designated shadow caster
+  (directional → ortho `light_vp`, spot → perspective, point → 6-face atlas), both
+  WebGL2 and WebGPU. `/gl-point` demo: `shadow.vmesh` cube + floor with a point
+  caster radiating shadows; a dim fill directional keeps the unlit side visible.
 
 ## [0.7.0] - 2026-06-22
 
