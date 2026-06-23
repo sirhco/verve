@@ -6,6 +6,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-22
+
 ### Added
 
 - **gl spot lights + spot shadows + multi-light** (`src/core/gl_scene.zig`,
