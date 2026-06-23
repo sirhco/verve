@@ -53,6 +53,12 @@ pub const Tag = enum(u16) {
     set_fog = 28, // {ptr -> 8 f32 FogParams}
     set_morph_weights = 29, // {count, idx_ptr -> count u32, wt_ptr -> count f32}
     create_morph_tex = 30, // {handle, width, height, ptr -> f16 deltas, byte_len}
+    // ── Point-light (omnidirectional) shadow atlas ──────────────────────
+    create_point_shadow = 31, // {handle, w, h} — RGBA8 atlas + depth scratch
+    begin_point_shadow_face = 32, // {handle, col, row, tile, face_vp_ptr, light_pos_ptr, far_bits}
+    draw_point_depth = 33, // {vbuf, ibuf, index_byte_off, index_count, model_ptr}
+    end_point_shadow = 34, // {width, height}
+    bind_point_shadow = 35, // {slot, handle, light_pos_ptr, far_bits}
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -90,6 +96,7 @@ pub const variant_double_sided: u32 = 1 << 11; // requires variant_pbr; render b
 pub const variant_instanced: u32 = 1 << 12; // requires variant_pbr; per-instance model (attr 4-7) + color (attr 8); non-skinned
 pub const variant_fog: u32 = 1 << 13; // requires variant_pbr; distance fog mix before tonemap
 pub const variant_morph: u32 = 1 << 14; // requires variant_pbr; texture-blended POSITION+NORMAL morph deltas
+pub const variant_shadow_point: u32 = 1 << 15; // requires variant_pbr; omnidirectional point-light shadow receiver (RGBA8 atlas)
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -110,6 +117,15 @@ pub const tex_slot_emissive: u32 = 3;
 pub const tex_slot_occlusion: u32 = 4;
 // IBL units (JS contract): irradiance=5 (cube), prefiltered=6 (cube), brdf_lut=7 (2D)
 pub const tex_slot_shadow: u32 = 8; // directional shadow map (sampler2DShadow), after the IBL units
+pub const tex_slot_point_shadow: u32 = 9; // point-light RGBA8 shadow atlas (sampler2D), slot after directional
+
+/// GLSL float-to-RGBA8 packing helpers shared between the point-depth and receiver shaders.
+pub const rgba8_pack_glsl: []const u8 = "vec4 packDist(float v){ vec4 e=fract(v*vec4(1.0,255.0,65025.0,16581375.0)); e-=e.yzww*vec4(1.0/255.0,1.0/255.0,1.0/255.0,0.0); return e; }";
+pub const rgba8_unpack_glsl: []const u8 = "float unpackDist(vec4 c){ return dot(c, vec4(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0)); }";
+
+/// WGSL float-to-RGBA8 packing helpers (same constants, vec4f).
+pub const rgba8_pack_wgsl: []const u8 = "fn packDist(v: f32) -> vec4f { var e = fract(v*vec4f(1.0,255.0,65025.0,16581375.0)); e -= e.yzww*vec4f(1.0/255.0,1.0/255.0,1.0/255.0,0.0); return e; }";
+pub const rgba8_unpack_wgsl: []const u8 = "fn unpackDist(c: vec4f) -> f32 { return dot(c, vec4f(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0)); }";
 
 pub const unlit_vs: []const u8 =
     \\#version 300 es
@@ -1846,6 +1862,59 @@ pub const Encoder = struct {
         self.putU32(light_vp_ptr);
     }
 
+    // ── Point-light (omnidirectional) shadow atlas ──────────────────────
+
+    /// Allocate the RGBA8 shadow atlas texture (w×h) and a matching depth scratch.
+    /// One per point light; recorded for context-restore replay.
+    pub fn createPointShadow(self: *Encoder, handle: u32, w: u32, h: u32) void {
+        self.header(.create_point_shadow, 12);
+        self.putU32(handle);
+        self.putU32(w);
+        self.putU32(h);
+    }
+
+    /// Begin rendering into one cube face tile. `col`/`row` address the tile in
+    /// the atlas; `tile` is the tile pixel size. `face_vp_ptr` → 16 f32 VP matrix
+    /// (from `cubeFaceVp`); `light_pos_ptr` → 3 f32 world-space position;
+    /// `far_bits` = `@as(u32, @bitCast(far))`.
+    pub fn beginPointShadowFace(self: *Encoder, handle: u32, col: u32, row: u32, tile: u32, face_vp_ptr: u32, light_pos_ptr: u32, far_bits: u32) void {
+        self.header(.begin_point_shadow_face, 28);
+        self.putU32(handle);
+        self.putU32(col);
+        self.putU32(row);
+        self.putU32(tile);
+        self.putU32(face_vp_ptr);
+        self.putU32(light_pos_ptr);
+        self.putU32(far_bits);
+    }
+
+    /// Depth draw into the point-shadow atlas face. `model_ptr` → 16 f32 model matrix.
+    pub fn drawPointDepth(self: *Encoder, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, model_ptr: u32) void {
+        self.header(.draw_point_depth, 20);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(model_ptr);
+    }
+
+    /// End the point-shadow pass: restore default framebuffer + canvas viewport.
+    pub fn endPointShadow(self: *Encoder, width: u32, height: u32) void {
+        self.header(.end_point_shadow, 8);
+        self.putU32(width);
+        self.putU32(height);
+    }
+
+    /// Bind the point-shadow atlas to `slot` and upload `light_pos_ptr` (3 f32)
+    /// + `far_bits` to the active program. Must follow SET_PIPELINE.
+    pub fn bindPointShadow(self: *Encoder, slot: u32, handle: u32, light_pos_ptr: u32, far_bits: u32) void {
+        self.header(.bind_point_shadow, 16);
+        self.putU32(slot);
+        self.putU32(handle);
+        self.putU32(light_pos_ptr);
+        self.putU32(far_bits);
+    }
+
     // ── Post-processing ─────────────────────────────────────────────────
 
     /// Allocate a color render target (FBO + color attachment, optional depth).
@@ -2932,4 +3001,83 @@ test "morph WGSL: variant emits morph binding + textureLoad; non-morph frozen" {
     try testing.expect(std.mem.indexOf(u8, w, "morph.count") != null);
     const plain = wgslPbr(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, plain, "u_morph_tex") == null);
+}
+
+// ── Point-light shadow: variant + tags + encoder payloads ─────────────────────
+
+test "point shadow: variant bit + tag values" {
+    try testing.expectEqual(@as(u32, 1 << 15), variant_shadow_point);
+    try testing.expectEqual(@as(u8, 31), @intFromEnum(Tag.create_point_shadow));
+    try testing.expectEqual(@as(u8, 32), @intFromEnum(Tag.begin_point_shadow_face));
+    try testing.expectEqual(@as(u8, 33), @intFromEnum(Tag.draw_point_depth));
+    try testing.expectEqual(@as(u8, 34), @intFromEnum(Tag.end_point_shadow));
+    try testing.expectEqual(@as(u8, 35), @intFromEnum(Tag.bind_point_shadow));
+}
+
+test "createPointShadow encodes tag 31 + 3 u32 payload (12 bytes)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createPointShadow(7, 1536, 1024);
+    const s = enc.finish();
+    // length header (4) + record header (4) + 3×u32 payload (12) = 16 record bytes
+    try testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, s[0..4], .little)); // length
+    try testing.expectEqual(@as(u16, 31), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 12), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[8..12], .little)); // handle
+    try testing.expectEqual(@as(u32, 1536), std.mem.readInt(u32, s[12..16], .little)); // w
+    try testing.expectEqual(@as(u32, 1024), std.mem.readInt(u32, s[16..20], .little)); // h
+}
+
+test "beginPointShadowFace encodes tag 32 + 7 u32 payload (28 bytes)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.beginPointShadowFace(7, 1, 0, 256, 0x1000, 0x2000, 0x3F800000); // far=1.0
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 32), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[8..12], .little)); // handle
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, s[12..16], .little)); // col
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, s[16..20], .little)); // row
+    try testing.expectEqual(@as(u32, 256), std.mem.readInt(u32, s[20..24], .little)); // tile
+    try testing.expectEqual(@as(u32, 0x1000), std.mem.readInt(u32, s[24..28], .little)); // face_vp_ptr
+    try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, s[28..32], .little)); // light_pos_ptr
+    try testing.expectEqual(@as(u32, 0x3F800000), std.mem.readInt(u32, s[32..36], .little)); // far_bits
+}
+
+test "drawPointDepth encodes tag 33 + 5 u32 payload (20 bytes)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.drawPointDepth(1, 2, 12, 36, 0x4000);
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 33), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 20), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, s[8..12], .little)); // vbuf
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, s[12..16], .little)); // ibuf
+    try testing.expectEqual(@as(u32, 12), std.mem.readInt(u32, s[16..20], .little)); // index_byte_off
+    try testing.expectEqual(@as(u32, 36), std.mem.readInt(u32, s[20..24], .little)); // index_count
+    try testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, s[24..28], .little)); // model_ptr
+}
+
+test "endPointShadow encodes tag 34 + 2 u32 payload (8 bytes)" {
+    var buf: [32]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.endPointShadow(800, 600);
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 34), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 8), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 800), std.mem.readInt(u32, s[8..12], .little)); // width
+    try testing.expectEqual(@as(u32, 600), std.mem.readInt(u32, s[12..16], .little)); // height
+}
+
+test "bindPointShadow encodes tag 35 + 4 u32 payload (16 bytes)" {
+    var buf: [32]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.bindPointShadow(9, 7, 0x5000, 0x41C80000); // far=25.0
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 35), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 16), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, s[8..12], .little)); // slot
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[12..16], .little)); // handle
+    try testing.expectEqual(@as(u32, 0x5000), std.mem.readInt(u32, s[16..20], .little)); // light_pos_ptr
+    try testing.expectEqual(@as(u32, 0x41C80000), std.mem.readInt(u32, s[20..24], .little)); // far_bits
 }
