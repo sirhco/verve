@@ -31,7 +31,7 @@ pub const Tag = enum(u16) {
     bind_texture = 8, // {slot, handle}
     draw_sub = 9, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr, color_ptr}
     create_texture_ex = 10, // {handle, target, format, w, h, mip_count, ptr, len}; cube data mip-major then +X,-X,+Y,-Y,+Z,-Z
-    set_lights = 11, // {count, ptr -> count*8 f32}
+    set_lights = 11, // {count, ptr -> count*16 f32 (4 vec4/light: v0=type/intensity/pos.xy, v1=pos.z/dir.xyz, v2=color.rgb/range, v3=cosIn/cosOut/__/__}
     bind_ibl = 12, // {irr, spec, lut, spec_mip_count}
     draw_pbr = 13, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr, model_ptr, normal_ptr, material_ptr, camera_ptr}
     delete_resource = 14, // {kind, handle} — frees one GPU object; slot may be reused after
@@ -98,7 +98,7 @@ pub const clear_flag_color: u32 = 1 << 0;
 pub const clear_flag_depth: u32 = 1 << 1;
 
 pub const max_lights: u32 = 4;
-pub const light_stride_f32: u32 = 8; // [type(0=dir,1=point), intensity, x,y,z, r,g,b]
+pub const light_stride_f32: u32 = 16; // v0:[type,intensity,pos.x,pos.y]  v1:[pos.z,dir.x,dir.y,dir.z]  v2:[color.r,color.g,color.b,range]  v3:[cos_inner,cos_outer,_pad,_pad]
 pub const fog_params_f32: u32 = 8; // [mode, r,g,b, near, far, density, _pad]
 pub const morph_max_active: u32 = 8; // K: max simultaneously-active morph influences
 pub const material_len_f32: u32 = 12; // base_color rgba | metallic, roughness, occlusion_strength, normal_scale | emissive rgb, 0
@@ -471,7 +471,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     const uniforms =
         \\uniform vec3 u_camera_pos;
         \\uniform vec4 u_material[3];
-        \\uniform vec4 u_lights[8];
+        \\uniform vec4 u_lights[16];
         \\uniform int u_light_count;
         \\uniform float u_prefiltered_mips;
         \\uniform sampler2D u_base_tex;
@@ -578,22 +578,34 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\  float alpha = roughness * roughness;
         \\  vec3 Lo = vec3(0.0);
         \\  for (int i = 0; i < u_light_count; i++) {
-        \\    vec4 l0 = u_lights[2 * i];
-        \\    vec4 l1 = u_lights[2 * i + 1];
-        \\    float ltype = l0.x;
-        \\    float intensity = l0.y;
-        \\    vec3 posdir = vec3(l0.z, l0.w, l1.x);
-        \\    vec3 lcolor = l1.yzw;
+        \\    vec4 v0 = u_lights[4 * i];
+        \\    vec4 v1 = u_lights[4 * i + 1];
+        \\    vec4 v2 = u_lights[4 * i + 2];
+        \\    vec4 v3 = u_lights[4 * i + 3];
+        \\    float ltype = v0.x;
+        \\    float intensity = v0.y;
+        \\    vec3 lpos = vec3(v0.z, v0.w, v1.x);
+        \\    vec3 ldir = normalize(vec3(v1.y, v1.z, v1.w));
+        \\    vec3 lcolor = v2.xyz;
+        \\    float lrange = v2.w;
+        \\    float cosIn = v3.x;
+        \\    float cosOut = v3.y;
         \\    vec3 L;
         \\    vec3 radiance;
         \\    if (ltype < 0.5) {
-        \\      L = -posdir;
+        \\      L = -ldir;
         \\      radiance = lcolor * intensity;
         \\    } else {
-        \\      vec3 Lvec = posdir - v_world_pos;
+        \\      vec3 Lvec = lpos - v_world_pos;
         \\      float dist = length(Lvec);
-        \\      L = Lvec / dist;
-        \\      radiance = lcolor * intensity / (dist * dist);
+        \\      L = Lvec / max(dist, 1e-4);
+        \\      float atten = 1.0 / max(dist * dist, 1e-4);
+        \\      if (lrange > 0.0 && dist > lrange) atten = 0.0;
+        \\      radiance = lcolor * intensity * atten;
+        \\      if (ltype > 1.5) {
+        \\        float cosA = dot(-L, ldir);
+        \\        radiance *= smoothstep(cosOut, cosIn, cosA);
+        \\      }
         \\    }
         \\    vec3 H = normalize(V + L);
         \\    float NdotL = max(dot(N, L), 0.0);
@@ -797,10 +809,10 @@ pub const fxaaFragmentSrc: []const u8 =
 //   model      : mat4x4<f32>      (offset 64)
 //   normal_mat : mat3x3<f32>      (offset 128; occupies 48B, three vec4 cols)
 //   camera_pos : vec3<f32>        (offset 176; +4B pad)
-//   material   : array<vec4<f32>,3>
-//   lights     : array<vec4<f32>,8>
-//   light_count: i32
-//   prefiltered_mips: f32         (+8B pad to 16B)
+//   material   : array<vec4<f32>,3> (offset 192)
+//   lights     : array<vec4<f32>,16> (offset 240; 256B — 4 vec4/light × 4 lights)
+//   light_count: i32              (offset 496)
+//   prefiltered_mips: f32         (offset 500; +8B pad to align mat4x4 at 512)
 //
 // Bindings (@group(1)): a shared sampler (binding 0) + per-slot textures.
 // Slots mirror the GLSL sampler order / JS texture-unit contract:
@@ -810,16 +822,16 @@ pub const fxaaFragmentSrc: []const u8 =
 pub fn wgslPbr(comptime flags: u32) []const u8 {
     comptime pbrCheck(flags);
     if (flags & variant_depth != 0) @compileError("wgslPbr: variant_depth uses wgslDepth(), not wgslPbr");
-    // variant_instanced appends `vp: mat4x4<f32>` at byte offset 384 — the same
+    // variant_instanced appends `vp: mat4x4<f32>` at byte offset 512 — the same
     // slot variant_shadow uses for `light_vp`.  The two are mutually exclusive in
     // v1 (instanced draws are non-shadow receivers).  Enforce it here so a future
     // caller cannot silently produce a broken WGSL U struct.
     if (flags & variant_instanced != 0 and flags & variant_shadow != 0)
-        @compileError("wgslPbr: variant_instanced + variant_shadow unsupported in v1 (vp/light_vp slot collision at offset 384)");
+        @compileError("wgslPbr: variant_instanced + variant_shadow unsupported in v1 (vp/light_vp slot collision at offset 512)");
 
     // ── Uniform block + group(0) ────────────────────────────────────
-    // Split so variant_shadow can append `light_vp` (offset 384, after the f32
-    // prefiltered_mips @ 372 padded to 384) without changing the non-shadow bytes.
+    // Split so variant_shadow can append `light_vp` (offset 512, after the f32
+    // prefiltered_mips @ 500 padded to 512) without changing the non-shadow bytes.
     const uniforms_head =
         \\struct U {
         \\  mvp: mat4x4<f32>,
@@ -827,7 +839,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  normal_mat: mat3x3<f32>,
         \\  camera_pos: vec3<f32>,
         \\  material: array<vec4<f32>, 3>,
-        \\  lights: array<vec4<f32>, 8>,
+        \\  lights: array<vec4<f32>, 16>,
         \\  light_count: i32,
         \\  prefiltered_mips: f32,
         \\
@@ -1177,22 +1189,34 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  let alpha = roughness * roughness;
         \\  var Lo = vec3<f32>(0.0);
         \\  for (var i: i32 = 0; i < u.light_count; i = i + 1) {
-        \\    let l0 = u.lights[2 * i];
-        \\    let l1 = u.lights[2 * i + 1];
-        \\    let ltype = l0.x;
-        \\    let intensity = l0.y;
-        \\    let posdir = vec3<f32>(l0.z, l0.w, l1.x);
-        \\    let lcolor = l1.yzw;
+        \\    let v0 = u.lights[4 * i];
+        \\    let v1 = u.lights[4 * i + 1];
+        \\    let v2 = u.lights[4 * i + 2];
+        \\    let v3 = u.lights[4 * i + 3];
+        \\    let ltype = v0.x;
+        \\    let intensity = v0.y;
+        \\    let lpos = vec3<f32>(v0.z, v0.w, v1.x);
+        \\    let ldir = normalize(vec3<f32>(v1.y, v1.z, v1.w));
+        \\    let lcolor = v2.xyz;
+        \\    let lrange = v2.w;
+        \\    let cosIn = v3.x;
+        \\    let cosOut = v3.y;
         \\    var L: vec3<f32>;
         \\    var radiance: vec3<f32>;
         \\    if (ltype < 0.5) {
-        \\      L = -posdir;
+        \\      L = -ldir;
         \\      radiance = lcolor * intensity;
         \\    } else {
-        \\      let Lvec = posdir - in.world_pos;
+        \\      let Lvec = lpos - in.world_pos;
         \\      let dist = length(Lvec);
-        \\      L = Lvec / dist;
-        \\      radiance = lcolor * intensity / (dist * dist);
+        \\      L = Lvec / max(dist, 1e-4);
+        \\      var atten = 1.0 / max(dist * dist, 1e-4);
+        \\      if (lrange > 0.0 && dist > lrange) { atten = 0.0; }
+        \\      radiance = lcolor * intensity * atten;
+        \\      if (ltype > 1.5) {
+        \\        let cosA = dot(-L, ldir);
+        \\        radiance = radiance * smoothstep(cosOut, cosIn, cosA);
+        \\      }
         \\    }
         \\    let H = normalize(V + L);
         \\    let NdotL = max(dot(N, L), 0.0);
@@ -2194,19 +2218,56 @@ test "golden: set_bones wire record" {
     );
 }
 
+test "GLSL lighting: 4-vec4 stride + spot/point falloff present" {
+    // Verifies the S1 lighting contract: u_lights[16] (4 vec4/light × max 4 lights),
+    // point/spot attenuation, and spot cone smoothstep in the emitted fragment source.
+    const fs = pbrFragmentSrc(variant_pbr);
+    // Wider uniform array
+    try testing.expect(std.mem.indexOf(u8, fs, "u_lights[16]") != null);
+    // 4-vec4 per-light reads
+    try testing.expect(std.mem.indexOf(u8, fs, "u_lights[4 * i]") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "u_lights[4 * i + 2]") != null);
+    // Spot cone falloff
+    try testing.expect(std.mem.indexOf(u8, fs, "smoothstep(cosOut, cosIn") != null);
+    // Point attenuation (range cutoff guard)
+    try testing.expect(std.mem.indexOf(u8, fs, "lrange > 0.0") != null);
+    // Directional branch: L = -ldir, radiance = lcolor * intensity (unchanged semantics)
+    try testing.expect(std.mem.indexOf(u8, fs, "L = -ldir") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "radiance = lcolor * intensity;") != null);
+}
+
+test "WGSL lighting: 4-vec4 stride + spot/point falloff present" {
+    // Verifies the T3 lighting contract: lights array<vec4,16> (4 vec4/light × max 4),
+    // point/spot attenuation (range cutoff), and spot cone smoothstep in the WGSL src.
+    const src = wgslPbr(variant_pbr);
+    // Wider uniform array (16 vec4 = 4 lights × 4 vec4 each)
+    try testing.expect(std.mem.indexOf(u8, src, "lights: array<vec4<f32>, 16>") != null);
+    // 4-vec4 per-light reads
+    try testing.expect(std.mem.indexOf(u8, src, "u.lights[4 * i]") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "u.lights[4 * i + 2]") != null);
+    // Spot cone falloff
+    try testing.expect(std.mem.indexOf(u8, src, "smoothstep(cosOut, cosIn, cosA)") != null);
+    // Point attenuation (range cutoff guard)
+    try testing.expect(std.mem.indexOf(u8, src, "lrange > 0.0") != null);
+    // Directional branch: L = -ldir, radiance = lcolor * intensity
+    try testing.expect(std.mem.indexOf(u8, src, "L = -ldir") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "radiance = lcolor * intensity") != null);
+}
+
 test "golden: PBR GLSL hashes frozen (FNV-1a-64)" {
     const F0 = variant_pbr;
     const F1 = variant_pbr | variant_normal_map;
     const F2 = variant_pbr | variant_normal_map | variant_emissive;
     // Frozen from first green run — a change here = deliberate GLSL contract bump.
-    // Fragment hashes bumped in P8: base-color + emissive samples no longer apply
-    // an in-shader pow(2.2) — those textures upload as SRGB8_ALPHA8 (hardware decode).
+    // Fragment hashes bumped in S1 (spot-shadows task 1): light stride 8→16 f32,
+    // 4-vec4 loop, point/spot attenuation + spot cone smoothstep added.
+    // VS hashes unchanged (lighting loop is fragment-only).
     try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(F0)));
     try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(F1)));
     try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(F2))); // emissive does not touch the VS
-    try testing.expectEqual(@as(u64, 0x2f65f1426c2c4ed2), fnv64(pbrFragmentSrc(F0)));
-    try testing.expectEqual(@as(u64, 0x4b3d632d4e94e70d), fnv64(pbrFragmentSrc(F1)));
-    try testing.expectEqual(@as(u64, 0xf0c580cec075612c), fnv64(pbrFragmentSrc(F2)));
+    try testing.expectEqual(@as(u64, 0x74f8716edb959d35), fnv64(pbrFragmentSrc(F0)));
+    try testing.expectEqual(@as(u64, 0x2044806ebe7eda00), fnv64(pbrFragmentSrc(F1)));
+    try testing.expectEqual(@as(u64, 0x0fcb65cc6f81c2fd), fnv64(pbrFragmentSrc(F2)));
 }
 
 test "skinned vertex variant: attribs + bone palette present, absent when off" {
@@ -2309,7 +2370,8 @@ test "WGSL PBR: variant_skinned vertex path" {
 
 test "golden: WGSL skinned hash frozen (FNV-1a-64)" {
     // Frozen from first green run — a change here = deliberate WGSL contract bump.
-    try testing.expectEqual(@as(u64, 0x1bab1e6822205a6a), fnv64(wgslPbr(variant_pbr | variant_skinned)));
+    // Bumped T3: lights 8→16 vec4, 4-vec4 loop, point/spot/spot-cone added.
+    try testing.expectEqual(@as(u64, 0xa024e07575f639b6), fnv64(wgslPbr(variant_pbr | variant_skinned)));
 }
 
 test "golden: WGSL PBR hashes frozen (FNV-1a-64)" {
@@ -2317,9 +2379,10 @@ test "golden: WGSL PBR hashes frozen (FNV-1a-64)" {
     const F1 = variant_pbr | variant_normal_map;
     const F2 = variant_pbr | variant_normal_map | variant_emissive;
     // Frozen from first green run — a change here = deliberate WGSL contract bump.
-    try testing.expectEqual(@as(u64, 0x22da26fe9b6d11ce), fnv64(wgslPbr(F0)));
-    try testing.expectEqual(@as(u64, 0x8415f4d5595e6473), fnv64(wgslPbr(F1)));
-    try testing.expectEqual(@as(u64, 0x08b2f7cb68681f01), fnv64(wgslPbr(F2)));
+    // Bumped T3: lights 8→16 vec4, 4-vec4 loop, point/spot/spot-cone added.
+    try testing.expectEqual(@as(u64, 0x357fb64fa20f9e48), fnv64(wgslPbr(F0)));
+    try testing.expectEqual(@as(u64, 0xc497d77d74cd4eb3), fnv64(wgslPbr(F1)));
+    try testing.expectEqual(@as(u64, 0x7de745a0f40a5f8f), fnv64(wgslPbr(F2)));
 }
 
 test "WGSL PBR shadow + depth: variant_shadow path and wgslDepth structure" {
@@ -2355,9 +2418,11 @@ test "golden: WGSL shadow + depth hashes frozen (FNV-1a-64)" {
     const S1 = variant_pbr | variant_normal_map | variant_shadow;
     const S2 = variant_pbr | variant_normal_map | variant_emissive | variant_shadow;
     // Frozen from first green run — a change here = deliberate WGSL contract bump.
-    try testing.expectEqual(@as(u64, 0x7135291bd052822a), fnv64(wgslPbr(S0)));
-    try testing.expectEqual(@as(u64, 0x3755ccbc75857e09), fnv64(wgslPbr(S1)));
-    try testing.expectEqual(@as(u64, 0x9df4e0e12b66da1f), fnv64(wgslPbr(S2)));
+    // Bumped T3: lights 8→16 vec4, 4-vec4 loop, point/spot/spot-cone added.
+    // wgslDepth() unchanged (no lighting in depth shader).
+    try testing.expectEqual(@as(u64, 0xae457faf55a79dc0), fnv64(wgslPbr(S0)));
+    try testing.expectEqual(@as(u64, 0xf88bbb5861b48f71), fnv64(wgslPbr(S1)));
+    try testing.expectEqual(@as(u64, 0xbe02499ac39559d9), fnv64(wgslPbr(S2)));
     try testing.expectEqual(@as(u64, 0x3bb6cf33bcf5f8b1), fnv64(wgslDepth()));
 }
 
@@ -2428,9 +2493,9 @@ test "golden: shadow-variant GLSL hashes frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0x4c653dc19966e2c9), fnv64(pbrVertexSrc(S0)));
     try testing.expectEqual(@as(u64, 0x39a20440b418312f), fnv64(pbrVertexSrc(S1)));
     try testing.expectEqual(@as(u64, 0x39a20440b418312f), fnv64(pbrVertexSrc(S2))); // emissive does not touch the VS
-    try testing.expectEqual(@as(u64, 0xe29b0bf3c830deef), fnv64(pbrFragmentSrc(S0)));
-    try testing.expectEqual(@as(u64, 0x361efc733727617a), fnv64(pbrFragmentSrc(S1)));
-    try testing.expectEqual(@as(u64, 0x55ae1c2b63596b7b), fnv64(pbrFragmentSrc(S2)));
+    try testing.expectEqual(@as(u64, 0x09110d4bba0f440e), fnv64(pbrFragmentSrc(S0)));
+    try testing.expectEqual(@as(u64, 0xf18a33b37372b96d), fnv64(pbrFragmentSrc(S1)));
+    try testing.expectEqual(@as(u64, 0x85ff8016048becec), fnv64(pbrFragmentSrc(S2)));
     // Depth-only shadow-pass shader.
     try testing.expectEqual(@as(u64, 0x5bd62d643af5c2d5), fnv64(depthVertexSrc()));
     try testing.expectEqual(@as(u64, 0xe43018c9a1312d96), fnv64(depthFragmentSrc()));
@@ -2610,8 +2675,9 @@ test "golden: post shader sources frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xdb360b028579d531), fnv64(wgslComposite()));
     try testing.expectEqual(@as(u64, 0xe8ac45e2d1276dfd), fnv64(wgslFxaa()));
     // linear-output PBR variant (omits tonemap+gamma; post composite pass tonemaps instead)
-    try testing.expectEqual(@as(u64, 0x435aa6e4ca89a81a), fnv64(pbrFragmentSrc(variant_pbr | variant_linear_output)));
-    try testing.expectEqual(@as(u64, 0x3e109d6415bcafaf), fnv64(wgslPbr(variant_pbr | variant_linear_output)));
+    // wgslPbr(variant_linear_output) bumped T3: lights 8→16 vec4, 4-vec4 loop.
+    try testing.expectEqual(@as(u64, 0xb491c514c6b79895), fnv64(pbrFragmentSrc(variant_pbr | variant_linear_output)));
+    try testing.expectEqual(@as(u64, 0x20187fe5b9ce2a1d), fnv64(wgslPbr(variant_pbr | variant_linear_output)));
 }
 
 // ── Task 3: Post-process effect-graph sequence tests ─────────────────

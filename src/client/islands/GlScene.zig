@@ -239,8 +239,29 @@ const Inst = struct {
     tidx: [max_submesh]u32 = undefined,
     tkey: [max_submesh]f32 = undefined,
 
-    // Single directional light from props: 8 f32 [type, intensity, x,y,z, r,g,b].
-    lights: [8]f32 = .{ 0, 3, -0.39801488, -0.69652603, -0.59702231, 1, 1, 1 },
+    // Multi-light array: up to max_lights lights, 16 f32 each.
+    // Layout per light i (base = i*16):
+    //   [0]  type (0=dir, 1=point, 2=spot)   [1]  intensity
+    //   [2..4]  pos x,y,z                    [5..7]  dir x,y,z (normalized)
+    //   [8..10] color r,g,b                  [11] range
+    //   [12] cosInner  [13] cosOuter          [14,15] _pad
+    lights: [gl.command.max_lights * 16]f32 = blk: {
+        var a = [_]f32{0} ** (gl.command.max_lights * 16);
+        // Default: single white directional light matching the old 8-f32 defaults.
+        a[0] = 0; // type = directional
+        a[1] = 3; // intensity
+        // pos [2..4] = 0 (directional has no position)
+        a[5] = -0.39801488; // dir x
+        a[6] = -0.69652603; // dir y
+        a[7] = -0.59702231; // dir z
+        a[8] = 1;
+        a[9] = 1;
+        a[10] = 1; // white
+        break :blk a;
+    },
+    light_count: u32 = 1,
+    // Index of the shadow-casting light (< max_lights). Sentinel max_lights = no caster.
+    shadow_caster: u32 = 0, // default: light 0 is the caster (matches existing behaviour)
 
     // Distance fog (mode,r,g,b,near,far,density,_pad). Default off.
     fog_params: [8]f32 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -688,6 +709,47 @@ fn parseFog(inst: *Inst, s: []const u8) void {
     inst.fog_enabled = true;
 }
 
+// Parse the `data-gllights` attribute into inst.lights / light_count / shadow_caster.
+// Format: semicolon-separated light records, each a 15-field comma-separated CSV:
+//   type,intensity,px,py,pz,dx,dy,dz,r,g,b,range,cosIn,cosOut,castsShadow
+// Maps CSV[0..13] → lights[i*16 + 0..13]; lights[i*16+14,15] = 0 (_pad).
+// CSV[14] (castsShadow): first directional (type=0) or spot (type=2) light with
+// value ≥ 0.5 becomes shadow_caster.  Point lights (type=1) flagged castsShadow
+// are skipped — point-light shadows are deferred to a future slice.
+// If no valid caster is found, shadow_caster = max_lights (sentinel: no shadow).
+// Tolerant: parse errors for a token leave that field at 0; extra fields ignored.
+fn parseLights(inst: *Inst, s: []const u8) void {
+    const max_l = gl.command.max_lights;
+    inst.shadow_caster = max_l; // sentinel: no caster until one is found
+    var li: u32 = 0;
+    var light_it = std.mem.splitScalar(u8, s, ';');
+    while (light_it.next()) |rec| {
+        if (li >= max_l) break;
+        const base = li * 16;
+        // Zero the full 16-f32 slot before filling (pad fields stay 0).
+        for (inst.lights[base .. base + 16]) |*f| f.* = 0;
+        var fi: u32 = 0;
+        var field_it = std.mem.splitScalar(u8, rec, ',');
+        while (field_it.next()) |tok| {
+            if (fi >= 15) break;
+            const v = std.fmt.parseFloat(f32, tok) catch 0.0;
+            if (fi < 14) {
+                inst.lights[base + fi] = v;
+            } else {
+                // fi == 14: castsShadow — only directional (0) or spot (2) are valid.
+                // Point lights (type≈1) cannot cast shadows yet; skip them.
+                const ltype = inst.lights[base + 0];
+                const is_dir_or_spot = ltype < 0.5 or ltype >= 1.5;
+                if (v >= 0.5 and inst.shadow_caster == max_l and is_dir_or_spot)
+                    inst.shadow_caster = li;
+            }
+            fi += 1;
+        }
+        li += 1;
+    }
+    inst.light_count = li;
+}
+
 // Parse a "w0,w1,…" morph-weight attribute into inst.morph_weights[0..].
 // Seeds up to max_morph_targets weights and marks each as runtime-set so the
 // per-frame baked-clip advance does not overwrite them.  Tolerant: extra
@@ -734,14 +796,28 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
             inst.auto_rotate = p.auto_rotate;
             inst.scrub_enabled = p.scrub;
 
-            inst.lights = .{
-                0, // type = directional
-                p.light_intensity,
-                p.light_dir_x,
-                p.light_dir_y,
-                p.light_dir_z,
-                1, 1, 1, // white
-            };
+            // Default single directional light into slot 0 of the 16-f32 layout.
+            // When data-gllights is present, parseLights overwrites this below.
+            inst.lights[0] = 0; // type = directional
+            inst.lights[1] = p.light_intensity;
+            // [2..4] pos = 0 (directional)
+            inst.lights[2] = 0;
+            inst.lights[3] = 0;
+            inst.lights[4] = 0;
+            inst.lights[5] = p.light_dir_x;
+            inst.lights[6] = p.light_dir_y;
+            inst.lights[7] = p.light_dir_z;
+            inst.lights[8] = 1; // r
+            inst.lights[9] = 1; // g
+            inst.lights[10] = 1; // b
+            // [11..15] range/cosIn/cosOut/_pad = 0
+            inst.lights[11] = 0;
+            inst.lights[12] = 0;
+            inst.lights[13] = 0;
+            inst.lights[14] = 0;
+            inst.lights[15] = 0;
+            inst.light_count = 1;
+            inst.shadow_caster = 0; // light 0 casts the shadow
 
             // Deep-copy pick names/ids into the instance (arena dies on reset).
             inst.pick_count = @min(@min(p.pick_names.len, p.pick_event_ids.len), max_picks);
@@ -782,6 +858,15 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         var fbuf: [512]u8 = undefined;
         const fa = verve.refGetAttr(ch, "data-glfog", &fbuf);
         if (fa.len != 0) parseFog(inst, fa);
+    }
+
+    // Multi-light array rides on the canvas `data-gllights` attribute (NOT Props).
+    // Format: semicolon-separated 15-field CSV records. When present, overrides
+    // the Props default-directional written above.
+    if (inst.canvas_handle) |ch| {
+        var llbuf: [1400]u8 = undefined;
+        const la = verve.refGetAttr(ch, "data-gllights", &llbuf);
+        if (la.len != 0) parseLights(inst, la);
     }
 
     // Morph weights ride on the canvas `data-glmorph` attribute (NOT Props).
@@ -1054,7 +1139,9 @@ fn stampName(inst: *const Inst, attr: []const u8, a: *const gl.vmesh.Reader, s: 
 }
 
 /// Directional light view-projection for the shadow pass (ortho fit to the
-/// union of submesh world AABBs). Call after `scene.updateWorld()`.
+/// union of submesh world AABBs). Reads caster direction from the 16-f32
+/// layout at base = shadow_caster*16, dir at +5..+7.
+/// Call after `scene.updateWorld()`.
 fn lightSpaceMatrix(inst: *const Inst, a: *const gl.vmesh.Reader) gl.math.Mat4 {
     const Vec3 = gl.math.Vec3;
     const inf = std.math.inf(f32);
@@ -1073,7 +1160,9 @@ fn lightSpaceMatrix(inst: *const Inst, a: *const gl.vmesh.Reader) gl.math.Mat4 {
     }
     const center = Vec3.scale(Vec3.add(lo, hi), 0.5);
     const radius = @max(@as(f32, 0.5), Vec3.length(Vec3.sub(hi, lo)) * 0.5);
-    const dir = Vec3.normalize(Vec3.init(inst.lights[2], inst.lights[3], inst.lights[4]));
+    // Read dir from caster's slot in the new 16-f32 layout (dir at +5..+7).
+    const base = inst.shadow_caster * 16;
+    const dir = Vec3.normalize(Vec3.init(inst.lights[base + 5], inst.lights[base + 6], inst.lights[base + 7]));
     const up = if (@abs(dir.y) > 0.99) Vec3.init(0, 0, 1) else Vec3.init(0, 1, 0);
     const dist = radius * 3.0;
     const eye = Vec3.sub(center, Vec3.scale(dir, dist));
@@ -1081,6 +1170,25 @@ fn lightSpaceMatrix(inst: *const Inst, a: *const gl.vmesh.Reader) gl.math.Mat4 {
     const ext = radius * 1.2;
     const proj = gl.math.Mat4.ortho(-ext, ext, -ext, ext, dist - radius * 1.5, dist + radius * 1.5);
     return proj.mul(view);
+}
+
+/// Spot light view-projection for the shadow pass (perspective from the spot's
+/// position looking in `dir`). fovy = 2*acos(cosOut) so the cone fits the frustum.
+fn spotLightVp(inst: *const Inst) gl.math.Mat4 {
+    const Vec3 = gl.math.Vec3;
+    const base = inst.shadow_caster * 16;
+    const pos = Vec3.init(inst.lights[base + 2], inst.lights[base + 3], inst.lights[base + 4]);
+    const dir = Vec3.init(inst.lights[base + 5], inst.lights[base + 6], inst.lights[base + 7]);
+    const cos_out = inst.lights[base + 13];
+    // fovy = 2 * acos(cosOut). Clamp cosOut to (0,1) to avoid degenerate fov.
+    const cos_out_clamped = @max(@as(f32, 0.001), @min(@as(f32, 0.9999), cos_out));
+    const fovy = 2.0 * std.math.acos(cos_out_clamped);
+    // near/far: small near to avoid clipping; far from range or a large default.
+    // Ensure far > near even when range is tiny or zero (degenerate projection guard).
+    const range = inst.lights[base + 11];
+    const near: f32 = 0.05;
+    const far: f32 = @max(near * 2.0, if (range > 0) range else 50.0);
+    return gl.math.spotLightVpMat(pos, dir, fovy, near, far);
 }
 
 // ── frame ─────────────────────────────────────────────────────────────────────
@@ -1265,52 +1373,70 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // clipFix is identity on WebGL2 (path unchanged) and the [−1,1]→[0,1] z
         // remap on WebGPU (gl.math ortho is GL-convention; the receiver's WGSL
         // shadowFactor uses ndc.z directly).
-        const light_vp = clipFix().mul(lightSpaceMatrix(inst, a));
+        //
+        // When shadow_caster == max_lights (sentinel) no light casts shadows:
+        // skip the shadow pass entirely. PBR receiver returns fully-lit for
+        // out-of-range shadow lookups, so skipping is safe.
+        const has_shadow_caster = inst.shadow_caster < gl.command.max_lights;
+        const light_vp = if (has_shadow_caster) blk: {
+            // Choose ortho (directional) vs. perspective (spot) based on caster type.
+            const caster_base = inst.shadow_caster * 16;
+            const caster_type = inst.lights[caster_base + 0];
+            if (caster_type >= 1.5) {
+                // Spot light: perspective projection from light position.
+                break :blk clipFix().mul(spotLightVp(inst));
+            } else {
+                // Directional light: ortho fit to scene AABB.
+                break :blk clipFix().mul(lightSpaceMatrix(inst, a));
+            }
+        } else gl.math.Mat4.perspective(1.0, 1.0, 0.1, 1.0); // dummy, never used
         inst.light_vp_mat = light_vp.m;
-        // Light-frustum planes for shadow-caster culling (T4). Culling against the
-        // LIGHT frustum (not the camera) so off-screen casters that cast into view
-        // are not incorrectly dropped.
-        const lplanes = gl.cull.frustumPlanes(light_vp);
         inst.cull_shadow_drawn = 0;
         inst.cull_shadow_culled = 0;
-        enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
-        // NOTE: double-sided shadows use back-cull this phase — drawDepth/drawDepthAt
-        // carry no per-draw state word, so cull is baked into the depth pipeline.
-        // A thin double-sided surface may under-shadow from one side; future work.
-        {
-            // Phase A: opaque + blend (alpha_mode != 2) — plain position-only depth.
-            // depth_mvps is computed for ALL submeshes (cheap) so Phase B can reuse it.
-            // Cull check happens here for ALL submeshes; culled ones skip both phases.
-            var sd: u32 = 0;
-            while (sd < a.submesh_count) : (sd += 1) {
-                if (sd >= max_submesh) break;
-                const sub = a.submesh(sd);
-                inst.depth_mvps[sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
-                const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
-                if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
-                    inst.cull_shadow_culled += 1;
-                    continue;
+        if (has_shadow_caster) {
+            // Light-frustum planes for shadow-caster culling (T4). Culling against the
+            // LIGHT frustum (not the camera) so off-screen casters that cast into view
+            // are not incorrectly dropped.
+            const lplanes = gl.cull.frustumPlanes(light_vp);
+            enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
+            // NOTE: double-sided shadows use back-cull this phase — drawDepth/drawDepthAt
+            // carry no per-draw state word, so cull is baked into the depth pipeline.
+            // A thin double-sided surface may under-shadow from one side; future work.
+            {
+                // Phase A: opaque + blend (alpha_mode != 2) — plain position-only depth.
+                // depth_mvps is computed for ALL submeshes (cheap) so Phase B can reuse it.
+                // Cull check happens here for ALL submeshes; culled ones skip both phases.
+                var sd: u32 = 0;
+                while (sd < a.submesh_count) : (sd += 1) {
+                    if (sd >= max_submesh) break;
+                    const sub = a.submesh(sd);
+                    inst.depth_mvps[sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
+                    const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                    if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
+                        inst.cull_shadow_culled += 1;
+                        continue;
+                    }
+                    if (sub.alpha_mode == 2) continue; // MASK: drawn in Phase B
+                    inst.cull_shadow_drawn += 1;
+                    enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])));
                 }
-                if (sub.alpha_mode == 2) continue; // MASK: drawn in Phase B
-                inst.cull_shadow_drawn += 1;
-                enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])));
+                // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
+                // Re-tests light frustum (same deterministic result as Phase A); only
+                // MASK submeshes that passed Phase A's frustum check reach drawDepthAt.
+                sd = 0;
+                while (sd < a.submesh_count) : (sd += 1) {
+                    if (sd >= max_submesh) break;
+                    const sub = a.submesh(sd);
+                    if (sub.alpha_mode != 2) continue;
+                    const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                    if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // already counted in Phase A
+                    inst.cull_shadow_drawn += 1;
+                    enc.bindTexture(0, texHandle(sub.tex_base));
+                    enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])), @intCast(@intFromPtr(&inst.mats[sd])));
+                }
             }
-            // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
-            // Re-tests light frustum (same deterministic result as Phase A); only
-            // MASK submeshes that passed Phase A's frustum check reach drawDepthAt.
-            sd = 0;
-            while (sd < a.submesh_count) : (sd += 1) {
-                if (sd >= max_submesh) break;
-                const sub = a.submesh(sd);
-                if (sub.alpha_mode != 2) continue;
-                const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
-                if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // already counted in Phase A
-                inst.cull_shadow_drawn += 1;
-                enc.bindTexture(0, texHandle(sub.tex_base));
-                enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])), @intCast(@intFromPtr(&inst.mats[sd])));
-            }
+            enc.endShadowPass(width, height);
         }
-        enc.endShadowPass(width, height);
 
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
 
@@ -1350,7 +1476,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             // bindShadowMap→bindTexture 0-4→drawPbrInstanced.
             const sub0 = a.submesh(0);
             enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
-            enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
+            enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
             enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
             enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
             if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
@@ -1451,7 +1577,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     inst.mvps[s] = pv.mul(world_s).m;
                     // Pass A: cull front → back faces drawn.
                     enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_front | gl.command.state_blend);
-                    enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
+                    enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
                     enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
@@ -1464,7 +1590,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.drawPbr(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.mvps[s])), @intCast(@intFromPtr(&inst.model_mats[s])), @intCast(@intFromPtr(&inst.normal9s[s])), @intCast(@intFromPtr(&inst.mats[s])), @intCast(@intFromPtr(&inst.camera_pos)));
                     // Pass B: cull back → front faces drawn.
                     enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_back | gl.command.state_blend);
-                    enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
+                    enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
                     enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
@@ -1555,7 +1681,7 @@ fn drawSubmesh(
         (if (inst.morph_enabled) variant_morph else 0);
     if (v != last_variant.*) {
         enc.setPipeline(shaderHandleFor(v), state);
-        enc.setLights(1, @intCast(@intFromPtr(&inst.lights)));
+        enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
         enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
         enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
         if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));

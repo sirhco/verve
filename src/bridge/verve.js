@@ -4788,9 +4788,10 @@
           const count = dv.getUint32(off, true);
           const p = dv.getUint32(off + 4, true);
           if (st.active && st.active.lights) {
-            // u_lights is vec4[8] (32 floats); count*8 floats updates only the
-            // leading vec4 elements — legal short uniform4fv in WebGL2.
-            gl.uniform4fv(st.active.lights, new Float32Array(memory.buffer, p, count * 8));
+            // u_lights is vec4[16] (64 floats); count*16 floats (4 vec4/light):
+            // v0=[type,intensity,pos.x,pos.y], v1=[pos.z,dir.x,dir.y,dir.z],
+            // v2=[color.r,color.g,color.b,range], v3=[cosIn,cosOut,__,__].
+            gl.uniform4fv(st.active.lights, new Float32Array(memory.buffer, p, count * 16));
             if (st.active.lightCount) gl.uniform1i(st.active.lightCount, count);
           }
           break;
@@ -5392,11 +5393,15 @@
   //   normal_mat : mat3x3  @ 128  (3 cols × vec4 = 12 f32, col i at 128+16i)
   //   camera_pos : vec3    @ 176  (3 f32 + 4B pad)
   //   material   : vec4[3] @ 192  (12 f32)
-  //   lights     : vec4[8] @ 240  (16 f32 packed = count*8 from wasm)
-  //   light_count: i32     @ 368
-  //   prefiltered_mips:f32 @ 372
-  //   light_vp   : mat4x4  @ 384  (variant_shadow only; non-shadow ignores it)
-  // base struct = 376 → 384; with light_vp → 448 (both 16B multiples).
+  //   lights     : vec4[16] @ 240  (64 f32 packed = count*16 from wasm; 4 vec4/light:
+  //                                  v0=[type,intensity,pos.x,pos.y],
+  //                                  v1=[pos.z,dir.x,dir.y,dir.z],
+  //                                  v2=[color.r,color.g,color.b,range],
+  //                                  v3=[cosIn,cosOut,__,__])
+  //   light_count: i32     @ 496
+  //   prefiltered_mips:f32 @ 500
+  //   light_vp   : mat4x4  @ 512  (variant_shadow only; non-shadow ignores it)
+  // base struct = 504 → 512; with light_vp → 576 (both 16B multiples).
   const PBR_U = {
     mvp: 0,
     model: 64,
@@ -5404,17 +5409,17 @@
     cameraPos: 176,
     material: 192,
     lights: 240,
-    lightCount: 368,
-    prefMips: 372,
-    lightVp: 384, // variant_shadow light-space matrix (set by bind_shadow_map)
-    size: 448,
+    lightCount: 496,
+    prefMips: 500,
+    lightVp: 512, // variant_shadow light-space matrix (set by bind_shadow_map)
+    size: 576,
   };
   // Multiple draws per frame each need isolated uniforms: WebGPU defers draws, so
   // a single shared buffer would let the last writeBuffer clobber earlier draws.
   // Solution: dynamic uniform offsets — each draw writes its full struct to its
   // own 256-aligned slot and binds with that offset. Per-frame values (lights/
   // ibl/light_vp) are cached and replicated into every slot.
-  const PBR_STRIDE = 512; // align(448, 256)
+  const PBR_STRIDE = 768; // align(576, 256)
   const DEPTH_STRIDE = 256; // one mat4 (64B) padded to the 256B dynamic-offset min
   const MAX_DRAWS = 64; // per-frame draw cap (cube+plane today; headroom for scenes)
   // Post fullscreen draws (bright/blurH/blurV/composite/fxaa = up to 5/frame) each
@@ -5712,10 +5717,10 @@
           // with two vertex.buffers and stored as kind "pbr-instanced". FRESH
           // descriptor literals — does NOT touch pbrDesc or the non-instanced pipeline.
           if ((variant & 0x1000) !== 0) {
-            // Guard: instanced + shadow (0x1020) share offset 384 in the WGSL U
+            // Guard: instanced + shadow (0x1020) share offset 512 in the WGSL U
             // struct (vp vs light_vp) — unsupported in v1.  Fail loud, not garbage.
             if ((variant & 0x1020) === 0x1020) {
-              console.error("gl: variant_instanced|variant_shadow (0x" + variant.toString(16) + ") unsupported — vp/light_vp collision at U offset 384; skipping pipeline build");
+              console.error("gl: variant_instanced|variant_shadow (0x" + variant.toString(16) + ") unsupported — vp/light_vp collision at U offset 512; skipping pipeline build");
               break;
             }
             const hasNormal = (variant & 0x8) !== 0;
@@ -6155,17 +6160,18 @@
         }
         case 11: { // SET_LIGHTS — pack into the PBR uniform's lights region.
           // Payload (command.zig Encoder.setLights, 8B): count | ptr. Each light
-          // is 8 f32 = 32B: [type(0=dir,1=point), intensity, posOrDir.xyz,
-          //   color.rgb]. This is ALREADY the WGSL packing: wgslPbr unpacks
-          //   l0 = lights[2i] = [type, intensity, pos.x, pos.y], l1 =
-          //   lights[2i+1] = [pos.z, color.r, color.g, color.b]. So count*8 f32
-          //   copies verbatim into lights[] (max 8 lights = 16 vec4 = 64 f32).
+          // is 16 f32 = 64B (4 vec4/light):
+          //   v0 = [type, intensity, pos.x, pos.y]
+          //   v1 = [pos.z, dir.x, dir.y, dir.z]
+          //   v2 = [color.r, color.g, color.b, range]
+          //   v3 = [cosIn, cosOut, __, __]
+          // Copies verbatim into lights[] (max 4 lights = 16 vec4 = 64 f32).
           // Per-frame state (same for every draw): cache a copy; draw_pbr writes
           // it into each draw's uniform slot. Copy out of wasm memory now.
           const count = dv.getUint32(off, true);
           const p = dv.getUint32(off + 4, true);
-          const n = Math.min(count, 8);
-          st.frameLights = (n > 0) ? new Float32Array(memory.buffer, p, n * 8).slice() : new Float32Array(0);
+          const n = Math.min(count, 4);
+          st.frameLights = (n > 0) ? new Float32Array(memory.buffer, p, n * 16).slice() : new Float32Array(0);
           st.frameLightCount = n;
           break;
         }
@@ -6480,15 +6486,15 @@
             });
           }
           device.queue.writeBuffer(st.instanceBuf, 0, memory.buffer, instancePtr, instBytes);
-          // ── Per-draw uniform slot (PBR_U layout, instanced U adds vp @ 384). ──
+          // ── Per-draw uniform slot (PBR_U layout, instanced U adds vp @ 512). ──
           // The instanced WGSL U struct has all standard fields (mvp, model, …)
-          // plus `vp: mat4x4<f32>` appended at offset 384 (same as PBR_U.lightVp).
+          // plus `vp: mat4x4<f32>` appended at offset 512 (same as PBR_U.lightVp).
           // We only write the fields the shader actually reads: vp, material, camera.
           const ubuf = gpuEnsurePbrUniform(st);
           const slot = st.pbrSlot++;
           if (slot >= MAX_DRAWS) break;
           const base = slot * PBR_STRIDE;
-          // vp (view-proj): u.vp — offset 384 (= PBR_U.lightVp in the JS table).
+          // vp (view-proj): u.vp — offset 512 (= PBR_U.lightVp in the JS table).
           device.queue.writeBuffer(ubuf, base + PBR_U.lightVp, new Float32Array(memory.buffer, vpPtr, 16));
           // material: 3×vec4 = 12 f32.
           device.queue.writeBuffer(ubuf, base + PBR_U.material, new Float32Array(memory.buffer, materialPtr, 12));

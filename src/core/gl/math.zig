@@ -359,6 +359,22 @@ pub fn transformDir(m: Mat4, v: Vec3) Vec3 {
     );
 }
 
+/// Spot-light view-projection matrix for shadow mapping.
+/// `pos`     — light position in world space.
+/// `dir`     — light direction (need not be unit; normalised internally).
+/// `fovy`    — full vertical field-of-view in radians (2 × half-angle).
+/// `near`    — near plane; caller must ensure near > 0.
+/// `far`     — far plane; caller must ensure far > near.
+/// Returns proj × view (column-major, WebGL clip space).
+pub fn spotLightVpMat(pos: Vec3, dir: Vec3, fovy: f32, near: f32, far: f32) Mat4 {
+    const d = dir.normalize();
+    const up = if (@abs(d.y) > 0.99) Vec3.init(0, 0, 1) else Vec3.init(0, 1, 0);
+    const target = Vec3.add(pos, d);
+    const view = Mat4.lookAt(pos, target, up);
+    const proj = Mat4.perspective(fovy, 1.0, near, far);
+    return proj.mul(view);
+}
+
 const testing = std.testing;
 const eps = 1e-5;
 
@@ -515,6 +531,40 @@ test "normalMatrix: non-uniform scale diag(2,1,0.5) inverts scales" {
     try testing.expectApproxEqAbs(@as(f32, 0), n[6], eps); // col2 row0
     try testing.expectApproxEqAbs(@as(f32, 0), n[7], eps); // col2 row1
     try testing.expectApproxEqAbs(@as(f32, 2), n[8], eps); // col2 row2
+}
+
+test "spotLightVpMat: finite matrix for representative spot" {
+    // Spot at (0,5,0) pointing straight down (-Y), 60-degree fovy, near=0.05, far=20.
+    // Verify all 16 elements are finite (not NaN, not inf).
+    const fovy = std.math.pi / 3.0; // 60 degrees
+    const vp = spotLightVpMat(
+        Vec3.init(0, 5, 0),
+        Vec3.init(0, -1, 0),
+        fovy,
+        0.05,
+        20.0,
+    );
+    for (vp.m) |elem| {
+        try testing.expect(std.math.isFinite(elem));
+    }
+    // Also test with a tilted direction (non-axis-aligned) to exercise the up-vector branch.
+    const vp2 = spotLightVpMat(
+        Vec3.init(3, 4, 0),
+        Vec3.init(-1, -1, 0),
+        fovy,
+        0.05,
+        10.0,
+    );
+    for (vp2.m) |elem| {
+        try testing.expect(std.math.isFinite(elem));
+    }
+    // Edge: tiny range forces far > near guard (far = max(0.1, range=0.01) → 0.1).
+    // spotLightVpMat itself doesn't enforce this — the guard lives in spotLightVp
+    // (GlScene.zig).  Here we confirm the math is still well-formed when far=0.1.
+    const vp3 = spotLightVpMat(Vec3.init(0, 1, 0), Vec3.init(0, -1, 0), fovy, 0.05, 0.1);
+    for (vp3.m) |elem| {
+        try testing.expect(std.math.isFinite(elem));
+    }
 }
 
 test "golden: normalMatrix rotation×non-uniform-scale" {

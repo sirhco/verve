@@ -8,6 +8,17 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **gl spot lights + spot shadows + multi-light** (`src/core/gl_scene.zig`,
+  `src/app/*`, `docs/24-gl.md`): up to 4 mixed directional / point / spot lights
+  via `.light()` / `.pointLight()` / `.spotLight()` on `GlSceneBuilder`. Spot
+  cone falloff uses `smoothstep(cos_outer, cos_inner, dot(-L, dir))`; point lights
+  use `1/d²` range attenuation. A spot or directional light can be designated as
+  the shadow caster (`casts_shadow = true`): spot → perspective `light_vp`
+  (fovy = 2 × outer_deg); directional → ortho `light_vp`. Lights travel via
+  `data-gllights` (16 f32 per light; type 0 = dir, 1 = point, 2 = spot). Props
+  stays 14 fields. Both WebGL2 and WebGPU backends. `/gl-spot` demo: shadow.vmesh
+  cube + floor, spot caster above + fill directional + colored point accent.
+
 - **gl distance fog** (`src/core/gl_scene.zig`, `src/app/*`, `docs/24-gl.md`):
   distance fog via `.fog(.{ .mode, .color, .near, .far, .density })` on
   `GlSceneBuilder`. Four modes: `none`, `linear`, `exp`, `exp2`. Wire tag 28;

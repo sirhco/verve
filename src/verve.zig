@@ -200,6 +200,11 @@ pub const anim = @import("core/anim/anim.zig");
 // in the bridge). Pre-1.0, surface will grow through P2-P5.
 pub const gl = @import("core/gl/gl.zig");
 
+// Re-export GlScene builder types so app code can name them directly
+// (e.g. `verve.GlLight` in a `[]const verve.GlLight` multi-light array).
+pub const GlLight = @import("core/gl_scene.zig").Light;
+pub const GlLightKind = @import("core/gl_scene.zig").LightKind;
+
 // Codec
 pub const encode = serialize_mod.encode;
 
