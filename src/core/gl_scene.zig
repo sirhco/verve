@@ -90,8 +90,8 @@ pub const FogOpts = struct {
 pub const LightKind = enum(u32) { directional = 0, point = 1, spot = 2 };
 
 /// Describes one light for the `data-gllights` out-of-band attribute.
-/// `casts_shadow` is reserved for S5 and is NOT serialized into the CSV
-/// (S4 emits SSR attrs only; shadow map upload is a later task).
+/// `casts_shadow` is serialized as field 15 (0 or 1) in the CSV so the
+/// chunk knows which light is the designated shadow caster (S5).
 pub const Light = struct {
     kind: LightKind = .directional,
     pos: [3]f32 = .{ 0, 0, 0 },
@@ -310,23 +310,24 @@ pub const GlSceneBuilder = struct {
             }
         }
 
-        // Lights travel OUTSIDE Props as a semicolon-separated list of 14-value
+        // Lights travel OUTSIDE Props as a semicolon-separated list of 15-value
         // comma-separated records (type,intensity,px,py,pz,dx,dy,dz,r,g,b,
-        // range,cosIn,cosOut). Only emitted when at least one light was added.
-        // dir is normalized; inner_deg/outer_deg are converted to cos of the
-        // half-angle. S5 parseLights reads this EXACT layout — field order frozen.
+        // range,cosIn,cosOut,castsShadow). Only emitted when at least one light
+        // was added. dir is normalized; inner_deg/outer_deg are converted to cos
+        // of the half-angle. parseLights reads this EXACT layout — field order
+        // frozen. castsShadow is 1 for the caster, 0 otherwise.
         if (self.light_count > 0) {
             const deg2rad = std.math.pi / 180.0;
-            // Upper bound per light: 14 fields × 20 chars + 13 commas + 1 semi ≈ 295 B.
-            // 4 lights × 295 = 1180; round up to 1280 for safety.
-            var lbuf: [1280]u8 = undefined;
+            // Upper bound per light: 15 fields × 20 chars + 14 commas + 1 semi ≈ 315 B.
+            // 4 lights × 315 = 1260; round up to 1400 for safety.
+            var lbuf: [1400]u8 = undefined;
             var lpos: usize = 0;
             for (self.lights_buf[0..self.light_count], 0..) |lgt, li| {
                 const d = normalize3(lgt.dir);
                 const cos_in = @cos(lgt.inner_deg * deg2rad);
                 const cos_out = @cos(lgt.outer_deg * deg2rad);
                 const sep: []const u8 = if (li != 0) ";" else "";
-                const lchunk = std.fmt.bufPrint(lbuf[lpos..], "{s}{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d}", .{
+                const lchunk = std.fmt.bufPrint(lbuf[lpos..], "{s}{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d}", .{
                     sep,
                     @intFromEnum(lgt.kind),
                     lgt.intensity,
@@ -342,6 +343,7 @@ pub const GlSceneBuilder = struct {
                     lgt.range,
                     cos_in,
                     cos_out,
+                    @as(u32, if (lgt.casts_shadow) 1 else 0),
                 }) catch break;
                 lpos += lchunk.len;
             }
@@ -746,6 +748,9 @@ test "glScene .spotLight emits data-gllights" {
     // cos(15°) ≈ 0.9659; cos(25°) ≈ 0.9063 — check first 4 digits of each.
     try testing.expect(std.mem.indexOf(u8, html, "0.9659") != null);
     try testing.expect(std.mem.indexOf(u8, html, "0.9063") != null);
+    // Field 15: castsShadow=1 (casts_shadow=true above). The record ends with
+    // ...,cosOut,1" so check that ",1\"" (or ",1;") terminates the attribute.
+    try testing.expect(std.mem.indexOf(u8, html, ",1\"") != null or std.mem.indexOf(u8, html, ",1;") != null);
 }
 
 test "glScene no lights emits no data-gllights" {
