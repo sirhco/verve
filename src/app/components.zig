@@ -1207,6 +1207,81 @@ pub fn glSceneShadow(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-spot: spot light + spot shadow + multi-light demo. Three lights mix in
+/// one scene: a spot caster above the cube (perspective shadow map — fovy =
+/// 2 × outer_deg), a dim fill directional (no shadow), and a colored point
+/// accent. Reuses shadow.vmesh (cube on a floor) so the cone shadow falls on
+/// the floor receiver. The spot type is serialized as light type 2 in the
+/// data-gllights CSV; the fill directional is type 0; the point is type 1.
+pub fn glSceneSpot(ctx: *const verve.Context) !*verve.Node {
+    // Three-light array: spot caster (type 2) + fill directional (type 0) +
+    // colored point accent (type 1). All three land in data-gllights; the spot
+    // is type 2 so its field 0 reads "2," in the CSV output.
+    const spot_lights = [_]verve.GlLight{
+        // Spot above the cube, slight forward tilt. casts_shadow=true →
+        // perspective depth pass (fovy = 2 × outer_deg = 44°).
+        .{
+            .kind = .spot,
+            .pos = .{ 0, 6, 1 },
+            .dir = .{ 0, -1, -0.15 },
+            .color = .{ 1, 0.95, 0.85 },
+            .intensity = 60,
+            .inner_deg = 14,
+            .outer_deg = 22,
+            .range = 20,
+            .casts_shadow = true,
+        },
+        // Dim fill directional — keeps the unlit side visible, no shadow.
+        .{
+            .kind = .directional,
+            .dir = .{ -0.4, -0.7, -0.4 },
+            .intensity = 0.6,
+        },
+        // Colored point accent — shows 1/d² attenuation on the cube face.
+        .{
+            .kind = .point,
+            .pos = .{ -3, 2, 2 },
+            .color = .{ 0.3, 0.5, 1.0 },
+            .intensity = 12,
+            .range = 10,
+        },
+    };
+
+    const scene = ctx.glScene(.{
+        .src = "/gl/shadow.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3ESpot%3C/text%3E%3C/svg%3E",
+    })
+        // Frame camera down to see the cone shadow on the floor.
+        .camera(.{ .distance = 9, .pitch = 0.55, .yaw = 0.7 })
+        .lights(&spot_lights)
+        .autoRotate(0.2)
+        .build();
+
+    const scene_box = ctx.div().class("gl-wrap").children(.{
+        ctx.div()
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;margin:0 auto")
+            .children(.{scene}),
+    });
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — spot lights + spot shadow"),
+        ctx.p().text("Three lights in one scene: a spot caster above the cube " ++
+            "that casts a perspective shadow (fovy = 2 \u{00d7} outer angle, same " ++
+            "depth pass + PCF as the directional shadow), a dim fill directional " ++
+            "keeping the unlit side visible, and a blue-tinted point accent that " ++
+            "shows 1/d\u{00b2} attenuation on the cube face."),
+        scene_box,
+        ctx.p().class("hint")
+            .text("Drag to orbit \u{00b7} wheel to zoom \u{00b7} cone shadow tracks the spot."),
+        ctx.p().text("The spot cone uses " ++
+            "smoothstep(cos_outer, cos_inner, dot(-L, dir)) for soft " ++
+            "falloff at the penumbra. The scene is lit by up to 4 mixed " ++
+            "directional / point / spot lights packed into SET_LIGHTS " ++
+            "(type 0 / 1 / 2 in the data-gllights attribute)."),
+    });
+}
+
 /// /gl-cutout: alpha-test (MASK) cutout dissolve demo. The "Cutout" cube's
 /// base-color texture has a real alpha channel with HOLES; its material is
 /// alphaMode:MASK (cutoff 0.5), so the variant_alpha_test shader DISCARDS any
