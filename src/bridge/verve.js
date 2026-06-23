@@ -6439,6 +6439,7 @@
           st.active = depthPipe;
           st.depthSlot = 0; // reset per-draw depth-uniform slot allocation
           st.depthAtSlot = 0; // depth-at draws use a separate buffer + slot counter
+          if (st.pointDepthPipe) st.pointDepthPipe.pointDepthSlot = 0; // reset once per frame (not per face)
           gpuEnsureDepthUniform(st, depthPipe);
           break;
         }
@@ -7022,7 +7023,7 @@
             // Uniform buffer: POINT_DEPTH_STRIDE slots (one per draw_point_depth call).
             const POINT_DEPTH_STRIDE = 256;
             const pointDepthUniform = device.createBuffer({
-              size: POINT_DEPTH_STRIDE * 64, // 64 draws per frame cap
+              size: POINT_DEPTH_STRIDE * 384, // 6 faces × 64 submeshes
               usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             });
             st.pointDepthPipe = { pipeline, bgl, pointDepthUniform,
@@ -7076,7 +7077,7 @@
           st.pointDepthPipe.faceVp    = new Float32Array(memory.buffer, faceVpPtr, 16).slice();
           st.pointDepthPipe.lightPos  = new Float32Array(memory.buffer, lightPosPtr, 3).slice();
           st.pointDepthPipe.far       = far;
-          st.pointDepthPipe.pointDepthSlot = 0; // reset per-face draw counter
+          // pointDepthSlot is reset once per frame (BEGIN_FRAME) — not per face — to keep slots unique across all 6 faces.
           break;
         }
         case 33: { // DRAW_POINT_DEPTH — draw one mesh into the active face tile.
