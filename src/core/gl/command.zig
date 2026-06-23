@@ -737,6 +737,63 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    // Point-shadow receiver (variant_shadow_point): RGBA8 atlas sampler, uniforms,
+    // unpackDist helper, and a manual 3×3 PCF pointShadowFactor().
+    // Atlas layout: 1536×1024, 3×2 of 512² tiles. Face f → col=f%3, row=f/3.
+    // Face order: 0=+X, 1=−X, 2=+Y, 3=−Y, 4=+Z, 5=−Z (matches cubeFaceVp).
+    // uvc signs per face (P4 WGSL must mirror exactly):
+    //   face 0 (+X): uvc = vec2(-v.z, -v.y)
+    //   face 1 (-X): uvc = vec2( v.z, -v.y)
+    //   face 2 (+Y): uvc = vec2( v.x,  v.z)
+    //   face 3 (-Y): uvc = vec2( v.x, -v.z)
+    //   face 4 (+Z): uvc = vec2( v.x, -v.y)
+    //   face 5 (-Z): uvc = vec2(-v.x, -v.y)
+    // Bias: 0.01 (normalised distance, not depth-buffer units).
+    const point_shadow_decls =
+        \\uniform sampler2D u_point_atlas;
+        \\uniform vec3 u_point_light_pos;
+        \\uniform float u_point_far;
+        \\float unpackDist(vec4 c){ return dot(c, vec4(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0)); }
+        \\float pointShadowFactor() {
+        \\  vec3 v = v_world_pos - u_point_light_pos;
+        \\  float cur = length(v) / u_point_far;
+        \\  vec3 a = abs(v);
+        \\  float ma; int face; vec2 uvc;
+        \\  if (a.x >= a.y && a.x >= a.z) {
+        \\    ma = a.x;
+        \\    if (v.x > 0.0) { face = 0; uvc = vec2(-v.z, -v.y); }
+        \\    else           { face = 1; uvc = vec2( v.z, -v.y); }
+        \\  } else if (a.y >= a.z) {
+        \\    ma = a.y;
+        \\    if (v.y > 0.0) { face = 2; uvc = vec2( v.x,  v.z); }
+        \\    else           { face = 3; uvc = vec2( v.x, -v.z); }
+        \\  } else {
+        \\    ma = a.z;
+        \\    if (v.z > 0.0) { face = 4; uvc = vec2( v.x, -v.y); }
+        \\    else           { face = 5; uvc = vec2(-v.x, -v.y); }
+        \\  }
+        \\  vec2 uv = 0.5 * (uvc / ma + 1.0);
+        \\  vec2 tile = vec2(float(face - (face / 3) * 3), float(face / 3));
+        \\  float bias = 0.01;
+        \\  vec2 texel = 1.0 / vec2(1536.0, 1024.0);
+        \\  float lit = 0.0;
+        \\  for (int dy = -1; dy <= 1; dy++) {
+        \\    for (int dx = -1; dx <= 1; dx++) {
+        \\      vec2 fuv = clamp(uv + vec2(float(dx), float(dy)) * texel * vec2(3.0, 2.0),
+        \\                       vec2(0.0008), vec2(0.9992));
+        \\      vec2 atlasUv = (tile + fuv) * vec2(1.0 / 3.0, 1.0 / 2.0);
+        \\      float stored = unpackDist(texture(u_point_atlas, atlasUv));
+        \\      lit += (cur <= stored + bias) ? 1.0 : 0.0;
+        \\    }
+        \\  }
+        \\  return lit / 9.0;
+        \\}
+        \\
+    ;
+    const combine_point_shadow =
+        \\  vec3 color = ambient + Lo * pointShadowFactor();
+        \\
+    ;
     const emissive =
         \\  color += emissive_factor * texture(u_emissive_tex, v_uv).rgb;
         \\
@@ -760,13 +817,14 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ ibl_samplers;
     if (flags & variant_fog != 0) src = src ++ fog_uniforms;
     if (flags & variant_shadow != 0) src = src ++ shadow_decls;
+    if (flags & variant_shadow_point != 0) src = src ++ point_shadow_decls;
     src = src ++ main_open;
     if (flags & variant_instanced != 0) src = src ++ inst_tint;
     if (flags & variant_alpha_test != 0) src = src ++ alpha_test;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
     if (flags & variant_double_sided != 0) src = src ++ ds_flip;
     src = src ++ lighting;
-    src = src ++ (if (flags & variant_shadow != 0) combine_shadow else combine_plain);
+    src = src ++ (if (flags & variant_shadow != 0) combine_shadow else if (flags & variant_shadow_point != 0) combine_point_shadow else combine_plain);
     if (flags & variant_emissive != 0) src = src ++ emissive;
     if (flags & variant_fog != 0) src = src ++ fog_mix;
     if (flags & variant_linear_output == 0) src = src ++ tail_tonemap;
@@ -3166,4 +3224,27 @@ test "point-depth WGSL: combined src has packDist + u_face_vp (via face_vp) + u_
     try testing.expect(std.mem.indexOf(u8, w, "light_pos") != null);
     try testing.expect(std.mem.indexOf(u8, w, "vs_main") != null);
     try testing.expect(std.mem.indexOf(u8, w, "fs_main") != null);
+}
+
+// ── Point-shadow receiver GLSL (T3) ──────────────────────────────────────────
+
+test "GLSL variant_shadow_point: receiver emits u_point_atlas, unpackDist, pointShadowFactor" {
+    const f = pbrFragmentSrc(variant_pbr | variant_shadow_point);
+    try testing.expect(std.mem.indexOf(u8, f, "u_point_atlas") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "unpackDist") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "pointShadowFactor") != null);
+    // The shadow term attenuates direct light only — IBL ambient stays lit.
+    try testing.expect(std.mem.indexOf(u8, f, "ambient + Lo * pointShadowFactor()") != null);
+    // Plain PBR variant carries none of it.
+    const plain = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "u_point_atlas") == null);
+    // Directional/spot shadow variant is unaffected.
+    const shadow2d = pbrFragmentSrc(variant_pbr | variant_shadow);
+    try testing.expect(std.mem.indexOf(u8, shadow2d, "u_point_atlas") == null);
+}
+
+test "golden: variant_shadow_point GLSL fragment hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate GLSL contract bump.
+    const SP = variant_pbr | variant_shadow_point;
+    try testing.expectEqual(@as(u64, 0x2c7127b6863d65c2), fnv64(pbrFragmentSrc(SP)));
 }
