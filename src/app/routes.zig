@@ -30,6 +30,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/gl-fog", renderGlFog),
     verve.Route.init("/gl-morph", renderGlMorph),
     verve.Route.init("/gl-spot", renderGlSpot),
+    verve.Route.init("/gl-point", renderGlPoint),
     verve.Route.init("/push-multi", renderPushMulti),
     verve.Route.init("/todos", renderTodos),
     verve.Route.init("/work/:slug", renderWorkDetail),
@@ -152,6 +153,11 @@ fn renderGlMorph(ctx: *verve.Context) !*verve.Node {
 
 fn renderGlSpot(ctx: *verve.Context) !*verve.Node {
     const body = try components.glSceneSpot(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderGlPoint(ctx: *verve.Context) !*verve.Node {
+    const body = try components.glScenePoint(ctx);
     return components.page(ctx, body);
 }
 

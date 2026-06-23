@@ -6,6 +6,19 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-06-22
+
+### Added
+
+- **gl point-light shadow demo** (`src/app/components.zig`, `src/app/routes.zig`,
+  `docs/24-gl.md`): `/gl-point` route + `glScenePoint` component. Reuses
+  `shadow.vmesh` (cube + floor) and `studio.venv`. One point caster
+  (`casts_shadow = true`, `intensity = 40`, `range = 18`) positioned at
+  `{1.5, 3.0, 1.5}` radiates shadows omnidirectionally via the 6-face RGBA8
+  distance atlas (`variant_shadow_point = 1<<15`); a dim fill directional keeps
+  the unlit side visible. Docs updated: Shadows section expanded with point-shadow
+  description; parity-status moves point-light shadows from Deferred → Shipped.
+
 ## [0.7.0] - 2026-06-22
 
 ### Added

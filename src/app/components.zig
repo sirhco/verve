@@ -1282,6 +1282,65 @@ pub fn glSceneSpot(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-point: omnidirectional point-light shadow demo. ONE point caster above
+/// the cube radiates shadows in all directions via a 6-face RGBA8 distance
+/// atlas (1536×1024, 3×2 of 512² tiles). The receiver samples the atlas with
+/// face-select + manual 3×3 PCF (`variant_shadow_point = 1<<15`). A dim fill
+/// directional keeps the unlit side from going pure-black. Reuses
+/// shadow.vmesh (cube + floor) and studio.venv.
+pub fn glScenePoint(ctx: *const verve.Context) !*verve.Node {
+    // Single point caster positioned high-right. 1/d² at ~3-4 units needs a
+    // large raw intensity (~40); fill dir keeps shadow side visible.
+    const point_lights = [_]verve.GlLight{
+        .{
+            .kind = .point,
+            .pos = .{ 1.5, 3.0, 1.5 },
+            .color = .{ 1, 0.9, 0.8 },
+            .intensity = 40,
+            .range = 18,
+            .casts_shadow = true,
+        },
+        // Dim fill so the unlit cube face isn't pure black.
+        .{
+            .kind = .directional,
+            .dir = .{ -0.4, -0.7, -0.4 },
+            .color = .{ 1, 1, 1 },
+            .intensity = 0.5,
+        },
+    };
+
+    const scene = ctx.glScene(.{
+        .src = "/gl/shadow.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EPoint%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 9, .pitch = 0.55, .yaw = 0.7 })
+        .lights(&point_lights)
+        .autoRotate(0.2)
+        .build();
+
+    const scene_box = ctx.div().class("gl-wrap").children(.{
+        ctx.div()
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;margin:0 auto")
+            .children(.{scene}),
+    });
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — point-light shadow"),
+        ctx.p().text("A point light positioned above the cube casts an " ++
+            "OMNIDIRECTIONAL shadow via a 6-face RGBA8 distance atlas " ++
+            "(1536\u{00d7}1024, 3\u{00d7}2 of 512\u{00b2} tiles). The receiver " ++
+            "face-selects the correct tile and applies manual 3\u{00d7}3 PCF " ++
+            "(`variant_shadow_point`). Unlike the directional (/gl-shadow) and " ++
+            "spot (/gl-spot) demos, the shadow radiates in all directions from " ++
+            "the light — the cube casts on the floor and the floor edge casts " ++
+            "back onto the cube side."),
+        scene_box,
+        ctx.p().class("hint")
+            .text("Drag to orbit \u{00b7} wheel to zoom \u{00b7} omnidirectional shadow from the point light."),
+    });
+}
+
 /// /gl-cutout: alpha-test (MASK) cutout dissolve demo. The "Cutout" cube's
 /// base-color texture has a real alpha channel with HOLES; its material is
 /// alphaMode:MASK (cutoff 0.5), so the variant_alpha_test shader DISCARDS any
