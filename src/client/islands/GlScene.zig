@@ -93,6 +93,14 @@ const depth_at_shader: u32 = 10; // alpha-tested depth shader for MASK cutout sh
 const shadow_handle: u32 = 1;
 const shadow_size: u32 = 1024;
 
+// Point-light shadow atlas (P11 task 5). RGBA8 1536×1024, 6 faces tiled 3×2
+// at 512×512 each. Lives in st.shadowMaps[] at handle 2 (distinct from the 2D
+// shadow map at handle 1 and IBL textures at handles 16/17/18).
+const point_atlas_handle: u32 = 2;
+const point_atlas_w: u32 = 1536;
+const point_atlas_h: u32 = 1024;
+const point_atlas_tile: u32 = 512;
+
 const max_submesh = 128; // per-instance pool cap (was 8); sizes Scene + all Inst pools
 const max_tex = 8; // material-texture cap (per mesh)
 
@@ -316,6 +324,18 @@ const Inst = struct {
     // M8: per-index runtime-set flag. When set, the per-frame baked-clip advance
     // skips that index so runtime tweens (or parseMorph seeds) are not clobbered.
     morph_runtime_set: [max_morph_targets]bool = .{false} ** max_morph_targets,
+
+    // P11 task 5 — point-light shadow atlas state.
+    // face_vp[f] = clipFix · cubeFaceVp(lp, f, near, far) — kept in Inst (not
+    // stack) so the Encoder pointer stays valid after glscene_frame returns.
+    // point_lp holds the caster world position; point_far the effective far plane.
+    face_vp: [6][16]f32 = undefined,
+    point_lp: [3]f32 = .{ 0, 0, 0 },
+    point_far: f32 = 1.0,
+    // True once createPointShadow has been emitted for this instance.
+    point_atlas_sent: bool = false,
+    // True when the active shadow caster is a point light (false = dir/spot 2D).
+    shadow_is_point: bool = false,
 };
 
 const MAX_INSTANCES = 4;
@@ -487,6 +507,24 @@ fn shaderHandleFor(variant: u32) u32 {
         variant_pbr | variant_nm | variant_at | variant_ds | variant_morph => 50,
         variant_pbr | variant_em | variant_at | variant_ds | variant_morph => 51,
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_morph => 52,
+        // Point-shadow receiver variants (variant_shadow_point): 16 combos at handles 53–68.
+        // No instanced+point (both backends @compileError); no fog or morph with point shadow v1.
+        variant_pbr | gl.command.variant_shadow_point => 53,
+        variant_pbr | variant_nm | gl.command.variant_shadow_point => 54,
+        variant_pbr | variant_em | gl.command.variant_shadow_point => 55,
+        variant_pbr | variant_nm | variant_em | gl.command.variant_shadow_point => 56,
+        variant_pbr | variant_at | gl.command.variant_shadow_point => 57,
+        variant_pbr | variant_nm | variant_at | gl.command.variant_shadow_point => 58,
+        variant_pbr | variant_em | variant_at | gl.command.variant_shadow_point => 59,
+        variant_pbr | variant_nm | variant_em | variant_at | gl.command.variant_shadow_point => 60,
+        variant_pbr | variant_ds | gl.command.variant_shadow_point => 61,
+        variant_pbr | variant_nm | variant_ds | gl.command.variant_shadow_point => 62,
+        variant_pbr | variant_em | variant_ds | gl.command.variant_shadow_point => 63,
+        variant_pbr | variant_nm | variant_em | variant_ds | gl.command.variant_shadow_point => 64,
+        variant_pbr | variant_at | variant_ds | gl.command.variant_shadow_point => 65,
+        variant_pbr | variant_nm | variant_at | variant_ds | gl.command.variant_shadow_point => 66,
+        variant_pbr | variant_em | variant_at | variant_ds | gl.command.variant_shadow_point => 67,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | gl.command.variant_shadow_point => 68,
         else => unreachable,
     };
 }
@@ -619,16 +657,50 @@ fn createShaderForVariant(inst: *Inst, enc: *gl.Encoder, variant: u32) void {
         variant_pbr | variant_nm | variant_at | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_ds | variant_morph),
         variant_pbr | variant_em | variant_at | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds | variant_morph),
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_morph => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_morph),
+        // Point-shadow receiver variants (handles 53–68). No instanced+point, no fog/morph v1.
+        variant_pbr | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr),
+        variant_pbr | variant_nm | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_nm),
+        variant_pbr | variant_em | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_em),
+        variant_pbr | variant_nm | variant_em | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_nm | variant_em),
+        variant_pbr | variant_at | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_at),
+        variant_pbr | variant_nm | variant_at | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_nm | variant_at),
+        variant_pbr | variant_em | variant_at | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_em | variant_at),
+        variant_pbr | variant_nm | variant_em | variant_at | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at),
+        variant_pbr | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_ds),
+        variant_pbr | variant_nm | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_nm | variant_ds),
+        variant_pbr | variant_em | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_em | variant_ds),
+        variant_pbr | variant_nm | variant_em | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_ds),
+        variant_pbr | variant_at | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_at | variant_ds),
+        variant_pbr | variant_nm | variant_at | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_ds),
+        variant_pbr | variant_em | variant_at | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds),
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds),
         else => unreachable,
     }
 }
 
 fn emitShader(inst: *Inst, enc: *gl.Encoder, comptime variant: u32) void {
-    const handle = shaderHandleFor(variant); // handle keyed on the bare variant (1..4)
-    // Every PBR program receives the directional shadow map (P9 slice 3).
+    const handle = shaderHandleFor(variant); // handle keyed on the bare variant (1..52)
+    // Every PBR program emitted here receives the 2D directional/spot shadow map.
     const full = variant | gl.command.variant_shadow;
     if (use_webgpu) {
         // One WGSL module (both stages) in the vs slot; fs slot 0/0.
+        const w = gl.command.wgslPbr(full);
+        enc.createShader(handle, full, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        inst.registry.recordShader(handle, full, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        return;
+    }
+    const vs = gl.command.pbrVertexSrc(full);
+    const fs = gl.command.pbrFragmentSrc(full);
+    enc.createShader(handle, full, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    inst.registry.recordShader(handle, full, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+}
+
+/// Emit a point-shadow PBR shader (variant | variant_shadow_point) at its distinct handle.
+/// Uses the same emitShader pattern but ORs in variant_shadow_point instead of variant_shadow.
+fn emitPointShader(inst: *Inst, enc: *gl.Encoder, comptime base_variant: u32) void {
+    const full = base_variant | gl.command.variant_shadow_point;
+    const handle = shaderHandleFor(full); // handle 53..68
+    if (use_webgpu) {
         const w = gl.command.wgslPbr(full);
         enc.createShader(handle, full, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
         inst.registry.recordShader(handle, full, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
@@ -713,10 +785,10 @@ fn parseFog(inst: *Inst, s: []const u8) void {
 // Format: semicolon-separated light records, each a 15-field comma-separated CSV:
 //   type,intensity,px,py,pz,dx,dy,dz,r,g,b,range,cosIn,cosOut,castsShadow
 // Maps CSV[0..13] → lights[i*16 + 0..13]; lights[i*16+14,15] = 0 (_pad).
-// CSV[14] (castsShadow): first directional (type=0) or spot (type=2) light with
-// value ≥ 0.5 becomes shadow_caster.  Point lights (type=1) flagged castsShadow
-// are skipped — point-light shadows are deferred to a future slice.
-// If no valid caster is found, shadow_caster = max_lights (sentinel: no shadow).
+// CSV[14] (castsShadow): the first light (directional/spot/point) with value ≥ 0.5
+// becomes shadow_caster. A directional → ortho light_vp, spot → perspective light_vp,
+// point → the 6-face RGBA8 distance atlas (variant_shadow_point).
+// If no light casts a shadow, shadow_caster = max_lights (sentinel: no shadow).
 // Tolerant: parse errors for a token leave that field at 0; extra fields ignored.
 fn parseLights(inst: *Inst, s: []const u8) void {
     const max_l = gl.command.max_lights;
@@ -736,11 +808,10 @@ fn parseLights(inst: *Inst, s: []const u8) void {
             if (fi < 14) {
                 inst.lights[base + fi] = v;
             } else {
-                // fi == 14: castsShadow — only directional (0) or spot (2) are valid.
-                // Point lights (type≈1) cannot cast shadows yet; skip them.
-                const ltype = inst.lights[base + 0];
-                const is_dir_or_spot = ltype < 0.5 or ltype >= 1.5;
-                if (v >= 0.5 and inst.shadow_caster == max_l and is_dir_or_spot)
+                // fi == 14: castsShadow — directional (0), point (1), and spot (2)
+                // are all valid casters. Point shadows use the 6-face RGBA8 atlas;
+                // dir/spot use the 2D depth map. Accept any type that flags castsShadow.
+                if (v >= 0.5 and inst.shadow_caster == max_l)
                     inst.shadow_caster = li;
             }
             fi += 1;
@@ -1263,6 +1334,11 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 const deltas = a.morphDeltas();
                 enc.createMorphTex(morph_tex_handle, morph_vertex_count, morph_target_count * 2, @intCast(@intFromPtr(deltas.ptr)), @intCast(deltas.len));
             }
+            // P11 task 5: Registry has no recordPointShadow; re-emit createPointShadow
+            // when the atlas was previously created (analogous to morph_tex_recorded).
+            if (inst.point_atlas_sent) {
+                enc.createPointShadow(point_atlas_handle, point_atlas_w, point_atlas_h);
+            }
         }
 
         // Upload any external (compressed) textures that finished decoding since the
@@ -1369,73 +1445,131 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             }
         }
 
-        // ── shadow depth pass (P9 slice 3) — render scene depth from the light.
-        // clipFix is identity on WebGL2 (path unchanged) and the [−1,1]→[0,1] z
-        // remap on WebGPU (gl.math ortho is GL-convention; the receiver's WGSL
-        // shadowFactor uses ndc.z directly).
+        // ── shadow depth pass — render scene depth from the caster light.
+        // Three cases: point (6-face atlas), spot (2D perspective), dir (2D ortho).
         //
         // When shadow_caster == max_lights (sentinel) no light casts shadows:
-        // skip the shadow pass entirely. PBR receiver returns fully-lit for
+        // skip all shadow passes entirely. PBR receiver returns fully-lit for
         // out-of-range shadow lookups, so skipping is safe.
         const has_shadow_caster = inst.shadow_caster < gl.command.max_lights;
-        const light_vp = if (has_shadow_caster) blk: {
-            // Choose ortho (directional) vs. perspective (spot) based on caster type.
-            const caster_base = inst.shadow_caster * 16;
-            const caster_type = inst.lights[caster_base + 0];
-            if (caster_type >= 1.5) {
-                // Spot light: perspective projection from light position.
-                break :blk clipFix().mul(spotLightVp(inst));
-            } else {
-                // Directional light: ortho fit to scene AABB.
-                break :blk clipFix().mul(lightSpaceMatrix(inst, a));
-            }
-        } else gl.math.Mat4.perspective(1.0, 1.0, 0.1, 1.0); // dummy, never used
-        inst.light_vp_mat = light_vp.m;
         inst.cull_shadow_drawn = 0;
         inst.cull_shadow_culled = 0;
         if (has_shadow_caster) {
-            // Light-frustum planes for shadow-caster culling (T4). Culling against the
-            // LIGHT frustum (not the camera) so off-screen casters that cast into view
-            // are not incorrectly dropped.
-            const lplanes = gl.cull.frustumPlanes(light_vp);
-            enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
-            // NOTE: double-sided shadows use back-cull this phase — drawDepth/drawDepthAt
-            // carry no per-draw state word, so cull is baked into the depth pipeline.
-            // A thin double-sided surface may under-shadow from one side; future work.
-            {
-                // Phase A: opaque + blend (alpha_mode != 2) — plain position-only depth.
-                // depth_mvps is computed for ALL submeshes (cheap) so Phase B can reuse it.
-                // Cull check happens here for ALL submeshes; culled ones skip both phases.
-                var sd: u32 = 0;
-                while (sd < a.submesh_count) : (sd += 1) {
-                    if (sd >= max_submesh) break;
-                    const sub = a.submesh(sd);
-                    inst.depth_mvps[sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
-                    const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
-                    if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
-                        inst.cull_shadow_culled += 1;
-                        continue;
+            const caster_base = inst.shadow_caster * 16;
+            const caster_type = inst.lights[caster_base + 0];
+            const caster_is_point = caster_type >= 0.5 and caster_type < 1.5;
+
+            if (caster_is_point) {
+                // ── Point-light shadow: 6-face RGBA8 atlas (P11 task 5).
+                // clipFix is applied to each face VP (WebGPU z remapping).
+                // face_vp[f] and point_lp live in Inst so the Encoder pointers
+                // remain valid after glscene_frame returns.
+                const lp = gl.math.Vec3.init(
+                    inst.lights[caster_base + 2],
+                    inst.lights[caster_base + 3],
+                    inst.lights[caster_base + 4],
+                );
+                inst.point_lp = .{ lp.x, lp.y, lp.z };
+                const rng = inst.lights[caster_base + 11];
+                // Use the declared range; fall back to a generous default (25 m).
+                const far: f32 = if (rng > 0) rng else 25.0;
+                const near: f32 = 0.05;
+                inst.point_far = far;
+
+                var face: u8 = 0;
+                while (face < 6) : (face += 1) {
+                    const fvp = clipFix().mul(gl.math.cubeFaceVp(lp, face, near, far));
+                    inst.face_vp[face] = fvp.m;
+                    const col: u32 = @as(u32, face) % 3;
+                    const row: u32 = @as(u32, face) / 3;
+                    enc.beginPointShadowFace(
+                        point_atlas_handle,
+                        col,
+                        row,
+                        point_atlas_tile,
+                        @intCast(@intFromPtr(&inst.face_vp[face])),
+                        @intCast(@intFromPtr(&inst.point_lp)),
+                        @bitCast(far),
+                    );
+                    var sd: u32 = 0;
+                    while (sd < a.submesh_count) : (sd += 1) {
+                        if (sd >= max_submesh) break;
+                        const sub = a.submesh(sd);
+                        enc.drawPointDepth(
+                            vbuf,
+                            ibuf,
+                            sub.index_byte_off,
+                            sub.index_count,
+                            @intCast(@intFromPtr(&inst.scene.world[sd + 1].m)),
+                        );
                     }
-                    if (sub.alpha_mode == 2) continue; // MASK: drawn in Phase B
-                    inst.cull_shadow_drawn += 1;
-                    enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])));
                 }
-                // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
-                // Re-tests light frustum (same deterministic result as Phase A); only
-                // MASK submeshes that passed Phase A's frustum check reach drawDepthAt.
-                sd = 0;
-                while (sd < a.submesh_count) : (sd += 1) {
-                    if (sd >= max_submesh) break;
-                    const sub = a.submesh(sd);
-                    if (sub.alpha_mode != 2) continue;
-                    const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
-                    if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // already counted in Phase A
-                    inst.cull_shadow_drawn += 1;
-                    enc.bindTexture(0, texHandle(sub.tex_base));
-                    enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])), @intCast(@intFromPtr(&inst.mats[sd])));
+                enc.endPointShadow(width, height);
+                enc.bindPointShadow(
+                    gl.command.tex_slot_point_shadow,
+                    point_atlas_handle,
+                    @intCast(@intFromPtr(&inst.point_lp)),
+                    @bitCast(far),
+                );
+                inst.shadow_is_point = true;
+                // light_vp_mat is unused on the point path; zero it for safety.
+                inst.light_vp_mat = [_]f32{0} ** 16;
+            } else {
+                // ── Directional / spot: 2D depth map (P9 slice 3, byte-identical).
+                // clipFix is identity on WebGL2 and z-remap on WebGPU.
+                const light_vp = if (caster_type >= 1.5)
+                    // Spot light: perspective projection from light position.
+                    clipFix().mul(spotLightVp(inst))
+                else
+                    // Directional light: ortho fit to scene AABB.
+                    clipFix().mul(lightSpaceMatrix(inst, a));
+                inst.light_vp_mat = light_vp.m;
+
+                // Light-frustum planes for shadow-caster culling (T4). Culling against
+                // the LIGHT frustum so off-screen casters that cast into view are kept.
+                const lplanes = gl.cull.frustumPlanes(light_vp);
+                enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
+                // NOTE: double-sided shadows use back-cull this phase — drawDepth/drawDepthAt
+                // carry no per-draw state word, so cull is baked into the depth pipeline.
+                // A thin double-sided surface may under-shadow from one side; future work.
+                {
+                    // Phase A: opaque + blend (alpha_mode != 2) — plain position-only depth.
+                    // depth_mvps is computed for ALL submeshes (cheap) so Phase B can reuse it.
+                    // Cull check happens here for ALL submeshes; culled ones skip both phases.
+                    var sd: u32 = 0;
+                    while (sd < a.submesh_count) : (sd += 1) {
+                        if (sd >= max_submesh) break;
+                        const sub = a.submesh(sd);
+                        inst.depth_mvps[sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
+                        const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                        if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
+                            inst.cull_shadow_culled += 1;
+                            continue;
+                        }
+                        if (sub.alpha_mode == 2) continue; // MASK: drawn in Phase B
+                        inst.cull_shadow_drawn += 1;
+                        enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])));
+                    }
+                    // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
+                    // Re-tests light frustum (same deterministic result as Phase A); only
+                    // MASK submeshes that passed Phase A's frustum check reach drawDepthAt.
+                    sd = 0;
+                    while (sd < a.submesh_count) : (sd += 1) {
+                        if (sd >= max_submesh) break;
+                        const sub = a.submesh(sd);
+                        if (sub.alpha_mode != 2) continue;
+                        const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                        if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // already counted in Phase A
+                        inst.cull_shadow_drawn += 1;
+                        enc.bindTexture(0, texHandle(sub.tex_base));
+                        enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])), @intCast(@intFromPtr(&inst.mats[sd])));
+                    }
                 }
+                enc.endShadowPass(width, height);
+                inst.shadow_is_point = false;
             }
-            enc.endShadowPass(width, height);
+        } else {
+            inst.shadow_is_point = false;
         }
 
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
@@ -1478,7 +1612,12 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
             enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
             enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-            enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+            if (inst.shadow_is_point) {
+                enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
+                enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
+            } else {
+                enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+            }
             if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
             enc.bindTexture(0, texHandle(sub0.tex_base));
             enc.bindTexture(1, texHandle(sub0.tex_mr));
@@ -1568,9 +1707,11 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     // front faces (cull back) for correct over-blend compositing.
                     // Both passes share the same variant; state word differs so each
                     // needs its own SET_PIPELINE + full lights/IBL/shadow re-emit.
+                    const ds_sbit: u32 = if (inst.shadow_is_point) gl.command.variant_shadow_point else 0;
                     const v = a.submeshVariant(s) |
                         (if (inst.fog_enabled) variant_fog else 0) |
-                        (if (inst.morph_enabled) variant_morph else 0);
+                        (if (inst.morph_enabled) variant_morph else 0) |
+                        ds_sbit;
                     const world_s = inst.scene.world[s + 1];
                     inst.model_mats[s] = world_s.m;
                     inst.normal9s[s] = gl.math.normalMatrix(world_s);
@@ -1579,7 +1720,12 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_front | gl.command.state_blend);
                     enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-                    enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+                    if (inst.shadow_is_point) {
+                        enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
+                        enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
+                    } else {
+                        enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+                    }
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
                     if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
                     enc.bindTexture(0, texHandle(sub.tex_base));
@@ -1592,7 +1738,12 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_back | gl.command.state_blend);
                     enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-                    enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+                    if (inst.shadow_is_point) {
+                        enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
+                        enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
+                    } else {
+                        enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+                    }
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
                     if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
                     enc.bindTexture(0, texHandle(sub.tex_base));
@@ -1676,14 +1827,27 @@ fn drawSubmesh(
     pv: gl.math.Mat4,
 ) void {
     const sub = a.submesh(s);
+    // Fold in the shadow receiver bit: point shadow uses variant_shadow_point (distinct
+    // handle 53–68); dir/spot uses the bare variant whose shader bakes variant_shadow
+    // (handles 1–52). No shadow caster → bare variant (no shadow bit).
+    const sbit: u32 = if (inst.shadow_is_point) gl.command.variant_shadow_point else 0;
     const v = a.submeshVariant(s) |
         (if (inst.fog_enabled) variant_fog else 0) |
-        (if (inst.morph_enabled) variant_morph else 0);
+        (if (inst.morph_enabled) variant_morph else 0) |
+        sbit;
     if (v != last_variant.*) {
         enc.setPipeline(shaderHandleFor(v), state);
         enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
         enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-        enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+        if (inst.shadow_is_point) {
+            // Point-shadow path: re-emit per-pipeline so WebGL2 writes the light
+            // uniforms (u_point_light_pos / u_point_far) to the now-active program.
+            // Idempotent on WebGPU (re-stashes the atlas bind group).
+            enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
+            enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
+        } else {
+            enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+        }
         if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
         if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
         last_variant.* = v;
@@ -1722,9 +1886,10 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     inst.morph_enabled = morph_target_count > 0;
 
     // Create + record only the distinct shader variants the mesh actually uses.
-    // [53]: slots 20–35 = base/ds fog variants; slot 36 = instanced+fog;
-    //        slots 37–52 = base/ds morph variants (M7).
-    var shader_seen: [53]bool = .{false} ** 53;
+    // [69]: slots 20–35 = base/ds fog variants; slot 36 = instanced+fog;
+    //        slots 37–52 = base/ds morph variants (M7);
+    //        slots 53–68 = base/ds point-shadow receiver variants (P11 task 5).
+    var shader_seen: [69]bool = .{false} ** 69;
     var sv: u32 = 0;
     while (sv < a.submesh_count) : (sv += 1) {
         if (sv >= max_submesh) break;
@@ -1735,6 +1900,23 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
         if (shader_seen[handle]) continue;
         shader_seen[handle] = true;
         createShaderForVariant(inst, enc, variant);
+    }
+
+    // P11 task 5: emit point-shadow receiver shaders for each bare variant in use.
+    // Distinct handles (53–68) so the 2D-shadow shaders (handles 1–52) are unchanged.
+    // No fog or morph combined with point-shadow in v1; no instanced+point.
+    {
+        var psv: u32 = 0;
+        while (psv < a.submesh_count) : (psv += 1) {
+            if (psv >= max_submesh) break;
+            // bare variant only (no fog/morph — point-shadow v1 does not combine them)
+            const bare = a.submeshVariant(psv);
+            const pv = bare | gl.command.variant_shadow_point;
+            const ph = shaderHandleFor(pv);
+            if (shader_seen[ph]) continue;
+            shader_seen[ph] = true;
+            createShaderForVariant(inst, enc, pv);
+        }
     }
 
     // T6: emit the instanced shader if this mesh carries an instances section.
@@ -1770,6 +1952,15 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     if (has_mask) emitDepthAtShader(inst, enc);
     enc.createShadowMap(shadow_handle, shadow_size);
     inst.registry.recordShadowMap(shadow_handle, shadow_size);
+
+    // P11 task 5: point-light shadow atlas (RGBA8 1536×1024, 6 faces 512×512).
+    // Always created alongside the 2D shadow map; the per-frame dispatch selects
+    // which one to render into based on the caster type (shadow_is_point).
+    // Registry has no recordPointShadow; inst.point_atlas_sent flags the restore
+    // path (analogous to morph_tex_recorded) to re-emit createPointShadow after
+    // registry.replay.
+    enc.createPointShadow(point_atlas_handle, point_atlas_w, point_atlas_h);
+    inst.point_atlas_sent = true;
 
     var t: u32 = 0;
     while (t < a.tex_count) : (t += 1) {
@@ -2065,6 +2256,45 @@ test "morph handle table covers every emitted morph combo" {
     // All 16 morph handles must be assigned (37..52 inclusive).
     var hi: u32 = 37;
     while (hi <= 52) : (hi += 1) {
+        try std.testing.expect(seen[hi]);
+    }
+}
+
+test "point-shadow handle table covers every emitted point-shadow combo" {
+    // P11 task 5: 16 point-shadow receiver variants (8 base + 8 ds).
+    // Handles 53–68 are distinct from the 2D-shadow handles (1–52) and from
+    // each other. No instanced+point (compileError); no fog or morph in v1.
+    // shaderHandleFor and createShaderForVariant MUST cover the same set.
+    const vsp = gl.command.variant_shadow_point;
+    const combos = [_]u32{
+        variant_pbr | vsp,
+        variant_pbr | variant_nm | vsp,
+        variant_pbr | variant_em | vsp,
+        variant_pbr | variant_nm | variant_em | vsp,
+        variant_pbr | variant_at | vsp,
+        variant_pbr | variant_nm | variant_at | vsp,
+        variant_pbr | variant_em | variant_at | vsp,
+        variant_pbr | variant_nm | variant_em | variant_at | vsp,
+        variant_pbr | variant_ds | vsp,
+        variant_pbr | variant_nm | variant_ds | vsp,
+        variant_pbr | variant_em | variant_ds | vsp,
+        variant_pbr | variant_nm | variant_em | variant_ds | vsp,
+        variant_pbr | variant_at | variant_ds | vsp,
+        variant_pbr | variant_nm | variant_at | variant_ds | vsp,
+        variant_pbr | variant_em | variant_at | variant_ds | vsp,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | vsp,
+    };
+    // Point-shadow handles 53–68; seen array sized to cover that range.
+    var seen = [_]bool{false} ** 69;
+    for (combos) |v| {
+        const h = shaderHandleFor(v);
+        try std.testing.expect(h >= 53 and h < seen.len);
+        try std.testing.expect(!seen[h]); // distinct
+        seen[h] = true;
+    }
+    // All 16 point-shadow handles must be assigned (53..68 inclusive).
+    var hi: u32 = 53;
+    while (hi <= 68) : (hi += 1) {
         try std.testing.expect(seen[hi]);
     }
 }

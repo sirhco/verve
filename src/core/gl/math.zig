@@ -375,6 +375,33 @@ pub fn spotLightVpMat(pos: Vec3, dir: Vec3, fovy: f32, near: f32, far: f32) Mat4
     return proj.mul(view);
 }
 
+/// 6-face cube view-projection for omnidirectional (point-light) shadow mapping.
+/// `light_pos` — light position in world space.
+/// `face`      — cube face index: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z.
+/// `near`/`far` — clip planes; caller must ensure 0 < near < far.
+/// Returns proj × view (column-major, 90° fovy, aspect 1).
+pub fn cubeFaceVp(light_pos: Vec3, face: u8, near: f32, far: f32) Mat4 {
+    const dirs = [6]Vec3{
+        Vec3.init(1, 0, 0), // +X
+        Vec3.init(-1, 0, 0), // -X
+        Vec3.init(0, 1, 0), // +Y
+        Vec3.init(0, -1, 0), // -Y
+        Vec3.init(0, 0, 1), // +Z
+        Vec3.init(0, 0, -1), // -Z
+    };
+    const ups = [6]Vec3{
+        Vec3.init(0, -1, 0), // +X: up=-Y
+        Vec3.init(0, -1, 0), // -X: up=-Y
+        Vec3.init(0, 0, 1), // +Y: up=+Z
+        Vec3.init(0, 0, -1), // -Y: up=-Z
+        Vec3.init(0, -1, 0), // +Z: up=-Y
+        Vec3.init(0, -1, 0), // -Z: up=-Y
+    };
+    const proj = Mat4.perspective(std.math.pi / 2.0, 1.0, near, far);
+    const view = Mat4.lookAt(light_pos, Vec3.add(light_pos, dirs[face]), ups[face]);
+    return proj.mul(view);
+}
+
 const testing = std.testing;
 const eps = 1e-5;
 
@@ -564,6 +591,14 @@ test "spotLightVpMat: finite matrix for representative spot" {
     const vp3 = spotLightVpMat(Vec3.init(0, 1, 0), Vec3.init(0, -1, 0), fovy, 0.05, 0.1);
     for (vp3.m) |elem| {
         try testing.expect(std.math.isFinite(elem));
+    }
+}
+
+test "cubeFaceVp: 6 finite face matrices" {
+    var f: u8 = 0;
+    while (f < 6) : (f += 1) {
+        const m = cubeFaceVp(Vec3.init(0, 2, 0), f, 0.05, 25.0);
+        for (m.m) |e| try testing.expect(std.math.isFinite(e));
     }
 }
 

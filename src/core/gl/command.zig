@@ -53,6 +53,12 @@ pub const Tag = enum(u16) {
     set_fog = 28, // {ptr -> 8 f32 FogParams}
     set_morph_weights = 29, // {count, idx_ptr -> count u32, wt_ptr -> count f32}
     create_morph_tex = 30, // {handle, width, height, ptr -> f16 deltas, byte_len}
+    // ── Point-light (omnidirectional) shadow atlas ──────────────────────
+    create_point_shadow = 31, // {handle, w, h} — RGBA8 atlas + depth scratch
+    begin_point_shadow_face = 32, // {handle, col, row, tile, face_vp_ptr, light_pos_ptr, far_bits}
+    draw_point_depth = 33, // {vbuf, ibuf, index_byte_off, index_count, model_ptr}
+    end_point_shadow = 34, // {width, height}
+    bind_point_shadow = 35, // {slot, handle, light_pos_ptr, far_bits}
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -90,6 +96,7 @@ pub const variant_double_sided: u32 = 1 << 11; // requires variant_pbr; render b
 pub const variant_instanced: u32 = 1 << 12; // requires variant_pbr; per-instance model (attr 4-7) + color (attr 8); non-skinned
 pub const variant_fog: u32 = 1 << 13; // requires variant_pbr; distance fog mix before tonemap
 pub const variant_morph: u32 = 1 << 14; // requires variant_pbr; texture-blended POSITION+NORMAL morph deltas
+pub const variant_shadow_point: u32 = 1 << 15; // requires variant_pbr; omnidirectional point-light shadow receiver (RGBA8 atlas)
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -110,6 +117,15 @@ pub const tex_slot_emissive: u32 = 3;
 pub const tex_slot_occlusion: u32 = 4;
 // IBL units (JS contract): irradiance=5 (cube), prefiltered=6 (cube), brdf_lut=7 (2D)
 pub const tex_slot_shadow: u32 = 8; // directional shadow map (sampler2DShadow), after the IBL units
+pub const tex_slot_point_shadow: u32 = 9; // point-light RGBA8 shadow atlas (sampler2D), slot after directional
+
+/// GLSL float-to-RGBA8 packing helpers shared between the point-depth and receiver shaders.
+pub const rgba8_pack_glsl: []const u8 = "vec4 packDist(float v){ vec4 e=fract(v*vec4(1.0,255.0,65025.0,16581375.0)); e-=e.yzww*vec4(1.0/255.0,1.0/255.0,1.0/255.0,0.0); return e; }";
+pub const rgba8_unpack_glsl: []const u8 = "float unpackDist(vec4 c){ return dot(c, vec4(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0)); }";
+
+/// WGSL float-to-RGBA8 packing helpers (same constants, vec4f).
+pub const rgba8_pack_wgsl: []const u8 = "fn packDist(v: f32) -> vec4f { var e = fract(v*vec4f(1.0,255.0,65025.0,16581375.0)); e -= e.yzww*vec4f(1.0/255.0,1.0/255.0,1.0/255.0,0.0); return e; }";
+pub const rgba8_unpack_wgsl: []const u8 = "fn unpackDist(c: vec4f) -> f32 { return dot(c, vec4f(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0)); }";
 
 pub const unlit_vs: []const u8 =
     \\#version 300 es
@@ -439,6 +455,70 @@ pub fn depthAtFragmentSrc() []const u8 {
     ;
 }
 
+/// Point-light distance depth vertex shader.  Writes world-space position to
+/// `v_world` so the fragment can compute linear distance from the light.
+/// Uniforms: `u_face_vp` (mat4, cube-face view-projection), `u_model` (mat4).
+/// Vertex layout: position at attrib 0 (matching PBR stride-48 VBO).
+pub fn pointDepthVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\uniform mat4 u_face_vp;
+    \\uniform mat4 u_model;
+    \\out vec3 v_world;
+    \\void main() {
+    \\  vec4 world = u_model * vec4(a_pos, 1.0);
+    \\  v_world = world.xyz;
+    \\  gl_Position = u_face_vp * world;
+    \\}
+    \\
+    ;
+}
+
+/// Point-light distance depth fragment shader.  Packs the normalised linear
+/// distance from the light into RGBA8 colour using the P1 `packDist` helper.
+/// Uniforms: `u_light_pos` (vec3 world-space), `u_far` (float, far-plane dist).
+pub fn pointDepthFragmentSrc() []const u8 {
+    // Inline pack const rather than runtime-concatenate so the return type is
+    // a comptime-known string literal (required for Zig ++ on []const u8).
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec3 v_world;
+    \\uniform vec3 u_light_pos;
+    \\uniform float u_far;
+    \\out vec4 frag_color;
+    \\vec4 packDist(float v){ vec4 e=fract(v*vec4(1.0,255.0,65025.0,16581375.0)); e-=e.yzww*vec4(1.0/255.0,1.0/255.0,1.0/255.0,0.0); return e; }
+    \\void main() {
+    \\  frag_color = packDist(clamp(length(v_world - u_light_pos) / u_far, 0.0, 1.0));
+    \\}
+    \\
+    ;
+}
+
+/// Combined WGSL module for the point-depth pass (vertex + fragment).
+/// Uniform struct U: face_vp mat4x4, model mat4x4, light_pos vec3, far f32.
+/// Renders to an rgba8unorm colour attachment; depth scratch is side-effect.
+pub fn pointDepthWgslSrc() []const u8 {
+    return
+    \\struct U { face_vp: mat4x4<f32>, model: mat4x4<f32>, light_pos: vec3<f32>, far: f32 }
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\struct VOut { @builtin(position) pos: vec4f, @location(0) world: vec3f }
+    \\fn packDist(v: f32) -> vec4f { var e = fract(v*vec4f(1.0,255.0,65025.0,16581375.0)); e -= e.yzww*vec4f(1.0/255.0,1.0/255.0,1.0/255.0,0.0); return e; }
+    \\@vertex fn vs_main(@location(0) a_pos: vec3f) -> VOut {
+    \\  var o: VOut;
+    \\  let world = u.model * vec4f(a_pos, 1.0);
+    \\  o.world = world.xyz;
+    \\  o.pos = u.face_vp * world;
+    \\  return o;
+    \\}
+    \\@fragment fn fs_main(@location(0) world: vec3f) -> @location(0) vec4f {
+    \\  return packDist(clamp(length(world - u.light_pos) / u.far, 0.0, 1.0));
+    \\}
+    \\
+    ;
+}
+
 pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     comptime pbrCheck(flags);
     const head =
@@ -657,6 +737,63 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    // Point-shadow receiver (variant_shadow_point): RGBA8 atlas sampler, uniforms,
+    // unpackDist helper, and a manual 3×3 PCF pointShadowFactor().
+    // Atlas layout: 1536×1024, 3×2 of 512² tiles. Face f → col=f%3, row=f/3.
+    // Face order: 0=+X, 1=−X, 2=+Y, 3=−Y, 4=+Z, 5=−Z (matches cubeFaceVp).
+    // uvc signs per face (P4 WGSL must mirror exactly):
+    //   face 0 (+X): uvc = vec2(-v.z, -v.y)
+    //   face 1 (-X): uvc = vec2( v.z, -v.y)
+    //   face 2 (+Y): uvc = vec2( v.x,  v.z)
+    //   face 3 (-Y): uvc = vec2( v.x, -v.z)
+    //   face 4 (+Z): uvc = vec2( v.x, -v.y)
+    //   face 5 (-Z): uvc = vec2(-v.x, -v.y)
+    // Bias: 0.01 (normalised distance, not depth-buffer units).
+    const point_shadow_decls =
+        \\uniform sampler2D u_point_atlas;
+        \\uniform vec3 u_point_light_pos;
+        \\uniform float u_point_far;
+        \\float unpackDist(vec4 c){ return dot(c, vec4(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0)); }
+        \\float pointShadowFactor() {
+        \\  vec3 v = v_world_pos - u_point_light_pos;
+        \\  float cur = length(v) / u_point_far;
+        \\  vec3 a = abs(v);
+        \\  float ma; int face; vec2 uvc;
+        \\  if (a.x >= a.y && a.x >= a.z) {
+        \\    ma = a.x;
+        \\    if (v.x > 0.0) { face = 0; uvc = vec2(-v.z, -v.y); }
+        \\    else           { face = 1; uvc = vec2( v.z, -v.y); }
+        \\  } else if (a.y >= a.z) {
+        \\    ma = a.y;
+        \\    if (v.y > 0.0) { face = 2; uvc = vec2( v.x,  v.z); }
+        \\    else           { face = 3; uvc = vec2( v.x, -v.z); }
+        \\  } else {
+        \\    ma = a.z;
+        \\    if (v.z > 0.0) { face = 4; uvc = vec2( v.x, -v.y); }
+        \\    else           { face = 5; uvc = vec2(-v.x, -v.y); }
+        \\  }
+        \\  vec2 uv = 0.5 * (uvc / ma + 1.0);
+        \\  vec2 tile = vec2(float(face - (face / 3) * 3), float(face / 3));
+        \\  float bias = 0.01;
+        \\  vec2 texel = 1.0 / vec2(1536.0, 1024.0);
+        \\  float lit = 0.0;
+        \\  for (int dy = -1; dy <= 1; dy++) {
+        \\    for (int dx = -1; dx <= 1; dx++) {
+        \\      vec2 fuv = clamp(uv + vec2(float(dx), float(dy)) * texel * vec2(3.0, 2.0),
+        \\                       vec2(0.0008), vec2(0.9992));
+        \\      vec2 atlasUv = (tile + fuv) * vec2(1.0 / 3.0, 1.0 / 2.0);
+        \\      float stored = unpackDist(texture(u_point_atlas, atlasUv));
+        \\      lit += (cur <= stored + bias) ? 1.0 : 0.0;
+        \\    }
+        \\  }
+        \\  return lit / 9.0;
+        \\}
+        \\
+    ;
+    const combine_point_shadow =
+        \\  vec3 color = ambient + Lo * pointShadowFactor();
+        \\
+    ;
     const emissive =
         \\  color += emissive_factor * texture(u_emissive_tex, v_uv).rgb;
         \\
@@ -680,13 +817,14 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ ibl_samplers;
     if (flags & variant_fog != 0) src = src ++ fog_uniforms;
     if (flags & variant_shadow != 0) src = src ++ shadow_decls;
+    if (flags & variant_shadow_point != 0) src = src ++ point_shadow_decls;
     src = src ++ main_open;
     if (flags & variant_instanced != 0) src = src ++ inst_tint;
     if (flags & variant_alpha_test != 0) src = src ++ alpha_test;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
     if (flags & variant_double_sided != 0) src = src ++ ds_flip;
     src = src ++ lighting;
-    src = src ++ (if (flags & variant_shadow != 0) combine_shadow else combine_plain);
+    src = src ++ (if (flags & variant_shadow != 0) combine_shadow else if (flags & variant_shadow_point != 0) combine_point_shadow else combine_plain);
     if (flags & variant_emissive != 0) src = src ++ emissive;
     if (flags & variant_fog != 0) src = src ++ fog_mix;
     if (flags & variant_linear_output == 0) src = src ++ tail_tonemap;
@@ -828,6 +966,8 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     // caller cannot silently produce a broken WGSL U struct.
     if (flags & variant_instanced != 0 and flags & variant_shadow != 0)
         @compileError("wgslPbr: variant_instanced + variant_shadow unsupported in v1 (vp/light_vp slot collision at offset 512)");
+    if (flags & variant_instanced != 0 and flags & variant_shadow_point != 0)
+        @compileError("wgslPbr: variant_instanced + variant_shadow_point unsupported in v1 (point-shadow bind-group not wired for instanced draw path)");
 
     // ── Uniform block + group(0) ────────────────────────────────────
     // Split so variant_shadow can append `light_vp` (offset 512, after the f32
@@ -892,6 +1032,16 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\@group(0) @binding(4) var u_morph_tex: texture_2d<f32>;
         \\
     ;
+    // Point-shadow receiver parameters (variant_shadow_point). SEPARATE group(0)
+    // binding at @binding(5) (FRAGMENT-only). Using a dedicated uniform avoids
+    // touching the U struct and re-deriving all PBR_U byte offsets (the spot-shadows
+    // lesson). Layout: point_light_pos (vec3, 12 bytes) + point_far (f32, 4 bytes)
+    // = 16 bytes total (naturally aligned, no pad needed).
+    const uniforms_point_shadow =
+        \\struct PointShadow { point_light_pos: vec3<f32>, point_far: f32 };
+        \\@group(0) @binding(5) var<uniform> pt: PointShadow;
+        \\
+    ;
     // Morph vertex function: adds @builtin(vertex_index) input, accumulates
     // POSITION + NORMAL deltas, then transforms the morphed locals.
     // vtx_index drives textureLoad (x-coord = vertex index, y-coord = 2*t or 2*t+1).
@@ -954,6 +1104,13 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const tex_shadow =
         \\@group(1) @binding(9) var shadow_map: texture_depth_2d;
         \\@group(1) @binding(10) var shadow_samp: sampler_comparison;
+        \\
+    ;
+    // Point-shadow receiver (variant_shadow_point): RGBA8 atlas sampler at
+    // binding 11 (after the 2D shadow pair). Sampled with the group(1) filtering
+    // sampler at binding 0 (textureSampleLevel, same samp as PBR textures).
+    const tex_point_shadow =
+        \\@group(1) @binding(11) var point_atlas: texture_2d<f32>;
         \\
     ;
     // ── varyings: VSOut struct ──────────────────────────────────────
@@ -1265,6 +1422,57 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  var color = ambient + Lo * shadowFactor(in.light_pos);
         \\
     ;
+    // Point-shadow receiver (variant_shadow_point): WGSL twin of P3 GLSL
+    // pointShadowFactor(). unpackDist + dominant-axis cubemap face select +
+    // 3×3 PCF over the RGBA8 atlas. Face signs are BYTE-IDENTICAL to the GLSL:
+    //   face 0 (+X): (-v.z,-v.y)  face 1 (-X): (v.z,-v.y)
+    //   face 2 (+Y): (v.x, v.z)  face 3 (-Y): (v.x,-v.z)
+    //   face 4 (+Z): (v.x,-v.y)  face 5 (-Z): (-v.x,-v.y)
+    // Atlas: 1536×1024, 3×2 of 512² tiles. tile = (f%3, f/3).
+    // Bias: 0.01. Margin clamp: [0.0008, 0.9992].
+    const fs_point_shadow_decl =
+        \\fn unpackDist(c: vec4f) -> f32 { return dot(c, vec4f(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0)); }
+        \\fn pointShadowFactor(world_pos: vec3<f32>) -> f32 {
+        \\  let v = world_pos - pt.point_light_pos;
+        \\  let cur = length(v) / pt.point_far;
+        \\  let a = abs(v);
+        \\  var ma: f32; var face: i32; var uvc: vec2<f32>;
+        \\  if (a.x >= a.y && a.x >= a.z) {
+        \\    ma = a.x;
+        \\    if (v.x > 0.0) { face = 0; uvc = vec2<f32>(-v.z, -v.y); }
+        \\    else           { face = 1; uvc = vec2<f32>( v.z, -v.y); }
+        \\  } else if (a.y >= a.z) {
+        \\    ma = a.y;
+        \\    if (v.y > 0.0) { face = 2; uvc = vec2<f32>( v.x,  v.z); }
+        \\    else           { face = 3; uvc = vec2<f32>( v.x, -v.z); }
+        \\  } else {
+        \\    ma = a.z;
+        \\    if (v.z > 0.0) { face = 4; uvc = vec2<f32>( v.x, -v.y); }
+        \\    else           { face = 5; uvc = vec2<f32>(-v.x, -v.y); }
+        \\  }
+        \\  let uv = 0.5 * (uvc / ma + vec2<f32>(1.0));
+        \\  let col = face % 3;
+        \\  let row = face / 3;
+        \\  let tile = vec2<f32>(f32(col), f32(row));
+        \\  let bias: f32 = 0.01;
+        \\  let texel = vec2<f32>(1.0 / 1536.0, 1.0 / 1024.0);
+        \\  var lit: f32 = 0.0;
+        \\  for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        \\    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+        \\      let fuv = clamp(uv + vec2<f32>(f32(dx), f32(dy)) * vec2<f32>(1.0/512.0), vec2<f32>(0.0008), vec2<f32>(0.9992));
+        \\      let atlasUv = (tile + fuv) * vec2<f32>(1.0/3.0, 0.5);
+        \\      let stored = unpackDist(textureSampleLevel(point_atlas, samp, atlasUv, 0.0));
+        \\      lit = lit + select(0.0, 1.0, cur <= stored + bias);
+        \\    }
+        \\  }
+        \\  return lit / 9.0;
+        \\}
+        \\
+    ;
+    const fs_combine_point_shadow =
+        \\  var color = ambient + Lo * pointShadowFactor(in.world_pos);
+        \\
+    ;
     const fs_emissive =
         \\  color = color + emissive_factor * textureSample(emissive_tex, samp, in.uv).rgb;
         \\
@@ -1302,6 +1510,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const nm = flags & variant_normal_map != 0;
     const em = flags & variant_emissive != 0;
     const shadow = flags & variant_shadow != 0;
+    const point_shadow = flags & variant_shadow_point != 0;
     const skinned = flags & variant_skinned != 0;
     const morphed = flags & variant_morph != 0;
     const lin = flags & variant_linear_output != 0;
@@ -1315,11 +1524,13 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (skinned) src = src ++ uniforms_bones;
     if (flags & variant_fog != 0) src = src ++ uniforms_fog;
     if (morphed) src = src ++ uniforms_morph;
+    if (point_shadow) src = src ++ uniforms_point_shadow;
     src = src ++ samp ++ tex_base;
     if (nm) src = src ++ tex_normal;
     if (em) src = src ++ tex_emissive;
     src = src ++ tex_ibl;
     if (shadow) src = src ++ tex_shadow;
+    if (point_shadow) src = src ++ tex_point_shadow;
     src = src ++ vsout_head;
     if (nm) src = src ++ vsout_nm;
     if (shadow) src = src ++ vsout_shadow;
@@ -1340,12 +1551,13 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     }
     src = src ++ helpers;
     if (shadow) src = src ++ fs_shadow_decl;
+    if (point_shadow) src = src ++ fs_point_shadow_decl;
     src = src ++ (if (inst) fs_open_instanced else (if (ds) fs_open_ds else fs_open));
     if (flags & variant_alpha_test != 0) src = src ++ fs_alpha_test;
     src = src ++ (if (nm) (if (ds) fs_normal_nm_ds else fs_normal_nm) else (if (ds) fs_normal_plain_ds else fs_normal_plain));
     if (ds) src = src ++ fs_ds_flip;
     src = src ++ fs_lighting;
-    src = src ++ (if (shadow) fs_combine_shadow else fs_combine_plain);
+    src = src ++ (if (shadow) fs_combine_shadow else if (point_shadow) fs_combine_point_shadow else fs_combine_plain);
     if (em) src = src ++ fs_emissive;
     if (flags & variant_fog != 0) src = src ++ fs_fog_mix;
     if (!lin) src = src ++ fs_tail_tonemap;
@@ -1844,6 +2056,59 @@ pub const Encoder = struct {
         self.putU32(slot);
         self.putU32(shadow_handle);
         self.putU32(light_vp_ptr);
+    }
+
+    // ── Point-light (omnidirectional) shadow atlas ──────────────────────
+
+    /// Allocate the RGBA8 shadow atlas texture (w×h) and a matching depth scratch.
+    /// One per point light; recorded for context-restore replay.
+    pub fn createPointShadow(self: *Encoder, handle: u32, w: u32, h: u32) void {
+        self.header(.create_point_shadow, 12);
+        self.putU32(handle);
+        self.putU32(w);
+        self.putU32(h);
+    }
+
+    /// Begin rendering into one cube face tile. `col`/`row` address the tile in
+    /// the atlas; `tile` is the tile pixel size. `face_vp_ptr` → 16 f32 VP matrix
+    /// (from `cubeFaceVp`); `light_pos_ptr` → 3 f32 world-space position;
+    /// `far_bits` = `@as(u32, @bitCast(far))`.
+    pub fn beginPointShadowFace(self: *Encoder, handle: u32, col: u32, row: u32, tile: u32, face_vp_ptr: u32, light_pos_ptr: u32, far_bits: u32) void {
+        self.header(.begin_point_shadow_face, 28);
+        self.putU32(handle);
+        self.putU32(col);
+        self.putU32(row);
+        self.putU32(tile);
+        self.putU32(face_vp_ptr);
+        self.putU32(light_pos_ptr);
+        self.putU32(far_bits);
+    }
+
+    /// Depth draw into the point-shadow atlas face. `model_ptr` → 16 f32 model matrix.
+    pub fn drawPointDepth(self: *Encoder, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, model_ptr: u32) void {
+        self.header(.draw_point_depth, 20);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(model_ptr);
+    }
+
+    /// End the point-shadow pass: restore default framebuffer + canvas viewport.
+    pub fn endPointShadow(self: *Encoder, width: u32, height: u32) void {
+        self.header(.end_point_shadow, 8);
+        self.putU32(width);
+        self.putU32(height);
+    }
+
+    /// Bind the point-shadow atlas to `slot` and upload `light_pos_ptr` (3 f32)
+    /// + `far_bits` to the active program. Must follow SET_PIPELINE.
+    pub fn bindPointShadow(self: *Encoder, slot: u32, handle: u32, light_pos_ptr: u32, far_bits: u32) void {
+        self.header(.bind_point_shadow, 16);
+        self.putU32(slot);
+        self.putU32(handle);
+        self.putU32(light_pos_ptr);
+        self.putU32(far_bits);
     }
 
     // ── Post-processing ─────────────────────────────────────────────────
@@ -2932,4 +3197,158 @@ test "morph WGSL: variant emits morph binding + textureLoad; non-morph frozen" {
     try testing.expect(std.mem.indexOf(u8, w, "morph.count") != null);
     const plain = wgslPbr(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, plain, "u_morph_tex") == null);
+}
+
+// ── Point-light shadow: variant + tags + encoder payloads ─────────────────────
+
+test "point shadow: variant bit + tag values" {
+    try testing.expectEqual(@as(u32, 1 << 15), variant_shadow_point);
+    try testing.expectEqual(@as(u8, 31), @intFromEnum(Tag.create_point_shadow));
+    try testing.expectEqual(@as(u8, 32), @intFromEnum(Tag.begin_point_shadow_face));
+    try testing.expectEqual(@as(u8, 33), @intFromEnum(Tag.draw_point_depth));
+    try testing.expectEqual(@as(u8, 34), @intFromEnum(Tag.end_point_shadow));
+    try testing.expectEqual(@as(u8, 35), @intFromEnum(Tag.bind_point_shadow));
+}
+
+test "createPointShadow encodes tag 31 + 3 u32 payload (12 bytes)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createPointShadow(7, 1536, 1024);
+    const s = enc.finish();
+    // length header (4) + record header (4) + 3×u32 payload (12) = 16 record bytes
+    try testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, s[0..4], .little)); // length
+    try testing.expectEqual(@as(u16, 31), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 12), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[8..12], .little)); // handle
+    try testing.expectEqual(@as(u32, 1536), std.mem.readInt(u32, s[12..16], .little)); // w
+    try testing.expectEqual(@as(u32, 1024), std.mem.readInt(u32, s[16..20], .little)); // h
+}
+
+test "beginPointShadowFace encodes tag 32 + 7 u32 payload (28 bytes)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.beginPointShadowFace(7, 1, 0, 256, 0x1000, 0x2000, 0x3F800000); // far=1.0
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 32), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[8..12], .little)); // handle
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, s[12..16], .little)); // col
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, s[16..20], .little)); // row
+    try testing.expectEqual(@as(u32, 256), std.mem.readInt(u32, s[20..24], .little)); // tile
+    try testing.expectEqual(@as(u32, 0x1000), std.mem.readInt(u32, s[24..28], .little)); // face_vp_ptr
+    try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, s[28..32], .little)); // light_pos_ptr
+    try testing.expectEqual(@as(u32, 0x3F800000), std.mem.readInt(u32, s[32..36], .little)); // far_bits
+}
+
+test "drawPointDepth encodes tag 33 + 5 u32 payload (20 bytes)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.drawPointDepth(1, 2, 12, 36, 0x4000);
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 33), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 20), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, s[8..12], .little)); // vbuf
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, s[12..16], .little)); // ibuf
+    try testing.expectEqual(@as(u32, 12), std.mem.readInt(u32, s[16..20], .little)); // index_byte_off
+    try testing.expectEqual(@as(u32, 36), std.mem.readInt(u32, s[20..24], .little)); // index_count
+    try testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, s[24..28], .little)); // model_ptr
+}
+
+test "endPointShadow encodes tag 34 + 2 u32 payload (8 bytes)" {
+    var buf: [32]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.endPointShadow(800, 600);
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 34), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 8), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 800), std.mem.readInt(u32, s[8..12], .little)); // width
+    try testing.expectEqual(@as(u32, 600), std.mem.readInt(u32, s[12..16], .little)); // height
+}
+
+test "bindPointShadow encodes tag 35 + 4 u32 payload (16 bytes)" {
+    var buf: [32]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.bindPointShadow(9, 7, 0x5000, 0x41C80000); // far=25.0
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 35), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 16), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, s[8..12], .little)); // slot
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[12..16], .little)); // handle
+    try testing.expectEqual(@as(u32, 0x5000), std.mem.readInt(u32, s[16..20], .little)); // light_pos_ptr
+    try testing.expectEqual(@as(u32, 0x41C80000), std.mem.readInt(u32, s[20..24], .little)); // far_bits
+}
+
+// ── Point-depth shader sources (T2) ──────────────────────────────────────────
+
+test "point-depth GLSL: vertex emits u_face_vp + u_model + v_world; fragment has packDist + u_light_pos + u_far" {
+    const vs = pointDepthVertexSrc();
+    try testing.expect(std.mem.indexOf(u8, vs, "u_face_vp") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "u_model") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "v_world") != null);
+    const fs = pointDepthFragmentSrc();
+    try testing.expect(std.mem.indexOf(u8, fs, "packDist") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "u_light_pos") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "u_far") != null);
+}
+
+test "point-depth WGSL: combined src has packDist + u_face_vp (via face_vp) + u_light_pos (via light_pos)" {
+    const w = pointDepthWgslSrc();
+    try testing.expect(std.mem.indexOf(u8, w, "packDist") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "face_vp") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "light_pos") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "vs_main") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fs_main") != null);
+}
+
+// ── Point-shadow receiver GLSL (T3) ──────────────────────────────────────────
+
+test "GLSL variant_shadow_point: receiver emits u_point_atlas, unpackDist, pointShadowFactor" {
+    const f = pbrFragmentSrc(variant_pbr | variant_shadow_point);
+    try testing.expect(std.mem.indexOf(u8, f, "u_point_atlas") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "unpackDist") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "pointShadowFactor") != null);
+    // The shadow term attenuates direct light only — IBL ambient stays lit.
+    try testing.expect(std.mem.indexOf(u8, f, "ambient + Lo * pointShadowFactor()") != null);
+    // Plain PBR variant carries none of it.
+    const plain = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "u_point_atlas") == null);
+    // Directional/spot shadow variant is unaffected.
+    const shadow2d = pbrFragmentSrc(variant_pbr | variant_shadow);
+    try testing.expect(std.mem.indexOf(u8, shadow2d, "u_point_atlas") == null);
+}
+
+test "golden: variant_shadow_point GLSL fragment hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate GLSL contract bump.
+    const SP = variant_pbr | variant_shadow_point;
+    try testing.expectEqual(@as(u64, 0x2c7127b6863d65c2), fnv64(pbrFragmentSrc(SP)));
+}
+
+// ── Point-shadow receiver WGSL (T4) ──────────────────────────────────────────
+
+test "WGSL variant_shadow_point: receiver emits binding(11), unpackDist, pointShadowFactor" {
+    const SP = variant_pbr | variant_shadow_point;
+    const w = wgslPbr(SP);
+    // Atlas texture at group(1) binding 11.
+    try testing.expect(std.mem.indexOf(u8, w, "@group(1) @binding(11) var point_atlas") != null);
+    // Separate point-shadow uniform at group(0) binding 5.
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(5) var<uniform> pt: PointShadow") != null);
+    // unpackDist helper present.
+    try testing.expect(std.mem.indexOf(u8, w, "unpackDist") != null);
+    // pointShadowFactor function present.
+    try testing.expect(std.mem.indexOf(u8, w, "pointShadowFactor") != null);
+    // Shadow term attenuates direct light; IBL ambient stays lit.
+    try testing.expect(std.mem.indexOf(u8, w, "ambient + Lo * pointShadowFactor(in.world_pos)") != null);
+    // Plain PBR variant carries none of it.
+    const plain = wgslPbr(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "point_atlas") == null);
+    try testing.expect(std.mem.indexOf(u8, plain, "pointShadowFactor") == null);
+    // Directional/spot shadow variant is unaffected.
+    const shadow2d = wgslPbr(variant_pbr | variant_shadow);
+    try testing.expect(std.mem.indexOf(u8, shadow2d, "point_atlas") == null);
+}
+
+test "golden: variant_shadow_point WGSL hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate WGSL contract bump.
+    const SP = variant_pbr | variant_shadow_point;
+    try testing.expectEqual(@as(u64, 0xf878d42bc3e6c811), fnv64(wgslPbr(SP)));
 }
