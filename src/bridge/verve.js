@@ -4646,6 +4646,14 @@
             sh.morphWt    = gl.getUniformLocation(prog, "u_morph_wt[0]");
             sh.morphCount = gl.getUniformLocation(prog, "u_morph_count");
           }
+          if (variant & 0x8000) { // variant_shadow_point: RGBA8 atlas + light uniforms
+            // u_point_atlas is bound to slot 9 (tex_slot_point_shadow); set once at link time.
+            const atlasLoc = gl.getUniformLocation(prog, "u_point_atlas");
+            if (atlasLoc) gl.uniform1i(atlasLoc, 9);
+            sh.pointAtlas    = atlasLoc; // cached for bind_point_shadow (slot bind confirm)
+            sh.pointLightPos = gl.getUniformLocation(prog, "u_point_light_pos");
+            sh.pointFar      = gl.getUniformLocation(prog, "u_point_far");
+          }
           st.shaders[handle] = sh;
           break;
         }
@@ -5980,6 +5988,7 @@
             const hasShadow = (variant & 0x20) !== 0;
             const skinned = (variant & 0x80) !== 0; // variant_skinned
             const doubleSided = (variant & 0x800) !== 0; // variant_double_sided
+            const hasPointShadow = (variant & 0x8000) !== 0; // variant_shadow_point: RGBA8 atlas + pt uniform
             // group(0): binding 0 is the per-draw uniform (dynamic offset),
             // visible to VERTEX|FRAGMENT (wgslPbr: @group(0) @binding(0)
             // var<uniform> u: U). Skinned variants ALSO declare a bones uniform
@@ -6023,6 +6032,15 @@
                 texture: { sampleType: "unfilterable-float", viewDimension: "2d" },
               });
             }
+            if (hasPointShadow) {
+              // binding 5: PointShadow uniform (16 bytes: point_light_pos vec3 + point_far f32).
+              // FRAGMENT-only. Separate from U struct to avoid shifting PBR_U byte offsets.
+              bgl0Entries.push({
+                binding: 5,
+                visibility: GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform" },
+              });
+            }
             const bgl0 = device.createBindGroupLayout({ entries: bgl0Entries });
             // group(1): sampler@0 + per-slot textures. Binding numbers + types
             // EXACTLY match wgslPbr's @group(1) decls. base@1, mr@2 always;
@@ -6046,6 +6064,9 @@
             if (hasShadow) { // variant_shadow: depth-compare shadow map + sampler
               g1.push({ binding: 9, visibility: FRAG, texture: { sampleType: "depth", viewDimension: "2d" } });
               g1.push({ binding: 10, visibility: FRAG, sampler: { type: "comparison" } });
+            }
+            if (hasPointShadow) { // variant_shadow_point: RGBA8 atlas at binding 11
+              g1.push({ binding: 11, visibility: FRAG, texture: tex2d });
             }
             const bgl1 = device.createBindGroupLayout({ entries: g1 });
             const layout = device.createPipelineLayout({
@@ -6148,6 +6169,7 @@
               skinned,
               hasFog,
               hasMorph,
+              hasPointShadow,
             };
             break;
           }
@@ -6571,6 +6593,12 @@
                 bg0Entries.push({ binding: 4, resource: mte });
               }
             }
+            // binding 5: PointShadow uniform (16B: vec3 point_light_pos + f32 point_far).
+            // Layout has binding 5 iff hasPointShadow — must match bgl0 exactly.
+            if (active.hasPointShadow) {
+              if (!st.pointShadowBuf) st.pointShadowBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+              bg0Entries.push({ binding: 5, resource: { buffer: st.pointShadowBuf } });
+            }
             st.bg0 = device.createBindGroup({ layout: active.bgl0, entries: bg0Entries });
             st.bg0Layout = active.bgl0;
           }
@@ -6602,9 +6630,19 @@
               e.push({ binding: 9, resource: (sm && sm.view) ? sm.view : d.shadowTex.view });
               e.push({ binding: 10, resource: (sm && sm.sampler) ? sm.sampler : d.shadowSampler });
             }
+            if (active.hasPointShadow) { // variant_shadow_point: RGBA8 atlas at binding 11
+              e.push({ binding: 11, resource: st.pointAtlasView || d.black2d });
+            }
             st.bg1 = device.createBindGroup({ layout: active.bgl1, entries: e });
             st.bg1Layout = active.bgl1;
             st.bg1Dirty = false;
+          }
+          // Write point_light_pos/far into the separate PointShadow uniform (binding 5).
+          if (active.hasPointShadow && st.pointShadowBuf && st.pointLightPos != null) {
+            const ptData = new Float32Array(4);
+            ptData[0] = st.pointLightPos[0]; ptData[1] = st.pointLightPos[1]; ptData[2] = st.pointLightPos[2];
+            ptData[3] = st.pointFar;
+            device.queue.writeBuffer(st.pointShadowBuf, 0, ptData);
           }
           st.pass.setPipeline(active.pipeline);
           st.pass.setVertexBuffer(0, vb.buf);
@@ -7482,6 +7520,7 @@
       st.pointAtlasView = null;
       st.pointLightPos = null;
       st.pointFar = 0;
+      if (st.pointShadowBuf) { st.pointShadowBuf.destroy?.(); st.pointShadowBuf = null; }
       st.morphTexView = null;
       st.pbrUniform = null;
       st.bonesBuf = null;

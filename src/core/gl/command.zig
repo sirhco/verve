@@ -1030,6 +1030,16 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\@group(0) @binding(4) var u_morph_tex: texture_2d<f32>;
         \\
     ;
+    // Point-shadow receiver parameters (variant_shadow_point). SEPARATE group(0)
+    // binding at @binding(5) (FRAGMENT-only). Using a dedicated uniform avoids
+    // touching the U struct and re-deriving all PBR_U byte offsets (the spot-shadows
+    // lesson). Layout: point_light_pos (vec3, 12 bytes) + point_far (f32, 4 bytes)
+    // = 16 bytes total (naturally aligned, no pad needed).
+    const uniforms_point_shadow =
+        \\struct PointShadow { point_light_pos: vec3<f32>, point_far: f32 };
+        \\@group(0) @binding(5) var<uniform> pt: PointShadow;
+        \\
+    ;
     // Morph vertex function: adds @builtin(vertex_index) input, accumulates
     // POSITION + NORMAL deltas, then transforms the morphed locals.
     // vtx_index drives textureLoad (x-coord = vertex index, y-coord = 2*t or 2*t+1).
@@ -1092,6 +1102,13 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const tex_shadow =
         \\@group(1) @binding(9) var shadow_map: texture_depth_2d;
         \\@group(1) @binding(10) var shadow_samp: sampler_comparison;
+        \\
+    ;
+    // Point-shadow receiver (variant_shadow_point): RGBA8 atlas sampler at
+    // binding 11 (after the 2D shadow pair). Sampled with the group(1) filtering
+    // sampler at binding 0 (textureSampleLevel, same samp as PBR textures).
+    const tex_point_shadow =
+        \\@group(1) @binding(11) var point_atlas: texture_2d<f32>;
         \\
     ;
     // ── varyings: VSOut struct ──────────────────────────────────────
@@ -1403,6 +1420,57 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  var color = ambient + Lo * shadowFactor(in.light_pos);
         \\
     ;
+    // Point-shadow receiver (variant_shadow_point): WGSL twin of P3 GLSL
+    // pointShadowFactor(). unpackDist + dominant-axis cubemap face select +
+    // 3×3 PCF over the RGBA8 atlas. Face signs are BYTE-IDENTICAL to the GLSL:
+    //   face 0 (+X): (-v.z,-v.y)  face 1 (-X): (v.z,-v.y)
+    //   face 2 (+Y): (v.x, v.z)  face 3 (-Y): (v.x,-v.z)
+    //   face 4 (+Z): (v.x,-v.y)  face 5 (-Z): (-v.x,-v.y)
+    // Atlas: 1536×1024, 3×2 of 512² tiles. tile = (f%3, f/3).
+    // Bias: 0.01. Margin clamp: [0.0008, 0.9992].
+    const fs_point_shadow_decl =
+        \\fn unpackDist(c: vec4f) -> f32 { return dot(c, vec4f(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0)); }
+        \\fn pointShadowFactor(world_pos: vec3<f32>) -> f32 {
+        \\  let v = world_pos - pt.point_light_pos;
+        \\  let cur = length(v) / pt.point_far;
+        \\  let a = abs(v);
+        \\  var ma: f32; var face: i32; var uvc: vec2<f32>;
+        \\  if (a.x >= a.y && a.x >= a.z) {
+        \\    ma = a.x;
+        \\    if (v.x > 0.0) { face = 0; uvc = vec2<f32>(-v.z, -v.y); }
+        \\    else           { face = 1; uvc = vec2<f32>( v.z, -v.y); }
+        \\  } else if (a.y >= a.z) {
+        \\    ma = a.y;
+        \\    if (v.y > 0.0) { face = 2; uvc = vec2<f32>( v.x,  v.z); }
+        \\    else           { face = 3; uvc = vec2<f32>( v.x, -v.z); }
+        \\  } else {
+        \\    ma = a.z;
+        \\    if (v.z > 0.0) { face = 4; uvc = vec2<f32>( v.x, -v.y); }
+        \\    else           { face = 5; uvc = vec2<f32>(-v.x, -v.y); }
+        \\  }
+        \\  let uv = 0.5 * (uvc / ma + vec2<f32>(1.0));
+        \\  let col = face % 3;
+        \\  let row = face / 3;
+        \\  let tile = vec2<f32>(f32(col), f32(row));
+        \\  let bias: f32 = 0.01;
+        \\  let texel = vec2<f32>(1.0 / 1536.0, 1.0 / 1024.0);
+        \\  var lit: f32 = 0.0;
+        \\  for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        \\    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+        \\      let fuv = clamp(uv + vec2<f32>(f32(dx), f32(dy)) * vec2<f32>(1.0/512.0), vec2<f32>(0.0008), vec2<f32>(0.9992));
+        \\      let atlasUv = (tile + fuv) * vec2<f32>(1.0/3.0, 0.5);
+        \\      let stored = unpackDist(textureSampleLevel(point_atlas, samp, atlasUv, 0.0));
+        \\      lit = lit + select(0.0, 1.0, cur <= stored + bias);
+        \\    }
+        \\  }
+        \\  return lit / 9.0;
+        \\}
+        \\
+    ;
+    const fs_combine_point_shadow =
+        \\  var color = ambient + Lo * pointShadowFactor(in.world_pos);
+        \\
+    ;
     const fs_emissive =
         \\  color = color + emissive_factor * textureSample(emissive_tex, samp, in.uv).rgb;
         \\
@@ -1440,6 +1508,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const nm = flags & variant_normal_map != 0;
     const em = flags & variant_emissive != 0;
     const shadow = flags & variant_shadow != 0;
+    const point_shadow = flags & variant_shadow_point != 0;
     const skinned = flags & variant_skinned != 0;
     const morphed = flags & variant_morph != 0;
     const lin = flags & variant_linear_output != 0;
@@ -1453,11 +1522,13 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (skinned) src = src ++ uniforms_bones;
     if (flags & variant_fog != 0) src = src ++ uniforms_fog;
     if (morphed) src = src ++ uniforms_morph;
+    if (point_shadow) src = src ++ uniforms_point_shadow;
     src = src ++ samp ++ tex_base;
     if (nm) src = src ++ tex_normal;
     if (em) src = src ++ tex_emissive;
     src = src ++ tex_ibl;
     if (shadow) src = src ++ tex_shadow;
+    if (point_shadow) src = src ++ tex_point_shadow;
     src = src ++ vsout_head;
     if (nm) src = src ++ vsout_nm;
     if (shadow) src = src ++ vsout_shadow;
@@ -1478,12 +1549,13 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     }
     src = src ++ helpers;
     if (shadow) src = src ++ fs_shadow_decl;
+    if (point_shadow) src = src ++ fs_point_shadow_decl;
     src = src ++ (if (inst) fs_open_instanced else (if (ds) fs_open_ds else fs_open));
     if (flags & variant_alpha_test != 0) src = src ++ fs_alpha_test;
     src = src ++ (if (nm) (if (ds) fs_normal_nm_ds else fs_normal_nm) else (if (ds) fs_normal_plain_ds else fs_normal_plain));
     if (ds) src = src ++ fs_ds_flip;
     src = src ++ fs_lighting;
-    src = src ++ (if (shadow) fs_combine_shadow else fs_combine_plain);
+    src = src ++ (if (shadow) fs_combine_shadow else if (point_shadow) fs_combine_point_shadow else fs_combine_plain);
     if (em) src = src ++ fs_emissive;
     if (flags & variant_fog != 0) src = src ++ fs_fog_mix;
     if (!lin) src = src ++ fs_tail_tonemap;
@@ -3247,4 +3319,34 @@ test "golden: variant_shadow_point GLSL fragment hash frozen (FNV-1a-64)" {
     // Frozen from first green run — a change here = deliberate GLSL contract bump.
     const SP = variant_pbr | variant_shadow_point;
     try testing.expectEqual(@as(u64, 0x2c7127b6863d65c2), fnv64(pbrFragmentSrc(SP)));
+}
+
+// ── Point-shadow receiver WGSL (T4) ──────────────────────────────────────────
+
+test "WGSL variant_shadow_point: receiver emits binding(11), unpackDist, pointShadowFactor" {
+    const SP = variant_pbr | variant_shadow_point;
+    const w = wgslPbr(SP);
+    // Atlas texture at group(1) binding 11.
+    try testing.expect(std.mem.indexOf(u8, w, "@group(1) @binding(11) var point_atlas") != null);
+    // Separate point-shadow uniform at group(0) binding 5.
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(5) var<uniform> pt: PointShadow") != null);
+    // unpackDist helper present.
+    try testing.expect(std.mem.indexOf(u8, w, "unpackDist") != null);
+    // pointShadowFactor function present.
+    try testing.expect(std.mem.indexOf(u8, w, "pointShadowFactor") != null);
+    // Shadow term attenuates direct light; IBL ambient stays lit.
+    try testing.expect(std.mem.indexOf(u8, w, "ambient + Lo * pointShadowFactor(in.world_pos)") != null);
+    // Plain PBR variant carries none of it.
+    const plain = wgslPbr(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "point_atlas") == null);
+    try testing.expect(std.mem.indexOf(u8, plain, "pointShadowFactor") == null);
+    // Directional/spot shadow variant is unaffected.
+    const shadow2d = wgslPbr(variant_pbr | variant_shadow);
+    try testing.expect(std.mem.indexOf(u8, shadow2d, "point_atlas") == null);
+}
+
+test "golden: variant_shadow_point WGSL hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate WGSL contract bump.
+    const SP = variant_pbr | variant_shadow_point;
+    try testing.expectEqual(@as(u64, 0xf878d42bc3e6c811), fnv64(wgslPbr(SP)));
 }
