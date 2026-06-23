@@ -785,10 +785,10 @@ fn parseFog(inst: *Inst, s: []const u8) void {
 // Format: semicolon-separated light records, each a 15-field comma-separated CSV:
 //   type,intensity,px,py,pz,dx,dy,dz,r,g,b,range,cosIn,cosOut,castsShadow
 // Maps CSV[0..13] → lights[i*16 + 0..13]; lights[i*16+14,15] = 0 (_pad).
-// CSV[14] (castsShadow): first directional (type=0) or spot (type=2) light with
-// value ≥ 0.5 becomes shadow_caster.  Point lights (type=1) flagged castsShadow
-// are skipped — point-light shadows are deferred to a future slice.
-// If no valid caster is found, shadow_caster = max_lights (sentinel: no shadow).
+// CSV[14] (castsShadow): the first light (directional/spot/point) with value ≥ 0.5
+// becomes shadow_caster. A directional → ortho light_vp, spot → perspective light_vp,
+// point → the 6-face RGBA8 distance atlas (variant_shadow_point).
+// If no light casts a shadow, shadow_caster = max_lights (sentinel: no shadow).
 // Tolerant: parse errors for a token leave that field at 0; extra fields ignored.
 fn parseLights(inst: *Inst, s: []const u8) void {
     const max_l = gl.command.max_lights;
