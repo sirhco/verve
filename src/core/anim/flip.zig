@@ -12,9 +12,14 @@ const types = @import("types.zig");
 pub const FlipOpts = struct {
     duration: f64 = 0.4,
     ease: types.Ease = .out_cubic,
-    /// Animate width/height ratios as scaleX/scaleY. Distorts children
-    /// (no nested counter-scale v1) — off by default.
+    /// Animate width/height ratios as scaleX/scaleY. When `counter_scale`
+    /// is also true, each immediate child receives the inverse scale every
+    /// tick so its content stays crisp — off by default.
     scale: bool = false,
+    /// Counter-scale immediate children of each FLIP element every tick
+    /// to neutralise the parent scaleX/scaleY distortion. Only meaningful
+    /// when `scale` is also true.
+    counter_scale: bool = false,
     /// Seconds per element index (play-time DOM order).
     stagger: f64 = 0,
     /// Elements present at play but absent at capture fade in 0 -> 1.
@@ -36,13 +41,16 @@ pub const FlipSlots = struct {
     }
 };
 
-/// `{"d":0.4,"e":"outCubic","sc":0,"st":0,"fade":1[,"cb":{"sC":N,"sE":N,"sL":N}]}`
+/// `{"d":0.4,"e":"outCubic","sc":0,"st":0,"fade":1[,"cs":1][,"cb":{"sC":N,"sE":N,"sL":N}]}`
 pub fn optsToJson(buf: []u8, o: FlipOpts, slots: FlipSlots) ![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
-    try w.print("{{\"d\":{d},\"e\":\"{s}\",\"sc\":{d},\"st\":{d},\"fade\":{d}", .{
+    try w.print("{{\"d\":{d},\"e\":\"{s}\",\"sc\":{d}", .{
         o.duration,
         o.ease.wireName(),
         @intFromBool(o.scale),
+    });
+    if (o.counter_scale) try w.writeAll(",\"cs\":1");
+    try w.print(",\"st\":{d},\"fade\":{d}", .{
         o.stagger,
         @intFromBool(o.fade_in),
     });
@@ -96,5 +104,10 @@ test "optsToJson goldens" {
     try std.testing.expectEqualStrings(
         "{\"d\":0.4,\"e\":\"outCubic\",\"sc\":0,\"st\":0,\"fade\":1,\"cb\":{\"sE\":7}}",
         try optsToJson(&buf, .{}, .{ .enter = 7 }),
+    );
+    // new: scale + counter_scale — "cs":1 appended after "sc":1
+    try std.testing.expectEqualStrings(
+        "{\"d\":0.4,\"e\":\"outCubic\",\"sc\":1,\"cs\":1,\"st\":0,\"fade\":1}",
+        try optsToJson(&buf, .{ .scale = true, .counter_scale = true }, .{}),
     );
 }

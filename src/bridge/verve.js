@@ -1883,6 +1883,8 @@
   let stVelT = 0;
   let stDirty = false;
   let stListening = false;
+  // Per-scroller-element scroll listeners: Map<el, {count, listener, ro}>
+  const stScrollerListeners = new Map();
   // ScrollSmoother singleton (installed by smootherScan; null = native).
   let smoother = null;
   let smActive = false; // smoother/lag unsettled — ticker keep-alive
@@ -1986,6 +1988,10 @@
       console.warn("verve scroll: cannot scrub an infinite animation; falling back to toggle");
       scrub = null;
     }
+    // Resolve container scroller: handle wins over selector; null = window.
+    let scrollerEl = null;
+    if (sc.slh != null) scrollerEl = refHandles[sc.slh] || null;
+    else if (sc.sl) scrollerEl = document.querySelector(sc.sl) || null;
     const t = {
       h: stSeq++,
       el,
@@ -2009,6 +2015,8 @@
       // snap is programmatic motion — disabled under reduced motion
       snap: prefersReduced ? null : sc.snap != null ? sc.snap : null,
       snapd: sc.snapd || 0.4,
+      snape: sc.snape || "outCubic",
+      snapdir: !!sc.snapdir,
       once: !!sc.once,
       keepClsOnKill: false,
       cls: sc.cls || null,
@@ -2020,9 +2028,29 @@
       enabled: true,
       startY: 0,
       endY: 1,
+      scroller: scrollerEl,
     };
     if (sc.pin && !prefersReduced) {
       t.pinEl = sc.pin === 1 ? el : sc.pin.s ? (selfEl || document).querySelector(sc.pin.s) : null;
+    }
+    if (scrollerEl) {
+      let entry = stScrollerListeners.get(scrollerEl);
+      if (!entry) {
+        const listener = () => { stDirty = true; tickerKick(); };
+        let ro = null;
+        try {
+          ro = new ResizeObserver(() => {
+            stRefreshAll();
+            stDirty = true;
+            tickerKick();
+          });
+          ro.observe(scrollerEl);
+        } catch {}
+        scrollerEl.addEventListener("scroll", listener, { passive: true });
+        entry = { count: 0, listener, ro };
+        stScrollerListeners.set(scrollerEl, entry);
+      }
+      entry.count++;
     }
     if (a) a.paused = true; // trigger owns play-state from here
     stTriggers.set(t.h, t);
@@ -2041,13 +2069,27 @@
     if (!el || !el.isConnected) return;
     if (t.pinEl) stClearPin(t);
     const r = el.getBoundingClientRect();
-    // Under a smoother, native scroll doesn't move the fixed subtree —
-    // only the content translate does, so gBCR.top = naturalTop - sm.y
-    // ALWAYS and adding stEffY() recovers the document offset EXACTLY
-    // (even mid-settle). Without a smoother this is the classic formula.
+    // Window scroll offset, function-scoped: feeds the non-scroller absTop
+    // AND the pin geometry below (t.pinTop). Must stay out here — the pin
+    // block runs regardless of branch. (Pins don't compose with element
+    // scrollers, a documented v1 limit; y0 is harmless/unused there.)
     const y0 = stEffY();
-    const absTop = r.top + y0;
-    const vh = window.innerHeight || 0;
+    let absTop, vh;
+    if (t.scroller) {
+      // Scroller-relative: trigger's offset into the scroller's scroll
+      // content = (el.getBoundingClientRect().top - scroller.getBoundingClientRect().top)
+      // + scroller.scrollTop. "viewport" height = scroller clientHeight.
+      const sr = t.scroller.getBoundingClientRect();
+      absTop = (r.top - sr.top) + t.scroller.scrollTop;
+      vh = t.scroller.clientHeight || 1;
+    } else {
+      // Under a smoother, native scroll doesn't move the fixed subtree —
+      // only the content translate does, so gBCR.top = naturalTop - sm.y
+      // ALWAYS and adding stEffY() recovers the document offset EXACTLY
+      // (even mid-settle). Without a smoother this is the classic formula.
+      absTop = r.top + y0;
+      vh = window.innerHeight || 0;
+    }
     const s = t.s;
     t.startY = absTop + s[0] * r.height - s[1] * vh + (s[2] || 0);
     const e = t.e;
@@ -2245,6 +2287,17 @@
 
   const stKill = (t) => {
     stTriggers.delete(t.h);
+    if (t.scroller) {
+      const entry = stScrollerListeners.get(t.scroller);
+      if (entry) {
+        entry.count--;
+        if (entry.count <= 0) {
+          t.scroller.removeEventListener("scroll", entry.listener);
+          if (entry.ro) try { entry.ro.disconnect(); } catch {}
+          stScrollerListeners.delete(t.scroller);
+        }
+      }
+    }
     if (t.pinEl) {
       stClearPin(t);
       if (t.spacer) {
@@ -2282,14 +2335,34 @@
   // Snap target in progress space. cfg = step (number) or sorted points
   // (array). dir breaks exact ties: >= 0 picks the higher point.
   // @verve-extract stSnapResolve
-  const stSnapResolve = (cfg, p, dir) => {
+  const stSnapResolve = (cfg, p, dir, directional) => {
     if (typeof cfg === "number") {
       const lo = Math.max(0, Math.min(1, Math.floor(p / cfg) * cfg));
       const hi = Math.min(1, lo + cfg);
       const dLo = p - lo;
       const dHi = hi - p;
+      if (directional && dir !== 0) {
+        // prefer the candidate in the direction of travel
+        if (dir > 0 && hi <= 1) return hi;
+        if (dir < 0 && lo >= 0) return lo;
+      }
       if (dLo === dHi) return dir >= 0 ? hi : lo;
       return dLo < dHi ? lo : hi;
+    }
+    // points form
+    if (directional && dir !== 0) {
+      // collect candidates in the direction of travel
+      let dirBest = null;
+      let dirBestD = Infinity;
+      let nearBest = cfg[0];
+      let nearBestD = Math.abs(p - cfg[0]);
+      for (let i = 0; i < cfg.length; i++) {
+        const d = Math.abs(p - cfg[i]);
+        if (d < nearBestD || (d === nearBestD && dir >= 0)) { nearBest = cfg[i]; nearBestD = d; }
+        const inDir = dir > 0 ? cfg[i] >= p : cfg[i] <= p;
+        if (inDir && (d < dirBestD || (d === dirBestD && dir >= 0))) { dirBest = cfg[i]; dirBestD = d; }
+      }
+      return dirBest !== null ? dirBest : nearBest;
     }
     let best = cfg[0];
     let bd = Math.abs(p - cfg[0]);
@@ -2310,20 +2383,21 @@
     let best = null;
     for (const t of stTriggers.values()) {
       if (t.snap == null || !t.enabled || !t.el || !t.el.isConnected) continue;
+      if (t.scroller) continue; // snap is window-scoped; element scrollers silently misfire
       const span = t.endY - t.startY;
       const margin = Math.min(span * 0.25, (window.innerHeight || 0) * 0.25);
       if (stScrollY < t.startY - margin || stScrollY > t.endY + margin) continue;
       const p = Math.max(0, Math.min((stScrollY - t.startY) / span, 1));
-      const target = t.startY + stSnapResolve(t.snap, p, stDir) * span;
+      const target = t.startY + stSnapResolve(t.snap, p, stDir, t.snapdir) * span;
       const dist = Math.abs(target - stScrollY);
       if (dist <= SNAP_EPS) continue;
       snapPending = true; // keep ticker alive through the idle window
-      if (!best || dist < best.dist) best = { y: target, dist, dur: t.snapd };
+      if (!best || dist < best.dist) best = { y: target, dist, dur: t.snapd, ease: t.snape };
     }
     if (!best) return;
     if (Math.abs(stVelocity()) > SNAP_VEL) return;
     if (!stVelT || now - stVelT < SNAP_IDLE_MS) return;
-    snapGlide = { from: stScrollY, to: best.y, t: 0, dur: best.dur, lastY: stScrollY };
+    snapGlide = { from: stScrollY, to: best.y, t: 0, dur: best.dur, ease: best.ease, lastY: stScrollY };
   };
 
   const stSnapGlide = (dt) => {
@@ -2336,7 +2410,7 @@
     }
     g.t += dt;
     const k = Math.min(1, g.t / g.dur);
-    const e = 1 - Math.pow(1 - k, 3); // outCubic, fixed v1
+    const e = easeFnOf(g.ease)(k);
     // behavior:"instant" defeats CSS scroll-behavior:smooth, which would
     // turn each per-frame write into its own competing animation.
     window.scrollTo({ top: g.from + (g.to - g.from) * e, behavior: "instant" });
@@ -2364,8 +2438,11 @@
       // transform-pins follow the smoothed Y per frame (listener path
       // skips pins when a smoother is installed)
       if (t.pinEl && smoother) stApplyPin(t);
+      // Container scroller triggers use the scroller's scrollTop;
+      // window triggers use the effective (possibly smoothed) scrollY.
+      const ty = t.scroller ? t.scroller.scrollTop : y;
       const wasActive = t.active;
-      const active = y >= t.startY && y < t.endY;
+      const active = ty >= t.startY && ty < t.endY;
       t.active = active;
       if (active !== wasActive) {
         if (active) {
@@ -2376,7 +2453,7 @@
             stApplyAction(a, t.act[2]);
             stFireScCb(t, "sEB", null);
           }
-        } else if (y >= t.endY) {
+        } else if (ty >= t.endY) {
           stApplyAction(a, t.act[1]);
           stFireScCb(t, "sL", "nL");
         } else {
@@ -2394,7 +2471,7 @@
         }
       }
       if (t.scrub != null && a) {
-        const raw = Math.max(0, Math.min((y - t.startY) / (t.endY - t.startY), 1));
+        const raw = Math.max(0, Math.min((ty - t.startY) / (t.endY - t.startY), 1));
         t.target = raw;
         if (t.smooth > 0) {
           t.cur += (t.target - t.cur) * Math.min(1, dt / t.smooth);
@@ -2824,6 +2901,24 @@
   };
   // @verve-extract-end
 
+  // Elastic wall reflection for a single axis during inertia throw.
+  // Returns updated {pos, endpoint} after reflecting off a wall.
+  // bounce: elasticity 0..1 (0 = hard clamp, 1 = fully elastic).
+  // The endpoint shifts symmetrically so the exponential-approach integrator
+  // naturally decelerates toward the new reflected endpoint.
+  // @verve-extract dragBounce
+  const dragBounceReflect = (pos, endpoint, wall, bounce) => {
+    // overshoot distance past the wall
+    const over = pos - wall;
+    // reflected position sits equally on the inside of the wall
+    const rpos = wall - over * bounce;
+    // new endpoint mirrors the old endpoint's overshoot, damped by bounce
+    const endOver = endpoint - wall;
+    const rendpoint = wall - endOver * bounce;
+    return { pos: rpos, endpoint: rendpoint };
+  };
+  // @verve-extract-end
+
   // @verve-extract dragSnapResolve
   const dragSnapResolve = (sn, x, y) => {
     if (!sn) return [x, y];
@@ -2921,8 +3016,14 @@
       ex += dragProject(d.vx, r);
       ey += dragProject(d.vy, r);
     }
-    ex = dclamp(ex, d.minX, d.maxX);
-    ey = dclamp(ey, d.minY, d.maxY);
+    // bounce > 0: skip hard clamp — the frame integrator bounces off walls
+    if (!d.bounce) {
+      ex = dclamp(ex, d.minX, d.maxX);
+      ey = dclamp(ey, d.minY, d.maxY);
+    }
+    // snap runs on possibly-out-of-bounds ex/ey when bounce is active; a snap
+    // target landing at/just outside a wall produces one extra bounce frame — acceptable
+    // because snap grids are designed to land inside bounds.
     const snapped = dragSnapResolve(d.snap, ex, ey);
     // axis lock LAST: a locked axis never moves, even to snap
     ex = d.ax === 2 ? s.x : snapped[0];
@@ -2953,6 +3054,9 @@
 
   // Per-frame throw integrator — called from animTick while
   // dragThrowing > 0. Exponential approach toward the projected endpoint.
+  // When bounce > 0 and position crosses a wall, dragBounceReflect adjusts
+  // both the current position and the target endpoint so the integrator
+  // naturally decelerates toward the new reflected destination.
   const dragUpdate = (dt) => {
     for (const d of [...drags.values()]) {
       if (!d.el.isConnected) {
@@ -2965,6 +3069,27 @@
       const f = 1 - Math.pow(r, dt);
       let nx = s.x + (d.ex - s.x) * f;
       let ny = s.y + (d.ey - s.y) * f;
+      // bounce: reflect off walls when overshoot occurs during the throw
+      if (d.bounce > 0) {
+        if (nx < d.minX && d.minX !== -Infinity) {
+          const rb = dragBounceReflect(nx, d.ex, d.minX, d.bounce);
+          nx = rb.pos;
+          d.ex = rb.endpoint;
+        } else if (nx > d.maxX && d.maxX !== Infinity) {
+          const rb = dragBounceReflect(nx, d.ex, d.maxX, d.bounce);
+          nx = rb.pos;
+          d.ex = rb.endpoint;
+        }
+        if (ny < d.minY && d.minY !== -Infinity) {
+          const rb = dragBounceReflect(ny, d.ey, d.minY, d.bounce);
+          ny = rb.pos;
+          d.ey = rb.endpoint;
+        } else if (ny > d.maxY && d.maxY !== Infinity) {
+          const rb = dragBounceReflect(ny, d.ey, d.maxY, d.bounce);
+          ny = rb.pos;
+          d.ey = rb.endpoint;
+        }
+      }
       d.vx = (d.ex - nx) * d.k;
       d.vy = (d.ey - ny) * d.k;
       if (Math.abs(d.ex - nx) < 0.1 && Math.abs(d.ey - ny) < 0.1) {
@@ -2992,6 +3117,7 @@
       boundsSpec: cfg.b || null,
       hasInertia: cfg.in != null,
       retention: cfg.in == null || cfg.in === 1 ? DRAG_DEFAULT_RETENTION : cfg.in,
+      bounce: cfg.bo != null ? cfg.bo : 0,
       snap: cfg.sn || null,
       th: cfg.th == null ? 3 : cfg.th,
       cur: cfg.cur !== 0,
@@ -3202,6 +3328,443 @@
     }
   };
 
+  // ---- Verve Sortable ----------------------------------------------------
+  // Drag-to-reorder with cross-list group transfer + edge autoscroll.
+  // Parses the `"so"` descriptor produced by serialize.sortableToJson.
+  // Wire sub-keys: "it" items selector, "hd" handle selector,
+  // "ax" axis (1=x,2=y,omit=y), "an" animate (0=off), "cls" toggle_class,
+  // "dis" disabled (1), "grp" group name (cross-list transfer),
+  // "as" autoscroll (0=off, omit=on), "ase" autoscroll edge px (omit=40),
+  // "cb":{"sR" on_reorder_slot, "sG" on_enter_group_slot}.
+
+  let sortableSeq = 1;
+  const sortables = new Map(); // handle → sortable state
+  // Group registry: groupName → Set of sortable state objects.
+  const sortableGroups = new Map();
+
+  const sortableAttach = (cfg, container) => {
+    const itemSel = cfg.it;
+    if (!itemSel) return 0;
+    const ax = cfg.ax != null ? cfg.ax : 2; // default y
+    const animate = cfg.an !== 0; // true unless "an":0
+    const cls = cfg.cls || null;
+    const cb = cfg.cb || null;
+    const enabled = cfg.dis !== 1;
+    const grp = cfg.grp || null; // group name for cross-list transfer
+    const autoscroll = cfg.as !== 0; // true unless "as":0
+    const edgePx = (cfg.ase != null && cfg.ase > 0) ? cfg.ase : 40;
+
+    const reducedMotion = prefersReduced;
+    const s = {
+      h: sortableSeq++,
+      container,
+      itemSel,
+      ax,
+      animate,
+      cls,
+      cb,
+      enabled,
+      grp,
+      autoscroll,
+      edgePx,
+      // last reorder result (-1 = never reordered)
+      lastFrom: -1,
+      lastTo: -1,
+      // last container identity for cross-list (null = no cross-list yet)
+      lastFromGroup: null,
+      lastToGroup: null,
+      // active drag state (null when idle)
+      drag: null,
+    };
+
+    // Register in group registry.
+    if (grp) {
+      let grpSet = sortableGroups.get(grp);
+      if (!grpSet) {
+        grpSet = new Set();
+        sortableGroups.set(grp, grpSet);
+      }
+      grpSet.add(s);
+    }
+
+    const getItems = () => Array.from(container.querySelectorAll(itemSel));
+
+    // Capture natural (untransformed) bounding rects of all siblings,
+    // excluding the dragged item (it moves with the pointer).
+    const captureRects = (excludeEl) => {
+      const items = getItems().filter((el) => el !== excludeEl);
+      return items.map((el) => {
+        const r = el.getBoundingClientRect();
+        return { el, rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom } };
+      });
+    };
+
+    // Clear any preview transforms on siblings.
+    const clearSiblingShifts = (siblings) => {
+      for (const sib of siblings) {
+        sib.el.style.transform = "";
+        sib.el.style.transition = "";
+      }
+    };
+
+    // Apply FLIP-preview translate to siblings based on target slot.
+    // The dragged item currently occupies `fromIndex` in the full list.
+    // Siblings at or after `toIndex` (up to `fromIndex`) shift forward one
+    // slot (or backward if dragging down).
+    const previewSiblingShifts = (dragged, siblings, fromIndex, toIndex, itemH, itemW) => {
+      // Transition only when animate=true AND reduced-motion is not set.
+      // Position preview (transform) always updates — only the motion is suppressed.
+      const useTransition = animate && !reducedMotion;
+      const n = siblings.length;
+      // siblings is the list EXCLUDING the dragged item; their original
+      // indices in the full list are: 0..(fromIndex-1), (fromIndex+1)..n
+      for (let i = 0; i < n; i++) {
+        const origFull = i < fromIndex ? i : i + 1;
+        // Does this sibling need to shift?
+        let shift = 0;
+        if (fromIndex < toIndex) {
+          // dragging down: items between (fromIndex+1)..toIndex shift up one slot
+          if (origFull > fromIndex && origFull <= toIndex) shift = -1;
+        } else if (fromIndex > toIndex) {
+          // dragging up: items between toIndex..(fromIndex-1) shift down one slot
+          if (origFull >= toIndex && origFull < fromIndex) shift = 1;
+        }
+        const sib = siblings[i];
+        if (shift !== 0) {
+          sib.el.style.transition = useTransition ? "transform 0.18s ease" : "";
+          if (ax === 1) {
+            sib.el.style.transform = `translateX(${shift * itemW}px)`;
+          } else {
+            sib.el.style.transform = `translateY(${shift * itemH}px)`;
+          }
+        } else {
+          sib.el.style.transition = useTransition ? "transform 0.18s ease" : "";
+          sib.el.style.transform = "";
+        }
+      }
+    };
+
+    const onPointerDown = (e) => {
+      if (!s.enabled || s.drag) return;
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      // Find which item was hit (or whose handle was hit).
+      let targetEl = null;
+      for (const item of getItems()) {
+        const grip = (cfg.hd ? item.querySelector(cfg.hd) : null) || item;
+        if (grip === e.target || grip.contains(e.target)) {
+          targetEl = item;
+          break;
+        }
+      }
+      if (!targetEl) return;
+      e.preventDefault();
+      e.stopPropagation();
+
+      const allItems = getItems();
+      const fromIndex = allItems.indexOf(targetEl);
+      if (fromIndex < 0) return;
+
+      // Capture item size for shift calculation.
+      const r = targetEl.getBoundingClientRect();
+      const itemH = r.height;
+      const itemW = r.width;
+
+      // Capture starting pointer offset within the item.
+      const offsetX = e.clientX - r.left;
+      const offsetY = e.clientY - r.top;
+
+      // Apply drag class.
+      if (cls) targetEl.classList.add(cls);
+
+      // Position dragged item absolutely under pointer.
+      // Use inline translate so layout siblings keep their flow positions.
+      // We'll translate relative to current position (no layout removal).
+      const startX = e.clientX - offsetX - r.left; // = 0 initially
+      const startY = e.clientY - offsetY - r.top;  // = 0 initially
+
+      // Raise z-index so it overlaps siblings.
+      targetEl.style.position = "relative";
+      targetEl.style.zIndex = "1000";
+      targetEl.style.pointerEvents = "none";
+
+      let currentSlot = fromIndex;
+      const siblings = captureRects(targetEl);
+
+      s.drag = {
+        el: targetEl,
+        fromIndex,
+        currentSlot,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startTranslateX: 0,
+        startTranslateY: 0,
+        offsetX,
+        offsetY,
+        itemH,
+        itemW,
+        pid: e.pointerId,
+        siblings,
+        // Cross-list: track current live target sortable (may differ from `s`).
+        // `liveTarget` is the sortable state object currently under the pointer.
+        liveTarget: s,
+        // Autoscroll rAF id (0 = not running).
+        scrollRaf: 0,
+      };
+
+      try { targetEl.setPointerCapture(e.pointerId); } catch {}
+    };
+
+    const onPointerMove = (e) => {
+      const d = s.drag;
+      if (!d || e.pointerId !== d.pid) return;
+
+      const dx = e.clientX - d.startClientX;
+      const dy = e.clientY - d.startClientY;
+
+      // Translate the dragged element under the pointer.
+      if (ax === 1) {
+        d.el.style.transform = `translateX(${dx}px)`;
+      } else if (ax === 2) {
+        d.el.style.transform = `translateY(${dy}px)`;
+      } else {
+        d.el.style.transform = `translate(${dx}px,${dy}px)`;
+      }
+
+      // Cross-list group hit-test: find the same-group container under pointer.
+      let newTarget = s; // default: same container
+      if (grp) {
+        const grpSet = sortableGroups.get(grp);
+        if (grpSet) {
+          for (const peer of grpSet) {
+            if (!peer.enabled) continue;
+            const cr = peer.container.getBoundingClientRect();
+            if (
+              e.clientX >= cr.left && e.clientX <= cr.right &&
+              e.clientY >= cr.top  && e.clientY <= cr.bottom
+            ) {
+              newTarget = peer;
+              // Keep iterating — later entries win (deepest/last in DOM order).
+            }
+          }
+        }
+      }
+
+      // If the live container changed, transfer the dragged node and fire
+      // on_enter_group_slot.
+      if (newTarget !== d.liveTarget) {
+        const prevTarget = d.liveTarget;
+        // Clear sibling shifts in the old container.
+        clearSiblingShifts(d.siblings);
+        // Move the dragged node into the new container (append to end as
+        // placeholder; slot will be corrected below).
+        newTarget.container.appendChild(d.el);
+        // Recompute siblings in new container.
+        d.siblings = Array.from(newTarget.container.querySelectorAll(newTarget.itemSel))
+          .filter((el) => el !== d.el)
+          .map((el) => {
+            const r = el.getBoundingClientRect();
+            return { el, rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom } };
+          });
+        // fromIndex in the new container = end (item just appended).
+        d.fromIndex = newTarget.container.querySelectorAll(newTarget.itemSel).length - 1;
+        d.currentSlot = d.fromIndex;
+        d.liveTarget = newTarget;
+        // Fire on_enter_group_slot via the NEW target's callback (cross-list).
+        const enterCb = newTarget.cb;
+        if (enterCb && enterCb.sG != null) {
+          animFireSlot(enterCb.sG);
+        }
+        // Also check the source container's cb.
+        const srcCb = prevTarget.cb;
+        if (srcCb && srcCb.sG != null) {
+          animFireSlot(srcCb.sG);
+        }
+      }
+
+      const lt = d.liveTarget;
+      const ltAx = lt.ax;
+
+      // Recompute slot: gather live rects of siblings (they may be animating).
+      const sibRects = d.siblings.map((sib) => {
+        const r = sib.el.getBoundingClientRect();
+        return { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+      });
+
+      // The target slot in the FULL list (including the dragged item's original slot).
+      // sortableSlotIndex gives 0..n-1 (siblings only), map back to full-list slot.
+      const rawSlot = sortableSlotIndex({ x: e.clientX, y: e.clientY }, sibRects, ltAx);
+      let fullSlot;
+      if (rawSlot <= d.fromIndex) {
+        fullSlot = rawSlot;
+      } else {
+        fullSlot = rawSlot; // rawSlot already accounts for the gap
+      }
+
+      d.currentSlot = fullSlot;
+      // previewSiblingShifts uses the closure vars (animate, reducedMotion, ax)
+      // from sortableAttach. For cross-list, use liveTarget's props.
+      const useTransitionLT = lt.animate && !reducedMotion;
+      const ltN = d.siblings.length;
+      for (let i = 0; i < ltN; i++) {
+        const origFull = i < d.fromIndex ? i : i + 1;
+        let shift = 0;
+        if (d.fromIndex < fullSlot) {
+          if (origFull > d.fromIndex && origFull <= fullSlot) shift = -1;
+        } else if (d.fromIndex > fullSlot) {
+          if (origFull >= fullSlot && origFull < d.fromIndex) shift = 1;
+        }
+        const sib = d.siblings[i];
+        sib.el.style.transition = useTransitionLT ? "transform 0.18s ease" : "";
+        sib.el.style.transform = shift !== 0
+          ? (ltAx === 1 ? `translateX(${shift * d.itemW}px)` : `translateY(${shift * d.itemH}px)`)
+          : "";
+      }
+
+      // Edge autoscroll: schedule rAF if pointer is in the edge band.
+      if (autoscroll) {
+        const cr = lt.container.getBoundingClientRect();
+        // For horizontal lists (ax=1), project x/left/right onto the y/top/bottom
+        // fields so sortableAutoscroll's fixed-axis math operates on the correct axis.
+        const asPtr = ltAx === 1 ? { x: 0, y: e.clientX } : { x: e.clientX, y: e.clientY };
+        const asRect = ltAx === 1 ? { top: cr.left, bottom: cr.right } : cr;
+        const delta = sortableAutoscroll(asPtr, asRect, lt.edgePx);
+        if (delta !== 0) {
+          if (!d.scrollRaf) {
+            const scrollStep = () => {
+              const dd = s.drag;
+              if (!dd || dd !== d) return; // drag ended
+              const crr = dd.liveTarget.container.getBoundingClientRect();
+              const ltAxCur = dd.liveTarget.ax;
+              const asPtr2 = ltAxCur === 1 ? { x: 0, y: dd.lastPointerX } : { x: dd.lastPointerX, y: dd.lastPointerY };
+              const asRect2 = ltAxCur === 1 ? { top: crr.left, bottom: crr.right } : crr;
+              const spd = sortableAutoscroll(asPtr2, asRect2, dd.liveTarget.edgePx);
+              if (spd !== 0) {
+                if (ltAx === 1) {
+                  dd.liveTarget.container.scrollLeft += spd;
+                } else {
+                  dd.liveTarget.container.scrollTop += spd;
+                }
+                dd.scrollRaf = requestAnimationFrame(scrollStep);
+              } else {
+                dd.scrollRaf = 0;
+              }
+            };
+            d.scrollRaf = requestAnimationFrame(scrollStep);
+          }
+        } else if (d.scrollRaf) {
+          cancelAnimationFrame(d.scrollRaf);
+          d.scrollRaf = 0;
+        }
+        d.lastPointerX = e.clientX;
+        d.lastPointerY = e.clientY;
+      }
+    };
+
+    const onPointerUp = (e) => {
+      const d = s.drag;
+      if (!d || e.pointerId !== d.pid) return;
+      s.drag = null;
+
+      // Cancel any running autoscroll rAF.
+      if (d.scrollRaf) {
+        cancelAnimationFrame(d.scrollRaf);
+        d.scrollRaf = 0;
+      }
+
+      const toIndex = d.currentSlot;
+      const lt = d.liveTarget; // may differ from `s` for cross-list drops
+
+      // Clear drag styles.
+      d.el.style.transform = "";
+      d.el.style.position = "";
+      d.el.style.zIndex = "";
+      d.el.style.pointerEvents = "";
+      if (cls) d.el.classList.remove(cls);
+
+      // Clear sibling preview shifts.
+      clearSiblingShifts(d.siblings);
+
+      // Reorder DOM: move dragged element to the target slot in liveTarget's container.
+      const ltContainer = lt.container;
+      const ltGetItems = () => Array.from(ltContainer.querySelectorAll(lt.itemSel));
+      const itemEls = ltGetItems();
+      if (toIndex >= itemEls.length) {
+        ltContainer.appendChild(d.el);
+      } else {
+        const refEl = itemEls[toIndex];
+        if (refEl !== d.el) {
+          const refIdx = Array.from(ltContainer.children).indexOf(refEl);
+          const dragIdx = Array.from(ltContainer.children).indexOf(d.el);
+          if (dragIdx < refIdx) {
+            ltContainer.insertBefore(d.el, refEl.nextSibling);
+          } else {
+            ltContainer.insertBefore(d.el, refEl);
+          }
+        }
+      }
+
+      // Store last reorder result on the SOURCE sortable (s) and fire on_reorder.
+      // For cross-list: fromContainer = s.h, toContainer = lt.h.
+      const isCrossGroup = lt !== s;
+      s.lastFrom = d.fromIndex;
+      s.lastTo = toIndex;
+      // Group container handles: -1 when no group, otherwise the sortable handle id.
+      s.lastFromGroup = grp ? s.h : -1;
+      s.lastToGroup = grp ? lt.h : -1;
+      if (cb && cb.sR != null) {
+        animFireSlot(cb.sR);
+      }
+      // Also store on the target sortable so its handle can read lastTo.
+      if (isCrossGroup) {
+        lt.lastFrom = d.fromIndex;
+        lt.lastTo = toIndex;
+        lt.lastFromGroup = grp ? s.h : -1;
+        lt.lastToGroup = grp ? lt.h : -1;
+        if (lt.cb && lt.cb.sR != null) {
+          animFireSlot(lt.cb.sR);
+        }
+      }
+    };
+
+    // Attach listeners to each item (on pointerdown, discover which item).
+    container.addEventListener("pointerdown", onPointerDown);
+    container.addEventListener("pointermove", onPointerMove);
+    container.addEventListener("pointerup", onPointerUp);
+    container.addEventListener("pointercancel", onPointerUp);
+
+    // touch-action: prevent scroll interference during vertical sort.
+    container.style.touchAction = ax === 1 ? "pan-y" : "pan-x";
+
+    sortables.set(s.h, s);
+    return s.h;
+  };
+
+  const sortableCreate = (desc, selfEl) => {
+    if (!desc || desc.v !== 1 || !desc.so) return 0;
+    const cfg = desc.so;
+    // Container ref lives at the DESCRIPTOR top level (sibling of "so"),
+    // spliced there by island_runtime.zig's sortable() — NOT inside "so"
+    // (serialize.sortableToJson never emits a container key).
+    const ct = desc.ct;
+    let containers = [];
+    if (ct && ct.h != null) {
+      const el = refHandles[ct.h];
+      if (el) containers = [el];
+    } else if (ct && ct.s) {
+      containers = Array.from((selfEl || document).querySelectorAll(ct.s));
+    } else if (selfEl) {
+      containers = [selfEl];
+    } else {
+      return 0;
+    }
+    let first = 0;
+    for (const el of containers) {
+      const h = sortableAttach(cfg, el);
+      if (!first) first = h;
+    }
+    return first;
+  };
+
   // ---- Verve Flip --------------------------------------------------------
   // FLIP layout animation (island-only, ops crossing — no wire root; play
   // options JSON from src/core/anim/flip.zig optsToJson). Capture stores
@@ -3239,6 +3802,82 @@
     rx: useScale && last.w > 0 ? first.w / last.w : 1,
     ry: useScale && last.h > 0 ? first.h / last.h : 1,
   });
+  // @verve-extract-end
+
+  // Apply inverse scale to each immediate child of a FLIP element so their
+  // content stays crisp while the parent is scaled. Called every tick when
+  // `cs` is set; pass the parent's current scaleX/scaleY from the lerp.
+  // @verve-extract flipCounterScale
+  const flipCounterScale = (el, sx, sy) => {
+    const inv_x = sx !== 0 ? 1 / sx : 1;
+    const inv_y = sy !== 0 ? 1 / sy : 1;
+    for (const child of el.children) {
+      child.style.transform = `scale(${inv_x},${inv_y})`;
+    }
+  };
+  const flipCounterScaleClear = (el) => {
+    // This clears the child's transform unconditionally; a pre-existing style.transform is not restored (acceptable for layout containers).
+    for (const child of el.children) {
+      child.style.transform = "";
+    }
+  };
+  // @verve-extract-end
+
+  // Compute the drop-slot index for a pointer position given item rects.
+  // Returns 0..n (inclusive): 0 = before first, n = after last.
+  // axis: 1=x, 2=y (default), 0=both (uses y). Each item is examined at
+  // its midpoint: pointer before mid → slot before that item, pointer
+  // at/after mid → slot after that item. Works for above-first, between,
+  // and below-last cases without special-casing.
+  // @verve-extract sortableSlotIndex
+  const sortableSlotIndex = (pos, rects, axis) => {
+    if (!rects || rects.length === 0) return 0;
+    const useX = axis === 1;
+    for (let i = 0; i < rects.length; i++) {
+      const r = rects[i];
+      const mid = useX
+        ? (r.left + r.right) / 2
+        : (r.top + r.bottom) / 2;
+      const coord = useX ? pos.x : pos.y;
+      if (coord < mid) return i;
+    }
+    return rects.length;
+  };
+  // @verve-extract-end
+
+  // Compute autoscroll velocity for a sortable container.
+  // Returns a signed scroll delta (pixels/frame) when the pointer is within
+  // `edgePx` of the container's start or end edge along the primary axis.
+  // Positive = scroll toward end (down/right), negative = toward start (up/left).
+  // Magnitude ramps linearly with proximity: 0 at the outer boundary of the
+  // band, MAX_SPEED at the inner edge (container edge).
+  // Returns 0 when the pointer is outside the edge band (or outside the container).
+  // axis is not passed — caller selects the relevant edge pair from containerRect.
+  // The rect is a DOMRect-compatible {left, top, right, bottom}.
+  // @verve-extract sortableAutoscroll
+  const sortableAutoscroll = (pointerPos, containerRect, edgePx) => {
+    const MAX_SPEED = 16; // max pixels per frame at the inner edge
+    // Operates on the y-axis (pointerPos.y vs containerRect.top/bottom).
+    // For horizontal lists (ax=1), the call site projects x/left/right onto
+    // y/top/bottom before calling so that this function stays axis-agnostic
+    // and purely testable without an ax parameter.
+    const top = containerRect.top;
+    const bottom = containerRect.bottom;
+    const py = pointerPos.y;
+    // Outside the container entirely → 0.
+    if (py < top || py > bottom) return 0;
+    const fromTop = py - top;
+    const fromBottom = bottom - py;
+    if (fromTop < edgePx) {
+      // Near the top edge → negative (scroll up).
+      return -MAX_SPEED * (1 - fromTop / edgePx);
+    }
+    if (fromBottom < edgePx) {
+      // Near the bottom edge → positive (scroll down).
+      return MAX_SPEED * (1 - fromBottom / edgePx);
+    }
+    return 0;
+  };
   // @verve-extract-end
 
   const flipCaptureImpl = (sel) => {
@@ -3289,6 +3928,7 @@
           if (f.useScale) {
             xformSet(s, "scaleX", 1);
             xformSet(s, "scaleY", 1);
+            if (f.counterScale) flipCounterScaleClear(it.el);
           }
           animDirty.add(it.el);
         }
@@ -3409,6 +4049,7 @@
       easeFn: easeFnOf(desc.e),
       cb,
       useScale,
+      counterScale: useScale && desc.cs === 1,
     };
     for (const it of items) flipByEl.set(it.el, f);
     flips.set(f.h, f);
@@ -3437,13 +4078,18 @@
           xformSet(s, "x", it.dx * (1 - e));
           xformSet(s, "y", it.dy * (1 - e));
           if (f.useScale) {
-            xformSet(s, "scaleX", it.rx + (1 - it.rx) * e);
-            xformSet(s, "scaleY", it.ry + (1 - it.ry) * e);
+            const csx = it.rx + (1 - it.rx) * e;
+            const csy = it.ry + (1 - it.ry) * e;
+            xformSet(s, "scaleX", csx);
+            xformSet(s, "scaleY", csy);
+            if (f.counterScale) flipCounterScale(it.el, csx, csy);
           }
           animDirty.add(it.el);
         }
-        if (p >= 1) flipFinishItem(it);
-        else live++;
+        if (p >= 1) {
+          if (f.counterScale && !it.fade) flipCounterScaleClear(it.el);
+          flipFinishItem(it);
+        } else live++;
       }
       if (!live) {
         flips.delete(f.h);
@@ -4096,6 +4742,48 @@
           return d.hover;
         default:
           return 0;
+      }
+    },
+    // ---- Sortable ops ------------------------------------------------------
+    // op: 0 kill, 1 disable, 2 enable
+    verve_sortable_create: (dp, dl) => {
+      let desc;
+      try {
+        desc = JSON.parse(readStr(dp, dl));
+      } catch (err) {
+        console.warn("verve sortable: bad descriptor", err);
+        return 0;
+      }
+      return sortableCreate(desc, null) >>> 0;
+    },
+    verve_sortable_ctrl: (h, op) => {
+      const s = sortables.get(h >>> 0);
+      if (!s) return;
+      if ((op >>> 0) === 0) {
+        sortables.delete(h >>> 0);
+        // Remove from group registry.
+        if (s.grp) {
+          const grpSet = sortableGroups.get(s.grp);
+          if (grpSet) {
+            grpSet.delete(s);
+            if (grpSet.size === 0) sortableGroups.delete(s.grp);
+          }
+        }
+      } else if ((op >>> 0) === 1) s.enabled = false;
+      else if ((op >>> 0) === 2) s.enabled = true;
+    },
+    // field: 0 lastFrom, 1 lastTo (-1 = never reordered),
+    //        2 lastFromGroup handle (-1 = no group / same-list),
+    //        3 lastToGroup handle (-1 = no group / same-list)
+    verve_sortable_get: (h, f) => {
+      const s = sortables.get(h >>> 0);
+      if (!s) return -1;
+      switch (f >>> 0) {
+        case 0: return s.lastFrom;
+        case 1: return s.lastTo;
+        case 2: return s.lastFromGroup != null ? s.lastFromGroup : -1;
+        case 3: return s.lastToGroup != null ? s.lastToGroup : -1;
+        default: return -1;
       }
     },
     // ---- FLIP ops ----------------------------------------------------------

@@ -24,16 +24,19 @@ const extract = (name) => {
 
 const fns = new Function(
   extract("mpSample") + extract("buildMorphD") + extract("animIsTriggerOnly") +
-    extract("dragProject") + extract("dragSnapResolve") +
+    extract("dragProject") + extract("dragBounce") + extract("dragSnapResolve") +
     extract("splitLineRuns") + extract("flipNatural") + extract("flipDelta") +
+    extract("flipCounterScale") +
     extract("stSnapResolve") + extract("dragZoneHit") + extract("glTweenState") +
-    extract("tweenHasGl") +
-    "return { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve, " +
-    "splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit, glTweenState, tweenHasGl };",
+    extract("tweenHasGl") + extract("sortableSlotIndex") + extract("sortableAutoscroll") +
+    "return { mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragBounceReflect, dragSnapResolve, " +
+    "splitLineRuns, flipNatural, flipDelta, flipCounterScale, flipCounterScaleClear, " +
+    "stSnapResolve, dragZoneHit, glTweenState, tweenHasGl, sortableSlotIndex, sortableAutoscroll };",
 )();
 const {
-  mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragSnapResolve,
-  splitLineRuns, flipNatural, flipDelta, stSnapResolve, dragZoneHit, glTweenState, tweenHasGl,
+  mpSample, buildMorphD, animIsTriggerOnly, dragProject, dragBounceReflect, dragSnapResolve,
+  splitLineRuns, flipNatural, flipDelta, flipCounterScale, flipCounterScaleClear,
+  stSnapResolve, dragZoneHit, glTweenState, tweenHasGl, sortableSlotIndex, sortableAutoscroll,
 } = fns;
 
 let fails = 0;
@@ -154,6 +157,36 @@ const approx = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
     animIsTriggerOnly({ v: 1, sc: {}, dr: {} }) === true);
 }
 
+// ---- Draggable: elastic bounce reflection ----
+{
+  // bounce=1: fully elastic — velocity inverts, position mirrors
+  let r = dragBounceReflect(110, 200, 100, 1.0);
+  check("bounce=1 pos reflects at wall", approx(r.pos, 90));
+  check("bounce=1 endpoint reflects", approx(r.endpoint, 0));
+
+  // bounce=0.5: half damped
+  // over = 120-100 = 20; rpos = 100 - 20*0.5 = 90
+  // endOver = 200-100 = 100; rendpoint = 100 - 100*0.5 = 50
+  r = dragBounceReflect(120, 200, 100, 0.5);
+  check("bounce=0.5 pos half-damps", approx(r.pos, 90));
+  check("bounce=0.5 endpoint half-damps", approx(r.endpoint, 50));
+
+  // bounce=0: hard clamp — no overshoot, endpoint pins to wall
+  r = dragBounceReflect(115, 180, 100, 0);
+  check("bounce=0 pos pins to wall", approx(r.pos, 100));
+  check("bounce=0 endpoint pins to wall", approx(r.endpoint, 100));
+
+  // min wall (pos < min): reflect off lower bound
+  r = dragBounceReflect(-10, -50, 0, 0.5);
+  check("bounce min wall pos", approx(r.pos, 5)); // 0 - (-10)*0.5 = 5
+  check("bounce min wall endpoint", approx(r.endpoint, 25)); // 0 - (-50)*0.5 = 25
+
+  // no overshoot: calling with pos inside bounds should still apply formula
+  // (caller guards; test that zero over = no change)
+  r = dragBounceReflect(100, 100, 100, 0.5);
+  check("bounce exact at wall no change", approx(r.pos, 100) && approx(r.endpoint, 100));
+}
+
 // ---- SplitText: offsetTop -> line runs ----
 {
   check("runs empty", JSON.stringify(splitLineRuns([])) === "[]");
@@ -212,6 +245,22 @@ const approx = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
   check("snap points nearest mid", stSnapResolve([0, 0.5, 1], 0.6, 1) === 0.5);
   check("snap points tie dir+", stSnapResolve([0, 0.5], 0.25, 1) === 0.5);
   check("snap points tie dir-", stSnapResolve([0, 0.5], 0.25, -1) === 0);
+  // directional snap (4th arg true): prefer target in direction of travel
+  // step form directional
+  check("snap step dir+ directional forward", stSnapResolve(0.25, 0.1, 1, true) === 0.25);
+  check("snap step dir- directional backward", stSnapResolve(0.25, 0.9, -1, true) === 0.75);
+  check("snap step dir+ directional skips behind", stSnapResolve(0.25, 0.49, 1, true) === 0.5);
+  check("snap step dir- directional skips ahead", stSnapResolve(0.25, 0.26, -1, true) === 0.25);
+  // points form directional
+  check("snap points dir+ directional forward", stSnapResolve([0, 0.5, 1], 0.1, 1, true) === 0.5);
+  check("snap points dir- directional backward", stSnapResolve([0, 0.5, 1], 0.9, -1, true) === 0.5);
+  check("snap points dir+ directional fallback nearest when at end", stSnapResolve([0, 0.5, 1], 1, 1, true) === 1);
+  check("snap points dir- directional fallback nearest when at start", stSnapResolve([0, 0.5, 1], 0, -1, true) === 0);
+  // directional=false (explicit) behaves like nearest
+  check("snap points non-directional explicit false", stSnapResolve([0, 0.5, 1], 0.2, 1, false) === 0);
+  // boundary fling edge cases: just past snap point going forward/backward
+  check("snap step fling forward past boundary", stSnapResolve(0.25, 0.26, 1, true) === 0.5);
+  check("snap step fling backward past boundary", stSnapResolve(0.25, 0.24, -1, true) === 0.0);
 }
 
 // ---- Drag drop-zone hit testing ----
@@ -261,8 +310,228 @@ const approx = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
   check("hasGl false for empty props", tweenHasGl({}) === false);
 }
 
+// ---- flipCounterScale: inverse-scale math ----
+// Simulates the DOM via plain objects with a .style.transform field.
+{
+  // Build a mock element with two children
+  const makeEl = (n) => {
+    const children = Array.from({ length: n }, () => ({ style: { transform: "" } }));
+    return { children };
+  };
+
+  // scaleX=2, scaleY=1 → children get scale(0.5,1)
+  {
+    const el = makeEl(2);
+    flipCounterScale(el, 2, 1);
+    check("counterScale scaleX=2 child0", el.children[0].style.transform === "scale(0.5,1)");
+    check("counterScale scaleX=2 child1", el.children[1].style.transform === "scale(0.5,1)");
+  }
+
+  // scaleX=1, scaleY=3 → children get scale(1,0.333...)
+  {
+    const el = makeEl(1);
+    flipCounterScale(el, 1, 3);
+    const expected = `scale(1,${1 / 3})`;
+    check("counterScale scaleY=3", el.children[0].style.transform === expected);
+  }
+
+  // scaleX=0.5, scaleY=0.5 → children get scale(2,2)
+  {
+    const el = makeEl(1);
+    flipCounterScale(el, 0.5, 0.5);
+    check("counterScale shrink inverts", el.children[0].style.transform === "scale(2,2)");
+  }
+
+  // identity: sx=1, sy=1 → children get scale(1,1) (no-op)
+  {
+    const el = makeEl(1);
+    flipCounterScale(el, 1, 1);
+    check("counterScale identity", el.children[0].style.transform === "scale(1,1)");
+  }
+
+  // degenerate: sx=0 → treated as 1 (avoid divide-by-zero)
+  {
+    const el = makeEl(1);
+    flipCounterScale(el, 0, 2);
+    check("counterScale sx=0 degenerates to 1", el.children[0].style.transform === "scale(1,0.5)");
+  }
+
+  // clear: removes transform from all children
+  {
+    const el = makeEl(2);
+    flipCounterScale(el, 2, 2);
+    flipCounterScaleClear(el);
+    check("counterScaleClear child0", el.children[0].style.transform === "");
+    check("counterScaleClear child1", el.children[1].style.transform === "");
+  }
+
+  // no children: must not throw
+  {
+    const el = makeEl(0);
+    let threw = false;
+    try { flipCounterScale(el, 2, 2); flipCounterScaleClear(el); } catch { threw = true; }
+    check("counterScale no children safe", !threw);
+  }
+}
+
+// ---- sortableSlotIndex: insertion-slot from pointer + item rects ----
+// Pure fn (pointerPos, itemRects, axis) → targetIndex.
+// axis: 0=both/x+y (uses y), 1=x, 2=y (default).
+// Each rect is {left, top, right, bottom} (or DOMRect-compatible).
+// Returns the DROP slot index (0 = before first, n = after last).
+{
+  // Three equal-height items stacked vertically (y axis):
+  // item 0: top=0   bottom=100
+  // item 1: top=100 bottom=200
+  // item 2: top=200 bottom=300
+  const rects = [
+    { left: 0, top: 0,   right: 100, bottom: 100 },
+    { left: 0, top: 100, right: 100, bottom: 200 },
+    { left: 0, top: 200, right: 100, bottom: 300 },
+  ];
+  // pointer above first item → slot 0
+  check("sortable: above first → 0", sortableSlotIndex({ x: 50, y: -10 }, rects, 2) === 0);
+  // pointer in top half of first item → slot 0 (before item 0)
+  check("sortable: top-half item0 → 0", sortableSlotIndex({ x: 50, y: 25 }, rects, 2) === 0);
+  // pointer in bottom half of first item → slot 1 (after item 0)
+  check("sortable: bottom-half item0 → 1", sortableSlotIndex({ x: 50, y: 75 }, rects, 2) === 1);
+  // pointer in top half of item 1 → slot 1 (before item 1)
+  check("sortable: top-half item1 → 1", sortableSlotIndex({ x: 50, y: 125 }, rects, 2) === 1);
+  // pointer in bottom half of item 1 → slot 2 (after item 1)
+  check("sortable: bottom-half item1 → 2", sortableSlotIndex({ x: 50, y: 175 }, rects, 2) === 2);
+  // pointer in top half of item 2 → slot 2
+  check("sortable: top-half item2 → 2", sortableSlotIndex({ x: 50, y: 225 }, rects, 2) === 2);
+  // pointer in bottom half of item 2 → slot 3 (after last)
+  check("sortable: bottom-half item2 → 3", sortableSlotIndex({ x: 50, y: 275 }, rects, 2) === 3);
+  // pointer below last item → slot 3
+  check("sortable: below last → 3", sortableSlotIndex({ x: 50, y: 350 }, rects, 2) === 3);
+
+  // x-axis (axis=1): three items side by side
+  // item 0: left=0   right=100
+  // item 1: left=100 right=200
+  // item 2: left=200 right=300
+  const hRects = [
+    { left: 0,   top: 0, right: 100, bottom: 50 },
+    { left: 100, top: 0, right: 200, bottom: 50 },
+    { left: 200, top: 0, right: 300, bottom: 50 },
+  ];
+  check("sortable x: left of first → 0", sortableSlotIndex({ x: -5, y: 25 }, hRects, 1) === 0);
+  check("sortable x: top-half item0 → 0", sortableSlotIndex({ x: 25, y: 25 }, hRects, 1) === 0);
+  check("sortable x: bottom-half item0 → 1", sortableSlotIndex({ x: 75, y: 25 }, hRects, 1) === 1);
+  check("sortable x: right of last → 3", sortableSlotIndex({ x: 350, y: 25 }, hRects, 1) === 3);
+
+  // axis=0 (both/unspecified) falls back to y
+  check("sortable axis=0 uses y", sortableSlotIndex({ x: 50, y: 25 }, rects, 0) === 0);
+  check("sortable axis=0 uses y bottom", sortableSlotIndex({ x: 50, y: 75 }, rects, 0) === 1);
+
+  // empty rects → always 0
+  check("sortable: empty rects → 0", sortableSlotIndex({ x: 50, y: 50 }, [], 2) === 0);
+}
+
+// ---- sortableAutoscroll: edge-band scroll velocity pure fn ----
+// Contract: (pointerPos, containerRect, edgePx) → scrollDelta
+// • delta = 0 when pointer is outside the edge band (middle of container)
+// • delta < 0 when pointer is within edgePx of the top edge (scroll up)
+// • delta > 0 when pointer is within edgePx of the bottom edge (scroll down)
+// • magnitude ramps from 0 (at outer boundary of band) to MAX_SPEED (at edge)
+// • exactly at the edge band boundary → ~0 (but still within band so > 0)
+// • magnitude is monotonically increasing with proximity to the edge
+// • returns 0 when pointer is outside the container entirely
+{
+  // Container: top=100, bottom=500, edgePx=40
+  // Middle band: y=140..460 → delta=0
+  const rect = { left: 0, top: 100, right: 200, bottom: 500 };
+  const edgePx = 40;
+
+  // Pointer in the middle → 0
+  check("autoscroll: middle → 0",
+    sortableAutoscroll({ x: 100, y: 300 }, rect, edgePx) === 0);
+
+  // Pointer near top edge (y=110, 10px from top=100, well within 40px band) → negative
+  const nearTop = sortableAutoscroll({ x: 100, y: 110 }, rect, edgePx);
+  check("autoscroll: near top → negative", nearTop < 0);
+
+  // Pointer near bottom edge (y=490, 10px from bottom=500, well within 40px band) → positive
+  const nearBottom = sortableAutoscroll({ x: 100, y: 490 }, rect, edgePx);
+  check("autoscroll: near bottom → positive", nearBottom > 0);
+
+  // Pointer outside container entirely → 0
+  check("autoscroll: above container → 0",
+    sortableAutoscroll({ x: 100, y: 50 }, rect, edgePx) === 0);
+  check("autoscroll: below container → 0",
+    sortableAutoscroll({ x: 100, y: 600 }, rect, edgePx) === 0);
+
+  // Exactly at the outer boundary of the top band (y=140 = top+edgePx):
+  // fromTop = 40 = edgePx → delta = 0 (band boundary, speed = 0)
+  const atTopBoundary = sortableAutoscroll({ x: 100, y: 140 }, rect, edgePx);
+  check("autoscroll: at top band boundary → 0", atTopBoundary === 0);
+
+  // Exactly at the outer boundary of the bottom band (y=460 = bottom-edgePx):
+  // fromBottom = 40 = edgePx → delta = 0
+  const atBottomBoundary = sortableAutoscroll({ x: 100, y: 460 }, rect, edgePx);
+  check("autoscroll: at bottom band boundary → 0", atBottomBoundary === 0);
+
+  // Magnitude monotonic: closer to top → larger negative magnitude
+  const close1 = sortableAutoscroll({ x: 100, y: 120 }, rect, edgePx); // 20px from top
+  const close2 = sortableAutoscroll({ x: 100, y: 110 }, rect, edgePx); // 10px from top
+  check("autoscroll: magnitude monotonic near top", Math.abs(close2) > Math.abs(close1));
+
+  // Magnitude monotonic: closer to bottom → larger positive magnitude
+  const close3 = sortableAutoscroll({ x: 100, y: 480 }, rect, edgePx); // 20px from bottom
+  const close4 = sortableAutoscroll({ x: 100, y: 490 }, rect, edgePx); // 10px from bottom
+  check("autoscroll: magnitude monotonic near bottom", Math.abs(close4) > Math.abs(close3));
+
+  // Symmetry: same distance from top and bottom → same absolute magnitude
+  const topDelta = sortableAutoscroll({ x: 100, y: 115 }, rect, edgePx); // 15px from top
+  const botDelta = sortableAutoscroll({ x: 100, y: 485 }, rect, edgePx); // 15px from bottom
+  check("autoscroll: symmetric magnitude top/bottom",
+    Math.abs(Math.abs(topDelta) - Math.abs(botDelta)) < 1e-9);
+}
+
+// ---- sortableAutoscroll: HORIZONTAL axis path (ax=1) ----
+// For a horizontal list the call site projects x→y and left/right→top/bottom
+// before calling sortableAutoscroll, so the same pure fn covers both axes.
+// These cases simulate exactly what the rAF call site passes for ax=1.
+{
+  // Horizontal container: left=200, right=800, edgePx=50
+  // Call site transforms: pointerPos.y = pointer.x, rect.top = cr.left, rect.bottom = cr.right
+  const hRect = { top: 200, bottom: 800 }; // left=200→top, right=800→bottom
+  const edgePx = 50;
+
+  // Pointer in the middle (x=500) → projected y=500, inside band 250..750 → 0
+  check("autoscroll-h: middle → 0",
+    sortableAutoscroll({ x: 0, y: 500 }, hRect, edgePx) === 0);
+
+  // Pointer near left edge (x=210, 10px from left=200) → projected y=210, within 50px band → negative
+  const nearLeft = sortableAutoscroll({ x: 0, y: 210 }, hRect, edgePx);
+  check("autoscroll-h: near left edge → negative", nearLeft < 0);
+
+  // Pointer near right edge (x=790, 10px from right=800) → projected y=790, within 50px band → positive
+  const nearRight = sortableAutoscroll({ x: 0, y: 790 }, hRect, edgePx);
+  check("autoscroll-h: near right edge → positive", nearRight > 0);
+
+  // Pointer outside container (x=100, left of left=200) → projected y=100 < top=200 → 0
+  check("autoscroll-h: left of container → 0",
+    sortableAutoscroll({ x: 0, y: 100 }, hRect, edgePx) === 0);
+
+  // Pointer outside container (x=900, right of right=800) → projected y=900 > bottom=800 → 0
+  check("autoscroll-h: right of container → 0",
+    sortableAutoscroll({ x: 0, y: 900 }, hRect, edgePx) === 0);
+
+  // Magnitude monotonic: closer to left edge → larger negative
+  const hClose1 = sortableAutoscroll({ x: 0, y: 230 }, hRect, edgePx); // 30px from left
+  const hClose2 = sortableAutoscroll({ x: 0, y: 215 }, hRect, edgePx); // 15px from left
+  check("autoscroll-h: magnitude monotonic near left", Math.abs(hClose2) > Math.abs(hClose1));
+
+  // Symmetry: same distance left vs right → same absolute magnitude
+  const leftD = sortableAutoscroll({ x: 0, y: 220 }, hRect, edgePx); // 20px from left
+  const rightD = sortableAutoscroll({ x: 0, y: 780 }, hRect, edgePx); // 20px from right
+  check("autoscroll-h: symmetric magnitude left/right",
+    Math.abs(Math.abs(leftD) - Math.abs(rightD)) < 1e-9);
+}
+
 if (fails === 0) {
-  console.log("anim conformance: ALL PASS (mp + morph + routing + drag + split + flip + snap + gl + gl-only)");
+  console.log("anim conformance: ALL PASS (mp + morph + routing + drag + split + flip + snap + gl + gl-only + counter-scale + sortable-slot + sortable-autoscroll + sortable-autoscroll-h)");
 } else {
   console.log(`anim conformance: ${fails} FAILURES`);
   process.exit(1);

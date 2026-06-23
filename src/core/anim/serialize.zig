@@ -15,6 +15,7 @@ const timeline_mod = @import("timeline.zig");
 const scroll = @import("scroll.zig");
 const path_mod = @import("path.zig");
 const drag_mod = @import("drag.zig");
+const sortable_mod = @import("sortable.zig");
 
 /// Which authoring surface is serializing. SSR rejects island-only
 /// constructs (dynamic values, fn modifiers, ref-handle targets, callback
@@ -168,6 +169,10 @@ fn writeDraggable(w: *std.Io.Writer, dr: drag_mod.Draggable, surface: Surface) a
             try w.print("\"in\":{d}", .{r});
         },
     }
+    if (dr.bounce) |b| {
+        try comma(w, &first);
+        try w.print("\"bo\":{d}", .{b});
+    }
     switch (dr.snap) {
         .none => {},
         .grid => |g| {
@@ -221,6 +226,89 @@ fn writeDraggable(w: *std.Io.Writer, dr: drag_mod.Draggable, surface: Surface) a
         if (dr.on_end_slot) |s| try slotField(w, &cb_first, "sE", s);
         if (dr.on_throw_complete_slot) |s| try slotField(w, &cb_first, "sT", s);
         if (dr.on_drop_slot) |s| try slotField(w, &cb_first, "sZ", s);
+        try w.writeAll("}");
+    }
+    try w.writeAll("}");
+}
+
+/// Sortable descriptor: `{"v":1,"so":{...}}` — stamped as `data-sortable`
+/// on SSR, handed to `verve_anim_create` on islands. Separate root from
+/// anim descriptors (a sortable is not a tween).
+///
+/// Wire contract (frozen): sub-keys {"it","hd","ax","grp","an","as","ase",
+/// "cls","dis","cb":{"sR","sG"}}. Defaults omitted:
+///   - axis: omitted when .y (the Sortable default, wire int 2)
+///   - animate: omitted when true; "an":0 when false
+///   - autoscroll: omitted when true; "as":0 when false
+///   - autoscroll_edge_px: omitted when 40; "ase":N otherwise
+///   - disabled: omitted when false; "dis":1 when true
+///   - cb: emitted only on .island surface; SSR rejects with
+///     error.CallbackSlotRequiresIsland
+pub fn sortableToJson(alloc: std.mem.Allocator, s: *const sortable_mod.Sort, surface: Surface) ![]const u8 {
+    if (s.err) |e| return e;
+    return grow(alloc, s, surface, writeSortableRoot);
+}
+
+fn writeSortableRoot(w: *std.Io.Writer, s: *const sortable_mod.Sort, surface: Surface) anyerror!void {
+    try w.writeAll("{\"v\":1");
+    try writeSortable(w, s.config, surface);
+    try w.writeAll("}");
+}
+
+/// Emit the `,"so":{...}` object. Defaults omitted per wire contract.
+fn writeSortable(w: *std.Io.Writer, so: sortable_mod.Sortable, surface: Surface) anyerror!void {
+    try w.writeAll(",\"so\":{");
+    var first = true;
+    // "it": required, always emitted
+    try w.writeAll("\"it\":");
+    try writeJsonString(w, so.items);
+    first = false;
+    if (so.handle) |sel| {
+        try comma(w, &first);
+        try w.writeAll("\"hd\":");
+        try writeJsonString(w, sel);
+    }
+    // axis: omit when .y (Sortable default)
+    if (so.axis != .y) {
+        try comma(w, &first);
+        try w.print("\"ax\":{d}", .{@intFromEnum(so.axis)});
+    }
+    if (so.group) |g| {
+        try comma(w, &first);
+        try w.writeAll("\"grp\":");
+        try writeJsonString(w, g);
+    }
+    // animate: omit when true (default)
+    if (!so.animate) {
+        try comma(w, &first);
+        try w.writeAll("\"an\":0");
+    }
+    // autoscroll: omit when true (default)
+    if (!so.autoscroll) {
+        try comma(w, &first);
+        try w.writeAll("\"as\":0");
+    }
+    // autoscroll_edge_px: omit when 40 (default)
+    if (so.autoscroll_edge_px != 40) {
+        try comma(w, &first);
+        try w.print("\"ase\":{d}", .{so.autoscroll_edge_px});
+    }
+    if (so.toggle_class) |c| {
+        try comma(w, &first);
+        try w.writeAll("\"cls\":");
+        try writeJsonString(w, c);
+    }
+    if (so.disabled) {
+        try comma(w, &first);
+        try w.writeAll("\"dis\":1");
+    }
+    if (so.hasSlots()) {
+        if (surface == .ssr) return error.CallbackSlotRequiresIsland;
+        try comma(w, &first);
+        try w.writeAll("\"cb\":{");
+        var cb_first = true;
+        if (so.on_reorder_slot) |s| try slotField(w, &cb_first, "sR", s);
+        if (so.on_enter_group_slot) |s| try slotField(w, &cb_first, "sG", s);
         try w.writeAll("}");
     }
     try w.writeAll("}");
@@ -546,6 +634,15 @@ fn writeScrollTrigger(w: *std.Io.Writer, sc: scroll.ScrollTrigger, surface: Surf
         try w.writeAll("}");
         first = false;
     }
+    if (sc.scroller_handle) |h| {
+        if (surface == .ssr) return error.HandleRequiresIsland;
+        try comma(w, &first);
+        try w.print("\"slh\":{d}", .{h});
+    } else if (sc.scroller) |sel| {
+        try comma(w, &first);
+        try w.writeAll("\"sl\":");
+        try writeJsonString(w, sel);
+    }
     const sv = sc.start;
     if (sv.trigger.value() != 0 or sv.viewport.value() != 1 or sv.offset_px != 0) {
         try comma(w, &first);
@@ -627,6 +724,16 @@ fn writeScrollTrigger(w: *std.Io.Writer, sc: scroll.ScrollTrigger, surface: Surf
     if (sc.snap != .none and sc.snap_duration != 0.4) {
         try comma(w, &first);
         try w.print("\"snapd\":{d}", .{sc.snap_duration});
+    }
+    if (sc.snap != .none and sc.snap_ease != .out_cubic) {
+        try comma(w, &first);
+        try w.writeAll("\"snape\":\"");
+        try w.writeAll(sc.snap_ease.wireName());
+        try w.writeByte('"');
+    }
+    if (sc.snap != .none and sc.snap_directional) {
+        try comma(w, &first);
+        try w.writeAll("\"snapdir\":1");
     }
     if (sc.toggle_class) |c| {
         try comma(w, &first);
@@ -994,6 +1101,35 @@ test "golden: snap on anim-less reveal trigger" {
     );
 }
 
+test "golden: snap_ease emits snape, snap_directional emits snapdir" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".bar").scaleX(1).duration(1)
+        .scrollTrigger(.{
+        .snap = .{ .step = 0.5 },
+        .snap_ease = .in_out_sine,
+        .snap_directional = true,
+    });
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expectEqualStrings("{\"v\":1,\"t\":{\"s\":\".bar\"},\"d\":1,\"e\":\"outQuad\",\"p\":{\"scaleX\":{\"to\":1}},\"sc\":{\"snap\":0.5,\"snape\":\"inOutSine\",\"snapdir\":1}}", json);
+}
+
+test "golden: snap_ease default out_cubic omitted, snap_directional false omitted" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = tween_mod.to(a, ".bar").scaleX(1).duration(1)
+        .scrollTrigger(.{
+        .snap = .{ .step = 0.5 },
+        .snap_ease = .out_cubic,
+        .snap_directional = false,
+    });
+    const json = try tweenToJson(a, t, .ssr);
+    try testing.expect(std.mem.indexOf(u8, json, "snape") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "snapdir") == null);
+}
+
 test "snap validation defers through builder" {
     var arena = testArena();
     defer arena.deinit();
@@ -1012,6 +1148,38 @@ test "ssr rejects sc island-only constructs" {
 
     const handle_t = tween_mod.to(a, ".x").x(1).scrollTrigger(.{ .trigger_handle = 3 });
     try testing.expectError(error.HandleRequiresIsland, tweenToJson(a, handle_t, .ssr));
+}
+
+test "golden: container scroller selector (sl)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // SSR: selector form emits "sl"; existing trigger selector beside it
+    const tr = scroll.reveal(a, "in-view", .{
+        .trigger = ".item",
+        .scroller = ".panel",
+        .once = true,
+    });
+    const json = try triggerToJson(a, tr, .ssr);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"sc\":{\"t\":{\"s\":\".item\"},\"sl\":\".panel\",\"once\":1,\"cls\":\"in-view\"}}",
+        json,
+    );
+}
+
+test "golden: container scroller handle (slh) on island" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Island: handle form emits "slh"; wins over any selector
+    const t = tween_mod.to(a, ".x").x(1)
+        .scrollTrigger(.{ .scroller_handle = 9 });
+    const json = try tweenToJson(a, t, .island);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"t\":{\"s\":\".x\"},\"d\":0.5,\"e\":\"outQuad\",\"p\":{\"x\":{\"to\":1}},\"sc\":{\"slh\":9}}",
+        json,
+    );
+    try testing.expect(std.mem.indexOf(u8, json, "\"sl\":") == null);
 }
 
 test "golden: motion path straight line, no rotate" {
@@ -1218,6 +1386,28 @@ test "golden: drag on_drop slot (island) + SSR rejection" {
     try testing.expectError(error.CallbackSlotRequiresIsland, dragToJson(a, ssr, .ssr));
 }
 
+test "golden: drag bounce emits bo key; null bounce omits it" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const with_bounce = drag_mod.draggable(a, .{
+        .bounds = .{ .rect = .{ .min_x = 0, .max_x = 400, .min_y = 0, .max_y = 300 } },
+        .inertia = .on,
+        .bounce = 0.7,
+    });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"dr\":{\"b\":[0,400,0,300],\"in\":1,\"bo\":0.7}}",
+        try dragToJson(a, with_bounce, .ssr),
+    );
+    // null bounce → existing goldens unchanged (no "bo" key)
+    const no_bounce = drag_mod.draggable(a, .{
+        .bounds = .{ .rect = .{ .min_x = 0, .max_x = 400, .min_y = 0, .max_y = 300 } },
+        .inertia = .on,
+    });
+    const no_bounce_json = try dragToJson(a, no_bounce, .ssr);
+    try testing.expectEqualStrings("{\"v\":1,\"dr\":{\"b\":[0,400,0,300],\"in\":1}}", no_bounce_json);
+}
+
 test "ssr rejects dr island-only constructs; validate propagates" {
     var arena = testArena();
     defer arena.deinit();
@@ -1411,4 +1601,119 @@ test "golden: gl-target-range slot-0 omits gls key but keeps f" {
     );
     try testing.expect(std.mem.indexOf(u8, json, "\"gls\"") == null);
     try testing.expect(std.mem.indexOf(u8, json, "\"f\":0.1") != null);
+}
+
+// ---- Sortable wire format ("so" key) ---------------------------------------
+// Wire contract frozen here. Minimal config emits only "it" (required).
+// Defaults omitted: axis .y, animate true, autoscroll true, edge_px 40.
+// Callbacks ("cb") only on .island; SSR rejects with CallbackSlotRequiresIsland.
+
+test "golden: sortable minimal (items only, all defaults)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = sortable_mod.sortable(a, .{ .items = "li" });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"so\":{\"it\":\"li\"}}",
+        try sortableToJson(a, s, .ssr),
+    );
+}
+
+test "golden: sortable handle + axis x + group (SSR-legal)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = sortable_mod.sortable(a, .{
+        .items = ".card",
+        .handle = ".grip",
+        .axis = .x,
+        .group = "board",
+    });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"so\":{\"it\":\".card\",\"hd\":\".grip\",\"ax\":1,\"grp\":\"board\"}}",
+        try sortableToJson(a, s, .ssr),
+    );
+}
+
+test "golden: sortable animate+autoscroll false + custom edge + class + disabled" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = sortable_mod.sortable(a, .{
+        .items = "li",
+        .animate = false,
+        .autoscroll = false,
+        .autoscroll_edge_px = 20,
+        .toggle_class = "dragging",
+        .disabled = true,
+    });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"so\":{\"it\":\"li\",\"an\":0,\"as\":0,\"ase\":20,\"cls\":\"dragging\",\"dis\":1}}",
+        try sortableToJson(a, s, .ssr),
+    );
+}
+
+test "golden: sortable island callback slots" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = sortable_mod.sortable(a, .{
+        .items = "li",
+        .group = "board",
+        .on_reorder_slot = 10,
+        .on_enter_group_slot = 11,
+    });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"so\":{\"it\":\"li\",\"grp\":\"board\",\"cb\":{\"sR\":10,\"sG\":11}}}",
+        try sortableToJson(a, s, .island),
+    );
+}
+
+test "golden: sortable on_reorder_slot only (island)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = sortable_mod.sortable(a, .{
+        .items = ".row",
+        .on_reorder_slot = 7,
+    });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"so\":{\"it\":\".row\",\"cb\":{\"sR\":7}}}",
+        try sortableToJson(a, s, .island),
+    );
+}
+
+test "golden: sortable SSR rejects callback slots" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = sortable_mod.sortable(a, .{ .items = "li", .on_reorder_slot = 3 });
+    try testing.expectError(error.CallbackSlotRequiresIsland, sortableToJson(a, s, .ssr));
+}
+
+test "golden: sortable axis .both emits ax:0" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = sortable_mod.sortable(a, .{ .items = "li", .axis = .both });
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"so\":{\"it\":\"li\",\"ax\":0}}",
+        try sortableToJson(a, s, .ssr),
+    );
+}
+
+test "sortable: builder error propagates through toJson" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bad = sortable_mod.sortable(a, .{ .items = "" });
+    try testing.expectError(error.SortableNoItems, sortableToJson(a, bad, .ssr));
+}
+
+test "sortable: group-callback-without-group propagates" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bad = sortable_mod.sortable(a, .{ .items = "li", .on_enter_group_slot = 5 });
+    try testing.expectError(error.GroupCallbackWithoutGroup, sortableToJson(a, bad, .ssr));
 }

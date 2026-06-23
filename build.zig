@@ -928,6 +928,57 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_desktop_tests.step);
     } // end if (tests_present)
 
+    // ---- Grapheme table regeneration ----------------------------------------
+    // `zig build gen-grapheme-table` regenerates the COMMITTED UAX#29
+    // Grapheme_Break property table at src/core/anim/grapheme_table.zig from
+    // tools/grapheme_table_gen.zig. The committed artifact is what the
+    // framework actually compiles against (both native + wasm island
+    // chunks), so this step is OPTIONAL and never on the default build.
+    //
+    // It degrades gracefully when consumed as a package: build.zig.zon
+    // `.paths` ship only `src` + LICENSE, so `tools/` is absent. We probe
+    // for the tool and skip wiring the step entirely when it's missing —
+    // exactly the `tests_present` / `have_templates` stance elsewhere.
+    const grapheme_tool_present = blk: {
+        const io_h = b.graph.io;
+        var f = b.build_root.handle.openFile(io_h, "tools/grapheme_table_gen.zig", .{}) catch break :blk false;
+        f.close(io_h);
+        break :blk true;
+    };
+    if (grapheme_tool_present) {
+        // The generator imports the committed table as its source of truth
+        // and reformats it deterministically (idempotent regen).
+        const grapheme_table_src_mod = b.createModule(.{
+            .root_source_file = b.path("src/core/anim/grapheme_table.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        });
+        const grapheme_gen_mod = b.createModule(.{
+            .root_source_file = b.path("tools/grapheme_table_gen.zig"),
+            .target = host_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "grapheme_table", .module = grapheme_table_src_mod },
+            },
+        });
+        const grapheme_gen_exe = b.addExecutable(.{
+            .name = "verve-grapheme-table-gen",
+            .root_module = grapheme_gen_mod,
+        });
+        // Write the freshly-generated table into a build WriteFiles dir, then
+        // copy it back over the committed source via an update-source step so
+        // `zig build gen-grapheme-table` leaves a clean, formatted file in the
+        // tree.
+        const grapheme_gen_run = b.addRunArtifact(grapheme_gen_exe);
+        const grapheme_out = grapheme_gen_run.addOutputFileArg("grapheme_table.zig");
+
+        const grapheme_update = b.addUpdateSourceFiles();
+        grapheme_update.addCopyFileToSource(grapheme_out, "src/core/anim/grapheme_table.zig");
+
+        const grapheme_step = b.step("gen-grapheme-table", "Regenerate src/core/anim/grapheme_table.zig (UAX#29 table)");
+        grapheme_step.dependOn(&grapheme_update.step);
+    }
+
     // ---- Autodoc generation -------------------------------------------------
     // `zig build docs` emits the Zig autodoc HTML/JS bundle for the
     // public `verve` module into `zig-out/docs/api/`. Open

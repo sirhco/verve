@@ -395,6 +395,7 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
             // is a keyed bind so move_keyed_child preserves element
             // identity (the FLIP fast path).
             ctx.el("button").attr("z-on-click", "anim_shuffle").text("shuffle"),
+            ctx.el("button").attr("z-on-click", "anim_flip_scale_toggle").text("scale morph"),
             flipGrid(ctx),
         }),
     });
@@ -418,8 +419,10 @@ pub fn animDemo(ctx: *const verve.Context) !*verve.Node {
         anim_island,
         splitSection(ctx),
         pathSection(ctx),
+        sortableSection(ctx),
         dragSection(ctx),
         scrollSection(ctx),
+        containerScrollSection(ctx),
         ctx.p().children(.{ctx.a("/", "← Home")}),
     }).build();
 }
@@ -515,6 +518,8 @@ pub fn smoothDemo(ctx: *const verve.Context) !*verve.Node {
         .end = .{ .at = .{ .trigger = .bottom, .viewport = .bottom } },
         .scrub = .exact,
         .snap = .{ .step = 1.0 / 3.0 },
+        .snap_ease = .out_bounce,
+        .snap_directional = true,
     }));
 
     const content = ctx.main_().class("home smooth-page").children(.{
@@ -588,9 +593,11 @@ fn flipGrid(ctx: *const verve.Context) *verve.Node {
     const grid = ctx.div().class("flip-grid").bind("flip_list");
     const keys = [_][]const u8{ "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8" };
     for (keys, 0..) |k, i| {
-        _ = grid.children(.{
-            ctx.div().class("anim-card fcard").attr("data-vkey", k).textInt(i + 1),
-        });
+        const card = ctx.div().class("anim-card fcard").attr("data-vkey", k).textInt(i + 1);
+        // data-ref="flip-c1" lets the AnimDemo chunk's anim_flip_scale_toggle
+        // find card c1 via queryRef for the counter-scale size-morph demo.
+        if (i == 0) _ = card.attr("data-ref", "flip-c1");
+        _ = grid.children(.{card});
     }
     return grid;
 }
@@ -613,6 +620,19 @@ fn splitSection(ctx: *const verve.Context) *verve.Node {
             .start = .{ .viewport = .{ .pct = 85 } },
             .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
         })),
+        // Grapheme split (UAX#29, SSR): the emoji ZWJ family, skin-tone
+        // thumbs-up, flag (two regional indicators), and decomposed "café"
+        // each stay ONE span — `.by = .graphemes` keeps clusters whole.
+        ctx.h2("Cafe\u{0301} \u{1F44D}\u{1F3FD} \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{1F1FA}\u{1F1F8}")
+            .splitText(.{ .by = .graphemes })
+            .animate(anim.from(a, ".anim-split h2:nth-of-type(2) .st-char")
+            .opacity(0).y(18).scale(0.6)
+            .duration(0.5).ease(.out_back)
+            .stagger(.{ .each = 0.06 })
+            .scrollTrigger(.{
+            .start = .{ .viewport = .{ .pct = 85 } },
+            .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
+        })),
         ctx.p()
             .text("Each line of this paragraph reveals on its own as you scroll. " ++
                 "The server splits the text into word spans; the bridge groups " ++
@@ -626,23 +646,92 @@ fn splitSection(ctx: *const verve.Context) *verve.Node {
             .start = .{ .viewport = .{ .pct = 85 } },
             .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
         })),
+        // RTL-aware split (phase 5 / task 6): mixed LTR + RTL headline.
+        // "Hello שלום مرحبا" — Latin, Hebrew, Arabic each form their own
+        // directional run. RTL runs get <span dir="rtl"> so the browser
+        // reorders glyphs correctly while data-st-i stays logical-order.
+        ctx.h2("Hello \u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{0645}\u{0631}\u{062D}\u{0628}\u{0627}")
+            .splitText(.{ .by = .chars, .rtl_aware = true })
+            .animate(anim.from(a, ".anim-split h2:nth-of-type(3) .st-char")
+            .opacity(0).y(18).scale(0.7)
+            .duration(0.5).ease(.out_back)
+            .stagger(.{ .each = 0.04 })
+            .scrollTrigger(.{
+            .start = .{ .viewport = .{ .pct = 85 } },
+            .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
+        })),
     });
 }
 
 /// Draggable demo (phase 4): a zero-wasm bounded drag card with inertia
 /// + grid snap — pure data-drag, no island.
+/// Sortable demo (phase 7): a single-list sortable + a two-column board
+/// demonstrating cross-list group transfer and edge autoscroll.
+fn sortableSection(ctx: *const verve.Context) *verve.Node {
+    // Single-list (7b demo — unchanged).
+    const list = ctx.el("ul").id("sort-list").class("sort-list");
+    const items = [_][]const u8{ "Alpha", "Beta", "Gamma", "Delta", "Epsilon" };
+    for (items) |item| {
+        _ = list.children(.{ctx.el("li").class("sort-item").text(item)});
+    }
+
+    // Two-column board (7c demo): cross-list group transfer + autoscroll.
+    // Column A: "Todo" items; Column B: "Done" items.
+    // The island attaches both as group="board" sortables.
+    const col_a = ctx.el("ul").id("board-col-a").class("sort-list board-col");
+    const todo_items = [_][]const u8{ "Write tests", "Review PR", "Update docs", "Fix bug", "Deploy" };
+    for (todo_items) |item| {
+        _ = col_a.children(.{ctx.el("li").class("sort-item").text(item)});
+    }
+
+    const col_b = ctx.el("ul").id("board-col-b").class("sort-list board-col");
+    const done_items = [_][]const u8{ "Setup CI", "Init repo" };
+    for (done_items) |item| {
+        _ = col_b.children(.{ctx.el("li").class("sort-item").text(item)});
+    }
+
+    const board = ctx.div().class("sort-board").children(.{
+        ctx.div().class("sort-board-col").children(.{
+            ctx.h3("Todo"),
+            col_a,
+        }),
+        ctx.div().class("sort-board-col").children(.{
+            ctx.h3("Done"),
+            col_b,
+        }),
+    });
+
+    return ctx.el("section").class("anim-drag").children(.{
+        ctx.h2("Sortable: drag-to-reorder + FLIP"),
+        ctx.p().class("hint").text("Drag any row — siblings FLIP-shift to preview the drop slot. The island fires on_reorder when you release."),
+        list,
+        ctx.p().class("hint").children(.{
+            ctx.span().text("status: "),
+            ctx.span().bind("sort_status").text("drag an item to reorder"),
+        }),
+        ctx.h3("Cross-list board (group transfer + autoscroll)"),
+        ctx.p().class("hint").text("Drag items between Todo and Done columns. Edge autoscroll activates near the top/bottom of each column."),
+        board,
+        ctx.p().class("hint").children(.{
+            ctx.span().text("board status: "),
+            ctx.span().bind("board_status").text("drag an item between columns"),
+        }),
+    });
+}
+
 fn dragSection(ctx: *const verve.Context) *verve.Node {
     const anim = verve.anim;
     const a = ctx.alloc();
 
     return ctx.el("section").class("anim-drag").children(.{
         ctx.h2("Draggable: bounds + inertia + grid snap"),
-        ctx.p().class("hint").text("Pure data-drag — no island, no wasm. Flick the card; it coasts and settles on the 40px grid inside the pen."),
+        ctx.p().class("hint").text("Pure data-drag — no island, no wasm. Flick the card at a wall to see elastic bounce-back (bounce=0.35); settles on the 40px grid."),
         ctx.div().class("drag-pen").children(.{
             ctx.div().class("anim-card drag-card").text("drag")
                 .draggable(anim.draggable(a, .{
                 .bounds = .{ .selector = ".drag-pen" },
                 .inertia = .on,
+                .bounce = 0.35,
                 .snap = .{ .grid = .{ .x = 40, .y = 40 } },
                 .toggle_class = "dragging",
             })),
@@ -652,6 +741,36 @@ fn dragSection(ctx: *const verve.Context) *verve.Node {
 
 /// ScrollTrigger demo (phase 2): scroll-gated stagger, zero-wasm class
 /// reveal, and a pinned scrubbed panel (markers on for DX show-off).
+fn containerScrollSection(ctx: *const verve.Context) *verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
+    // A fixed-height scrollable container. Each card inside reveals when
+    // it enters the container's viewport (not the window). `scroller`
+    // passes the wire key "sl" so the JS side binds a scroll listener on
+    // the container element instead of window.
+    const container = ctx.div().id("cscroll-box").class("cscroll-container");
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        _ = container.children(.{ctx.div()
+            .class("anim-card cscroll-card")
+            .textInt(i + 1)
+            .animate(anim.reveal(a, "in-view", .{
+            .scroller = "#cscroll-box",
+            .start = .{ .trigger = .bottom, .viewport = .bottom },
+            .once = true,
+        }))});
+    }
+
+    return ctx.el("section").class("anim-scroll").children(.{
+        ctx.div().class("anim-spacer").ariaHidden(true),
+        ctx.h2("Container scroller"),
+        ctx.p().class("hint").text("Cards reveal as they scroll into the box — tracked against the container's scrollTop, not the window."),
+        container,
+        ctx.div().class("anim-spacer").ariaHidden(true),
+    });
+}
+
 fn scrollSection(ctx: *const verve.Context) *verve.Node {
     const anim = verve.anim;
     const a = ctx.alloc();
@@ -1719,6 +1838,7 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.st-char,.st-word{display:inline-block;will-change:transform}
                 \\.flip-grid{display:flex;gap:.5rem;flex-wrap:wrap;margin:.75rem 0;max-width:18rem}
                 \\.fcard{width:3.5rem;height:3.5rem}
+                \\.fcard.fcard-big{width:6rem;height:6rem;font-size:1.25rem}
                 \\.drop-row{display:flex;gap:.5rem;margin:.75rem 0}
                 \\.drop-zone{flex:1;min-height:4rem;display:flex;align-items:center;justify-content:center;border:1px dashed #444;border-radius:8px;color:#8b949e}
                 \\.drop-zone.drop-hover{border-color:#58a6ff;color:#58a6ff;background:#11161f}

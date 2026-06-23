@@ -1244,6 +1244,120 @@ pub fn draggable(cfg: anim.Draggable, cbs: DragCallbacks) ?DragHandle {
     return .{ .id = h };
 }
 
+// ---- Sortable (verve.anim Sortable) ----------------------------------------
+// JS engine owns the pointer machine, slot computation, FLIP preview, and
+// DOM reorder; the island surface registers callbacks and gets a handle.
+
+extern "verve_runtime" fn verve_sortable_create(desc_ptr: [*]const u8, desc_len: u32) u32;
+// op: 0 kill, 1 disable, 2 enable
+extern "verve_runtime" fn verve_sortable_ctrl(handle: u32, op: u32) void;
+// field: 0 lastFrom, 1 lastTo (-1 = never reordered),
+//        2 lastFromGroup handle (-1 = no group / same-list),
+//        3 lastToGroup handle (-1 = no group / same-list)
+extern "verve_runtime" fn verve_sortable_get(handle: u32, field: u32) i32;
+
+/// Live sortable handle. Plain u32 id — safe in chunk statics.
+pub const SortableHandle = struct {
+    id: u32,
+
+    pub fn kill(self: SortableHandle) void {
+        verve_sortable_ctrl(self.id, 0);
+    }
+    pub fn disable(self: SortableHandle) void {
+        verve_sortable_ctrl(self.id, 1);
+    }
+    pub fn enable(self: SortableHandle) void {
+        verve_sortable_ctrl(self.id, 2);
+    }
+
+    /// Original index of the item before the last reorder (-1 if none yet).
+    pub fn lastFrom(self: SortableHandle) i32 {
+        return verve_sortable_get(self.id, 0);
+    }
+
+    /// Final index of the item after the last reorder (-1 if none yet).
+    pub fn lastTo(self: SortableHandle) i32 {
+        return verve_sortable_get(self.id, 1);
+    }
+
+    /// Sortable handle id of the source container in the last cross-list
+    /// reorder (-1 if no group configured or no reorder yet).
+    pub fn fromContainer(self: SortableHandle) i32 {
+        return verve_sortable_get(self.id, 2);
+    }
+
+    /// Sortable handle id of the target container in the last cross-list
+    /// reorder (-1 if no group configured or no reorder yet).
+    pub fn toContainer(self: SortableHandle) i32 {
+        return verve_sortable_get(self.id, 3);
+    }
+};
+
+/// Sortable lifecycle callbacks. Registered as event slots.
+pub const SortableCallbacks = struct {
+    /// Fires on settle after a reorder. Read current DOM order in the handler.
+    on_reorder: ?*const fn () void = null,
+    /// Fires when the dragged item enters a new group container.
+    /// Requires `group` to be set on the Sortable config.
+    on_enter_group: ?*const fn () void = null,
+};
+
+fn stampSortableSlots(so: *anim.sortable_mod.Sortable, cbs: SortableCallbacks) void {
+    if (cbs.on_reorder) |f| so.on_reorder_slot = registerEvent(f);
+    if (cbs.on_enter_group) |f| so.on_enter_group_slot = registerEvent(f);
+}
+
+/// Escape `"` and `\` in `s` for embedding in a JSON string value.
+/// Allocates from `a`; returns the escaped slice.
+fn jsonEscapeStr(a: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]u8 {
+    var extra: usize = 0;
+    for (s) |c| if (c == '"' or c == '\\') {
+        extra += 1;
+    };
+    if (extra == 0) return a.dupe(u8, s);
+    var out = try a.alloc(u8, s.len + extra);
+    var i: usize = 0;
+    for (s) |c| {
+        if (c == '"' or c == '\\') {
+            out[i] = '\\';
+            i += 1;
+        }
+        out[i] = c;
+        i += 1;
+    }
+    return out;
+}
+
+/// Imperative sortable:
+/// `verve.sortable("#my-list", .{ .items = "li" }, .{ .on_reorder = &f })`.
+/// `container_sel` is a CSS selector for the container element.
+/// Returns null on validation / serialize failure.
+pub fn sortable(container_sel: []const u8, cfg: anim.Sortable, cbs: SortableCallbacks) ?SortableHandle {
+    var c = cfg;
+    stampSortableSlots(&c, cbs);
+    const a = chunkArena();
+    const s = anim.sortable_mod.sortable(a, c);
+    // Build descriptor with container selector in "ct"."s".
+    // Format: {"v":1,"ct":{"s":"<selector>"},"so":{...}}
+    // Produces sortable JSON {"v":1,"so":{...}}, then splices in "ct":{"s":"<sel>"},
+    // by concatenating slices — no allocPrint (forbidden on wasm32-freestanding).
+    const inner = anim.serialize.sortableToJson(a, s, .island) catch return null;
+    // inner is {"v":1,"so":{...}} — find the "so" key splice point.
+    const so_pos = std.mem.indexOf(u8, inner, ",\"so\"") orelse return null;
+    // Escape `"` and `\` in the selector to produce valid JSON.
+    const sel_escaped = jsonEscapeStr(a, container_sel) catch return null;
+    // Build: {"v":1,"ct":{"s":"<sel>"},"so":{...}}
+    const json = std.mem.concat(a, u8, &.{
+        "{\"v\":1,\"ct\":{\"s\":\"",
+        sel_escaped,
+        "\"}",
+        inner[so_pos..],
+    }) catch return null;
+    const h = verve_sortable_create(json.ptr, @intCast(json.len));
+    if (h == 0) return null;
+    return .{ .id = h };
+}
+
 // ---- ScrollSmoother (verve.anim phase 6) -----------------------------------
 //
 // The smoother is a page singleton authored via Node.smoothScroll();

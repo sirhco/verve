@@ -61,6 +61,12 @@ pub const DragInertia = drag.Inertia;
 pub const DragSnap = drag.Snap;
 pub const draggable = drag.draggable;
 
+// Sortable (phase 7): drag-to-reorder lists with FLIP animation +
+// cross-list groups + edge autoscroll.
+pub const sortable_mod = @import("sortable.zig");
+pub const Sortable = sortable_mod.Sortable;
+pub const sortable = sortable_mod.sortable;
+
 // ScrollTrigger (phase 2): gate/scrub/pin animations by scroll position.
 pub const scroll = @import("scroll.zig");
 pub const ScrollTrigger = scroll.ScrollTrigger;
@@ -98,7 +104,9 @@ test {
     _ = @import("scroll.zig");
     _ = @import("path.zig");
     _ = @import("drag.zig");
+    _ = @import("sortable.zig");
     _ = @import("split.zig");
+    _ = @import("grapheme.zig");
     _ = @import("flip.zig");
     _ = @import("smoother.zig");
 }

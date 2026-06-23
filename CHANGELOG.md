@@ -6,6 +6,71 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-23
+
+### Added
+
+- **anim container scrollers** (`src/core/anim/scroll.zig`,
+  `src/bridge/verve.js`, `src/app/components.zig`, `docs/23-animation.md`):
+  `ScrollTrigger.scroller` (CSS selector, wire `"sl"`) and
+  `scroller_handle` (island ref-handle, wire `"slh"`) let a trigger observe
+  a scrollable element instead of the window. Geometry is computed relative
+  to the container's scroll position and client rect. SSR-legal. v1 limits:
+  snap stays window-scoped; pin uses `position:fixed`.
+
+- **anim configurable snap ease + directional snap**
+  (`src/core/anim/scroll.zig`, `src/bridge/verve.js`,
+  `src/core/anim/serialize.zig`, `docs/23-animation.md`):
+  `ScrollTrigger.snap_ease: types.Ease` (default `.out_cubic`, wire
+  `"snape"`, omitted at default) overrides the snap glide ease curve.
+  `snap_directional: bool` (default `false`, wire `"snapdir"`, omitted when
+  false) biases the snap target toward the scroll direction, falling back to
+  nearest when no target exists in that direction.
+
+- **anim drag bounce** (`src/core/anim/drag.zig`, `src/bridge/verve.js`,
+  `docs/23-animation.md`): `Draggable.bounce: ?f64` (wire `"bo"`, omitted
+  when null) adds elastic reflection when a throw hits a bound. Value range
+  `(0, 1]` — `~0.2` for GSAP-like feel; `1` fully elastic. Requires
+  `inertia != .off` (`error.BounceWithoutInertia`) and `bounds != .none`
+  (`error.BounceWithoutBounds`).
+
+- **anim FLIP nested counter-scale** (`src/core/anim/flip.zig`,
+  `src/bridge/verve.js`, `docs/23-animation.md`):
+  `FlipOpts.counter_scale: bool` (wire `"cs"`, emitted only when true)
+  applies the inverse `scaleX/Y` to each immediate child every tick when
+  `scale = true`, keeping child content crisp. Child transforms are cleared
+  on finish; pre-existing child transforms are not restored.
+
+- **anim SplitText grapheme clustering** (`src/core/anim/split.zig`,
+  `src/core/anim/grapheme.zig`, `src/core/anim/grapheme_table.zig`,
+  `docs/23-animation.md`): `By.graphemes` splitting mode keeps extended
+  grapheme clusters whole (combining marks, ZWJ emoji, skin-tone modifiers,
+  regional-indicator flags, Hangul syllables) using a UAX#29 state machine
+  backed by a Unicode 15.1 grapheme-break table, computed SSR in Zig with
+  zero JS.
+
+- **anim SplitText RTL awareness** (`src/core/anim/split.zig`,
+  `src/bridge/verve.js`, `docs/23-animation.md`):
+  `Options.rtl_aware: bool` (default `false`) wraps consecutive RTL
+  codepoint runs in `<span dir="rtl">` so the browser reorders glyphs
+  within each run; `data-st-i` indices remain logical-order dense. Deferred:
+  full UAX#9 bidi reordering across runs.
+
+- **anim Sortable plugin** (`src/core/anim/sortable.zig`,
+  `src/bridge/verve.js`, `src/core/anim/serialize.zig`,
+  `src/verve.zig`, `docs/23-animation.md`): new `verve.anim.Sortable` /
+  `verve.anim.sortable(alloc, cfg)` plugin for drag-to-reorder lists. Wire
+  root `"so"`. Config: `items` (required CSS selector), `handle`, `axis`
+  (drag.Axis, default `.y`), `group` (cross-list transfer between same-group
+  containers), `animate` (FLIP sibling shift, default true), `autoscroll`
+  (edge scroll, default true), `autoscroll_edge_px` (default 40),
+  `toggle_class`, `disabled`, `on_reorder_slot`, `on_enter_group_slot`
+  (requires `group`). `SortableHandle.lastFrom()`/`lastTo()` read the
+  before/after slot indices; `fromContainer()`/`toContainer()` read the
+  source/target container handle IDs for cross-list moves.
+  `on_enter_group_slot` fires on both source and target containers of a
+  cross-list move. Respects `prefers-reduced-motion`.
+
 ## [0.7.1] - 2026-06-23
 
 ### Added

@@ -69,6 +69,9 @@ pub const Draggable = struct {
     axis: Axis = .both,
     bounds: Bounds = .none,
     inertia: Inertia = .off,
+    /// Elasticity on bounds hit during a throw. 0 = hard clamp (default);
+    /// ~0.2 = GSAP-ish feel; 1 = fully elastic. Requires bounds != .none.
+    bounce: ?f64 = null,
     snap: Snap = .none,
 
     /// Class applied to the target while dragging or throwing.
@@ -121,6 +124,10 @@ pub const Draggable = struct {
             },
             .none, .selector => {},
         }
+        if (self.bounce) |b| {
+            if (!std.math.isFinite(b) or b < 0.0 or b > 1.0) return error.BadBounce;
+        }
+        if (self.bounce != null and self.bounds == .none) return error.BounceWithoutBounds;
         switch (self.snap) {
             .grid => |g| {
                 if (!(g.x > 0) or !(g.y > 0) or
@@ -137,6 +144,8 @@ pub const Draggable = struct {
         }
         if (!(self.threshold_px > 0) or !std.math.isFinite(self.threshold_px))
             return error.BadThreshold;
+        if (self.bounce != null and self.inertia == .off)
+            return error.BounceWithoutInertia;
         if (self.on_throw_complete_slot != null and self.inertia == .off)
             return error.ThrowCallbackWithoutInertia;
         if ((self.zone_class != null or self.on_drop_slot != null) and self.zones == null)
@@ -224,6 +233,26 @@ test "validate matrix" {
     // axis lock + degenerate other-axis rect is legal
     const locked: Draggable = .{ .axis = .x, .bounds = .{ .rect = .{ .min_x = 0, .max_x = 600 } } };
     try std.testing.expectEqual(@as(?anyerror, null), locked.validate());
+
+    // bounce validation
+    const bounce_no_bounds: Draggable = .{ .bounce = 0.5 };
+    try std.testing.expectEqual(@as(?anyerror, error.BounceWithoutBounds), bounce_no_bounds.validate());
+    const bounce_high: Draggable = .{ .bounds = .{ .rect = .{ .max_x = 100 } }, .bounce = 1.5 };
+    try std.testing.expectEqual(@as(?anyerror, error.BadBounce), bounce_high.validate());
+    const bounce_neg: Draggable = .{ .bounds = .{ .rect = .{ .max_x = 100 } }, .bounce = -0.1 };
+    try std.testing.expectEqual(@as(?anyerror, error.BadBounce), bounce_neg.validate());
+    const bounce_nan: Draggable = .{ .bounds = .{ .rect = .{ .max_x = 100 } }, .bounce = std.math.nan(f64) };
+    try std.testing.expectEqual(@as(?anyerror, error.BadBounce), bounce_nan.validate());
+    const bounce_no_inertia: Draggable = .{ .bounds = .{ .rect = .{ .min_x = 0, .max_x = 400 } }, .bounce = 0.5 };
+    try std.testing.expectEqual(@as(?anyerror, error.BounceWithoutInertia), bounce_no_inertia.validate());
+    const bounce_ok: Draggable = .{ .inertia = .on, .bounds = .{ .rect = .{ .max_x = 100 } }, .bounce = 0.5 };
+    try std.testing.expectEqual(@as(?anyerror, null), bounce_ok.validate());
+    const bounce_zero_ok: Draggable = .{ .inertia = .on, .bounds = .{ .rect = .{ .max_x = 100 } }, .bounce = 0.0 };
+    try std.testing.expectEqual(@as(?anyerror, null), bounce_zero_ok.validate());
+    const bounce_one_ok: Draggable = .{ .inertia = .on, .bounds = .{ .rect = .{ .max_x = 100 } }, .bounce = 1.0 };
+    try std.testing.expectEqual(@as(?anyerror, null), bounce_one_ok.validate());
+    const bounce_selector_ok: Draggable = .{ .inertia = .on, .bounds = .{ .selector = ".wall" }, .bounce = 0.5 };
+    try std.testing.expectEqual(@as(?anyerror, null), bounce_selector_ok.validate());
 }
 
 test "builder validates and poisons" {

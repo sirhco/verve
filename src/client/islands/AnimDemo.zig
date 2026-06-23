@@ -86,6 +86,43 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         .on_throw_complete = &onThrowDone,
         .on_drop = &onDrop,
     })) |dh| drag_id = dh.id;
+
+    // Sortable demo: vertical list with FLIP-animated reordering (7b).
+    verve.registerStr("sort_status", "drag an item to reorder");
+    _ = verve.sortable("#sort-list", .{ .items = "li", .toggle_class = "sorting" }, .{
+        .on_reorder = &onReorder,
+    });
+
+    // Cross-list board demo (7c): two columns share group="board".
+    verve.registerStr("board_status", "drag an item between columns");
+    _ = verve.sortable("#board-col-a", .{
+        .items = "li",
+        .group = "board",
+        .toggle_class = "sorting",
+    }, .{
+        .on_reorder = &onBoardReorder,
+        .on_enter_group = &onBoardEnter,
+    });
+    _ = verve.sortable("#board-col-b", .{
+        .items = "li",
+        .group = "board",
+        .toggle_class = "sorting",
+    }, .{
+        .on_reorder = &onBoardReorder,
+        .on_enter_group = &onBoardEnter,
+    });
+}
+
+fn onReorder() void {
+    verve.signalSetStr("sort_status", "reordered!");
+}
+
+fn onBoardReorder() void {
+    verve.signalSetStr("board_status", "item moved!");
+}
+
+fn onBoardEnter() void {
+    verve.signalSetStr("board_status", "item entering column…");
 }
 
 fn onProbeEnter() void {
@@ -261,6 +298,26 @@ export fn anim_flip_card_toggle() void {
         .ease = .out_cubic,
         .stagger = 0.01,
     }, .{ .on_enter = &onCardEntered, .on_leave = &onCardLeft });
+}
+
+/// Toggle card "c1" between normal and big size using FLIP with scale +
+/// counter-scale. The card text stays crisp because immediate children
+/// receive the inverse scale transform each tick.
+var flip_scale_big: bool = false;
+export fn anim_flip_scale_toggle() void {
+    // Capture before the DOM changes.
+    const state = verve.flipCapture(".flip-grid .fcard") orelse return;
+    // Toggle the card size via a data-ref class toggle.
+    const card_h = verve.queryRef(@as([]const u8, "flip-c1")) orelse return;
+    flip_scale_big = !flip_scale_big;
+    verve.setRefClass(card_h, "fcard-big", flip_scale_big);
+    verve.signalSetStr(STATUS, if (flip_scale_big) "scale →big (counter-scale on)" else "scale →normal (counter-scale on)");
+    _ = verve.flipPlay(state, .{
+        .duration = 0.5,
+        .ease = .in_out_sine,
+        .scale = true,
+        .counter_scale = true,
+    }, .{});
 }
 
 export fn anim_morph_toggle() void {

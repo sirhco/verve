@@ -5,8 +5,10 @@ library (31 curves), stagger with grid/distribution patterns, dynamic
 values, per-frame modifiers, a full control API
 (pause/play/reverse/restart/seek/timeScale), math utilities, and built-in
 `prefers-reduced-motion` handling — plus the plugin set documented below:
-ScrollTrigger (with snap), Observer, ScrollSmoother, MotionPath,
-MorphSVG, Draggable (with drop zones), SplitText, and FLIP.
+ScrollTrigger (with snap, element scroller, configurable snap ease,
+directional snap), Observer, ScrollSmoother, MotionPath, MorphSVG,
+Draggable (with drop zones and elastic bounce), Sortable, SplitText
+(grapheme clustering + RTL), and FLIP (with nested counter-scale).
 
 **Architecture — hybrid execution.** Zig builds tween/timeline descriptors
 and serializes them to a compact JSON wire format (`"v":1`); a small
@@ -288,12 +290,13 @@ ctx.h2("Pricing").animate(anim.reveal(a, "in-view", .{
   disabled; class toggles and callback triggers still run.
 - **Snap**: `.snap = .{ .step = 0.25 }` (progress multiples; `1` =
   start/end — full-section snapping) or `.{ .points = &.{ 0, 0.5, 1 } }`
-  (sorted, 0..1), plus `.snap_duration` (default 0.4s, outCubic). When
-  input goes idle (~120ms under 20px/s) inside the trigger's span ±25%,
-  the NATIVE scroll glides to the nearest point — nearest candidate wins
-  across snap-enabled triggers, exact ties break in the last scroll
-  direction, and any user input cancels the glide. Legal on any trigger
-  (not just scrubbed). Disabled under reduced motion.
+  (sorted, 0..1), plus `.snap_duration` (default 0.4s). When input goes
+  idle (~120ms under 20px/s) inside the trigger's span ±25%, the NATIVE
+  scroll glides to the nearest point — nearest candidate wins across
+  snap-enabled triggers, exact ties break in the last scroll direction,
+  and any user input cancels the glide. Legal on any trigger (not just
+  scrubbed). Disabled under reduced motion. See also: configurable snap
+  ease and directional snap below.
 - **Island surface**: `verve.scrollCallbacks(t, .{ .on_enter = &f, ... })`
   stamps wasm callbacks onto a builder's trigger;
   `verve.scrollTrigger(cfg, cbs)` creates a standalone trigger (no
@@ -302,6 +305,45 @@ ctx.h2("Pricing").animate(anim.reveal(a, "in-view", .{
   `verve.scrollRefresh()` re-measures everything after layout-changing
   DOM work; `verve.scrollPos()` reads the page scroll position. SSR
   named-export callbacks: `cb_island` + `cb_enter_export`/`cb_leave_export`.
+
+### Container scrollers
+
+A trigger can watch a scrollable element instead of the window. Set
+`scroller` to a CSS selector or `scroller_handle` to an island ref-handle
+(wins over selector). Geometry is then computed relative to the
+container's scroll position and client rect.
+
+```zig
+const container = ctx.div().id("feed").class("feed-scroll");
+_ = container.children(.{
+    ctx.article().class("post")
+        .animate(anim.reveal(a, "in-view", .{
+            .trigger  = ".post",
+            .scroller = "#feed",        // wire key "sl"; handle → "slh"
+            .start    = .{ .trigger = .bottom, .viewport = .bottom },
+            .once     = true,
+        })),
+});
+```
+
+Wire: `"sl"` (selector) / `"slh"` (handle), omitted when null. v1
+limits: snap stays window-scoped and pin uses `position:fixed` — neither
+composes with element scrollers yet.
+
+### Configurable snap ease + directional snap
+
+Override the snap glide ease with `snap_ease` (default `.out_cubic`;
+accepts any of the 31 `types.Ease` values) and bias the snap target
+toward scroll travel with `snap_directional` (falls back to nearest when
+no target exists in the travel direction).
+
+```zig
+.scrollTrigger(.{
+    .snap            = .{ .step = 0.25 },
+    .snap_ease       = .in_out_sine,   // wire "snape"; omitted at default
+    .snap_directional = true,          // wire "snapdir"; omitted when false
+})
+```
 
 ## Observer (islands)
 
@@ -398,10 +440,44 @@ works. Lines are measured once; late webfonts or resizes can stale them
 Requirements + caveats: spans need `display:inline-block` CSS for
 transforms (`.st-char,.st-word{display:inline-block}`); kerning and
 ligatures break across char spans (prefer `.words` for typographic
-fidelity); splitting is per UTF-8 codepoint — grapheme clusters
-(emoji/ZWJ/combining marks) and bidi/RTL text are unsupported v1.
-Splitting requires a plain leaf text node (no children, no raw HTML, no
-reactive bind — deferred errors otherwise).
+fidelity). Splitting requires a plain leaf text node (no children, no
+raw HTML, no reactive bind — deferred errors otherwise).
+
+### Grapheme clustering (`By.graphemes`)
+
+`By.graphemes` keeps extended grapheme clusters whole — combining marks,
+ZWJ emoji families (👨‍👩‍👧), skin-tone modifiers, regional-indicator flags
+(🇺🇸), and Hangul syllables — using a UAX#29 state machine backed by a
+Unicode 15.1 grapheme-break table, computed SSR in Zig with zero JS.
+
+```zig
+ctx.h1("👩‍💻 Hello, 世界")
+    .splitText(.{ .by = .graphemes })
+    .animate(anim.from(a, ".st-char")
+        .opacity(0).y(12).duration(0.4).ease(.out_cubic)
+        .stagger(.{ .each = 0.03 }))
+```
+
+Default `.chars` splits per UTF-8 codepoint; use `.graphemes` whenever
+the text contains emoji or combining marks.
+
+### RTL-aware splitting
+
+`Options.rtl_aware = true` detects consecutive codepoints of the same
+strong bidi direction and wraps RTL runs in `<span dir="rtl">` so the
+browser visually reorders glyphs within each run. `data-st-i` indices
+remain logical-order dense across the full text.
+
+```zig
+ctx.p("Hello שלום World")
+    .splitText(.{ .by = .words, .rtl_aware = true })
+    .animate(anim.from(a, ".st-word").opacity(0).duration(0.5)
+        .stagger(.{ .each = 0.04 }))
+```
+
+Set `dir="auto"` on the host element for predominantly-RTL text.
+Deferred: full UAX#9 bidi reordering *across* runs (interleaved
+LTR/RTL tokens within a word remain the browser's responsibility).
 
 ## FLIP
 
@@ -412,11 +488,12 @@ Animate layout changes — reorders, DOM moves — as transforms
 const state = verve.flipCapture(".flip-grid .fcard") orelse return;
 verve.listDiff("flip_list", &old_keys, &new_keys, &html);  // or any DOM mutation
 _ = verve.flipPlay(state, .{
-    .duration = 0.45,
-    .ease = .out_cubic,
-    .scale = false,      // width/height ratios as scaleX/Y (distorts children)
-    .stagger = 0.015,    // per play-time DOM order
-    .fade_in = true,     // elements that appeared since capture fade 0->1
+    .duration      = 0.45,
+    .ease          = .out_cubic,
+    .scale         = false,          // width/height ratios as scaleX/Y
+    .counter_scale = false,          // inverse-scale children each tick (see below)
+    .stagger       = 0.015,          // per play-time DOM order
+    .fade_in       = true,           // elements that appeared since capture fade 0->1
 }, .{ .on_complete = &onDone });
 ```
 
@@ -436,6 +513,25 @@ Re-flipping mid-flight steals elements cleanly. Under reduced motion,
 play is a no-op that fires `on_complete` immediately. Caveats: assumes
 translate+scale-only transforms at play (rotate/skew → position-only),
 default `transform-origin`, and unpinned elements.
+
+### Nested counter-scale (`FlipOpts.counter_scale`)
+
+When `scale = true` animates a parent's width/height as `scaleX/Y`,
+child content is distorted. Set `counter_scale = true` to apply the
+inverse scale to each immediate child every tick, keeping their content
+crisp throughout the FLIP (wire key `"cs"`, emitted only when true).
+
+```zig
+_ = verve.flipPlay(state, .{
+    .scale         = true,
+    .counter_scale = true,   // children receive 1/scaleX, 1/scaleY each frame
+    .duration      = 0.5,
+    .ease          = .in_out_sine,
+}, .{});
+```
+
+Caveat: child transforms are cleared on finish — any pre-existing child
+`transform` is not restored.
 
 ## Draggable
 
@@ -479,11 +575,75 @@ Semantics: a 3px engage threshold keeps clicks inside draggables working
 (configurable `threshold_px`); after a real drag the synthetic click is
 suppressed. Bounds re-measure at the start of every gesture. Throws
 project the rest point analytically from release velocity (exponential
-friction), clamp it to bounds, snap it, then decelerate exactly onto it —
-no bounce. `touch-action` is set per axis at create so touch drags don't
-scroll the page along the drag axis. Reduced motion: dragging itself
-stays (direct manipulation), but releases land instantly on the
-projected, snapped rest point.
+friction), clamp it to bounds, snap it, then decelerate exactly onto it.
+`touch-action` is set per axis at create so touch drags don't scroll the
+page along the drag axis. Reduced motion: dragging itself stays (direct
+manipulation), but releases land instantly on the projected, snapped
+rest point.
+
+### Drag bounce
+
+`Draggable.bounce` adds elastic reflection when a throw hits a bound.
+`null` (default) = hard clamp; a value in `[0, 1]` sets elasticity
+(`0` = zero-elasticity / clamp-equivalent; `~0.2` gives a GSAP-like feel; `1` is fully elastic). Requires both
+`inertia` (non-`.off`) and `bounds` (non-`.none`) — validation errors
+`BounceWithoutInertia` / `BounceWithoutBounds` otherwise. Wire key
+`"bo"`, omitted when null.
+
+```zig
+ctx.div().class("card")
+    .draggable(anim.draggable(a, .{
+        .bounds  = .{ .selector = ".pen" },
+        .inertia = .on,
+        .bounce  = 0.2,   // elasticity [0,1]; wire "bo"
+    }))
+```
+
+## Sortable
+
+Drag-to-reorder lists with FLIP-animated sibling shifts, cross-list
+transfer, and edge autoscroll — verve's Sortable plugin.
+
+```zig
+// SSR: vertical list, items reorder with FLIP animation
+ctx.ul().sortable(anim.sortable(a, .{
+    .items       = "li",           // CSS selector for sortable children (required)
+    .handle      = ".grip",        // grip sub-selector; null = whole item
+    .axis        = .y,             // .x / .y (default .y) / .both
+    .animate     = true,           // FLIP sibling shift; wire "an":0 when false
+    .autoscroll  = true,           // edge scroll; wire "as":0 when false
+    .autoscroll_edge_px = 40,      // edge band width in px (wire "ase"; omitted at 40)
+    .toggle_class = "dragging",    // applied to the dragged item
+}))
+```
+
+```zig
+// Cross-list transfer: two boards share group "board"
+ctx.ul().id("todo").sortable(anim.sortable(a, .{
+    .items = "li", .group = "board", .on_reorder_slot = reorder_slot,
+}))
+ctx.ul().id("done").sortable(anim.sortable(a, .{
+    .items = "li", .group = "board",
+    .on_reorder_slot    = reorder_slot,
+    .on_enter_group_slot = enter_slot,  // fires on BOTH source and target containers
+}))
+// Island: read result after settle
+const h: verve.SortableHandle = .{ .id = handle_id };
+const from = h.lastFrom();       // slot index before move
+const to   = h.lastTo();         // slot index after move
+const from_c = h.fromContainer(); // source container handle (-1 if same list)
+const to_c   = h.toContainer();   // target container handle (-1 if same list)
+```
+
+Wire root `"so"`. Booleans `animate`/`autoscroll` default true → emitted
+only when false (`"an":0` / `"as":0`). `axis` default `.y` is omitted.
+Validation: `items` must be non-empty (`error.SortableNoItems`);
+`on_enter_group_slot` requires `group` (`error.GroupCallbackWithoutGroup`);
+`autoscroll_edge_px` must be finite and positive (`error.BadAutoscrollEdge`).
+Callback slots are island-only (SSR rejects them). Respects
+`prefers-reduced-motion` (reorder is instant, no FLIP). Note:
+`on_enter_group_slot` fires on **both** the source and target containers
+of a cross-list move — disambiguate via `fromContainer()`/`toContainer()`.
 
 ## MotionPath
 
@@ -707,9 +867,20 @@ reads them (the earlier ≤1-frame lag is gone).
 
 ## Not yet
 
-The original GSAP-class spec is complete. Tracked follow-ups:
-horizontal / container scrollers, configurable snap ease +
-inertia-aware directional snap, grapheme-aware/RTL splitting + split
-revert, FLIP nested counter-scale, drag bounce / sortable lists,
-MotionPath `align` to another element (`.align_to = .start`
-self-alignment shipped).
+The original GSAP-class spec is complete and all six tracked follow-ups
+from the v0.7.x backlog have shipped. Remaining genuinely-deferred items:
+
+- **Full UAX#9 bidi reordering across runs** — `rtl_aware` wraps
+  same-direction runs in `<span dir="rtl">` so the browser handles
+  within-run glyph order; true cross-run reordering (interleaved LTR/RTL
+  tokens within a word) is the browser's job. Set `dir="auto"` on the
+  host element for predominantly-RTL text.
+- **MotionPath `align` to another element** — `.align_to = .start`
+  self-alignment shipped; aligning to a *separate* element's position
+  is not yet implemented.
+- **Snap + pin with element scrollers** — `snap` stays window-scoped and
+  `pin` uses `position:fixed`; neither composes with `scroller`/
+  `scroller_handle` container scrollers yet.
+- **Sortable multi-parent collapse, multi-instance** — single and
+  cross-list cases ship; complex nested/multi-level lists are not yet
+  exercised.

@@ -8,6 +8,7 @@
 //! toggle actions emit as the `Action` enum's integer values.
 
 const std = @import("std");
+const types = @import("types.zig");
 
 /// A point on the trigger element or a line in the viewport, as a
 /// fraction of the relevant height. 0 = top, 1 = bottom.
@@ -114,13 +115,20 @@ pub const Snap = union(enum) {
 
 /// ScrollTrigger config — the option struct for `.scrollTrigger(.{...})`
 /// on tweens/timelines and for `reveal`/`verve.scrollTrigger`.
-/// v1 scope: vertical window scroll only.
+/// v1 scope: vertical scroll (window or a scrollable container element).
 pub const ScrollTrigger = struct {
     /// CSS selector for the trigger element. null = the animation's own
     /// target (SSR: the node `.animate()` is called on).
     trigger: ?[]const u8 = null,
     /// Island-only: ref-handle trigger; wins over `trigger`.
     trigger_handle: ?i32 = null,
+
+    /// CSS selector for the scroll container. null = window (default).
+    /// When set, trigger geometry is computed relative to the scroller's
+    /// scroll position and client rect, not the window. SSR-legal.
+    scroller: ?[]const u8 = null,
+    /// Island-only: ref-handle for the scroller; wins over `scroller`.
+    scroller_handle: ?i32 = null,
 
     /// GSAP default "top bottom": trigger top meets viewport bottom.
     start: ScrollSpec = .{},
@@ -132,8 +140,14 @@ pub const ScrollTrigger = struct {
     /// Settle the native scroll on progress points when input goes idle.
     /// Legal on any trigger (not just scrubbed ones).
     snap: Snap = .none,
-    /// Snap glide duration, seconds. Ease is outCubic (fixed in v1).
+    /// Snap glide duration, seconds.
     snap_duration: f64 = 0.4,
+    /// Easing curve for the snap glide animation. Defaults to outCubic.
+    snap_ease: types.Ease = .out_cubic,
+    /// When true, snap biases toward the snap target in the direction of
+    /// scroll travel rather than the nearest target. Falls back to nearest
+    /// if no target exists in the travel direction.
+    snap_directional: bool = false,
     actions: ToggleActions = .{},
     /// Fire on_enter once, then self-kill (toggle class stays applied).
     once: bool = false,
@@ -303,6 +317,14 @@ test "validate matrix" {
     try std.testing.expectEqual(@as(?anyerror, null), cls.validateStandalone());
     const slot: ScrollTrigger = .{ .on_enter_slot = 4 };
     try std.testing.expectEqual(@as(?anyerror, null), slot.validateStandalone());
+
+    // container scroller: selector and handle both validate OK
+    const sc_sel: ScrollTrigger = .{ .toggle_class = "in-view", .scroller = ".panel" };
+    try std.testing.expectEqual(@as(?anyerror, null), sc_sel.validate());
+    try std.testing.expectEqualStrings(".panel", sc_sel.scroller.?);
+    const sc_h: ScrollTrigger = .{ .toggle_class = "in-view", .scroller_handle = 7 };
+    try std.testing.expectEqual(@as(?anyerror, null), sc_h.validate());
+    try std.testing.expectEqual(@as(?i32, 7), sc_h.scroller_handle.?);
 }
 
 test "snap validate matrix" {
@@ -329,6 +351,14 @@ test "snap validate matrix" {
     // duration ignored when snap off
     const off: ScrollTrigger = .{ .snap_duration = 0 };
     try std.testing.expectEqual(@as(?anyerror, null), off.validate());
+
+    // snap_ease + snap_directional: any Ease is valid, bool is valid
+    const snap_ease_dir: ScrollTrigger = .{
+        .snap = .{ .step = 0.5 },
+        .snap_ease = .in_out_sine,
+        .snap_directional = true,
+    };
+    try std.testing.expectEqual(@as(?anyerror, null), snap_ease_dir.validate());
 }
 
 test "reveal builder fills class and validates" {
