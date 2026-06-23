@@ -5269,6 +5269,151 @@
           st.morphTex = tex; // active morph texture (most recently created)
           break;
         }
+
+        // ── Point-light shadow atlas (T2) ──────────────────────────────────
+        case 31: { // CREATE_POINT_SHADOW — RGBA8 atlas + DEPTH_COMPONENT16 renderbuffer.
+          // Payload (12B): handle | w | h.
+          // Atlas: RGBA8 colour texture (w×h) — the 6 cube-face tiles are rendered
+          // into sub-regions via scissor/viewport. A shared DEPTH_COMPONENT16
+          // renderbuffer provides per-face depth testing.
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          // Lazily compile the point-depth program (once per GL context).
+          if (!st.pointDepthProg) {
+            const pdVs = [
+              "#version 300 es",
+              "layout(location=0) in vec3 a_pos;",
+              "uniform mat4 u_face_vp;",
+              "uniform mat4 u_model;",
+              "out vec3 v_world;",
+              "void main(){",
+              "  vec4 w=u_model*vec4(a_pos,1.0);",
+              "  v_world=w.xyz;",
+              "  gl_Position=u_face_vp*w;",
+              "}",
+            ].join("\n");
+            const pdFs = [
+              "#version 300 es",
+              "precision highp float;",
+              "in vec3 v_world;",
+              "uniform vec3 u_light_pos;",
+              "uniform float u_far;",
+              "out vec4 frag_color;",
+              "vec4 packDist(float v){vec4 e=fract(v*vec4(1.0,255.0,65025.0,16581375.0));e-=e.yzww*vec4(1.0/255.0,1.0/255.0,1.0/255.0,0.0);return e;}",
+              "void main(){",
+              "  frag_color=packDist(clamp(length(v_world-u_light_pos)/u_far,0.0,1.0));",
+              "}",
+            ].join("\n");
+            const prog = glCompile(gl, pdVs, pdFs);
+            st.pointDepthProg = {
+              prog,
+              faceVp:   gl.getUniformLocation(prog, "u_face_vp"),
+              model:    gl.getUniformLocation(prog, "u_model"),
+              lightPos: gl.getUniformLocation(prog, "u_light_pos"),
+              far:      gl.getUniformLocation(prog, "u_far"),
+            };
+          }
+          // RGBA8 colour atlas.
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.bindTexture(gl.TEXTURE_2D, null);
+          // Shared depth renderbuffer (same w×h as the atlas).
+          const depth = gl.createRenderbuffer();
+          gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+          gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+          gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+          // FBO: colour0 = atlas, depth = renderbuffer.
+          const fbo = gl.createFramebuffer();
+          gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+          gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          st.pointShadows[handle] = { fbo, tex, depth, w, h };
+          break;
+        }
+        case 32: { // BEGIN_POINT_SHADOW_FACE — bind FBO, set per-face viewport+scissor+uniforms.
+          // Payload (28B): handle | col | row | tile | face_vp_ptr | light_pos_ptr | far_bits.
+          const ps = st.pointShadows[dv.getUint32(off, true)];
+          const col  = dv.getUint32(off + 4, true);
+          const row  = dv.getUint32(off + 8, true);
+          const tile = dv.getUint32(off + 12, true);
+          const faceVpPtr   = dv.getUint32(off + 16, true);
+          const lightPosPtr = dv.getUint32(off + 20, true);
+          const far = dv.getFloat32(off + 24, true); // far_bits reinterpreted as f32
+          if (!ps || !st.pointDepthProg) break;
+          gl.bindFramebuffer(gl.FRAMEBUFFER, ps.fbo);
+          gl.viewport(col * tile, row * tile, tile, tile);
+          gl.enable(gl.SCISSOR_TEST);
+          gl.scissor(col * tile, row * tile, tile, tile);
+          // Clear colour to (1,1,1,1) = maximum encoded distance (= far).
+          gl.clearColor(1, 1, 1, 1);
+          gl.depthMask(true);
+          gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+          gl.useProgram(st.pointDepthProg.prog);
+          st.active = st.pointDepthProg;
+          gl.enable(gl.DEPTH_TEST);
+          gl.enable(gl.CULL_FACE);
+          gl.cullFace(gl.BACK); // normal back-face cull for point-light depth
+          // Per-face uniforms: face VP matrix (16 f32), light position (3 f32), far (1 f32).
+          gl.uniformMatrix4fv(st.pointDepthProg.faceVp, false,
+            new Float32Array(memory.buffer, faceVpPtr, 16));
+          gl.uniform3fv(st.pointDepthProg.lightPos,
+            new Float32Array(memory.buffer, lightPosPtr, 3));
+          gl.uniform1f(st.pointDepthProg.far, far);
+          break;
+        }
+        case 33: { // DRAW_POINT_DEPTH — draw one mesh into the active face tile.
+          // Payload (20B): vbuf | ibuf | index_byte_off | index_count | model_ptr.
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const modelPtr = dv.getUint32(off + 16, true);
+          if (!st.buffers[vh] || !st.buffers[ih] || !st.active) break;
+          bindVaoFor(st, vh, ih);
+          gl.uniformMatrix4fv(st.active.model, false,
+            new Float32Array(memory.buffer, modelPtr, 16));
+          gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
+        case 34: { // END_POINT_SHADOW — unbind FBO, disable scissor, restore canvas viewport.
+          // Payload (8B): width | height (canvas dimensions to restore).
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.disable(gl.SCISSOR_TEST);
+          gl.viewport(0, 0, dv.getUint32(off, true), dv.getUint32(off + 4, true));
+          gl.cullFace(gl.BACK);
+          break;
+        }
+        case 35: { // BIND_POINT_SHADOW — bind atlas colour tex to slot; store for receiver.
+          // Payload (16B): slot | handle | light_pos_ptr | far_bits.
+          const slot = dv.getUint32(off, true);
+          const ps = st.pointShadows[dv.getUint32(off + 4, true)];
+          if (ps) {
+            gl.activeTexture(gl.TEXTURE0 + slot);
+            gl.bindTexture(gl.TEXTURE_2D, ps.tex);
+          }
+          // Set receiver uniforms on the active program if the locations exist
+          // (resolved in T3/T4 CREATE_SHADER; safe to call with null location).
+          if (st.active) {
+            const lightPosPtr = dv.getUint32(off + 8, true);
+            const far = dv.getFloat32(off + 12, true); // far_bits reinterpreted as f32
+            if (st.active.pointAtlas != null)
+              gl.uniform1i(st.active.pointAtlas, slot);
+            if (st.active.pointLightPos != null)
+              gl.uniform3fv(st.active.pointLightPos,
+                new Float32Array(memory.buffer, lightPosPtr, 3));
+            if (st.active.pointFar != null)
+              gl.uniform1f(st.active.pointFar, far);
+          }
+          break;
+        }
+
         default:
           break; // unknown tag: size-skip = forward compatible
       }
@@ -5298,12 +5443,21 @@
     if (st.emptyVao) { gl.deleteVertexArray(st.emptyVao); st.emptyVao = null; }
     if (st.instanceBuf) { gl.deleteBuffer(st.instanceBuf); st.instanceBuf = null; }
     for (const tex of st.morphTextures) if (tex) gl.deleteTexture(tex);
+    for (const ps of st.pointShadows) {
+      if (ps) {
+        gl.deleteFramebuffer(ps.fbo);
+        gl.deleteTexture(ps.tex);
+        gl.deleteRenderbuffer(ps.depth);
+      }
+    }
+    if (st.pointDepthProg) { gl.deleteProgram(st.pointDepthProg.prog); st.pointDepthProg = null; }
     st.morphTextures = [];
     st.morphTex = null;
     st.buffers = [];
     st.textures = [];
     st.shaders = [];
     st.renderTargets = [];
+    st.pointShadows = [];
     st.vaos.clear();
     st.active = null;
   };
@@ -6743,6 +6897,196 @@
           st.bg0Layout = null;
           break;
         }
+
+        // ── Point-light shadow atlas (T2, WebGPU) ──────────────────────────
+        case 31: { // CREATE_POINT_SHADOW — rgba8unorm atlas + depth scratch texture.
+          // Payload (12B): handle | w | h.
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          // rgba8unorm colour atlas (w×h); RENDER_ATTACHMENT for face passes,
+          // TEXTURE_BINDING so the receiver can sample it.
+          const atlasTex = device.createTexture({
+            size: [w, h],
+            format: "rgba8unorm",
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+          });
+          // Shared depth scratch (depth16unorm, same footprint as the atlas).
+          // One per atlas; each begin_point_shadow_face begins a fresh render pass
+          // (clear), so faces don't bleed into each other's depth.
+          const depthTex = device.createTexture({
+            size: [w, h],
+            format: "depth16unorm",
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+          });
+          st.pointShadows[handle] = {
+            atlasTex,
+            atlasView: atlasTex.createView(),
+            depthView: depthTex.createView(),
+            w, h,
+          };
+          // Lazily build the point-depth pipeline (once per device).
+          if (!st.pointDepthPipe) {
+            // Uniform layout (256B stride): face_vp @0 (64B), model @64 (64B),
+            //   light_pos @128 (12B), far @140 (4B). Total 144B fits in 256B slot.
+            const VERT = GPUShaderStage.VERTEX;
+            const FRAG = GPUShaderStage.FRAGMENT;
+            const bgl = device.createBindGroupLayout({
+              entries: [
+                { binding: 0, visibility: VERT | FRAG,
+                  buffer: { type: "uniform", hasDynamicOffset: true } },
+              ],
+            });
+            const wgsl = [
+              "struct U { face_vp: mat4x4<f32>, model: mat4x4<f32>, light_pos: vec3<f32>, far: f32 }",
+              "@group(0) @binding(0) var<uniform> u: U;",
+              "struct VOut { @builtin(position) pos: vec4f, @location(0) world: vec3f }",
+              "fn packDist(v: f32) -> vec4f {",
+              "  var e = fract(v*vec4f(1.0,255.0,65025.0,16581375.0));",
+              "  e -= e.yzww*vec4f(1.0/255.0,1.0/255.0,1.0/255.0,0.0);",
+              "  return e;",
+              "}",
+              "@vertex fn vs_main(@location(0) a_pos: vec3f) -> VOut {",
+              "  var o: VOut;",
+              "  let w = u.model * vec4f(a_pos, 1.0);",
+              "  o.world = w.xyz;",
+              "  o.pos = u.face_vp * w;",
+              "  return o;",
+              "}",
+              "@fragment fn fs_main(@location(0) world: vec3f) -> @location(0) vec4f {",
+              "  return packDist(clamp(length(world - u.light_pos) / u.far, 0.0, 1.0));",
+              "}",
+            ].join("\n");
+            const module = device.createShaderModule({ code: wgsl });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+            const pipeline = device.createRenderPipeline({
+              layout,
+              vertex: {
+                module, entryPoint: "vs_main",
+                buffers: [{
+                  arrayStride: 48, // PBR stride: pos@0 only used here
+                  attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
+                }],
+              },
+              fragment: {
+                module, entryPoint: "fs_main",
+                targets: [{ format: "rgba8unorm" }],
+              },
+              primitive: { topology: "triangle-list", cullMode: "back" },
+              depthStencil: {
+                format: "depth16unorm",
+                depthWriteEnabled: true,
+                depthCompare: "less",
+              },
+            });
+            // Uniform buffer: POINT_DEPTH_STRIDE slots (one per draw_point_depth call).
+            const POINT_DEPTH_STRIDE = 256;
+            const pointDepthUniform = device.createBuffer({
+              size: POINT_DEPTH_STRIDE * 64, // 64 draws per frame cap
+              usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            st.pointDepthPipe = { pipeline, bgl, pointDepthUniform,
+              POINT_DEPTH_STRIDE, pointDepthSlot: 0,
+              // Cached per-face data (written by begin_point_shadow_face).
+              faceVp: null, lightPos: null, far: 0 };
+          }
+          break;
+        }
+        case 32: { // BEGIN_POINT_SHADOW_FACE — start a render pass for one cube face.
+          // Payload (28B): handle | col | row | tile | face_vp_ptr | light_pos_ptr | far_bits.
+          // Each face is a separate render pass (clear colour to 1,1,1,1 = far,
+          // clear depth). setViewport + setScissorRect restrict to the tile.
+          const ps = st.pointShadows[dv.getUint32(off, true)];
+          const col  = dv.getUint32(off + 4, true);
+          const row  = dv.getUint32(off + 8, true);
+          const tile = dv.getUint32(off + 12, true);
+          const faceVpPtr   = dv.getUint32(off + 16, true);
+          const lightPosPtr = dv.getUint32(off + 20, true);
+          const far = dv.getFloat32(off + 24, true); // far_bits reinterpreted as f32
+          if (!ps || !st.pointDepthPipe) break;
+          // Ensure a command encoder exists (shared with the later colour pass).
+          if (!st.encoder) st.encoder = device.createCommandEncoder();
+          // Close any previous face pass before opening the next.
+          if (st.pointPass) { st.pointPass.end(); st.pointPass = null; }
+          // Open a render pass over the full atlas with load="clear" (colour = far, depth = 1).
+          st.pointPass = st.encoder.beginRenderPass({
+            colorAttachments: [{
+              view: ps.atlasView,
+              clearValue: { r: 1, g: 1, b: 1, a: 1 }, // 1,1,1,1 = packDist(1) ≈ far
+              loadOp: "clear",
+              storeOp: "store",
+            }],
+            depthStencilAttachment: {
+              view: ps.depthView,
+              depthClearValue: 1.0,
+              depthLoadOp: "clear",
+              depthStoreOp: "discard", // depth scratch: no need to preserve
+            },
+          });
+          // Restrict rendering to this face's tile via viewport + scissor.
+          st.pointPass.setViewport(col * tile, row * tile, tile, tile, 0, 1);
+          st.pointPass.setScissorRect(col * tile, row * tile, tile, tile);
+          st.pointPass.setPipeline(st.pointDepthPipe.pipeline);
+          // Cache per-face uniforms; they are written per draw in DRAW_POINT_DEPTH.
+          st.pointDepthPipe.faceVp    = new Float32Array(memory.buffer, faceVpPtr, 16).slice();
+          st.pointDepthPipe.lightPos  = new Float32Array(memory.buffer, lightPosPtr, 3).slice();
+          st.pointDepthPipe.far       = far;
+          st.pointDepthPipe.pointDepthSlot = 0; // reset per-face draw counter
+          break;
+        }
+        case 33: { // DRAW_POINT_DEPTH — draw one mesh into the active face tile.
+          // Payload (20B): vbuf | ibuf | index_byte_off | index_count | model_ptr.
+          const vb = st.buffers[dv.getUint32(off, true)];
+          const ib = st.buffers[dv.getUint32(off + 4, true)];
+          const byteOff = dv.getUint32(off + 8, true);
+          const count   = dv.getUint32(off + 12, true);
+          const modelPtr = dv.getUint32(off + 16, true);
+          if (!vb || !ib || !st.pointPass || !st.pointDepthPipe) break;
+          const pd = st.pointDepthPipe;
+          const slot = pd.pointDepthSlot++;
+          const base = slot * pd.POINT_DEPTH_STRIDE;
+          // Write face_vp @0 (64B), model @64 (64B), light_pos @128 (12B), far @140 (4B).
+          // faceVp / lightPos are .slice() copies so byteOffset = 0.
+          device.queue.writeBuffer(pd.pointDepthUniform, base, pd.faceVp, 0, 64);
+          const modelF32 = new Float32Array(memory.buffer, modelPtr, 16);
+          device.queue.writeBuffer(pd.pointDepthUniform, base + 64,
+            modelF32.buffer, modelF32.byteOffset, 64);
+          device.queue.writeBuffer(pd.pointDepthUniform, base + 128, pd.lightPos, 0, 12);
+          device.queue.writeBuffer(pd.pointDepthUniform, base + 140,
+            new Float32Array([pd.far]).buffer, 0, 4);
+          // Bind group with dynamic offset to this slot.
+          const bg = device.createBindGroup({
+            layout: pd.bgl,
+            entries: [{ binding: 0, resource: { buffer: pd.pointDepthUniform,
+              offset: 0, size: 144 } }],
+          });
+          st.pointPass.setBindGroup(0, bg, [base]);
+          st.pointPass.setVertexBuffer(0, vb.buf);
+          st.pointPass.setIndexBuffer(ib.buf, "uint16", byteOff);
+          st.pointPass.drawIndexed(count);
+          break;
+        }
+        case 34: { // END_POINT_SHADOW — close the active face pass.
+          // Payload (8B): width | height — unused by WebGPU (no viewport restore needed).
+          if (st.pointPass) { st.pointPass.end(); st.pointPass = null; }
+          break;
+        }
+        case 35: { // BIND_POINT_SHADOW — stash atlas view + light uniforms for the receiver.
+          // Payload (16B): slot | handle | light_pos_ptr | far_bits.
+          // T4 wires the bind group (group(1) binding 11); here we record the view
+          // and uniforms so bg1 can be rebuilt with the atlas before the colour pass.
+          const ps = st.pointShadows[dv.getUint32(off + 4, true)];
+          const lightPosPtr = dv.getUint32(off + 8, true);
+          const far = dv.getFloat32(off + 12, true); // far_bits reinterpreted as f32
+          if (ps) {
+            st.pointAtlasView = ps.atlasView;
+          }
+          st.pointLightPos = new Float32Array(memory.buffer, lightPosPtr, 3).slice();
+          st.pointFar = far;
+          st.bg1Dirty = true; // trigger bg1 rebuild before next DRAW_PBR
+          break;
+        }
+
         default:
           break; // unknown tag: size-skip = forward compatible
       }
@@ -6836,6 +7180,8 @@
       textures: [],
       shadowMaps: [], // P9 slice 3: { fbo, tex, size } per handle
       renderTargets: [], // post-processing: { fbo, colorTex, depthTex, w, h } per handle
+      pointShadows: [], // T2: { fbo, tex, depth, w, h } per handle (RGBA8 atlas + depth RBO)
+      pointDepthProg: null, // lazy — compiled on first CREATE_POINT_SHADOW (case 31)
       vaos: new Map(),
       emptyVao: null, // lazy-created VAO for fullscreen-quad draw (case 25)
       instanceBuf: null, // lazy-created ARRAY_BUFFER for per-instance mat4+color (case 27)
@@ -6991,6 +7337,12 @@
       ibl: null, // { irr, spec, lut } texture handles set by bind_ibl (2b)
       shadowMaps: [], // { tex, view, sampler, size } by handle (create_shadow_map, 2c)
       shadow: null, // { handle } set by bind_shadow_map (2c)
+      pointShadows: [], // T2: { atlasTex, atlasView, depthView, w, h } by handle
+      pointDepthPipe: null, // lazy — pipeline + uniform buf for point-depth pass
+      pointPass: null, // active render pass during begin/end_point_shadow_face
+      pointAtlasView: null, // stashed by bind_point_shadow (tag 35) for bg1 in T4
+      pointLightPos: null, // Float32Array(3) stashed by bind_point_shadow
+      pointFar: 0, // f32 stashed by bind_point_shadow
       renderTargets: [], // post: { tex, view, depthTex, depthView, w, h, format } by handle
       curTargetFormat: null, // color format of the active pass (post pipeline keying)
       curPassHasDepth: false, // true when the active render pass has a depth attachment

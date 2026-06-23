@@ -455,6 +455,70 @@ pub fn depthAtFragmentSrc() []const u8 {
     ;
 }
 
+/// Point-light distance depth vertex shader.  Writes world-space position to
+/// `v_world` so the fragment can compute linear distance from the light.
+/// Uniforms: `u_face_vp` (mat4, cube-face view-projection), `u_model` (mat4).
+/// Vertex layout: position at attrib 0 (matching PBR stride-48 VBO).
+pub fn pointDepthVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\uniform mat4 u_face_vp;
+    \\uniform mat4 u_model;
+    \\out vec3 v_world;
+    \\void main() {
+    \\  vec4 world = u_model * vec4(a_pos, 1.0);
+    \\  v_world = world.xyz;
+    \\  gl_Position = u_face_vp * world;
+    \\}
+    \\
+    ;
+}
+
+/// Point-light distance depth fragment shader.  Packs the normalised linear
+/// distance from the light into RGBA8 colour using the P1 `packDist` helper.
+/// Uniforms: `u_light_pos` (vec3 world-space), `u_far` (float, far-plane dist).
+pub fn pointDepthFragmentSrc() []const u8 {
+    // Inline pack const rather than runtime-concatenate so the return type is
+    // a comptime-known string literal (required for Zig ++ on []const u8).
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec3 v_world;
+    \\uniform vec3 u_light_pos;
+    \\uniform float u_far;
+    \\out vec4 frag_color;
+    \\vec4 packDist(float v){ vec4 e=fract(v*vec4(1.0,255.0,65025.0,16581375.0)); e-=e.yzww*vec4(1.0/255.0,1.0/255.0,1.0/255.0,0.0); return e; }
+    \\void main() {
+    \\  frag_color = packDist(clamp(length(v_world - u_light_pos) / u_far, 0.0, 1.0));
+    \\}
+    \\
+    ;
+}
+
+/// Combined WGSL module for the point-depth pass (vertex + fragment).
+/// Uniform struct U: face_vp mat4x4, model mat4x4, light_pos vec3, far f32.
+/// Renders to an rgba8unorm colour attachment; depth scratch is side-effect.
+pub fn pointDepthWgslSrc() []const u8 {
+    return
+    \\struct U { face_vp: mat4x4<f32>, model: mat4x4<f32>, light_pos: vec3<f32>, far: f32 }
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\struct VOut { @builtin(position) pos: vec4f, @location(0) world: vec3f }
+    \\fn packDist(v: f32) -> vec4f { var e = fract(v*vec4f(1.0,255.0,65025.0,16581375.0)); e -= e.yzww*vec4f(1.0/255.0,1.0/255.0,1.0/255.0,0.0); return e; }
+    \\@vertex fn vs_main(@location(0) a_pos: vec3f) -> VOut {
+    \\  var o: VOut;
+    \\  let world = u.model * vec4f(a_pos, 1.0);
+    \\  o.world = world.xyz;
+    \\  o.pos = u.face_vp * world;
+    \\  return o;
+    \\}
+    \\@fragment fn fs_main(@location(0) world: vec3f) -> @location(0) vec4f {
+    \\  return packDist(clamp(length(world - u.light_pos) / u.far, 0.0, 1.0));
+    \\}
+    \\
+    ;
+}
+
 pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     comptime pbrCheck(flags);
     const head =
@@ -3080,4 +3144,26 @@ test "bindPointShadow encodes tag 35 + 4 u32 payload (16 bytes)" {
     try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[12..16], .little)); // handle
     try testing.expectEqual(@as(u32, 0x5000), std.mem.readInt(u32, s[16..20], .little)); // light_pos_ptr
     try testing.expectEqual(@as(u32, 0x41C80000), std.mem.readInt(u32, s[20..24], .little)); // far_bits
+}
+
+// ── Point-depth shader sources (T2) ──────────────────────────────────────────
+
+test "point-depth GLSL: vertex emits u_face_vp + u_model + v_world; fragment has packDist + u_light_pos + u_far" {
+    const vs = pointDepthVertexSrc();
+    try testing.expect(std.mem.indexOf(u8, vs, "u_face_vp") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "u_model") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "v_world") != null);
+    const fs = pointDepthFragmentSrc();
+    try testing.expect(std.mem.indexOf(u8, fs, "packDist") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "u_light_pos") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "u_far") != null);
+}
+
+test "point-depth WGSL: combined src has packDist + u_face_vp (via face_vp) + u_light_pos (via light_pos)" {
+    const w = pointDepthWgslSrc();
+    try testing.expect(std.mem.indexOf(u8, w, "packDist") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "face_vp") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "light_pos") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "vs_main") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fs_main") != null);
 }
