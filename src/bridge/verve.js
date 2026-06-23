@@ -7093,12 +7093,17 @@
           const slot = pd.pointDepthSlot++;
           const base = slot * pd.POINT_DEPTH_STRIDE;
           // Write face_vp @0 (64B), model @64 (64B), light_pos @128 (12B), far @140 (4B).
-          // faceVp / lightPos are .slice() copies so byteOffset = 0.
-          device.queue.writeBuffer(pd.pointDepthUniform, base, pd.faceVp, 0, 64);
+          // NOTE: when `data` is a TypedArray, writeBuffer's dataOffset/size are in
+          // ELEMENTS, not bytes — so pass the underlying .buffer (ArrayBuffer) with
+          // byte offset/size, matching the model/far writes. faceVp / lightPos are
+          // .slice() copies so byteOffset = 0.
+          device.queue.writeBuffer(pd.pointDepthUniform, base,
+            pd.faceVp.buffer, pd.faceVp.byteOffset, 64);
           const modelF32 = new Float32Array(memory.buffer, modelPtr, 16);
           device.queue.writeBuffer(pd.pointDepthUniform, base + 64,
             modelF32.buffer, modelF32.byteOffset, 64);
-          device.queue.writeBuffer(pd.pointDepthUniform, base + 128, pd.lightPos, 0, 12);
+          device.queue.writeBuffer(pd.pointDepthUniform, base + 128,
+            pd.lightPos.buffer, pd.lightPos.byteOffset, 12);
           device.queue.writeBuffer(pd.pointDepthUniform, base + 140,
             new Float32Array([pd.far]).buffer, 0, 4);
           // Bind group with dynamic offset to this slot.
