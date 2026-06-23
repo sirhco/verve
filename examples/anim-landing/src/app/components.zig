@@ -7,9 +7,13 @@
 //!   features    zero-wasm class reveals + scroll-gated card stagger
 //!   journey     MotionPath flight along a curve, scrubbed by scroll
 //!   morph       MorphSVG star -> blob, scrubbed by scroll
-//!   pinned      transform-pinned panel, scrubbed bar, points snap
-//!   playground  zero-wasm Draggable with inertia + drop-zone hover
-//!   gallery     FLIP island (shuffle + remove/restore)
+//!   pinned      transform-pinned panel, scrubbed bar, points snap + snap-ease
+//!   playground  zero-wasm Draggable with inertia + elastic bounce + drop-zone hover
+//!   gallery     FLIP island (shuffle + remove/restore + counter-scale resize)
+//!   scroller    container-scroll reveals (ScrollTrigger.scroller)
+//!   graphemes   SplitText grapheme cluster splitting (emoji-safe)
+//!   rtl         SplitText rtl_aware (mixed LTR/RTL bidi)
+//!   sortable    Sortable island (single list + two-column board)
 //! The whole page rides a ScrollSmoother — render the smoothScroll()
 //! RETURN VALUE, and note position:fixed/sticky are dead inside it.
 
@@ -98,13 +102,14 @@ pub fn index(ctx: *const verve.Context) !*verve.Node {
             .scrub = .{ .smooth = 0.3 },
         })),
 
-        // ---- pinned: transform-pin + snap under the smoother --------------
-        sectionTitle(ctx, "Pin + snap"),
-        ctx.p().class("hint").text("The panel pins for 150vh while the bar scrubs; let go and the scroll settles on 0 / 50 / 100%. Under a smoother, pins counter-translate instead of position:fixed."),
+        // ---- pinned: transform-pin + snap under the smoother + snap-ease ----
+        // Feature 2: snap_ease + snap_directional on the existing snap section.
+        sectionTitle(ctx, "Pin + snap (ease + directional)"),
+        ctx.p().class("hint").text("The panel pins for 150vh while the bar scrubs; snap points at 0 / 50 / 100% with in_out_cubic ease and directional=true — the settle eases differently when scrolling down vs up."),
         ctx.div().class("pin-panel")
             .children(.{
                 ctx.div().class("scrub-bar").ariaHidden(true),
-                ctx.p().text("Pinned while the bar scrubs (points snap: 0, ½, 1)."),
+                ctx.p().text("Pinned while the bar scrubs (snap_ease=in_out_cubic, snap_directional=true)."),
             })
             .animate(anim.to(a, ".scrub-bar")
             .scaleX(1).propFrom("scaleX", 0)
@@ -115,16 +120,20 @@ pub fn index(ctx: *const verve.Context) !*verve.Node {
             .scrub = .{ .smooth = 0.3 },
             .pin = .self,
             .snap = .{ .points = &.{ 0, 0.5, 1 } },
+            .snap_ease = .in_out_cubic,
+            .snap_directional = true,
         })),
 
-        // ---- playground: zero-wasm Draggable + drop zones -----------------
-        sectionTitle(ctx, "Drag, flick, drop"),
-        ctx.p().class("hint").text("Pure data-drag — no island. Flick the chip (analytic inertia, 32px grid snap); the zones light up on hover, zero wasm involved."),
+        // ---- playground: zero-wasm Draggable + elastic bounce + drop zones --
+        // Feature 3: bounce=0.35 on the Draggable (inertia + bounds required).
+        sectionTitle(ctx, "Drag, flick, bounce"),
+        ctx.p().class("hint").text("Pure data-drag — no island. Flick the chip (analytic inertia, 32px grid snap, elastic bounce=0.35 on the walls); the zones light up on hover."),
         ctx.div().class("pen").children(.{
             ctx.div().class("chip drag-chip").text("flick me")
                 .draggable(anim.draggable(a, .{
                 .bounds = .{ .selector = ".pen" },
                 .inertia = .on,
+                .bounce = 0.35,
                 .snap = .{ .grid = .{ .x = 32, .y = 32 } },
                 .zones = ".dz",
                 .zone_class = "dz-hover",
@@ -134,10 +143,55 @@ pub fn index(ctx: *const verve.Context) !*verve.Node {
             ctx.div().class("dz").text("archive"),
         }),
 
-        // ---- gallery: FLIP island ------------------------------------------
+        // ---- gallery: FLIP island + counter-scale resize --------------------
+        // Feature 4: counter_scale=true on a scale FLIP variant in Gallery.zig.
         sectionTitle(ctx, "Layout that animates itself"),
-        ctx.p().class("hint").text("The island reorders keyed cards through the reconciler; FLIP measures the before/after and animates the difference. Remove/restore exercises the enter/leave callbacks + fade-in."),
+        ctx.p().class("hint").text("Shuffle: keyed FLIP reorder. Remove/restore: enter/leave callbacks. Resize: scale+counter_scale keeps card text crisp while the container scales."),
         gallery(ctx),
+
+        // ---- container scroller: ScrollTrigger.scroller --------------------
+        // Feature 1: cards reveal on a scrollable overflow:auto container's scroll.
+        sectionTitle(ctx, "Container scroll reveals"),
+        ctx.p().class("hint").text("These cards animate in as you scroll INSIDE the box below — ScrollTrigger.scroller binds the trigger geometry to the overflow container, not the window."),
+        scrollerSection(ctx),
+
+        // ---- grapheme SplitText -------------------------------------------
+        // Feature 5: By.graphemes keeps emoji families/skin-tones whole.
+        sectionTitle(ctx, "Grapheme-safe SplitText"),
+        ctx.p().class("hint").text("Each grapheme cluster (including multi-codepoint emoji) gets its own span — no glyph-splitting artifacts."),
+        ctx.p().class("grapheme-line")
+            .text("Hello 👨‍👩‍👧‍👦 world 🏳️‍🌈 done 👍🏽")
+            .splitText(.{ .by = .graphemes })
+            .animate(anim.from(a, ".grapheme-line .st-ch")
+            .opacity(0).y(20).scale(0.8)
+            .duration(0.45).ease(.out_back)
+            .stagger(.{ .each = 0.055 })
+            .scrollTrigger(.{
+            .start = .{ .viewport = .{ .pct = 85 } },
+            .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
+        })),
+
+        // ---- RTL-aware SplitText ------------------------------------------
+        // Feature 6: rtl_aware=true wraps RTL runs in dir=rtl spans.
+        sectionTitle(ctx, "RTL-aware SplitText"),
+        ctx.p().class("hint").text("Mixed LTR/RTL text: consecutive RTL codepoints are grouped into <span dir=rtl> runs so the UA reorders glyphs correctly, while animation indices stay logical."),
+        ctx.p().class("rtl-line").attr("dir", "auto")
+            .text("Animate: مرحبا hello שָׁלוֹם world")
+            .splitText(.{ .by = .chars, .rtl_aware = true })
+            .animate(anim.from(a, ".rtl-line .st-ch")
+            .opacity(0).x(-10)
+            .duration(0.4).ease(.out_cubic)
+            .stagger(.{ .each = 0.04 })
+            .scrollTrigger(.{
+            .start = .{ .viewport = .{ .pct = 85 } },
+            .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
+        })),
+
+        // ---- sortable island -----------------------------------------------
+        // Feature 7: Sortable island — single list + two-column board.
+        sectionTitle(ctx, "Drag to reorder"),
+        ctx.p().class("hint").text("Siblings FLIP-shift to preview the drop slot. The island fires on_reorder on settle and on_enter_group when an item crosses columns."),
+        sortableSection(ctx),
 
         ctx.el("footer").class("foot").children(.{
             ctx.p().text("Built with verve.anim — every animation on this page survives prefers-reduced-motion (entrances land instantly, loops skip, the smoother turns off)."),
@@ -176,22 +230,99 @@ fn featureDeck(ctx: *const verve.Context) *verve.Node {
     }));
 }
 
+/// Container-scroller section: an overflow:auto box whose scroll drives
+/// card reveal animations (ScrollTrigger.scroller = "#scroll-box").
+fn scrollerSection(ctx: *const verve.Context) *verve.Node {
+    const anim = verve.anim;
+    const a = ctx.alloc();
+
+    const box = ctx.div().id("scroll-box").class("scroll-box");
+    const card_labels = [_][]const u8{ "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta" };
+    for (card_labels) |label| {
+        _ = box.children(.{
+            ctx.div().class("scroll-card")
+                .text(label)
+                .animate(anim.from(a, ".scroll-card")
+                .opacity(0).x(30)
+                .duration(0.45).ease(.out_cubic)
+                .scrollTrigger(.{
+                .scroller = "#scroll-box",
+                .start = .{ .viewport = .{ .pct = 90 } },
+                .actions = .{ .on_enter = .play, .on_leave_back = .reverse },
+            })),
+        });
+    }
+    return box;
+}
+
+/// Sortable island: SSR markup for the single list + two-column board.
+/// The island (Sortable.zig) attaches verve.sortable() to each container.
+fn sortableSection(ctx: *const verve.Context) *verve.Node {
+    const list = ctx.el("ul").id("sort-list").class("sort-list");
+    const list_items = [_][]const u8{ "Alpha", "Beta", "Gamma", "Delta", "Epsilon" };
+    for (list_items) |item| {
+        _ = list.children(.{ctx.el("li").class("sort-item").text(item)});
+    }
+
+    const col_a = ctx.el("ul").id("board-col-a").class("sort-list board-col");
+    const todo_items = [_][]const u8{ "Write tests", "Review PR", "Update docs", "Fix bug", "Deploy" };
+    for (todo_items) |item| {
+        _ = col_a.children(.{ctx.el("li").class("sort-item").text(item)});
+    }
+
+    const col_b = ctx.el("ul").id("board-col-b").class("sort-list board-col");
+    const done_items = [_][]const u8{ "Design spec", "Wireframes" };
+    for (done_items) |item| {
+        _ = col_b.children(.{ctx.el("li").class("sort-item").text(item)});
+    }
+
+    const board = ctx.div().class("sort-board").children(.{
+        ctx.div().class("sort-board-col").children(.{
+            ctx.h3("Todo"),
+            col_a,
+        }),
+        ctx.div().class("sort-board-col").children(.{
+            ctx.h3("Done"),
+            col_b,
+        }),
+    });
+
+    const inner = ctx.div().children(.{
+        ctx.p().class("hint").children(.{
+            ctx.span().text("List status: "),
+            ctx.span().bind("sort_status").text("drag an item to reorder"),
+        }),
+        list,
+        ctx.h3("Cross-list board"),
+        ctx.p().class("hint").children(.{
+            ctx.span().text("Board status: "),
+            ctx.span().bind("board_status").text("drag an item between columns"),
+        }),
+        board,
+    });
+    return verve.island(ctx, .{ .name = "Sortable" }, inner);
+}
+
 /// FLIP gallery island: keyed cards (data-vkey g1..g8) + controls. The
 /// grid is a keyed bind so move_keyed_child preserves element identity
-/// (the FLIP fast path).
+/// (the FLIP fast path). Card g1 gets data-ref="gal-g1" for the
+/// counter-scale resize demo (Feature 4).
 fn gallery(ctx: *const verve.Context) *verve.Node {
     const grid = ctx.div().class("gal-grid").bind("gallery_list");
     const keys = [_][]const u8{ "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8" };
     for (keys, 0..) |k, i| {
-        _ = grid.children(.{
-            ctx.div().class("chip gcard").attr("data-vkey", k).textInt(i + 1),
-        });
+        const card = ctx.div().class("chip gcard").attr("data-vkey", k).textInt(i + 1);
+        if (i == 0) _ = card.attr("data-ref", "gal-g1");
+        _ = grid.children(.{card});
     }
     const inner = ctx.div().children(.{
         ctx.div().class("gal-controls").children(.{
             ctx.el("button").attr("z-on-click", "gal_shuffle").text("shuffle"),
             ctx.el("button").attr("z-on-click", "gal_toggle").text("remove/restore"),
             ctx.span().class("hint").bind("g_status").text("ready"),
+        }),
+        ctx.div().class("gal-resize-controls").children(.{
+            ctx.el("button").attr("z-on-click", "gal_resize_toggle").text("resize card 1 (counter-scale)"),
         }),
         grid,
     });
@@ -236,6 +367,21 @@ pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
                 \\.gal-controls{display:flex;gap:.5rem;align-items:center;margin:.75rem 0}
                 \\.gal-grid{display:flex;gap:.5rem;flex-wrap:wrap;max-width:19rem}
                 \\.gcard{width:3.8rem;height:3.8rem}
+                \\.gcard-big{width:8rem;height:8rem;font-size:1.4rem}
+                \\.gal-resize-controls{display:flex;gap:.5rem;align-items:center;margin:.5rem 0}
+                \\.scroll-box{height:14rem;overflow-y:auto;display:flex;flex-direction:column;gap:.5rem;padding:.75rem;background:#101218;border:1px dashed #2a2f3a;border-radius:12px;margin-top:.75rem;scroll-behavior:smooth}
+                \\.scroll-card{padding:.75rem 1rem;background:#1f6feb22;border:1px solid #1f6feb44;border-radius:8px;color:#e6e6e6;font-weight:600}
+                \\.grapheme-line{font-size:1.4rem;margin:.75rem 0}
+                \\.grapheme-line .st-ch{display:inline-block;will-change:transform}
+                \\.rtl-line{font-size:1.2rem;margin:.75rem 0}
+                \\.rtl-line .st-ch{display:inline-block;will-change:transform}
+                \\.sort-list{list-style:none;padding:0;margin:.5rem 0;display:flex;flex-direction:column;gap:.35rem;min-height:2rem}
+                \\.sort-item{padding:.55rem 1rem;background:#21262d;border:1px solid #30363d;border-radius:6px;cursor:grab;user-select:none;touch-action:none}
+                \\.sort-item.sorting{opacity:.55;border-style:dashed}
+                \\.sort-board{display:flex;gap:1rem;margin-top:.75rem}
+                \\.sort-board-col{flex:1}
+                \\.sort-board-col h3{margin:0 0 .4rem;font-size:.9em;color:#9aa0a6;text-transform:uppercase;letter-spacing:.05em}
+                \\.board-col{background:#13151b;border-radius:8px;padding:.4rem;min-height:6rem}
                 \\.foot{padding:5rem 1.5rem 6rem;color:#8b949e}
             ),
         }),
