@@ -966,6 +966,8 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     // caller cannot silently produce a broken WGSL U struct.
     if (flags & variant_instanced != 0 and flags & variant_shadow != 0)
         @compileError("wgslPbr: variant_instanced + variant_shadow unsupported in v1 (vp/light_vp slot collision at offset 512)");
+    if (flags & variant_instanced != 0 and flags & variant_shadow_point != 0)
+        @compileError("wgslPbr: variant_instanced + variant_shadow_point unsupported in v1 (point-shadow bind-group not wired for instanced draw path)");
 
     // ── Uniform block + group(0) ────────────────────────────────────
     // Split so variant_shadow can append `light_vp` (offset 512, after the f32
