@@ -30,7 +30,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 - **anim drag bounce** (`src/core/anim/drag.zig`, `src/bridge/verve.js`,
   `docs/23-animation.md`): `Draggable.bounce: ?f64` (wire `"bo"`, omitted
   when null) adds elastic reflection when a throw hits a bound. Value range
-  `(0, 1]` — `~0.2` for GSAP-like feel; `1` fully elastic. Requires
+  `[0, 1]` — `0` = no bounce (hard clamp), `~0.2` for GSAP-like feel, `1`
+  fully elastic; `null` is the default hard clamp. Requires
   `inertia != .off` (`error.BounceWithoutInertia`) and `bounds != .none`
   (`error.BounceWithoutBounds`).
 
@@ -70,6 +71,14 @@ versions follow [Semantic Versioning](https://semver.org/).
   source/target container handle IDs for cross-list moves.
   `on_enter_group_slot` fires on both source and target containers of a
   cross-list move. Respects `prefers-reduced-motion`.
+
+- **example showcase** (`examples/anim-landing`): the anim landing demo now
+  exercises all seven additions — declarative sections for container
+  scrollers (`#scroll-box`), eased + directional snap, drag bounce, and
+  grapheme / RTL-aware `splitText` headlines; a Gallery-island "resize"
+  control demonstrating FLIP counter-scale; and a new `Sortable` island with
+  a single drag-to-reorder list plus a two-column cross-group board with edge
+  autoscroll.
 
 ## [0.7.1] - 2026-06-23
 
