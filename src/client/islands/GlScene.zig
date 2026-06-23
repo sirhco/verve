@@ -1612,7 +1612,12 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
             enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
             enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-            enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+            if (inst.shadow_is_point) {
+                enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
+                enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
+            } else {
+                enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
+            }
             if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
             enc.bindTexture(0, texHandle(sub0.tex_base));
             enc.bindTexture(1, texHandle(sub0.tex_mr));
@@ -1716,6 +1721,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
                     if (inst.shadow_is_point) {
+                        enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
                         enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
                     } else {
                         enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
@@ -1733,6 +1739,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
                     if (inst.shadow_is_point) {
+                        enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
                         enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
                     } else {
                         enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
@@ -1833,8 +1840,10 @@ fn drawSubmesh(
         enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
         enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
         if (inst.shadow_is_point) {
-            // Point-shadow path: atlas already bound by bindPointShadow above;
-            // still bind the 2D slot to a zero handle (slot won't be sampled).
+            // Point-shadow path: re-emit per-pipeline so WebGL2 writes the light
+            // uniforms (u_point_light_pos / u_point_far) to the now-active program.
+            // Idempotent on WebGPU (re-stashes the atlas bind group).
+            enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
             enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
         } else {
             enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
