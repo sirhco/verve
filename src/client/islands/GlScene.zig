@@ -713,8 +713,10 @@ fn parseFog(inst: *Inst, s: []const u8) void {
 // Format: semicolon-separated light records, each a 15-field comma-separated CSV:
 //   type,intensity,px,py,pz,dx,dy,dz,r,g,b,range,cosIn,cosOut,castsShadow
 // Maps CSV[0..13] → lights[i*16 + 0..13]; lights[i*16+14,15] = 0 (_pad).
-// CSV[14] (castsShadow): first light with value ≥ 0.5 becomes shadow_caster.
-// If no light sets castsShadow, shadow_caster = max_lights (sentinel: no shadow).
+// CSV[14] (castsShadow): first directional (type=0) or spot (type=2) light with
+// value ≥ 0.5 becomes shadow_caster.  Point lights (type=1) flagged castsShadow
+// are skipped — point-light shadows are deferred to a future slice.
+// If no valid caster is found, shadow_caster = max_lights (sentinel: no shadow).
 // Tolerant: parse errors for a token leave that field at 0; extra fields ignored.
 fn parseLights(inst: *Inst, s: []const u8) void {
     const max_l = gl.command.max_lights;
@@ -734,8 +736,11 @@ fn parseLights(inst: *Inst, s: []const u8) void {
             if (fi < 14) {
                 inst.lights[base + fi] = v;
             } else {
-                // fi == 14: castsShadow
-                if (v >= 0.5 and inst.shadow_caster == max_l)
+                // fi == 14: castsShadow — only directional (0) or spot (2) are valid.
+                // Point lights (type≈1) cannot cast shadows yet; skip them.
+                const ltype = inst.lights[base + 0];
+                const is_dir_or_spot = ltype < 0.5 or ltype >= 1.5;
+                if (v >= 0.5 and inst.shadow_caster == max_l and is_dir_or_spot)
                     inst.shadow_caster = li;
             }
             fi += 1;
@@ -1173,20 +1178,17 @@ fn spotLightVp(inst: *const Inst) gl.math.Mat4 {
     const Vec3 = gl.math.Vec3;
     const base = inst.shadow_caster * 16;
     const pos = Vec3.init(inst.lights[base + 2], inst.lights[base + 3], inst.lights[base + 4]);
-    const dir = Vec3.normalize(Vec3.init(inst.lights[base + 5], inst.lights[base + 6], inst.lights[base + 7]));
+    const dir = Vec3.init(inst.lights[base + 5], inst.lights[base + 6], inst.lights[base + 7]);
     const cos_out = inst.lights[base + 13];
     // fovy = 2 * acos(cosOut). Clamp cosOut to (0,1) to avoid degenerate fov.
     const cos_out_clamped = @max(@as(f32, 0.001), @min(@as(f32, 0.9999), cos_out));
     const fovy = 2.0 * std.math.acos(cos_out_clamped);
-    const up = if (@abs(dir.y) > 0.99) Vec3.init(0, 0, 1) else Vec3.init(0, 1, 0);
-    const target = Vec3.add(pos, dir);
-    const view = gl.math.Mat4.lookAt(pos, target, up);
     // near/far: small near to avoid clipping; far from range or a large default.
+    // Ensure far > near even when range is tiny or zero (degenerate projection guard).
     const range = inst.lights[base + 11];
     const near: f32 = 0.05;
-    const far: f32 = if (range > 0) range else 50.0;
-    const proj = gl.math.Mat4.perspective(fovy, 1.0, near, far);
-    return proj.mul(view);
+    const far: f32 = @max(near * 2.0, if (range > 0) range else 50.0);
+    return gl.math.spotLightVpMat(pos, dir, fovy, near, far);
 }
 
 // ── frame ─────────────────────────────────────────────────────────────────────
