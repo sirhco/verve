@@ -5388,6 +5388,7 @@
           gl.disable(gl.SCISSOR_TEST);
           gl.viewport(0, 0, dv.getUint32(off, true), dv.getUint32(off + 4, true));
           gl.cullFace(gl.BACK);
+          st.active = null; // match end_shadow_pass pattern; prevent stale program writes
           break;
         }
         case 35: { // BIND_POINT_SHADOW — bind atlas colour tex to slot; store for receiver.
@@ -6922,6 +6923,7 @@
           st.pointShadows[handle] = {
             atlasTex,
             atlasView: atlasTex.createView(),
+            depthTex,   // kept so teardown can .destroy() both textures
             depthView: depthTex.createView(),
             w, h,
           };
@@ -7008,18 +7010,23 @@
           if (!st.encoder) st.encoder = device.createCommandEncoder();
           // Close any previous face pass before opening the next.
           if (st.pointPass) { st.pointPass.end(); st.pointPass = null; }
-          // Open a render pass over the full atlas with load="clear" (colour = far, depth = 1).
+          // WebGPU: loadOp:"clear" clears the ENTIRE attachment regardless of
+          // scissor/viewport. Only the first face (col=0,row=0) should clear —
+          // it zeros the whole atlas to (1,1,1,1) = packDist(1) ≈ far. All
+          // subsequent faces use "load" so they preserve the already-drawn tiles;
+          // setScissorRect + setViewport below restrict each draw to its own tile.
+          const isFirstFace = (col === 0 && row === 0);
           st.pointPass = st.encoder.beginRenderPass({
             colorAttachments: [{
               view: ps.atlasView,
               clearValue: { r: 1, g: 1, b: 1, a: 1 }, // 1,1,1,1 = packDist(1) ≈ far
-              loadOp: "clear",
+              loadOp: isFirstFace ? "clear" : "load",
               storeOp: "store",
             }],
             depthStencilAttachment: {
               view: ps.depthView,
               depthClearValue: 1.0,
-              depthLoadOp: "clear",
+              depthLoadOp: "clear",   // fresh depth per face (tiles don't overlap)
               depthStoreOp: "discard", // depth scratch: no need to preserve
             },
           });
@@ -7465,6 +7472,16 @@
       st.instanceBuf = null; // GPU vertex buffer for per-instance data (no .destroy — dead device)
       if (st.fogBuf) { st.fogBuf.destroy?.(); st.fogBuf = null; }
       if (st.morphBuf) { st.morphBuf.destroy?.(); st.morphBuf = null; }
+      // Destroy point-shadow atlas textures before dropping references.
+      for (const ps of st.pointShadows) {
+        if (ps) { ps.atlasTex?.destroy(); ps.depthTex?.destroy(); }
+      }
+      st.pointShadows = [];
+      if (st.pointDepthPipe) { st.pointDepthPipe.pointDepthUniform?.destroy(); st.pointDepthPipe = null; }
+      st.pointPass = null;
+      st.pointAtlasView = null;
+      st.pointLightPos = null;
+      st.pointFar = 0;
       st.morphTexView = null;
       st.pbrUniform = null;
       st.bonesBuf = null;
