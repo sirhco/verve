@@ -1165,11 +1165,38 @@ pub const compositeFragmentSrc: []const u8 =
     \\  const float a=2.51, b=0.03, c=2.43, d=0.59, e=0.14;
     \\  return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
     \\}
-    \\// AgX approximation — Filament/Hyper 3-term polynomial fit to the AgX base contrast
-    \\// curve (neutral look, sRGB primaries). Formula: y = x/(x+0.155)*1.019, applied per
-    \\// channel, then clamped. Matches the WGSL twin identically (no extra matrices/CDL).
-    \\vec3 agx_approx(vec3 x) {
-    \\  return clamp(x / (x + 0.155) * 1.019, 0.0, 1.0);
+    \\// Minimal AgX tone-mapper (Troy Sobotka / Filament).  This is the same
+    \\// approximation that underlies three.js AgXToneMapping (r160+).
+    \\// Steps: (1) linear sRGB → AgX log via input matrix; (2) log2-encode and
+    \\// normalise over [-12.47393, 4.026069]; (3) 7th-order per-channel contrast
+    \\// polynomial; (4) AgX output (inverse) matrix; (5) EOTF pow(·,2.2).
+    \\// GLSL and WGSL twins share byte-identical matrices and coefficients.
+    \\vec3 agxDefaultContrastApprox(vec3 x) {
+    \\  vec3 x2 = x * x; vec3 x4 = x2 * x2;
+    \\  return -0.00232 + x * (0.1191 + x * (0.4298 + x * (-6.868 +
+    \\    x * (31.96 + x * (-40.14 + x * 15.5)))));
+    \\}
+    \\vec3 agx(vec3 v) {
+    \\  // (1) input matrix: linear sRGB -> AgX log space
+    \\  mat3 agxMat = mat3(
+    \\    0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+    \\    0.0784335999999992, 0.878468636469772, 0.0784336,
+    \\    0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+    \\  vec3 LOG2_MIN = vec3(-12.47393); vec3 LOG2_MAX = vec3(4.026069);
+    \\  v = agxMat * v;
+    \\  // (2) log2-encode + normalise to [0,1]
+    \\  v = clamp(log2(max(v, vec3(1e-10))), LOG2_MIN, LOG2_MAX);
+    \\  v = (v - LOG2_MIN) / (LOG2_MAX - LOG2_MIN);
+    \\  // (3) per-channel contrast polynomial
+    \\  v = agxDefaultContrastApprox(clamp(v, 0.0, 1.0));
+    \\  // (4) output matrix: AgX log space -> linear sRGB
+    \\  mat3 agxMatInv = mat3(
+    \\    1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+    \\    -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+    \\    -0.0990297440797205, -0.099043597298276, 1.15107367264116);
+    \\  v = agxMatInv * v;
+    \\  // (5) EOTF: AgX output gamma
+    \\  return pow(clamp(v, vec3(0.0), vec3(1.0)), vec3(2.2));
     \\}
     \\vec3 hable(vec3 x) {
     \\  const float A=0.15, B=0.50, C=0.10, D=0.20, E=0.02, F=0.30;
@@ -1191,7 +1218,7 @@ pub const compositeFragmentSrc: []const u8 =
     \\  } else if (op == 3) {
     \\    rgb = aces(hdr);
     \\  } else if (op == 4) {
-    \\    rgb = agx_approx(hdr);
+    \\    rgb = agx(hdr);
     \\  } else {
     \\    const float W = 11.2;
     \\    vec3 x = hable(hdr * 2.0) / hable(vec3(W));
@@ -2226,11 +2253,38 @@ pub fn wgslComposite() []const u8 {
     \\  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
     \\  return clamp((x*(a*x+b))/(x*(c*x+d)+e), vec3<f32>(0.0), vec3<f32>(1.0));
     \\}
-    \\// AgX approximation — Filament/Hyper 3-term polynomial fit to the AgX base contrast
-    \\// curve (neutral look, sRGB primaries). Formula: y = x/(x+0.155)*1.019, per channel,
-    \\// clamped. Identical math to the GLSL twin.
-    \\fn agx_approx(x: vec3<f32>) -> vec3<f32> {
-    \\  return clamp(x / (x + vec3<f32>(0.155)) * 1.019, vec3<f32>(0.0), vec3<f32>(1.0));
+    \\// Minimal AgX tone-mapper (Troy Sobotka / Filament).  This is the same
+    \\// approximation that underlies three.js AgXToneMapping (r160+).
+    \\// Steps: (1) linear sRGB → AgX log via input matrix; (2) log2-encode and
+    \\// normalise over [-12.47393, 4.026069]; (3) 7th-order per-channel contrast
+    \\// polynomial; (4) AgX output (inverse) matrix; (5) EOTF pow(·,2.2).
+    \\// GLSL and WGSL twins share byte-identical matrices and coefficients.
+    \\fn agxDefaultContrastApprox(x: vec3<f32>) -> vec3<f32> {
+    \\  return -0.00232 + x * (0.1191 + x * (0.4298 + x * (-6.868 +
+    \\    x * (31.96 + x * (-40.14 + x * 15.5)))));
+    \\}
+    \\fn agx(v_in: vec3<f32>) -> vec3<f32> {
+    \\  // (1) input matrix: linear sRGB -> AgX log space
+    \\  let agxMat = mat3x3<f32>(
+    \\    vec3<f32>(0.842479062253094, 0.0423282422610123, 0.0423756549057051),
+    \\    vec3<f32>(0.0784335999999992, 0.878468636469772, 0.0784336),
+    \\    vec3<f32>(0.0792237451477643, 0.0791661274605434, 0.879142973793104));
+    \\  let LOG2_MIN = vec3<f32>(-12.47393);
+    \\  let LOG2_MAX = vec3<f32>(4.026069);
+    \\  var v = agxMat * v_in;
+    \\  // (2) log2-encode + normalise to [0,1]
+    \\  v = clamp(log2(max(v, vec3<f32>(1e-10))), LOG2_MIN, LOG2_MAX);
+    \\  v = (v - LOG2_MIN) / (LOG2_MAX - LOG2_MIN);
+    \\  // (3) per-channel contrast polynomial
+    \\  v = agxDefaultContrastApprox(clamp(v, vec3<f32>(0.0), vec3<f32>(1.0)));
+    \\  // (4) output matrix: AgX log space -> linear sRGB
+    \\  let agxMatInv = mat3x3<f32>(
+    \\    vec3<f32>(1.19687900512017, -0.0528968517574562, -0.0529716355144438),
+    \\    vec3<f32>(-0.0980208811401368, 1.15190312990417, -0.0980434501171241),
+    \\    vec3<f32>(-0.0990297440797205, -0.099043597298276, 1.15107367264116));
+    \\  v = agxMatInv * v;
+    \\  // (5) EOTF: AgX output gamma
+    \\  return pow(clamp(v, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
     \\}
     \\fn hable(x: vec3<f32>) -> vec3<f32> {
     \\  let A = 0.15; let B = 0.50; let C = 0.10; let D = 0.20; let E = 0.02; let F = 0.30;
@@ -2252,7 +2306,7 @@ pub fn wgslComposite() []const u8 {
     \\  } else if (op == 3) {
     \\    rgb = aces(hdr);
     \\  } else if (op == 4) {
-    \\    rgb = agx_approx(hdr);
+    \\    rgb = agx(hdr);
     \\  } else {
     \\    let W = 11.2;
     \\    let x = hable(hdr * 2.0) / hable(vec3<f32>(W));
@@ -2318,7 +2372,9 @@ pub const ToneMap = enum(u8) {
     /// ACES (default): Hill fit (a=2.51,b=0.03,c=2.43,d=0.59,e=0.14), NO gamma.
     /// This is byte-identical to the pre-slice-2 composite output.
     aces = 3,
-    /// AgX: Filament/Hyper approximation (see composite shader comment for formula).
+    /// AgX: minimal AgX approximation (Sobotka/Filament).  Input matrix → log2 encode
+    /// over [-12.47393, 4.026069] → 7th-order contrast polynomial → output matrix →
+    /// pow(·,2.2) EOTF.  This is the basis for three.js `AgXToneMapping` (r160+).
     agx = 4,
     /// Uncharted2/Hable filmic: Hable curve, exposure-bias 2, white-scale W=11.2, gamma 2.2.
     uncharted2 = 5,
@@ -4523,7 +4579,8 @@ test "golden: post shader sources frozen after slice 2 (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xefa46fcd8c5003b6), fnv64(wgslBright()));
     try testing.expectEqual(@as(u64, 0xb93270d3619361ca), fnv64(wgslBlur()));
     try testing.expectEqual(@as(u64, 0xe8ac45e2d1276dfd), fnv64(wgslFxaa()));
-    // Composite goldens UPDATED for slice 2 (6 operators + vignette — intentional change):
-    try testing.expectEqual(@as(u64, 0x8438dca8f1889dbb), fnv64(compositeFragmentSrc));
-    try testing.expectEqual(@as(u64, 0x4d0aafe889f67c81), fnv64(wgslComposite()));
+    // Composite goldens UPDATED for AgX fix (real Sobotka/Filament minimal AgX —
+    // replaces the mislabeled Reinhard-variant that shipped in commit ebe2373):
+    try testing.expectEqual(@as(u64, 0xeaacf23156d5b2bd), fnv64(compositeFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x0d62d18cbf80d694), fnv64(wgslComposite()));
 }
