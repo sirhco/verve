@@ -34,6 +34,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/gl-multishadow", renderGlMultiShadow),
     verve.Route.init("/gl-csm", renderGlCsm),
     verve.Route.init("/gl-area", renderGlArea),
+    verve.Route.init("/gl-tonemap", renderGlTonemap),
     verve.Route.init("/push-multi", renderPushMulti),
     verve.Route.init("/todos", renderTodos),
     verve.Route.init("/work/:slug", renderWorkDetail),
@@ -176,6 +177,11 @@ fn renderGlCsm(ctx: *verve.Context) !*verve.Node {
 
 fn renderGlArea(ctx: *verve.Context) !*verve.Node {
     const body = try components.glSceneArea(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderGlTonemap(ctx: *verve.Context) !*verve.Node {
+    const body = try components.glTonemap(ctx);
     return components.page(ctx, body);
 }
 

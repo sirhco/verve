@@ -1155,16 +1155,52 @@ pub const compositeFragmentSrc: []const u8 =
     \\precision highp float;
     \\in vec2 v_uv;
     \\out vec4 frag;
-    \\uniform sampler2D u_tex0; // scene HDR
-    \\uniform sampler2D u_tex1; // bloom
-    \\uniform float u_intensity;
+    \\uniform sampler2D u_tex0;      // scene HDR
+    \\uniform sampler2D u_tex1;      // bloom
+    \\uniform float u_intensity;     // bloom intensity   (p_comp[0])
+    \\uniform float u_tonemap;       // operator index    (p_comp[1])
+    \\uniform float u_vig_intensity; // vignette strength (p_comp[2])
+    \\uniform float u_vig_radius;    // vignette radius   (p_comp[3])
     \\vec3 aces(vec3 x) {
     \\  const float a=2.51, b=0.03, c=2.43, d=0.59, e=0.14;
     \\  return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
     \\}
+    \\// AgX approximation — Filament/Hyper 3-term polynomial fit to the AgX base contrast
+    \\// curve (neutral look, sRGB primaries). Formula: y = x/(x+0.155)*1.019, applied per
+    \\// channel, then clamped. Matches the WGSL twin identically (no extra matrices/CDL).
+    \\vec3 agx_approx(vec3 x) {
+    \\  return clamp(x / (x + 0.155) * 1.019, 0.0, 1.0);
+    \\}
+    \\vec3 hable(vec3 x) {
+    \\  const float A=0.15, B=0.50, C=0.10, D=0.20, E=0.02, F=0.30;
+    \\  return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
+    \\}
     \\void main() {
     \\  vec3 hdr = texture(u_tex0, v_uv).rgb + u_intensity * texture(u_tex1, v_uv).rgb;
-    \\  frag = vec4(aces(hdr), 1.0);
+    \\  int op = int(u_tonemap + 0.5);
+    \\  vec3 rgb;
+    \\  if (op == 0) {
+    \\    rgb = pow(clamp(hdr, 0.0, 1.0), vec3(1.0/2.2));
+    \\  } else if (op == 1) {
+    \\    vec3 x = hdr / (1.0 + hdr);
+    \\    rgb = pow(x, vec3(1.0/2.2));
+    \\  } else if (op == 2) {
+    \\    const float W = 4.0;
+    \\    vec3 x = hdr * (1.0 + hdr/(W*W)) / (1.0 + hdr);
+    \\    rgb = pow(x, vec3(1.0/2.2));
+    \\  } else if (op == 3) {
+    \\    rgb = aces(hdr);
+    \\  } else if (op == 4) {
+    \\    rgb = agx_approx(hdr);
+    \\  } else {
+    \\    const float W = 11.2;
+    \\    vec3 x = hable(hdr * 2.0) / hable(vec3(W));
+    \\    rgb = pow(x, vec3(1.0/2.2));
+    \\  }
+    \\  float d = length(v_uv - vec2(0.5));
+    \\  float v = smoothstep(u_vig_radius, u_vig_radius - 0.45, d);
+    \\  rgb *= mix(1.0, v, u_vig_intensity);
+    \\  frag = vec4(rgb, 1.0);
     \\}
 ;
 
@@ -2179,7 +2215,9 @@ pub fn wgslComposite() []const u8 {
     \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
     \\  return o;
     \\}
-    \\struct Params { intensity: f32, _pad: vec3<f32> };
+    \\// Params (16B, one vec4): intensity=bloom blend, tonemap=op index,
+    \\// vig_intensity=vignette strength, vig_radius=vignette falloff start.
+    \\struct Params { intensity: f32, tonemap: f32, vig_intensity: f32, vig_radius: f32 };
     \\@group(0) @binding(0) var<uniform> P: Params;
     \\@group(1) @binding(0) var samp: sampler;
     \\@group(1) @binding(1) var tex0: texture_2d<f32>;
@@ -2188,9 +2226,42 @@ pub fn wgslComposite() []const u8 {
     \\  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
     \\  return clamp((x*(a*x+b))/(x*(c*x+d)+e), vec3<f32>(0.0), vec3<f32>(1.0));
     \\}
+    \\// AgX approximation — Filament/Hyper 3-term polynomial fit to the AgX base contrast
+    \\// curve (neutral look, sRGB primaries). Formula: y = x/(x+0.155)*1.019, per channel,
+    \\// clamped. Identical math to the GLSL twin.
+    \\fn agx_approx(x: vec3<f32>) -> vec3<f32> {
+    \\  return clamp(x / (x + vec3<f32>(0.155)) * 1.019, vec3<f32>(0.0), vec3<f32>(1.0));
+    \\}
+    \\fn hable(x: vec3<f32>) -> vec3<f32> {
+    \\  let A = 0.15; let B = 0.50; let C = 0.10; let D = 0.20; let E = 0.02; let F = 0.30;
+    \\  return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
+    \\}
     \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     \\  let hdr = textureSample(tex0, samp, uv).rgb + P.intensity * textureSample(tex1, samp, uv).rgb;
-    \\  return vec4<f32>(aces(hdr), 1.0);
+    \\  let op = i32(P.tonemap + 0.5);
+    \\  var rgb: vec3<f32>;
+    \\  if (op == 0) {
+    \\    rgb = pow(clamp(hdr, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0/2.2));
+    \\  } else if (op == 1) {
+    \\    let x = hdr / (vec3<f32>(1.0) + hdr);
+    \\    rgb = pow(x, vec3<f32>(1.0/2.2));
+    \\  } else if (op == 2) {
+    \\    let W = 4.0;
+    \\    let x = hdr * (vec3<f32>(1.0) + hdr/(W*W)) / (vec3<f32>(1.0) + hdr);
+    \\    rgb = pow(x, vec3<f32>(1.0/2.2));
+    \\  } else if (op == 3) {
+    \\    rgb = aces(hdr);
+    \\  } else if (op == 4) {
+    \\    rgb = agx_approx(hdr);
+    \\  } else {
+    \\    let W = 11.2;
+    \\    let x = hable(hdr * 2.0) / hable(vec3<f32>(W));
+    \\    rgb = pow(x, vec3<f32>(1.0/2.2));
+    \\  }
+    \\  let d = length(uv - vec2<f32>(0.5));
+    \\  let v = smoothstep(P.vig_radius, P.vig_radius - 0.45, d);
+    \\  rgb = rgb * mix(1.0, v, P.vig_intensity);
+    \\  return vec4<f32>(rgb, 1.0);
     \\}
     ;
 }
@@ -2234,6 +2305,33 @@ pub fn wgslFxaa() []const u8 {
 
 // ── Task 3: Post-process effect-graph structs ────────────────────────
 
+/// Tone-mapping operator applied in the composite stage (image-quality slice 2).
+/// These integer values are the wire contract with the composite shader
+/// (`let op = i32(P.tonemap + 0.5)` selects the branch).
+pub const ToneMap = enum(u8) {
+    /// Linear/None: `pow(clamp(hdr,0,1), 1/2.2)` — clips high values to white.
+    linear = 0,
+    /// Reinhard: `x = hdr/(1+hdr)`, then gamma 2.2.
+    reinhard = 1,
+    /// Reinhard-extended: `x = hdr*(1+hdr/(W*W))/(1+hdr)`, W=4, then gamma 2.2.
+    reinhard_ext = 2,
+    /// ACES (default): Hill fit (a=2.51,b=0.03,c=2.43,d=0.59,e=0.14), NO gamma.
+    /// This is byte-identical to the pre-slice-2 composite output.
+    aces = 3,
+    /// AgX: Filament/Hyper approximation (see composite shader comment for formula).
+    agx = 4,
+    /// Uncharted2/Hable filmic: Hable curve, exposure-bias 2, white-scale W=11.2, gamma 2.2.
+    uncharted2 = 5,
+};
+
+/// Optional vignette applied after tone-mapping in the composite shader.
+pub const Vignette = struct {
+    /// 0 = off, 1 = full effect.
+    intensity: f32 = 0.0,
+    /// Distance from center at which vignette starts; typical 0.5–0.8.
+    radius: f32 = 0.75,
+};
+
 /// Bloom configuration for the post-process pass.
 pub const Bloom = struct {
     /// Luminance threshold above which pixels contribute to bloom.
@@ -2253,6 +2351,12 @@ pub const PostProcess = struct {
     /// vs slot (fs slot 0/0) for the WebGPU backend, mirroring how GlScene/GlSkin
     /// select WGSL vs GLSL via `use_webgpu`. Default (false) emits GLSL.
     webgpu: bool = false,
+    /// Tone-mapping operator applied in the composite stage.
+    /// Default `.aces` reproduces pre-slice-2 output byte-for-byte.
+    tonemap: ToneMap = .aces,
+    /// Optional vignette applied after tone-mapping.
+    /// `null` = off (vig_intensity=0 in the shader, no effect).
+    vignette: ?Vignette = null,
 };
 
 /// Persistent state owned by the island (one static per GL canvas island).
@@ -2281,7 +2385,7 @@ pub const PostCtx = struct {
     p_bright: [4]f32 = .{ 0, 0, 0, 0 }, // [threshold, 0, 0, 0]
     p_blur_h: [4]f32 = .{ 0, 0, 1, 0 }, // [texel.x, texel.y, dir.x=1, dir.y=0]
     p_blur_v: [4]f32 = .{ 0, 0, 0, 1 }, // [texel.x, texel.y, dir.x=0, dir.y=1]
-    p_comp: [4]f32 = .{ 0, 0, 0, 0 }, // [intensity, 0, 0, 0]
+    p_comp: [4]f32 = .{ 0, 0, 0, 0 }, // [intensity, tonemap, vig_intensity, vig_radius]
     p_fxaa: [4]f32 = .{ 0, 0, 0, 0 }, // [texel.x, texel.y, 0, 0]
 };
 
@@ -2812,6 +2916,13 @@ pub const Encoder = struct {
         const fw: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, w)));
         const fh: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, h)));
 
+        // Composite params: [intensity, tonemap_index, vig_intensity, vig_radius].
+        // Written here so both the bloom and no-bloom paths carry all 4 fields.
+        const vig = ctx.opts.vignette orelse Vignette{};
+        ctx.p_comp[1] = @as(f32, @floatFromInt(@intFromEnum(ctx.opts.tonemap)));
+        ctx.p_comp[2] = vig.intensity;
+        ctx.p_comp[3] = vig.radius;
+
         if (ctx.opts.bloom) |b| {
             // bright-pass: scene_hdr -> bloom_a (½-res)
             ctx.p_bright[0] = b.threshold;
@@ -2834,9 +2945,9 @@ pub const Encoder = struct {
         }
 
         if (ctx.opts.fxaa) {
-            // composite (scene_hdr + bloom_a) -> ldr offscreen
+            // composite (scene_hdr + bloom_a) -> ldr offscreen; 4 params = all of p_comp.
             self.beginOffscreenPass(PostCtx.h_ldr, .{ 0, 0, 0, 1 }, clear_flag_color);
-            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 1);
+            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 4);
             self.endOffscreenPass();
             // fxaa: ldr -> canvas
             ctx.p_fxaa = .{ fw, fh, 0, 0 };
@@ -2844,9 +2955,9 @@ pub const Encoder = struct {
             self.drawFullscreenQuad(PostCtx.sh_fxaa, PostCtx.h_ldr, 0, @truncate(@intFromPtr(&ctx.p_fxaa)), 2);
             self.endFrame();
         } else {
-            // composite straight to canvas
+            // composite straight to canvas; 4 params = all of p_comp.
             self.beginFrame(.{ 0, 0, 0, 1 }, w, h);
-            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 1);
+            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 4);
             self.endFrame();
         }
     }
@@ -3570,16 +3681,14 @@ test "fog WGSL: fog binding + mix; non-fog frozen" {
 
 test "golden: post shader sources frozen (FNV-1a-64)" {
     // Frozen from first green run — a change here = deliberate shader contract bump.
-    // GLSL
+    // GLSL (composite intentionally changed in slice 2 — see slice-2 golden test below)
     try testing.expectEqual(@as(u64, 0xd8e25fe0c5f0c5c3), fnv64(fullscreenVertexSrc));
     try testing.expectEqual(@as(u64, 0xceff6b2f105a92ec), fnv64(brightFragmentSrc));
     try testing.expectEqual(@as(u64, 0x221d8b95dd9492ba), fnv64(blurFragmentSrc));
-    try testing.expectEqual(@as(u64, 0x0ac71cffb32f57ad), fnv64(compositeFragmentSrc));
     try testing.expectEqual(@as(u64, 0x9d052976fb0b2105), fnv64(fxaaFragmentSrc));
-    // WGSL
+    // WGSL (composite intentionally changed in slice 2 — see slice-2 golden test below)
     try testing.expectEqual(@as(u64, 0xefa46fcd8c5003b6), fnv64(wgslBright()));
     try testing.expectEqual(@as(u64, 0xb93270d3619361ca), fnv64(wgslBlur()));
-    try testing.expectEqual(@as(u64, 0xdb360b028579d531), fnv64(wgslComposite()));
     try testing.expectEqual(@as(u64, 0xe8ac45e2d1276dfd), fnv64(wgslFxaa()));
     // linear-output PBR variant (omits tonemap+gamma; post composite pass tonemaps instead)
     // wgslPbr(variant_linear_output) bumped T3: lights 8→16 vec4, 4-vec4 loop.
@@ -4295,4 +4404,126 @@ test "non-PBR shaders unchanged by Slice 3 (no area/LTC leakage)" {
     try testing.expect(std.mem.indexOf(u8, depthVertexSrc(), "u_ltc") == null);
     // Frozen non-pbr hashes (must not move).
     try testing.expectEqual(@as(u64, 0xa159f35e040f6f8f), fnv64(wgslUnlit));
+}
+
+// ── Image-quality slice 2: tone-mapping + vignette ───────────────────────────
+
+test "ToneMap enum integer values (wire contract)" {
+    // These integer values are the wire contract between Zig and the composite shader.
+    // Changing any of them is a breaking change.
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(ToneMap.linear));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(ToneMap.reinhard));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(ToneMap.reinhard_ext));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(ToneMap.aces));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(ToneMap.agx));
+    try testing.expectEqual(@as(u8, 5), @intFromEnum(ToneMap.uncharted2));
+}
+
+test "PostProcess defaults: tonemap=aces, vignette=null" {
+    const pp = PostProcess{};
+    try testing.expectEqual(ToneMap.aces, pp.tonemap);
+    try testing.expect(pp.vignette == null);
+}
+
+test "Vignette default values" {
+    const v = Vignette{};
+    try testing.expectEqual(@as(f32, 0.0), v.intensity);
+    try testing.expectEqual(@as(f32, 0.75), v.radius);
+}
+
+test "composite param layout: 4 floats [intensity, tonemap, vig_intensity, vig_radius]" {
+    // p_comp is [4]f32; verify endPostProcess sets all 4 fields.
+    var buf: [4096]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = PostCtx{};
+    enc.beginPostProcess(&ctx, .{
+        .bloom = .{ .intensity = 0.6 },
+        .tonemap = .reinhard,
+        .vignette = .{ .intensity = 0.5, .radius = 0.8 },
+    }, 800, 600);
+    enc.endPostProcess(&ctx);
+    // p_comp[0] = bloom intensity, [1] = tonemap index, [2] = vig_intensity, [3] = vig_radius.
+    try testing.expectApproxEqAbs(@as(f32, 0.6), ctx.p_comp[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), ctx.p_comp[1], 1e-6); // reinhard = 1
+    try testing.expectApproxEqAbs(@as(f32, 0.5), ctx.p_comp[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), ctx.p_comp[3], 1e-6);
+}
+
+test "composite param: aces default writes index 3.0" {
+    var buf: [4096]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = PostCtx{};
+    enc.beginPostProcess(&ctx, .{ .bloom = .{ .intensity = 0.8 } }, 800, 600);
+    enc.endPostProcess(&ctx);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), ctx.p_comp[1], 1e-6); // aces = 3
+    try testing.expectApproxEqAbs(@as(f32, 0.0), ctx.p_comp[2], 1e-6); // no vignette
+}
+
+test "composite param: no-bloom path still writes tonemap + vignette" {
+    var buf: [4096]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = PostCtx{};
+    enc.beginPostProcess(&ctx, .{
+        .bloom = null,
+        .tonemap = .agx,
+        .vignette = .{ .intensity = 1.0, .radius = 0.6 },
+    }, 800, 600);
+    enc.endPostProcess(&ctx);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), ctx.p_comp[0], 1e-6); // no bloom
+    try testing.expectApproxEqAbs(@as(f32, 4.0), ctx.p_comp[1], 1e-6); // agx = 4
+    try testing.expectApproxEqAbs(@as(f32, 1.0), ctx.p_comp[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), ctx.p_comp[3], 1e-6);
+}
+
+test "WGSL composite: all 6 operator branches + vignette + struct Params repacked" {
+    const src = wgslComposite();
+    // Repacked Params struct (vec4, 16B).
+    try testing.expect(std.mem.indexOf(u8, src, "struct Params { intensity: f32, tonemap: f32, vig_intensity: f32, vig_radius: f32 }") != null);
+    // Operator dispatch.
+    try testing.expect(std.mem.indexOf(u8, src, "let op = i32(P.tonemap + 0.5)") != null);
+    // Each operator branch.
+    try testing.expect(std.mem.indexOf(u8, src, "if (op == 0)") != null); // linear
+    try testing.expect(std.mem.indexOf(u8, src, "else if (op == 1)") != null); // reinhard
+    try testing.expect(std.mem.indexOf(u8, src, "else if (op == 2)") != null); // reinhard_ext
+    try testing.expect(std.mem.indexOf(u8, src, "else if (op == 3)") != null); // aces (default)
+    try testing.expect(std.mem.indexOf(u8, src, "else if (op == 4)") != null); // agx
+    // ACES branch contains the original coefficients (byte-identical guard).
+    try testing.expect(std.mem.indexOf(u8, src, "let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;") != null);
+    // Vignette applied after tonemap.
+    try testing.expect(std.mem.indexOf(u8, src, "vig_radius") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "smoothstep") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "vig_intensity") != null);
+}
+
+test "GLSL composite: all 6 operators + vignette + u_tonemap + u_vig_intensity + u_vig_radius" {
+    const src = compositeFragmentSrc;
+    try testing.expect(std.mem.indexOf(u8, src, "u_tonemap") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "u_vig_intensity") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "u_vig_radius") != null);
+    // All 6 operator branches.
+    try testing.expect(std.mem.indexOf(u8, src, "op == 0") != null); // linear
+    try testing.expect(std.mem.indexOf(u8, src, "op == 1") != null); // reinhard
+    try testing.expect(std.mem.indexOf(u8, src, "op == 2") != null); // reinhard_ext
+    try testing.expect(std.mem.indexOf(u8, src, "op == 3") != null); // aces
+    try testing.expect(std.mem.indexOf(u8, src, "op == 4") != null); // agx
+    // ACES coefficients unchanged.
+    try testing.expect(std.mem.indexOf(u8, src, "2.51") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "2.43") != null);
+    // Vignette.
+    try testing.expect(std.mem.indexOf(u8, src, "smoothstep") != null);
+}
+
+test "golden: post shader sources frozen after slice 2 (FNV-1a-64)" {
+    // Composite hashes changed intentionally (new operators + vignette).
+    // Non-composite post shaders must NOT change.
+    try testing.expectEqual(@as(u64, 0xd8e25fe0c5f0c5c3), fnv64(fullscreenVertexSrc));
+    try testing.expectEqual(@as(u64, 0xceff6b2f105a92ec), fnv64(brightFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x221d8b95dd9492ba), fnv64(blurFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x9d052976fb0b2105), fnv64(fxaaFragmentSrc));
+    try testing.expectEqual(@as(u64, 0xefa46fcd8c5003b6), fnv64(wgslBright()));
+    try testing.expectEqual(@as(u64, 0xb93270d3619361ca), fnv64(wgslBlur()));
+    try testing.expectEqual(@as(u64, 0xe8ac45e2d1276dfd), fnv64(wgslFxaa()));
+    // Composite goldens UPDATED for slice 2 (6 operators + vignette — intentional change):
+    try testing.expectEqual(@as(u64, 0x8438dca8f1889dbb), fnv64(compositeFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x4d0aafe889f67c81), fnv64(wgslComposite()));
 }

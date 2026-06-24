@@ -199,3 +199,13 @@ pub const GlScene = struct {
         pick_export_names: []const []const u8, // P8 onPickExport: per-slot DOM event name ("" = none)
     };
 };
+
+/// verve.gl tone-mapping + vignette demo (/gl-tonemap, image-quality slice 2).
+/// Renders a bright emissive PBR cube through a selectable composite tone-mapper
+/// (Linear/Reinhard/Reinhard-ext/ACES/AgX/Uncharted2) and optional vignette.
+/// Default operator is ACES — `/gl-post` appearance is unchanged.
+/// Controls: Cycle Tone-mapper / Toggle Vignette / Freeze.
+/// Source: `src/client/islands/GlTonemap.zig`.
+pub const GlTonemap = struct {
+    pub const props_schema: []const u8 = "{}";
+};

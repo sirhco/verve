@@ -1162,6 +1162,49 @@ pub fn glPost(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl tone-mapping + vignette demo — /gl-tonemap (image-quality slice 2).
+/// Renders a bright emissive PBR cube through a selectable composite tone-mapper.
+/// Cycle Tone-mapper cycles through 6 operators (Linear/Reinhard/Reinhard-ext/ACES/AgX/Uncharted2).
+/// Vignette toggle adds a smoothstep corner-darkening pass after tone-mapping.
+/// Default operator is ACES so the initial appearance matches /gl-post.
+pub fn glTonemap(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "gltonemap-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#0a0b0f;border-radius:8px;"),
+    });
+
+    // Controls wired to the GlTonemap chunk's no-arg exports via z-on-click.
+    // Must live INSIDE the island subtree so events route to this chunk.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "gltonemap_cycle_tonemap").text("Cycle Tone-mapper"),
+        ctx.el("button").attr("z-on-click", "gltonemap_toggle_vignette").text("Toggle Vignette"),
+        ctx.el("button").attr("z-on-click", "gltonemap_freeze").text("Freeze"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Emissive cube — selectable tone-mapper + vignette"),
+        canvas,
+        controls,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlTonemap" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — tone-mapping"),
+        ctx.p().text("A bright emissive PBR cube rendered through the full post-processing " ++
+            "pipeline with a selectable tone-mapping operator. The Cycle Tone-mapper button " ++
+            "steps through: Linear (clips to white), Reinhard (soft rolloff), " ++
+            "Reinhard-extended (brighter shoulder), ACES (filmic S-curve, default), " ++
+            "AgX (neutral, perceptually uniform), Uncharted2/Hable (crushed blacks, filmic). " ++
+            "Toggle Vignette darkens the corners with a smoothstep falloff applied AFTER " ++
+            "tone-mapping. Default (ACES) reproduces the /gl-post appearance exactly. " ++
+            "Renders through WebGPU when available, else WebGL2."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a

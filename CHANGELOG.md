@@ -4,6 +4,54 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] - 2026-06-24
+
+### Added
+
+- **gl selectable tone-mapping operators + vignette (image-quality slice 2)**
+  (`src/core/gl/command.zig`, `src/bridge/verve.js`,
+  `src/client/islands/GlTonemap.zig`, `src/app/components.zig`):
+  the post-processing composite stage now supports 6 tone-mapping operators
+  and an optional vignette, all packed into the existing 16-byte composite
+  params slot — no buffer-size change, no new wire tags.
+
+  **New public API (`src/core/gl/command.zig`)**:
+  - `ToneMap` enum: `linear=0`, `reinhard=1`, `reinhard_ext=2`, `aces=3`
+    (default), `agx=4`, `uncharted2=5`. Wire contract — values are the shader
+    branch selector (`let op = i32(P.tonemap + 0.5)`).
+  - `Vignette` struct: `{ intensity: f32 = 0.0, radius: f32 = 0.75 }`.
+    Applied AFTER tone-mapping via `smoothstep(radius, radius-0.45, d)`.
+  - `PostProcess` gains `tonemap: ToneMap = .aces` and `vignette: ?Vignette = null`.
+  - `PostCtx.p_comp` repacked: `[intensity, tonemap, vig_intensity, vig_radius]`
+    (was `[intensity, 0, 0, 0]`). `endPostProcess` writes all 4 every frame.
+
+  **Operators** (identical math, both backends):
+  - `0` Linear: `pow(clamp(hdr,0,1), 1/2.2)` — clips highlights to white.
+  - `1` Reinhard: `x=hdr/(1+hdr)`, then gamma 2.2.
+  - `2` Reinhard-extended: `x=hdr*(1+hdr/(W*W))/(1+hdr)`, W=4, gamma 2.2.
+  - `3` ACES (default): Hill fit `(a=2.51,b=0.03,c=2.43,d=0.59,e=0.14)`,
+    **no gamma** — byte-identical to the pre-slice-2 composite output.
+    `/gl-post` appearance is unchanged.
+  - `4` AgX: Filament/Hyper 3-term polynomial approximation
+    `y = clamp(x/(x+0.155)*1.019, 0, 1)` per channel. Neutral look,
+    no hue-shift at highlights, no extra matrix transforms.
+  - `5` Uncharted2/Hable: Hable curve, exposure-bias 2.0, white-scale W=11.2,
+    then gamma 2.2. Classic filmic shoulder.
+
+  **Bridge** (`src/bridge/verve.js`):
+  - `applyPostParams` extended: reads `p[1]=tonemap`, `p[2]=vig_intensity`,
+    `p[3]=vig_radius` and applies to `u_tonemap`/`u_vig_intensity`/`u_vig_radius`
+    (null-guarded; non-composite post shaders ignore them).
+  - variant_post shader create path: caches `uTonemap`, `uVigIntensity`,
+    `uVigRadius` uniform locations.
+  - WebGPU path already reads up to 4 floats; no size change needed.
+
+  **Demo** (`/gl-tonemap`): bright emissive PBR cube (emissive factor 4.0,
+  two lights) through bloom+FXAA+tonemap+vignette. Controls:
+  - "Cycle Tone-mapper" — steps through all 6 operators (0→5→0).
+  - "Toggle Vignette" — smoothstep corner darkening on/off.
+  - "Freeze" — pins orbit for stable CDP frames.
+
 ## [0.12.0] - 2026-06-24
 
 ### Added

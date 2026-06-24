@@ -5274,12 +5274,16 @@
   // Post-process param upload: maps the f32 param array to whichever uniforms
   // exist on the program. Unused locations are null and silently skipped.
   // bright: p[0]=threshold; blur: p[0..1]=texel, p[2..3]=dir;
-  // composite: p[0]=intensity; fxaa: p[0..1]=texel.
+  // composite: p[0]=intensity, p[1]=tonemap, p[2]=vig_intensity, p[3]=vig_radius;
+  // fxaa: p[0..1]=texel.
   const applyPostParams = (gl, sh, dv, ptr, count) => {
     const p = [];
     for (let i = 0; i < count; i++) p.push(dv.getFloat32(ptr + i * 4, true));
     if (sh.uThreshold && count >= 1) gl.uniform1f(sh.uThreshold, p[0]);
     if (sh.uIntensity && count >= 1) gl.uniform1f(sh.uIntensity, p[0]);
+    if (sh.uTonemap && count >= 2) gl.uniform1f(sh.uTonemap, p[1]);
+    if (sh.uVigIntensity && count >= 3) gl.uniform1f(sh.uVigIntensity, p[2]);
+    if (sh.uVigRadius && count >= 4) gl.uniform1f(sh.uVigRadius, p[3]);
     if (sh.uTexel && count >= 2) gl.uniform2f(sh.uTexel, p[0], p[1]);
     if (sh.uDir && count >= 4) gl.uniform2f(sh.uDir, p[2], p[3]);
   };
@@ -5403,6 +5407,10 @@
             sh.uTexel = gl.getUniformLocation(prog, "u_texel");
             sh.uDir = gl.getUniformLocation(prog, "u_dir");
             sh.uIntensity = gl.getUniformLocation(prog, "u_intensity");
+            // composite-only: tone-mapping operator + vignette (slice 2)
+            sh.uTonemap = gl.getUniformLocation(prog, "u_tonemap");
+            sh.uVigIntensity = gl.getUniformLocation(prog, "u_vig_intensity");
+            sh.uVigRadius = gl.getUniformLocation(prog, "u_vig_radius");
           }
           if (variant & 0x10000) { // variant_prepass (1<<16): mvp + mv (view·model)
             // sh.mvp ("u_mvp") is already resolved above; cache the second matrix.
