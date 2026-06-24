@@ -4,6 +4,19 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-06-24
+
+### Added
+
+- **gl Cascaded Shadow Maps (CSM)** (`src/core/gl/`, `src/bridge/verve.js`,
+  `src/client/islands/GlScene.zig`, `src/app/components.zig`,
+  `src/app/routes.zig`): directional shadows are split into 4 cascades fit to
+  view-frustum depth slices (practical split λ=0.5), with per-fragment cascade
+  selection + boundary blend, both backends. New `/gl-csm` demo wires a single
+  directional caster over the shadow.vmesh floor receiver (crisp near + covered
+  far), reusing the Slice-1 Freeze / Unfreeze control. Builds on the Slice-1
+  shadow atlas.
+
 ## [0.9.0] - 2026-06-24
 
 ### Added

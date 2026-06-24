@@ -342,6 +342,15 @@ const Inst = struct {
     // Caster tables: light index per slot, populated by parseLights/hydrate.
     n_2d_casters: u32 = 0,
     casters_2d: [gl.command.max_2d_casters]u32 = undefined,
+    // ── CSM (Slice 2): the directional caster is split into `cascade_count`
+    // cascades occupying 2D atlas slots 0..cascade_count-1. csm_light is its light
+    // index (-1 = no CSM caster this frame → behave like slice 1, spots/points only).
+    // cascade_splits (view-space FAR per cascade) + view_forward are PERSISTENT
+    // because set_csm points at them (deferred decode walks cmd_buf post-return).
+    csm_light: i32 = -1,
+    cascade_count: u32 = 0,
+    cascade_splits: [4]f32 = .{ 0, 0, 0, 0 },
+    view_forward: [3]f32 = .{ 0, 0, -1 },
     n_point_casters: u32 = 0,
     casters_point: [gl.command.max_point_casters]u32 = undefined,
     // True once createPointShadow has been emitted for this instance.
@@ -396,28 +405,28 @@ fn clipFix() gl.math.Mat4 {
 // the bridge walks the stream synchronously before the next frame call, so
 // instances never interleave within a tick. NOT per-instance (saves 3×4 KB).
 //
-// MULTI-CASTER WORST CASE. Every command record = 4-byte header + payload.
-// With max_submesh M = 128, up to max_2d_casters (4) 2D passes + up to
-// max_point_casters (4) point casters (each 6 faces) + one main pass, all in a
-// single frame:
+// MULTI-CASTER + CSM WORST CASE. Every command record = 4-byte header + payload.
+// With max_submesh M = 128, up to max_2d_casters (8 — CSM: 4 cascades share the 2D
+// atlas + up to 4 spots/dir) 2D passes + up to max_point_casters (4) point casters
+// (each 6 faces) + one main pass, all in a single frame:
 //
-//   2D depth (per caster): beginShadowPass(4+20=24) + M × MASK-worst
+//   2D depth (per slot): beginShadowPass(4+20=24) + M × MASK-worst
 //                          (bindTexture 12 + drawDepthAt 32 = 44) + endShadowPass(12)
-//                          = 24 + 128×44 + 12 = 5,668; × 4 = 22,672
+//                          = 24 + 128×44 + 12 = 5,668; × 8 = 45,344
 //   point depth (per caster): 6 faces × (beginPointShadowFace(4+28=32) +
 //                          M × drawPointDepth(4+20=24)) = 6×(32 + 128×24) = 18,624;
 //                          × 4 = 74,496; + ONE endPointShadow(12) total
-//   main: beginFrame(28) + M × DS-BLEND-worst(≈384: 2-pass setPipeline+setLights+
-//                          bindIbl+bindShadowMap(20)+bindPointShadow(12)+fog+morph+
-//                          5×bindTexture+drawPbr) + endFrame(4) = 28 + 128×384 + 4
-//                          = 49,184
+//   main: beginFrame(28) + set_csm(4+12=16) + M × DS-BLEND-worst(≈384: 2-pass
+//                          setPipeline+setLights+bindIbl+bindShadowMap(20)+
+//                          bindPointShadow(12)+fog+morph+5×bindTexture+drawPbr) +
+//                          endFrame(4) = 28 + 16 + 128×384 + 4 = 49,200
 //   one-time create/replay burst (shares this buffer on frame 1): ≈ 800 B
 //   length header(4) + slop.
 //
-//   22,672 + 74,508 + 49,184 + 800 + 4 ≈ 147,168 → round up to 160 KiB.
-// (CDP at T4 confirms this fits chunk memory; the static-buffer growth from
-// 46,720 B → 163,840 B is the price of simultaneous multi-caster shadows.)
-const cmd_buf_cap: usize = 160 * 1024;
+//   45,344 + 74,508 + 49,200 + 800 + 4 ≈ 169,856 → round up to 192 KiB.
+// (CDP at T4 confirms this fits chunk memory; the static-buffer growth to
+// 196,608 B is the price of simultaneous CSM + multi-caster shadows.)
+const cmd_buf_cap: usize = 192 * 1024;
 var cmd_buf: [cmd_buf_cap]u8 = undefined;
 
 fn findSlot(vid: u32) ?*Inst {
@@ -857,9 +866,44 @@ fn parseLights(inst: *Inst, s: []const u8) void {
 fn classifyCasters(inst: *Inst, casts: []const bool) void {
     inst.n_2d_casters = 0;
     inst.n_point_casters = 0;
+    inst.csm_light = -1;
+    inst.cascade_count = 0;
+
+    // ── Pass 1: the FIRST directional shadow caster becomes a CSM caster (kind=3),
+    // reserving 2D atlas slots 0..N-1 (N = max_csm_cascades). Its v3.z = base
+    // cascade slot (0); the receiver samples shadow_vp[0 + ci]. Only one directional
+    // CSM caster is supported; later directional casters fall through to Pass 2 as
+    // plain single-2D casters (kind=1) at slots after the cascades.
+    const ncas = gl.command.max_csm_cascades;
+    {
+        var li: u32 = 0;
+        while (li < inst.light_count) : (li += 1) {
+            const base = li * 16;
+            const wants = li < casts.len and casts[li];
+            const ltype = inst.lights[base + 0];
+            const is_dir = ltype < 0.5;
+            if (wants and is_dir and inst.csm_light < 0 and inst.n_2d_casters + ncas <= gl.command.max_2d_casters) {
+                inst.csm_light = @intCast(li);
+                inst.cascade_count = ncas;
+                // Reserve cascade slots 0..N-1 for this caster; casters_2d[c] = li so
+                // each cascade's depth pass + VP knows its source light.
+                var c: u32 = 0;
+                while (c < ncas) : (c += 1) {
+                    inst.casters_2d[c] = li;
+                    inst.n_2d_casters += 1;
+                }
+                inst.lights[base + 14] = 0.0; // base cascade slot
+                inst.lights[base + 15] = 3.0; // CSM directional
+            }
+        }
+    }
+
+    // ── Pass 2: every other caster. Points → cube atlas (kind=2). Spots and any
+    // extra directional casters → single 2D (kind=1) at slots after the cascades.
     var li: u32 = 0;
     while (li < inst.light_count) : (li += 1) {
         const base = li * 16;
+        if (@as(i32, @intCast(li)) == inst.csm_light) continue; // already CSM-classified
         const wants = li < casts.len and casts[li];
         if (!wants) {
             inst.lights[base + 14] = -1.0; // shadow_index = none
@@ -884,7 +928,7 @@ fn classifyCasters(inst: *Inst, casts: []const bool) void {
                 inst.lights[base + 15] = 0.0;
             }
         } else {
-            // directional (type<0.5) or spot (type≥1.5) → 2D atlas
+            // spot (type≥1.5) or extra directional (type<0.5) → 2D atlas, kind=1
             if (inst.n_2d_casters < gl.command.max_2d_casters) {
                 const sidx = inst.n_2d_casters;
                 inst.n_2d_casters += 1;
@@ -1323,6 +1367,75 @@ fn lightSpaceMatrix(inst: *const Inst, a: *const gl.vmesh.Reader, light_idx: u32
     return proj.mul(view);
 }
 
+// ── CSM (Slice 2) ────────────────────────────────────────────────────────────
+
+// CSM shadow distance (m): the camera proj uses far=100, but packing 4 cascades
+// over the full 0.1..100 range wastes resolution far from the camera. Clamp the
+// CSM far to a tuned shadow distance so cascades concentrate near the viewer.
+// min(proj_far, csm_far) keeps it valid for any scene scale.
+const csm_far: f32 = 60.0;
+const csm_lambda: f32 = 0.5; // practical-split blend (0=uniform, 1=logarithmic)
+
+/// Practical-scheme cascade splits (view-space FAR distance per cascade).
+/// split_i = λ·cn·(cf/cn)^(i/N) + (1-λ)·(cn + (cf-cn)·i/N), i=1..N.
+/// cn = camera near, cf = min(camera far, csm_far). Writes inst.cascade_splits.
+fn computeCascadeSplits(inst: *Inst, cn: f32, cam_far: f32) void {
+    const ncas = gl.command.max_csm_cascades;
+    const cf = @min(cam_far, csm_far);
+    var i: u32 = 1;
+    while (i <= ncas) : (i += 1) {
+        const fi: f32 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(ncas));
+        const log = cn * std.math.pow(f32, cf / cn, fi);
+        const uni = cn + (cf - cn) * fi;
+        inst.cascade_splits[i - 1] = csm_lambda * log + (1.0 - csm_lambda) * uni;
+    }
+}
+
+/// Ortho light VP fit to ONE cascade's view-frustum depth slice [near_d, far_d]
+/// (view-space forward distances). Builds the 8 world-space corners of that slice
+/// (view-space corner box → world via invert(view)), then fits a light-space AABB
+/// over them and an ortho box — the same scheme as lightSpaceMatrix, generalized to
+/// an arbitrary point set. `view` is the camera view matrix (NO clipFix). clipFix is
+/// applied by the caller (matching the other shadow VPs).
+fn cascadeLightVp(inst: *const Inst, light_idx: u32, near_d: f32, far_d: f32, aspect: f32, view: gl.math.Mat4) gl.math.Mat4 {
+    const Vec3 = gl.math.Vec3;
+    const inv_view = gl.math.invert(view);
+    const tan_half = std.math.tan(fov_y * 0.5);
+    // 8 view-space corners (camera looks down -Z → forward distance d → z=-d).
+    var corners: [8]Vec3 = undefined;
+    const depths = [2]f32{ near_d, far_d };
+    var ci: usize = 0;
+    for (depths) |d| {
+        const hh = d * tan_half;
+        const hw = hh * aspect;
+        const z = -d;
+        // 4 corners at this depth: (±hw, ±hh, z), transformed to world.
+        corners[ci + 0] = gl.math.transformPoint(inv_view, Vec3.init(-hw, -hh, z));
+        corners[ci + 1] = gl.math.transformPoint(inv_view, Vec3.init(hw, -hh, z));
+        corners[ci + 2] = gl.math.transformPoint(inv_view, Vec3.init(-hw, hh, z));
+        corners[ci + 3] = gl.math.transformPoint(inv_view, Vec3.init(hw, hh, z));
+        ci += 4;
+    }
+    // Frustum-slice bounding sphere (center = mean of corners, radius = max dist).
+    var center = Vec3.init(0, 0, 0);
+    for (corners) |c| center = Vec3.add(center, c);
+    center = Vec3.scale(center, 1.0 / 8.0);
+    var radius: f32 = 0;
+    for (corners) |c| radius = @max(radius, Vec3.length(Vec3.sub(c, center)));
+    radius = @max(radius, 0.5);
+    // Light view from the directional caster's dir (lookAt along -dir), exactly as
+    // lightSpaceMatrix. Place the light eye back along -dir so the whole slice fits.
+    const base = light_idx * 16;
+    const dir = Vec3.normalize(Vec3.init(inst.lights[base + 5], inst.lights[base + 6], inst.lights[base + 7]));
+    const up = if (@abs(dir.y) > 0.99) Vec3.init(0, 0, 1) else Vec3.init(0, 1, 0);
+    const dist = radius * 3.0;
+    const eye = Vec3.sub(center, Vec3.scale(dir, dist));
+    const lview = gl.math.Mat4.lookAt(eye, center, up);
+    const ext = radius * 1.2;
+    const proj = gl.math.Mat4.ortho(-ext, ext, -ext, ext, dist - radius * 1.5, dist + radius * 1.5);
+    return proj.mul(lview);
+}
+
 /// Spot light view-projection for the shadow pass (perspective from the spot's
 /// position looking in `dir`). fovy = 2*acos(cosOut) so the cone fits the frustum.
 fn spotLightVp(inst: *const Inst, light_idx: u32) gl.math.Mat4 {
@@ -1357,10 +1470,22 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
     inst.input = .{};
 
     const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(@max(height, 1)));
-    const proj = gl.math.Mat4.perspective(fov_y, aspect, 0.1, 100.0);
+    const cam_near: f32 = 0.1;
+    const cam_far: f32 = 100.0;
+    const proj = gl.math.Mat4.perspective(fov_y, aspect, cam_near, cam_far);
     const view = inst.orbit.viewMatrix(up_vec);
     const eye = inst.orbit.eye();
     inst.camera_pos = .{ eye.x, eye.y, eye.z };
+
+    // CSM frame-globals: camera look direction (view-space +viewZ axis) + practical
+    // cascade splits. Persistent (set_csm points at them — deferred decode). Only
+    // meaningful when classifyCasters tagged a directional CSM caster (cascade_count
+    // > 0); harmless to compute otherwise.
+    {
+        const fwd = gl.math.Vec3.normalize(gl.math.Vec3.sub(inst.orbit.target, eye));
+        inst.view_forward = .{ fwd.x, fwd.y, fwd.z };
+        if (inst.cascade_count > 0) computeCascadeSplits(inst, cam_near, cam_far);
+    }
 
     // Sync animated rotations into the scene graph (skip unchanged via mirrors).
     if (inst.scene_built) {
@@ -1543,8 +1668,15 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 const li = inst.casters_2d[s];
                 const caster_base = li * 16;
                 const caster_type = inst.lights[caster_base + 0];
+                const is_csm = inst.cascade_count > 0 and @as(i32, @intCast(li)) == inst.csm_light and s < inst.cascade_count;
                 // clipFix is identity on WebGL2, z-remap on WebGPU.
-                const light_vp = if (caster_type >= 1.5)
+                const light_vp = if (is_csm) blk: {
+                    // Cascade s of the CSM caster: fit ortho VP to this cascade's
+                    // view-frustum depth slice [near_s, far_s].
+                    const near_s: f32 = if (s == 0) cam_near else inst.cascade_splits[s - 1];
+                    const far_s: f32 = inst.cascade_splits[s];
+                    break :blk clipFix().mul(cascadeLightVp(inst, li, near_s, far_s, aspect, view));
+                } else if (caster_type >= 1.5)
                     clipFix().mul(spotLightVp(inst, li)) // spot: perspective
                 else
                     clipFix().mul(lightSpaceMatrix(inst, a, li)); // directional: ortho
@@ -1553,9 +1685,10 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 inst.shadow_vp_mats[s] = light_vp.m;
 
                 // Per-caster light-frustum cull (keeps off-screen casters that cast
-                // into view). Tile = (col=s, row=0) since ≤ max_2d_casters fit row 0.
+                // into view). Atlas tile = (col=s%4, row=s/4): up to 8 slots span
+                // rows 0..1 (CSM cascades 0..3 + spots/extra-dir after).
                 const lplanes = gl.cull.frustumPlanes(light_vp);
-                enc.beginShadowPass(shadow_handle, depth_shader, s, 0, shadow_tile);
+                enc.beginShadowPass(shadow_handle, depth_shader, s % 4, s / 4, shadow_tile);
                 // NOTE: double-sided shadows back-cull this phase (drawDepth/drawDepthAt
                 // carry no state word; cull is baked into the depth pipeline).
                 {
@@ -1646,6 +1779,12 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         }
 
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
+
+        // CSM frame-globals — MUST be emitted AFTER beginFrame: the bridge resets
+        // frameCascadeCount=0 at begin_frame, so an earlier set_csm would be wiped
+        // (see S2T2 report). cascade_splits/view_forward are persistent Inst storage.
+        if (inst.cascade_count > 0)
+            enc.setCsm(inst.cascade_count, @intCast(@intFromPtr(&inst.cascade_splits)), @intCast(@intFromPtr(&inst.view_forward)));
 
         const pv = clipFix().mul(proj).mul(view);
         // World-space frustum planes for this frame's camera (P9 slice 2).

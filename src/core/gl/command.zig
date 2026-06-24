@@ -59,6 +59,12 @@ pub const Tag = enum(u16) {
     draw_point_depth = 33, // {vbuf, ibuf, index_byte_off, index_count, model_ptr}
     end_point_shadow = 34, // {width, height}
     bind_point_shadow = 35, // {slot, handle} — binds the point atlas texture to `slot`; caster pos/far come from the lights array (lpos=v0.zw/v1.x, far=v2.w=lrange)
+    // ── Cascaded shadow maps (CSM directional) ──────────────────────────
+    set_csm = 36, // {cascade_count, splits_ptr, view_forward_ptr} — frame-global CSM params for the directional caster.
+    //   Cache cascade_count, the 4 f32 at splits_ptr (cascade_splits — view-space FAR distance per cascade),
+    //   and the 3 f32 at view_forward_ptr (normalized camera look dir). The bridge (S2T2) writes them into each
+    //   shadowed draw's U at cascade_count@1024 / cascade_splits@1040 / view_forward@1056. Per-frame transient
+    //   (re-emitted each frame, NOT recorded into the registry) — mirrors set_lights.
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -108,11 +114,17 @@ pub const max_lights: u32 = 4;
 pub const light_stride_f32: u32 = 16; // v0:[type,intensity,pos.x,pos.y]  v1:[pos.z,dir.x,dir.y,dir.z]  v2:[color.r,color.g,color.b,range]  v3:[cos_inner,cos_outer,shadow_index,shadow_kind]
 // v3.z = shadow_index: for a 2D caster → index in shadow_vp[] AND its tile in the 2D atlas (0..3);
 //        for a point caster → its point-caster index (0..3). -1.0 = this light casts no shadow.
-// v3.w = shadow_kind: 0 = none, 1 = 2D (directional/spot), 2 = point.
+// v3.w = shadow_kind: 0 = none, 1 = 2D (directional/spot), 2 = point, 3 = CSM directional (cascade-select).
+// For shadow_kind 3 (CSM), v3.z is the BASE shadow_vp[] index of cascade 0; the receiver
+// selects cascade ci by view-space depth and samples shadow_vp[base + ci] (each cascade
+// is its own ortho VP in its own 2D-atlas tile). cascade_count / cascade_splits come from U.
 
-// ── Simultaneous multi-caster shadow contract (Slice 1) ─────────────
+// ── Simultaneous multi-caster shadow contract (Slice 1 + Slice 2 CSM) ─────────────
 // Up to `max_lights` lights may cast at once, in any mix of 2D / point.
-pub const max_2d_casters: u32 = 4; // directional/spot casters share the 2D atlas; index 0..3
+// shadow_vp[] holds (up to max_csm_cascades) CSM cascades + single 2D casters; 8 covers
+// 4 cascades + 4 spots. The 16-tile atlas (4×4) supports all 8 in rows 0..1.
+pub const max_2d_casters: u32 = 8; // CSM cascades + directional/spot casters share the 2D atlas; index 0..7
+pub const max_csm_cascades: u32 = 4; // a CSM directional light splits into up to this many cascades
 pub const max_point_casters: u32 = 4; // point casters share the cube atlas; index 0..3
 // CONTRACT (T3 MUST honor): a point caster's range (light v2.w = lrange) MUST equal the
 // far plane used in its depth pass (begin_point_shadow_face far_bits). The receiver normalises
@@ -121,7 +133,7 @@ pub const max_point_casters: u32 = 4; // point casters share the cube atlas; ind
 // 2D shadow atlas geometry. CHANGING THESE REQUIRES the verve.js atlas-create AND
 // the in-shader shadowFactor2D constants to move in lockstep.
 pub const shadow_atlas_dim: u32 = 4096; // full atlas is shadow_atlas_dim²
-pub const shadow_tile_dim: u32 = 1024; // → 4 tiles per row, 16 tiles total; up to 4 used in row 0
+pub const shadow_tile_dim: u32 = 1024; // → 4 tiles per row, 16 tiles total; up to 8 used in rows 0..1
 pub const shadow_tiles_per_row: u32 = 4;
 // Point shadow atlas geometry. 3 cols × 8 rows of 512² tiles = 6 faces × 4 casters.
 // Caster `c` occupies rows [c*2, c*2+1]; face `f` → col = f%3, row = c*2 + f/3.
@@ -708,12 +720,20 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     // via v3.w (shadow_kind) so we guard each branch on its variant too. Each
     // snippet keeps the loop-body indentation and a trailing newline so it slots
     // in between lighting_head and lighting_tail without disturbing the layout.
+    // Guards are reordered/range-bounded so they stay mutually exclusive regardless
+    // of emission order: sk>2.5 → CSM (kind 3), sk>1.5 → point (kind 2),
+    // sk>0.5 → single 2D (kind 1). CSM is emitted under variant_shadow (csmFactor
+    // lives in shadow_decls).
+    const lighting_shadow_csm =
+        \\    if (v3.w > 2.5) radiance *= csmFactor(int(v3.z + 0.5));
+        \\
+    ;
     const lighting_shadow_2d =
         \\    if (v3.w > 0.5 && v3.w < 1.5) radiance *= shadowFactor2D(int(v3.z + 0.5));
         \\
     ;
     const lighting_shadow_point =
-        \\    if (v3.w > 1.5) radiance *= pointShadowFactor(lpos, lrange, int(v3.z + 0.5));
+        \\    if (v3.w > 1.5 && v3.w < 2.5) radiance *= pointShadowFactor(lpos, lrange, int(v3.z + 0.5));
         \\
     ;
     const lighting_tail =
@@ -752,7 +772,10 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     // are the Zig constants of the same name — keep them in lockstep with verve.js.
     const shadow_decls =
         \\uniform highp sampler2DShadow u_shadow_map;
-        \\uniform mat4 u_shadow_vp[4];
+        \\uniform mat4 u_shadow_vp[8];
+        \\uniform int u_cascade_count;
+        \\uniform vec4 u_cascade_splits;
+        \\uniform vec3 u_view_forward;
         \\float shadowFactor2D(int slot) {
         \\  vec4 lp = u_shadow_vp[slot] * vec4(v_world_pos, 1.0);
         \\  vec3 proj = lp.xyz / lp.w;
@@ -771,6 +794,27 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\      sum += texture(u_shadow_map, vec3(atlasUv, proj.z - bias));
         \\    }
         \\  return sum / 9.0;
+        \\}
+        \\// CSM: select a cascade by view-space depth (viewZ = dot(world-camera, fwd)),
+        \\// sample shadow_vp[base+ci], blend into the next cascade near the boundary.
+        \\float csmFactor(int base) {
+        \\  float viewZ = dot(v_world_pos - u_camera_pos, u_view_forward);
+        \\  int ci = u_cascade_count - 1;
+        \\  for (int i = 0; i < 4; i++) {
+        \\    if (i >= u_cascade_count) break;
+        \\    if (viewZ <= u_cascade_splits[i]) { ci = i; break; }
+        \\  }
+        \\  float f = shadowFactor2D(base + ci);
+        \\  if (ci < u_cascade_count - 1) {
+        \\    float prev = (ci == 0) ? 0.0 : u_cascade_splits[ci - 1];
+        \\    float far = u_cascade_splits[ci];
+        \\    float band = 0.1 * (far - prev);
+        \\    if (band > 0.0001 && viewZ > far - band) {
+        \\      float t = clamp((viewZ - (far - band)) / band, 0.0, 1.0);
+        \\      f = mix(f, shadowFactor2D(base + ci + 1), t);
+        \\    }
+        \\  }
+        \\  return f;
         \\}
         \\
     ;
@@ -858,8 +902,9 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
     if (flags & variant_double_sided != 0) src = src ++ ds_flip;
     src = src ++ lighting_head;
-    if (flags & variant_shadow != 0) src = src ++ lighting_shadow_2d;
+    if (flags & variant_shadow != 0) src = src ++ lighting_shadow_csm;
     if (flags & variant_shadow_point != 0) src = src ++ lighting_shadow_point;
+    if (flags & variant_shadow != 0) src = src ++ lighting_shadow_2d;
     src = src ++ lighting_tail;
     src = src ++ combine_plain;
     if (flags & variant_emissive != 0) src = src ++ emissive;
@@ -988,12 +1033,21 @@ pub const fxaaFragmentSrc: []const u8 =
 //   lights     : array<vec4<f32>,16> (offset 240; 256B — 4 vec4/light × 4 lights)
 //   light_count: i32              (offset 496)
 //   prefiltered_mips: f32         (offset 500; +8B pad to align mat4x4 at 512)
-//   (variant_shadow) shadow_vp: array<mat4x4<f32>,4> (offset 512; 256B → 512..768)
+//   (variant_shadow) shadow_vp: array<mat4x4<f32>,8> (offset 512; 512B → 512..1024)
+//   (variant_shadow) cascade_count:  i32        (offset 1024; 1024..1028)
+//   (variant_shadow) cascade_splits: vec4<f32>  (offset 1040; 16-aligned, 1040..1056)
+//   (variant_shadow) view_forward:   vec3<f32>  (offset 1056; 1056..1068, +4B pad → 1072)
 //
-// SHADOW-VARIANT BYTE MAP (for T2 bridge): shadow_vp @ 512, struct size 768,
-// PBR_STRIDE = align(768, 256) = 768 (UNCHANGED from current 768). Keeping
-// max_2d_casters = 4 (array<mat4,4> = 256B) deliberately avoids any stride change
-// this slice. (The instanced uniforms_vp single `vp` @ 512 is a different variant,
+// SHADOW-VARIANT BYTE MAP (S2 CSM — for T2 bridge / T3 scene):
+//   shadow_vp@512 (8×mat4 = 512B → 512..1024)
+//   cascade_count@1024   (i32,  1024..1028)
+//   cascade_splits@1040  (vec4, 1040..1056 — view-space FAR distance per cascade)
+//   view_forward@1056    (vec3, 1056..1068 — normalized camera look dir, +pad → 1072)
+//   struct size = 1072
+//   PBR_STRIDE = align(1072, 256) = 1280  (was 768)
+//   PBR_U.size = 1072
+// cascade_count / cascade_splits / view_forward live ONLY in the shadow variant.
+// (The instanced uniforms_vp single `vp` @ 512 is a different variant,
 // struct size 576, untouched.)
 //
 // Bindings (@group(1)): a shared sampler (binding 0) + per-slot textures.
@@ -1014,9 +1068,10 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         @compileError("wgslPbr: variant_instanced + variant_shadow_point unsupported in v1 (point-shadow bind-group not wired for instanced draw path)");
 
     // ── Uniform block + group(0) ────────────────────────────────────
-    // Split so variant_shadow can append `shadow_vp: array<mat4x4,4>` (offset 512,
-    // after the f32 prefiltered_mips @ 500 padded to 512; 256B → 512..768) without
-    // changing the non-shadow bytes. struct size 768, PBR_STRIDE = align(768,256) = 768.
+    // Split so variant_shadow can append `shadow_vp: array<mat4x4,8>` (offset 512,
+    // after the f32 prefiltered_mips @ 500 padded to 512; 512B → 512..1024) plus the
+    // CSM fields (cascade_count@1024, cascade_splits@1040, view_forward@1056) without
+    // changing the non-shadow bytes. struct size 1072, PBR_STRIDE = align(1072,256) = 1280.
     const uniforms_head =
         \\struct U {
         \\  mvp: mat4x4<f32>,
@@ -1030,7 +1085,10 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\
     ;
     const uniforms_shadow =
-        \\  shadow_vp: array<mat4x4<f32>, 4>,
+        \\  shadow_vp: array<mat4x4<f32>, 8>,
+        \\  cascade_count: i32,
+        \\  cascade_splits: vec4<f32>,
+        \\  view_forward: vec3<f32>,
         \\
     ;
     // Instanced (variant_instanced): view-projection only (model comes from
@@ -1409,12 +1467,18 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\
     ;
     // Per-light shadow attenuation (WGSL twin of the GLSL lighting_shadow_* snippets).
+    // Range-bounded guards stay mutually exclusive: sk>2.5 → CSM (3), sk>1.5 →
+    // point (2), sk>0.5 → single 2D (1). Mirrors the GLSL order/math exactly.
+    const fs_lighting_shadow_csm =
+        \\    if (v3.w > 2.5) { radiance = radiance * csmFactor(in.world_pos, i32(v3.z + 0.5)); }
+        \\
+    ;
     const fs_lighting_shadow_2d =
         \\    if (v3.w > 0.5 && v3.w < 1.5) { radiance = radiance * shadowFactor2D(in.world_pos, i32(v3.z + 0.5)); }
         \\
     ;
     const fs_lighting_shadow_point =
-        \\    if (v3.w > 1.5) { radiance = radiance * pointShadowFactor(in.world_pos, lpos, lrange, i32(v3.z + 0.5)); }
+        \\    if (v3.w > 1.5 && v3.w < 2.5) { radiance = radiance * pointShadowFactor(in.world_pos, lpos, lrange, i32(v3.z + 0.5)); }
         \\
     ;
     const fs_lighting_tail =
@@ -1463,6 +1527,29 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\    }
         \\  }
         \\  return sum / 9.0;
+        \\}
+        \\// CSM: select a cascade by view-space depth (viewZ = dot(world-camera, fwd)),
+        \\// sample shadow_vp[base+ci], blend into the next cascade near the boundary.
+        \\// Free fn: world_pos is a PARAM; u.* is module-scope (OK), no in.* refs.
+        \\fn csmFactor(world_pos: vec3<f32>, base: i32) -> f32 {
+        \\  let viewZ = dot(world_pos - u.camera_pos, u.view_forward);
+        \\  var ci = u.cascade_count - 1;
+        \\  for (var i = 0; i < 4; i = i + 1) {
+        \\    if (i >= u.cascade_count) { break; }
+        \\    if (viewZ <= u.cascade_splits[i]) { ci = i; break; }
+        \\  }
+        \\  var f = shadowFactor2D(world_pos, base + ci);
+        \\  if (ci < u.cascade_count - 1) {
+        \\    var prev = 0.0;
+        \\    if (ci > 0) { prev = u.cascade_splits[ci - 1]; }
+        \\    let far = u.cascade_splits[ci];
+        \\    let band = 0.1 * (far - prev);
+        \\    if (band > 0.0001 && viewZ > far - band) {
+        \\      let t = clamp((viewZ - (far - band)) / band, 0.0, 1.0);
+        \\      f = mix(f, shadowFactor2D(world_pos, base + ci + 1), t);
+        \\    }
+        \\  }
+        \\  return f;
         \\}
         \\
     ;
@@ -1598,8 +1685,9 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ (if (nm) (if (ds) fs_normal_nm_ds else fs_normal_nm) else (if (ds) fs_normal_plain_ds else fs_normal_plain));
     if (ds) src = src ++ fs_ds_flip;
     src = src ++ fs_lighting_head;
-    if (shadow) src = src ++ fs_lighting_shadow_2d;
+    if (shadow) src = src ++ fs_lighting_shadow_csm;
     if (point_shadow) src = src ++ fs_lighting_shadow_point;
+    if (shadow) src = src ++ fs_lighting_shadow_2d;
     src = src ++ fs_lighting_tail;
     src = src ++ fs_combine_plain;
     if (em) src = src ++ fs_emissive;
@@ -1962,6 +2050,16 @@ pub const Encoder = struct {
         self.header(.set_lights, 8);
         self.putU32(count);
         self.putU32(ptr);
+    }
+
+    /// Encode set_csm: frame-global cascaded-shadow params for the directional caster.
+    /// splits_ptr -> 4 f32 cascade_splits (view-space far per cascade); view_forward_ptr
+    /// -> 3 f32 normalized camera look dir. Per-frame transient like setLights (not recorded).
+    pub fn setCsm(self: *Encoder, cascade_count: u32, splits_ptr: u32, view_forward_ptr: u32) void {
+        self.header(.set_csm, 12);
+        self.putU32(cascade_count);
+        self.putU32(splits_ptr);
+        self.putU32(view_forward_ptr);
     }
 
     /// Encode a set_fog command: ptr -> 8 f32 FogParams [mode, r,g,b, near, far, density, _pad].
@@ -2711,7 +2809,13 @@ test "WGSL PBR shadow + depth: variant_shadow path and wgslDepth structure" {
         try testing.expect(std.mem.indexOf(u8, src, "shadow_map: texture_depth_2d") != null);
         try testing.expect(std.mem.indexOf(u8, src, "shadow_samp: sampler_comparison") != null);
         try testing.expect(std.mem.indexOf(u8, src, "textureSampleCompareLevel") != null);
-        try testing.expect(std.mem.indexOf(u8, src, "shadow_vp: array<mat4x4<f32>, 4>") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "shadow_vp: array<mat4x4<f32>, 8>") != null);
+        // S2 CSM: cascade fields appended to U + cascade-select receiver.
+        try testing.expect(std.mem.indexOf(u8, src, "cascade_count: i32") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "cascade_splits: vec4<f32>") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "view_forward: vec3<f32>") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "fn csmFactor(world_pos: vec3<f32>, base: i32)") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "if (v3.w > 2.5) { radiance = radiance * csmFactor(in.world_pos, i32(v3.z + 0.5)); }") != null);
         // Per-caster sampling: shadow factor computed in-loop, no light_pos varying.
         try testing.expect(std.mem.indexOf(u8, src, "shadowFactor2D(in.world_pos, i32(v3.z + 0.5))") != null);
         try testing.expect(std.mem.indexOf(u8, src, "light_pos") == null);
@@ -2735,13 +2839,13 @@ test "golden: WGSL shadow + depth hashes frozen (FNV-1a-64)" {
     const S0 = variant_pbr | variant_shadow;
     const S1 = variant_pbr | variant_normal_map | variant_shadow;
     const S2 = variant_pbr | variant_normal_map | variant_emissive | variant_shadow;
-    // Re-frozen (Slice 1 multi-caster): U.light_vp → shadow_vp: array<mat4x4,4>
-    // (offset 512, struct size 768, stride 768 unchanged); shadowFactor→shadowFactor2D
-    // (atlas-tiled), in-loop per-light shadow, light_pos varying removed.
+    // Re-frozen (Slice 2 CSM): shadow_vp array<mat4x4,4>→<,8> (offset 512, 512B →
+    // 512..1024); +cascade_count@1024/cascade_splits@1040/view_forward@1056 (struct
+    // size 1072, PBR_STRIDE 768→1280); +csmFactor helper + reordered loop guards.
     // wgslDepth() unchanged (no lighting in depth shader).
-    try testing.expectEqual(@as(u64, 0x9526692b364620b1), fnv64(wgslPbr(S0)));
-    try testing.expectEqual(@as(u64, 0xc21f19b0dcb7e6ce), fnv64(wgslPbr(S1)));
-    try testing.expectEqual(@as(u64, 0xbe762eb5018a073e), fnv64(wgslPbr(S2)));
+    try testing.expectEqual(@as(u64, 0xe938fd309d353c93), fnv64(wgslPbr(S0)));
+    try testing.expectEqual(@as(u64, 0x3a9f979ce53f3930), fnv64(wgslPbr(S1)));
+    try testing.expectEqual(@as(u64, 0x7401bd5c3d6ff71c), fnv64(wgslPbr(S2)));
     try testing.expectEqual(@as(u64, 0x3bb6cf33bcf5f8b1), fnv64(wgslDepth()));
 }
 
@@ -2812,12 +2916,14 @@ test "golden: shadow-variant GLSL hashes frozen (FNV-1a-64)" {
     // shadow-variant VS hashes now EQUAL the non-shadow F0/F1 VS hashes (shadow
     // light-space pos is recomputed per caster in the fragment). The FS hashes move
     // because shadowFactor→shadowFactor2D + in-loop per-light shadow + u_shadow_vp[4].
+    // Re-frozen (Slice 2 CSM): VS unchanged (shadow still not in VS); FS hashes move
+    // (u_shadow_vp[4]→[8], +cascade uniforms, +csmFactor, reordered loop guards).
     try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(S0)));
     try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(S1)));
     try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(S2))); // emissive does not touch the VS
-    try testing.expectEqual(@as(u64, 0x96f5c3d0e29b5733), fnv64(pbrFragmentSrc(S0)));
-    try testing.expectEqual(@as(u64, 0x07b3423a91e5a03c), fnv64(pbrFragmentSrc(S1)));
-    try testing.expectEqual(@as(u64, 0x2de2fd2609629e21), fnv64(pbrFragmentSrc(S2)));
+    try testing.expectEqual(@as(u64, 0x0490a473dae87dcc), fnv64(pbrFragmentSrc(S0)));
+    try testing.expectEqual(@as(u64, 0xf804307663c9940b), fnv64(pbrFragmentSrc(S1)));
+    try testing.expectEqual(@as(u64, 0x308ad970648f6e0a), fnv64(pbrFragmentSrc(S2)));
     // Depth-only shadow-pass shader.
     try testing.expectEqual(@as(u64, 0x5bd62d643af5c2d5), fnv64(depthVertexSrc()));
     try testing.expectEqual(@as(u64, 0xe43018c9a1312d96), fnv64(depthFragmentSrc()));
@@ -2828,7 +2934,13 @@ test "shadow variant adds receiver uniforms; base variant has none" {
     // The light-space VP array lives in the FRAGMENT shader now; the vertex stage
     // carries no shadow uniform (light pos recomputed per caster from v_world_pos).
     try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "u_shadow_map") != null);
-    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "uniform mat4 u_shadow_vp[4];") != null);
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "uniform mat4 u_shadow_vp[8];") != null);
+    // S2 CSM: cascade uniforms + cascade-select receiver in the shadow variant.
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "uniform int u_cascade_count;") != null);
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "uniform vec4 u_cascade_splits;") != null);
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "uniform vec3 u_view_forward;") != null);
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "float csmFactor(int base)") != null);
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "if (v3.w > 2.5) radiance *= csmFactor(int(v3.z + 0.5));") != null);
     try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "shadowFactor2D(int(v3.z + 0.5))") != null);
     // The shadow is folded into per-light radiance; the combine is plain.
     try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "vec3 color = ambient + Lo;") != null);
@@ -3288,6 +3400,20 @@ test "createPointShadow encodes tag 31 + 3 u32 payload (12 bytes)" {
     try testing.expectEqual(@as(u32, 1024), std.mem.readInt(u32, s[16..20], .little)); // h
 }
 
+test "setCsm encodes tag 36 + 3 u32 payload (12 bytes)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.setCsm(4, 0x1000, 0x2000);
+    const s = enc.finish();
+    // length header (4) + record header (4) + 3×u32 payload (12) = 16 record bytes
+    try testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, s[0..4], .little)); // length
+    try testing.expectEqual(@as(u16, 36), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 12), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, s[8..12], .little)); // cascade_count
+    try testing.expectEqual(@as(u32, 0x1000), std.mem.readInt(u32, s[12..16], .little)); // splits_ptr
+    try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, s[16..20], .little)); // view_forward_ptr
+}
+
 test "beginPointShadowFace encodes tag 32 + 7 u32 payload (28 bytes)" {
     var buf: [64]u8 = undefined;
     var enc = Encoder.init(&buf);
@@ -3439,7 +3565,10 @@ test "golden: variant_shadow_point GLSL fragment hash frozen (FNV-1a-64)" {
     // Re-frozen (Slice 1 multi-caster): pointShadowFactor now takes (lpos, far, pidx),
     // samples the 1536×4096 atlas per caster, and is folded into per-light radiance.
     const SP = variant_pbr | variant_shadow_point;
-    try testing.expectEqual(@as(u64, 0xf856cde8b55faa84), fnv64(pbrFragmentSrc(SP)));
+    // Re-frozen (Slice 2 CSM): loop guards reordered + range-bounded (point now
+    // `>1.5 && <2.5`, csm slot inserted before point/2d). pointShadowFactor body
+    // unchanged; the in-loop guard text + emission order shifted the FS hash.
+    try testing.expectEqual(@as(u64, 0xda87a180897d0aeb), fnv64(pbrFragmentSrc(SP)));
 }
 
 // ── Point-shadow receiver WGSL (T4) ──────────────────────────────────────────
@@ -3471,5 +3600,8 @@ test "golden: variant_shadow_point WGSL hash frozen (FNV-1a-64)" {
     // Re-frozen (Slice 1 multi-caster): PointShadow uniform removed (lpos/far from
     // the loop), pointShadowFactor takes (world_pos, lpos, far, pidx), 1536×4096 atlas.
     const SP = variant_pbr | variant_shadow_point;
-    try testing.expectEqual(@as(u64, 0xdd271fddd96b5b0d), fnv64(wgslPbr(SP)));
+    // Re-frozen (Slice 2 CSM): loop guards reordered + range-bounded (point now
+    // `>1.5 && <2.5`, csm slot inserted before point/2d in emission). pointShadowFactor
+    // body unchanged; the in-loop guard text + emission order shifted the FS hash.
+    try testing.expectEqual(@as(u64, 0x4d1e817da11f0446), fnv64(wgslPbr(SP)));
 }

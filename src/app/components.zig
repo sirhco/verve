@@ -1550,6 +1550,79 @@ pub fn glSceneMultiShadow(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-csm: Slice 2 capstone — Cascaded Shadow Maps. A SINGLE directional light
+/// (type 0) with casts_shadow=true automatically becomes a 4-cascade CSM caster
+/// (S2T3: every directional caster is split into 4 cascades fit to view-frustum
+/// depth slices, practical split λ=0.5). The view frustum is sliced near→far and
+/// each slice gets its own tight depth pass, so near shadows stay crisp while far
+/// shadows remain covered; per-fragment cascade selection + a boundary blend hide
+/// the seams. Reuses shadow.vmesh (cube + floor) so the flat ground plane acts as
+/// a receiver: the shadow stretches across the floor and the near-crisp / far-soft
+/// gradient is clearly visible as the shadow travels away from the cube. Reuses the
+/// page-global glscene_freeze / glscene_unfreeze control (Slice 1) so a CDP run
+/// has a stable frame; the buttons sit INSIDE the GlScene island subtree so
+/// z-on-click routes to the chunk's exports.
+pub fn glSceneCsm(ctx: *const verve.Context) !*verve.Node {
+    // ONE directional caster → 4 CSM cascades (automatic, S2T3). Raking from the
+    // upper-left so the shadow stretches across the floor receiver; casts_shadow=true
+    // is the only flag CSM needs.
+    const lights = [_]verve.GlLight{
+        .{
+            .kind = .directional,
+            .dir = .{ -0.55, -0.72, -0.42 },
+            .color = .{ 1, 0.97, 0.9 },
+            .intensity = 2.6,
+            .casts_shadow = true,
+        },
+    };
+
+    const island_node = ctx.glScene(.{
+        .src = "/gl/shadow.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='44' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3ECascaded Shadows%3C/text%3E%3C/svg%3E",
+    })
+        // Flatter pitch + larger distance so the floor plane recedes into the
+        // frame and the near/far cascade quality split is visible on the ground.
+        .camera(.{ .distance = 14.0, .pitch = 0.30, .yaw = 0.55 })
+        .lights(&lights)
+        .autoRotate(0.15)
+        .build();
+
+    // Freeze/Unfreeze control — appended INSIDE the GlScene island node so
+    // z-on-click resolves against the GlScene chunk's exports (Slice-1 control;
+    // do NOT re-define it). Mirrors the GlSkin / GlPost freeze convention.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glscene_freeze").text("Freeze"),
+        ctx.el("button").attr("z-on-click", "glscene_unfreeze").text("Unfreeze"),
+    });
+    _ = island_node.children(.{controls});
+
+    const scene_box = ctx.div().class("gl-wrap").children(.{
+        ctx.div()
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;margin:0 auto")
+            .children(.{island_node}),
+    });
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — Cascaded Shadow Maps (CSM)"),
+        ctx.p().text("Slice 2 capstone: ONE directional light casts shadows split " ++
+            "into FOUR cascades. The view frustum is sliced near→far (practical " ++
+            "split λ=0.5) and each slice gets its own tight depth pass packed into " ++
+            "the shadow atlas. Near shadows stay crisp at high resolution while far " ++
+            "shadows stay covered; the fragment shader picks the right cascade per " ++
+            "pixel and blends across cascade boundaries so the transitions are " ++
+            "seamless. The shadow falls on a flat floor plane that recedes into the " ++
+            "distance — near-crisp vs far-smooth is directly observable on the ground " ++
+            "receiver — both WebGL2 and WebGPU backends decode all four cascades " ++
+            "from the Slice-1 shadow atlas."),
+        scene_box,
+        ctx.p().class("hint")
+            .text("Drag to orbit \u{00b7} wheel to zoom \u{00b7} Freeze pins the orbit. " ++
+            "Look for a crisp shadow edge close to the cube and a softer shadow where " ++
+            "the floor recedes into the distance — different cascade bands at work."),
+    });
+}
+
 /// /gl-cutout: alpha-test (MASK) cutout dissolve demo. The "Cutout" cube's
 /// base-color texture has a real alpha channel with HOLES; its material is
 /// alphaMode:MASK (cutoff 0.5), so the variant_alpha_test shader DISCARDS any

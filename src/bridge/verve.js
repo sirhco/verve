@@ -5248,6 +5248,9 @@
           // when the mask is false, breaking depth each frame after a blend pass.
           gl.depthMask(true);
           gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+          // Default CSM off each frame; set_csm (tag 36) re-enables when a CSM caster
+          // is active, so a non-CSM frame never carries stale cascade data.
+          st.frameCascadeCount = 0;
           break;
         }
         case 2: { // CREATE_BUFFER
@@ -5304,6 +5307,10 @@
             if (variant & 32) { // shadow receiver: shadow_vp[] array + atlas depth sampler (unit 8)
               sh.shadowVp = gl.getUniformLocation(prog, "u_shadow_vp[0]");
               setSampler("u_shadow_map", 8);
+              // CSM frame-globals (only present in CSM-capable receivers; no-op on others).
+              sh.cascadeCount = gl.getUniformLocation(prog, "u_cascade_count");
+              sh.cascadeSplits = gl.getUniformLocation(prog, "u_cascade_splits");
+              sh.viewForward = gl.getUniformLocation(prog, "u_view_forward");
             }
             // Skinned variant: cache the bone-palette array base location.
             // Querying "u_bones[0]" yields the array's base location, which
@@ -5490,6 +5497,15 @@
             gl.uniform4fv(st.active.lights, new Float32Array(memory.buffer, p, count * 16));
             if (st.active.lightCount) gl.uniform1i(st.active.lightCount, count);
           }
+          break;
+        }
+        case 36: { // SET_CSM — cache CSM frame-globals (cascade_count, splits, view_forward).
+          // Payload (command.zig Encoder.setCsm, 12B): count | splits_ptr | view_forward_ptr.
+          // splits_ptr → 4 f32 (view-space FAR per cascade); view_forward_ptr → 3 f32 look dir.
+          // Frame-global, like set_lights; written into the receiver in bind_shadow_map (20).
+          st.frameCascadeCount = dv.getUint32(off, true);
+          st.frameCascadeSplits = new Float32Array(memory.buffer, dv.getUint32(off + 4, true), 4).slice();
+          st.frameViewForward = new Float32Array(memory.buffer, dv.getUint32(off + 8, true), 3).slice();
           break;
         }
         case 12: { // BIND_IBL — irradiance(5)/prefiltered(6)/brdf_lut(7) on active program
@@ -5733,6 +5749,13 @@
           }
           if (st.active && st.active.shadowVp && count > 0)
             gl.uniformMatrix4fv(st.active.shadowVp, false, new Float32Array(memory.buffer, vpPtr, count * 16));
+          // CSM frame-globals: the active program here is the receiver. Set them when a
+          // CSM frame is active (set_csm, tag 36) and the program has the locations.
+          if (st.active && st.frameCascadeCount > 0) {
+            if (st.active.cascadeCount) gl.uniform1i(st.active.cascadeCount, st.frameCascadeCount);
+            if (st.active.cascadeSplits) gl.uniform4fv(st.active.cascadeSplits, st.frameCascadeSplits);
+            if (st.active.viewForward) gl.uniform3fv(st.active.viewForward, st.frameViewForward);
+          }
           break;
         }
         case 21: { // SET_BONES — upload the bone palette to u_bones[] (skinned program)
@@ -6267,18 +6290,22 @@
     lights: 240,
     lightCount: 496,
     prefMips: 500,
-    // Multi-caster: shadow_vp is array<mat4x4<f32>,4> @ 512 (4×64 = 256B, 512..768).
+    // CSM/Multi-caster: shadow_vp is array<mat4x4<f32>,8> @ 512 (8×64 = 512B, 512..1024).
     // (The instanced variant reuses offset 512 for its single `vp` mat — same slot.)
-    shadowVp: 512, // shadow_vp[4] (set by bind_shadow_map; instanced path writes 1 mat here)
-    // shadowVp @512 (4×mat4 = 256B, 512..768), size 768, stride 768
-    size: 768,
+    shadowVp: 512, // shadow_vp[8] (set by bind_shadow_map; instanced path writes 1 mat here)
+    // CSM frame-globals (shadow variant only), set by set_csm (tag 36):
+    cascadeCount: 1024,  // i32  @1024 (1024..1028)
+    cascadeSplits: 1040, // vec4 @1040 (16-aligned, 1040..1056) view-space FAR per cascade
+    viewForward: 1056,   // vec3 @1056 (1056..1068, +4B pad → 1072) normalized camera look dir
+    // shadowVp @512 (8×mat4 = 512B, 512..1024); cascade fields 1024..1072; size 1072, stride 1280
+    size: 1072,
   };
   // Multiple draws per frame each need isolated uniforms: WebGPU defers draws, so
   // a single shared buffer would let the last writeBuffer clobber earlier draws.
   // Solution: dynamic uniform offsets — each draw writes its full struct to its
   // own 256-aligned slot and binds with that offset. Per-frame values (lights/
   // ibl/light_vp) are cached and replicated into every slot.
-  const PBR_STRIDE = 768; // align(576, 256)
+  const PBR_STRIDE = 1280; // align(1072, 256)
   const DEPTH_STRIDE = 256; // one mat4 (64B) padded to the 256B dynamic-offset min
   const MAX_DRAWS = 64; // per-frame draw cap (cube+plane today; headroom for scenes)
   // Post fullscreen draws (bright/blurH/blurV/composite/fxaa = up to 5/frame) each
@@ -6431,6 +6458,7 @@
             st.lastH = h;
           }
           st.pbrSlot = 0; // reset per-draw uniform slot allocation for this frame
+          st.frameCascadeCount = 0; // default CSM off; set_csm (36) re-enables per frame
           st.curTargetFormat = st.format; // canvas pass: post draws target st.format
           st.curPassHasDepth = true; // canvas pass always has depth24plus
           // Reuse the encoder if a shadow/offscreen pass already opened one this
@@ -7039,6 +7067,15 @@
           st.frameLightCount = n;
           break;
         }
+        case 36: { // SET_CSM — cache CSM frame-globals (cascade_count, splits, view_forward).
+          // Payload (command.zig Encoder.setCsm, 12B): count | splits_ptr | view_forward_ptr.
+          // Frame-global like set_lights; draw_pbr/case-20 write them into each shadowed
+          // draw's U at PBR_U.cascadeCount/cascadeSplits/viewForward. .slice() → byteOffset 0.
+          st.frameCascadeCount = dv.getUint32(off, true);
+          st.frameCascadeSplits = new Float32Array(memory.buffer, dv.getUint32(off + 4, true), 4).slice();
+          st.frameViewForward = new Float32Array(memory.buffer, dv.getUint32(off + 8, true), 3).slice();
+          break;
+        }
         case 12: { // BIND_IBL — irradiance(6)/prefiltered(7)/brdf_lut(8) + prefMips.
           // Payload (command.zig Encoder.bindIbl, 16B): irr|spec|lut|spec_mip_count.
           // Records the IBL handles; draw_pbr resolves them into bind group 1
@@ -7275,6 +7312,16 @@
             // ELEMENTS for a TypedArray, so pass .buffer/.byteOffset + the byte size.
             device.queue.writeBuffer(ubuf, base + PBR_U.shadowVp,
               st.frameShadowVp.buffer, st.frameShadowVp.byteOffset, st.frameShadowVpCount * 64);
+          }
+          // CSM frame-globals (set_csm, tag 36): cascade_count i32 @1024, cascade_splits
+          // vec4 @1040 (16B), view_forward vec3 @1056 (12B). Element-vs-byte: pass
+          // .buffer/.byteOffset + byte size for the TypedArrays (they are .slice()'d → off 0).
+          if (st.frameCascadeCount > 0) {
+            device.queue.writeBuffer(ubuf, base + PBR_U.cascadeCount, new Int32Array([st.frameCascadeCount | 0]));
+            device.queue.writeBuffer(ubuf, base + PBR_U.cascadeSplits,
+              st.frameCascadeSplits.buffer, st.frameCascadeSplits.byteOffset, 16);
+            device.queue.writeBuffer(ubuf, base + PBR_U.viewForward,
+              st.frameViewForward.buffer, st.frameViewForward.byteOffset, 12);
           }
           // ── Bind group 0: created once; the dynamic offset selects the slot. ──
           // Skinned variants add binding 1 (bones palette, whole buffer, static).
@@ -8092,6 +8139,9 @@
       shadow: null, // { handle } (2D atlas) set by bind_shadow_map
       frameShadowVp: null, // Float32Array(count*16) shadow_vp[] cached by bind_shadow_map
       frameShadowVpCount: 0, // number of 2D casters in frameShadowVp
+      frameCascadeCount: 0, // CSM: active cascade count (set_csm, tag 36; 0 = no CSM)
+      frameCascadeSplits: null, // CSM: Float32Array(4) view-space FAR per cascade
+      frameViewForward: null, // CSM: Float32Array(3) normalized camera look dir
       pointShadows: [], // T2: { atlasTex, atlasView, depthView, w, h } by handle
       pointDepthPipe: null, // lazy — pipeline + uniform buf for point-depth pass
       pointPass: null, // active render pass during begin/end_point_shadow_face
