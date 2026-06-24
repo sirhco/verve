@@ -4,7 +4,18 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.0] - 2026-06-24
+
+### Added
+
+- **gl simultaneous multi-light shadow casters** (`src/bridge/verve.js`,
+  `src/core/gl/`, `src/client/islands/GlScene.zig`, `src/app/components.zig`,
+  `src/app/routes.zig`): directional + spot + point lights now cast shadows
+  AT THE SAME TIME (up to 4 of each type via a tiled 2D shadow atlas plus an
+  enlarged point cube atlas), both backends. New `/gl-multishadow` demo wires
+  one caster of each type onto the shadow.vmesh floor, with a Freeze /
+  Unfreeze control (`glscene_freeze` / `glscene_unfreeze`) that pins the
+  auto-orbit for a stable frame.
 
 ## [0.8.0] - 2026-06-23
 

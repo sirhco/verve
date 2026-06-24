@@ -46,8 +46,18 @@ var camera_pos: [3]f32 = .{ 3, 3.5, 6 };
 // emissive.rgb, pad. Metallic + low roughness so the IBL environment shows as
 // reflections (metals tint the reflection by the base-color texture).
 var material: [12]f32 = .{ 1, 1, 1, 1, 0, 0.5, 1, 1, 0, 0, 0, 0 };
-// One directional light: [type(0=dir), intensity, dir.xyz, color.rgb].
-var light: [8]f32 = .{ 0, 3, -0.4, -0.7, -0.6, 1, 1, 1 };
+// One directional light in the full 16-f32 layout (setLights stride = 16). The
+// receiver reads per-light shadow metadata at v3.z (index 14 = shadow_index) and
+// v3.w (index 15 = shadow_kind): kind 1 = 2D, slot 0 → samples atlas tile 0.
+//   [type(0=dir), intensity, pos.xyz(0), dir.xyz, color.rgb, range, cosIn, cosOut,
+//    shadow_index=0, shadow_kind=1]
+var light: [16]f32 = .{
+    0, 3, 0, 0, 0, // type, intensity, pos.xyz
+    -0.4, -0.7, -0.6, // dir.xyz
+    1, 1, 1, // color.rgb
+    0, 0, 0, // range, cosIn, cosOut
+    0, 1, // v3.z shadow_index=0, v3.w shadow_kind=1 (2D)
+};
 
 // Ground plane (shadow receiver): matte dielectric so the shadow reads clearly.
 var plane_mvp: [16]f32 = undefined;
@@ -92,7 +102,6 @@ const plane_vbuf_handle: u32 = 3;
 const plane_ibuf_handle: u32 = 4;
 const depth_shader: u32 = 5; // variant_depth program (separate shader space)
 const shadow_handle: u32 = 1; // shadow map (separate shadowMaps space)
-const shadow_size: u32 = 1024;
 const frame_export = "glscenewebgpu_frame";
 const env_ready_export = "glscenewebgpu_env_ready";
 const env_url = "/gl/studio.venv";
@@ -102,7 +111,7 @@ const env_url = "/gl/studio.venv";
 // so premultiply Zfix (row 2 = [0,0,0.5,0.5]) to remap clip z → [0,1]. The WGSL
 // shadowFactor then uses ndc.z directly (see command.zig wgslPbr fs_shadow_decl).
 fn computeLightVp() gl.math.Mat4 {
-    const dir = gl.math.Vec3.normalize(gl.math.Vec3.init(light[2], light[3], light[4]));
+    const dir = gl.math.Vec3.normalize(gl.math.Vec3.init(light[5], light[6], light[7]));
     const center = gl.math.Vec3.init(0, -0.5, 0);
     const eye = gl.math.Vec3.sub(center, gl.math.Vec3.scale(dir, 8.0));
     const view = gl.math.Mat4.lookAt(eye, center, gl.math.Vec3.init(0, 1, 0));
@@ -234,7 +243,9 @@ export fn glscenewebgpu_frame(dt_ms: f32, width: u32, height: u32) u32 {
             0,
             0,
         );
-        enc.createShadowMap(shadow_handle, shadow_size);
+        // Multi-caster atlas geometry: create the full 4096² atlas so the receiver's
+        // tile math (tile 0 = col 0, row 0 of a 4096² atlas) matches the depth pass.
+        enc.createShadowMap(shadow_handle, gl.command.shadow_atlas_dim);
         // Base color is sRGB (hardware decode); MR stays linear.
         enc.createTextureSrgb(base_tex, 2, 2, @intCast(@intFromPtr(&base_rgba)), @intCast(base_rgba.len));
         enc.createTexture(mr_tex, 1, 1, @intCast(@intFromPtr(&mr_rgba)), @intCast(mr_rgba.len));
@@ -249,7 +260,8 @@ export fn glscenewebgpu_frame(dt_ms: f32, width: u32, height: u32) u32 {
         enc.createTextureEx(lut_handle, .tex_2d, .rgba16f, env.lut_size, env.lut_size, 1, @intCast(@intFromPtr(env.lut.ptr)), @intCast(env.lut.len));
     }
     // ── shadow depth pass (light's POV) — MUST precede the color pass ──
-    enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
+    // Single 2D caster in tile (col=0, row=0) of the atlas; tile = shadow_tile_dim.
+    enc.beginShadowPass(shadow_handle, depth_shader, 0, 0, gl.command.shadow_tile_dim);
     enc.drawDepth(vbuf_handle, ibuf_handle, 0, @intCast(gl.mesh.pbr_cube_indices.len), @intCast(@intFromPtr(&depth_mvp_cube)));
     enc.drawDepth(plane_vbuf_handle, plane_ibuf_handle, 0, @intCast(gl.mesh.pbr_plane_indices.len), @intCast(@intFromPtr(&depth_mvp_plane)));
     enc.endShadowPass(width, height);
@@ -259,7 +271,8 @@ export fn glscenewebgpu_frame(dt_ms: f32, width: u32, height: u32) u32 {
     enc.setPipeline(shader_handle, gl.command.state_depth_test | gl.command.state_cull_back);
     enc.setLights(1, @intCast(@intFromPtr(&light)));
     if (ibl_sent) enc.bindIbl(irr_handle, spec_handle, lut_handle, env_reader.?.spec_mip_count);
-    enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&light_vp)));
+    // Bind the atlas + upload this single caster's VP into shadow_vp[0] (count=1).
+    enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&light_vp)), 1);
     // Cube (metallic, textured).
     enc.bindTexture(0, base_tex);
     enc.bindTexture(1, mr_tex);

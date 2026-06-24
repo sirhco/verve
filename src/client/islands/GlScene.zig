@@ -91,14 +91,17 @@ const lut_handle: u32 = 18;
 const depth_shader: u32 = 5;
 const depth_at_shader: u32 = 10; // alpha-tested depth shader for MASK cutout shadows
 const shadow_handle: u32 = 1;
-const shadow_size: u32 = 1024;
+// Multi-caster 2D shadow atlas (was a single 1024² map). Now a 4096² atlas tiled
+// into 1024² cells; up to max_2d_casters (4) directional/spot casters share row 0.
+const shadow_size: u32 = gl.command.shadow_atlas_dim; // 4096
+const shadow_tile: u32 = gl.command.shadow_tile_dim; // 1024
 
-// Point-light shadow atlas (P11 task 5). RGBA8 1536×1024, 6 faces tiled 3×2
-// at 512×512 each. Lives in st.shadowMaps[] at handle 2 (distinct from the 2D
-// shadow map at handle 1 and IBL textures at handles 16/17/18).
+// Point-light shadow atlas (multi-caster). RGBA8 1536×4096: 3 cols × 8 rows of
+// 512² tiles = 6 faces × up to max_point_casters (4) point casters. Caster `pidx`
+// occupies rows [pidx*2, pidx*2+1]. Lives in st.shadowMaps[] at handle 2.
 const point_atlas_handle: u32 = 2;
-const point_atlas_w: u32 = 1536;
-const point_atlas_h: u32 = 1024;
+const point_atlas_w: u32 = gl.command.point_atlas_w; // 1536
+const point_atlas_h: u32 = gl.command.point_atlas_h; // 4096
 const point_atlas_tile: u32 = 512;
 
 const max_submesh = 128; // per-instance pool cap (was 8); sizes Scene + all Inst pools
@@ -237,8 +240,6 @@ const Inst = struct {
     model_mats: [max_submesh][16]f32 = undefined,
     normal9s: [max_submesh][9]f32 = undefined,
     submesh_aabb: [max_submesh]gl.cull.Aabb = undefined, // P9 slice 2 (CPU-only)
-    depth_mvps: [max_submesh][16]f32 = undefined, // P9 slice 3 shadow pass
-    light_vp_mat: [16]f32 = undefined,
     mats: [max_submesh][12]f32 = undefined, // per-submesh material block
     // Pass-2 transparency sort scratch. Kept in Inst (static), NOT on the
     // frame stack: at max_submesh=128 these two arrays are 1 KB, and keeping
@@ -268,8 +269,6 @@ const Inst = struct {
         break :blk a;
     },
     light_count: u32 = 1,
-    // Index of the shadow-casting light (< max_lights). Sentinel max_lights = no caster.
-    shadow_caster: u32 = 0, // default: light 0 is the caster (matches existing behaviour)
 
     // Distance fog (mode,r,g,b,near,far,density,_pad). Default off.
     fog_params: [8]f32 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -325,17 +324,28 @@ const Inst = struct {
     // skips that index so runtime tweens (or parseMorph seeds) are not clobbered.
     morph_runtime_set: [max_morph_targets]bool = .{false} ** max_morph_targets,
 
-    // P11 task 5 — point-light shadow atlas state.
-    // face_vp[f] = clipFix · cubeFaceVp(lp, f, near, far) — kept in Inst (not
-    // stack) so the Encoder pointer stays valid after glscene_frame returns.
-    // point_lp holds the caster world position; point_far the effective far plane.
-    face_vp: [6][16]f32 = undefined,
-    point_lp: [3]f32 = .{ 0, 0, 0 },
-    point_far: f32 = 1.0,
+    // ── Multi-caster shadow state (up to max_2d_casters 2D + max_point_casters
+    // point, all at once). EVERY matrix a command points at must remain valid at
+    // deferred-decode time (the bridge walks cmd_buf AFTER glscene_frame returns),
+    // so each caster owns its OWN persistent buffer here in Inst — never the frame
+    // stack (chunk wasm stack is 64 KB; these pools would overflow it). The price
+    // of deferred decode is ~33 KB of static per-caster matrix storage.
+    //
+    // 2D casters (directional/spot): CONTIGUOUS VP array so &shadow_vp_mats[0] +
+    // n_2d_casters feeds one bind_shadow_map; per-caster per-submesh depth MVPs.
+    shadow_vp_mats: [gl.command.max_2d_casters][16]f32 = undefined,
+    depth_mvps_mc: [gl.command.max_2d_casters][max_submesh][16]f32 = undefined,
+    // Point casters: per-caster 6-face VPs + light pos + far plane.
+    face_vp_mc: [gl.command.max_point_casters][6][16]f32 = undefined,
+    point_lp_mc: [gl.command.max_point_casters][3]f32 = undefined,
+    point_far_mc: [gl.command.max_point_casters]f32 = undefined,
+    // Caster tables: light index per slot, populated by parseLights/hydrate.
+    n_2d_casters: u32 = 0,
+    casters_2d: [gl.command.max_2d_casters]u32 = undefined,
+    n_point_casters: u32 = 0,
+    casters_point: [gl.command.max_point_casters]u32 = undefined,
     // True once createPointShadow has been emitted for this instance.
     point_atlas_sent: bool = false,
-    // True when the active shadow caster is a point light (false = dir/spot 2D).
-    shadow_is_point: bool = false,
 };
 
 const MAX_INSTANCES = 4;
@@ -350,6 +360,11 @@ var current: ?*Inst = null;
 var live_count: u32 = 0;
 
 var reduced_motion: bool = false; // page media query — same for every instance
+// Debug/test-harness freeze: pins the auto-orbit so a CDP run has a stable frame
+// for pixel metrics (mirrors GlSkin's glskin_freeze). Page-global, like
+// reduced_motion. Toggled via the glscene_freeze / glscene_unfreeze exports
+// (wired to a /gl-multishadow button); orbit drag still works while frozen.
+var freeze: bool = false;
 // P10 slice 2d: page-global backend choice. Set once at the first hydrate from
 // gl_webgpu_available(); selects WGSL + gl_start_gpu vs GLSL + gl_start, and
 // whether the clip-space z fix is applied to the proj/light matrices.
@@ -380,19 +395,29 @@ fn clipFix() gl.math.Mat4 {
 // Shared transient scratch — `glscene_frame` fills it and returns its pointer;
 // the bridge walks the stream synchronously before the next frame call, so
 // instances never interleave within a tick. NOT per-instance (saves 3×4 KB).
-//   one-time create OR replay: 2×createBuffer + ≤16 PBR/alpha-test/DS shader variants +
-//     1 depth + 1 depth_at shader + 1 shadow map + 5 createTexture + 3 createTextureEx ≈ 420 B
-//   per-frame bound (320 = double-sided BLEND main draw, 44 = MASK shadow draw):
-//     main:   beginFrame(28) + N×2×160 (double-sided BLEND, 320/submesh) + endFrame(4)
-//     shadow: beginShadowPass(16) + N×44 (MASK: bindTexture(12)+drawDepthAt(32)) + endShadowPass(12)
-//     + 64 slop → 4 + 128×364 + (28+4+16+12) + 64 = 46,720 B
-//   320 (BLEND main) and 44 (MASK shadow) can't BOTH come from one submesh
-//   (alpha_mode is one value: BLEND main pairs with plain depth=24, MASK shadow
-//   pairs with a 160 main draw), so 320+44 is deliberately over-conservative —
-//   the real per-submesh max is ~344. The ~2.6 KB of slack also absorbs the
-//   one-time ~420 B sendResources create/replay burst that shares this buffer
-//   on the first frame.
-const cmd_buf_cap: usize = 4 + max_submesh * (320 + 44) + (28 + 4 + 16 + 12) + 64;
+//
+// MULTI-CASTER WORST CASE. Every command record = 4-byte header + payload.
+// With max_submesh M = 128, up to max_2d_casters (4) 2D passes + up to
+// max_point_casters (4) point casters (each 6 faces) + one main pass, all in a
+// single frame:
+//
+//   2D depth (per caster): beginShadowPass(4+20=24) + M × MASK-worst
+//                          (bindTexture 12 + drawDepthAt 32 = 44) + endShadowPass(12)
+//                          = 24 + 128×44 + 12 = 5,668; × 4 = 22,672
+//   point depth (per caster): 6 faces × (beginPointShadowFace(4+28=32) +
+//                          M × drawPointDepth(4+20=24)) = 6×(32 + 128×24) = 18,624;
+//                          × 4 = 74,496; + ONE endPointShadow(12) total
+//   main: beginFrame(28) + M × DS-BLEND-worst(≈384: 2-pass setPipeline+setLights+
+//                          bindIbl+bindShadowMap(20)+bindPointShadow(12)+fog+morph+
+//                          5×bindTexture+drawPbr) + endFrame(4) = 28 + 128×384 + 4
+//                          = 49,184
+//   one-time create/replay burst (shares this buffer on frame 1): ≈ 800 B
+//   length header(4) + slop.
+//
+//   22,672 + 74,508 + 49,184 + 800 + 4 ≈ 147,168 → round up to 160 KiB.
+// (CDP at T4 confirms this fits chunk memory; the static-buffer growth from
+// 46,720 B → 163,840 B is the price of simultaneous multi-caster shadows.)
+const cmd_buf_cap: usize = 160 * 1024;
 var cmd_buf: [cmd_buf_cap]u8 = undefined;
 
 fn findSlot(vid: u32) ?*Inst {
@@ -695,11 +720,16 @@ fn emitShader(inst: *Inst, enc: *gl.Encoder, comptime variant: u32) void {
     inst.registry.recordShader(handle, full, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
 }
 
-/// Emit a point-shadow PBR shader (variant | variant_shadow_point) at its distinct handle.
-/// Uses the same emitShader pattern but ORs in variant_shadow_point instead of variant_shadow.
+/// Emit a combined-shadow PBR receiver (variant | variant_shadow | variant_shadow_point)
+/// at its distinct handle (53..68). Bakes BOTH the 2D and point sampling paths so the
+/// SAME program receives up to max_2d_casters 2D casters AND up to max_point_casters
+/// point casters simultaneously (selected per-light at runtime via v3.w shadow_kind).
+/// The handle is keyed on (base | variant_shadow_point); variant_shadow is folded into
+/// `full` here so the bridge derives both hasShadow (0x20) and hasPointShadow (0x8000).
 fn emitPointShader(inst: *Inst, enc: *gl.Encoder, comptime base_variant: u32) void {
-    const full = base_variant | gl.command.variant_shadow_point;
-    const handle = shaderHandleFor(full); // handle 53..68
+    const full = base_variant | gl.command.variant_shadow | gl.command.variant_shadow_point;
+    // Handle keyed on the point bit only (matches shaderHandleFor's 53..68 table).
+    const handle = shaderHandleFor(base_variant | gl.command.variant_shadow_point);
     if (use_webgpu) {
         const w = gl.command.wgslPbr(full);
         enc.createShader(handle, full, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
@@ -781,19 +811,18 @@ fn parseFog(inst: *Inst, s: []const u8) void {
     inst.fog_enabled = true;
 }
 
-// Parse the `data-gllights` attribute into inst.lights / light_count / shadow_caster.
+// Parse the `data-gllights` attribute into inst.lights / light_count, then
+// classify shadow casters into the 2D + point tables.
 // Format: semicolon-separated light records, each a 15-field comma-separated CSV:
 //   type,intensity,px,py,pz,dx,dy,dz,r,g,b,range,cosIn,cosOut,castsShadow
-// Maps CSV[0..13] → lights[i*16 + 0..13]; lights[i*16+14,15] = 0 (_pad).
-// CSV[14] (castsShadow): the first light (directional/spot/point) with value ≥ 0.5
-// becomes shadow_caster. A directional → ortho light_vp, spot → perspective light_vp,
-// point → the 6-face RGBA8 distance atlas (variant_shadow_point).
-// If no light casts a shadow, shadow_caster = max_lights (sentinel: no shadow).
+// Maps CSV[0..13] → lights[i*16 + 0..13]. Indices 14,15 are NOT from the CSV:
+// they are per-light shadow metadata (v3.z=shadow_index, v3.w=shadow_kind) filled
+// by classifyCasters(). CSV[14] (castsShadow) only drives the classification.
 // Tolerant: parse errors for a token leave that field at 0; extra fields ignored.
 fn parseLights(inst: *Inst, s: []const u8) void {
     const max_l = gl.command.max_lights;
-    inst.shadow_caster = max_l; // sentinel: no caster until one is found
     var li: u32 = 0;
+    var casts: [gl.command.max_lights]bool = .{false} ** gl.command.max_lights;
     var light_it = std.mem.splitScalar(u8, s, ';');
     while (light_it.next()) |rec| {
         if (li >= max_l) break;
@@ -808,17 +837,66 @@ fn parseLights(inst: *Inst, s: []const u8) void {
             if (fi < 14) {
                 inst.lights[base + fi] = v;
             } else {
-                // fi == 14: castsShadow — directional (0), point (1), and spot (2)
-                // are all valid casters. Point shadows use the 6-face RGBA8 atlas;
-                // dir/spot use the 2D depth map. Accept any type that flags castsShadow.
-                if (v >= 0.5 and inst.shadow_caster == max_l)
-                    inst.shadow_caster = li;
+                // fi == 14: castsShadow — directional (0), point (1), spot (2) all
+                // valid. Classification (2D vs point slot) happens after the loop.
+                casts[li] = v >= 0.5;
             }
             fi += 1;
         }
         li += 1;
     }
     inst.light_count = li;
+    classifyCasters(inst, casts[0..li]);
+}
+
+// Classify every shadow-casting light into the 2D atlas (directional/spot) or the
+// point cube atlas, filling the caster tables and writing per-light shadow metadata
+// into v3.z (shadow_index) and v3.w (shadow_kind: 0=none, 1=2D, 2=point). Over-cap
+// casters degrade to non-casters. Does NOT clobber v3.x/v3.y (indices 12,13 =
+// cos_inner/cos_outer for spots). Enforces the range==far contract for point casters.
+fn classifyCasters(inst: *Inst, casts: []const bool) void {
+    inst.n_2d_casters = 0;
+    inst.n_point_casters = 0;
+    var li: u32 = 0;
+    while (li < inst.light_count) : (li += 1) {
+        const base = li * 16;
+        const wants = li < casts.len and casts[li];
+        if (!wants) {
+            inst.lights[base + 14] = -1.0; // shadow_index = none
+            inst.lights[base + 15] = 0.0; // shadow_kind = none
+            continue;
+        }
+        const ltype = inst.lights[base + 0];
+        const is_point = ltype >= 0.5 and ltype < 1.5;
+        if (is_point) {
+            if (inst.n_point_casters < gl.command.max_point_casters) {
+                const pidx = inst.n_point_casters;
+                inst.n_point_casters += 1;
+                inst.casters_point[pidx] = li;
+                inst.lights[base + 14] = @floatFromInt(pidx);
+                inst.lights[base + 15] = 2.0; // point
+                // Enforce range==far: the receiver normalises by range (v2.w =
+                // lights[base+11]); range≤0 is illegal for a caster. Clamp to the
+                // depth-pass default far AND write it back so both agree.
+                if (inst.lights[base + 11] <= 0) inst.lights[base + 11] = 25.0;
+            } else {
+                inst.lights[base + 14] = -1.0;
+                inst.lights[base + 15] = 0.0;
+            }
+        } else {
+            // directional (type<0.5) or spot (type≥1.5) → 2D atlas
+            if (inst.n_2d_casters < gl.command.max_2d_casters) {
+                const sidx = inst.n_2d_casters;
+                inst.n_2d_casters += 1;
+                inst.casters_2d[sidx] = li;
+                inst.lights[base + 14] = @floatFromInt(sidx);
+                inst.lights[base + 15] = 1.0; // 2D
+            } else {
+                inst.lights[base + 14] = -1.0;
+                inst.lights[base + 15] = 0.0;
+            }
+        }
+    }
 }
 
 // Parse a "w0,w1,…" morph-weight attribute into inst.morph_weights[0..].
@@ -888,7 +966,9 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
             inst.lights[14] = 0;
             inst.lights[15] = 0;
             inst.light_count = 1;
-            inst.shadow_caster = 0; // light 0 casts the shadow
+            // Default: light 0 is a 2D (directional) shadow caster in slot 0.
+            // classifyCasters writes v3.z/v3.w; parseLights (data-gllights) overrides.
+            classifyCasters(inst, &.{true});
 
             // Deep-copy pick names/ids into the instance (arena dies on reset).
             inst.pick_count = @min(@min(p.pick_names.len, p.pick_event_ids.len), max_picks);
@@ -1211,9 +1291,9 @@ fn stampName(inst: *const Inst, attr: []const u8, a: *const gl.vmesh.Reader, s: 
 
 /// Directional light view-projection for the shadow pass (ortho fit to the
 /// union of submesh world AABBs). Reads caster direction from the 16-f32
-/// layout at base = shadow_caster*16, dir at +5..+7.
+/// layout at base = light_idx*16, dir at +5..+7.
 /// Call after `scene.updateWorld()`.
-fn lightSpaceMatrix(inst: *const Inst, a: *const gl.vmesh.Reader) gl.math.Mat4 {
+fn lightSpaceMatrix(inst: *const Inst, a: *const gl.vmesh.Reader, light_idx: u32) gl.math.Mat4 {
     const Vec3 = gl.math.Vec3;
     const inf = std.math.inf(f32);
     var lo = Vec3.init(inf, inf, inf);
@@ -1232,7 +1312,7 @@ fn lightSpaceMatrix(inst: *const Inst, a: *const gl.vmesh.Reader) gl.math.Mat4 {
     const center = Vec3.scale(Vec3.add(lo, hi), 0.5);
     const radius = @max(@as(f32, 0.5), Vec3.length(Vec3.sub(hi, lo)) * 0.5);
     // Read dir from caster's slot in the new 16-f32 layout (dir at +5..+7).
-    const base = inst.shadow_caster * 16;
+    const base = light_idx * 16;
     const dir = Vec3.normalize(Vec3.init(inst.lights[base + 5], inst.lights[base + 6], inst.lights[base + 7]));
     const up = if (@abs(dir.y) > 0.99) Vec3.init(0, 0, 1) else Vec3.init(0, 1, 0);
     const dist = radius * 3.0;
@@ -1245,9 +1325,9 @@ fn lightSpaceMatrix(inst: *const Inst, a: *const gl.vmesh.Reader) gl.math.Mat4 {
 
 /// Spot light view-projection for the shadow pass (perspective from the spot's
 /// position looking in `dir`). fovy = 2*acos(cosOut) so the cone fits the frustum.
-fn spotLightVp(inst: *const Inst) gl.math.Mat4 {
+fn spotLightVp(inst: *const Inst, light_idx: u32) gl.math.Mat4 {
     const Vec3 = gl.math.Vec3;
-    const base = inst.shadow_caster * 16;
+    const base = light_idx * 16;
     const pos = Vec3.init(inst.lights[base + 2], inst.lights[base + 3], inst.lights[base + 4]);
     const dir = Vec3.init(inst.lights[base + 5], inst.lights[base + 6], inst.lights[base + 7]);
     const cos_out = inst.lights[base + 13];
@@ -1267,8 +1347,9 @@ fn spotLightVp(inst: *const Inst) gl.math.Mat4 {
 export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
     const inst = current orelse return 0;
 
-    // autoRotate spins the camera at a constant rate, bypassing damping.
-    if (!reduced_motion and inst.auto_rotate != 0)
+    // autoRotate spins the camera at a constant rate, bypassing damping. Freeze
+    // (debug/test) pins the orbit so a CDP run has a stable frame.
+    if (!reduced_motion and !freeze and inst.auto_rotate != 0)
         inst.orbit.yaw += inst.auto_rotate * (dt_ms / 1000.0);
 
     // Consume accumulated pointer/wheel input, then zero the accumulator.
@@ -1445,50 +1526,106 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             }
         }
 
-        // ── shadow depth pass — render scene depth from the caster light.
-        // Three cases: point (6-face atlas), spot (2D perspective), dir (2D ortho).
-        //
-        // When shadow_caster == max_lights (sentinel) no light casts shadows:
-        // skip all shadow passes entirely. PBR receiver returns fully-lit for
-        // out-of-range shadow lookups, so skipping is safe.
-        const has_shadow_caster = inst.shadow_caster < gl.command.max_lights;
+        // ── multi-caster shadow depth pass — render scene depth from EVERY caster.
+        // Up to max_2d_casters (4) directional/spot casters tile the 2D atlas (row
+        // 0, col = slot) and up to max_point_casters (4) point casters tile the cube
+        // atlas, all in this one frame. Per-caster matrices live in Inst (persistent)
+        // so the Encoder pointers survive deferred decode (the bridge walks cmd_buf
+        // AFTER this fn returns). No casters → no shadow passes; the PBR receiver is
+        // fully-lit for out-of-range/none lookups (v3.w==0), so skipping is safe.
         inst.cull_shadow_drawn = 0;
         inst.cull_shadow_culled = 0;
-        if (has_shadow_caster) {
-            const caster_base = inst.shadow_caster * 16;
-            const caster_type = inst.lights[caster_base + 0];
-            const caster_is_point = caster_type >= 0.5 and caster_type < 1.5;
 
-            if (caster_is_point) {
-                // ── Point-light shadow: 6-face RGBA8 atlas (P11 task 5).
-                // clipFix is applied to each face VP (WebGPU z remapping).
-                // face_vp[f] and point_lp live in Inst so the Encoder pointers
-                // remain valid after glscene_frame returns.
+        // ── 2D casters (directional/spot): one tiled pass each into the 4096² atlas.
+        if (inst.n_2d_casters > 0) {
+            var s: u32 = 0;
+            while (s < inst.n_2d_casters) : (s += 1) {
+                const li = inst.casters_2d[s];
+                const caster_base = li * 16;
+                const caster_type = inst.lights[caster_base + 0];
+                // clipFix is identity on WebGL2, z-remap on WebGPU.
+                const light_vp = if (caster_type >= 1.5)
+                    clipFix().mul(spotLightVp(inst, li)) // spot: perspective
+                else
+                    clipFix().mul(lightSpaceMatrix(inst, a, li)); // directional: ortho
+                // Store the VP in the CONTIGUOUS array (&shadow_vp_mats[0] + count
+                // feeds one bind_shadow_map; index s == the atlas tile + receiver slot).
+                inst.shadow_vp_mats[s] = light_vp.m;
+
+                // Per-caster light-frustum cull (keeps off-screen casters that cast
+                // into view). Tile = (col=s, row=0) since ≤ max_2d_casters fit row 0.
+                const lplanes = gl.cull.frustumPlanes(light_vp);
+                enc.beginShadowPass(shadow_handle, depth_shader, s, 0, shadow_tile);
+                // NOTE: double-sided shadows back-cull this phase (drawDepth/drawDepthAt
+                // carry no state word; cull is baked into the depth pipeline).
+                {
+                    // Phase A: opaque+blend (alpha_mode != 2) — plain position-only depth.
+                    // depth_mvps_mc[s][sd] precomputed for ALL submeshes (Phase B reuses).
+                    var sd: u32 = 0;
+                    while (sd < a.submesh_count) : (sd += 1) {
+                        if (sd >= max_submesh) break;
+                        const sub = a.submesh(sd);
+                        inst.depth_mvps_mc[s][sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
+                        const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                        if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
+                            inst.cull_shadow_culled += 1;
+                            continue;
+                        }
+                        if (sub.alpha_mode == 2) continue; // MASK: Phase B
+                        inst.cull_shadow_drawn += 1;
+                        enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])));
+                    }
+                    // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
+                    sd = 0;
+                    while (sd < a.submesh_count) : (sd += 1) {
+                        if (sd >= max_submesh) break;
+                        const sub = a.submesh(sd);
+                        if (sub.alpha_mode != 2) continue;
+                        const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                        if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // counted in Phase A
+                        inst.cull_shadow_drawn += 1;
+                        enc.bindTexture(0, texHandle(sub.tex_base));
+                        enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])), @intCast(@intFromPtr(&inst.mats[sd])));
+                    }
+                }
+                enc.endShadowPass(width, height);
+            }
+        }
+
+        // ── point casters: 6-face distance atlas each. clipFix applied per face.
+        // ALL faces of ALL casters render before the single endPointShadow (the
+        // WebGPU bridge clears the atlas only on col==0&&row==0 = caster 0 face 0;
+        // every later face/caster loads). Tile = (col=face%3, row=pidx*2+face/3).
+        if (inst.n_point_casters > 0) {
+            var pidx: u32 = 0;
+            while (pidx < inst.n_point_casters) : (pidx += 1) {
+                const li = inst.casters_point[pidx];
+                const caster_base = li * 16;
                 const lp = gl.math.Vec3.init(
                     inst.lights[caster_base + 2],
                     inst.lights[caster_base + 3],
                     inst.lights[caster_base + 4],
                 );
-                inst.point_lp = .{ lp.x, lp.y, lp.z };
-                const rng = inst.lights[caster_base + 11];
-                // Use the declared range; fall back to a generous default (25 m).
-                const far: f32 = if (rng > 0) rng else 25.0;
+                inst.point_lp_mc[pidx] = .{ lp.x, lp.y, lp.z };
+                // range==far contract: classifyCasters wrote range back into v2.w
+                // (default 25 when ≤0), so the depth-pass far matches the receiver far.
+                const far: f32 = inst.lights[caster_base + 11];
+                inst.point_far_mc[pidx] = far;
                 const near: f32 = 0.05;
-                inst.point_far = far;
 
                 var face: u8 = 0;
                 while (face < 6) : (face += 1) {
                     const fvp = clipFix().mul(gl.math.cubeFaceVp(lp, face, near, far));
-                    inst.face_vp[face] = fvp.m;
+                    inst.face_vp_mc[pidx][face] = fvp.m;
                     const col: u32 = @as(u32, face) % 3;
-                    const row: u32 = @as(u32, face) / 3;
+                    const row: u32 = pidx * 2 + @as(u32, face) / 3;
                     enc.beginPointShadowFace(
                         point_atlas_handle,
                         col,
                         row,
                         point_atlas_tile,
-                        @intCast(@intFromPtr(&inst.face_vp[face])),
-                        @intCast(@intFromPtr(&inst.point_lp)),
+                        @intCast(@intFromPtr(&inst.face_vp_mc[pidx][face])),
+                        @intCast(@intFromPtr(&inst.point_lp_mc[pidx])),
                         @bitCast(far),
                     );
                     var sd: u32 = 0;
@@ -1504,72 +1641,8 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                         );
                     }
                 }
-                enc.endPointShadow(width, height);
-                enc.bindPointShadow(
-                    gl.command.tex_slot_point_shadow,
-                    point_atlas_handle,
-                    @intCast(@intFromPtr(&inst.point_lp)),
-                    @bitCast(far),
-                );
-                inst.shadow_is_point = true;
-                // light_vp_mat is unused on the point path; zero it for safety.
-                inst.light_vp_mat = [_]f32{0} ** 16;
-            } else {
-                // ── Directional / spot: 2D depth map (P9 slice 3, byte-identical).
-                // clipFix is identity on WebGL2 and z-remap on WebGPU.
-                const light_vp = if (caster_type >= 1.5)
-                    // Spot light: perspective projection from light position.
-                    clipFix().mul(spotLightVp(inst))
-                else
-                    // Directional light: ortho fit to scene AABB.
-                    clipFix().mul(lightSpaceMatrix(inst, a));
-                inst.light_vp_mat = light_vp.m;
-
-                // Light-frustum planes for shadow-caster culling (T4). Culling against
-                // the LIGHT frustum so off-screen casters that cast into view are kept.
-                const lplanes = gl.cull.frustumPlanes(light_vp);
-                enc.beginShadowPass(shadow_handle, depth_shader, shadow_size);
-                // NOTE: double-sided shadows use back-cull this phase — drawDepth/drawDepthAt
-                // carry no per-draw state word, so cull is baked into the depth pipeline.
-                // A thin double-sided surface may under-shadow from one side; future work.
-                {
-                    // Phase A: opaque + blend (alpha_mode != 2) — plain position-only depth.
-                    // depth_mvps is computed for ALL submeshes (cheap) so Phase B can reuse it.
-                    // Cull check happens here for ALL submeshes; culled ones skip both phases.
-                    var sd: u32 = 0;
-                    while (sd < a.submesh_count) : (sd += 1) {
-                        if (sd >= max_submesh) break;
-                        const sub = a.submesh(sd);
-                        inst.depth_mvps[sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
-                        const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
-                        if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
-                            inst.cull_shadow_culled += 1;
-                            continue;
-                        }
-                        if (sub.alpha_mode == 2) continue; // MASK: drawn in Phase B
-                        inst.cull_shadow_drawn += 1;
-                        enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])));
-                    }
-                    // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
-                    // Re-tests light frustum (same deterministic result as Phase A); only
-                    // MASK submeshes that passed Phase A's frustum check reach drawDepthAt.
-                    sd = 0;
-                    while (sd < a.submesh_count) : (sd += 1) {
-                        if (sd >= max_submesh) break;
-                        const sub = a.submesh(sd);
-                        if (sub.alpha_mode != 2) continue;
-                        const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
-                        if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // already counted in Phase A
-                        inst.cull_shadow_drawn += 1;
-                        enc.bindTexture(0, texHandle(sub.tex_base));
-                        enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps[sd])), @intCast(@intFromPtr(&inst.mats[sd])));
-                    }
-                }
-                enc.endShadowPass(width, height);
-                inst.shadow_is_point = false;
             }
-        } else {
-            inst.shadow_is_point = false;
+            enc.endPointShadow(width, height);
         }
 
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
@@ -1612,12 +1685,10 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
             enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
             enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-            if (inst.shadow_is_point) {
-                enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
-                enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
-            } else {
-                enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
-            }
+            // Instanced shader is a non-receiver (variant_shadow{,_point} are
+            // @compileError with variant_inst), so these binds are inert on the
+            // shader side; emitted for stream uniformity with the new signatures.
+            bindShadowResources(inst, &enc);
             if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
             enc.bindTexture(0, texHandle(sub0.tex_base));
             enc.bindTexture(1, texHandle(sub0.tex_mr));
@@ -1707,7 +1778,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     // front faces (cull back) for correct over-blend compositing.
                     // Both passes share the same variant; state word differs so each
                     // needs its own SET_PIPELINE + full lights/IBL/shadow re-emit.
-                    const ds_sbit: u32 = if (inst.shadow_is_point) gl.command.variant_shadow_point else 0;
+                    const ds_sbit: u32 = if (pointActive(inst)) gl.command.variant_shadow_point else 0;
                     const v = a.submeshVariant(s) |
                         (if (inst.fog_enabled) variant_fog else 0) |
                         (if (inst.morph_enabled) variant_morph else 0) |
@@ -1720,12 +1791,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_front | gl.command.state_blend);
                     enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-                    if (inst.shadow_is_point) {
-                        enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
-                        enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
-                    } else {
-                        enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
-                    }
+                    bindShadowResources(inst, &enc);
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
                     if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
                     enc.bindTexture(0, texHandle(sub.tex_base));
@@ -1738,12 +1804,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_back | gl.command.state_blend);
                     enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-                    if (inst.shadow_is_point) {
-                        enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
-                        enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
-                    } else {
-                        enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
-                    }
+                    bindShadowResources(inst, &enc);
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
                     if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
                     enc.bindTexture(0, texHandle(sub.tex_base));
@@ -1811,6 +1872,40 @@ export fn glmorph_reset() void {
     inst.morph_runtime_set[0] = false;
 }
 
+// Debug/test-harness freeze (wired to the /gl-multishadow button via
+// z-on-click). Pins the auto-orbit so the user's CDP run has a stable frame for
+// pixel metrics; orbit drag still works. Page-global (mirrors glskin_freeze).
+export fn glscene_freeze() void {
+    freeze = true;
+}
+export fn glscene_unfreeze() void {
+    freeze = false;
+}
+
+/// True when this instance has at least one point-shadow caster — selects the
+/// variant_shadow_point receiver shaders (handles 53–68, which now ALSO bake
+/// variant_shadow so they receive BOTH 2D and point casters simultaneously).
+fn pointActive(inst: *const Inst) bool {
+    return inst.n_point_casters > 0;
+}
+
+/// Emit the receiver shadow binds with the multi-caster signatures, once per
+/// pipeline (re-emitted on WebGL2 because uniform locations are per-program;
+/// idempotent re-stash on WebGPU). bindShadowMap uploads the CONTIGUOUS 2D-caster
+/// VP array (count = n_2d_casters; atlas handle 0 when there are none). The
+/// receiver reads per-light slot/kind from the lights array (uploaded via
+/// setLights), so no other per-draw shadow state is needed.
+fn bindShadowResources(inst: *const Inst, enc: *gl.Encoder) void {
+    enc.bindShadowMap(
+        gl.command.tex_slot_shadow,
+        if (inst.n_2d_casters > 0) shadow_handle else 0,
+        @intCast(@intFromPtr(&inst.shadow_vp_mats[0])),
+        inst.n_2d_casters,
+    );
+    if (inst.n_point_casters > 0)
+        enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle);
+}
+
 /// Emit the draw commands for a single submesh `s` with the given pipeline
 /// `state` word. Lazily re-emits SET_PIPELINE (+ lights/IBL/shadow rebind) when
 /// the variant changes vs `last_variant.*`. `pv` is the clip-space proj*view.
@@ -1827,10 +1922,11 @@ fn drawSubmesh(
     pv: gl.math.Mat4,
 ) void {
     const sub = a.submesh(s);
-    // Fold in the shadow receiver bit: point shadow uses variant_shadow_point (distinct
-    // handle 53–68); dir/spot uses the bare variant whose shader bakes variant_shadow
-    // (handles 1–52). No shadow caster → bare variant (no shadow bit).
-    const sbit: u32 = if (inst.shadow_is_point) gl.command.variant_shadow_point else 0;
+    // Fold in the shadow receiver bit. The base variant always bakes variant_shadow
+    // (2D receiver, handles 1–52). When ANY point caster is present, switch to the
+    // variant_shadow_point handles (53–68) which now bake BOTH variant_shadow AND
+    // variant_shadow_point, so a single program receives 2D + point casters at once.
+    const sbit: u32 = if (pointActive(inst)) gl.command.variant_shadow_point else 0;
     const v = a.submeshVariant(s) |
         (if (inst.fog_enabled) variant_fog else 0) |
         (if (inst.morph_enabled) variant_morph else 0) |
@@ -1839,15 +1935,8 @@ fn drawSubmesh(
         enc.setPipeline(shaderHandleFor(v), state);
         enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
         enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-        if (inst.shadow_is_point) {
-            // Point-shadow path: re-emit per-pipeline so WebGL2 writes the light
-            // uniforms (u_point_light_pos / u_point_far) to the now-active program.
-            // Idempotent on WebGPU (re-stashes the atlas bind group).
-            enc.bindPointShadow(gl.command.tex_slot_point_shadow, point_atlas_handle, @intCast(@intFromPtr(&inst.point_lp)), @bitCast(inst.point_far));
-            enc.bindShadowMap(gl.command.tex_slot_shadow, 0, @intCast(@intFromPtr(&inst.light_vp_mat)));
-        } else {
-            enc.bindShadowMap(gl.command.tex_slot_shadow, shadow_handle, @intCast(@intFromPtr(&inst.light_vp_mat)));
-        }
+        // Re-bind per-pipeline (WebGL2 uniforms are per-program; WebGPU re-stash).
+        bindShadowResources(inst, enc);
         if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
         if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
         last_variant.* = v;
@@ -1953,12 +2042,11 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     enc.createShadowMap(shadow_handle, shadow_size);
     inst.registry.recordShadowMap(shadow_handle, shadow_size);
 
-    // P11 task 5: point-light shadow atlas (RGBA8 1536×1024, 6 faces 512×512).
-    // Always created alongside the 2D shadow map; the per-frame dispatch selects
-    // which one to render into based on the caster type (shadow_is_point).
-    // Registry has no recordPointShadow; inst.point_atlas_sent flags the restore
-    // path (analogous to morph_tex_recorded) to re-emit createPointShadow after
-    // registry.replay.
+    // Multi-caster point shadow atlas (RGBA8 1536×4096, 3 cols × 8 rows of 512²
+    // tiles = 6 faces × up to max_point_casters casters). Created alongside the 2D
+    // atlas (both are cheap allocations; the per-frame dispatch fills only the tiles
+    // its casters use). Registry has no recordPointShadow; inst.point_atlas_sent
+    // flags the restore path to re-emit createPointShadow after registry.replay.
     enc.createPointShadow(point_atlas_handle, point_atlas_w, point_atlas_h);
     inst.point_atlas_sent = true;
 

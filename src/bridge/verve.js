@@ -5301,8 +5301,8 @@
             setSampler("u_irradiance", 5);
             setSampler("u_prefiltered", 6);
             setSampler("u_brdf_lut", 7);
-            if (variant & 32) { // shadow receiver: light-space matrix + depth sampler (unit 8)
-              sh.lightVp = gl.getUniformLocation(prog, "u_light_vp");
+            if (variant & 32) { // shadow receiver: shadow_vp[] array + atlas depth sampler (unit 8)
+              sh.shadowVp = gl.getUniformLocation(prog, "u_shadow_vp[0]");
               setSampler("u_shadow_map", 8);
             }
             // Skinned variant: cache the bone-palette array base location.
@@ -5339,8 +5339,8 @@
             const atlasLoc = gl.getUniformLocation(prog, "u_point_atlas");
             if (atlasLoc) gl.uniform1i(atlasLoc, 9);
             sh.pointAtlas    = atlasLoc; // cached for bind_point_shadow (slot bind confirm)
-            sh.pointLightPos = gl.getUniformLocation(prog, "u_point_light_pos");
-            sh.pointFar      = gl.getUniformLocation(prog, "u_point_far");
+            // Multi-caster: u_point_light_pos/u_point_far removed (Task 1) — the
+            // receiver reads each caster's lpos/far from the per-light loop vars.
           }
           st.shaders[handle] = sh;
           break;
@@ -5649,7 +5649,9 @@
           }
           break;
         }
-        case 16: { // CREATE_SHADOW_MAP — FBO + depth texture for the shadow pass
+        case 16: { // CREATE_SHADOW_MAP — FBO + depth texture; now a 2D shadow ATLAS (4096²)
+          // Multi-caster: T3 passes size=4096; up to 4 casters each render into a
+          // 1024² tile (col=slot%4, row=slot/4) of this single shared atlas texture.
           const handle = dv.getUint32(off, true);
           const size = dv.getUint32(off + 4, true);
           const tex = gl.createTexture();
@@ -5672,13 +5674,21 @@
           st.shadowMaps[handle] = { fbo, tex, size };
           break;
         }
-        case 17: { // BEGIN_SHADOW_PASS — render depth from the light's POV
+        case 17: { // BEGIN_SHADOW_PASS — render depth into one ATLAS TILE from the light's POV
+          // NEW payload {atlas_handle, depth_shader_handle, col, row, tile} (20B).
           const sm = st.shadowMaps[dv.getUint32(off, true)];
           const sh = st.shaders[dv.getUint32(off + 4, true)];
-          const size = dv.getUint32(off + 8, true);
+          const col = dv.getUint32(off + 8, true);
+          const row = dv.getUint32(off + 12, true);
+          const tile = dv.getUint32(off + 16, true);
           if (!sm || !sh) break;
           gl.bindFramebuffer(gl.FRAMEBUFFER, sm.fbo);
-          gl.viewport(0, 0, size, size);
+          const x = col * tile, y = row * tile;
+          gl.viewport(x, y, tile, tile);
+          // Scissor restricts both viewport and the depth clear to this tile so
+          // multiple casters rendering into the same atlas don't wipe each other.
+          gl.enable(gl.SCISSOR_TEST);
+          gl.scissor(x, y, tile, tile);
           // Restore depth mask so the depth-only clear actually writes.
           gl.depthMask(true);
           gl.clear(gl.DEPTH_BUFFER_BIT);
@@ -5692,6 +5702,7 @@
           break;
         }
         case 18: { // END_SHADOW_PASS — back to the canvas framebuffer
+          gl.disable(gl.SCISSOR_TEST);
           gl.bindFramebuffer(gl.FRAMEBUFFER, null);
           gl.viewport(0, 0, dv.getUint32(off, true), dv.getUint32(off + 4, true));
           gl.cullFace(gl.BACK); // restore the color-pass winding
@@ -5709,16 +5720,19 @@
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
           break;
         }
-        case 20: { // BIND_SHADOW_MAP — depth tex + light-space matrix on active program
+        case 20: { // BIND_SHADOW_MAP — atlas depth tex + shadow_vp[] array on active program
+          // NEW payload {slot, atlas_handle, vp_ptr, count} (16B): bind the 2D atlas
+          // to texture unit `slot`, upload `count` consecutive mat4 to u_shadow_vp[0..count].
           const slot = dv.getUint32(off, true);
           const sm = st.shadowMaps[dv.getUint32(off + 4, true)];
-          const lvpPtr = dv.getUint32(off + 8, true);
+          const vpPtr = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
           if (sm) {
             gl.activeTexture(gl.TEXTURE0 + slot);
             gl.bindTexture(gl.TEXTURE_2D, sm.tex);
           }
-          if (st.active && st.active.lightVp)
-            gl.uniformMatrix4fv(st.active.lightVp, false, new Float32Array(memory.buffer, lvpPtr, 16));
+          if (st.active && st.active.shadowVp && count > 0)
+            gl.uniformMatrix4fv(st.active.shadowVp, false, new Float32Array(memory.buffer, vpPtr, count * 16));
           break;
         }
         case 21: { // SET_BONES — upload the bone palette to u_bones[] (skinned program)
@@ -6088,26 +6102,17 @@
           break;
         }
         case 35: { // BIND_POINT_SHADOW — bind atlas colour tex to slot; store for receiver.
-          // Payload (16B): slot | handle | light_pos_ptr | far_bits.
+          // NEW payload (8B): slot | handle. Multi-caster: u_point_light_pos/u_point_far
+          // removed (Task 1) — the receiver reads each caster's lpos/far from the
+          // per-light loop vars, so the bridge only binds the atlas to the texture unit.
           const slot = dv.getUint32(off, true);
           const ps = st.pointShadows[dv.getUint32(off + 4, true)];
           if (ps) {
             gl.activeTexture(gl.TEXTURE0 + slot);
             gl.bindTexture(gl.TEXTURE_2D, ps.tex);
           }
-          // Set receiver uniforms on the active program if the locations exist
-          // (resolved in T3/T4 CREATE_SHADER; safe to call with null location).
-          if (st.active) {
-            const lightPosPtr = dv.getUint32(off + 8, true);
-            const far = dv.getFloat32(off + 12, true); // far_bits reinterpreted as f32
-            if (st.active.pointAtlas != null)
-              gl.uniform1i(st.active.pointAtlas, slot);
-            if (st.active.pointLightPos != null)
-              gl.uniform3fv(st.active.pointLightPos,
-                new Float32Array(memory.buffer, lightPosPtr, 3));
-            if (st.active.pointFar != null)
-              gl.uniform1f(st.active.pointFar, far);
-          }
+          if (st.active && st.active.pointAtlas != null)
+            gl.uniform1i(st.active.pointAtlas, slot);
           break;
         }
 
@@ -6262,8 +6267,11 @@
     lights: 240,
     lightCount: 496,
     prefMips: 500,
-    lightVp: 512, // variant_shadow light-space matrix (set by bind_shadow_map)
-    size: 576,
+    // Multi-caster: shadow_vp is array<mat4x4<f32>,4> @ 512 (4×64 = 256B, 512..768).
+    // (The instanced variant reuses offset 512 for its single `vp` mat — same slot.)
+    shadowVp: 512, // shadow_vp[4] (set by bind_shadow_map; instanced path writes 1 mat here)
+    // shadowVp @512 (4×mat4 = 256B, 512..768), size 768, stride 768
+    size: 768,
   };
   // Multiple draws per frame each need isolated uniforms: WebGPU defers draws, so
   // a single shared buffer would let the last writeBuffer clobber earlier draws.
@@ -6720,15 +6728,6 @@
                 texture: { sampleType: "unfilterable-float", viewDimension: "2d" },
               });
             }
-            if (hasPointShadow) {
-              // binding 5: PointShadow uniform (16 bytes: point_light_pos vec3 + point_far f32).
-              // FRAGMENT-only. Separate from U struct to avoid shifting PBR_U byte offsets.
-              bgl0Entries.push({
-                binding: 5,
-                visibility: GPUShaderStage.FRAGMENT,
-                buffer: { type: "uniform" },
-              });
-            }
             const bgl0 = device.createBindGroupLayout({ entries: bgl0Entries });
             // group(1): sampler@0 + per-slot textures. Binding numbers + types
             // EXACTLY match wgslPbr's @group(1) decls. base@1, mr@2 always;
@@ -7089,8 +7088,10 @@
           }
           break;
         }
-        case 16: { // CREATE_SHADOW_MAP — depth texture + comparison sampler.
+        case 16: { // CREATE_SHADOW_MAP — depth texture + comparison sampler; 2D shadow ATLAS.
           // Payload (command.zig Encoder.createShadowMap, 8B): handle | size.
+          // Multi-caster: T3 passes size=4096; up to 4 casters each render into a
+          // 1024² tile (col=slot%4, row=slot/4) of this one depth32float atlas.
           const handle = dv.getUint32(off, true);
           const size = dv.getUint32(off + 4, true);
           const tex = device.createTexture({
@@ -7107,26 +7108,42 @@
           st.shadowMaps[handle] = { tex, view: tex.createView(), sampler, size };
           break;
         }
-        case 17: { // BEGIN_SHADOW_PASS — open a depth-only pass on the shadow map.
-          // Payload (12B): shadow_handle | depth_shader_handle | size. Runs BEFORE
-          // begin_frame; opens (and owns) the frame's command encoder so the depth
-          // pass and the later color pass share one encoder + submit.
+        case 17: { // BEGIN_SHADOW_PASS — open a depth-only pass into one ATLAS TILE.
+          // NEW payload (20B): atlas_handle | depth_shader_handle | col | row | tile.
+          // Runs BEFORE begin_frame; opens (and owns) the frame's command encoder so
+          // the depth pass and the later color pass share one encoder + submit.
+          // Multi-caster: mirrors the point-face tiling (case 32) — each caster opens
+          // its own depth pass into the shared atlas; loadOp clears the WHOLE depth
+          // attachment ONLY on the first tile (col=0,row=0) since WebGPU loadOp
+          // ignores scissor, then setViewport/setScissorRect restrict draws to the tile.
           const sm = st.shadowMaps[dv.getUint32(off, true)];
           const depthPipe = st.pipelines[dv.getUint32(off + 4, true)];
+          const col  = dv.getUint32(off + 8, true);
+          const row  = dv.getUint32(off + 12, true);
+          const tile = dv.getUint32(off + 16, true);
           if (!sm || !depthPipe) break;
           if (!st.encoder) st.encoder = device.createCommandEncoder();
+          // Close any prior shadow pass (previous caster's tile) before opening this one.
+          if (st.shadowPass) { st.shadowPass.end(); st.shadowPass = null; }
+          const isFirstTile = (col === 0 && row === 0);
           st.shadowPass = st.encoder.beginRenderPass({
             colorAttachments: [],
             depthStencilAttachment: {
               view: sm.view,
               depthClearValue: 1.0,
-              depthLoadOp: "clear",
+              depthLoadOp: isFirstTile ? "clear" : "load",
               depthStoreOp: "store",
             },
           });
+          st.shadowPass.setViewport(col * tile, row * tile, tile, tile, 0, 1);
+          st.shadowPass.setScissorRect(col * tile, row * tile, tile, tile);
           st.active = depthPipe;
-          st.depthSlot = 0; // reset per-draw depth-uniform slot allocation
-          st.depthAtSlot = 0; // depth-at draws use a separate buffer + slot counter
+          // Reset per-draw depth-uniform slot allocation only at the first tile so
+          // slots are unique across all casters within the frame (like point faces).
+          if (isFirstTile) {
+            st.depthSlot = 0; // reset per-draw depth-uniform slot allocation
+            st.depthAtSlot = 0; // depth-at draws use a separate buffer + slot counter
+          }
           gpuEnsureDepthUniform(st, depthPipe);
           break;
         }
@@ -7195,16 +7212,18 @@
           st.shadowPass.drawIndexed(count);
           break;
         }
-        case 20: { // BIND_SHADOW_MAP — record the shadow map + write light_vp.
-          // Payload (12B): slot | shadow_handle | light_vp_ptr. The depth-compare
-          // map + comparison sampler are bound at draw_pbr (group(1) 9/10); here we
-          // record the handle and write the light-space matrix into the uniform.
-          const shadowHandle = dv.getUint32(off + 4, true);
-          const lvpPtr = dv.getUint32(off + 8, true);
-          st.shadow = { handle: shadowHandle };
-          // Cache the light-space matrix; draw_pbr writes it into each slot.
-          st.frameLightVp = new Float32Array(memory.buffer, lvpPtr, 16).slice();
-          st.bg1Dirty = true; // rebind group(1) with the real shadow map
+        case 20: { // BIND_SHADOW_MAP — record the atlas + cache shadow_vp[] array.
+          // NEW payload (16B): slot | atlas_handle | vp_ptr | count. The depth-compare
+          // atlas + comparison sampler are bound at draw_pbr (group(1) 9/10); here we
+          // record the handle and cache `count` consecutive mat4 for the U.shadow_vp[].
+          const atlasHandle = dv.getUint32(off + 4, true);
+          const vpPtr = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          st.shadow = { handle: atlasHandle };
+          // Cache the shadow_vp[] array; draw_pbr writes it into each slot.
+          st.frameShadowVp = new Float32Array(memory.buffer, vpPtr, count * 16).slice();
+          st.frameShadowVpCount = count;
+          st.bg1Dirty = true; // rebind group(1) with the real shadow atlas
           break;
         }
         case 13: { // DRAW_PBR — full PBR submesh draw.
@@ -7251,8 +7270,11 @@
           }
           device.queue.writeBuffer(ubuf, base + PBR_U.lightCount, new Int32Array([st.frameLightCount | 0]));
           device.queue.writeBuffer(ubuf, base + PBR_U.prefMips, new Float32Array([st.framePrefMips || 0]));
-          if (st.frameLightVp) {
-            device.queue.writeBuffer(ubuf, base + PBR_U.lightVp, st.frameLightVp);
+          if (st.frameShadowVp && st.frameShadowVpCount > 0) {
+            // shadow_vp[count] → U.shadow_vp @512. writeBuffer dataOffset/size are
+            // ELEMENTS for a TypedArray, so pass .buffer/.byteOffset + the byte size.
+            device.queue.writeBuffer(ubuf, base + PBR_U.shadowVp,
+              st.frameShadowVp.buffer, st.frameShadowVp.byteOffset, st.frameShadowVpCount * 64);
           }
           // ── Bind group 0: created once; the dynamic offset selects the slot. ──
           // Skinned variants add binding 1 (bones palette, whole buffer, static).
@@ -7281,12 +7303,11 @@
                 bg0Entries.push({ binding: 4, resource: mte });
               }
             }
-            // binding 5: PointShadow uniform (16B: vec3 point_light_pos + f32 point_far).
-            // Layout has binding 5 iff hasPointShadow — must match bgl0 exactly.
-            if (active.hasPointShadow) {
-              if (!st.pointShadowBuf) st.pointShadowBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-              bg0Entries.push({ binding: 5, resource: { buffer: st.pointShadowBuf } });
-            }
+            // Multi-caster: the dead PointShadow uniform (old bg0 binding 5) is GONE.
+            // Task 1 deleted the WGSL `struct PointShadow` + `@group(0) @binding(5)`;
+            // the receiver now reads each point caster's lpos/far from the per-light
+            // loop vars. Pushing a binding-5 entry here would be a bind-group-layout
+            // mismatch (WebGPU validation error), so it is removed entirely.
             st.bg0 = device.createBindGroup({ layout: active.bgl0, entries: bg0Entries });
             st.bg0Layout = active.bgl0;
           }
@@ -7325,13 +7346,8 @@
             st.bg1Layout = active.bgl1;
             st.bg1Dirty = false;
           }
-          // Write point_light_pos/far into the separate PointShadow uniform (binding 5).
-          if (active.hasPointShadow && st.pointShadowBuf && st.pointLightPos != null) {
-            const ptData = new Float32Array(4);
-            ptData[0] = st.pointLightPos[0]; ptData[1] = st.pointLightPos[1]; ptData[2] = st.pointLightPos[2];
-            ptData[3] = st.pointFar;
-            device.queue.writeBuffer(st.pointShadowBuf, 0, ptData);
-          }
+          // Multi-caster: no per-draw PointShadow uniform write — the dead binding-5
+          // buffer is gone (the receiver reads lpos/far from the per-light loop vars).
           st.pass.setPipeline(active.pipeline);
           st.pass.setVertexBuffer(0, vb.buf);
           st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
@@ -7369,14 +7385,15 @@
           device.queue.writeBuffer(st.instanceBuf, 0, memory.buffer, instancePtr, instBytes);
           // ── Per-draw uniform slot (PBR_U layout, instanced U adds vp @ 512). ──
           // The instanced WGSL U struct has all standard fields (mvp, model, …)
-          // plus `vp: mat4x4<f32>` appended at offset 512 (same as PBR_U.lightVp).
+          // plus a single `vp: mat4x4<f32>` appended at offset 512 — the SAME slot as
+          // PBR_U.shadowVp (the shadow variant's shadow_vp[0]). We write one mat here.
           // We only write the fields the shader actually reads: vp, material, camera.
           const ubuf = gpuEnsurePbrUniform(st);
           const slot = st.pbrSlot++;
           if (slot >= MAX_DRAWS) break;
           const base = slot * PBR_STRIDE;
-          // vp (view-proj): u.vp — offset 512 (= PBR_U.lightVp in the JS table).
-          device.queue.writeBuffer(ubuf, base + PBR_U.lightVp, new Float32Array(memory.buffer, vpPtr, 16));
+          // vp (view-proj): u.vp — offset 512 (= PBR_U.shadowVp in the JS table).
+          device.queue.writeBuffer(ubuf, base + PBR_U.shadowVp, new Float32Array(memory.buffer, vpPtr, 16));
           // material: 3×vec4 = 12 f32.
           device.queue.writeBuffer(ubuf, base + PBR_U.material, new Float32Array(memory.buffer, materialPtr, 12));
           // camera_pos: vec3 (3 f32, 4th byte is pad).
@@ -7811,18 +7828,14 @@
           if (st.pointPass) { st.pointPass.end(); st.pointPass = null; }
           break;
         }
-        case 35: { // BIND_POINT_SHADOW — stash atlas view + light uniforms for the receiver.
-          // Payload (16B): slot | handle | light_pos_ptr | far_bits.
-          // T4 wires the bind group (group(1) binding 11); here we record the view
-          // and uniforms so bg1 can be rebuilt with the atlas before the colour pass.
+        case 35: { // BIND_POINT_SHADOW — stash the atlas view for the receiver bg1.
+          // NEW payload (8B): slot | handle. Multi-caster: the per-caster lpos/far
+          // uniforms are gone (Task 1) — the receiver reads them from the per-light
+          // loop vars, so we only stash the atlas view for group(1) binding 11.
           const ps = st.pointShadows[dv.getUint32(off + 4, true)];
-          const lightPosPtr = dv.getUint32(off + 8, true);
-          const far = dv.getFloat32(off + 12, true); // far_bits reinterpreted as f32
           if (ps) {
             st.pointAtlasView = ps.atlasView;
           }
-          st.pointLightPos = new Float32Array(memory.buffer, lightPosPtr, 3).slice();
-          st.pointFar = far;
           st.bg1Dirty = true; // trigger bg1 rebuild before next DRAW_PBR
           break;
         }
@@ -8076,13 +8089,13 @@
       boundTex: [],
       ibl: null, // { irr, spec, lut } texture handles set by bind_ibl (2b)
       shadowMaps: [], // { tex, view, sampler, size } by handle (create_shadow_map, 2c)
-      shadow: null, // { handle } set by bind_shadow_map (2c)
+      shadow: null, // { handle } (2D atlas) set by bind_shadow_map
+      frameShadowVp: null, // Float32Array(count*16) shadow_vp[] cached by bind_shadow_map
+      frameShadowVpCount: 0, // number of 2D casters in frameShadowVp
       pointShadows: [], // T2: { atlasTex, atlasView, depthView, w, h } by handle
       pointDepthPipe: null, // lazy — pipeline + uniform buf for point-depth pass
       pointPass: null, // active render pass during begin/end_point_shadow_face
-      pointAtlasView: null, // stashed by bind_point_shadow (tag 35) for bg1 in T4
-      pointLightPos: null, // Float32Array(3) stashed by bind_point_shadow
-      pointFar: 0, // f32 stashed by bind_point_shadow
+      pointAtlasView: null, // stashed by bind_point_shadow (tag 35) for bg1 binding 11
       renderTargets: [], // post: { tex, view, depthTex, depthView, w, h, format } by handle
       curTargetFormat: null, // color format of the active pass (post pipeline keying)
       curPassHasDepth: false, // true when the active render pass has a depth attachment
@@ -8213,9 +8226,9 @@
       if (st.pointDepthPipe) { st.pointDepthPipe.pointDepthUniform?.destroy(); st.pointDepthPipe = null; }
       st.pointPass = null;
       st.pointAtlasView = null;
-      st.pointLightPos = null;
-      st.pointFar = 0;
-      if (st.pointShadowBuf) { st.pointShadowBuf.destroy?.(); st.pointShadowBuf = null; }
+      st.frameShadowVp = null;
+      st.frameShadowVpCount = 0;
+      // Multi-caster: pointShadowBuf (dead bg0 binding 5) removed — nothing to destroy.
       st.morphTexView = null;
       st.pbrUniform = null;
       st.bonesBuf = null;

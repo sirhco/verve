@@ -1460,6 +1460,96 @@ pub fn glScenePoint(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-multishadow: Slice 1 capstone — directional + spot + point lights ALL
+/// cast shadows SIMULTANEOUSLY in one scene. Three casters land in the
+/// data-gllights CSV with casts_shadow=1: a directional (type 0) raking from
+/// upper-left, a spot (type 2) from above-forward, and a point (type 1) off to
+/// the right with a positive range (range==far contract). Each shadow falls in a
+/// different direction on the floor so all three read distinctly. Reuses
+/// shadow.vmesh (cube + floor) and studio.venv. A Freeze/Unfreeze control
+/// (glscene_freeze / glscene_unfreeze, page-global) pins the auto-orbit so a CDP
+/// run has a stable frame for pixel metrics; the buttons are appended INSIDE the
+/// GlScene island subtree so z-on-click routes to the chunk's exports.
+pub fn glSceneMultiShadow(ctx: *const verve.Context) !*verve.Node {
+    // Three simultaneous casters — one of each light type, all casts_shadow=true.
+    const lights = [_]verve.GlLight{
+        // Directional caster (type 0) raking from upper-left → shadow stretches
+        // to lower-right on the floor.
+        .{
+            .kind = .directional,
+            .dir = .{ -0.55, -0.78, -0.30 },
+            .color = .{ 1, 0.97, 0.9 },
+            .intensity = 2.2,
+            .casts_shadow = true,
+        },
+        // Spot caster (type 2) above + forward → perspective cone shadow toward
+        // the viewer. casts_shadow=true → fovy = 2 × outer_deg depth pass.
+        .{
+            .kind = .spot,
+            .pos = .{ 0.5, 6, 2.5 },
+            .dir = .{ -0.05, -1, -0.35 },
+            .color = .{ 0.85, 0.95, 1.0 },
+            .intensity = 55,
+            .inner_deg = 16,
+            .outer_deg = 26,
+            .range = 22,
+            .casts_shadow = true,
+        },
+        // Point caster (type 1) off to the right → omnidirectional shadow via the
+        // cube distance atlas, casting to the left. Positive range so range==far.
+        .{
+            .kind = .point,
+            .pos = .{ 3.5, 2.5, -0.5 },
+            .color = .{ 1.0, 0.8, 0.6 },
+            .intensity = 38,
+            .range = 16,
+            .casts_shadow = true,
+        },
+    };
+
+    const island_node = ctx.glScene(.{
+        .src = "/gl/shadow.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='44' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EMulti-shadow%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 9.5, .pitch = 0.55, .yaw = 0.7 })
+        .lights(&lights)
+        .autoRotate(0.2)
+        .build();
+
+    // Freeze/Unfreeze control. Appended INSIDE the GlScene island node so the
+    // z-on-click resolves against the GlScene chunk's exports (the verve.js
+    // dispatcher walks `target.closest("verve-island")`). Mirrors the GlSkin /
+    // GlPost freeze convention.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glscene_freeze").text("Freeze"),
+        ctx.el("button").attr("z-on-click", "glscene_unfreeze").text("Unfreeze"),
+    });
+    _ = island_node.children(.{controls});
+
+    const scene_box = ctx.div().class("gl-wrap").children(.{
+        ctx.div()
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;margin:0 auto")
+            .children(.{island_node}),
+    });
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — simultaneous multi-light shadows"),
+        ctx.p().text("Slice 1 capstone: a directional, a spot, AND a point light " ++
+            "all cast real depth-mapped shadows AT THE SAME TIME onto the floor. " ++
+            "The directional rakes from the upper-left (shadow to lower-right), the " ++
+            "spot drops a perspective cone from above-forward (toward the viewer), " ++
+            "and the point off to the right casts an omnidirectional shadow to the " ++
+            "left via its cube distance atlas. Up to 4 casters of each type pack " ++
+            "into a tiled 2D shadow atlas plus an enlarged point cube atlas; both " ++
+            "the WebGL2 and WebGPU backends decode all three at once."),
+        scene_box,
+        ctx.p().class("hint")
+            .text("Drag to orbit \u{00b7} wheel to zoom \u{00b7} Freeze pins the orbit. " ++
+            "Look for THREE distinct shadows fanning in different directions."),
+    });
+}
+
 /// /gl-cutout: alpha-test (MASK) cutout dissolve demo. The "Cutout" cube's
 /// base-color texture has a real alpha channel with HOLES; its material is
 /// alphaMode:MASK (cutoff 0.5), so the variant_alpha_test shader DISCARDS any

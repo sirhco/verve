@@ -38,10 +38,10 @@ pub const Tag = enum(u16) {
     create_texture_srgb = 15, // {handle, width, height, ptr, len} raw RGBA8 → SRGB8_ALPHA8 internal (P8); same layout as tag 7
     // ── P9 slice 3: single directional shadow map ──────────────────────
     create_shadow_map = 16, // {handle, size} — FBO + DEPTH_COMPONENT24 depth tex (size²), compare mode for sampler2DShadow
-    begin_shadow_pass = 17, // {shadow_handle, depth_shader_handle, size} — bind FBO, viewport, clear depth, bind depth shader
+    begin_shadow_pass = 17, // {atlas_handle, depth_shader_handle, col, row, tile} — bind atlas FBO, set viewport+scissor to (col*tile,row*tile,tile,tile), scissor-clear that tile's depth, bind depth shader
     end_shadow_pass = 18, // {width, height} — unbind FBO back to canvas, restore viewport
     draw_depth = 19, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr} — depth-only draw (mvp = light_vp·world)
-    bind_shadow_map = 20, // {slot, shadow_handle, light_vp_ptr} — bind depth tex + set u_light_vp on active program
+    bind_shadow_map = 20, // {slot, atlas_handle, vp_ptr, count} — bind 2D shadow atlas to slot + upload `count` mat4 → u_shadow_vp[0..count] (shadow_vp[0..count] WGSL)
     set_bones = 21, // {count, ptr} — count×mat4 bone palette → u_bones[] on the active program
     // ── Post-processing ─────────────────────────────────────────────────
     create_render_target = 22, // {handle, width, height, format, flags(bit0=with_depth)} — color RT (+optional depth)
@@ -58,7 +58,7 @@ pub const Tag = enum(u16) {
     begin_point_shadow_face = 32, // {handle, col, row, tile, face_vp_ptr, light_pos_ptr, far_bits}
     draw_point_depth = 33, // {vbuf, ibuf, index_byte_off, index_count, model_ptr}
     end_point_shadow = 34, // {width, height}
-    bind_point_shadow = 35, // {slot, handle, light_pos_ptr, far_bits}
+    bind_point_shadow = 35, // {slot, handle} — binds the point atlas texture to `slot`; caster pos/far come from the lights array (lpos=v0.zw/v1.x, far=v2.w=lrange)
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -105,7 +105,30 @@ pub const clear_flag_color: u32 = 1 << 0;
 pub const clear_flag_depth: u32 = 1 << 1;
 
 pub const max_lights: u32 = 4;
-pub const light_stride_f32: u32 = 16; // v0:[type,intensity,pos.x,pos.y]  v1:[pos.z,dir.x,dir.y,dir.z]  v2:[color.r,color.g,color.b,range]  v3:[cos_inner,cos_outer,_pad,_pad]
+pub const light_stride_f32: u32 = 16; // v0:[type,intensity,pos.x,pos.y]  v1:[pos.z,dir.x,dir.y,dir.z]  v2:[color.r,color.g,color.b,range]  v3:[cos_inner,cos_outer,shadow_index,shadow_kind]
+// v3.z = shadow_index: for a 2D caster → index in shadow_vp[] AND its tile in the 2D atlas (0..3);
+//        for a point caster → its point-caster index (0..3). -1.0 = this light casts no shadow.
+// v3.w = shadow_kind: 0 = none, 1 = 2D (directional/spot), 2 = point.
+
+// ── Simultaneous multi-caster shadow contract (Slice 1) ─────────────
+// Up to `max_lights` lights may cast at once, in any mix of 2D / point.
+pub const max_2d_casters: u32 = 4; // directional/spot casters share the 2D atlas; index 0..3
+pub const max_point_casters: u32 = 4; // point casters share the cube atlas; index 0..3
+// CONTRACT (T3 MUST honor): a point caster's range (light v2.w = lrange) MUST equal the
+// far plane used in its depth pass (begin_point_shadow_face far_bits). The receiver normalises
+// distance by range (`length(v) / far`), so range=0 or "unlimited" is ILLEGAL for a shadow
+// caster — the scene must clamp the light's range to the actual depth-pass far.
+// 2D shadow atlas geometry. CHANGING THESE REQUIRES the verve.js atlas-create AND
+// the in-shader shadowFactor2D constants to move in lockstep.
+pub const shadow_atlas_dim: u32 = 4096; // full atlas is shadow_atlas_dim²
+pub const shadow_tile_dim: u32 = 1024; // → 4 tiles per row, 16 tiles total; up to 4 used in row 0
+pub const shadow_tiles_per_row: u32 = 4;
+// Point shadow atlas geometry. 3 cols × 8 rows of 512² tiles = 6 faces × 4 casters.
+// Caster `c` occupies rows [c*2, c*2+1]; face `f` → col = f%3, row = c*2 + f/3.
+// CHANGING THESE REQUIRES the verve.js point-atlas-create AND the in-shader
+// pointShadowFactor constants to move in lockstep.
+pub const point_atlas_w: u32 = 1536; // 3 × 512
+pub const point_atlas_h: u32 = 4096; // 8 × 512 (was effectively 1024 for one caster)
 pub const fog_params_f32: u32 = 8; // [mode, r,g,b, near, far, density, _pad]
 pub const morph_max_active: u32 = 8; // K: max simultaneously-active morph influences
 pub const material_len_f32: u32 = 12; // base_color rgba | metallic, roughness, occlusion_strength, normal_scale | emissive rgb, 0
@@ -321,22 +344,9 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
-    // Shadow-receiver additions (variant_shadow): light-space clip position
-    // forwarded to the fragment shader for the depth comparison.
-    const shadow_outs =
-        \\uniform mat4 u_light_vp;
-        \\out vec4 v_light_pos;
-        \\
-    ;
-    const shadow_body =
-        \\  v_light_pos = u_light_vp * u_model * vec4(a_pos, 1.0);
-        \\
-    ;
-    // Shadow body on the morph path: use morphed m_pos for the light-space clip.
-    const shadow_body_morph =
-        \\  v_light_pos = u_light_vp * u_model * vec4(m_pos, 1.0);
-        \\
-    ;
+    // Shadow receiver (variant_shadow): light-space positions are computed per
+    // caster IN THE FRAGMENT shader from v_world_pos and u_shadow_vp[slot], so the
+    // vertex stage carries NO shadow uniform or varying anymore.
     // Instanced (variant_instanced): per-instance mat4 model columns as vertex
     // attributes (loc 4-7) + per-instance color (loc 8); u_vp replaces u_mvp/u_model.
     // All non-instanced bytes stay byte-identical; this block is appended ONLY under the gate.
@@ -372,7 +382,6 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
     }
     if (morphed and skinned) @compileError("variant_morph + variant_skinned not supported this slice");
     if (flags & variant_normal_map != 0) src = src ++ nm_outs;
-    if (flags & variant_shadow != 0) src = src ++ shadow_outs;
     if (skinned) src = src ++ skin_decl;
     if (morphed) src = src ++ morph_uniforms;
     if (morphed) {
@@ -383,7 +392,6 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         src = src ++ body_open;
     }
     if (flags & variant_normal_map != 0) src = src ++ (if (skinned) nm_body_skinned else nm_body);
-    if (flags & variant_shadow != 0) src = src ++ (if (morphed) shadow_body_morph else shadow_body);
     if (morphed) {
         src = src ++ body_close_morph;
     } else if (skinned) {
@@ -650,7 +658,11 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\  N = gl_FrontFacing ? N : -N;
         \\
     ;
-    const lighting =
+    // Light loop, split so the shadow variants can inject a per-light shadow
+    // attenuation of `radiance` BEFORE the BRDF accumulation. For non-shadow
+    // variants, lighting_head ++ lighting_tail is byte-identical to the original
+    // single `lighting` string (no extra bytes leak into the non-shadow path).
+    const lighting_head =
         \\  vec3 V = normalize(u_camera_pos - v_world_pos);
         \\  float NdotV = max(dot(N, V), 0.0);
         \\  vec3 F0 = mix(vec3(0.04), albedo, metallic);
@@ -687,6 +699,24 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\        radiance *= smoothstep(cosOut, cosIn, cosA);
         \\      }
         \\    }
+        \\
+    ;
+    // Per-light shadow attenuation, injected into the loop body after `radiance`
+    // is computed and before the BRDF accumulation. Emitted only under a shadow
+    // variant; the helper bodies (shadowFactor2D / pointShadowFactor) are emitted
+    // only under their respective variants, but a light may pick either at runtime
+    // via v3.w (shadow_kind) so we guard each branch on its variant too. Each
+    // snippet keeps the loop-body indentation and a trailing newline so it slots
+    // in between lighting_head and lighting_tail without disturbing the layout.
+    const lighting_shadow_2d =
+        \\    if (v3.w > 0.5 && v3.w < 1.5) radiance *= shadowFactor2D(int(v3.z + 0.5));
+        \\
+    ;
+    const lighting_shadow_point =
+        \\    if (v3.w > 1.5) radiance *= pointShadowFactor(lpos, lrange, int(v3.z + 0.5));
+        \\
+    ;
+    const lighting_tail =
         \\    vec3 H = normalize(V + L);
         \\    float NdotL = max(dot(N, L), 0.0);
         \\    float D = distributionGGX(N, H, alpha);
@@ -706,57 +736,65 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\  vec3 ambient = (kD_ibl * diffuse + specular_ibl) * mix(1.0, ao_sample, occlusion_strength);
         \\
     ;
-    // Direct-light combine, split out so the shadow variant can attenuate the
-    // direct term (`Lo`) while leaving the IBL ambient unshadowed. The
-    // non-shadow string is byte-identical to the pre-slice-3 source.
+    // Direct-light combine. The shadow is now folded into each light's `radiance`
+    // inside the loop, so ALL variants use the plain combine; IBL ambient stays
+    // unshadowed. Byte-identical to the pre-slice-3 source.
     const combine_plain =
         \\  vec3 color = ambient + Lo;
         \\
     ;
-    const combine_shadow =
-        \\  vec3 color = ambient + Lo * shadowFactor(v_light_pos);
-        \\
-    ;
-    // Shadow-receiver declarations (variant_shadow): the depth-compare sampler,
-    // the interpolated light-space position, and a 3×3 PCF lookup. Hardware
-    // comparison (sampler2DShadow + LINEAR) gives 2×2 filtering per tap.
+    // Shadow-receiver declarations (variant_shadow): a depth-compare sampler over
+    // the 4096² 2D atlas + per-caster shadowFactor2D(slot). The light-space clip
+    // position is recomputed per caster from u_shadow_vp[slot]·v_world_pos; PCF
+    // samples are confined to the caster's 1024² tile (row 0, col = slot) so
+    // neighbouring tiles never bleed. Hardware compare (sampler2DShadow + LINEAR)
+    // gives 2×2 filtering per tap. shadow_atlas_dim/shadow_tile_dim/shadow_tiles_per_row
+    // are the Zig constants of the same name — keep them in lockstep with verve.js.
     const shadow_decls =
         \\uniform highp sampler2DShadow u_shadow_map;
-        \\in vec4 v_light_pos;
-        \\float shadowFactor(vec4 lp) {
+        \\uniform mat4 u_shadow_vp[4];
+        \\float shadowFactor2D(int slot) {
+        \\  vec4 lp = u_shadow_vp[slot] * vec4(v_world_pos, 1.0);
         \\  vec3 proj = lp.xyz / lp.w;
         \\  proj = proj * 0.5 + 0.5;
         \\  if (proj.z > 1.0) return 1.0;
         \\  float bias = 0.0015;
-        \\  vec2 texel = 1.0 / vec2(textureSize(u_shadow_map, 0));
+        \\  float tileScale = 1024.0 / 4096.0;
+        \\  vec2 tile = vec2(float(slot - (slot / 4) * 4), float(slot / 4));
+        \\  float texel = 1.0 / 4096.0;
+        \\  vec2 pclamp = clamp(proj.xy, vec2(0.0), vec2(1.0));
         \\  float sum = 0.0;
         \\  for (int y = -1; y <= 1; y++)
-        \\    for (int x = -1; x <= 1; x++)
-        \\      sum += texture(u_shadow_map, vec3(proj.xy + vec2(x, y) * texel, proj.z - bias));
+        \\    for (int x = -1; x <= 1; x++) {
+        \\      vec2 t = clamp(pclamp + vec2(x, y) * texel, vec2(0.0), vec2(1.0));
+        \\      vec2 atlasUv = (tile + t) * tileScale;
+        \\      sum += texture(u_shadow_map, vec3(atlasUv, proj.z - bias));
+        \\    }
         \\  return sum / 9.0;
         \\}
         \\
     ;
-    // Point-shadow receiver (variant_shadow_point): RGBA8 atlas sampler, uniforms,
-    // unpackDist helper, and a manual 3×3 PCF pointShadowFactor().
-    // Atlas layout: 1536×1024, 3×2 of 512² tiles. Face f → col=f%3, row=f/3.
+    // Point-shadow receiver (variant_shadow_point): RGBA8 atlas sampler +
+    // per-caster pointShadowFactor(lpos, far, pidx). Light pos & far come from the
+    // per-light loop vars (no dedicated uniform). The atlas is now 1536×4096
+    // (3 cols × 8 rows of 512² tiles); caster `pidx` occupies rows [pidx*2,
+    // pidx*2+1], face f → col = f%3, row = pidx*2 + f/3.
     // Face order: 0=+X, 1=−X, 2=+Y, 3=−Y, 4=+Z, 5=−Z (matches cubeFaceVp).
-    // uvc signs per face (P4 WGSL must mirror exactly):
+    // uvc signs per face (WGSL twin must mirror EXACTLY — wire-frozen):
     //   face 0 (+X): uvc = vec2(-v.z, -v.y)
     //   face 1 (-X): uvc = vec2( v.z, -v.y)
     //   face 2 (+Y): uvc = vec2( v.x,  v.z)
     //   face 3 (-Y): uvc = vec2( v.x, -v.z)
     //   face 4 (+Z): uvc = vec2( v.x, -v.y)
     //   face 5 (-Z): uvc = vec2(-v.x, -v.y)
-    // Bias: 0.01 (normalised distance, not depth-buffer units).
+    // Bias: 0.01 (normalised distance). In-tile clamp [0.0008,0.9992] stays
+    // tile-local (applied before adding the tile offset).
     const point_shadow_decls =
         \\uniform sampler2D u_point_atlas;
-        \\uniform vec3 u_point_light_pos;
-        \\uniform float u_point_far;
         \\float unpackDist(vec4 c){ return dot(c, vec4(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0)); }
-        \\float pointShadowFactor() {
-        \\  vec3 v = v_world_pos - u_point_light_pos;
-        \\  float cur = length(v) / u_point_far;
+        \\float pointShadowFactor(vec3 lpos, float far, int pidx) {
+        \\  vec3 v = v_world_pos - lpos;
+        \\  float cur = length(v) / far;
         \\  vec3 a = abs(v);
         \\  float ma; int face; vec2 uvc;
         \\  if (a.x >= a.y && a.x >= a.z) {
@@ -773,25 +811,21 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\    else           { face = 5; uvc = vec2(-v.x, -v.y); }
         \\  }
         \\  vec2 uv = 0.5 * (uvc / ma + 1.0);
-        \\  vec2 tile = vec2(float(face - (face / 3) * 3), float(face / 3));
+        \\  vec2 tile = vec2(float(face - (face / 3) * 3), float(pidx * 2 + face / 3));
         \\  float bias = 0.01;
-        \\  vec2 texel = 1.0 / vec2(1536.0, 1024.0);
+        \\  vec2 texel = 1.0 / vec2(1536.0, 4096.0);
         \\  float lit = 0.0;
         \\  for (int dy = -1; dy <= 1; dy++) {
         \\    for (int dx = -1; dx <= 1; dx++) {
-        \\      vec2 fuv = clamp(uv + vec2(float(dx), float(dy)) * texel * vec2(3.0, 2.0),
+        \\      vec2 fuv = clamp(uv + vec2(float(dx), float(dy)) / 512.0,
         \\                       vec2(0.0008), vec2(0.9992));
-        \\      vec2 atlasUv = (tile + fuv) * vec2(1.0 / 3.0, 1.0 / 2.0);
+        \\      vec2 atlasUv = (tile + fuv) * vec2(1.0 / 3.0, 1.0 / 8.0);
         \\      float stored = unpackDist(texture(u_point_atlas, atlasUv));
         \\      lit += (cur <= stored + bias) ? 1.0 : 0.0;
         \\    }
         \\  }
         \\  return lit / 9.0;
         \\}
-        \\
-    ;
-    const combine_point_shadow =
-        \\  vec3 color = ambient + Lo * pointShadowFactor();
         \\
     ;
     const emissive =
@@ -823,8 +857,11 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     if (flags & variant_alpha_test != 0) src = src ++ alpha_test;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
     if (flags & variant_double_sided != 0) src = src ++ ds_flip;
-    src = src ++ lighting;
-    src = src ++ (if (flags & variant_shadow != 0) combine_shadow else if (flags & variant_shadow_point != 0) combine_point_shadow else combine_plain);
+    src = src ++ lighting_head;
+    if (flags & variant_shadow != 0) src = src ++ lighting_shadow_2d;
+    if (flags & variant_shadow_point != 0) src = src ++ lighting_shadow_point;
+    src = src ++ lighting_tail;
+    src = src ++ combine_plain;
     if (flags & variant_emissive != 0) src = src ++ emissive;
     if (flags & variant_fog != 0) src = src ++ fog_mix;
     if (flags & variant_linear_output == 0) src = src ++ tail_tonemap;
@@ -951,6 +988,13 @@ pub const fxaaFragmentSrc: []const u8 =
 //   lights     : array<vec4<f32>,16> (offset 240; 256B — 4 vec4/light × 4 lights)
 //   light_count: i32              (offset 496)
 //   prefiltered_mips: f32         (offset 500; +8B pad to align mat4x4 at 512)
+//   (variant_shadow) shadow_vp: array<mat4x4<f32>,4> (offset 512; 256B → 512..768)
+//
+// SHADOW-VARIANT BYTE MAP (for T2 bridge): shadow_vp @ 512, struct size 768,
+// PBR_STRIDE = align(768, 256) = 768 (UNCHANGED from current 768). Keeping
+// max_2d_casters = 4 (array<mat4,4> = 256B) deliberately avoids any stride change
+// this slice. (The instanced uniforms_vp single `vp` @ 512 is a different variant,
+// struct size 576, untouched.)
 //
 // Bindings (@group(1)): a shared sampler (binding 0) + per-slot textures.
 // Slots mirror the GLSL sampler order / JS texture-unit contract:
@@ -970,8 +1014,9 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         @compileError("wgslPbr: variant_instanced + variant_shadow_point unsupported in v1 (point-shadow bind-group not wired for instanced draw path)");
 
     // ── Uniform block + group(0) ────────────────────────────────────
-    // Split so variant_shadow can append `light_vp` (offset 512, after the f32
-    // prefiltered_mips @ 500 padded to 512) without changing the non-shadow bytes.
+    // Split so variant_shadow can append `shadow_vp: array<mat4x4,4>` (offset 512,
+    // after the f32 prefiltered_mips @ 500 padded to 512; 256B → 512..768) without
+    // changing the non-shadow bytes. struct size 768, PBR_STRIDE = align(768,256) = 768.
     const uniforms_head =
         \\struct U {
         \\  mvp: mat4x4<f32>,
@@ -985,7 +1030,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\
     ;
     const uniforms_shadow =
-        \\  light_vp: mat4x4<f32>,
+        \\  shadow_vp: array<mat4x4<f32>, 4>,
         \\
     ;
     // Instanced (variant_instanced): view-projection only (model comes from
@@ -1032,16 +1077,9 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\@group(0) @binding(4) var u_morph_tex: texture_2d<f32>;
         \\
     ;
-    // Point-shadow receiver parameters (variant_shadow_point). SEPARATE group(0)
-    // binding at @binding(5) (FRAGMENT-only). Using a dedicated uniform avoids
-    // touching the U struct and re-deriving all PBR_U byte offsets (the spot-shadows
-    // lesson). Layout: point_light_pos (vec3, 12 bytes) + point_far (f32, 4 bytes)
-    // = 16 bytes total (naturally aligned, no pad needed).
-    const uniforms_point_shadow =
-        \\struct PointShadow { point_light_pos: vec3<f32>, point_far: f32 };
-        \\@group(0) @binding(5) var<uniform> pt: PointShadow;
-        \\
-    ;
+    // (variant_shadow_point no longer needs a dedicated PointShadow uniform: each
+    // caster's light pos & far come from the per-light loop vars lpos/lrange, and
+    // pointShadowFactor takes them as args — mirrors the GLSL receiver exactly.)
     // Morph vertex function: adds @builtin(vertex_index) input, accumulates
     // POSITION + NORMAL deltas, then transforms the morphed locals.
     // vtx_index drives textureLoad (x-coord = vertex index, y-coord = 2*t or 2*t+1).
@@ -1127,10 +1165,8 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  @location(4) bitangent: vec3<f32>,
         \\
     ;
-    const vsout_shadow =
-        \\  @location(5) light_pos: vec4<f32>,
-        \\
-    ;
+    // (variant_shadow no longer needs a light-space varying: the fragment
+    // recomputes light-space position per caster from u.shadow_vp[slot] · world_pos.)
     // Instanced: per-instance color varying (next free location after shadow's 5).
     const vsout_inst_color =
         \\  @location(6) inst_color: vec4<f32>,
@@ -1186,15 +1222,6 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  let t = normalize((mat3x3<f32>(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz)) * (mat3x3<f32>(skin[0].xyz, skin[1].xyz, skin[2].xyz) * a_tangent.xyz));
         \\  out.tangent = t;
         \\  out.bitangent = cross(out.normal, t) * a_tangent.w;
-        \\
-    ;
-    const vs_shadow =
-        \\  out.light_pos = u.light_vp * u.model * vec4<f32>(a_pos, 1.0);
-        \\
-    ;
-    // Shadow path on the morph variant: use the morphed m_pos (parity with GLSL shadow_body_morph).
-    const vs_shadow_morph =
-        \\  out.light_pos = u.light_vp * u.model * vec4<f32>(m_pos, 1.0);
         \\
     ;
     const vs_tail =
@@ -1338,7 +1365,11 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  N = select(-N, N, front_facing);
         \\
     ;
-    const fs_lighting =
+    // Light loop, split so the shadow variants can inject a per-light shadow
+    // attenuation of `radiance` BEFORE the BRDF accumulation. For non-shadow
+    // variants, fs_lighting_head ++ fs_lighting_tail is byte-identical to the
+    // original single fs_lighting string. Mirrors the GLSL split exactly.
+    const fs_lighting_head =
         \\  let V = normalize(u.camera_pos - in.world_pos);
         \\  let NdotV = max(dot(N, V), 0.0);
         \\  let F0 = mix(vec3<f32>(0.04), albedo, metallic);
@@ -1375,6 +1406,18 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\        radiance = radiance * smoothstep(cosOut, cosIn, cosA);
         \\      }
         \\    }
+        \\
+    ;
+    // Per-light shadow attenuation (WGSL twin of the GLSL lighting_shadow_* snippets).
+    const fs_lighting_shadow_2d =
+        \\    if (v3.w > 0.5 && v3.w < 1.5) { radiance = radiance * shadowFactor2D(in.world_pos, i32(v3.z + 0.5)); }
+        \\
+    ;
+    const fs_lighting_shadow_point =
+        \\    if (v3.w > 1.5) { radiance = radiance * pointShadowFactor(in.world_pos, lpos, lrange, i32(v3.z + 0.5)); }
+        \\
+    ;
+    const fs_lighting_tail =
         \\    let H = normalize(V + L);
         \\    let NdotL = max(dot(N, L), 0.0);
         \\    let D = distributionGGX(N, H, alpha);
@@ -1394,20 +1437,29 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  let ambient = (kD_ibl * diffuse + specular_ibl) * mix(1.0, ao_sample, occlusion_strength);
         \\
     ;
-    // 3×3 PCF over the depth-compare sampler. The chunk supplies a light_vp that
-    // already remaps clip z to WebGPU's [0,1] range (Zfix·ortho·view), so the
-    // depth ref is ndc.z directly; uv flips Y for WebGPU texture space.
+    // Per-caster 3×3 PCF over the depth-compare sampler into the 4096² 2D atlas.
+    // Light-space position is recomputed per caster from u.shadow_vp[slot]·world_pos.
+    // The chunk supplies a shadow_vp that already remaps clip z to WebGPU's [0,1]
+    // range (Zfix·ortho·view), so the depth ref is ndc.z directly; uv flips Y for
+    // WebGPU texture space. PCF samples are confined to the caster's 1024² tile
+    // (row 0, col = slot). Atlas geometry mirrors the GLSL shadowFactor2D exactly.
     const fs_shadow_decl =
-        \\fn shadowFactor(lp: vec4<f32>) -> f32 {
+        \\fn shadowFactor2D(world_pos: vec3<f32>, slot: i32) -> f32 {
+        \\  let lp = u.shadow_vp[slot] * vec4<f32>(world_pos, 1.0);
         \\  let ndc = lp.xyz / lp.w;
         \\  if (ndc.z > 1.0) { return 1.0; }
         \\  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * -0.5 + 0.5);
         \\  let bias = 0.0015;
-        \\  let texel = 1.0 / vec2<f32>(textureDimensions(shadow_map, 0));
+        \\  let tileScale = 1024.0 / 4096.0;
+        \\  let tile = vec2<f32>(f32(slot % 4), f32(slot / 4));
+        \\  let texel = 1.0 / 4096.0;
+        \\  let pclamp = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
         \\  var sum = 0.0;
         \\  for (var y = -1; y <= 1; y = y + 1) {
         \\    for (var x = -1; x <= 1; x = x + 1) {
-        \\      sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + vec2<f32>(f32(x), f32(y)) * texel, ndc.z - bias);
+        \\      let t = clamp(pclamp + vec2<f32>(f32(x), f32(y)) * texel, vec2<f32>(0.0), vec2<f32>(1.0));
+        \\      let atlasUv = (tile + t) * tileScale;
+        \\      sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, atlasUv, ndc.z - bias);
         \\    }
         \\  }
         \\  return sum / 9.0;
@@ -1418,23 +1470,20 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  var color = ambient + Lo;
         \\
     ;
-    const fs_combine_shadow =
-        \\  var color = ambient + Lo * shadowFactor(in.light_pos);
-        \\
-    ;
-    // Point-shadow receiver (variant_shadow_point): WGSL twin of P3 GLSL
+    // Point-shadow receiver (variant_shadow_point): WGSL twin of the GLSL
     // pointShadowFactor(). unpackDist + dominant-axis cubemap face select +
     // 3×3 PCF over the RGBA8 atlas. Face signs are BYTE-IDENTICAL to the GLSL:
     //   face 0 (+X): (-v.z,-v.y)  face 1 (-X): (v.z,-v.y)
     //   face 2 (+Y): (v.x, v.z)  face 3 (-Y): (v.x,-v.z)
     //   face 4 (+Z): (v.x,-v.y)  face 5 (-Z): (-v.x,-v.y)
-    // Atlas: 1536×1024, 3×2 of 512² tiles. tile = (f%3, f/3).
-    // Bias: 0.01. Margin clamp: [0.0008, 0.9992].
+    // Atlas: 1536×4096, 3 cols × 8 rows of 512² tiles. Caster `pidx` occupies rows
+    // [pidx*2, pidx*2+1]; tile = (f%3, pidx*2 + f/3). lpos/far come from the loop.
+    // Bias: 0.01. In-tile margin clamp: [0.0008, 0.9992] (tile-local).
     const fs_point_shadow_decl =
         \\fn unpackDist(c: vec4f) -> f32 { return dot(c, vec4f(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0)); }
-        \\fn pointShadowFactor(world_pos: vec3<f32>) -> f32 {
-        \\  let v = world_pos - pt.point_light_pos;
-        \\  let cur = length(v) / pt.point_far;
+        \\fn pointShadowFactor(world_pos: vec3<f32>, lpos: vec3<f32>, far: f32, pidx: i32) -> f32 {
+        \\  let v = world_pos - lpos;
+        \\  let cur = length(v) / far;
         \\  let a = abs(v);
         \\  var ma: f32; var face: i32; var uvc: vec2<f32>;
         \\  if (a.x >= a.y && a.x >= a.z) {
@@ -1452,25 +1501,21 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  }
         \\  let uv = 0.5 * (uvc / ma + vec2<f32>(1.0));
         \\  let col = face % 3;
-        \\  let row = face / 3;
+        \\  let row = pidx * 2 + face / 3;
         \\  let tile = vec2<f32>(f32(col), f32(row));
         \\  let bias: f32 = 0.01;
-        \\  let texel = vec2<f32>(1.0 / 1536.0, 1.0 / 1024.0);
+        \\  let texel = vec2<f32>(1.0 / 1536.0, 1.0 / 4096.0);
         \\  var lit: f32 = 0.0;
         \\  for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
         \\    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
         \\      let fuv = clamp(uv + vec2<f32>(f32(dx), f32(dy)) * vec2<f32>(1.0/512.0), vec2<f32>(0.0008), vec2<f32>(0.9992));
-        \\      let atlasUv = (tile + fuv) * vec2<f32>(1.0/3.0, 0.5);
+        \\      let atlasUv = (tile + fuv) * vec2<f32>(1.0/3.0, 1.0/8.0);
         \\      let stored = unpackDist(textureSampleLevel(point_atlas, samp, atlasUv, 0.0));
         \\      lit = lit + select(0.0, 1.0, cur <= stored + bias);
         \\    }
         \\  }
         \\  return lit / 9.0;
         \\}
-        \\
-    ;
-    const fs_combine_point_shadow =
-        \\  var color = ambient + Lo * pointShadowFactor(in.world_pos);
         \\
     ;
     const fs_emissive =
@@ -1524,7 +1569,6 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (skinned) src = src ++ uniforms_bones;
     if (flags & variant_fog != 0) src = src ++ uniforms_fog;
     if (morphed) src = src ++ uniforms_morph;
-    if (point_shadow) src = src ++ uniforms_point_shadow;
     src = src ++ samp ++ tex_base;
     if (nm) src = src ++ tex_normal;
     if (em) src = src ++ tex_emissive;
@@ -1533,7 +1577,6 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (point_shadow) src = src ++ tex_point_shadow;
     src = src ++ vsout_head;
     if (nm) src = src ++ vsout_nm;
-    if (shadow) src = src ++ vsout_shadow;
     if (inst) src = src ++ vsout_inst_color;
     src = src ++ vsout_tail;
     if (inst) {
@@ -1541,12 +1584,10 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     } else if (morphed and !skinned) {
         src = src ++ vs_head_morph;
         if (nm) src = src ++ vs_nm;
-        if (shadow) src = src ++ vs_shadow_morph;
         src = src ++ vs_tail_morph;
     } else {
         src = src ++ (if (skinned) vs_head_skinned else vs_head);
         if (nm) src = src ++ (if (skinned) vs_nm_skinned else vs_nm);
-        if (shadow) src = src ++ vs_shadow;
         src = src ++ (if (skinned) vs_tail_skinned else vs_tail);
     }
     src = src ++ helpers;
@@ -1556,8 +1597,11 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (flags & variant_alpha_test != 0) src = src ++ fs_alpha_test;
     src = src ++ (if (nm) (if (ds) fs_normal_nm_ds else fs_normal_nm) else (if (ds) fs_normal_plain_ds else fs_normal_plain));
     if (ds) src = src ++ fs_ds_flip;
-    src = src ++ fs_lighting;
-    src = src ++ (if (shadow) fs_combine_shadow else if (point_shadow) fs_combine_point_shadow else fs_combine_plain);
+    src = src ++ fs_lighting_head;
+    if (shadow) src = src ++ fs_lighting_shadow_2d;
+    if (point_shadow) src = src ++ fs_lighting_shadow_point;
+    src = src ++ fs_lighting_tail;
+    src = src ++ fs_combine_plain;
     if (em) src = src ++ fs_emissive;
     if (flags & variant_fog != 0) src = src ++ fs_fog_mix;
     if (!lin) src = src ++ fs_tail_tonemap;
@@ -1991,13 +2035,18 @@ pub const Encoder = struct {
         self.putU32(size);
     }
 
-    /// Begin the depth pass: bind the shadow FBO, set the depth-only shader, and
-    /// size the viewport to the shadow map. `drawDepth` calls follow.
-    pub fn beginShadowPass(self: *Encoder, shadow_handle: u32, depth_shader: u32, size: u32) void {
-        self.header(.begin_shadow_pass, 12);
-        self.putU32(shadow_handle);
+    /// Begin the depth pass into an atlas tile: bind the atlas FBO, set
+    /// viewport + scissor to `(col*tile, row*tile, tile, tile)`, scissor-clear
+    /// only that tile's depth channel, and bind the depth shader. Mirrors the
+    /// `{col, row, tile}` convention of `beginPointShadowFace` (tag 32).
+    /// `drawDepth` / `drawDepthAt` calls follow; `endShadowPass` closes.
+    pub fn beginShadowPass(self: *Encoder, atlas_handle: u32, depth_shader: u32, col: u32, row: u32, tile: u32) void {
+        self.header(.begin_shadow_pass, 20);
+        self.putU32(atlas_handle);
         self.putU32(depth_shader);
-        self.putU32(size);
+        self.putU32(col);
+        self.putU32(row);
+        self.putU32(tile);
     }
 
     /// End the depth pass: restore the default framebuffer + canvas viewport.
@@ -2048,14 +2097,17 @@ pub const Encoder = struct {
         self.putU32(camera_ptr);
     }
 
-    /// Bind the shadow map to `slot` and set `u_light_vp` on the active program.
-    /// Like setLights / bindIbl, must be re-emitted after each SET_PIPELINE since
-    /// it writes a uniform on the currently active program.
-    pub fn bindShadowMap(self: *Encoder, slot: u32, shadow_handle: u32, light_vp_ptr: u32) void {
-        self.header(.bind_shadow_map, 12);
+    /// Bind the 2D shadow ATLAS to `slot` and upload `count` consecutive mat4 from
+    /// `vp_ptr` into `u_shadow_vp[0..count]` (GLSL) / `shadow_vp[0..count]` (WGSL)
+    /// on the active program. `count` is the number of 2D shadow casters this draw
+    /// receives (0..max_2d_casters). Like setLights / bindIbl, must be re-emitted
+    /// after each SET_PIPELINE since it writes uniforms on the active program.
+    pub fn bindShadowMap(self: *Encoder, slot: u32, atlas_handle: u32, vp_ptr: u32, count: u32) void {
+        self.header(.bind_shadow_map, 16);
         self.putU32(slot);
-        self.putU32(shadow_handle);
-        self.putU32(light_vp_ptr);
+        self.putU32(atlas_handle);
+        self.putU32(vp_ptr);
+        self.putU32(count);
     }
 
     // ── Point-light (omnidirectional) shadow atlas ──────────────────────
@@ -2101,14 +2153,14 @@ pub const Encoder = struct {
         self.putU32(height);
     }
 
-    /// Bind the point-shadow atlas to `slot` and upload `light_pos_ptr` (3 f32)
-    /// + `far_bits` to the active program. Must follow SET_PIPELINE.
-    pub fn bindPointShadow(self: *Encoder, slot: u32, handle: u32, light_pos_ptr: u32, far_bits: u32) void {
-        self.header(.bind_point_shadow, 16);
+    /// Bind the point-shadow atlas to `slot`. Must follow SET_PIPELINE.
+    /// Each caster's light position and far distance are read by the receiver
+    /// shader from the per-light loop vars (lpos = v0.zw/v1.x, far = v2.w),
+    /// so no per-caster uniform fields are needed here.
+    pub fn bindPointShadow(self: *Encoder, slot: u32, handle: u32) void {
+        self.header(.bind_point_shadow, 8);
         self.putU32(slot);
         self.putU32(handle);
-        self.putU32(light_pos_ptr);
-        self.putU32(far_bits);
     }
 
     // ── Post-processing ─────────────────────────────────────────────────
@@ -2659,15 +2711,16 @@ test "WGSL PBR shadow + depth: variant_shadow path and wgslDepth structure" {
         try testing.expect(std.mem.indexOf(u8, src, "shadow_map: texture_depth_2d") != null);
         try testing.expect(std.mem.indexOf(u8, src, "shadow_samp: sampler_comparison") != null);
         try testing.expect(std.mem.indexOf(u8, src, "textureSampleCompareLevel") != null);
-        try testing.expect(std.mem.indexOf(u8, src, "light_vp: mat4x4<f32>") != null);
-        try testing.expect(std.mem.indexOf(u8, src, "light_pos: vec4<f32>") != null);
-        try testing.expect(std.mem.indexOf(u8, src, "shadowFactor(in.light_pos)") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "shadow_vp: array<mat4x4<f32>, 4>") != null);
+        // Per-caster sampling: shadow factor computed in-loop, no light_pos varying.
+        try testing.expect(std.mem.indexOf(u8, src, "shadowFactor2D(in.world_pos, i32(v3.z + 0.5))") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "light_pos") == null);
     }
     // Non-shadow variants must NOT carry any shadow machinery.
     inline for ([_]u32{ variant_pbr, variant_pbr | variant_normal_map | variant_emissive }) |f| {
         const src = wgslPbr(f);
         try testing.expect(std.mem.indexOf(u8, src, "shadow_map") == null);
-        try testing.expect(std.mem.indexOf(u8, src, "light_vp") == null);
+        try testing.expect(std.mem.indexOf(u8, src, "shadow_vp") == null);
         try testing.expect(std.mem.indexOf(u8, src, "shadowFactor") == null);
     }
     // Depth-only shader: a vertex stage on position + an empty fragment.
@@ -2682,12 +2735,13 @@ test "golden: WGSL shadow + depth hashes frozen (FNV-1a-64)" {
     const S0 = variant_pbr | variant_shadow;
     const S1 = variant_pbr | variant_normal_map | variant_shadow;
     const S2 = variant_pbr | variant_normal_map | variant_emissive | variant_shadow;
-    // Frozen from first green run — a change here = deliberate WGSL contract bump.
-    // Bumped T3: lights 8→16 vec4, 4-vec4 loop, point/spot/spot-cone added.
+    // Re-frozen (Slice 1 multi-caster): U.light_vp → shadow_vp: array<mat4x4,4>
+    // (offset 512, struct size 768, stride 768 unchanged); shadowFactor→shadowFactor2D
+    // (atlas-tiled), in-loop per-light shadow, light_pos varying removed.
     // wgslDepth() unchanged (no lighting in depth shader).
-    try testing.expectEqual(@as(u64, 0xae457faf55a79dc0), fnv64(wgslPbr(S0)));
-    try testing.expectEqual(@as(u64, 0xf88bbb5861b48f71), fnv64(wgslPbr(S1)));
-    try testing.expectEqual(@as(u64, 0xbe02499ac39559d9), fnv64(wgslPbr(S2)));
+    try testing.expectEqual(@as(u64, 0x9526692b364620b1), fnv64(wgslPbr(S0)));
+    try testing.expectEqual(@as(u64, 0xc21f19b0dcb7e6ce), fnv64(wgslPbr(S1)));
+    try testing.expectEqual(@as(u64, 0xbe762eb5018a073e), fnv64(wgslPbr(S2)));
     try testing.expectEqual(@as(u64, 0x3bb6cf33bcf5f8b1), fnv64(wgslDepth()));
 }
 
@@ -2754,13 +2808,16 @@ test "golden: shadow-variant GLSL hashes frozen (FNV-1a-64)" {
     const S0 = variant_pbr | variant_shadow;
     const S1 = variant_pbr | variant_normal_map | variant_shadow;
     const S2 = variant_pbr | variant_normal_map | variant_emissive | variant_shadow;
-    // Frozen from first green run. A change here = deliberate GLSL contract bump.
-    try testing.expectEqual(@as(u64, 0x4c653dc19966e2c9), fnv64(pbrVertexSrc(S0)));
-    try testing.expectEqual(@as(u64, 0x39a20440b418312f), fnv64(pbrVertexSrc(S1)));
-    try testing.expectEqual(@as(u64, 0x39a20440b418312f), fnv64(pbrVertexSrc(S2))); // emissive does not touch the VS
-    try testing.expectEqual(@as(u64, 0x09110d4bba0f440e), fnv64(pbrFragmentSrc(S0)));
-    try testing.expectEqual(@as(u64, 0xf18a33b37372b96d), fnv64(pbrFragmentSrc(S1)));
-    try testing.expectEqual(@as(u64, 0x85ff8016048becec), fnv64(pbrFragmentSrc(S2)));
+    // Re-frozen (Slice 1 multi-caster): shadow no longer touches the VS, so the
+    // shadow-variant VS hashes now EQUAL the non-shadow F0/F1 VS hashes (shadow
+    // light-space pos is recomputed per caster in the fragment). The FS hashes move
+    // because shadowFactor→shadowFactor2D + in-loop per-light shadow + u_shadow_vp[4].
+    try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(S0)));
+    try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(S1)));
+    try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(S2))); // emissive does not touch the VS
+    try testing.expectEqual(@as(u64, 0x96f5c3d0e29b5733), fnv64(pbrFragmentSrc(S0)));
+    try testing.expectEqual(@as(u64, 0x07b3423a91e5a03c), fnv64(pbrFragmentSrc(S1)));
+    try testing.expectEqual(@as(u64, 0x2de2fd2609629e21), fnv64(pbrFragmentSrc(S2)));
     // Depth-only shadow-pass shader.
     try testing.expectEqual(@as(u64, 0x5bd62d643af5c2d5), fnv64(depthVertexSrc()));
     try testing.expectEqual(@as(u64, 0xe43018c9a1312d96), fnv64(depthFragmentSrc()));
@@ -2768,40 +2825,47 @@ test "golden: shadow-variant GLSL hashes frozen (FNV-1a-64)" {
 
 test "shadow variant adds receiver uniforms; base variant has none" {
     const S0 = variant_pbr | variant_shadow;
-    try testing.expect(std.mem.indexOf(u8, pbrVertexSrc(S0), "u_light_vp") != null);
+    // The light-space VP array lives in the FRAGMENT shader now; the vertex stage
+    // carries no shadow uniform (light pos recomputed per caster from v_world_pos).
     try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "u_shadow_map") != null);
-    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "shadowFactor(v_light_pos)") != null);
-    // The shadow term attenuates direct light only — IBL ambient stays lit.
-    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "ambient + Lo * shadowFactor") != null);
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "uniform mat4 u_shadow_vp[4];") != null);
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "shadowFactor2D(int(v3.z + 0.5))") != null);
+    // The shadow is folded into per-light radiance; the combine is plain.
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(S0), "vec3 color = ambient + Lo;") != null);
+    try testing.expect(std.mem.indexOf(u8, pbrVertexSrc(S0), "u_shadow_vp") == null);
+    try testing.expect(std.mem.indexOf(u8, pbrVertexSrc(S0), "v_light_pos") == null);
     // Base PBR variant carries none of it.
     try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(variant_pbr), "u_shadow_map") == null);
-    try testing.expect(std.mem.indexOf(u8, pbrVertexSrc(variant_pbr), "u_light_vp") == null);
+    try testing.expect(std.mem.indexOf(u8, pbrFragmentSrc(variant_pbr), "u_shadow_vp") == null);
 }
 
 test "golden: shadow-pass frame records (tags 16-20)" {
-    var buf: [128]u8 = undefined;
+    // begin_shadow_pass grew 12→20 bytes (Task 1b: atlas_handle,depth_shader,col,row,tile).
+    // bind_shadow_map stays 16 bytes (Task 1: slot,atlas_handle,vp_ptr,count).
+    // Total record bytes: 12+24+24+12+20+4 = 96 = 0x60.
+    var buf: [256]u8 = undefined;
     var enc = Encoder.init(&buf);
     enc.createShadowMap(8, 1024);
-    enc.beginShadowPass(8, 4, 1024);
+    enc.beginShadowPass(8, 4, 0, 0, 1024); // atlas=8, depth_shader=4, col=0, row=0, tile=1024
     enc.drawDepth(1, 2, 12, 36, 0x3000);
     enc.endShadowPass(300, 150);
-    enc.bindShadowMap(tex_slot_shadow, 8, 0x3500);
+    enc.bindShadowMap(tex_slot_shadow, 8, 0x3500, 2);
     enc.endFrame();
     const stream = enc.finish();
     const hex = try hexAlloc(testing.allocator, stream);
     defer testing.allocator.free(hex);
     try testing.expectEqualStrings(
-        "54000000" ++ // length header: 84 record bytes
+        "60000000" ++ // length header: 96 record bytes (begin_shadow_pass grew 12→20)
             // CREATE_SHADOW_MAP handle=8 size=1024
             "1000" ++ "0800" ++ "08000000" ++ "00040000" ++
-            // BEGIN_SHADOW_PASS shadow=8 depth_shader=4 size=1024
-            "1100" ++ "0c00" ++ "08000000" ++ "04000000" ++ "00040000" ++
+            // BEGIN_SHADOW_PASS atlas=8 depth_shader=4 col=0 row=0 tile=1024
+            "1100" ++ "1400" ++ "08000000" ++ "04000000" ++ "00000000" ++ "00000000" ++ "00040000" ++
             // DRAW_DEPTH vbuf=1 ibuf=2 idx_off=12 count=36 mvp=0x3000
             "1300" ++ "1400" ++ "01000000" ++ "02000000" ++ "0c000000" ++ "24000000" ++ "00300000" ++
             // END_SHADOW_PASS width=300 height=150
             "1200" ++ "0800" ++ "2c010000" ++ "96000000" ++
-            // BIND_SHADOW_MAP slot=8 shadow=8 light_vp=0x3500
-            "1400" ++ "0c00" ++ "08000000" ++ "08000000" ++ "00350000" ++
+            // BIND_SHADOW_MAP slot=8 atlas_handle=8 vp_ptr=0x3500 count=2
+            "1400" ++ "1000" ++ "08000000" ++ "08000000" ++ "00350000" ++ "02000000" ++
             // END_FRAME
             "0600" ++ "0000",
         hex,
@@ -3265,17 +3329,70 @@ test "endPointShadow encodes tag 34 + 2 u32 payload (8 bytes)" {
     try testing.expectEqual(@as(u32, 600), std.mem.readInt(u32, s[12..16], .little)); // height
 }
 
-test "bindPointShadow encodes tag 35 + 4 u32 payload (16 bytes)" {
+test "bindPointShadow encodes tag 35 + 2 u32 payload (8 bytes)" {
+    // Task 1b: bind_point_shadow shrank 16→8 bytes; light_pos_ptr + far_bits dropped
+    // because the receiver reads lpos/far from the per-light loop vars (no dedicated uniform).
     var buf: [32]u8 = undefined;
     var enc = Encoder.init(&buf);
-    enc.bindPointShadow(9, 7, 0x5000, 0x41C80000); // far=25.0
+    enc.bindPointShadow(9, 7);
     const s = enc.finish();
+    // length header (4) + record header (4) + 2×u32 payload (8) = 16 total stream bytes
+    try testing.expectEqual(@as(u32, 12), std.mem.readInt(u32, s[0..4], .little)); // record bytes = 12
     try testing.expectEqual(@as(u16, 35), std.mem.readInt(u16, s[4..6], .little)); // tag
-    try testing.expectEqual(@as(u16, 16), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u16, 8), std.mem.readInt(u16, s[6..8], .little)); // payload_size
     try testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, s[8..12], .little)); // slot
     try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[12..16], .little)); // handle
-    try testing.expectEqual(@as(u32, 0x5000), std.mem.readInt(u32, s[16..20], .little)); // light_pos_ptr
-    try testing.expectEqual(@as(u32, 0x41C80000), std.mem.readInt(u32, s[20..24], .little)); // far_bits
+}
+
+test "golden: begin_shadow_pass (tag 17) 20-byte layout" {
+    // Task 1b: begin_shadow_pass widened from {shadow,depth_shader,size}=12B
+    // to {atlas_handle,depth_shader,col,row,tile}=20B so depth passes can target
+    // individual tiles in the 4096² atlas. Mirrors begin_point_shadow_face col/row/tile convention.
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.beginShadowPass(3, 5, 1, 0, 1024); // atlas=3, depth_shader=5, col=1, row=0, tile=1024
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // length header (4) + BEGIN_SHADOW_PASS (4+20=24) + END_FRAME (4) = 28 record bytes
+    try testing.expectEqualStrings(
+        "1c000000" ++ // length header: 28 record bytes
+            // BEGIN_SHADOW_PASS tag=17=0x11 payload=20=0x14
+            "1100" ++ "1400" ++
+            "03000000" ++ // atlas_handle=3
+            "05000000" ++ // depth_shader=5
+            "01000000" ++ // col=1
+            "00000000" ++ // row=0
+            "00040000" ++ // tile=1024=0x400
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "golden: bind_point_shadow (tag 35) 8-byte layout" {
+    // Task 1b: bind_point_shadow shrank from {slot,handle,light_pos_ptr,far_bits}=16B
+    // to {slot,handle}=8B. The receiver reads lpos/far from the per-light loop
+    // (v0.zw/v1.x = lpos, v2.w = lrange = far), matching the Task 1 shader redesign.
+    var buf: [32]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.bindPointShadow(tex_slot_point_shadow, 12);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // length header (4) + BIND_POINT_SHADOW (4+8=12) + END_FRAME (4) = 16 record bytes
+    try testing.expectEqualStrings(
+        "10000000" ++ // length header: 16 record bytes
+            // BIND_POINT_SHADOW tag=35=0x23 payload=8
+            "2300" ++ "0800" ++
+            "09000000" ++ // slot=tex_slot_point_shadow=9
+            "0c000000" ++ // handle=12
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
 }
 
 // ── Point-depth shader sources (T2) ──────────────────────────────────────────
@@ -3306,9 +3423,10 @@ test "GLSL variant_shadow_point: receiver emits u_point_atlas, unpackDist, point
     const f = pbrFragmentSrc(variant_pbr | variant_shadow_point);
     try testing.expect(std.mem.indexOf(u8, f, "u_point_atlas") != null);
     try testing.expect(std.mem.indexOf(u8, f, "unpackDist") != null);
-    try testing.expect(std.mem.indexOf(u8, f, "pointShadowFactor") != null);
-    // The shadow term attenuates direct light only — IBL ambient stays lit.
-    try testing.expect(std.mem.indexOf(u8, f, "ambient + Lo * pointShadowFactor()") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "pointShadowFactor(vec3 lpos, float far, int pidx)") != null);
+    // The shadow is folded into per-light radiance; the combine is plain.
+    try testing.expect(std.mem.indexOf(u8, f, "radiance *= pointShadowFactor(lpos, lrange, int(v3.z + 0.5))") != null);
+    try testing.expect(std.mem.indexOf(u8, f, "vec3 color = ambient + Lo;") != null);
     // Plain PBR variant carries none of it.
     const plain = pbrFragmentSrc(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, plain, "u_point_atlas") == null);
@@ -3318,9 +3436,10 @@ test "GLSL variant_shadow_point: receiver emits u_point_atlas, unpackDist, point
 }
 
 test "golden: variant_shadow_point GLSL fragment hash frozen (FNV-1a-64)" {
-    // Frozen from first green run — a change here = deliberate GLSL contract bump.
+    // Re-frozen (Slice 1 multi-caster): pointShadowFactor now takes (lpos, far, pidx),
+    // samples the 1536×4096 atlas per caster, and is folded into per-light radiance.
     const SP = variant_pbr | variant_shadow_point;
-    try testing.expectEqual(@as(u64, 0x2c7127b6863d65c2), fnv64(pbrFragmentSrc(SP)));
+    try testing.expectEqual(@as(u64, 0xf856cde8b55faa84), fnv64(pbrFragmentSrc(SP)));
 }
 
 // ── Point-shadow receiver WGSL (T4) ──────────────────────────────────────────
@@ -3330,14 +3449,15 @@ test "WGSL variant_shadow_point: receiver emits binding(11), unpackDist, pointSh
     const w = wgslPbr(SP);
     // Atlas texture at group(1) binding 11.
     try testing.expect(std.mem.indexOf(u8, w, "@group(1) @binding(11) var point_atlas") != null);
-    // Separate point-shadow uniform at group(0) binding 5.
-    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(5) var<uniform> pt: PointShadow") != null);
+    // No dedicated point-shadow uniform: lpos/far come from the per-light loop now.
+    try testing.expect(std.mem.indexOf(u8, w, "PointShadow") == null);
     // unpackDist helper present.
     try testing.expect(std.mem.indexOf(u8, w, "unpackDist") != null);
-    // pointShadowFactor function present.
-    try testing.expect(std.mem.indexOf(u8, w, "pointShadowFactor") != null);
-    // Shadow term attenuates direct light; IBL ambient stays lit.
-    try testing.expect(std.mem.indexOf(u8, w, "ambient + Lo * pointShadowFactor(in.world_pos)") != null);
+    // pointShadowFactor takes per-caster args.
+    try testing.expect(std.mem.indexOf(u8, w, "fn pointShadowFactor(world_pos: vec3<f32>, lpos: vec3<f32>, far: f32, pidx: i32)") != null);
+    // Shadow folded into radiance; combine is plain.
+    try testing.expect(std.mem.indexOf(u8, w, "radiance = radiance * pointShadowFactor(in.world_pos, lpos, lrange, i32(v3.z + 0.5))") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "var color = ambient + Lo;") != null);
     // Plain PBR variant carries none of it.
     const plain = wgslPbr(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, plain, "point_atlas") == null);
@@ -3348,7 +3468,8 @@ test "WGSL variant_shadow_point: receiver emits binding(11), unpackDist, pointSh
 }
 
 test "golden: variant_shadow_point WGSL hash frozen (FNV-1a-64)" {
-    // Frozen from first green run — a change here = deliberate WGSL contract bump.
+    // Re-frozen (Slice 1 multi-caster): PointShadow uniform removed (lpos/far from
+    // the loop), pointShadowFactor takes (world_pos, lpos, far, pidx), 1536×4096 atlas.
     const SP = variant_pbr | variant_shadow_point;
-    try testing.expectEqual(@as(u64, 0xf878d42bc3e6c811), fnv64(wgslPbr(SP)));
+    try testing.expectEqual(@as(u64, 0xdd271fddd96b5b0d), fnv64(wgslPbr(SP)));
 }
