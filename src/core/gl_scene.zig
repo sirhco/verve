@@ -107,6 +107,27 @@ pub const Light = struct {
 /// Maximum number of lights accumulated per scene (matches shader UBO capacity).
 pub const max_lights = 4;
 
+/// Describes one rect (LTC) area light for the `data-glarealights` out-of-band
+/// attribute. `ex`/`ey` are the HALF-edge vectors: the rect's four corners are
+/// `pos ± ex ± ey` (CCW c0=pos+ex-ey, c1=pos-ex-ey, c2=pos-ex+ey, c3=pos+ex+ey —
+/// matches the S3T1 packing). The rect normal is `normalize(cross(ex,ey))`; the
+/// shadow caster (when `casts_shadow`) renders a spot-like perspective depth pass
+/// from `pos` along that normal. `two_sided` lights both faces (reserved; the LTC
+/// eval is single-sided by default — see S3T1 report).
+pub const AreaLight = struct {
+    pos: [3]f32,
+    ex: [3]f32 = .{ 0.5, 0, 0 }, // half-width edge
+    ey: [3]f32 = .{ 0, 0.5, 0 }, // half-height edge
+    color: [3]f32 = .{ 1, 1, 1 },
+    intensity: f32 = 1,
+    two_sided: bool = false,
+    casts_shadow: bool = false,
+};
+
+/// Max number of area lights accumulated per scene. Mirrors
+/// `gl.command.max_area_lights` (the shader UBO `area_lights[16]` = 4 vec4 each).
+pub const max_area_lights = 4;
+
 /// Fluent builder. Returned by `ctx.glScene`; finalize with `.build()`.
 /// All setters return `*GlSceneBuilder` so calls chain; `build()` returns
 /// the island-wrapped `*verve.Node` (or a poison node carrying the error,
@@ -122,6 +143,8 @@ pub const GlSceneBuilder = struct {
     morph_weights_buf: []const f32 = &.{},
     lights_buf: [max_lights]Light = undefined,
     light_count: usize = 0,
+    area_lights_buf: [max_area_lights]AreaLight = undefined,
+    area_count: usize = 0,
     pick_names_buf: [max_picks][]const u8 = undefined,
     pick_ids_buf: [max_picks]u32 = undefined,
     pick_export_buf: [max_picks][]const u8 = undefined,
@@ -190,6 +213,15 @@ pub const GlSceneBuilder = struct {
         pl.kind = .point;
         self.lights_buf[self.light_count] = pl;
         self.light_count += 1;
+        return self;
+    }
+
+    /// Append one rect (LTC) area light. Drops when `max_area_lights` reached.
+    /// Transported outside Props via `data-glarealights` so Props stays 14 fields.
+    pub fn areaLight(self: *GlSceneBuilder, a: AreaLight) *GlSceneBuilder {
+        if (self.area_count >= max_area_lights) return self;
+        self.area_lights_buf[self.area_count] = a;
+        self.area_count += 1;
         return self;
     }
 
@@ -350,6 +382,45 @@ pub const GlSceneBuilder = struct {
             if (lpos > 0) {
                 const lights_attr = std.fmt.allocPrint(self.ctx.allocator, "{s}", .{lbuf[0..lpos]}) catch null;
                 if (lights_attr) |la| _ = canvas.attr("data-gllights", la);
+            }
+        }
+
+        // Area lights travel OUTSIDE Props as a semicolon-separated list of 15-value
+        // comma-separated records (px,py,pz, exx,exy,exz, eyx,eyy,eyz, r,g,b,
+        // intensity, two_sided(0/1), casts_shadow(0/1)). Only emitted when at least
+        // one area light was added. parseAreaLights reads this EXACT layout — field
+        // order frozen. ex/ey are the HALF-edge vectors (NOT normalized; their length
+        // is the rect half-size).
+        if (self.area_count > 0) {
+            // Upper bound per light: 15 fields × 20 chars + 14 commas + 1 semi ≈ 315 B.
+            // 4 lights × 315 = 1260; round up to 1400 for safety.
+            var abuf: [1400]u8 = undefined;
+            var apos: usize = 0;
+            for (self.area_lights_buf[0..self.area_count], 0..) |al, ai| {
+                const sep: []const u8 = if (ai != 0) ";" else "";
+                const achunk = std.fmt.bufPrint(abuf[apos..], "{s}{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d}", .{
+                    sep,
+                    al.pos[0],
+                    al.pos[1],
+                    al.pos[2],
+                    al.ex[0],
+                    al.ex[1],
+                    al.ex[2],
+                    al.ey[0],
+                    al.ey[1],
+                    al.ey[2],
+                    al.color[0],
+                    al.color[1],
+                    al.color[2],
+                    al.intensity,
+                    @as(u32, if (al.two_sided) 1 else 0),
+                    @as(u32, if (al.casts_shadow) 1 else 0),
+                }) catch break;
+                apos += achunk.len;
+            }
+            if (apos > 0) {
+                const area_attr = std.fmt.allocPrint(self.ctx.allocator, "{s}", .{abuf[0..apos]}) catch null;
+                if (area_attr) |aa| _ = canvas.attr("data-glarealights", aa);
             }
         }
 
@@ -751,6 +822,60 @@ test "glScene .spotLight emits data-gllights" {
     // Field 15: castsShadow=1 (casts_shadow=true above). The record ends with
     // ...,cosOut,1" so check that ",1\"" (or ",1;") terminates the attribute.
     try testing.expect(std.mem.indexOf(u8, html, ",1\"") != null or std.mem.indexOf(u8, html, ",1;") != null);
+}
+
+test "glScene .areaLight emits data-glarealights" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .areaLight(.{
+            .pos = .{ 0, 3, 0 },
+            .ex = .{ 0.5, 0, 0 },
+            .ey = .{ 0, 0, 0.5 },
+            .color = .{ 1, 0.9, 0.8 },
+            .intensity = 4,
+            .casts_shadow = true,
+        })
+        .build();
+    const html = try renderHtml(scene, arena.allocator());
+    // px,py,pz = 0,3,0 then exx,exy,exz = 0.5,0,0 at the record start.
+    try testing.expect(std.mem.indexOf(u8, html, "data-glarealights=\"0,3,0,0.5,0,0,") != null);
+    // Last two fields: two_sided=0, casts_shadow=1 → record ends with ",0,1".
+    try testing.expect(std.mem.indexOf(u8, html, ",0,1\"") != null or std.mem.indexOf(u8, html, ",0,1;") != null);
+}
+
+test "glScene no area lights emits no data-glarealights" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glarealights") == null);
+}
+
+test "glScene .areaLight caps at max_area_lights" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    var b = ctx.glScene(.{ .src = "s", .env = "e" });
+    var i: u32 = 0;
+    while (i < max_area_lights + 3) : (i += 1) _ = b.areaLight(.{ .pos = .{ 0, 1, 0 } });
+    const scene = b.build();
+    const html = try renderHtml(scene, arena.allocator());
+    // Slice out the data-glarealights="…" value and count semicolons:
+    // max_area_lights records → max_area_lights-1 separators.
+    const key = "data-glarealights=\"";
+    const start = std.mem.indexOf(u8, html, key).? + key.len;
+    const end = start + std.mem.indexOfScalar(u8, html[start..], '"').?;
+    var semis: usize = 0;
+    for (html[start..end]) |c| {
+        if (c == ';') semis += 1;
+    }
+    try testing.expectEqual(@as(usize, max_area_lights - 1), semis);
 }
 
 test "glScene no lights emits no data-gllights" {

@@ -1623,6 +1623,86 @@ pub fn glSceneCsm(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-area: LTC (Linearly Transformed Cosines, Heitz 2016) rect AREA light demo.
+/// ONE overhead rect area light hovers above the model + floor, facing straight
+/// down (cross(ex,ey) = −Y), and casts a SOFT area shadow. Unlike a point/spot
+/// light, the rect has finite size so it produces realistic soft diffuse falloff,
+/// a stretched specular highlight that follows the rect's shape (the LTC
+/// approximation), and a penumbra-soft shadow whose edge widens with distance from
+/// the receiver. The regular punctual lights are kept to a tiny ambient-ish fill so
+/// the area light's lighting + shadow are the visible feature, not drowned out by a
+/// directional key. Reuses shadow.vmesh (cube + floor receiver) and the page-global
+/// glscene_freeze / glscene_unfreeze control (Slice 1) so a CDP run has a stable
+/// frame; the buttons sit INSIDE the GlScene island subtree so z-on-click routes to
+/// the chunk's exports. The LTC LUTs are fetched as /gl/ltc.bin.
+pub fn glSceneArea(ctx: *const verve.Context) !*verve.Node {
+    // Tiny low-intensity fill so the scene isn't pure black where the area light
+    // doesn't reach — kept minimal so the AREA light is the visible feature.
+    const lights = [_]verve.GlLight{
+        .{
+            .kind = .directional,
+            .dir = .{ -0.2, -1.0, -0.3 },
+            .color = .{ 0.6, 0.65, 0.8 },
+            .intensity = 0.25,
+            .casts_shadow = false,
+        },
+    };
+
+    const island_node = ctx.glScene(.{
+        .src = "/gl/shadow.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='44' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EArea Light (LTC)%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 14.0, .pitch = 0.30, .yaw = 0.55 })
+        .lights(&lights)
+        // ONE overhead rect area light. ex=+X half-edge, ey=+Z half-edge →
+        // cross(ex,ey) = −Y, so the rect faces DOWN onto the model + floor and
+        // casts a soft area shadow. casts_shadow=true renders the rect as a
+        // perspective caster into the 2D shadow atlas.
+        .areaLight(.{
+            .pos = .{ 0, 3, 0 },
+            .ex = .{ 0.6, 0, 0 },
+            .ey = .{ 0, 0, 0.6 },
+            .color = .{ 1, 1, 1 },
+            .intensity = 5,
+            .casts_shadow = true,
+        })
+        .autoRotate(0.15)
+        .build();
+
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glscene_freeze").text("Freeze"),
+        ctx.el("button").attr("z-on-click", "glscene_unfreeze").text("Unfreeze"),
+    });
+    _ = island_node.children(.{controls});
+
+    const scene_box = ctx.div().class("gl-wrap").children(.{
+        ctx.div()
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;margin:0 auto")
+            .children(.{island_node}),
+    });
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — Area Light (LTC)"),
+        ctx.p().text("Slice 3 capstone: ONE rectangular AREA light hovers overhead, " ++
+            "facing straight down at the model and floor. Real area lights have finite " ++
+            "size, so instead of a single hard highlight they produce a soft diffuse " ++
+            "spread and a specular reflection STRETCHED into the shape of the rectangle. " ++
+            "Verve evaluates this with Linearly Transformed Cosines (LTC, Heitz 2016): a " ++
+            "pair of small lookup tables (fetched as /gl/ltc.bin) transform a cosine " ++
+            "distribution into the rect's clipped solid angle, giving physically-based " ++
+            "area lighting in one shader pass. The rect also casts a SOFT area shadow — " ++
+            "rendered as a perspective caster into the 2D shadow atlas — whose penumbra " ++
+            "widens with distance from the receiver. Both WebGL2 and WebGPU backends."),
+        scene_box,
+        ctx.p().class("hint")
+            .text("Drag to orbit \u{00b7} wheel to zoom \u{00b7} Freeze pins the orbit. " ++
+            "Look for soft, even lighting on the top faces, a specular highlight that " ++
+            "stretches to match the rectangle, and a soft-edged shadow under the cube " ++
+            "on the floor."),
+    });
+}
+
 /// /gl-cutout: alpha-test (MASK) cutout dissolve demo. The "Cutout" cube's
 /// base-color texture has a real alpha channel with HOLES; its material is
 /// alphaMode:MASK (cutoff 0.5), so the variant_alpha_test shader DISCARDS any

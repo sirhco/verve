@@ -355,6 +355,22 @@ const Inst = struct {
     casters_point: [gl.command.max_point_casters]u32 = undefined,
     // True once createPointShadow has been emitted for this instance.
     point_atlas_sent: bool = false,
+
+    // ── Area lights (Slice 3, LTC). Pool of up to max_area_lights rect lights,
+    // 16 f32 each (4 vec4). Layout per area light i (base = i*16) — mirrors the
+    // S3T1 shader UBO packing:
+    //   a0 = [pos.x, pos.y, pos.z, intensity]
+    //   a1 = [ex.x, ex.y, ex.z, two_sided]      (ex = half-width edge)
+    //   a2 = [ey.x, ey.y, ey.z, shadow_slot]    (ey = half-height edge; 2D slot or -1)
+    //   a3 = [color.r, color.g, color.b, shadow_kind]  (0=none, 1=2D shadow)
+    // set_area_lights points at &area_lights[0] (deferred decode → persistent).
+    area_lights: [gl.command.max_area_lights * 16]f32 = .{0} ** (gl.command.max_area_lights * 16),
+    area_count: u32 = 0,
+    // Area shadow casters share the 2D atlas slots (after cascades+spots). For each
+    // occupied 2D slot, slot_area_li = the area-light index that owns it (-1 = a
+    // regular directional/spot/CSM caster). Set by classifyAreaCasters; read in the
+    // 2D depth-pass loop to pick the area VP vs. the light-pool VP.
+    slot_area_li: [gl.command.max_2d_casters]i32 = .{-1} ** gl.command.max_2d_casters,
 };
 
 const MAX_INSTANCES = 4;
@@ -943,6 +959,107 @@ fn classifyCasters(inst: *Inst, casts: []const bool) void {
     }
 }
 
+// Parse the `data-glarealights` attribute into inst.area_lights / area_count,
+// then classify area shadow casters into the shared 2D atlas.
+// Format: semicolon-separated area-light records, each a 15-field comma CSV:
+//   px,py,pz, exx,exy,exz, eyx,eyy,eyz, r,g,b, intensity, two_sided, casts_shadow
+// Maps into the S3T1 packing: a0=[pos,intensity], a1=[ex,two_sided],
+// a2=[ey,shadow_slot=-1], a3=[color,shadow_kind=0]. classifyAreaCasters fills the
+// shadow_slot / shadow_kind after parsing. Tolerant: parse errors → 0; extras ignored.
+fn parseAreaLights(inst: *Inst, s: []const u8) void {
+    const max_a = gl.command.max_area_lights;
+    var ai: u32 = 0;
+    var casts: [gl.command.max_area_lights]bool = .{false} ** gl.command.max_area_lights;
+    var it = std.mem.splitScalar(u8, s, ';');
+    while (it.next()) |rec| {
+        if (ai >= max_a) break;
+        const base = ai * 16;
+        for (inst.area_lights[base .. base + 16]) |*f| f.* = 0;
+        // Parse the 15 CSV fields into temporaries, then pack into the 4 vec4 layout.
+        var fields: [15]f32 = .{0} ** 15;
+        var fi: u32 = 0;
+        var field_it = std.mem.splitScalar(u8, rec, ',');
+        while (field_it.next()) |tok| {
+            if (fi >= 15) break;
+            fields[fi] = std.fmt.parseFloat(f32, tok) catch 0.0;
+            fi += 1;
+        }
+        // a0 = [pos.xyz, intensity]
+        inst.area_lights[base + 0] = fields[0];
+        inst.area_lights[base + 1] = fields[1];
+        inst.area_lights[base + 2] = fields[2];
+        inst.area_lights[base + 3] = fields[12]; // intensity
+        // a1 = [ex.xyz, two_sided]
+        inst.area_lights[base + 4] = fields[3];
+        inst.area_lights[base + 5] = fields[4];
+        inst.area_lights[base + 6] = fields[5];
+        inst.area_lights[base + 7] = fields[13]; // two_sided
+        // a2 = [ey.xyz, shadow_slot] (slot filled by classifyAreaCasters; -1 default)
+        inst.area_lights[base + 8] = fields[6];
+        inst.area_lights[base + 9] = fields[7];
+        inst.area_lights[base + 10] = fields[8];
+        inst.area_lights[base + 11] = -1.0;
+        // a3 = [color.rgb, shadow_kind] (kind filled by classifyAreaCasters; 0 default)
+        inst.area_lights[base + 12] = fields[9];
+        inst.area_lights[base + 13] = fields[10];
+        inst.area_lights[base + 14] = fields[11];
+        inst.area_lights[base + 15] = 0.0;
+        casts[ai] = fields[14] >= 0.5; // casts_shadow
+        ai += 1;
+    }
+    inst.area_count = ai;
+    classifyAreaCasters(inst, casts[0..ai]);
+}
+
+// Assign each shadow-casting area light the NEXT free 2D atlas slot, AFTER the
+// cascades + spot/dir casters already counted in n_2d_casters. Writes a2.w = slot
+// (float) and a3.w = 1.0 (2D shadow kind) into the area pool, records the owning
+// area-light index in slot_area_li[slot], and increments n_2d_casters so
+// bindShadowMap covers the area passes too. If the 8-slot pool is full the area
+// shadow is DROPPED (a3.w stays 0 → the shader treats it as unshadowed). MUST run
+// after classifyCasters (parseLights) so the slot accounting is correct.
+fn classifyAreaCasters(inst: *Inst, casts: []const bool) void {
+    var ai: u32 = 0;
+    while (ai < inst.area_count) : (ai += 1) {
+        const base = ai * 16;
+        const wants = ai < casts.len and casts[ai];
+        if (!wants) {
+            inst.area_lights[base + 11] = -1.0; // shadow_slot = none
+            inst.area_lights[base + 15] = 0.0; // shadow_kind = none
+            continue;
+        }
+        if (inst.n_2d_casters < gl.command.max_2d_casters) {
+            const slot = inst.n_2d_casters;
+            inst.n_2d_casters += 1;
+            inst.slot_area_li[slot] = @intCast(ai);
+            inst.area_lights[base + 11] = @floatFromInt(slot); // a2.w = slot
+            inst.area_lights[base + 15] = 1.0; // a3.w = 2D shadow
+        } else {
+            // Pool full (cascades+spots already used all 8 slots) → drop the shadow.
+            inst.area_lights[base + 11] = -1.0;
+            inst.area_lights[base + 15] = 0.0;
+        }
+    }
+}
+
+/// Area-light view-projection for the shadow depth pass: a spot-like perspective
+/// from the rect center (pos) along the rect normal = normalize(cross(ex,ey)).
+/// The normal points OUT of the lit face (CCW corners c0=pos+ex-ey … → cross(ex,ey)
+/// is the front normal). A wide 90° fovy covers the near hemisphere the rect lights.
+fn areaLightVp(inst: *const Inst, area_idx: u32) gl.math.Mat4 {
+    const Vec3 = gl.math.Vec3;
+    const base = area_idx * 16;
+    const pos = Vec3.init(inst.area_lights[base + 0], inst.area_lights[base + 1], inst.area_lights[base + 2]);
+    const ex = Vec3.init(inst.area_lights[base + 4], inst.area_lights[base + 5], inst.area_lights[base + 6]);
+    const ey = Vec3.init(inst.area_lights[base + 8], inst.area_lights[base + 9], inst.area_lights[base + 10]);
+    // Rect normal = cross(ex,ey); the rect emits along this direction (the lit side).
+    const normal = Vec3.normalize(Vec3.cross(ex, ey));
+    const fovy: f32 = std.math.pi * 0.5; // 90°
+    const near: f32 = 0.05;
+    const far: f32 = 50.0;
+    return gl.math.spotLightVpMat(pos, normal, fovy, near, far);
+}
+
 // Parse a "w0,w1,…" morph-weight attribute into inst.morph_weights[0..].
 // Seeds up to max_morph_targets weights and marks each as runtime-set so the
 // per-frame baked-clip advance does not overwrite them.  Tolerant: extra
@@ -1062,6 +1179,16 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         var llbuf: [1400]u8 = undefined;
         const la = verve.refGetAttr(ch, "data-gllights", &llbuf);
         if (la.len != 0) parseLights(inst, la);
+    }
+
+    // Area lights ride on the canvas `data-glarealights` attribute (NOT Props).
+    // Format: semicolon-separated 15-field CSV records. MUST be parsed AFTER
+    // data-gllights so classifyAreaCasters appends to the n_2d_casters the
+    // cascades+spots already claimed (shared 8-slot atlas). Absent → area_count=0.
+    if (inst.canvas_handle) |ch| {
+        var albuf: [1400]u8 = undefined;
+        const aa = verve.refGetAttr(ch, "data-glarealights", &albuf);
+        if (aa.len != 0) parseAreaLights(inst, aa);
     }
 
     // Morph weights ride on the canvas `data-glmorph` attribute (NOT Props).
@@ -1665,12 +1792,21 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         if (inst.n_2d_casters > 0) {
             var s: u32 = 0;
             while (s < inst.n_2d_casters) : (s += 1) {
-                const li = inst.casters_2d[s];
+                const area_li = inst.slot_area_li[s]; // ≥0 → this slot is an area caster
+                // casters_2d[s] is ONLY written for regular (dir/spot/CSM) caster
+                // slots. For an area slot it is undefined/stale, so guard every read
+                // of it (and the inst.lights index it derives) behind area_li < 0 —
+                // a stale li*16 would OOB-index inst.lights[64] and trap in wasm.
+                const li = if (area_li < 0) inst.casters_2d[s] else 0;
                 const caster_base = li * 16;
-                const caster_type = inst.lights[caster_base + 0];
-                const is_csm = inst.cascade_count > 0 and @as(i32, @intCast(li)) == inst.csm_light and s < inst.cascade_count;
+                const caster_type = if (area_li < 0) inst.lights[caster_base + 0] else 0;
+                const is_csm = area_li < 0 and inst.cascade_count > 0 and @as(i32, @intCast(li)) == inst.csm_light and s < inst.cascade_count;
                 // clipFix is identity on WebGL2, z-remap on WebGPU.
-                const light_vp = if (is_csm) blk: {
+                const light_vp = if (area_li >= 0)
+                    // Area caster: spot-like perspective from the rect center along
+                    // its normal (cross(ex,ey)).
+                    clipFix().mul(areaLightVp(inst, @intCast(area_li)))
+                else if (is_csm) blk: {
                     // Cascade s of the CSM caster: fit ortho VP to this cascade's
                     // view-frustum depth slice [near_s, far_s].
                     const near_s: f32 = if (s == 0) cam_near else inst.cascade_splits[s - 1];
@@ -1785,6 +1921,18 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // (see S2T2 report). cascade_splits/view_forward are persistent Inst storage.
         if (inst.cascade_count > 0)
             enc.setCsm(inst.cascade_count, @intCast(@intFromPtr(&inst.cascade_splits)), @intCast(@intFromPtr(&inst.view_forward)));
+
+        // Area lights (LTC) — frame-global, emitted ONLY for area scenes AFTER
+        // beginFrame (the bridge resets frameAreaCount=0 at begin_frame, like
+        // frameCascadeCount, so an earlier set_area_lights would be wiped).
+        // bind_ltc_lut handles are advisory: emitting it triggers the bridge's
+        // lazy /gl/ltc.bin fetch + binds the real LUTs; non-area scenes omit both
+        // → the bridge keeps the dummy 1×1 LUTs bound. area_lights is persistent
+        // Inst storage (deferred decode walks cmd_buf post-return).
+        if (inst.area_count > 0) {
+            enc.setAreaLights(inst.area_count, @intCast(@intFromPtr(&inst.area_lights[0])));
+            enc.bindLtcLut(0, 0);
+        }
 
         const pv = clipFix().mul(proj).mul(view);
         // World-space frustum planes for this frame's camera (P9 slice 2).

@@ -5145,6 +5145,70 @@
   // active shader's variant to select the correct attribute layout.
   // variant & 1 (variant_vertex_color): loc0 vec3 s24 o0, loc1 vec3 s24 o12
   // variant & 2 (variant_lit_uv):       loc0 vec3 s32 o0, loc1 vec3 s32 o12, loc2 vec2 s32 o24
+  // S3 LTC LUTs (WebGL2): a 1×1 rgba16f dummy bound to units 10/11 by default so
+  // every PBR draw has complete textures at the LTC samplers even before the real
+  // LUTs load (or when no area light is active — the shader skips sampling then).
+  // RGBA16F needs EXT_color_buffer_float for render targets but plain sampling of
+  // a half-float texture works in WebGL2 core; texImage2D with HALF_FLOAT is fine.
+  const glEnsureLtcDummy = (st) => {
+    if (st.ltcDummy) return st.ltcDummy;
+    const gl = st.gl;
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    // 1×1 RGBA16F, all-zero (4 halfs = 0x0000). Content irrelevant (never sampled
+    // when area_count=0). NEAREST min, LINEAR mag, CLAMP_TO_EDGE — matches real LUTs.
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, 1, 1, 0, gl.RGBA, gl.HALF_FLOAT, new Uint16Array([0, 0, 0, 0]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    st.ltcDummy = tex;
+    return tex;
+  };
+  // Bind the LTC dummy (or, if already loaded, the real LUTs) to units 10/11.
+  const glBindLtcDummy = (st) => {
+    const gl = st.gl;
+    if (!gl) return;
+    const mat = st.ltcMat || glEnsureLtcDummy(st);
+    const mag = st.ltcMag || glEnsureLtcDummy(st);
+    gl.activeTexture(gl.TEXTURE10);
+    gl.bindTexture(gl.TEXTURE_2D, mat);
+    gl.activeTexture(gl.TEXTURE11);
+    gl.bindTexture(gl.TEXTURE_2D, mag);
+  };
+  // Lazily fetch /gl/ltc.bin (65536B) ONCE, split into two 64×64 rgba16f textures
+  // (bytes 0..32767 → ltc_mat, 32768..65535 → ltc_mag; already little-endian f16).
+  // CLAMP_TO_EDGE, mag=LINEAR, min=NEAREST. Cached on st.ltcMat/st.ltcMag. The
+  // fetch is guarded by st.ltcLoading so it fires exactly once.
+  const glEnsureLtc = (st) => {
+    if (st.ltcMat || st.ltcLoading) return; // loaded or in-flight
+    st.ltcLoading = true;
+    fetch("/gl/ltc.bin")
+      .then((r) => r.arrayBuffer())
+      .then((buf) => {
+        const gl = st.gl;
+        if (!gl) return;
+        const make = (byteOffset) => {
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          // 64×64 RGBA16F. The 32768 bytes = 16384 halfs = 64×64×4. HALF_FLOAT
+          // expects a Uint16Array view over the f16 bytes.
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, 64, 64, 0, gl.RGBA, gl.HALF_FLOAT,
+            new Uint16Array(buf, byteOffset, 16384));
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          return tex;
+        };
+        st.ltcMat = make(0);      // bytes 0..32767
+        st.ltcMag = make(32768);  // bytes 32768..65535
+        // Bind the freshly-loaded LUTs to units 10/11 right away.
+        glBindLtcDummy(st);
+      })
+      .catch(() => { st.ltcLoading = false; }); // allow a later retry on failure
+  };
+
   const bindVaoFor = (st, vh, ih) => {
     const gl = st.gl;
     const vb = st.buffers[vh];
@@ -5251,6 +5315,13 @@
           // Default CSM off each frame; set_csm (tag 36) re-enables when a CSM caster
           // is active, so a non-CSM frame never carries stale cascade data.
           st.frameCascadeCount = 0;
+          // Default no area lights each frame; set_area_lights (tag 37) re-enables.
+          st.frameAreaCount = 0;
+          st.frameAreaLights = null;
+          // Ensure the 1×1 rgba16f LTC dummy is bound to units 10/11 by default so
+          // every PBR draw has valid (incomplete-free) textures at those samplers
+          // even before /gl/ltc.bin loads. Real LUTs (tag 38) override these binds.
+          glBindLtcDummy(st);
           break;
         }
         case 2: { // CREATE_BUFFER
@@ -5286,6 +5357,9 @@
             sh.lights = gl.getUniformLocation(prog, "u_lights");
             sh.lightCount = gl.getUniformLocation(prog, "u_light_count");
             sh.prefMips = gl.getUniformLocation(prog, "u_prefiltered_mips");
+            // S3 area lights (LTC): count + the area_lights[] vec4 array base.
+            sh.areaCount = gl.getUniformLocation(prog, "u_area_count");
+            sh.areaLights = gl.getUniformLocation(prog, "u_area_lights[0]");
             // Sampler units are fixed at link time. Only set the ones that exist
             // in this variant's compiled program (variant-stripped samplers
             // return a null location). useProgram is required before uniform1i;
@@ -5304,6 +5378,10 @@
             setSampler("u_irradiance", 5);
             setSampler("u_prefiltered", 6);
             setSampler("u_brdf_lut", 7);
+            // S3 LTC LUT samplers — fixed units 10/11 (ALWAYS declared; a 1×1
+            // dummy is bound until /gl/ltc.bin loads / when area_count=0).
+            setSampler("u_ltc_mat", 10);
+            setSampler("u_ltc_mag", 11);
             if (variant & 32) { // shadow receiver: shadow_vp[] array + atlas depth sampler (unit 8)
               sh.shadowVp = gl.getUniformLocation(prog, "u_shadow_vp[0]");
               setSampler("u_shadow_map", 8);
@@ -5528,6 +5606,32 @@
           if (st.active && st.active.prefMips) gl.uniform1f(st.active.prefMips, specMips);
           break;
         }
+        case 37: { // SET_AREA_LIGHTS — cache the per-frame area-light array (LTC).
+          // Payload (command.zig Encoder.setAreaLights, 8B): count | ptr. Each area
+          // light = 16 f32 (4 vec4): a0=[pos,intensity] a1=[ex,two_sided]
+          // a2=[ey,shadow_slot] a3=[color,shadow_kind]. Cached like set_csm; each
+          // DRAW_PBR writes u_area_count/u_area_lights on its active program. Max 16.
+          const count = dv.getUint32(off, true);
+          const p = dv.getUint32(off + 4, true);
+          const n = Math.min(count, 16);
+          st.frameAreaCount = n;
+          st.frameAreaLights = (n > 0) ? new Float32Array(memory.buffer, p, n * 16).slice() : null;
+          break;
+        }
+        case 38: { // BIND_LTC_LUT — ensure the LTC LUTs are loaded; bind to units 10/11.
+          // Payload (command.zig Encoder.bindLtcLut, 8B): mat_handle | mag_handle.
+          // Handles are ADVISORY — the bridge OWNS the LUTs (global) and fetches
+          // them by fixed URL (/gl/ltc.bin) ONCE. Until loaded, the 1×1 dummy stays
+          // bound at units 10/11 (set per-draw). On load, bind the real LUTs here.
+          glEnsureLtc(st);
+          if (st.ltcMat && st.ltcMag) {
+            gl.activeTexture(gl.TEXTURE10);
+            gl.bindTexture(gl.TEXTURE_2D, st.ltcMat);
+            gl.activeTexture(gl.TEXTURE11);
+            gl.bindTexture(gl.TEXTURE_2D, st.ltcMag);
+          }
+          break;
+        }
         case 13: { // DRAW_PBR — full PBR submesh draw
           const vh = dv.getUint32(off, true);
           const ih = dv.getUint32(off + 4, true);
@@ -5549,6 +5653,13 @@
             gl.uniform4fv(st.active.material, new Float32Array(memory.buffer, materialPtr, 12));
           if (st.active.cameraPos)
             gl.uniform3fv(st.active.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
+          // S3 area lights: write the cached per-frame array on the active program.
+          // The shader ALWAYS samples u_ltc_mat/u_ltc_mag (units 10/11) — the dummy
+          // (or real LUTs, bound by tag 38) covers them; area_count=0 → loop skipped.
+          if (st.active.areaCount)
+            gl.uniform1i(st.active.areaCount, st.frameAreaCount | 0);
+          if (st.active.areaLights && st.frameAreaCount > 0 && st.frameAreaLights)
+            gl.uniform4fv(st.active.areaLights, st.frameAreaLights);
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
           break;
         }
@@ -5613,6 +5724,8 @@
             gl2.uniform4fv(st.active.material, new Float32Array(memory.buffer, materialPtr, 12));
           if (st.active.cameraPos)
             gl2.uniform3fv(st.active.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
+          // Instanced is non-area: zero area_count so the shader skips the LTC loop.
+          if (st.active.areaCount) gl2.uniform1i(st.active.areaCount, 0);
           gl2.drawElementsInstanced(gl2.TRIANGLES, count, gl2.UNSIGNED_SHORT, byteOff, instanceCount);
           break;
         }
@@ -6260,6 +6373,26 @@
         return { tex: t, view: t.createView() };
       })(),
       shadowSampler: device.createSampler({ compare: "less" }),
+      // S3 LTC fallback: the WGSL PBR shader ALWAYS declares the LTC samplers
+      // (group(1) bindings 12/13), so every PBR bind group MUST bind them even
+      // when no LTC LUT is loaded / area_count=0. A 1×1 rgba16f dummy keeps the
+      // bind-group layout valid (content irrelevant — shader never samples it
+      // when area_count=0). Mirrors the white2d/blackCube fallback pattern.
+      ltcDummy: (() => {
+        const t = device.createTexture({
+          size: [1, 1],
+          format: "rgba16float",
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        // 4 halfs = 0.0 (bit pattern 0x0000). bytesPerRow = 8 (1 texel × 8B).
+        device.queue.writeTexture(
+          { texture: t },
+          new Uint16Array([0, 0, 0, 0]),
+          { bytesPerRow: 8, rowsPerImage: 1 },
+          [1, 1],
+        );
+        return { tex: t, view: t.createView(), w: 1, h: 1 };
+      })(),
     };
   };
 
@@ -6279,8 +6412,12 @@
   //                                  v3=[cosIn,cosOut,__,__])
   //   light_count: i32     @ 496
   //   prefiltered_mips:f32 @ 500
-  //   light_vp   : mat4x4  @ 512  (variant_shadow only; non-shadow ignores it)
-  // base struct = 504 → 512; with light_vp → 576 (both 16B multiples).
+  //   area_count : i32     @ 504  (S3 area lights — ALWAYS present)
+  //   area_lights: vec4[16]@ 512  (512..768; 4 vec4/area light)
+  //   shadow_vp  : mat4x4[8]@ 768 (variant_shadow; non-shadow ignores; instanced
+  //                                writes its single vp here)
+  //   cascade_count: i32   @1280  cascade_splits: vec4 @1296  view_forward: vec3 @1312
+  // base struct = 768; shadow struct = 1328 → PBR_STRIDE = align(1328,256) = 1536.
   const PBR_U = {
     mvp: 0,
     model: 64,
@@ -6290,22 +6427,29 @@
     lights: 240,
     lightCount: 496,
     prefMips: 500,
-    // CSM/Multi-caster: shadow_vp is array<mat4x4<f32>,8> @ 512 (8×64 = 512B, 512..1024).
-    // (The instanced variant reuses offset 512 for its single `vp` mat — same slot.)
-    shadowVp: 512, // shadow_vp[8] (set by bind_shadow_map; instanced path writes 1 mat here)
+    // S3 area lights (LTC): area_count i32 @504; area_lights array<vec4,16> @512
+    // (512..768, ALWAYS present). a0=[pos,intensity] a1=[ex,two_sided]
+    // a2=[ey,shadow_slot] a3=[color,shadow_kind]. Base (non-shadow) struct = 768.
+    areaCount: 504,  // i32  @504 (504..508, 4-aligned after prefMips@500)
+    areaLights: 512, // array<vec4,16> @512 (512..768, 256B)
+    // CSM/Multi-caster: shadow_vp is array<mat4x4<f32>,8> @ 768 (8×64 = 512B, 768..1280),
+    // shifted from 512 by the area_lights block. (Instanced variant reuses 768 for its
+    // single `vp` mat — same slot, where shadow_vp would be.)
+    shadowVp: 768, // shadow_vp[8] (set by bind_shadow_map; instanced path writes 1 mat here)
     // CSM frame-globals (shadow variant only), set by set_csm (tag 36):
-    cascadeCount: 1024,  // i32  @1024 (1024..1028)
-    cascadeSplits: 1040, // vec4 @1040 (16-aligned, 1040..1056) view-space FAR per cascade
-    viewForward: 1056,   // vec3 @1056 (1056..1068, +4B pad → 1072) normalized camera look dir
-    // shadowVp @512 (8×mat4 = 512B, 512..1024); cascade fields 1024..1072; size 1072, stride 1280
-    size: 1072,
+    cascadeCount: 1280,  // i32  @1280 (1280..1284)
+    cascadeSplits: 1296, // vec4 @1296 (16-aligned, 1296..1312) view-space FAR per cascade
+    viewForward: 1312,   // vec3 @1312 (1312..1324, +4B pad → 1328) normalized camera look dir
+    // area @504/512..768; shadowVp @768 (512B, 768..1280); cascade fields 1280..1328;
+    // size 1328, stride 1536
+    size: 1328,
   };
   // Multiple draws per frame each need isolated uniforms: WebGPU defers draws, so
   // a single shared buffer would let the last writeBuffer clobber earlier draws.
   // Solution: dynamic uniform offsets — each draw writes its full struct to its
   // own 256-aligned slot and binds with that offset. Per-frame values (lights/
   // ibl/light_vp) are cached and replicated into every slot.
-  const PBR_STRIDE = 1280; // align(1072, 256)
+  const PBR_STRIDE = 1536; // align(1328, 256)
   const DEPTH_STRIDE = 256; // one mat4 (64B) padded to the 256B dynamic-offset min
   const MAX_DRAWS = 64; // per-frame draw cap (cube+plane today; headroom for scenes)
   // Post fullscreen draws (bright/blurH/blurV/composite/fxaa = up to 5/frame) each
@@ -6395,6 +6539,42 @@
     return (t && t.view) ? t.view : fallback.view;
   };
 
+  // S3 LTC LUTs (WebGPU): lazily fetch /gl/ltc.bin (65536B) ONCE, split into two
+  // 64×64 rgba16f textures (bytes 0..32767 → ltc_mat, 32768..65535 → ltc_mag; the
+  // bytes are already little-endian f16 — upload directly). CLAMP_TO_EDGE; the
+  // shared filtering sampler covers mag=LINEAR. Cached on st.ltcMat/st.ltcMag.
+  // The fetch is guarded by st.ltcLoading so it fires exactly once. On completion
+  // mark bg1Dirty so the next draw rebuilds group(1) with the real views.
+  const gpuEnsureLtc = (st) => {
+    if (st.ltcMat || st.ltcLoading) return; // loaded or in-flight
+    st.ltcLoading = true;
+    fetch("/gl/ltc.bin")
+      .then((r) => r.arrayBuffer())
+      .then((buf) => {
+        const device = st.device;
+        if (!device) return;
+        const make = (byteOffset) => {
+          const tex = device.createTexture({
+            size: [64, 64],
+            format: "rgba16float",
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+          });
+          // 64 texels/row × 8 bytes (4 halfs) = 512 bytes/row; 64 rows = 32768B.
+          device.queue.writeTexture(
+            { texture: tex },
+            new Uint8Array(buf, byteOffset, 32768),
+            { bytesPerRow: 64 * 8, rowsPerImage: 64 },
+            [64, 64],
+          );
+          return { tex, view: tex.createView(), w: 64, h: 64 };
+        };
+        st.ltcMat = make(0);      // bytes 0..32767
+        st.ltcMag = make(32768);  // bytes 32768..65535
+        st.bg1Dirty = true;       // rebind group(1) with the real LUT views
+      })
+      .catch(() => { st.ltcLoading = false; }); // allow a later retry on failure
+  };
+
   // Lazily build (and cache) a post render pipeline for a given (format, hasDepth)
   // combination. Post pipelines must match the pass's color attachment format AND
   // its depth-stencil state. The final canvas pass (BEGIN_FRAME) has depth24plus;
@@ -6459,6 +6639,7 @@
           }
           st.pbrSlot = 0; // reset per-draw uniform slot allocation for this frame
           st.frameCascadeCount = 0; // default CSM off; set_csm (36) re-enables per frame
+          st.frameAreaCount = 0; // default no area lights; set_area_lights (37) re-enables per frame
           st.curTargetFormat = st.format; // canvas pass: post draws target st.format
           st.curPassHasDepth = true; // canvas pass always has depth24plus
           // Reuse the encoder if a shadow/offscreen pass already opened one this
@@ -6604,10 +6785,10 @@
           // with two vertex.buffers and stored as kind "pbr-instanced". FRESH
           // descriptor literals — does NOT touch pbrDesc or the non-instanced pipeline.
           if ((variant & 0x1000) !== 0) {
-            // Guard: instanced + shadow (0x1020) share offset 512 in the WGSL U
-            // struct (vp vs light_vp) — unsupported in v1.  Fail loud, not garbage.
+            // Guard: instanced + shadow (0x1020) share offset 768 in the WGSL U
+            // struct (vp vs shadow_vp[0]) — unsupported in v1.  Fail loud, not garbage.
             if ((variant & 0x1020) === 0x1020) {
-              console.error("gl: variant_instanced|variant_shadow (0x" + variant.toString(16) + ") unsupported — vp/light_vp collision at U offset 512; skipping pipeline build");
+              console.error("gl: variant_instanced|variant_shadow (0x" + variant.toString(16) + ") unsupported — vp/shadow_vp collision at U offset 768; skipping pipeline build");
               break;
             }
             const hasNormal = (variant & 0x8) !== 0;
@@ -6646,6 +6827,9 @@
               g1.push({ binding: 9, visibility: FRAG, texture: { sampleType: "depth", viewDimension: "2d" } });
               g1.push({ binding: 10, visibility: FRAG, sampler: { type: "comparison" } });
             }
+            // S3 LTC LUTs — ALWAYS declared in every PBR variant (group(1) 12/13).
+            g1.push({ binding: 12, visibility: FRAG, texture: { sampleType: "float", viewDimension: "2d" } }); // ltc_mat
+            g1.push({ binding: 13, visibility: FRAG, texture: { sampleType: "float", viewDimension: "2d" } }); // ltc_mag
             const bgl1 = device.createBindGroupLayout({ entries: g1 });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
             const pbrFragFormat = (variant & 0x200) ? "rgba16float" : st.format;
@@ -6783,6 +6967,11 @@
             if (hasPointShadow) { // variant_shadow_point: RGBA8 atlas at binding 11
               g1.push({ binding: 11, visibility: FRAG, texture: tex2d });
             }
+            // S3 LTC LUTs — ALWAYS declared in every PBR variant (group(1) 12/13),
+            // so the layout must include them even when no area light is active
+            // (the bind group binds a 1×1 rgba16f dummy otherwise).
+            g1.push({ binding: 12, visibility: FRAG, texture: tex2d }); // ltc_mat
+            g1.push({ binding: 13, visibility: FRAG, texture: tex2d }); // ltc_mag
             const bgl1 = device.createBindGroupLayout({ entries: g1 });
             const layout = device.createPipelineLayout({
               bindGroupLayouts: [bgl0, bgl1],
@@ -7090,6 +7279,29 @@
           st.bg1Dirty = true; // rebind group(1) with the real IBL views
           break;
         }
+        case 37: { // SET_AREA_LIGHTS — cache the per-frame area-light array (LTC).
+          // Payload (command.zig Encoder.setAreaLights, 8B): count | ptr. Each area
+          // light is 16 f32 = 64B (4 vec4): a0=[pos,intensity] a1=[ex,two_sided]
+          // a2=[ey,shadow_slot] a3=[color,shadow_kind]. Per-frame state; draw_pbr
+          // writes area_count@504 + area_lights@512 into each draw's slot. Max 16.
+          const count = dv.getUint32(off, true);
+          const p = dv.getUint32(off + 4, true);
+          const n = Math.min(count, 16);
+          st.frameAreaCount = n;
+          st.frameAreaLights = (n > 0) ? new Float32Array(memory.buffer, p, n * 16).slice() : null;
+          break;
+        }
+        case 38: { // BIND_LTC_LUT — ensure the LTC LUTs are loaded + mark group(1) dirty.
+          // Payload (command.zig Encoder.bindLtcLut, 8B): mat_handle | mag_handle.
+          // The handles are ADVISORY — the bridge OWNS the LUTs (global, not per
+          // scene) and fetches them by fixed URL (/gl/ltc.bin) ONCE. The two 64×64
+          // rgba16f textures bind at group(1) 12/13 (draw_pbr); a 1×1 dummy stands
+          // in until the fetch resolves. bg1Dirty so the bind group rebuilds with
+          // the real views once loaded.
+          gpuEnsureLtc(st);
+          st.bg1Dirty = true;
+          break;
+        }
         case 21: { // SET_BONES — upload the bone palette to bones @group(0)@binding(1).
           // Payload (command.zig Encoder.setBones, 8B): count | ptr. count = number
           // of mat4 (≤64); ptr → count*16 f32 column-major. Writes the whole
@@ -7307,14 +7519,22 @@
           }
           device.queue.writeBuffer(ubuf, base + PBR_U.lightCount, new Int32Array([st.frameLightCount | 0]));
           device.queue.writeBuffer(ubuf, base + PBR_U.prefMips, new Float32Array([st.framePrefMips || 0]));
+          // S3 area lights (set_area_lights, tag 37): area_count i32 @504, area_lights
+          // array<vec4,16> @512 (count*16 f32). Element-vs-byte: pass .buffer/.byteOffset
+          // + byte size for the TypedArray (it is .slice()'d → byteOffset 0).
+          device.queue.writeBuffer(ubuf, base + PBR_U.areaCount, new Int32Array([st.frameAreaCount | 0]));
+          if (st.frameAreaLights && st.frameAreaCount > 0) {
+            device.queue.writeBuffer(ubuf, base + PBR_U.areaLights,
+              st.frameAreaLights.buffer, st.frameAreaLights.byteOffset, (st.frameAreaCount | 0) * 16 * 4);
+          }
           if (st.frameShadowVp && st.frameShadowVpCount > 0) {
-            // shadow_vp[count] → U.shadow_vp @512. writeBuffer dataOffset/size are
+            // shadow_vp[count] → U.shadow_vp @768. writeBuffer dataOffset/size are
             // ELEMENTS for a TypedArray, so pass .buffer/.byteOffset + the byte size.
             device.queue.writeBuffer(ubuf, base + PBR_U.shadowVp,
               st.frameShadowVp.buffer, st.frameShadowVp.byteOffset, st.frameShadowVpCount * 64);
           }
-          // CSM frame-globals (set_csm, tag 36): cascade_count i32 @1024, cascade_splits
-          // vec4 @1040 (16B), view_forward vec3 @1056 (12B). Element-vs-byte: pass
+          // CSM frame-globals (set_csm, tag 36): cascade_count i32 @1280, cascade_splits
+          // vec4 @1296 (16B), view_forward vec3 @1312 (12B). Element-vs-byte: pass
           // .buffer/.byteOffset + byte size for the TypedArrays (they are .slice()'d → off 0).
           if (st.frameCascadeCount > 0) {
             device.queue.writeBuffer(ubuf, base + PBR_U.cascadeCount, new Int32Array([st.frameCascadeCount | 0]));
@@ -7389,6 +7609,12 @@
             if (active.hasPointShadow) { // variant_shadow_point: RGBA8 atlas at binding 11
               e.push({ binding: 11, resource: st.pointAtlasView || d.black2d });
             }
+            // S3 LTC LUTs (ALWAYS declared in every PBR variant — bindings 12/13).
+            // Bind the loaded LUTs (set by bind_ltc_lut, tag 38) or a 1×1 rgba16f
+            // dummy so the group(1) layout stays valid even when no LTC is loaded /
+            // area_count=0 (shader never samples them then — content irrelevant).
+            e.push({ binding: 12, resource: (st.ltcMat && st.ltcMat.view) ? st.ltcMat.view : d.ltcDummy.view });
+            e.push({ binding: 13, resource: (st.ltcMag && st.ltcMag.view) ? st.ltcMag.view : d.ltcDummy.view });
             st.bg1 = device.createBindGroup({ layout: active.bgl1, entries: e });
             st.bg1Layout = active.bgl1;
             st.bg1Dirty = false;
@@ -7430,16 +7656,18 @@
             });
           }
           device.queue.writeBuffer(st.instanceBuf, 0, memory.buffer, instancePtr, instBytes);
-          // ── Per-draw uniform slot (PBR_U layout, instanced U adds vp @ 512). ──
-          // The instanced WGSL U struct has all standard fields (mvp, model, …)
-          // plus a single `vp: mat4x4<f32>` appended at offset 512 — the SAME slot as
-          // PBR_U.shadowVp (the shadow variant's shadow_vp[0]). We write one mat here.
-          // We only write the fields the shader actually reads: vp, material, camera.
+          // ── Per-draw uniform slot (PBR_U layout, instanced U adds vp @ 768). ──
+          // The instanced WGSL U struct has all standard fields (mvp, model, …) plus
+          // the S3 area block (area_count@504, area_lights@512..768), then a single
+          // `vp: mat4x4<f32>` appended at offset 768 — the SAME slot as PBR_U.shadowVp
+          // (the shadow variant's shadow_vp[0]). We write one mat there. We only write
+          // the fields the shader actually reads: vp, material, camera. Instanced is
+          // non-area (area_count=0), but we still zero area_count for a valid struct.
           const ubuf = gpuEnsurePbrUniform(st);
           const slot = st.pbrSlot++;
           if (slot >= MAX_DRAWS) break;
           const base = slot * PBR_STRIDE;
-          // vp (view-proj): u.vp — offset 512 (= PBR_U.shadowVp in the JS table).
+          // vp (view-proj): u.vp — offset 768 (= PBR_U.shadowVp in the JS table).
           device.queue.writeBuffer(ubuf, base + PBR_U.shadowVp, new Float32Array(memory.buffer, vpPtr, 16));
           // material: 3×vec4 = 12 f32.
           device.queue.writeBuffer(ubuf, base + PBR_U.material, new Float32Array(memory.buffer, materialPtr, 12));
@@ -7451,6 +7679,8 @@
           }
           device.queue.writeBuffer(ubuf, base + PBR_U.lightCount, new Int32Array([st.frameLightCount | 0]));
           device.queue.writeBuffer(ubuf, base + PBR_U.prefMips, new Float32Array([st.framePrefMips || 0]));
+          // Instanced is non-area: zero area_count so the shader skips the area loop.
+          device.queue.writeBuffer(ubuf, base + PBR_U.areaCount, new Int32Array([0]));
           // ── Bind group 0: dynamic-offset uniform. Instanced has no bones. ──
           if (!st.bg0 || st.bg0Layout !== active.bgl0) {
             const bg0Entries = [{ binding: 0, resource: { buffer: ubuf, offset: 0, size: PBR_U.size } }];
@@ -7486,6 +7716,10 @@
               e.push({ binding: 9, resource: (sm && sm.view) ? sm.view : d.shadowTex.view });
               e.push({ binding: 10, resource: (sm && sm.sampler) ? sm.sampler : d.shadowSampler });
             }
+            // S3 LTC LUTs — always declared (bindings 12/13). Instanced is non-area
+            // so the dummy is what binds; the layout still requires the entries.
+            e.push({ binding: 12, resource: (st.ltcMat && st.ltcMat.view) ? st.ltcMat.view : d.ltcDummy.view });
+            e.push({ binding: 13, resource: (st.ltcMag && st.ltcMag.view) ? st.ltcMag.view : d.ltcDummy.view });
             st.bg1 = device.createBindGroup({ layout: active.bgl1, entries: e });
             st.bg1Layout = active.bgl1;
             st.bg1Dirty = false;
@@ -7988,6 +8222,12 @@
       morphTextures: [], // morph-target RGBA16F textures (case 30), indexed by handle
       morphTex: null, // active morph texture bound to TEXTURE9 (most recently created)
       extColorBufferFloat: null, // EXT_color_buffer_float, enabled on first rgba16f target
+      frameAreaCount: 0, // S3 area lights: active count (set_area_lights, tag 37; 0 = none)
+      frameAreaLights: null, // S3: Float32Array(count*16) area_lights[] cached per frame
+      ltcMat: null, // S3: ltc_mat 64×64 rgba16f LUT (fetched from /gl/ltc.bin once)
+      ltcMag: null, // S3: ltc_mag 64×64 rgba16f LUT
+      ltcDummy: null, // S3: 1×1 rgba16f dummy bound to units 10/11 by default
+      ltcLoading: false, // S3: guards the one-shot /gl/ltc.bin fetch
       active: null,
       last: 0,
       // Poster swap: SSR may drop an <img data-gl-poster> sibling under the
@@ -8091,6 +8331,12 @@
       st.shaders = [];
       st.vaos.clear();
       st.active = null;
+      // S3 LTC: the LUT/dummy textures died with the context — drop the handles +
+      // reset the fetch guard so they re-create/re-fetch against the new context.
+      st.ltcMat = null;
+      st.ltcMag = null;
+      st.ltcDummy = null;
+      st.ltcLoading = false;
       // Re-hide poster only after the first new frame draws again.
       st.posterHidden = false;
       st.lost = false;
@@ -8142,6 +8388,11 @@
       frameCascadeCount: 0, // CSM: active cascade count (set_csm, tag 36; 0 = no CSM)
       frameCascadeSplits: null, // CSM: Float32Array(4) view-space FAR per cascade
       frameViewForward: null, // CSM: Float32Array(3) normalized camera look dir
+      frameAreaCount: 0, // S3 area lights: active count (set_area_lights, tag 37; 0 = none)
+      frameAreaLights: null, // S3: Float32Array(count*16) area_lights[] cached per frame
+      ltcMat: null, // S3: ltc_mat 64×64 rgba16f LUT (bridge fetches /gl/ltc.bin once)
+      ltcMag: null, // S3: ltc_mag 64×64 rgba16f LUT
+      ltcLoading: false, // S3: guards the one-shot /gl/ltc.bin fetch
       pointShadows: [], // T2: { atlasTex, atlasView, depthView, w, h } by handle
       pointDepthPipe: null, // lazy — pipeline + uniform buf for point-depth pass
       pointPass: null, // active render pass during begin/end_point_shadow_face
@@ -8278,6 +8529,11 @@
       st.pointAtlasView = null;
       st.frameShadowVp = null;
       st.frameShadowVpCount = 0;
+      // S3 LTC: drop the LUT textures + reset the fetch guard so they re-fetch on
+      // the next bind_ltc_lut against the new device.
+      st.ltcMat = null;
+      st.ltcMag = null;
+      st.ltcLoading = false;
       // Multi-caster: pointShadowBuf (dead bg0 binding 5) removed — nothing to destroy.
       st.morphTexView = null;
       st.pbrUniform = null;

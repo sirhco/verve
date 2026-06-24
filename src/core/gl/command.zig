@@ -65,6 +65,13 @@ pub const Tag = enum(u16) {
     //   and the 3 f32 at view_forward_ptr (normalized camera look dir). The bridge (S2T2) writes them into each
     //   shadowed draw's U at cascade_count@1024 / cascade_splits@1040 / view_forward@1056. Per-frame transient
     //   (re-emitted each frame, NOT recorded into the registry) — mirrors set_lights.
+    // ── Slice 3: rect area lights (LTC) ─────────────────────────────────
+    set_area_lights = 37, // {count, ptr -> count*16 f32 (4 vec4/area light)} — mirrors set_lights (tag 11). Per-frame transient.
+    //   Cache count + the count*16 f32 at ptr; the bridge writes them into each PBR draw's U at
+    //   area_count@504 / area_lights@512 (always present, before the shadow block). See max_area_lights packing.
+    bind_ltc_lut = 38, // {ltc_mat_handle, ltc_mag_handle} — bind the two LTC LUT textures to tex_slot_ltc_mat(10)/tex_slot_ltc_mag(11).
+    //   Mirrors bind_ibl (tag 12). The bridge binds dummy 1×1 LUTs when no area light (like the IBL fallback) so the
+    //   LTC samplers are always valid. Must follow SET_PIPELINE (writes uniforms/binds on the active program).
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -111,6 +118,18 @@ pub const clear_flag_color: u32 = 1 << 0;
 pub const clear_flag_depth: u32 = 1 << 1;
 
 pub const max_lights: u32 = 4;
+// ── Slice 3: rect area lights (LTC) ─────────────────────────────────
+// Up to `max_area_lights` RectAreaLights, evaluated per PBR draw via LTC.
+// area_lights is in the BASE U (always present); area_count=0 → loop is a no-op.
+// Packing (each area light = 4 vec4, into area_lights[4*i .. 4*i+3]):
+//   a0 = [pos.x, pos.y, pos.z, intensity]
+//   a1 = [ex.x, ex.y, ex.z, two_sided]     (ex = half-width edge vector)
+//   a2 = [ey.x, ey.y, ey.z, shadow_slot]   (ey = half-height edge vector; shadow_slot = 2D-atlas slot or -1)
+//   a3 = [color.r, color.g, color.b, shadow_kind]  (0 none / 1 = 2D shadow)
+// Rect corners (CCW, light shines in local -ey×ex normal dir, matching three.js):
+//   c0 = pos + ex - ey   c1 = pos - ex - ey   c2 = pos - ex + ey   c3 = pos + ex + ey
+pub const max_area_lights: u32 = 4;
+pub const area_light_stride_f32: u32 = 16; // 4 vec4 per area light
 pub const light_stride_f32: u32 = 16; // v0:[type,intensity,pos.x,pos.y]  v1:[pos.z,dir.x,dir.y,dir.z]  v2:[color.r,color.g,color.b,range]  v3:[cos_inner,cos_outer,shadow_index,shadow_kind]
 // v3.z = shadow_index: for a 2D caster → index in shadow_vp[] AND its tile in the 2D atlas (0..3);
 //        for a point caster → its point-caster index (0..3). -1.0 = this light casts no shadow.
@@ -153,6 +172,9 @@ pub const tex_slot_occlusion: u32 = 4;
 // IBL units (JS contract): irradiance=5 (cube), prefiltered=6 (cube), brdf_lut=7 (2D)
 pub const tex_slot_shadow: u32 = 8; // directional shadow map (sampler2DShadow), after the IBL units
 pub const tex_slot_point_shadow: u32 = 9; // point-light RGBA8 shadow atlas (sampler2D), slot after directional
+// ── Slice 3: rect area lights (LTC) ─────────────────────────────────
+pub const tex_slot_ltc_mat: u32 = 10; // LTC_1 LUT (Minv reconstruction), 64×64 RGBA float; ALWAYS bound (dummy when no area light)
+pub const tex_slot_ltc_mag: u32 = 11; // LTC_2 LUT (magnitude + fresnel), 64×64 RGBA float; ALWAYS bound
 
 /// GLSL float-to-RGBA8 packing helpers shared between the point-depth and receiver shaders.
 pub const rgba8_pack_glsl: []const u8 = "vec4 packDist(float v){ vec4 e=fract(v*vec4(1.0,255.0,65025.0,16581375.0)); e-=e.yzww*vec4(1.0/255.0,1.0/255.0,1.0/255.0,0.0); return e; }";
@@ -574,6 +596,8 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\uniform vec4 u_lights[16];
         \\uniform int u_light_count;
         \\uniform float u_prefiltered_mips;
+        \\uniform int u_area_count;
+        \\uniform vec4 u_area_lights[16];
         \\uniform sampler2D u_base_tex;
         \\uniform sampler2D u_mr_tex;
         \\uniform sampler2D u_occlusion_tex;
@@ -613,6 +637,46 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\vec3 fresnelSchlickRoughness(float cosT, vec3 F0, float rough) {
         \\  vec3 Fr = max(vec3(1.0 - rough), F0);
         \\  return F0 + (Fr - F0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
+        \\}
+        \\// ── LTC (Linearly Transformed Cosines) rect area lights ──
+        \\// Transcribed from three.js r160 (selfshadow ltc_code). LUT data convention
+        \\// matches ltc_data.zig: ltc_mat=LTC_1 (Minv), ltc_mag=LTC_2 (mag/fresnel).
+        \\uniform sampler2D u_ltc_mat;
+        \\uniform sampler2D u_ltc_mag;
+        \\vec3 ltcEdgeVectorFormFactor(vec3 v1, vec3 v2) {
+        \\  float x = dot(v1, v2);
+        \\  float y = abs(x);
+        \\  float a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
+        \\  float b = 3.4175940 + (4.1616724 + y) * y;
+        \\  float v = a / b;
+        \\  float theta_sintheta = (x > 0.0) ? v : 0.5 * inversesqrt(max(1.0 - x * x, 1e-7)) - v;
+        \\  return cross(v1, v2) * theta_sintheta;
+        \\}
+        \\float ltcClippedSphereFormFactor(vec3 f) {
+        \\  float l = length(f);
+        \\  return max((l * l + f.z) / (l + 1.0), 0.0);
+        \\}
+        \\// Evaluate the LTC form factor for a quad (corners CCW) at shading point P.
+        \\// mInv = identity for diffuse, the LUT-reconstructed Minv for specular.
+        \\vec3 ltcEvaluate(vec3 N, vec3 V, vec3 P, mat3 mInv, vec3 c0, vec3 c1, vec3 c2, vec3 c3) {
+        \\  vec3 v1 = c1 - c0;
+        \\  vec3 v2 = c3 - c0;
+        \\  vec3 lightNormal = cross(v1, v2);
+        \\  if (dot(lightNormal, P - c0) < 0.0) return vec3(0.0);
+        \\  vec3 T1 = normalize(V - N * dot(V, N));
+        \\  vec3 T2 = -cross(N, T1);
+        \\  mat3 basis = mat3(T1, T2, N);
+        \\  mat3 m = mInv * transpose(basis);
+        \\  vec3 p0 = normalize(m * (c0 - P));
+        \\  vec3 p1 = normalize(m * (c1 - P));
+        \\  vec3 p2 = normalize(m * (c2 - P));
+        \\  vec3 p3 = normalize(m * (c3 - P));
+        \\  vec3 ff = vec3(0.0);
+        \\  ff += ltcEdgeVectorFormFactor(p0, p1);
+        \\  ff += ltcEdgeVectorFormFactor(p1, p2);
+        \\  ff += ltcEdgeVectorFormFactor(p2, p3);
+        \\  ff += ltcEdgeVectorFormFactor(p3, p0);
+        \\  return vec3(ltcClippedSphereFormFactor(ff));
         \\}
         \\
     ;
@@ -745,6 +809,48 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\    vec3 spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.0001);
         \\    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
         \\    Lo += (kD * albedo / PI + spec) * radiance * NdotL;
+        \\  }
+        \\
+    ;
+    // ── Rect area lights (LTC), evaluated after the punctual loop. ──
+    // ALWAYS emitted (area_count=0 → no-op). Mirrors three.js RE_Direct_RectArea_Physical:
+    //   diffuse  = albedo  * ltcEvaluate(N,V,P, mat3(1.0), corners)
+    //   specular = fresnel * ltcEvaluate(N,V,P, Minv,      corners)
+    // The form factor is already normalized (theta/sin/2pi in the edge term) — NO extra /PI.
+    // Shadow multiply (a_kind > 0.5) is emitted ONLY under variant_shadow (shadowFactor2D lives there).
+    const area_lighting_head =
+        \\  for (int ai = 0; ai < u_area_count; ai++) {
+        \\    vec4 a0 = u_area_lights[4 * ai];
+        \\    vec4 a1 = u_area_lights[4 * ai + 1];
+        \\    vec4 a2 = u_area_lights[4 * ai + 2];
+        \\    vec4 a3 = u_area_lights[4 * ai + 3];
+        \\    vec3 a_pos = a0.xyz;
+        \\    float a_intensity = a0.w;
+        \\    vec3 ex = a1.xyz;
+        \\    vec3 ey = a2.xyz;
+        \\    vec3 a_color = a3.xyz;
+        \\    vec3 c0 = a_pos + ex - ey;
+        \\    vec3 c1 = a_pos - ex - ey;
+        \\    vec3 c2 = a_pos - ex + ey;
+        \\    vec3 c3 = a_pos + ex + ey;
+        \\    vec2 ltc_uv = vec2(roughness, sqrt(1.0 - NdotV)) * (63.0 / 64.0) + 0.5 / 64.0;
+        \\    vec4 t1 = textureLod(u_ltc_mat, ltc_uv, 0.0);
+        \\    vec4 t2 = textureLod(u_ltc_mag, ltc_uv, 0.0);
+        \\    mat3 Minv = mat3(vec3(t1.x, 0.0, t1.y), vec3(0.0, 1.0, 0.0), vec3(t1.z, 0.0, t1.w));
+        \\    vec3 a_fresnel = F0 * t2.x + (vec3(1.0) - F0) * t2.y;
+        \\    vec3 a_diffuse = ltcEvaluate(N, V, v_world_pos, mat3(1.0), c0, c1, c2, c3);
+        \\    vec3 a_spec = a_fresnel * ltcEvaluate(N, V, v_world_pos, Minv, c0, c1, c2, c3);
+        \\    vec3 area_radiance = a_color * a_intensity;
+        \\    vec3 area_contrib = area_radiance * (albedo * a_diffuse + a_spec);
+        \\
+    ;
+    // 2D-shadow attenuation for an area caster — only emitted under variant_shadow.
+    const area_lighting_shadow_2d =
+        \\    if (a3.w > 0.5) area_contrib *= shadowFactor2D(int(a2.w + 0.5));
+        \\
+    ;
+    const area_lighting_tail =
+        \\    Lo += area_contrib;
         \\  }
         \\  vec3 F_ibl = fresnelSchlickRoughness(NdotV, F0, roughness);
         \\  vec3 kD_ibl = (vec3(1.0) - F_ibl) * (1.0 - metallic);
@@ -906,6 +1012,9 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     if (flags & variant_shadow_point != 0) src = src ++ lighting_shadow_point;
     if (flags & variant_shadow != 0) src = src ++ lighting_shadow_2d;
     src = src ++ lighting_tail;
+    src = src ++ area_lighting_head;
+    if (flags & variant_shadow != 0) src = src ++ area_lighting_shadow_2d;
+    src = src ++ area_lighting_tail;
     src = src ++ combine_plain;
     if (flags & variant_emissive != 0) src = src ++ emissive;
     if (flags & variant_fog != 0) src = src ++ fog_mix;
@@ -1032,23 +1141,35 @@ pub const fxaaFragmentSrc: []const u8 =
 //   material   : array<vec4<f32>,3> (offset 192)
 //   lights     : array<vec4<f32>,16> (offset 240; 256B — 4 vec4/light × 4 lights)
 //   light_count: i32              (offset 496)
-//   prefiltered_mips: f32         (offset 500; +8B pad to align mat4x4 at 512)
-//   (variant_shadow) shadow_vp: array<mat4x4<f32>,8> (offset 512; 512B → 512..1024)
-//   (variant_shadow) cascade_count:  i32        (offset 1024; 1024..1028)
-//   (variant_shadow) cascade_splits: vec4<f32>  (offset 1040; 16-aligned, 1040..1056)
-//   (variant_shadow) view_forward:   vec3<f32>  (offset 1056; 1056..1068, +4B pad → 1072)
+//   prefiltered_mips: f32         (offset 500)
+//   area_count : i32              (offset 504; 504..508)             [S3 — ALWAYS present]
+//   area_lights: array<vec4<f32>,16> (offset 512; 256B → 512..768)  [S3 — 4 area lights × 4 vec4]
+//   (variant_shadow) shadow_vp: array<mat4x4<f32>,8> (offset 768; 512B → 768..1280)
+//   (variant_shadow) cascade_count:  i32        (offset 1280; 1280..1284)
+//   (variant_shadow) cascade_splits: vec4<f32>  (offset 1296; 16-aligned, 1296..1312)
+//   (variant_shadow) view_forward:   vec3<f32>  (offset 1312; 1312..1324, +4B pad → 1328)
 //
-// SHADOW-VARIANT BYTE MAP (S2 CSM — for T2 bridge / T3 scene):
-//   shadow_vp@512 (8×mat4 = 512B → 512..1024)
-//   cascade_count@1024   (i32,  1024..1028)
-//   cascade_splits@1040  (vec4, 1040..1056 — view-space FAR distance per cascade)
-//   view_forward@1056    (vec3, 1056..1068 — normalized camera look dir, +pad → 1072)
-//   struct size = 1072
-//   PBR_STRIDE = align(1072, 256) = 1280  (was 768)
-//   PBR_U.size = 1072
+// BASE (non-shadow) BYTE MAP (S3 — for T3 bridge / T4 scene):
+//   ... lights@240, light_count@496, prefiltered_mips@500,
+//   area_count@504 (i32), area_lights@512 (16 vec4 = 256B → 512..768)
+//   struct size = 768  (was 512)
+//
+// SHADOW-VARIANT BYTE MAP (S3 — area block shifts the shadow block by 256):
+//   area_count@504, area_lights@512..768,
+//   shadow_vp@768 (8×mat4 = 512B → 768..1280)
+//   cascade_count@1280   (i32,  1280..1284)
+//   cascade_splits@1296  (vec4, 1296..1312 — view-space FAR distance per cascade)
+//   view_forward@1312    (vec3, 1312..1324 — normalized camera look dir, +pad → 1328)
+//   struct size = 1328  (was 1072)
+//   PBR_STRIDE = align(1328, 256) = 1536  (was 1280)
+//   PBR_U.size = 1328
 // cascade_count / cascade_splits / view_forward live ONLY in the shadow variant.
-// (The instanced uniforms_vp single `vp` @ 512 is a different variant,
-// struct size 576, untouched.)
+// area_count / area_lights are in the BASE U (every PBR variant), offset 504/512.
+//
+// INSTANCED VARIANT (S3 — vp offset MOVED 512→768):
+//   The instanced `vp: mat4x4` now sits AFTER area_lights, at offset 768 (where
+//   shadow_vp would be). Instanced draws are non-shadow + non-area (area_count=0).
+//   struct size = 768 + 64 = 832 (was 576). FLAG for T3: bridge instanced vp offset 512→768.
 //
 // Bindings (@group(1)): a shared sampler (binding 0) + per-slot textures.
 // Slots mirror the GLSL sampler order / JS texture-unit contract:
@@ -1058,20 +1179,20 @@ pub const fxaaFragmentSrc: []const u8 =
 pub fn wgslPbr(comptime flags: u32) []const u8 {
     comptime pbrCheck(flags);
     if (flags & variant_depth != 0) @compileError("wgslPbr: variant_depth uses wgslDepth(), not wgslPbr");
-    // variant_instanced appends `vp: mat4x4<f32>` at byte offset 512 — the same
-    // slot variant_shadow uses for `light_vp`.  The two are mutually exclusive in
-    // v1 (instanced draws are non-shadow receivers).  Enforce it here so a future
-    // caller cannot silently produce a broken WGSL U struct.
+    // variant_instanced appends `vp: mat4x4<f32>` at byte offset 768 (after the S3
+    // area_lights block) — the same slot variant_shadow uses for `shadow_vp`. The two
+    // are mutually exclusive in v1 (instanced draws are non-shadow receivers). Enforce
+    // it here so a future caller cannot silently produce a broken WGSL U struct.
     if (flags & variant_instanced != 0 and flags & variant_shadow != 0)
-        @compileError("wgslPbr: variant_instanced + variant_shadow unsupported in v1 (vp/light_vp slot collision at offset 512)");
+        @compileError("wgslPbr: variant_instanced + variant_shadow unsupported in v1 (vp/shadow_vp slot collision at offset 768)");
     if (flags & variant_instanced != 0 and flags & variant_shadow_point != 0)
         @compileError("wgslPbr: variant_instanced + variant_shadow_point unsupported in v1 (point-shadow bind-group not wired for instanced draw path)");
 
     // ── Uniform block + group(0) ────────────────────────────────────
-    // Split so variant_shadow can append `shadow_vp: array<mat4x4,8>` (offset 512,
-    // after the f32 prefiltered_mips @ 500 padded to 512; 512B → 512..1024) plus the
-    // CSM fields (cascade_count@1024, cascade_splits@1040, view_forward@1056) without
-    // changing the non-shadow bytes. struct size 1072, PBR_STRIDE = align(1072,256) = 1280.
+    // BASE U always carries area_count@504 (i32) + area_lights@512 (16 vec4 → 512..768).
+    // variant_shadow then appends `shadow_vp: array<mat4x4,8>` (offset 768; 512B → 768..1280)
+    // plus the CSM fields (cascade_count@1280, cascade_splits@1296, view_forward@1312)
+    // without changing the base bytes. shadow struct size 1328, PBR_STRIDE = align(1328,256) = 1536.
     const uniforms_head =
         \\struct U {
         \\  mvp: mat4x4<f32>,
@@ -1082,6 +1203,8 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  lights: array<vec4<f32>, 16>,
         \\  light_count: i32,
         \\  prefiltered_mips: f32,
+        \\  area_count: i32,
+        \\  area_lights: array<vec4<f32>, 16>,
         \\
     ;
     const uniforms_shadow =
@@ -1207,6 +1330,16 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     // sampler at binding 0 (textureSampleLevel, same samp as PBR textures).
     const tex_point_shadow =
         \\@group(1) @binding(11) var point_atlas: texture_2d<f32>;
+        \\
+    ;
+    // LTC LUTs (rect area lights) at bindings 12/13. ALWAYS declared (the bridge
+    // binds dummy 1×1 LUTs when no area light, like the IBL fallback) so the
+    // group(1) bind-group layout stays valid across variants. Sampled with the
+    // shared `samp` at binding 0 (textureSampleLevel, mip 0). tex_slot_ltc_mat=10
+    // / tex_slot_ltc_mag=11 are the JS texture-unit slots; WGSL bindings are 12/13.
+    const tex_ltc =
+        \\@group(1) @binding(12) var ltc_mat: texture_2d<f32>;
+        \\@group(1) @binding(13) var ltc_mag: texture_2d<f32>;
         \\
     ;
     // ── varyings: VSOut struct ──────────────────────────────────────
@@ -1343,6 +1476,43 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\fn fresnelSchlickRoughness(cosT: f32, F0: vec3<f32>, rough: f32) -> vec3<f32> {
         \\  let Fr = max(vec3<f32>(1.0 - rough), F0);
         \\  return F0 + (Fr - F0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
+        \\}
+        \\// ── LTC (Linearly Transformed Cosines) rect area lights ──
+        \\// WGSL twin of the GLSL ltcEvaluate. Free fns: N/V/P are PARAMS (no in.* refs).
+        \\// Transcribed from three.js r160; normalization is the form factor itself (no extra /PI).
+        \\fn ltcEdgeVectorFormFactor(v1: vec3<f32>, v2: vec3<f32>) -> vec3<f32> {
+        \\  let x = dot(v1, v2);
+        \\  let y = abs(x);
+        \\  let a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
+        \\  let b = 3.4175940 + (4.1616724 + y) * y;
+        \\  let v = a / b;
+        \\  var theta_sintheta: f32;
+        \\  if (x > 0.0) { theta_sintheta = v; } else { theta_sintheta = 0.5 * inverseSqrt(max(1.0 - x * x, 1e-7)) - v; }
+        \\  return cross(v1, v2) * theta_sintheta;
+        \\}
+        \\fn ltcClippedSphereFormFactor(f: vec3<f32>) -> f32 {
+        \\  let l = length(f);
+        \\  return max((l * l + f.z) / (l + 1.0), 0.0);
+        \\}
+        \\fn ltcEvaluate(N: vec3<f32>, V: vec3<f32>, P: vec3<f32>, mInv: mat3x3<f32>, c0: vec3<f32>, c1: vec3<f32>, c2: vec3<f32>, c3: vec3<f32>) -> vec3<f32> {
+        \\  let v1 = c1 - c0;
+        \\  let v2 = c3 - c0;
+        \\  let lightNormal = cross(v1, v2);
+        \\  if (dot(lightNormal, P - c0) < 0.0) { return vec3<f32>(0.0); }
+        \\  let T1 = normalize(V - N * dot(V, N));
+        \\  let T2 = -cross(N, T1);
+        \\  let basis = mat3x3<f32>(T1, T2, N);
+        \\  let m = mInv * transpose(basis);
+        \\  let p0 = normalize(m * (c0 - P));
+        \\  let p1 = normalize(m * (c1 - P));
+        \\  let p2 = normalize(m * (c2 - P));
+        \\  let p3 = normalize(m * (c3 - P));
+        \\  var ff = vec3<f32>(0.0);
+        \\  ff += ltcEdgeVectorFormFactor(p0, p1);
+        \\  ff += ltcEdgeVectorFormFactor(p1, p2);
+        \\  ff += ltcEdgeVectorFormFactor(p2, p3);
+        \\  ff += ltcEdgeVectorFormFactor(p3, p0);
+        \\  return vec3<f32>(ltcClippedSphereFormFactor(ff));
         \\}
         \\
     ;
@@ -1490,6 +1660,44 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\    let spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.0001);
         \\    let kD = (vec3<f32>(1.0) - F) * (1.0 - metallic);
         \\    Lo = Lo + (kD * albedo / PI + spec) * radiance * NdotL;
+        \\  }
+        \\
+    ;
+    // Rect area lights (LTC), WGSL twin of area_lighting_*. ALWAYS emitted; world_pos
+    // threaded as in.world_pos into the free ltcEvaluate helper. Shadow line emitted
+    // only under variant_shadow (shadowFactor2D lives in fs_shadow_decl).
+    const fs_area_lighting_head =
+        \\  for (var ai: i32 = 0; ai < u.area_count; ai = ai + 1) {
+        \\    let a0 = u.area_lights[4 * ai];
+        \\    let a1 = u.area_lights[4 * ai + 1];
+        \\    let a2 = u.area_lights[4 * ai + 2];
+        \\    let a3 = u.area_lights[4 * ai + 3];
+        \\    let a_pos = a0.xyz;
+        \\    let a_intensity = a0.w;
+        \\    let ex = a1.xyz;
+        \\    let ey = a2.xyz;
+        \\    let a_color = a3.xyz;
+        \\    let c0 = a_pos + ex - ey;
+        \\    let c1 = a_pos - ex - ey;
+        \\    let c2 = a_pos - ex + ey;
+        \\    let c3 = a_pos + ex + ey;
+        \\    let ltc_uv = vec2<f32>(roughness, sqrt(1.0 - NdotV)) * (63.0 / 64.0) + 0.5 / 64.0;
+        \\    let t1 = textureSampleLevel(ltc_mat, samp, ltc_uv, 0.0);
+        \\    let t2 = textureSampleLevel(ltc_mag, samp, ltc_uv, 0.0);
+        \\    let Minv = mat3x3<f32>(vec3<f32>(t1.x, 0.0, t1.y), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(t1.z, 0.0, t1.w));
+        \\    let a_fresnel = F0 * t2.x + (vec3<f32>(1.0) - F0) * t2.y;
+        \\    let a_diffuse = ltcEvaluate(N, V, in.world_pos, mat3x3<f32>(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0), c0, c1, c2, c3);
+        \\    let a_spec = a_fresnel * ltcEvaluate(N, V, in.world_pos, Minv, c0, c1, c2, c3);
+        \\    let area_radiance = a_color * a_intensity;
+        \\    var area_contrib = area_radiance * (albedo * a_diffuse + a_spec);
+        \\
+    ;
+    const fs_area_lighting_shadow_2d =
+        \\    if (a3.w > 0.5) { area_contrib = area_contrib * shadowFactor2D(in.world_pos, i32(a2.w + 0.5)); }
+        \\
+    ;
+    const fs_area_lighting_tail =
+        \\    Lo = Lo + area_contrib;
         \\  }
         \\  let F_ibl = fresnelSchlickRoughness(NdotV, F0, roughness);
         \\  let kD_ibl = (vec3<f32>(1.0) - F_ibl) * (1.0 - metallic);
@@ -1662,6 +1870,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ tex_ibl;
     if (shadow) src = src ++ tex_shadow;
     if (point_shadow) src = src ++ tex_point_shadow;
+    src = src ++ tex_ltc;
     src = src ++ vsout_head;
     if (nm) src = src ++ vsout_nm;
     if (inst) src = src ++ vsout_inst_color;
@@ -1689,6 +1898,9 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (point_shadow) src = src ++ fs_lighting_shadow_point;
     if (shadow) src = src ++ fs_lighting_shadow_2d;
     src = src ++ fs_lighting_tail;
+    src = src ++ fs_area_lighting_head;
+    if (shadow) src = src ++ fs_area_lighting_shadow_2d;
+    src = src ++ fs_area_lighting_tail;
     src = src ++ fs_combine_plain;
     if (em) src = src ++ fs_emissive;
     if (flags & variant_fog != 0) src = src ++ fs_fog_mix;
@@ -2092,6 +2304,25 @@ pub const Encoder = struct {
         self.header(.set_bones, 8);
         self.putU32(count);
         self.putU32(ptr);
+    }
+
+    /// Encode set_area_lights: per-frame rect-area-light array (≤ max_area_lights).
+    /// `ptr` → count*16 f32 (4 vec4/area light; see max_area_lights packing). The
+    /// bridge writes them into the active PBR program's U at area_count@504 /
+    /// area_lights@512. Per-frame transient like setLights (not recorded into the registry).
+    pub fn setAreaLights(self: *Encoder, count: u32, ptr: u32) void {
+        self.header(.set_area_lights, 8);
+        self.putU32(count);
+        self.putU32(ptr);
+    }
+
+    /// Encode bind_ltc_lut: bind the two LTC LUT textures to tex_slot_ltc_mat(10) /
+    /// tex_slot_ltc_mag(11). Mirrors bindIbl. The bridge binds dummy 1×1 LUTs when no
+    /// area light. Must follow SET_PIPELINE (writes binds on the active program).
+    pub fn bindLtcLut(self: *Encoder, ltc_mat_handle: u32, ltc_mag_handle: u32) void {
+        self.header(.bind_ltc_lut, 8);
+        self.putU32(ltc_mat_handle);
+        self.putU32(ltc_mag_handle);
     }
 
     /// See setLights: SET_PIPELINE must precede BIND_IBL in a frame.
@@ -2677,12 +2908,15 @@ test "golden: PBR GLSL hashes frozen (FNV-1a-64)" {
     // Fragment hashes bumped in S1 (spot-shadows task 1): light stride 8→16 f32,
     // 4-vec4 loop, point/spot attenuation + spot cone smoothstep added.
     // VS hashes unchanged (lighting loop is fragment-only).
+    // Re-frozen (Slice 3 LTC): area_count/u_area_lights uniforms + LTC samplers + LTC
+    // helper fns + always-on rect-area-light eval loop added to EVERY PBR fragment.
+    // VS hashes still unchanged (area lighting is fragment-only).
     try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(F0)));
     try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(F1)));
     try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(F2))); // emissive does not touch the VS
-    try testing.expectEqual(@as(u64, 0x74f8716edb959d35), fnv64(pbrFragmentSrc(F0)));
-    try testing.expectEqual(@as(u64, 0x2044806ebe7eda00), fnv64(pbrFragmentSrc(F1)));
-    try testing.expectEqual(@as(u64, 0x0fcb65cc6f81c2fd), fnv64(pbrFragmentSrc(F2)));
+    try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(F0)));
+    try testing.expectEqual(@as(u64, 0x12afc4e9a79f341b), fnv64(pbrFragmentSrc(F1)));
+    try testing.expectEqual(@as(u64, 0xdaeef6d1e356244e), fnv64(pbrFragmentSrc(F2)));
 }
 
 test "skinned vertex variant: attribs + bone palette present, absent when off" {
@@ -2786,7 +3020,8 @@ test "WGSL PBR: variant_skinned vertex path" {
 test "golden: WGSL skinned hash frozen (FNV-1a-64)" {
     // Frozen from first green run — a change here = deliberate WGSL contract bump.
     // Bumped T3: lights 8→16 vec4, 4-vec4 loop, point/spot/spot-cone added.
-    try testing.expectEqual(@as(u64, 0xa024e07575f639b6), fnv64(wgslPbr(variant_pbr | variant_skinned)));
+    // Re-frozen (Slice 3 LTC): area fields in base U + LTC bindings/helpers/eval.
+    try testing.expectEqual(@as(u64, 0xa65614f22334f9be), fnv64(wgslPbr(variant_pbr | variant_skinned)));
 }
 
 test "golden: WGSL PBR hashes frozen (FNV-1a-64)" {
@@ -2795,9 +3030,11 @@ test "golden: WGSL PBR hashes frozen (FNV-1a-64)" {
     const F2 = variant_pbr | variant_normal_map | variant_emissive;
     // Frozen from first green run — a change here = deliberate WGSL contract bump.
     // Bumped T3: lights 8→16 vec4, 4-vec4 loop, point/spot/spot-cone added.
-    try testing.expectEqual(@as(u64, 0x357fb64fa20f9e48), fnv64(wgslPbr(F0)));
-    try testing.expectEqual(@as(u64, 0xc497d77d74cd4eb3), fnv64(wgslPbr(F1)));
-    try testing.expectEqual(@as(u64, 0x7de745a0f40a5f8f), fnv64(wgslPbr(F2)));
+    // Re-frozen (Slice 3 LTC): area_count/area_lights in base U + tex_ltc bindings
+    // (12/13) + LTC helper fns + always-on rect-area-light eval loop.
+    try testing.expectEqual(@as(u64, 0x64869f3d4d29920e), fnv64(wgslPbr(F0)));
+    try testing.expectEqual(@as(u64, 0x7861284caaa651af), fnv64(wgslPbr(F1)));
+    try testing.expectEqual(@as(u64, 0x795f98fe53f113d5), fnv64(wgslPbr(F2)));
 }
 
 test "WGSL PBR shadow + depth: variant_shadow path and wgslDepth structure" {
@@ -2842,10 +3079,13 @@ test "golden: WGSL shadow + depth hashes frozen (FNV-1a-64)" {
     // Re-frozen (Slice 2 CSM): shadow_vp array<mat4x4,4>→<,8> (offset 512, 512B →
     // 512..1024); +cascade_count@1024/cascade_splits@1040/view_forward@1056 (struct
     // size 1072, PBR_STRIDE 768→1280); +csmFactor helper + reordered loop guards.
-    // wgslDepth() unchanged (no lighting in depth shader).
-    try testing.expectEqual(@as(u64, 0xe938fd309d353c93), fnv64(wgslPbr(S0)));
-    try testing.expectEqual(@as(u64, 0x3a9f979ce53f3930), fnv64(wgslPbr(S1)));
-    try testing.expectEqual(@as(u64, 0x7401bd5c3d6ff71c), fnv64(wgslPbr(S2)));
+    // Re-frozen (Slice 3 LTC): base U gains area_count@504 + area_lights@512..768,
+    // shadow_vp shifts 512→768, struct size 1072→1328, PBR_STRIDE 1280→1536;
+    // +tex_ltc bindings (12/13) + LTC helpers + always-on area eval (area shadow line
+    // emitted under variant_shadow). wgslDepth() unchanged (no lighting in depth shader).
+    try testing.expectEqual(@as(u64, 0xcf13de40f43f4d50), fnv64(wgslPbr(S0)));
+    try testing.expectEqual(@as(u64, 0xa282355908fba4c7), fnv64(wgslPbr(S1)));
+    try testing.expectEqual(@as(u64, 0x71fee8885570c823), fnv64(wgslPbr(S2)));
     try testing.expectEqual(@as(u64, 0x3bb6cf33bcf5f8b1), fnv64(wgslDepth()));
 }
 
@@ -2918,13 +3158,15 @@ test "golden: shadow-variant GLSL hashes frozen (FNV-1a-64)" {
     // because shadowFactor→shadowFactor2D + in-loop per-light shadow + u_shadow_vp[4].
     // Re-frozen (Slice 2 CSM): VS unchanged (shadow still not in VS); FS hashes move
     // (u_shadow_vp[4]→[8], +cascade uniforms, +csmFactor, reordered loop guards).
+    // Re-frozen (Slice 3 LTC): VS still unchanged; FS hashes move (area uniforms +
+    // LTC samplers/helpers + always-on area eval, with area-shadow line under shadow).
     try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(S0)));
     try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(S1)));
     try testing.expectEqual(@as(u64, 0x197481afefd351c2), fnv64(pbrVertexSrc(S2))); // emissive does not touch the VS
-    try testing.expectEqual(@as(u64, 0x0490a473dae87dcc), fnv64(pbrFragmentSrc(S0)));
-    try testing.expectEqual(@as(u64, 0xf804307663c9940b), fnv64(pbrFragmentSrc(S1)));
-    try testing.expectEqual(@as(u64, 0x308ad970648f6e0a), fnv64(pbrFragmentSrc(S2)));
-    // Depth-only shadow-pass shader.
+    try testing.expectEqual(@as(u64, 0xa12d2fac005271e2), fnv64(pbrFragmentSrc(S0)));
+    try testing.expectEqual(@as(u64, 0xd9a325fca962b1f7), fnv64(pbrFragmentSrc(S1)));
+    try testing.expectEqual(@as(u64, 0xedf44ca97aeed4d6), fnv64(pbrFragmentSrc(S2)));
+    // Depth-only shadow-pass shader (unchanged — area lighting is PBR-only).
     try testing.expectEqual(@as(u64, 0x5bd62d643af5c2d5), fnv64(depthVertexSrc()));
     try testing.expectEqual(@as(u64, 0xe43018c9a1312d96), fnv64(depthFragmentSrc()));
 }
@@ -3117,8 +3359,9 @@ test "golden: post shader sources frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xe8ac45e2d1276dfd), fnv64(wgslFxaa()));
     // linear-output PBR variant (omits tonemap+gamma; post composite pass tonemaps instead)
     // wgslPbr(variant_linear_output) bumped T3: lights 8→16 vec4, 4-vec4 loop.
-    try testing.expectEqual(@as(u64, 0xb491c514c6b79895), fnv64(pbrFragmentSrc(variant_pbr | variant_linear_output)));
-    try testing.expectEqual(@as(u64, 0x20187fe5b9ce2a1d), fnv64(wgslPbr(variant_pbr | variant_linear_output)));
+    // Re-frozen (Slice 3 LTC): area uniforms + LTC eval added to all PBR fragments.
+    try testing.expectEqual(@as(u64, 0x54e229ed5e77c27a), fnv64(pbrFragmentSrc(variant_pbr | variant_linear_output)));
+    try testing.expectEqual(@as(u64, 0x903208e333ab2def), fnv64(wgslPbr(variant_pbr | variant_linear_output)));
 }
 
 // ── Task 3: Post-process effect-graph sequence tests ─────────────────
@@ -3568,7 +3811,8 @@ test "golden: variant_shadow_point GLSL fragment hash frozen (FNV-1a-64)" {
     // Re-frozen (Slice 2 CSM): loop guards reordered + range-bounded (point now
     // `>1.5 && <2.5`, csm slot inserted before point/2d). pointShadowFactor body
     // unchanged; the in-loop guard text + emission order shifted the FS hash.
-    try testing.expectEqual(@as(u64, 0xda87a180897d0aeb), fnv64(pbrFragmentSrc(SP)));
+    // Re-frozen (Slice 3 LTC): area uniforms + LTC eval added to all PBR fragments.
+    try testing.expectEqual(@as(u64, 0x5fc23591bcddf578), fnv64(pbrFragmentSrc(SP)));
 }
 
 // ── Point-shadow receiver WGSL (T4) ──────────────────────────────────────────
@@ -3603,5 +3847,142 @@ test "golden: variant_shadow_point WGSL hash frozen (FNV-1a-64)" {
     // Re-frozen (Slice 2 CSM): loop guards reordered + range-bounded (point now
     // `>1.5 && <2.5`, csm slot inserted before point/2d in emission). pointShadowFactor
     // body unchanged; the in-loop guard text + emission order shifted the FS hash.
-    try testing.expectEqual(@as(u64, 0x4d1e817da11f0446), fnv64(wgslPbr(SP)));
+    // Re-frozen (Slice 3 LTC): area fields in base U + LTC bindings/helpers/eval.
+    try testing.expectEqual(@as(u64, 0xfd6be0911979ca4e), fnv64(wgslPbr(SP)));
+}
+
+// ── Slice 3: rect area lights (LTC) ─────────────────────────────────
+
+test "area lights: tag values + constants" {
+    try testing.expectEqual(@as(u16, 37), @intFromEnum(Tag.set_area_lights));
+    try testing.expectEqual(@as(u16, 38), @intFromEnum(Tag.bind_ltc_lut));
+    try testing.expectEqual(@as(u32, 4), max_area_lights);
+    try testing.expectEqual(@as(u32, 16), area_light_stride_f32);
+    try testing.expectEqual(@as(u32, 10), tex_slot_ltc_mat);
+    try testing.expectEqual(@as(u32, 11), tex_slot_ltc_mag);
+}
+
+test "GLSL PBR: area-light uniforms + LTC samplers + eval present in every variant" {
+    // area_lights is in the BASE U → present in EVERY pbr fragment variant.
+    inline for (.{
+        variant_pbr,
+        variant_pbr | variant_normal_map,
+        variant_pbr | variant_emissive,
+        variant_pbr | variant_shadow,
+        variant_pbr | variant_shadow_point,
+        variant_pbr | variant_skinned,
+    }) |F| {
+        const fs = pbrFragmentSrc(F);
+        try testing.expect(std.mem.indexOf(u8, fs, "uniform int u_area_count;") != null);
+        try testing.expect(std.mem.indexOf(u8, fs, "uniform vec4 u_area_lights[16];") != null);
+        try testing.expect(std.mem.indexOf(u8, fs, "uniform sampler2D u_ltc_mat;") != null);
+        try testing.expect(std.mem.indexOf(u8, fs, "uniform sampler2D u_ltc_mag;") != null);
+        try testing.expect(std.mem.indexOf(u8, fs, "vec3 ltcEvaluate(") != null);
+        try testing.expect(std.mem.indexOf(u8, fs, "ai < u_area_count") != null);
+        // Corner construction (pos ± ex ± ey).
+        try testing.expect(std.mem.indexOf(u8, fs, "vec3 c0 = a_pos + ex - ey;") != null);
+        // LTC UV mapping (63/64 scale + 0.5/64 bias).
+        try testing.expect(std.mem.indexOf(u8, fs, "(63.0 / 64.0) + 0.5 / 64.0") != null);
+        // Fresnel from LTC_2 channels (no extra /PI on the form factor).
+        try testing.expect(std.mem.indexOf(u8, fs, "F0 * t2.x + (vec3(1.0) - F0) * t2.y") != null);
+    }
+}
+
+test "GLSL area shadow line only under variant_shadow" {
+    const with = pbrFragmentSrc(variant_pbr | variant_shadow);
+    const without = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, with, "area_contrib *= shadowFactor2D(int(a2.w + 0.5))") != null);
+    try testing.expect(std.mem.indexOf(u8, without, "area_contrib *= shadowFactor2D") == null);
+    // Area eval loop itself is ALWAYS present (even without shadow).
+    try testing.expect(std.mem.indexOf(u8, without, "ai < u_area_count") != null);
+}
+
+test "WGSL PBR: area fields in U + LTC bindings + eval present in every variant" {
+    inline for (.{
+        variant_pbr,
+        variant_pbr | variant_normal_map,
+        variant_pbr | variant_shadow,
+        variant_pbr | variant_shadow_point,
+        variant_pbr | variant_skinned,
+    }) |F| {
+        const src = wgslPbr(F);
+        try testing.expect(std.mem.indexOf(u8, src, "area_count: i32,") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "area_lights: array<vec4<f32>, 16>,") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "@binding(12) var ltc_mat: texture_2d<f32>;") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "@binding(13) var ltc_mag: texture_2d<f32>;") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "fn ltcEvaluate(") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "ai < u.area_count") != null);
+        // Free helper threads world_pos as a PARAM (no in.* ref inside ltcEvaluate).
+        try testing.expect(std.mem.indexOf(u8, src, "ltcEvaluate(N, V, in.world_pos") != null);
+    }
+}
+
+test "WGSL U layout order: area_count/area_lights between prefiltered_mips and shadow_vp" {
+    const src = wgslPbr(variant_pbr | variant_shadow);
+    const i_mips = std.mem.indexOf(u8, src, "prefiltered_mips: f32,").?;
+    const i_acount = std.mem.indexOf(u8, src, "area_count: i32,").?;
+    const i_alights = std.mem.indexOf(u8, src, "area_lights: array<vec4<f32>, 16>,").?;
+    const i_shadow = std.mem.indexOf(u8, src, "shadow_vp: array<mat4x4<f32>, 8>,").?;
+    // Byte order in the struct = field offset order: mips@500 < area_count@504 <
+    // area_lights@512 < shadow_vp@768.
+    try testing.expect(i_mips < i_acount);
+    try testing.expect(i_acount < i_alights);
+    try testing.expect(i_alights < i_shadow);
+}
+
+test "WGSL instanced vp lands AFTER area_lights (offset 512→768)" {
+    // Instanced draws are non-shadow + non-area; their `vp` must NOT collide with
+    // area_lights@512. It now follows area_lights (offset 768).
+    const src = wgslPbr(variant_pbr | variant_instanced);
+    const i_alights = std.mem.indexOf(u8, src, "area_lights: array<vec4<f32>, 16>,").?;
+    // Match the instanced `vp` line specifically (leading newline+spaces avoids the
+    // `mvp:` field, which also ends in "vp:").
+    const i_vp = std.mem.indexOf(u8, src, "\n  vp: mat4x4<f32>,").?;
+    try testing.expect(i_alights < i_vp);
+}
+
+test "golden: set_area_lights (tag 37) 8-byte payload" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.setAreaLights(2, 0x1000);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "10000000" ++ // 16 record bytes
+            // SET_AREA_LIGHTS count=2 ptr=0x1000
+            "2500" ++ "0800" ++ "02000000" ++ "00100000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "golden: bind_ltc_lut (tag 38) 8-byte payload" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.bindLtcLut(0x20, 0x21);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "10000000" ++ // 16 record bytes
+            // BIND_LTC_LUT ltc_mat=0x20 ltc_mag=0x21
+            "2600" ++ "0800" ++ "20000000" ++ "21000000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "non-PBR shaders unchanged by Slice 3 (no area/LTC leakage)" {
+    // Area lighting is PBR-only: unlit/lit/depth must NOT gain area uniforms.
+    try testing.expect(std.mem.indexOf(u8, unlit_fs, "u_area") == null);
+    try testing.expect(std.mem.indexOf(u8, lit_fs, "u_area") == null);
+    try testing.expect(std.mem.indexOf(u8, depthFragmentSrc(), "u_area") == null);
+    try testing.expect(std.mem.indexOf(u8, depthVertexSrc(), "u_ltc") == null);
+    // Frozen non-pbr hashes (must not move).
+    try testing.expectEqual(@as(u64, 0xa159f35e040f6f8f), fnv64(wgslUnlit));
 }

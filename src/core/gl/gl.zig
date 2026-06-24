@@ -26,6 +26,10 @@ pub const gltf = @import("gltf.zig");
 pub const hdr = @import("hdr.zig");
 pub const ibl = @import("ibl.zig");
 pub const fixture = @import("fixture.zig");
+// LTC (Linearly Transformed Cosines) LUT data for rect area lights. Pure data
+// (two [16384]f32 arrays); the native ltc gen tool imports this to pack ltc.bin.
+// Lazy import — island chunks never reference it, so it stays out of the wasm.
+pub const ltc_data = @import("ltc_data.zig");
 
 pub const Scene = scene.Scene;
 pub const Encoder = command.Encoder;

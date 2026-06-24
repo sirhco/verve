@@ -4,6 +4,21 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] - 2026-06-24
+
+### Added
+
+- **gl LTC rect area lights** (`src/core/gl/`, `src/core/gl_scene.zig`,
+  `src/bridge/verve.js`, `src/client/islands/GlScene.zig`,
+  `src/app/components.zig`, `src/app/routes.zig`): physically-based
+  `RectAreaLight` evaluated with Linearly Transformed Cosines (Heitz 2016),
+  giving soft diffuse + a specular highlight stretched to the rect's shape, plus
+  area-light shadows (the rect rendered as a perspective caster into the 2D
+  shadow atlas), both backends. LTC LUTs are served as `/gl/ltc.bin`. New
+  `/gl-area` demo wires one overhead rect area light over the shadow.vmesh floor
+  receiver, reusing the Slice-1 Freeze / Unfreeze control. Completes the
+  Lighting(3) parity workstream (multi-caster + CSM + LTC).
+
 ## [0.10.0] - 2026-06-24
 
 ### Added
