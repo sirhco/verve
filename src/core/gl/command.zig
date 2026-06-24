@@ -72,6 +72,11 @@ pub const Tag = enum(u16) {
     bind_ltc_lut = 38, // {ltc_mat_handle, ltc_mag_handle} — bind the two LTC LUT textures to tex_slot_ltc_mat(10)/tex_slot_ltc_mag(11).
     //   Mirrors bind_ibl (tag 12). The bridge binds dummy 1×1 LUTs when no area light (like the IBL fallback) so the
     //   LTC samplers are always valid. Must follow SET_PIPELINE (writes uniforms/binds on the active program).
+    // ── Image-quality slice 1: depth + view-space normal prepass ────────
+    draw_prepass = 39, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr, mv_ptr} — geometry draw into the G-buffer.
+    //   Mirrors draw_depth (tag 19) + a second mat4 pointer. The prepass program (variant_prepass) reads pos+normal of
+    //   the stride-48 PBR layout and writes rgb=viewNormal*0.5+0.5, a=-viewPos.z into the rgba16f G-buffer (h_gbuffer).
+    //   mvp = proj·view·model (clip pos); mv = view·model (no projection; transforms normals + gives viewPos).
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -110,6 +115,7 @@ pub const variant_instanced: u32 = 1 << 12; // requires variant_pbr; per-instanc
 pub const variant_fog: u32 = 1 << 13; // requires variant_pbr; distance fog mix before tonemap
 pub const variant_morph: u32 = 1 << 14; // requires variant_pbr; texture-blended POSITION+NORMAL morph deltas
 pub const variant_shadow_point: u32 = 1 << 15; // requires variant_pbr; omnidirectional point-light shadow receiver (RGBA8 atlas)
+pub const variant_prepass: u32 = 1 << 16; // depth + view-space normal prepass; rgba16f G-buffer (rgb=n*0.5+0.5, a=-viewPos.z). Standalone shader pair (mvp+mv UBO), not a PBR add-on.
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -492,6 +498,75 @@ pub fn depthAtFragmentSrc() []const u8 {
     \\uniform vec4 u_material[3];
     \\void main() {
     \\  if (texture(u_base_tex, v_uv).a * u_material[0].w < u_material[2].w) discard;
+    \\}
+    \\
+    ;
+}
+
+// ── Image-quality slice 1: depth + view-space normal prepass (GLSL) ──────
+//
+// A standalone shader pair (NOT a PBR add-on) rendered once before the main
+// PBR pass into the rgba16f G-buffer. Reads pos (attrib 0) + normal (attrib 1)
+// of the stride-48 PBR layout. Outputs: rgb = viewNormal*0.5+0.5, a = -viewPos.z
+// (linear view-space depth, positive in front of the camera). Uniforms:
+// u_mvp = proj·view·model (clip position); u_mv = view·model (view-space pos +
+// normal transform; mv's upper-3×3 is used directly — exact for rigid /
+// uniform-scale transforms, adequate for the debug G-buffer).
+
+pub fn prepassVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\layout(location = 1) in vec3 a_normal;
+    \\uniform mat4 u_mvp;
+    \\uniform mat4 u_mv;
+    \\out vec3 v_view_normal;
+    \\out vec3 v_view_pos;
+    \\void main() {
+    \\  v_view_normal = mat3(u_mv) * a_normal;
+    \\  v_view_pos = (u_mv * vec4(a_pos, 1.0)).xyz;
+    \\  gl_Position = u_mvp * vec4(a_pos, 1.0);
+    \\}
+    \\
+    ;
+}
+
+pub fn prepassFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec3 v_view_normal;
+    \\in vec3 v_view_pos;
+    \\out vec4 o_gbuffer;
+    \\void main() {
+    \\  vec3 n = normalize(v_view_normal);
+    \\  o_gbuffer = vec4(n * 0.5 + 0.5, -v_view_pos.z);
+    \\}
+    \\
+    ;
+}
+
+/// G-buffer debug fullscreen fragment (GLSL, variant_post). Samples the prepass
+/// G-buffer bound at tex0. u_threshold (params.x) selects the mode: 0 = view
+/// normals (the rgb channel passed through), 1 = linearized depth grayscale
+/// (the alpha channel, divided by a fixed range so the near cube reads darker
+/// than the far background). Reuses the shared fullscreen vertex + post params.
+pub fn gbufferDebugFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\uniform sampler2D u_tex0;
+    \\uniform float u_threshold;
+    \\out vec4 o_color;
+    \\void main() {
+    \\  vec4 g = texture(u_tex0, v_uv);
+    \\  if (u_threshold > 0.5) {
+    \\    float d = clamp(g.a / 10.0, 0.0, 1.0);
+    \\    o_color = vec4(vec3(d), 1.0);
+    \\  } else {
+    \\    o_color = vec4(g.rgb, 1.0);
+    \\  }
     \\}
     \\
     ;
@@ -1960,6 +2035,76 @@ pub fn wgslDepthAt() []const u8 {
     ;
 }
 
+/// Depth + view-space normal prepass WGSL (variant_prepass). Standalone shader
+/// pair rendered once into the rgba16f G-buffer before the main PBR pass. Reads
+/// pos (location 0) + normal (location 1) of the stride-48 PBR layout. Writes
+/// rgb = viewNormal*0.5+0.5, a = -viewPos.z (linear view-space depth). Private
+/// 128-byte UBO {mvp @0, mv @64} — does NOT touch PBR_U. mvp = proj·view·model;
+/// mv = view·model (view-space position + normal transform).
+pub fn wgslPrepass() []const u8 {
+    return
+    \\struct U {
+    \\  mvp: mat4x4<f32>,
+    \\  mv: mat4x4<f32>,
+    \\};
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\struct VsOut {
+    \\  @builtin(position) pos: vec4<f32>,
+    \\  @location(0) view_normal: vec3<f32>,
+    \\  @location(1) view_pos: vec3<f32>,
+    \\};
+    \\@vertex
+    \\fn vs_main(@location(0) a_pos: vec3<f32>, @location(1) a_normal: vec3<f32>) -> VsOut {
+    \\  var out: VsOut;
+    \\  let mv3 = mat3x3<f32>(u.mv[0].xyz, u.mv[1].xyz, u.mv[2].xyz);
+    \\  out.view_normal = mv3 * a_normal;
+    \\  out.view_pos = (u.mv * vec4<f32>(a_pos, 1.0)).xyz;
+    \\  out.pos = u.mvp * vec4<f32>(a_pos, 1.0);
+    \\  return out;
+    \\}
+    \\@fragment
+    \\fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    \\  let n = normalize(in.view_normal);
+    \\  return vec4<f32>(n * 0.5 + 0.5, -in.view_pos.z);
+    \\}
+    \\
+    ;
+}
+
+/// G-buffer debug fullscreen WGSL (variant_post). Samples the prepass G-buffer
+/// at tex0 and selects a mode via P.params.x: 0 = view normals (rgb passthrough),
+/// 1 = linearized depth grayscale (alpha / fixed range). The Params struct is
+/// 80 bytes: params vec4 @0, inv_proj mat4 @16 (inv_proj is unused by the debug
+/// viz but rides the widened post params buffer for downstream slices). Threads
+/// `uv` as a fs_main parameter (WGSL free-fn restriction does not apply — no
+/// helper references it).
+pub fn wgslGbufferDebug() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { params: vec4<f32>, inv_proj: mat4x4<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let g = textureSample(tex0, samp, uv);
+    \\  if (P.params.x > 0.5) {
+    \\    let d = clamp(g.a / 10.0, 0.0, 1.0);
+    \\    return vec4<f32>(vec3<f32>(d), 1.0);
+    \\  }
+    \\  return vec4<f32>(g.rgb, 1.0);
+    \\}
+    \\
+    ;
+}
+
 // ── Post-processing WGSL modules ─────────────────────────────────────
 //
 // Shared bind-group layout for all 4 post effects:
@@ -2138,6 +2283,26 @@ pub const PostCtx = struct {
     p_blur_v: [4]f32 = .{ 0, 0, 0, 1 }, // [texel.x, texel.y, dir.x=0, dir.y=1]
     p_comp: [4]f32 = .{ 0, 0, 0, 0 }, // [intensity, 0, 0, 0]
     p_fxaa: [4]f32 = .{ 0, 0, 0, 0 }, // [texel.x, texel.y, 0, 0]
+};
+
+/// Persistent state for the depth + view-space normal prepass (image-quality
+/// slice 1). Parallels `PostCtx`: fixed handles + a created/last_w/last_h guard.
+/// Handle reservation: 248–250 (251 spare) — after PostCtx's 240–247, before app
+/// handles. `h_gbuffer` (248) is the documented public consumption handle that
+/// downstream slices (SSAO/SSR/DOF) sample. The G-buffer is rgba16f WITH depth
+/// (rt_flag_with_depth) so the prepass can depth-test and future slices can bind
+/// hardware depth.
+pub const PrepassCtx = struct {
+    pub const h_gbuffer: u32 = 248; // rgba16f color RT (+depth) — public G-buffer handle
+    pub const sh_prepass: u32 = 249; // variant_prepass shader (mvp+mv UBO)
+    pub const sh_gdebug: u32 = 250; // variant_post G-buffer debug-viz shader
+    // 251 spare.
+
+    /// True once the shaders + target have been emitted for the first time.
+    created: bool = false,
+    last_w: u32 = 0,
+    last_h: u32 = 0,
+    webgpu: bool = false,
 };
 
 pub const Encoder = struct {
@@ -2394,6 +2559,19 @@ pub const Encoder = struct {
         self.putU32(index_byte_off);
         self.putU32(index_count);
         self.putU32(mvp_ptr);
+    }
+
+    /// Prepass geometry draw into the G-buffer (image-quality slice 1). Mirrors
+    /// `drawDepth` plus a second mat4 pointer. `mvp_ptr` = proj·view·model (clip
+    /// position); `mv_ptr` = view·model (view-space position + normal transform).
+    pub fn drawPrepass(self: *Encoder, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, mvp_ptr: u32, mv_ptr: u32) void {
+        self.header(.draw_prepass, 24);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(mvp_ptr);
+        self.putU32(mv_ptr);
     }
 
     /// Alpha-tested depth draw (MASK cutout shadows): binds `shader` (the depth-at
@@ -2671,6 +2849,52 @@ pub const Encoder = struct {
             self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 1);
             self.endFrame();
         }
+    }
+
+    // ── Image-quality slice 1: depth + view-space normal prepass API ──
+
+    /// Open the G-buffer prepass for this frame.
+    ///
+    /// On first call (or on resize) emits `createRenderTarget` for `h_gbuffer`
+    /// (rgba16f WITH depth) and (first call only) `createShader` × 2 (the prepass
+    /// program + the G-buffer debug-viz program). Ends by opening an offscreen
+    /// pass into `h_gbuffer` — the caller re-emits geometry via `drawPrepass`,
+    /// then calls `endPrepass`. Mirrors `beginPostProcess`. `webgpu` selects WGSL
+    /// vs GLSL exactly like `PostProcess.webgpu`.
+    pub fn beginPrepass(self: *Encoder, ctx: *PrepassCtx, webgpu: bool, width: u32, height: u32) void {
+        ctx.webgpu = webgpu;
+        const resized = width != ctx.last_w or height != ctx.last_h;
+        if (!ctx.created or resized) {
+            if (resized and ctx.created) {
+                self.deleteResource(.render_target, PrepassCtx.h_gbuffer);
+            }
+            self.createRenderTarget(PrepassCtx.h_gbuffer, width, height, .rgba16f, rt_flag_with_depth);
+            ctx.last_w = width;
+            ctx.last_h = height;
+        }
+        if (!ctx.created) {
+            if (webgpu) {
+                self.createShader(PrepassCtx.sh_prepass, variant_prepass, @truncate(@intFromPtr(wgslPrepass().ptr)), @intCast(wgslPrepass().len), 0, 0);
+                self.createPostShaderWgsl(PrepassCtx.sh_gdebug, wgslGbufferDebug());
+            } else {
+                const vs = prepassVertexSrc();
+                const fs = prepassFragmentSrc();
+                self.createShader(PrepassCtx.sh_prepass, variant_prepass, @truncate(@intFromPtr(vs.ptr)), @intCast(vs.len), @truncate(@intFromPtr(fs.ptr)), @intCast(fs.len));
+                self.createPostShaderGlsl(PrepassCtx.sh_gdebug, gbufferDebugFragmentSrc());
+            }
+            ctx.created = true;
+        }
+        // Open the G-buffer pass: clear color to (0,0,0,0) — normals=0 outside
+        // geometry, depth alpha 0 (treated as far) — and clear depth. The caller
+        // then `setPipeline(sh_prepass, depth_test|cull_back)` + `drawPrepass`,
+        // mirroring the beginPostProcess → setPipeline → draw convention.
+        self.beginOffscreenPass(PrepassCtx.h_gbuffer, .{ 0, 0, 0, 0 }, clear_flag_color | clear_flag_depth);
+    }
+
+    /// Close the G-buffer prepass pass. The next `begin_*` rebinds.
+    pub fn endPrepass(self: *Encoder, ctx: *PrepassCtx) void {
+        _ = ctx;
+        self.endOffscreenPass();
     }
 };
 
@@ -3478,6 +3702,92 @@ test "drawDepthAt encodes tag 26 + 7 u32 payload" {
     try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, buf[6..8], .little)); // payload_size
     try testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, buf[8..12], .little)); // shader
     try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, buf[32..36], .little)); // material_ptr (7th u32)
+}
+
+test "drawPrepass encodes tag 39 + 6 u32 payload" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.drawPrepass(1, 2, 48, 36, 0x1000, 0x2000);
+    // [4..6) tag, [6..8) payload_size, [8..32) 6×u32 payload.
+    try testing.expectEqual(@as(u16, 39), std.mem.readInt(u16, buf[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 24), std.mem.readInt(u16, buf[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, buf[8..12], .little)); // vbuf
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, buf[12..16], .little)); // ibuf
+    try testing.expectEqual(@as(u32, 48), std.mem.readInt(u32, buf[16..20], .little)); // index_byte_off
+    try testing.expectEqual(@as(u32, 36), std.mem.readInt(u32, buf[20..24], .little)); // index_count
+    try testing.expectEqual(@as(u32, 0x1000), std.mem.readInt(u32, buf[24..28], .little)); // mvp_ptr
+    try testing.expectEqual(@as(u32, 0x2000), std.mem.readInt(u32, buf[28..32], .little)); // mv_ptr
+}
+
+test "variant_prepass bit value (1<<16) is free" {
+    try testing.expectEqual(@as(u32, 1 << 16), variant_prepass);
+    // No collision with any existing variant bit (0..15).
+    try testing.expect(variant_prepass & variant_shadow_point == 0);
+    try testing.expect(variant_prepass & variant_post == 0);
+}
+
+test "beginPrepass/endPrepass emit the G-buffer pass" {
+    var buf: [4096]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = PrepassCtx{};
+    enc.beginPrepass(&ctx, false, 800, 600);
+    enc.setPipeline(PrepassCtx.sh_prepass, state_depth_test | state_cull_back);
+    enc.drawPrepass(1, 2, 0, 36, 0x1000, 0x2000);
+    enc.endPrepass(&ctx);
+    const out = enc.finish();
+    var tag_buf: [64]Tag = undefined;
+    const n = collectTags(out, &tag_buf);
+    // First frame: G-buffer RT created, prepass + gdebug shaders created, then the
+    // offscreen pass opened, geometry drawn, pass closed.
+    try expectContainsInOrder(tag_buf[0..n], n, &.{
+        .create_render_target, // h_gbuffer
+        .create_shader, // sh_prepass
+        .create_shader, // sh_gdebug
+        .begin_offscreen_pass, // -> h_gbuffer
+        .set_pipeline,
+        .draw_prepass,
+        .end_offscreen_pass,
+    });
+}
+
+test "PrepassCtx handles do not collide with PostCtx handles" {
+    // 248–250 sit after PostCtx's 240–247; 251 is spare.
+    try testing.expectEqual(@as(u32, 248), PrepassCtx.h_gbuffer);
+    try testing.expectEqual(@as(u32, 249), PrepassCtx.sh_prepass);
+    try testing.expectEqual(@as(u32, 250), PrepassCtx.sh_gdebug);
+    try testing.expect(PrepassCtx.h_gbuffer > PostCtx.sh_fxaa);
+}
+
+test "prepass + gdebug shader content (both backends)" {
+    // GLSL prepass: pos + normal in, view normal/pos out, mv+mvp uniforms, gbuffer out.
+    const pv = prepassVertexSrc();
+    try testing.expect(std.mem.indexOf(u8, pv, "a_normal") != null);
+    try testing.expect(std.mem.indexOf(u8, pv, "u_mv") != null);
+    try testing.expect(std.mem.indexOf(u8, pv, "u_mvp") != null);
+    const pf = prepassFragmentSrc();
+    try testing.expect(std.mem.indexOf(u8, pf, "n * 0.5 + 0.5") != null);
+    try testing.expect(std.mem.indexOf(u8, pf, "-v_view_pos.z") != null);
+    // WGSL prepass: private U {mvp, mv}, threads varyings as VsOut, NO PBR_U.
+    const wp = wgslPrepass();
+    try testing.expect(std.mem.indexOf(u8, wp, "mvp: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, wp, "mv: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, wp, "n * 0.5 + 0.5") != null);
+    // gdebug: mode-select on params.x in both backends.
+    const gf = gbufferDebugFragmentSrc();
+    try testing.expect(std.mem.indexOf(u8, gf, "u_threshold > 0.5") != null);
+    try testing.expect(std.mem.indexOf(u8, gf, "u_tex0") != null);
+    const wg = wgslGbufferDebug();
+    try testing.expect(std.mem.indexOf(u8, wg, "P.params.x > 0.5") != null);
+    try testing.expect(std.mem.indexOf(u8, wg, "inv_proj: mat4x4<f32>") != null);
+}
+
+test "golden: prepass + gdebug shader sources frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = a deliberate shader bump.
+    try testing.expectEqual(@as(u64, 0x91c87241e3a67f02), fnv64(prepassVertexSrc()));
+    try testing.expectEqual(@as(u64, 0x177573915216ade5), fnv64(prepassFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xfe0b7897c73027c0), fnv64(gbufferDebugFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0x30c9a8f934c49b91), fnv64(wgslPrepass()));
+    try testing.expectEqual(@as(u64, 0x10e6f50be5ce2b92), fnv64(wgslGbufferDebug()));
 }
 
 test "variant_double_sided flips normal; non-DS frozen; state_cull_front" {

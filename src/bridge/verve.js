@@ -5404,6 +5404,10 @@
             sh.uDir = gl.getUniformLocation(prog, "u_dir");
             sh.uIntensity = gl.getUniformLocation(prog, "u_intensity");
           }
+          if (variant & 0x10000) { // variant_prepass (1<<16): mvp + mv (view·model)
+            // sh.mvp ("u_mvp") is already resolved above; cache the second matrix.
+            sh.mv = gl.getUniformLocation(prog, "u_mv");
+          }
           if (variant & 0x1000) { // variant_instanced: u_vp replaces u_mvp/u_model
             sh.vp = gl.getUniformLocation(prog, "u_vp");
           }
@@ -6027,6 +6031,40 @@
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
           break;
         }
+        case 39: { // DRAW_PREPASS — pos+normal draw into the G-buffer (image-quality slice 1)
+          // Payload (24B): vbuf | ibuf | idx_byte_off | count | mvp_ptr | mv_ptr.
+          // The active program is the prepass shader (variant_prepass, set by the
+          // preceding SET_PIPELINE). Uploads u_mvp + u_mv, then draws over a
+          // dedicated VAO (pos loc0 @0, normal loc1 @12, stride 48).
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const mvpPtr = dv.getUint32(off + 16, true);
+          const mvPtr = dv.getUint32(off + 20, true);
+          const vb = st.buffers[vh];
+          const ib = st.buffers[ih];
+          if (!vb || !ib || !st.active) break;
+          if (st.active.mvp) gl.uniformMatrix4fv(st.active.mvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
+          if (st.active.mv) gl.uniformMatrix4fv(st.active.mv, false, new Float32Array(memory.buffer, mvPtr, 16));
+          // Dedicated VAO keyed "pp" so it never collides with PBR/depth/depth-at VAOs.
+          const ppKey = `${vh}:${ih}:pp`;
+          let ppVao = st.vaos.get(ppKey);
+          if (!ppVao) {
+            ppVao = gl.createVertexArray();
+            gl.bindVertexArray(ppVao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);  // pos
+            gl.enableVertexAttribArray(1);
+            gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 48, 12); // normal
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
+            st.vaos.set(ppKey, ppVao);
+          }
+          gl.bindVertexArray(ppVao);
+          gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
         case 28: { // SET_FOG — set fog uniforms on the active program (per-program; follows SET_PIPELINE)
           const ptr = dv.getUint32(off, true);
           const f = new Float32Array(memory.buffer, ptr, 8);
@@ -6508,6 +6546,25 @@
     }
     return st.depthUniform;
   };
+  // Lazily create the prepass uniform (per draw: mvp 64B + mv 64B = 128B, padded
+  // to the DEPTH_STRIDE 256B dynamic-offset slot) + its bind group against the
+  // prepass pipeline's dynamic-offset layout. Reused across frames.
+  const gpuEnsurePrepassUniform = (st, prepassPipe) => {
+    if (!st.prepassUniform) {
+      st.prepassUniform = st.device.createBuffer({
+        size: DEPTH_STRIDE * MAX_DRAWS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    if (!st.prepassBindGroup && prepassPipe) {
+      st.prepassBindGroup = st.device.createBindGroup({
+        layout: prepassPipe.bgl0,
+        // size = mvp(64) + mv(64) = 128B; the dynamic offset selects the slot.
+        entries: [{ binding: 0, resource: { buffer: st.prepassUniform, offset: 0, size: 128 } }],
+      });
+    }
+    return st.prepassUniform;
+  };
   // Lazily create the depth-at uniform (per draw: mvp 64B + material 48B = 112B,
   // padded to the DEPTH_STRIDE 256B dynamic-offset slot). The bind group is built
   // per draw_depth_at (binding 1 = base texture view varies), so only the buffer
@@ -6646,7 +6703,7 @@
           // frame (those run BEFORE begin_frame); else create one. All passes share
           // one encoder + submit. Reset post slot only on a genuinely new encoder so
           // the canvas FXAA draw keeps a slot distinct from the offscreen bloom draws.
-          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; }
+          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; st.prepassSlot = 0; }
           st.pass = st.encoder.beginRenderPass({
             colorAttachments: [{
               view: st.ctx.getCurrentTexture().createView(),
@@ -6702,7 +6759,53 @@
                 { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
               ],
             });
-            st.pipelines[handle] = { module, bgl0, bgl1, kind: "post", byFormat: {} };
+            // Params binding size: the G-buffer debug shader (handle sh_gdebug=250)
+            // uses an 80B Params struct {params vec4 @0, inv_proj mat4 @16}; the
+            // four bloom/fxaa modules use 32B (f32 + vec3 padded to struct align 16
+            // = 32; vec2+vec2 = 16 but kept at 32 to match the prior binding). The
+            // bind-group binding size at draw time (case 25) must be ≥ what the
+            // shader reads, so record it here.
+            const paramsSize = (handle === 250) ? 80 : 32;
+            st.pipelines[handle] = { module, bgl0, bgl1, kind: "post", byFormat: {}, paramsSize };
+            break;
+          }
+          // variant_prepass = 1 << 16 (0x10000) — depth + view-space normal prepass.
+          // Standalone shader pair: single rgba16f color target (the G-buffer),
+          // depth-write ON (depth24plus, matching the RT's depth), a 128B group(0)
+          // UBO {mvp @0, mv @64} (dynamic offset for per-draw slots). pos+normal
+          // vertex over the stride-48 PBR layout. Does NOT touch PBR_U.
+          if ((variant & 0x10000) !== 0) {
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX,
+                buffer: { type: "uniform", hasDynamicOffset: true },
+              }],
+            });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
+            const pipeline = device.createRenderPipeline({
+              layout,
+              vertex: {
+                module,
+                entryPoint: "vs_main",
+                buffers: [{
+                  arrayStride: 48, // PBR layout: pos @0 (loc0), normal @12 (loc1)
+                  attributes: [
+                    { shaderLocation: 0, offset: 0, format: "float32x3" },
+                    { shaderLocation: 1, offset: 12, format: "float32x3" },
+                  ],
+                }],
+              },
+              // rgba16f G-buffer color target. Back-cull (cull-back) like the scene.
+              fragment: { module, entryPoint: "fs_main", targets: [{ format: "rgba16float" }] },
+              primitive: { topology: "triangle-list", cullMode: "back" },
+              depthStencil: {
+                format: "depth24plus",
+                depthWriteEnabled: true,
+                depthCompare: "less",
+              },
+            });
+            st.pipelines[handle] = { pipeline, bgl0, kind: "prepass" };
             break;
           }
           // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
@@ -7461,6 +7564,31 @@
           st.shadowPass.drawIndexed(count);
           break;
         }
+        case 39: { // DRAW_PREPASS — pos+normal draw into the G-buffer (image-quality slice 1).
+          // Payload (24B): vbuf | ibuf | idx_byte_off | count | mvp_ptr | mv_ptr.
+          // Renders into the active offscreen G-buffer pass (st.pass) using the
+          // prepass pipeline (set by the preceding SET_PIPELINE → st.active, kind
+          // "prepass"). Writes {mvp@0, mv@64} into a 128B dynamic-offset slot.
+          const vb = st.buffers[dv.getUint32(off, true)];
+          const ib = st.buffers[dv.getUint32(off + 4, true)];
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const mvpPtr = dv.getUint32(off + 16, true);
+          const mvPtr = dv.getUint32(off + 20, true);
+          if (!vb || !ib || !st.pass || !st.active || st.active.kind !== "prepass") break;
+          const pslot = st.prepassSlot++;
+          if (pslot >= MAX_DRAWS) break; // per-frame draw cap
+          const pbase = pslot * DEPTH_STRIDE;
+          const ubuf = gpuEnsurePrepassUniform(st, st.active);
+          device.queue.writeBuffer(ubuf, pbase, new Float32Array(memory.buffer, mvpPtr, 16)); // mvp @0
+          device.queue.writeBuffer(ubuf, pbase + 64, new Float32Array(memory.buffer, mvPtr, 16)); // mv @64
+          st.pass.setPipeline(st.active.pipeline);
+          st.pass.setVertexBuffer(0, vb.buf);
+          st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
+          st.pass.setBindGroup(0, st.prepassBindGroup, [pbase]);
+          st.pass.drawIndexed(count);
+          break;
+        }
         case 20: { // BIND_SHADOW_MAP — record the atlas + cache shadow_vp[] array.
           // NEW payload (16B): slot | atlas_handle | vp_ptr | count. The depth-compare
           // atlas + comparison sampler are bound at draw_pbr (group(1) 9/10); here we
@@ -7753,7 +7881,11 @@
             depthTex = device.createTexture({
               size: [w, h],
               format: "depth24plus",
-              usage: GPUTextureUsage.RENDER_ATTACHMENT,
+              // + TEXTURE_BINDING so downstream image-quality slices (SSAO/SSR/DOF)
+              // CAN bind hardware depth from the G-buffer. No depth sampler/bind
+              // group is wired this slice — the prepass writes linear depth into
+              // the color alpha channel, which the debug viz samples.
+              usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
             });
             depthView = depthTex.createView();
           }
@@ -7771,7 +7903,7 @@
           const rt = st.renderTargets[target];
           if (!rt) break;
           // First pass of a post frame: new encoder → reset the post params slot.
-          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; }
+          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; st.prepassSlot = 0; }
           st.pass = st.encoder.beginRenderPass({
             colorAttachments: [{
               view: rt.view,
@@ -7814,13 +7946,20 @@
           const pslot = st.postSlot++;
           if (pslot >= MAX_POST_DRAWS) break; // per-frame cap (silently drop extras)
           const pbase = pslot * POST_STRIDE;
-          const arr = new Float32Array(4);
+          // The binding size matches the shader's Params struct: 16B for the four
+          // bloom/fxaa modules, 80B for the G-buffer debug shader {params vec4 @0,
+          // inv_proj mat4 @16} (grown from 32; inv_proj rides this widened post
+          // params path for downstream slices, currently unread by the debug viz).
+          // Write a full-size zero-padded array so the inv_proj region never leaks
+          // stale slot data.  Wire params (up to 4 f32) land at @0.
+          const paramsSize = entry.paramsSize || 32;
+          const arr = new Float32Array(paramsSize / 4);
           for (let i = 0; i < pCount && i < 4; i++) arr[i] = dv.getFloat32(pPtr + i * 4, true);
           device.queue.writeBuffer(pubuf, pbase, arr);
           const src1 = (t1 !== 0 && st.renderTargets[t1]) ? st.renderTargets[t1].view : st.dummyTexView;
           const bg0 = device.createBindGroup({
             layout: entry.bgl0,
-            entries: [{ binding: 0, resource: { buffer: pubuf, offset: pbase, size: 32 } }],
+            entries: [{ binding: 0, resource: { buffer: pubuf, offset: pbase, size: paramsSize } }],
           });
           const bg1 = device.createBindGroup({
             layout: entry.bgl1,

@@ -1138,6 +1138,9 @@ pub fn glPost(ctx: *const verve.Context) !*verve.Node {
         ctx.el("button").attr("z-on-click", "glpost_toggle_bloom").text("Toggle Bloom"),
         ctx.el("button").attr("z-on-click", "glpost_toggle_fxaa").text("Toggle FXAA"),
         ctx.el("button").attr("z-on-click", "glpost_toggle_freeze").text("Freeze"),
+        // Image-quality slice 1: G-buffer prepass debug viz.
+        ctx.el("button").attr("z-on-click", "glpost_toggle_gbuffer").text("Toggle G-buffer"),
+        ctx.el("button").attr("z-on-click", "glpost_toggle_gbuffer_mode").text("G-buffer Mode (normals/depth)"),
     });
 
     const inner = ctx.section().class("card").children(.{

@@ -4,6 +4,31 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-06-24
+
+### Added
+
+- **gl depth + view-space normal prepass (G-buffer foundation)**
+  (`src/core/gl/command.zig`, `src/bridge/verve.js`,
+  `src/client/islands/GlPost.zig`, `src/app/components.zig`): a stripped prepass
+  renders scene geometry once into a normal+depth G-buffer (`h_gbuffer`, rgba16f
+  with depth) BEFORE the main PBR pass — `rgb = viewNormal*0.5+0.5`,
+  `a = -viewPos.z` (linear view-space depth). No user-visible feature; this is
+  the foundation later image-quality slices (SSAO/SSR/DOF) consume. Both backends
+  (WGSL + GLSL): a standalone prepass shader pair (`wgslPrepass` /
+  `prepassVertexSrc`+`prepassFragmentSrc`) with its own private 128B
+  `{mvp, mv}` UBO (PBR_U untouched), plus a `variant_post` G-buffer debug-viz
+  shader (`wgslGbufferDebug` / `gbufferDebugFragmentSrc`). New wire surface:
+  `variant_prepass = 1<<16`, `draw_prepass` tag 39, `PrepassCtx`
+  (`h_gbuffer`=248 / `sh_prepass`=249 / `sh_gdebug`=250) with
+  `beginPrepass`/`drawPrepass`/`endPrepass` encoder methods mirroring the post
+  path. The post params buffer grows 32→80 bytes to carry `inv_proj` for
+  downstream screen-space reconstruction, and the WebGPU offscreen RT depth
+  texture gains `TEXTURE_BINDING` so a future slice can bind hardware depth. The
+  `/gl-post` demo gains "Toggle G-buffer" + "G-buffer Mode (normals/depth)"
+  controls (`glpost_toggle_gbuffer` / `glpost_toggle_gbuffer_mode`) that blit the
+  debug viz straight to the canvas.
+
 ## [0.11.0] - 2026-06-24
 
 ### Added
