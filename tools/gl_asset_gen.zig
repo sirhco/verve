@@ -129,6 +129,7 @@ fn convertGlb(
         model.instances, // EXT_mesh_gpu_instancing → vmesh instances section
         model.instance_count,
         model.morph, // v13 morph section; null when no morph targets present
+        model.lod, // v15 LOD section; null when no _lodN meshes
     );
     defer alloc.free(vmesh_bytes);
 

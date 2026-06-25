@@ -551,6 +551,25 @@ pub fn build(b: *std.Build) void {
     const morph16_dir = gl_asset_gen_morph16_run.addOutputDirectoryArg("morph16");
     gl_asset_gen_morph16_run.addArg("morph16");
 
+    // LOD-sphere asset: gen_lod_glb → lodsphere.glb → gl_asset_gen → lodsphere.vmesh.
+    // Three UV-sphere LOD levels (sphere_lod0/1/2) packed into a single vmesh v15.
+    const gen_lod_glb_mod = b.createModule(.{
+        .root_source_file = b.path("tools/gen_lod_glb.zig"),
+        .target = host_target,
+        .optimize = optimize,
+    });
+    const gen_lod_glb_exe = b.addExecutable(.{
+        .name = "verve-gen-lod-glb",
+        .root_module = gen_lod_glb_mod,
+    });
+    const gen_lod_glb_run = b.addRunArtifact(gen_lod_glb_exe);
+    const lod_glb_path = gen_lod_glb_run.addOutputFileArg("lodsphere.glb");
+
+    const gl_asset_gen_lod_run = b.addRunArtifact(gl_asset_gen_exe);
+    gl_asset_gen_lod_run.addFileArg(lod_glb_path);
+    const lod_dir = gl_asset_gen_lod_run.addOutputDirectoryArg("lodsphere");
+    gl_asset_gen_lod_run.addArg("lodsphere");
+
     // HDR fixture → studio.hdr → studio.venv pipeline.
     // gen_demo_hdr writes the procedural studio environment; the same
     // gl_asset_gen binary (branching on the .hdr extension) runs the full
@@ -615,6 +634,7 @@ pub fn build(b: *std.Build) void {
     _ = wf_gl.addCopyFile(cubefield_dir.path(b, "cubefield.vmesh"), "cubefield.vmesh");
     _ = wf_gl.addCopyFile(morph_dir.path(b, "morph.vmesh"), "morph.vmesh");
     _ = wf_gl.addCopyFile(morph16_dir.path(b, "morph16.vmesh"), "morph16.vmesh");
+    _ = wf_gl.addCopyFile(lod_dir.path(b, "lodsphere.vmesh"), "lodsphere.vmesh");
     _ = wf_gl.addCopyFile(studio_dir.path(b, "studio.venv"), "studio.venv");
     _ = wf_gl.addCopyFile(ltc_bin_path, "ltc.bin");
     const gl_assets_src =
@@ -636,6 +656,7 @@ pub fn build(b: *std.Build) void {
         \\    .{ .name = "cubefield.vmesh", .bytes = @embedFile("cubefield.vmesh") },
         \\    .{ .name = "morph.vmesh", .bytes = @embedFile("morph.vmesh") },
         \\    .{ .name = "morph16.vmesh", .bytes = @embedFile("morph16.vmesh") },
+        \\    .{ .name = "lodsphere.vmesh", .bytes = @embedFile("lodsphere.vmesh") },
         \\    .{ .name = "studio.venv", .bytes = @embedFile("studio.venv") },
         \\    .{ .name = "ltc.bin", .bytes = @embedFile("ltc.bin") },
         \\};

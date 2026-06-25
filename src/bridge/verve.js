@@ -590,6 +590,20 @@
     hudEl.textContent = `drawn ${d} / culled ${c} / ${d + c} · shadow ${sd}/${sc}`;
   };
 
+  // T-LOD: Write per-frame LOD stats into the [data-ref="gllod-hud"] element.
+  // Encoding: glscene_lod_stats() returns (lod_active&0xff)|((level_count&0xff)<<8)|((count&0xffff)<<16).
+  // Guard: no-op when the function or element is absent (every demo except /gl-lod).
+  const glLodHudUpdate = (exports) => {
+    if (typeof exports.glscene_lod_stats !== "function") return;
+    const hudEl = document.querySelector('[data-ref="gllod-hud"]');
+    if (!hudEl) return;
+    const packed = exports.glscene_lod_stats() >>> 0;
+    const active = packed & 0xff;
+    const total  = (packed >>> 8) & 0xff;
+    const subs   = (packed >>> 16) & 0xffff;
+    hudEl.textContent = total === 0 ? "LOD off" : `LOD ${active} / ${total - 1} · ${subs} submesh`;
+  };
+
   const dispatchEventId = (e, attr, prevent) => {
     const node = e.target.closest(`[${attr}]`);
     if (!node) return false;
@@ -8730,6 +8744,8 @@
         }
         // T3: cull HUD — only present on /gl-cull; no-op on all other demos.
         glCullHudUpdate(st.exports);
+        // T-LOD: LOD HUD — only present on /gl-lod; no-op on all other demos.
+        glLodHudUpdate(st.exports);
       } catch (err) {
         // A corrupt stream/pointer must not kill the loop silently.
         console.error("verve.gl: interpreter fault, loop stopped:", err, err && err.stack);
@@ -8918,6 +8934,8 @@
         gpuInterpret(st, ptr);
         // T3: cull HUD — only present on /gl-cull; no-op on all other demos.
         glCullHudUpdate(st.exports);
+        // T-LOD: LOD HUD — only present on /gl-lod; no-op on all other demos.
+        glLodHudUpdate(st.exports);
       } catch (err) {
         console.error("verve.gl: WebGPU interpreter fault, loop stopped:", err);
         glSinks.delete(sink);

@@ -302,6 +302,14 @@ const Inst = struct {
     cull_shadow_drawn: u32 = 0,
     cull_shadow_culled: u32 = 0,
 
+    // LOD state (T-LOD). Populated at asset load from vmesh LOD section.
+    // When lod_level_count == 0, no LOD data → full submesh range drawn.
+    lod_level_count: u32 = 0,
+    lod_dist_min_sq: [8]f32 = .{0} ** 8,
+    lod_first: [8]u32 = .{0} ** 8,
+    lod_count: [8]u32 = .{0} ** 8,
+    lod_active: u32 = 0,
+
     // GPU instancing (T6): per-instance mat4(16)+color(4) = 20 f32, animated per frame.
     // Lives in Inst (static) NOT on the frame stack — 1024×80 B = 80 KB would overflow
     // the 64 KB chunk stack (same lesson as the frustum-cull OOB).
@@ -1329,6 +1337,21 @@ fn buildScene(inst: *Inst, a: *const gl.vmesh.Reader) void {
         };
         inst.submesh_aabb[s] = submeshLocalAabb(verts_f32, indices_u16, sub.index_byte_off / 2, sub.index_count);
     }
+    // LOD: populate from vmesh LOD section (v15+).
+    inst.lod_level_count = a.lodLevelCount();
+    if (inst.lod_level_count > 0) {
+        var li: u32 = 0;
+        while (li < inst.lod_level_count and li < 8) : (li += 1) {
+            const lv = a.lodLevel(li);
+            inst.lod_dist_min_sq[li] = lv.dist_min_sq;
+            inst.lod_first[li] = lv.submesh_first;
+            inst.lod_count[li] = lv.submesh_count;
+        }
+        inst.lod_active = 0;
+    } else {
+        inst.lod_level_count = 0;
+        inst.lod_active = 0;
+    }
     inst.model_yaw_applied = 0;
     inst.node_rot_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
     inst.node_pos_applied = [_][3]f32{.{ 0, 0, 0 }} ** max_submesh;
@@ -1842,8 +1865,11 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 {
                     // Phase A: opaque+blend (alpha_mode != 2) — plain position-only depth.
                     // depth_mvps_mc[s][sd] precomputed for ALL submeshes (Phase B reuses).
-                    var sd: u32 = 0;
-                    while (sd < a.submesh_count) : (sd += 1) {
+                    // Narrow to the active LOD level's submesh range (T-LOD).
+                    const s_lo_2d: u32 = if (inst.lod_level_count > 0) inst.lod_first[inst.lod_active] else 0;
+                    const s_hi_2d: u32 = if (inst.lod_level_count > 0) s_lo_2d + inst.lod_count[inst.lod_active] else a.submesh_count;
+                    var sd: u32 = s_lo_2d;
+                    while (sd < s_hi_2d) : (sd += 1) {
                         if (sd >= max_submesh) break;
                         const sub = a.submesh(sd);
                         inst.depth_mvps_mc[s][sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
@@ -1857,8 +1883,8 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                         enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])));
                     }
                     // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
-                    sd = 0;
-                    while (sd < a.submesh_count) : (sd += 1) {
+                    sd = s_lo_2d;
+                    while (sd < s_hi_2d) : (sd += 1) {
                         if (sd >= max_submesh) break;
                         const sub = a.submesh(sd);
                         if (sub.alpha_mode != 2) continue;
@@ -1909,8 +1935,10 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                         @intCast(@intFromPtr(&inst.point_lp_mc[pidx])),
                         @bitCast(far),
                     );
-                    var sd: u32 = 0;
-                    while (sd < a.submesh_count) : (sd += 1) {
+                    const s_lo_pt: u32 = if (inst.lod_level_count > 0) inst.lod_first[inst.lod_active] else 0;
+                    const s_hi_pt: u32 = if (inst.lod_level_count > 0) s_lo_pt + inst.lod_count[inst.lod_active] else a.submesh_count;
+                    var sd: u32 = s_lo_pt;
+                    while (sd < s_hi_pt) : (sd += 1) {
                         if (sd >= max_submesh) break;
                         const sub = a.submesh(sd);
                         enc.drawPointDepth(
@@ -1949,6 +1977,35 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         const pv = clipFix().mul(proj).mul(view);
         // World-space frustum planes for this frame's camera (P9 slice 2).
         const planes = gl.cull.frustumPlanes(pv);
+
+        // ── T-LOD: distance-based LOD selection ──────────────────────────────
+        // Pick the highest LOD level (lowest detail = highest index) whose
+        // dist_min_sq threshold is ≤ squared camera-to-object distance.
+        // Level 0 (dist_min_sq == 0) always qualifies. Thresholds are SQUARED
+        // distance so no sqrt is needed.
+        if (inst.lod_level_count > 0) {
+            const cx = inst.camera_pos[0];
+            const cy = inst.camera_pos[1];
+            const cz = inst.camera_pos[2];
+            // Object center from LOD level-0's first submesh AABB.
+            const lod0_first = inst.lod_first[0];
+            const wbox0 = gl.cull.worldAabb(inst.submesh_aabb[lod0_first], inst.scene.world[lod0_first + 1]);
+            const ocx = (wbox0.min.x + wbox0.max.x) * 0.5;
+            const ocy = (wbox0.min.y + wbox0.max.y) * 0.5;
+            const ocz = (wbox0.min.z + wbox0.max.z) * 0.5;
+            const dx = ocx - cx;
+            const dy = ocy - cy;
+            const dz = ocz - cz;
+            const dsq = dx * dx + dy * dy + dz * dz;
+            var best: u32 = 0;
+            var li: u32 = 1;
+            while (li < inst.lod_level_count) : (li += 1) {
+                if (inst.lod_dist_min_sq[li] <= dsq) best = li;
+            }
+            inst.lod_active = best;
+        }
+        // ── end T-LOD ─────────────────────────────────────────────────────────
+
         // Reset per-frame main-pass cull counters (T3). Shadow counters reset above (T4).
         inst.cull_main_drawn = 0;
         inst.cull_main_culled = 0;
@@ -1957,8 +2014,10 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // When the asset carries an instances section (instanceCount > 0), emit ONE
         // draw_pbr_instanced for mesh 0 INSTEAD of the per-submesh loop.
         // Non-instanced assets (instanceCount == 0) fall through byte-identical.
+        // LOD is incompatible with instancing (out of scope) — skip instanced fast-path
+        // when LOD is active to avoid mismatches.
         const inst_n = a.instanceCount();
-        if (inst_n > 0 and a.submesh_count > 0) {
+        if (inst_n > 0 and a.submesh_count > 0 and inst.lod_level_count == 0) {
             // inst_time_ms already advanced above (unconditional, for morph + instanced).
             const t_s: f32 = inst.inst_time_ms / 1000.0;
             const n = @min(inst_n, max_instances);
@@ -2008,12 +2067,17 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // stream when every submesh is opaque. Pass 2: transparent submeshes
         // sorted back-to-front with state_blend.
 
+        // Compute LOD-narrowed submesh range for main passes.
+        // When lod_level_count == 0, full range [0, a.submesh_count).
+        const s_lo_main: u32 = if (inst.lod_level_count > 0) inst.lod_first[inst.lod_active] else 0;
+        const s_hi_main: u32 = if (inst.lod_level_count > 0) s_lo_main + inst.lod_count[inst.lod_active] else a.submesh_count;
+
         // Pass 1: opaque (alpha_mode == 0).
         // Sentinel 0 is never a valid variant (variant_pbr always set).
         var last_variant: u32 = 0;
         {
-            var s: u32 = 0;
-            while (s < a.submesh_count) : (s += 1) {
+            var s: u32 = s_lo_main;
+            while (s < s_hi_main) : (s += 1) {
                 if (s >= max_submesh) break;
                 const sub1 = a.submesh(s);
                 if (sub1.alpha_mode == 1) continue; // Pass 1 = opaque + mask (skip blend)
@@ -2033,8 +2097,8 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         const tidx = &inst.tidx;
         const tkey = &inst.tkey;
         {
-            var s: u32 = 0;
-            while (s < a.submesh_count) : (s += 1) {
+            var s: u32 = s_lo_main;
+            while (s < s_hi_main) : (s += 1) {
                 if (s >= max_submesh) break;
                 if (a.submesh(s).alpha_mode != 1) continue;
                 if (!visibleAfterCull(inst, planes, s)) {
@@ -2152,6 +2216,22 @@ export fn glscene_cull_stats() u32 {
         ((inst.cull_main_culled & 0xff) << 8) |
         ((inst.cull_shadow_drawn & 0xff) << 16) |
         ((inst.cull_shadow_culled & 0xff) << 24);
+}
+
+/// LOD stats — active level + total level count + active submesh count packed into u32.
+///
+/// Encoding:
+///   bits  7:0  — lod_active (active LOD level index)
+///   bits 15:8  — lod_level_count (0 = no LOD)
+///   bits 31:16 — active submesh count for the active level (0 when no LOD)
+///
+/// Returns 0 when no instance is selected.
+export fn glscene_lod_stats() u32 {
+    const inst = current orelse return 0;
+    const cnt: u32 = if (inst.lod_level_count > 0) inst.lod_count[inst.lod_active] else 0;
+    return (inst.lod_active & 0xff) |
+        ((inst.lod_level_count & 0xff) << 8) |
+        ((cnt & 0xffff) << 16);
 }
 
 // ── /gl-morph runtime controls ────────────────────────────────────────────────

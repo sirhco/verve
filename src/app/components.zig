@@ -2331,6 +2331,32 @@ pub fn pushMulti(ctx: *const verve.Context) !*verve.Node {
     }).build();
 }
 
+/// /gl-lod: distance-based LOD demo — three UV-sphere LOD levels embedded in a
+/// single vmesh v15. The HUD shows active LOD level and submesh count. Zoom out
+/// to trigger transitions: LOD 0 (nearest/high-poly) → LOD 1 → LOD 2 (far/low-poly).
+/// The scene starts close so LOD 0 is active; scroll/zoom out crosses the thresholds.
+pub fn glSceneLod(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/lodsphere.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3ELOD%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 2.5, .pitch = 0.3, .yaw = 0.5 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .build();
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — distance-based LOD"),
+        ctx.p().text("Three UV-sphere LOD levels packed into a single vmesh v15. " ++
+            "The runtime picks the active level by squared camera distance: " ++
+            "LOD 0 = ~2048 tri (close), LOD 1 = ~128 tri (medium), LOD 2 = ~32 tri (far)."),
+        ctx.div().attr("data-ref", "gllod-hud").class("hint"),
+        scene,
+        ctx.p().text("Wheel to zoom · watch the HUD. The silhouette visibly coarsens " ++
+            "as you zoom out past the LOD 1 and LOD 2 thresholds."),
+    });
+}
+
 pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
     // Provide a default title only if the page didn't set one of its own.
     try ctx.setTitleIfUnset("Verve");

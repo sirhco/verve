@@ -72,6 +72,7 @@ pub const Model = struct {
     // arena-allocated (f16 bytes). weight_clip is the first weights animation
     // channel, or null.
     morph: ?vmesh.MorphData = null,
+    lod: ?vmesh.LodData = null,
 
     pub fn deinit(self: *Model) void {
         self.arena.deinit();
@@ -106,6 +107,7 @@ pub fn toVmesh(alloc: std.mem.Allocator, glb_bytes: []const u8) ![]u8 {
         model.instances,
         model.instance_count,
         model.morph,
+        model.lod,
     );
 }
 
@@ -1251,6 +1253,44 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         break; // first EXT node wins
     }
 
+    // ── 7b-lod. _lodN grouping ────────────────────────────────────────────────
+    // Scan submesh names for _lod{N} suffix. If found, build a LodData.
+    var lod_data_opt: ?vmesh.LodData = null;
+    {
+        var found_any_lod = false;
+        for (name_list.items) |nm| {
+            if (lodLevelFromName(nm) >= 0) { found_any_lod = true; break; }
+        }
+        if (found_any_lod) {
+            var levels_buf: [8]vmesh.LodLevel = undefined;
+            var n_levels: u32 = 0;
+            var si: u32 = 0;
+            while (si < @as(u32, @intCast(name_list.items.len))) {
+                const lvl = lodLevelFromName(name_list.items[si]);
+                if (lvl < 0) { si += 1; continue; }
+                const first = si;
+                var count: u32 = 0;
+                while (si < @as(u32, @intCast(name_list.items.len)) and lodLevelFromName(name_list.items[si]) == lvl) {
+                    si += 1;
+                    count += 1;
+                }
+                if (n_levels < 8) {
+                    const lf: f32 = @floatFromInt(lvl);
+                    levels_buf[n_levels] = .{
+                        .dist_min_sq = lf * lf * 100.0,
+                        .submesh_first = first,
+                        .submesh_count = count,
+                    };
+                    n_levels += 1;
+                }
+            }
+            if (n_levels > 0) {
+                const lvls = try aa.dupe(vmesh.LodLevel, levels_buf[0..n_levels]);
+                lod_data_opt = vmesh.LodData{ .levels = lvls };
+            }
+        }
+    }
+
     // ── 8. Package Model ───────────────────────────────────────────────────────
     return Model{
         .arena = arena,
@@ -1268,10 +1308,24 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         .instance_count = inst_count,
         .instances = inst_slice,
         .morph = morph_data,
+        .lod = lod_data_opt,
     };
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────
+
+/// Returns the LOD level N from a name ending in `_lodN` (0..7), or -1 if not a LOD name.
+fn lodLevelFromName(nm: []const u8) i32 {
+    if (nm.len < 5) return -1;
+    var i: usize = nm.len - 1;
+    while (i >= 4) : (i -= 1) {
+        if (std.ascii.isDigit(nm[i]) and std.mem.eql(u8, nm[i - 4 .. i], "_lod")) {
+            return @intCast(nm[i] - '0');
+        }
+        if (i == 0) break;
+    }
+    return -1;
+}
 
 /// Get a typed integer from a json.Value (integer or float that is whole).
 fn jsonInt(v: std.json.Value) ?i64 {
@@ -1851,6 +1905,7 @@ test "parse pbrCubeMixedMaterialGlb: 2 submeshes, variant fan-out (full vs base-
         null,
         &.{},
         0,
+        null,
         null,
     );
     defer testing.allocator.free(bytes);
@@ -2557,6 +2612,7 @@ test "gltf parses EXT_mesh_gpu_instancing" {
         model.instances,
         model.instance_count,
         null,
+        null,
     );
     defer alloc.free(vmesh_bytes);
     const r = try vmesh.Reader.init(vmesh_bytes);
@@ -2786,6 +2842,7 @@ test "gl_asset_gen path: morphDemoGlb morph section survives parseGlb + pack (C1
         model.instances,
         model.instance_count,
         model.morph, // must NOT be null — this is what C1 broke
+        model.lod,
     );
     defer testing.allocator.free(bytes);
     var r = try vmesh.Reader.init(bytes);
@@ -2803,9 +2860,9 @@ test "glTF morph TANGENT accessor (v14): nonzero tangent deltas survive parseGlb
     const bytes = try toVmesh(testing.allocator, glb);
     defer testing.allocator.free(bytes);
     var r = try vmesh.Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 14), r.fileVersion());
+    try testing.expectEqual(@as(u32, 15), r.fileVersion());
     try testing.expectEqual(@as(u32, 1), r.morphTargetCount());
-    // morphDeltas() must have 9-f16 stride (v14).
+    // morphDeltas() must have 9-f16 stride (v14/v15).
     const vc = r.morphVertexCount();
     try testing.expectEqual(@as(usize, 1 * @as(usize, vc) * 9 * @sizeOf(f16)), r.morphDeltas().len);
     // Target 0, vertex 0: tangent delta (bytes 12-13) must be nonzero (fixture sets 0.75).

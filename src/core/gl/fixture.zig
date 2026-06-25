@@ -2618,7 +2618,7 @@ test "windFarmGlb .vmesh asset exposes turbineN/rotorN names the pick maps on" {
     defer model.deinit();
     var br = try bvh.build(a, model.vertices, 12, model.indices);
     defer br.deinit(a);
-    const bytes = try vmesh.pack(a, model.vertices, model.indices, model.submeshes, model.textures, br.nodes, br.tri_perm, model.names, model.skinned, model.joints, model.weights, model.skel, if (model.anim_clips.len == 0) null else vmesh.Anims{ .clips = model.anim_clips }, &.{}, 0, null);
+    const bytes = try vmesh.pack(a, model.vertices, model.indices, model.submeshes, model.textures, br.nodes, br.tri_perm, model.names, model.skinned, model.joints, model.weights, model.skel, if (model.anim_clips.len == 0) null else vmesh.Anims{ .clips = model.anim_clips }, &.{}, 0, null, null);
     defer a.free(bytes);
     const reader = try vmesh.Reader.init(bytes);
     // Every turbine id 0..3 must be reachable from BOTH a turbine* and a rotor*
@@ -4626,6 +4626,7 @@ test "skinmorphBarGlb: vmesh round-trip preserves both skin and morph sections" 
         &.{},
         0,
         model.morph,
+        model.lod,
     );
     defer testing.allocator.free(vmesh_bytes);
 
@@ -4669,4 +4670,122 @@ test "cubeFieldGlb: 256 instances round-trip via EXT_mesh_gpu_instancing" {
     try testing.expectEqual(@as(u32, 256), model.instance_count);
     // first and last instance colors differ (varied field)
     try testing.expect(model.instances.len == 256 * 20);
+}
+
+// ── lodGlb fixture ────────────────────────────────────────────────────────────
+
+/// Minimal GLB with 3 meshes named "sphere_lod0", "sphere_lod1", "sphere_lod2".
+/// Each mesh has 1 primitive (a single triangle) for testing _lodN LOD grouping.
+pub fn lodGlb(alloc: Allocator) ![]u8 {
+    const positions = [_]f32{ -1, 0, 0, 1, 0, 0, 0, 1, 0 };
+    const normals = [_]f32{ 0, 0, 1, 0, 0, 1, 0, 0, 1 };
+    const uvs = [_]f32{ 0, 0, 1, 0, 0.5, 1 };
+    const indices = [_]u16{ 0, 1, 2 };
+
+    const pos_off: u32 = 0;
+    const pos_len: u32 = 3 * 3 * 4; // 36 B
+    const nrm_off: u32 = pos_off + pos_len;
+    const nrm_len: u32 = 3 * 3 * 4; // 36 B
+    const uv_off: u32 = nrm_off + nrm_len;
+    const uv_len: u32 = 3 * 2 * 4; // 24 B
+    const idx_off: u32 = uv_off + uv_len;
+    const idx_len: u32 = 3 * 2; // 6 B
+    const bin_total: u32 = idx_off + idx_len;
+    const bin_padded: u32 = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    @memcpy(bin[pos_off..][0..pos_len], std.mem.sliceAsBytes(&positions));
+    @memcpy(bin[nrm_off..][0..nrm_len], std.mem.sliceAsBytes(&normals));
+    @memcpy(bin[uv_off..][0..uv_len], std.mem.sliceAsBytes(&uvs));
+    @memcpy(bin[idx_off..][0..idx_len], std.mem.sliceAsBytes(&indices));
+
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    try w.writeAll("{");
+    try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0,1,2]}],");
+    try w.writeAll("\"nodes\":[");
+    try w.writeAll("{\"mesh\":0,\"name\":\"sphere_lod0\"},");
+    try w.writeAll("{\"mesh\":1,\"name\":\"sphere_lod1\"},");
+    try w.writeAll("{\"mesh\":2,\"name\":\"sphere_lod2\"}");
+    try w.writeAll("],");
+    try w.writeAll("\"meshes\":[");
+    const level_names = [_][]const u8{ "sphere_lod0", "sphere_lod1", "sphere_lod2" };
+    for (0..3) |mi| {
+        if (mi > 0) try w.writeByte(',');
+        try w.print("{{\"name\":\"{s}\",\"primitives\":[{{\"attributes\":{{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2}},\"indices\":3,\"material\":0}}]}}", .{level_names[mi]});
+    }
+    try w.writeAll("],");
+    try w.writeAll("\"accessors\":[");
+    try w.print("{{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\",\"min\":[-1.0,0.0,0.0],\"max\":[1.0,1.0,0.0]}},", .{});
+    try w.print("{{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}},", .{});
+    try w.print("{{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}},", .{});
+    try w.print("{{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}}", .{});
+    try w.writeAll("],");
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ pos_off, pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ nrm_off, nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ uv_off, uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}}", .{ idx_off, idx_len });
+    try w.writeAll("],");
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1.0,1.0,1.0,1.0],\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42;
+    glb[goff + 1] = 0x49;
+    glb[goff + 2] = 0x4E;
+    glb[goff + 3] = 0x00;
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+    return glb;
+}
+
+test "lodGlb: 3 LOD meshes → lodLevelCount == 3 after parseGlb + pack" {
+    const glb = try lodGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try gltf_mod.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    try testing.expect(model.lod != null);
+    try testing.expectEqual(@as(usize, 3), model.lod.?.levels.len);
+    try testing.expectEqual(@as(f32, 0), model.lod.?.levels[0].dist_min_sq);
+    const anim: ?vmesh.Anims = if (model.anim_clips.len > 0) .{ .clips = model.anim_clips } else null;
+    const bytes = try vmesh.pack(
+        testing.allocator, model.vertices, model.indices, model.submeshes,
+        model.textures, &.{}, &.{}, model.names, model.skinned,
+        model.joints, model.weights, model.skel, anim,
+        model.instances, model.instance_count, model.morph, model.lod,
+    );
+    defer testing.allocator.free(bytes);
+    const r = try vmesh.Reader.init(bytes);
+    try testing.expectEqual(@as(u32, 3), r.lodLevelCount());
+    try testing.expectEqual(@as(u32, 0), r.lodLevel(0).submesh_first);
 }
