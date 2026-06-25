@@ -401,6 +401,28 @@ pub fn build(b: *std.Build) void {
     const skin_dir = gl_asset_gen_skin_run.addOutputDirectoryArg("skinbar");
     gl_asset_gen_skin_run.addArg("skinbar");
 
+    // Combined skinned+morph asset (/gl-skin-morph route, slice 3).
+    // gen_skinmorph_glb → skinmorph.glb → gl_asset_gen → skinmorph.vmesh.
+    const gen_skinmorph_glb_mod = b.createModule(.{
+        .root_source_file = b.path("tools/gen_skinmorph_glb.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "verve_gl", .module = host_gl_mod },
+        },
+    });
+    const gen_skinmorph_glb_exe = b.addExecutable(.{
+        .name = "verve-gen-skinmorph-glb",
+        .root_module = gen_skinmorph_glb_mod,
+    });
+    const gen_skinmorph_glb_run = b.addRunArtifact(gen_skinmorph_glb_exe);
+    const skinmorph_glb_path = gen_skinmorph_glb_run.addOutputFileArg("skinmorph.glb");
+
+    const gl_asset_gen_skinmorph_run = b.addRunArtifact(gl_asset_gen_exe);
+    gl_asset_gen_skinmorph_run.addFileArg(skinmorph_glb_path);
+    const skinmorph_dir = gl_asset_gen_skinmorph_run.addOutputDirectoryArg("skinmorph");
+    gl_asset_gen_skinmorph_run.addArg("skinmorph");
+
     // Wind-farm asset: gen_windfarm_glb → windfarm.glb → gl_asset_gen → windfarm.vmesh.
     const gen_windfarm_glb_mod = b.createModule(.{
         .root_source_file = b.path("tools/gen_windfarm_glb.zig"),
@@ -586,6 +608,7 @@ pub fn build(b: *std.Build) void {
     _ = wf_gl.addCopyFile(cutout_dir.path(b, "cutout.tex0.png"), "cutout.tex0.png");
     _ = wf_gl.addCopyFile(shadow_dir.path(b, "shadow.vmesh"), "shadow.vmesh");
     _ = wf_gl.addCopyFile(skin_dir.path(b, "skinbar.vmesh"), "skinbar.vmesh");
+    _ = wf_gl.addCopyFile(skinmorph_dir.path(b, "skinmorph.vmesh"), "skinmorph.vmesh");
     _ = wf_gl.addCopyFile(windfarm_dir.path(b, "windfarm.vmesh"), "windfarm.vmesh");
     _ = wf_gl.addCopyFile(double_dir.path(b, "double.vmesh"), "double.vmesh");
     _ = wf_gl.addCopyFile(cubegrid_dir.path(b, "cubegrid.vmesh"), "cubegrid.vmesh");
@@ -606,6 +629,7 @@ pub fn build(b: *std.Build) void {
         \\    .{ .name = "cutout.tex0.png", .bytes = @embedFile("cutout.tex0.png") },
         \\    .{ .name = "shadow.vmesh", .bytes = @embedFile("shadow.vmesh") },
         \\    .{ .name = "skinbar.vmesh", .bytes = @embedFile("skinbar.vmesh") },
+        \\    .{ .name = "skinmorph.vmesh", .bytes = @embedFile("skinmorph.vmesh") },
         \\    .{ .name = "windfarm.vmesh", .bytes = @embedFile("windfarm.vmesh") },
         \\    .{ .name = "double.vmesh", .bytes = @embedFile("double.vmesh") },
         \\    .{ .name = "cubegrid.vmesh", .bytes = @embedFile("cubegrid.vmesh") },

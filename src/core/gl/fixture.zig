@@ -4187,6 +4187,333 @@ pub fn morphDemo16Glb(alloc: Allocator) ![]u8 {
     return glb;
 }
 
+// ── skinmorphBarGlb fixture ───────────────────────────────────────────────────
+
+/// A skinned bar that ALSO carries 1 morph target ("Bulge").
+/// Same geometry as skinnedBarGlb (40 verts / 96 indices / 3-joint chain) but
+/// adds a morph POSITION+NORMAL target that pushes each vertex outward along its
+/// face normal by 0.3 units, and a LINEAR weight animation [0.0→1.0] over 1 s.
+/// Used by gen_skinmorph_glb.zig → gl_asset_gen → skinmorph.vmesh.
+/// The fixture proves parseGlb populates BOTH model.skinned AND model.morph.
+pub fn skinmorphBarGlb(alloc: Allocator) ![]u8 {
+    const half: f32 = 0.3;
+    const nr: usize = 5;
+    const ring_y = [nr]f32{ 0.0, 0.75, 1.5, 2.25, 3.0 };
+    const RingSkin = struct { j0: u8, w0: f32, j1: u8, w1: f32 };
+    const ring_skin = [nr]RingSkin{
+        .{ .j0 = 0, .w0 = 1.0, .j1 = 0, .w1 = 0.0 },
+        .{ .j0 = 0, .w0 = 0.5, .j1 = 1, .w1 = 0.5 },
+        .{ .j0 = 1, .w0 = 1.0, .j1 = 1, .w1 = 0.0 },
+        .{ .j0 = 1, .w0 = 0.5, .j1 = 2, .w1 = 0.5 },
+        .{ .j0 = 2, .w0 = 1.0, .j1 = 2, .w1 = 0.0 },
+    };
+    const Side = struct { lx: f32, lz: f32, rx: f32, rz: f32, nx: f32, nz: f32 };
+    const sides = [4]Side{
+        .{ .lx = half, .lz = half, .rx = -half, .rz = half, .nx = 0, .nz = 1 },
+        .{ .lx = -half, .lz = half, .rx = -half, .rz = -half, .nx = -1, .nz = 0 },
+        .{ .lx = -half, .lz = -half, .rx = half, .rz = -half, .nx = 0, .nz = -1 },
+        .{ .lx = half, .lz = -half, .rx = half, .rz = half, .nx = 1, .nz = 0 },
+    };
+
+    const vert_count: u32 = 4 * @as(u32, nr) * 2; // 40
+    const index_count: u32 = 4 * (@as(u32, nr) - 1) * 6; // 96
+    const joint_count: u32 = 3;
+    const morph_delta: f32 = 0.3; // outward bulge magnitude
+
+    // PNG
+    var checker: [8 * 8 * 4]u8 = undefined;
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            const light = (row + col) % 2 == 0;
+            checker[idx + 0] = if (light) 200 else 100;
+            checker[idx + 1] = if (light) 200 else 100;
+            checker[idx + 2] = if (light) 240 else 180;
+            checker[idx + 3] = 255;
+        }
+    }
+    const png_bytes = try png.encodeRgba(alloc, &checker, 8, 8);
+    defer alloc.free(png_bytes);
+
+    // ── BIN layout ──────────────────────────────────────────────────────────────
+    const off_pos: u32 = 0;
+    const len_pos: u32 = vert_count * 12;
+    const off_nrm: u32 = off_pos + len_pos;
+    const len_nrm: u32 = vert_count * 12;
+    const off_uv: u32 = off_nrm + len_nrm;
+    const len_uv: u32 = vert_count * 8;
+    const off_jnt: u32 = off_uv + len_uv;
+    const len_jnt: u32 = vert_count * 4;
+    const off_wgt: u32 = off_jnt + len_jnt;
+    const len_wgt: u32 = vert_count * 16;
+    const off_idx: u32 = off_wgt + len_wgt;
+    const len_idx: u32 = index_count * 2;
+    const off_ibm: u32 = off_idx + len_idx;
+    const len_ibm: u32 = joint_count * 64;
+    // morph target 0: POSITION deltas (VEC3 f32) + NORMAL deltas (VEC3 f32)
+    const off_mt0pos: u32 = off_ibm + len_ibm;
+    const len_mt0pos: u32 = vert_count * 12;
+    const off_mt0nrm: u32 = off_mt0pos + len_mt0pos;
+    const len_mt0nrm: u32 = vert_count * 12;
+    // weight animation: 2 time keyframes + 2 weight values (LINEAR)
+    const off_wtimes: u32 = off_mt0nrm + len_mt0nrm;
+    const len_wtimes: u32 = 2 * 4; // 2 × f32
+    const off_wwts: u32 = off_wtimes + len_wtimes;
+    const len_wwts: u32 = 2 * 4; // 2 × f32 (weights for 1 target)
+    // skin anim times + jmid rot
+    const off_atime: u32 = off_wwts + len_wwts;
+    const len_atime: u32 = 3 * 4;
+    const off_arot: u32 = off_atime + len_atime;
+    const len_arot: u32 = 3 * 4 * 4;
+    // PNG
+    const off_png: u32 = off_arot + len_arot;
+    const png_len: u32 = @intCast(png_bytes.len);
+
+    const bin_total: u32 = off_png + png_len;
+    const bin_padded = (bin_total + 3) & ~@as(u32, 3);
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // write f32 helper
+    const wf = struct {
+        fn w(b: []u8, off: usize, v: f32) void {
+            std.mem.writeInt(u32, b[off..][0..4], @bitCast(v), .little);
+        }
+    }.w;
+
+    // positions / normals / uvs / joints / weights + morph deltas
+    var pc: usize = off_pos;
+    var nc: usize = off_nrm;
+    var uc: usize = off_uv;
+    var jc: usize = off_jnt;
+    var wc: usize = off_wgt;
+    var mc: usize = off_mt0pos; // morph pos deltas
+    var mn: usize = off_mt0nrm; // morph nrm deltas
+    for (sides) |s| {
+        for (0..nr) |r| {
+            const y = ring_y[r];
+            const rs = ring_skin[r];
+            const cols = [2][2]f32{ .{ s.lx, s.lz }, .{ s.rx, s.rz } };
+            for (cols, 0..) |c, col| {
+                wf(bin, pc + 0, c[0]); wf(bin, pc + 4, y); wf(bin, pc + 8, c[1]); pc += 12;
+                wf(bin, nc + 0, s.nx); wf(bin, nc + 4, 0); wf(bin, nc + 8, s.nz); nc += 12;
+                wf(bin, uc + 0, @floatFromInt(col)); wf(bin, uc + 4, y / 3.0); uc += 8;
+                bin[jc + 0] = rs.j0; bin[jc + 1] = rs.j1; bin[jc + 2] = 0; bin[jc + 3] = 0; jc += 4;
+                wf(bin, wc + 0, rs.w0); wf(bin, wc + 4, rs.w1); wf(bin, wc + 8, 0); wf(bin, wc + 12, 0); wc += 16;
+                // morph target 0: outward bulge along face normal
+                wf(bin, mc + 0, s.nx * morph_delta); wf(bin, mc + 4, 0); wf(bin, mc + 8, s.nz * morph_delta); mc += 12;
+                // normal delta: same direction (push outward)
+                wf(bin, mn + 0, s.nx * 0.5); wf(bin, mn + 4, 0); wf(bin, mn + 8, s.nz * 0.5); mn += 12;
+            }
+        }
+    }
+
+    // indices
+    var ic: usize = off_idx;
+    for (0..4) |side| {
+        const base: u16 = @intCast(side * nr * 2);
+        for (0..nr - 1) |r| {
+            const bl: u16 = base + @as(u16, @intCast(r * 2 + 0));
+            const br: u16 = base + @as(u16, @intCast(r * 2 + 1));
+            const tr: u16 = base + @as(u16, @intCast((r + 1) * 2 + 1));
+            const tl: u16 = base + @as(u16, @intCast((r + 1) * 2 + 0));
+            for ([6]u16{ bl, br, tr, bl, tr, tl }) |v| {
+                std.mem.writeInt(u16, bin[ic..][0..2], v, .little);
+                ic += 2;
+            }
+        }
+    }
+
+    // inverseBindMatrices
+    const inv_y = [joint_count]f32{ 0.0, -1.5, -3.0 };
+    for (inv_y, 0..) |ty, j| {
+        const mo = off_ibm + @as(u32, @intCast(j)) * 64;
+        var m = [16]f32{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+        m[13] = ty;
+        inline for (0..16) |k| wf(bin, mo + k * 4, m[k]);
+    }
+
+    // morph weight animation: [0.0, 1.0] seconds → [0.0, 1.0] weight
+    wf(bin, off_wtimes + 0, 0.0);
+    wf(bin, off_wtimes + 4, 1.0);
+    wf(bin, off_wwts + 0, 0.0); // weight at t=0
+    wf(bin, off_wwts + 4, 1.0); // weight at t=1
+
+    // skin animation: bend jmid (id → rotZ(0.7) → id)
+    const a_times = [3]f32{ 0.0, 0.5, 1.0 };
+    for (a_times, 0..) |tv, i| wf(bin, off_atime + i * 4, tv);
+    const a_half: f32 = 0.7 * 0.5;
+    const a_sin = @sin(a_half);
+    const a_cos = @cos(a_half);
+    const a_quats = [3][4]f32{ .{ 0, 0, 0, 1 }, .{ 0, 0, a_sin, a_cos }, .{ 0, 0, 0, 1 } };
+    for (a_quats, 0..) |q, i| {
+        const base = off_arot + @as(u32, @intCast(i)) * 16;
+        inline for (0..4) |c2| wf(bin, base + c2 * 4, q[c2]);
+    }
+
+    @memcpy(bin[off_png..][0..png_len], png_bytes);
+
+    // ── JSON ────────────────────────────────────────────────────────────────────
+    //
+    // Accessor indices (0-based):
+    //  0 = POSITION,  1 = NORMAL,    2 = TEXCOORD_0
+    //  3 = JOINTS_0,  4 = WEIGHTS_0, 5 = indices
+    //  6 = inverseBindMatrices
+    //  7 = morph target 0 POSITION deltas
+    //  8 = morph target 0 NORMAL deltas
+    //  9 = weight anim times (2 SCALAR)
+    // 10 = weight anim values (2 SCALAR)
+    // 11 = skin anim times (3 SCALAR)
+    // 12 = skin anim rotations (3 VEC4)
+    //
+    // bufferView indices mirror accessor order (1:1 for simplicity).
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    try w.writeAll("{\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"scene\":0,\"scenes\":[{\"nodes\":[0,1]}],");
+    try w.writeAll("\"nodes\":[");
+    try w.writeAll("{\"mesh\":0,\"skin\":0,\"name\":\"SkinMorphBar\"},");
+    try w.writeAll("{\"name\":\"jroot\",\"translation\":[0.0,0.0,0.0],\"children\":[2]},");
+    try w.writeAll("{\"name\":\"jmid\",\"translation\":[0.0,1.5,0.0],\"children\":[3]},");
+    try w.writeAll("{\"name\":\"jtop\",\"translation\":[0.0,1.5,0.0]}");
+    try w.writeAll("],");
+    try w.writeAll("\"skins\":[{\"joints\":[1,2,3],\"inverseBindMatrices\":6}],");
+    try w.writeAll("\"meshes\":[{\"name\":\"SkinMorphBar\",");
+    try w.writeAll("\"extras\":{\"targetNames\":[\"Bulge\"]},");
+    try w.writeAll("\"primitives\":[{\"attributes\":{");
+    try w.writeAll("\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2,\"JOINTS_0\":3,\"WEIGHTS_0\":4");
+    try w.writeAll("},\"indices\":5,\"material\":0,");
+    try w.writeAll("\"targets\":[{\"POSITION\":7,\"NORMAL\":8}]}]}],");
+
+    // accessors
+    try w.writeAll("\"accessors\":[");
+    try w.print("{{\"bufferView\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{vert_count});
+    try w.print("{{\"bufferView\":1,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{vert_count});
+    try w.print("{{\"bufferView\":2,\"componentType\":5126,\"count\":{d},\"type\":\"VEC2\"}},", .{vert_count});
+    try w.print("{{\"bufferView\":3,\"componentType\":5121,\"count\":{d},\"type\":\"VEC4\"}},", .{vert_count});
+    try w.print("{{\"bufferView\":4,\"componentType\":5126,\"count\":{d},\"type\":\"VEC4\"}},", .{vert_count});
+    try w.print("{{\"bufferView\":5,\"componentType\":5123,\"count\":{d},\"type\":\"SCALAR\"}},", .{index_count});
+    try w.print("{{\"bufferView\":6,\"componentType\":5126,\"count\":{d},\"type\":\"MAT4\"}},", .{joint_count});
+    try w.print("{{\"bufferView\":7,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{vert_count});
+    try w.print("{{\"bufferView\":8,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{vert_count});
+    try w.writeAll("{\"bufferView\":9,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},"); // 9 wt times
+    try w.writeAll("{\"bufferView\":10,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\"},"); // 10 wt values
+    try w.writeAll("{\"bufferView\":11,\"componentType\":5126,\"count\":3,\"type\":\"SCALAR\"},"); // 11 skin times
+    try w.writeAll("{\"bufferView\":12,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"}"); // 12 skin rot
+    try w.writeAll("],");
+
+    // bufferViews
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_pos, len_pos });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_nrm, len_nrm });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_uv, len_uv });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_jnt, len_jnt });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_wgt, len_wgt });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d},\"target\":34963}},", .{ off_idx, len_idx });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_ibm, len_ibm });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_mt0pos, len_mt0pos });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_mt0nrm, len_mt0nrm });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_wtimes, len_wtimes });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_wwts, len_wwts });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_atime, len_atime });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_arot, len_arot });
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.8,0.8,1.0,1.0],\"metallicFactor\":0.0,\"roughnessFactor\":0.6}}],");
+
+    // animations:
+    //  0 = SkinMorphAnim: both skin bend + morph weight animated simultaneously
+    try w.writeAll("\"animations\":[{\"name\":\"SkinMorphAnim\",");
+    try w.writeAll("\"channels\":[");
+    // morph weights channel
+    try w.writeAll("{\"sampler\":0,\"target\":{\"node\":0,\"path\":\"weights\"}},");
+    // skin bend channel (jmid rotation)
+    try w.writeAll("{\"sampler\":1,\"target\":{\"node\":2,\"path\":\"rotation\"}}");
+    try w.writeAll("],");
+    try w.writeAll("\"samplers\":[");
+    try w.writeAll("{\"input\":9,\"output\":10,\"interpolation\":\"LINEAR\"},");
+    try w.writeAll("{\"input\":11,\"output\":12,\"interpolation\":\"LINEAR\"}");
+    try w.writeAll("]}]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF"); goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little); goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little); goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little); goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON"); goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes); goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little); goff += 4;
+    glb[goff] = 0x42; glb[goff + 1] = 0x49; glb[goff + 2] = 0x4E; glb[goff + 3] = 0x00;
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+    return glb;
+}
+
+// ── skinmorphBarGlb fixture tests ─────────────────────────────────────────────
+
+test "skinmorphBarGlb: both skinned=true AND morphTargetCount>0" {
+    const glb = try skinmorphBarGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try gltf_mod.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    // Must have BOTH skin AND morph.
+    try testing.expect(model.skinned);
+    try testing.expectEqual(@as(usize, 3), model.skel.len);
+    try testing.expect(model.morph != null);
+    try testing.expectEqual(@as(u32, 1), model.morph.?.target_count);
+}
+
+test "skinmorphBarGlb: vmesh round-trip preserves both skin and morph sections" {
+    const glb = try skinmorphBarGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try gltf_mod.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+
+    var br = try bvh.build(testing.allocator, model.vertices, 12, model.indices);
+    defer br.deinit(testing.allocator);
+
+    const vmesh_bytes = try vmesh.pack(
+        testing.allocator,
+        model.vertices,
+        model.indices,
+        model.submeshes,
+        model.textures,
+        br.nodes,
+        br.tri_perm,
+        model.names,
+        model.skinned,
+        model.joints,
+        model.weights,
+        model.skel,
+        if (model.anim_clips.len == 0) null else vmesh.Anims{ .clips = model.anim_clips },
+        &.{},
+        0,
+        model.morph,
+    );
+    defer testing.allocator.free(vmesh_bytes);
+
+    var r = try vmesh.Reader.init(vmesh_bytes);
+    // Both skin and morph must be present.
+    try testing.expect(r.jointCount() > 0);
+    try testing.expectEqual(@as(u32, 3), r.jointCount());
+    try testing.expect(r.morphTargetCount() > 0);
+    try testing.expectEqual(@as(u32, 1), r.morphTargetCount());
+    try testing.expectEqual(@as(u32, 40), r.morphVertexCount()); // 40 verts
+    try testing.expect(r.morphDeltas().len > 0);
+}
+
 // ── morphDemoGlb tests ────────────────────────────────────────────────────────
 
 test "morphDemoGlb: parses as valid glb with 3 targets" {

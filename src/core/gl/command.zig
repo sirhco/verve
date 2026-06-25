@@ -400,6 +400,29 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    // Combined skinned+morph body_open: morph deltas FIRST (local pos/normal),
+    // then the skin matrix transforms the morphed locals.
+    const body_open_skinned_morph =
+        \\void main() {
+        \\  vec3 m_pos = a_pos;
+        \\  vec3 m_nrm = a_normal;
+        \\  for (int i = 0; i < u_morph_count; i++) {
+        \\    int t = u_morph_idx[i];
+        \\    float w = u_morph_wt[i];
+        \\    m_pos += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t), 0).xyz;
+        \\    m_nrm += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t + 1), 0).xyz;
+        \\  }
+        \\  mat4 skin = a_weights.x * u_bones[a_joints.x] + a_weights.y * u_bones[a_joints.y] + a_weights.z * u_bones[a_joints.z] + a_weights.w * u_bones[a_joints.w];
+        \\  v_world_pos = (u_model * (skin * vec4(m_pos, 1.0))).xyz;
+        \\  v_normal = u_normal_mat * (mat3(skin) * m_nrm);
+        \\  v_uv = a_uv;
+        \\
+    ;
+    const body_close_skinned_morph =
+        \\  gl_Position = u_mvp * (skin * vec4(m_pos, 1.0));
+        \\}
+        \\
+    ;
     // Shadow receiver (variant_shadow): light-space positions are computed per
     // caster IN THE FRAGMENT shader from v_world_pos and u_shadow_vp[slot], so the
     // vertex stage carries NO shadow uniform or varying anymore.
@@ -436,11 +459,12 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         src = src ++ inst_body;
         return src;
     }
-    if (morphed and skinned) @compileError("variant_morph + variant_skinned not supported this slice");
     if (flags & variant_normal_map != 0) src = src ++ nm_outs;
     if (skinned) src = src ++ skin_decl;
     if (morphed) src = src ++ morph_uniforms;
-    if (morphed) {
+    if (morphed and skinned) {
+        src = src ++ body_open_skinned_morph;
+    } else if (morphed) {
         src = src ++ body_open_morph;
     } else if (skinned) {
         src = src ++ body_open_skinned;
@@ -448,7 +472,9 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         src = src ++ body_open;
     }
     if (flags & variant_normal_map != 0) src = src ++ (if (skinned) nm_body_skinned else nm_body);
-    if (morphed) {
+    if (morphed and skinned) {
+        src = src ++ body_close_skinned_morph;
+    } else if (morphed) {
         src = src ++ body_close_morph;
     } else if (skinned) {
         src = src ++ body_close_skinned;
@@ -1861,6 +1887,35 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    // Combined skinned+morph vs head: morph deltas FIRST, then skin. Defines
+    // `skin` and `sp = skin * morphed_pos` so vs_nm_skinned + vs_tail_skinned reuse.
+    const vs_head_skinned_morph =
+        \\@vertex
+        \\fn vs_main(
+        \\  @location(0) a_pos: vec3<f32>,
+        \\  @location(1) a_normal: vec3<f32>,
+        \\  @location(2) a_tangent: vec4<f32>,
+        \\  @location(3) a_uv: vec2<f32>,
+        \\  @location(4) a_joints: vec4<u32>,
+        \\  @location(5) a_weights: vec4<f32>,
+        \\  @builtin(vertex_index) vtx_index: u32,
+        \\) -> VSOut {
+        \\  var out: VSOut;
+        \\  var m_pos = a_pos;
+        \\  var m_nrm = a_normal;
+        \\  for (var i = 0; i < morph.count; i = i + 1) {
+        \\    let t = morph.idx[i / 4][i % 4];
+        \\    let w = morph.wt[i / 4][i % 4];
+        \\    m_pos = m_pos + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 2 * t), 0).xyz;
+        \\    m_nrm = m_nrm + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 2 * t + 1), 0).xyz;
+        \\  }
+        \\  let skin = a_weights.x * bones.m[a_joints.x] + a_weights.y * bones.m[a_joints.y] + a_weights.z * bones.m[a_joints.z] + a_weights.w * bones.m[a_joints.w];
+        \\  let sp = skin * vec4<f32>(m_pos, 1.0);
+        \\  out.world_pos = (u.model * sp).xyz;
+        \\  out.normal = u.normal_mat * (mat3x3<f32>(skin[0].xyz, skin[1].xyz, skin[2].xyz) * m_nrm);
+        \\  out.uv = a_uv;
+        \\
+    ;
     // Instanced vs_main: reads per-instance mat4 model (col-major rows at loc 4-7)
     // + per-instance color (loc 8); reconstructs model, transforms position/normal,
     // writes inst_color varying. u.vp (view-proj) replaces u.mvp + u.model.
@@ -2290,7 +2345,6 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const lin = flags & variant_linear_output != 0;
     const ds = flags & variant_double_sided != 0;
     const inst = flags & variant_instanced != 0;
-    if (morphed and skinned) @compileError("variant_morph + variant_skinned not supported this slice");
     comptime var src: []const u8 = uniforms_head;
     if (shadow) src = src ++ uniforms_shadow;
     if (inst) src = src ++ uniforms_vp;
@@ -2311,7 +2365,11 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ vsout_tail;
     if (inst) {
         src = src ++ vs_head_instanced;
-    } else if (morphed and !skinned) {
+    } else if (morphed and skinned) {
+        src = src ++ vs_head_skinned_morph;
+        if (nm) src = src ++ vs_nm_skinned;
+        src = src ++ vs_tail_skinned;
+    } else if (morphed) {
         src = src ++ vs_head_morph;
         if (nm) src = src ++ vs_nm;
         src = src ++ vs_tail_morph;
@@ -6241,4 +6299,78 @@ test "golden: post shader sources frozen after slice 2 (FNV-1a-64)" {
     // → /gl-post + /gl-tonemap unchanged.
     try testing.expectEqual(@as(u64, 0xa3323897aa626eb7), fnv64(compositeFragmentSrc));
     try testing.expectEqual(@as(u64, 0x5396005eb65b17e8), fnv64(wgslComposite()));
+}
+
+// ── Slice 3 (combined skinned+morph): goldens ─────────────────────────────────
+
+test "golden: plain morph GLSL VS hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate GLSL contract bump.
+    // variant_morph path (no skin).
+    try testing.expectEqual(@as(u64, 0xb8cbafc493520a64), fnv64(pbrVertexSrc(variant_pbr | variant_morph)));
+}
+
+test "golden: plain morph WGSL VS hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate WGSL contract bump.
+    // variant_morph path (no skin).
+    try testing.expectEqual(@as(u64, 0xa1ef39848f50ca7d), fnv64(wgslPbr(variant_pbr | variant_morph)));
+}
+
+test "golden: combined skinned+morph GLSL VS hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate GLSL contract bump.
+    // morph-then-skin order; tangent not morphed (Slice 4).
+    try testing.expectEqual(@as(u64, 0xbcafd0d22fe70e28), fnv64(pbrVertexSrc(variant_pbr | variant_skinned | variant_morph)));
+}
+
+test "golden: combined skinned+morph WGSL VS hash frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate WGSL contract bump.
+    // morph-then-skin order; vs_nm_skinned + vs_tail_skinned reuse sp/skin.
+    try testing.expectEqual(@as(u64, 0x3ea294413da683d3), fnv64(wgslPbr(variant_pbr | variant_skinned | variant_morph)));
+}
+
+test "combined variant: GLSL has morph loop + skin matrix; order morph-before-skin" {
+    const v = pbrVertexSrc(variant_pbr | variant_skinned | variant_morph);
+    // Morph accumulation loop present.
+    try testing.expect(std.mem.indexOf(u8, v, "u_morph_tex") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "u_morph_count") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "texelFetch") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "m_pos") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "m_nrm") != null);
+    // Skin matrix present, applied to morphed pos.
+    try testing.expect(std.mem.indexOf(u8, v, "u_bones[a_joints.x]") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "mat4 skin") != null);
+    // skin * vec4(m_pos, ...) — skin applied after morph.
+    try testing.expect(std.mem.indexOf(u8, v, "skin * vec4(m_pos, 1.0)") != null);
+    // Both attrib declarations present.
+    try testing.expect(std.mem.indexOf(u8, v, "a_joints") != null);
+    try testing.expect(std.mem.indexOf(u8, v, "a_weights") != null);
+}
+
+test "combined variant: WGSL has morph loop + skin matrix; order morph-before-skin" {
+    const w = wgslPbr(variant_pbr | variant_skinned | variant_morph);
+    // Morph UBO + texture bindings.
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(3)") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(4)") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "u_morph_tex") != null);
+    // Bones binding.
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(1)") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "bones.m[a_joints.x]") != null);
+    // Morph loop vars.
+    try testing.expect(std.mem.indexOf(u8, w, "morph.count") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "m_pos") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "m_nrm") != null);
+    // skin applied to morphed pos.
+    try testing.expect(std.mem.indexOf(u8, w, "skin * vec4<f32>(m_pos, 1.0)") != null);
+    // vtx_index builtin present (required for textureLoad).
+    try testing.expect(std.mem.indexOf(u8, w, "vtx_index: u32") != null);
+}
+
+test "combined variant: single-variant outputs unchanged" {
+    // Skin-only path must be byte-identical to original.
+    const sk_only = pbrVertexSrc(variant_pbr | variant_skinned);
+    try testing.expect(std.mem.indexOf(u8, sk_only, "m_pos") == null); // no morph vars
+    try testing.expect(std.mem.indexOf(u8, sk_only, "u_morph_tex") == null);
+    // Morph-only path must be byte-identical to original.
+    const mo_only = pbrVertexSrc(variant_pbr | variant_morph);
+    try testing.expect(std.mem.indexOf(u8, mo_only, "u_bones") == null); // no skin vars
+    try testing.expect(std.mem.indexOf(u8, mo_only, "a_joints") == null);
 }

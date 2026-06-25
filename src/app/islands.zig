@@ -146,6 +146,16 @@ pub const GlSkin = struct {
     pub const props_schema: []const u8 = "{}";
 };
 
+/// verve.gl combined skinned+morph demo (/gl-skin-morph). Renders the skinmorph
+/// bar using `variant_pbr | variant_skinned | variant_morph` — the first variant
+/// to exercise both backends simultaneously. Morph deltas are applied to local
+/// pos/normal before the skin matrix transforms them (glTF order). Backend-detects
+/// WebGPU vs WebGL2 like GlSkin. SSR emits `<canvas data-ref="glskinmorph-canvas">`.
+/// Source: `src/client/islands/GlSkinMorph.zig`.
+pub const GlSkinMorph = struct {
+    pub const props_schema: []const u8 = "{}";
+};
+
 /// verve.gl post-processing demo (/gl-post). Renders a bright emissive PBR cube
 /// with a full bloom + FXAA pipeline. The scene shader uses
 /// `variant_pbr | variant_emissive | variant_linear_output` so it emits linear

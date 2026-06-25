@@ -23,6 +23,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/gl-webgpu", renderGlWebgpu),
     verve.Route.init("/gl-scene-webgpu", renderGlSceneWebgpu),
     verve.Route.init("/gl-skin", renderGlSkin),
+    verve.Route.init("/gl-skin-morph", renderGlSkinMorph),
     verve.Route.init("/gl-post", renderGlPost),
     verve.Route.init("/gl-double", renderGlDouble),
     verve.Route.init("/gl-cull", renderGlCull),
@@ -127,6 +128,11 @@ fn renderGlSceneWebgpu(ctx: *verve.Context) !*verve.Node {
 
 fn renderGlSkin(ctx: *verve.Context) !*verve.Node {
     const body = try components.glSkin(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderGlSkinMorph(ctx: *verve.Context) !*verve.Node {
+    const body = try components.glSkinMorph(ctx);
     return components.page(ctx, body);
 }
 

@@ -1116,6 +1116,41 @@ pub fn glSkin(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl combined skinned+morph demo — /gl-skin-morph.
+/// Renders a GPU-skinned bar that is simultaneously morphed (Bulge target) using
+/// `variant_pbr | variant_skinned | variant_morph`. The morph deltas are applied
+/// to local pos/normal FIRST, then the skin matrix transforms the morphed locals
+/// (glTF-correct order). The morph weight oscillates 0→1→0 so the bulge is
+/// continuously visible; the bar also bends via a slow jmid rotation, making
+/// both skin and morph effects simultaneously observable. Renders through WebGPU
+/// when available, else WebGL2.
+pub fn glSkinMorph(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "glskinmorph-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#070810;border-radius:8px;"),
+    });
+
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glskinmorph_freeze").text("Freeze"),
+    });
+
+    const inner = ctx.div().children(.{ canvas, controls });
+    const demo_island = verve.island(ctx, .{ .name = "GlSkinMorph" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — combined skinned+morph"),
+        ctx.p().text("A rigged bar rendered with variant_pbr | variant_skinned | variant_morph: " ++
+            "morph deltas (Bulge target) applied to local pos/normal first, then the skin " ++
+            "matrix transforms the morphed locals. The morph weight oscillates 0→1→0 (3 s " ++
+            "period) while the bar bends via a jmid rotation, confirming both effects " ++
+            "simultaneously in WebGL2 and WebGPU."),
+        demo_island,
+    });
+}
+
 /// verve.gl post-processing demo — /gl-post.
 /// Renders a bright emissive PBR cube with bloom + FXAA post-processing.
 /// The GlPost chunk uses `variant_pbr | variant_emissive | variant_linear_output`
