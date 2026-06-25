@@ -5,154 +5,120 @@ each carry their own "Not yet built / Deferred" notes; this file gathers
 them so the backlog is discoverable in one place. Desktop has its own
 authoritative backlog at [`docs/11-desktop-roadmap.md`](docs/11-desktop-roadmap.md).
 
-**Current:** v0.1.36 (pre-1.0; public APIs unstable). Status legend:
-✅ done · 🟡 partial · ⏳ remaining · 🔒 host-gated (needs a real Win/Linux
-host to verify) · 🍎 macOS-verifiable on a dev machine.
+**Current:** v0.18.2 (pre-1.0; public APIs unstable, break between minor
+versions). Status legend: ✅ done · 🟡 partial · ⏳ remaining · 🔒 host-gated
+(needs a real Win/Linux host to verify) · 🍎 macOS-verifiable on a dev machine.
 
 ---
 
-## Shipped through v0.1.32
+## Shipped
 
-The original 6-phase roadmap is substantially complete:
+### Core framework (original 6-phase web/SSR/island work)
 
-- ✅ **Client hydration + lifecycle** — per-island + route disposal
-  (`verve_unmount_route` / `verve_unmount_island`), `MutationObserver`
-  hydrate/dispose, per-`vid` owners, keyed reconciler.
+- ✅ **Client hydration + lifecycle** — per-island + route disposal,
+  `MutationObserver` hydrate/dispose, per-`vid` owners, keyed reconciler.
 - ✅ **Streaming SSR async** — `Resource` via `std.Io.async`; concurrent
-  out-of-order Suspense drain (`streamRender(w, io, …)`).
-- ✅ **Resource-state hydration** — `ctx.islandState` / `resourceFromState`
-  / `islandStateValue` + `<script type="application/verve-state">`.
-- ✅ **Typed island props** — `encodeProps`/`decodeProps` over the
-  `serialize.zig` binary codec (panic-free decoder).
-- ✅ **Chunk-runtime integration** — chunks decode props + read state, scope
-  signals to their `vid`, dispatch `z-on-click` to chunk exports.
-- ✅ **Multi-instance islands** — auto per-`vid` `z-bind`/`data-ref`
-  namespacing (`name__v{vid}`).
-- ✅ **Server-fn `_call`** — typed correlated callback (native; correlation
-  infra in place).
-- ✅ **i18n** — RTL direction + CLDR cardinal pluralization.
-- ✅ **Desktop image clipboard (macOS)** — `Clipboard.writeImage`/`readImage`
-  (PNG).
+  out-of-order Suspense drain (`streamRender`).
+- ✅ **Island system** — typed props (`serialize.zig` codec, panic-free
+  decoder), resource-state hydration, per-`vid` chunk runtime, multi-instance
+  namespacing, keyed-list (`bindForEach`) per-instance binds, cross-component
+  handler-name isolation, client-side `fetchSignal` resource round-trips.
+- ✅ **Server functions** — typed `_call` wasm round-trip (correlated
+  `x-verve-rid` reply), CSRF, server-fn codegen.
+- ✅ **i18n** — RTL direction + CLDR cardinal pluralization; opt-in
+  `LazyCatalog` (per-locale embedded blobs, single-binary preserved).
+
+### Domain libraries (the bulk of v0.3 → v0.18)
+
+- ✅ **`verve.viz`** — charts + node-link graphs, **SVG and canvas2d** render
+  paths; force / sankey / treemap / chord layouts; pan / zoom / hover / select
+  hit-testing; live data over the SSE **and WebSocket** push hub
+  (`push.publish` / `/push` / `/push-ws`). Guide: `docs/22-visualization.md`.
+- ✅ **`verve.anim`** — GSAP-class engine, pure Zig + one JS interpreter:
+  tweens, timelines, ScrollTrigger / ScrollSmoother, MotionPath + MorphSVG,
+  SplitText (UAX#29 graphemes), FLIP, Draggable, Sortable (single + cross-list
+  groups). Frozen wire contract via `serialize.zig` goldens. Guide:
+  `docs/23-animation.md`.
+- ✅ **`verve.gl`** — three.js-class 3D, pure Zig + **WebGL2 and WebGPU**
+  interpreters off one binary command stream. PBR metallic-roughness + IBL;
+  multi-light **shadow casters** + **CSM** + **LTC area lights**; **skeletal
+  skinning** (all glTF interp modes); **morph targets** (POSITION + NORMAL +
+  TANGENT deltas, 32 influences, Hermite easing, **combined skinned + morph**);
+  **distance-based LOD**; image quality (G-buffer prepass, SSAO, SSR, DOF,
+  **weighted-blended OIT**, 6 tone-mappers, vignette, bloom + FXAA); build-time
+  `.glb` → packed `.vmesh` asset pipeline. Guide: `docs/24-gl.md`.
+
+### Desktop
+
+All three backends (macOS / Windows / Linux GTK) verified on real hardware as
+of v0.2.0. Windows validated on a real host (custom-scheme assets, WinRT toast,
+update-apply). See **Remaining → Desktop** below; authoritative backlog in
+[`docs/11-desktop-roadmap.md`](docs/11-desktop-roadmap.md).
 
 ---
 
 ## Remaining
 
-### Finishing partial phases
+### `verve.gl` — three.js parity gaps
 
-- ✅ **Server-fn `_call` wasm round-trip** — the browser path now
-  serializes args, registers a correlated one-shot typed decoder, and
-  posts with `x-verve-rid`; the server's `"rid"` echo routes the reply
-  back to decode the typed value and fire `on_reply`. `app_client` is
-  compiled into the wasm client; the client installs the hooks at hydrate.
-  Demo: the `/counter` "call +" button.
-  → `docs/03-actions.md`, `src/core/server_fn_gen.zig`, `src/client/main.zig`
+Rough complexity in (parens). From `docs/24-gl.md` → "Remaining for three.js parity".
 
-- ✅ **i18n lazy/streaming catalog loading** — opt-in `LazyCatalog` ships each
-  locale as a separate embedded JSON blob and parses + caches only the active
-  (and default-fallback) locale on demand, mutex-guarded for the worker pool.
-  Build walker (`-Di18n-dir`) turns `i18n/<locale>.json` into the embedded
-  `locales` manifest (single-binary preserved). The comptime `Catalog` stays for
-  small sets. Guide: `docs/14-i18n.md`.
-  → `src/core/i18n_lazy.zig`, `build.zig`
+- ⏳ **Primitives:** particles / points / sprite material (med); fat lines /
+  LineSegments (small/med); decals (med).
+- ⏳ **Camera:** orthographic projection (small); user clipping planes (small).
+- ⏳ **Assets:** Draco / meshopt compression (med/large — gated by the zero-dep
+  rule); KTX2 / basis textures (med).
+- ⏳ **Instancing edges:** instanced shadows; per-instance frustum culling;
+  multi-mesh instancing; non-uniform-scale instance normals (each small/med).
+- ⏳ **Advanced:** user custom shader materials (large); runtime reflection
+  probes / cubemap capture (large); wireframe mode (small); water / terrain
+  (large, domain-specific).
 
-### Island follow-ups
+### `verve.anim` — deferred
 
-- ✅ **Keyed-list (`bindForEach`) multi-instance namespacing** —
-  `registerForEach` now suffixes its `parent_bind` by the enclosing island's
-  vid (matching the server-side `z-bind` suffix), so two instances of one
-  component each reconcile only their own keyed list — no manual parent-bind
-  disambiguation. Documented in `docs/15-islands.md`.
-  → `src/client/runtime.zig` (`registerForEach`)
+- ⏳ **Full UAX#9 bidi reordering across runs** — same-direction runs wrap in
+  `<span dir>`; true cross-run interleaved reordering is left to the browser.
+- ⏳ **MotionPath `align` to another element** — self-alignment ships; aligning
+  to a separate element's position does not.
+- ⏳ **Snap + pin with element scrollers** — `snap`/`pin` stay window-scoped;
+  neither composes with container scrollers yet.
+- ⏳ **Sortable nested / multi-level lists** — single + cross-list ship; deep
+  nesting not yet exercised.
 
-- ✅ **Client-side fetch of pending / local resources** — chunks fetch a value
-  not resolved at SSR via `verve.fetchSignal(T, action, args, signal_name)`: a
-  correlated server-fn round-trip whose typed reply sets the island's vid-scoped
-  signal (multiple instances never cross). Built on extending Phase A's rid
-  correlation to the chunk runtime. Failure leaves the signal at its loading
-  value (error path deferred). Guide: `docs/15-islands.md`.
-  → `src/client/island_runtime.zig`, `src/client/runtime_exports.zig`
+### `verve.viz` — deferred
 
-- ✅ **Chunk-handler cross-component name collisions** — `z-on-click`
-  dispatch now nests chunk exports by island `data-name` then export name,
-  and resolves against the click target's enclosing `<verve-island>`, so two
-  different island components may export the same handler name without
-  colliding. Documented in `docs/15-islands.md`.
-  → `src/bridge/verve.js` (registration + click delegate)
+- ⏳ **Multi-parent-aware collapse visibility** — a hidden node with a second
+  visible parent should stay visible; v1 hides it.
+- ⏳ **Multiple interactive graphs per page** — the island is module-static,
+  single-instance.
+- ⏳ **Smooth routed-edge interactivity** — curved / orthogonal `<path>` edges
+  that re-route during drag are static-render-only so far.
 
-### Desktop backlog (P6)
+### Desktop
 
 Authoritative: [`docs/11-desktop-roadmap.md`](docs/11-desktop-roadmap.md).
-Windows is now validated on a real host (v0.1.36). Linux remains
-host-gated — no Linux host available, so its paths cross-compile clean
-but stay behavior-unvalidated.
+Windows validated on a real host; **Linux remains host-gated** (cross-compiles
+clean, behavior-unvalidated — no Linux host available).
 
-- ✅ **Windows rich WinRT Toast** — `notifications.show` now prefers the
-  modern Action Center toast: per-app AUMID via
-  `SetCurrentProcessExplicitAppUserModelID`, a lazily-created Start-menu
-  `.lnk` carrying `System.AppUserModel.ID` (IShellLink + IPropertyStore),
-  then WinRT activation of an `XmlDocument` `ToastGeneric` template →
-  `ToastNotificationManager` → `IToastNotifier::Show`. Falls back to the
-  `Shell_NotifyIconW` balloon if WinRT init fails. Links `combase`.
-  (🔒 live banner/Action-Center delivery needs the Windows host.)
-  → `src/desktop/windows.zig` (`showToast`), `src/desktop/notifications.zig`
-- 🟡 **Updates apply** — macOS (`.app` swap) + **Windows** ship.
-  Windows uses a pure-Zig side-by-side swap: download + SHA-256 verify →
-  `tar.exe` extract to `%TEMP%` → detached `swap.cmd` waits for the PID,
-  robocopy-/MOVEs over the locked install dir, relaunches, self-deletes
-  (no Squirrel/MSIX). Linux (AppImageUpdate) 🔒 remains. (🔒 live
-  end-to-end swap needs the Windows host.)
-  → `src/desktop/updates.zig` (`applyUpdateWindows`, `buildSwapScript`)
 - ⏳🔒 **GTK4 + WebKitGTK 6.0** behind `-Dgtk4` — largest item; GTK3 +
   WebKitGTK 4.1 wired today. Needs Ubuntu 24 LTS / Fedora 41 validation.
-- 🟡 **Full a11y provider** — window-chrome accessibility covers
-  `setAccessibilityHelp`, `setAccessibilityRoleDescription`, and
-  `setAccessibilitySubrole` on **macOS** (NSAccessibility) and **Windows**
-  (a server-side UIA `IRawElementProviderSimple` answering `WM_GETOBJECT`:
-  role-desc → `LocalizedControlType`, help → `HelpText`, dialog subroles →
-  `IsDialog`; host provider supplies Name/bounds). Linux: help via
-  `atk_object_set_description`; role-desc/subrole still no-ops pending an
-  AtkObject provider (🔒). Web content + menus self-publish.
-- ✅🍎 **macOS `UNUserNotificationCenter` migration** —
-  `notifications.show` uses `UNUserNotificationCenter` with a bundle-id
-  guard + lazy synchronous authorization (nested `NSRunLoop` pump);
-  `NSUserNotification` removed; scaffold links `UserNotifications.framework`.
-  Verified live on a signed `.app` (v0.1.35): first-call permission prompt
-  + banner delivery.
-- 🟡 **Image clipboard** — macOS (PNG) + **Windows (`CF_DIBV5`)** ship;
-  Windows transcodes PNG↔32bpp-BGRA DIB via WIC (`Clipboard.writeImage`/
-  `readImage`). Linux (`image/png` GtkClipboard target) 🔒 remains.
-- ✅ **Windows `verve://` custom-scheme asset serving** — WebView2
-  `ICustomSchemeRegistration` via `ICoreWebView2EnvironmentOptions4` serves
-  the embedded asset table to the webview, at parity with macOS
-  (`WKURLSchemeHandler`) / Linux (WebKit scheme). Validated on a real
-  Windows host (v0.1.36).
-- 🟡 **Live Win/Linux validation** — Windows validated on a real host
-  (v0.1.36); Linux (🔒) still needs a real Ubuntu/Fedora boot of every
-  code path.
-- ✅ **Notarization automation (macOS)** — `zig build notarize` ships in the
-  desktop scaffold (`-Dnotarize-profile=<keychain-profile>` →
-  ditto-zip → `notarytool submit --wait` → `stapler staple` → stapled ship
-  zip; hardened runtime implied). The framework has no app of its own to
-  notarize — each downstream app runs the step under its own Developer ID
-  Application cert. Live end-to-end needs that cert (the dev machine's
-  "Apple Development" cert is rejected by notarization).
+- 🟡 **Updates apply** — macOS (`.app` swap) + Windows (side-by-side swap)
+  ship; Linux (AppImageUpdate) 🔒 remains.
+- 🟡 **Image clipboard** — macOS (PNG) + Windows (`CF_DIBV5` via WIC) ship;
+  Linux (`image/png` GtkClipboard target) 🔒 remains.
+- 🟡 **Full a11y provider** — role-desc / subrole on macOS (NSAccessibility) +
+  Windows (UIA); Linux help only, role-desc/subrole pending an AtkObject
+  provider (🔒).
+- 🟡 **Live Win/Linux validation** — Windows done; Linux 🔒 needs a real
+  Ubuntu/Fedora boot of every code path.
 
 ---
 
 ## Notes
 
-- **No single source of truth before this file.** Remaining work is otherwise
-  only discoverable by grepping each guide's "Not yet built / Deferred"
-  section; only desktop had a consolidated backlog. Keep this file in sync, or
-  fold it into `docs/README.md`.
-- **Genuinely out of scope (not bugs):** the `_post` fire-and-forget path,
-  the `verve-spa` meta opt-out (unimplemented by design), and decimal-operand
-  CLDR plural forms (integer counts only) are intentional, not pending.
-- **Client binding-walker fix (2026-06-02):** the JS auto-walker that
-  registers `bindI32`/`bindStr`/… signals is gated on the wasm exporting
-  `verve_island_scratch_ptr`/`_capacity`. Those accessors moved from
-  `src/client/main.zig` to the shared `src/client/runtime_exports.zig`
-  so island-free apps (e.g. the desktop scaffold) export them and their
-  bindings register. Both bridges now `console.warn` instead of silently
-  skipping the walker.
+- **Keep this file in sync** with each guide's "Not yet / Deferred" section
+  (or fold it into `docs/README.md`). Release versions live in `CHANGELOG.md`
+  and the git tags (`v0.x.y`) — those are authoritative.
+- **Genuinely out of scope (not bugs):** the `_post` fire-and-forget path, the
+  `verve-spa` meta opt-out (unimplemented by design), and decimal-operand CLDR
+  plural forms (integer counts only) are intentional, not pending.
