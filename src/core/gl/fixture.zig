@@ -3717,8 +3717,8 @@ pub fn morphDemoGlb(alloc: Allocator) ![]u8 {
     // Target 2 POSITION deltas      = 300 bytes
     // Target 2 NORMAL deltas        = 300 bytes
     // Anim times  4 × 4             =  16 bytes
-    // Anim weights 12 × 4           =  48 bytes
-    // bin_total                     = 2856 bytes
+    // Anim weights CUBICSPLINE 36×4 = 144 bytes  (4 keys × 3 targets × 3 slots)
+    // bin_total                     = 2952 bytes
     const off_pos: usize = 0;
     const off_nrm: usize = 300;
     const off_uv: usize = 600;
@@ -3731,7 +3731,7 @@ pub fn morphDemoGlb(alloc: Allocator) ![]u8 {
     const off_t2nrm: usize = 2492;
     const off_times: usize = 2792;
     const off_wts: usize = 2808;
-    const bin_total: usize = 2856;
+    const bin_total: usize = 2952;
 
     const bin = try alloc.alloc(u8, bin_total);
     defer alloc.free(bin);
@@ -3846,12 +3846,24 @@ pub fn morphDemoGlb(alloc: Allocator) ![]u8 {
     wf32(bin, off_times + 8, 2.0);
     wf32(bin, off_times + 12, 3.0);
 
-    // ── Anim weights: 4 keyframes × 3 targets = 12 scalars ───────────────────
+    // ── Anim weights: CUBICSPLINE, 4 keyframes × 3 targets × 3 slots = 36 scalars ─
+    // Each keyframe stores [inTangent×3, point×3, outTangent×3] per the glTF spec:
+    // accessor count = 4 × 3 (key_count × components), but each "element" is a
+    // SCALAR so count = 4 × 3 × 3 = 36 (glTF CUBICSPLINE: output count = 3 × key_count × comps).
     // The baked clip animates ONLY Wave (target 1) and Twist (target 2); Bulge
     // (target 0) stays 0 so it is purely runtime-controlled by the /gl-morph
     // "Bulge +" button (otherwise the baked Bulge pulse masks the runtime lock).
-    // k0: [0,0,0]  k1: [0,1,0]  k2: [0,0,1]  k3: [0,0,0]
-    const anim_weights = [12]f32{ 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+    // Layout per key: [in0,in1,in2, point0,point1,point2, out0,out1,out2]
+    // k0: in=[0,0,0] point=[0,0,0] out=[0,0,0]   (start at rest)
+    // k1: in=[0,0,0] point=[0,1,0] out=[0,0,0]   (Wave fully active)
+    // k2: in=[0,0,0] point=[0,0,1] out=[0,0,0]   (Twist fully active)
+    // k3: in=[0,0,0] point=[0,0,0] out=[0,0,0]   (return to rest)
+    const anim_weights = [36]f32{
+        0, 0, 0,  0, 0, 0,  0, 0, 0, // k0: in, point, out
+        0, 0, 0,  0, 1, 0,  0, 0, 0, // k1: in, point, out
+        0, 0, 0,  0, 0, 1,  0, 0, 0, // k2: in, point, out
+        0, 0, 0,  0, 0, 0,  0, 0, 0, // k3: in, point, out
+    };
     for (anim_weights, 0..) |wt, wi| {
         wf32(bin, off_wts + wi * 4, wt);
     }
@@ -3870,7 +3882,7 @@ pub fn morphDemoGlb(alloc: Allocator) ![]u8 {
     // bufferViews
     try w.writeAll("\"bufferViews\":[");
     const bv_offsets = [12]usize{ off_pos, off_nrm, off_uv, off_idx, off_t0pos, off_t0nrm, off_t1pos, off_t1nrm, off_t2pos, off_t2nrm, off_times, off_wts };
-    const bv_lens = [12]usize{ 300, 300, 200, 192, 300, 300, 300, 300, 300, 300, 16, 48 };
+    const bv_lens = [12]usize{ 300, 300, 200, 192, 300, 300, 300, 300, 300, 300, 16, 144 };
     for (bv_offsets, bv_lens, 0..) |bv_off, bv_len, bvi| {
         if (bvi > 0) try w.writeAll(",");
         try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ bv_off, bv_len });
@@ -3892,8 +3904,8 @@ pub fn morphDemoGlb(alloc: Allocator) ![]u8 {
     }
     // 10: times SCALAR f32 4
     try w.writeAll("{\"bufferView\":10,\"byteOffset\":0,\"componentType\":5126,\"count\":4,\"type\":\"SCALAR\",\"min\":[0.0],\"max\":[3.0]},");
-    // 11: weights SCALAR f32 12
-    try w.writeAll("{\"bufferView\":11,\"byteOffset\":0,\"componentType\":5126,\"count\":12,\"type\":\"SCALAR\"}");
+    // 11: weights CUBICSPLINE SCALAR f32 36 (4 keys × 3 targets × 3 slots)
+    try w.writeAll("{\"bufferView\":11,\"byteOffset\":0,\"componentType\":5126,\"count\":36,\"type\":\"SCALAR\"}");
     try w.writeAll("],");
     // mesh
     try w.writeAll("\"meshes\":[{\"name\":\"MorphPlane\",\"extras\":{\"targetNames\":[\"Bulge\",\"Wave\",\"Twist\"]},");
@@ -3904,7 +3916,7 @@ pub fn morphDemoGlb(alloc: Allocator) ![]u8 {
     // animation
     try w.writeAll("\"animations\":[{\"name\":\"MorphDemoAnim\",");
     try w.writeAll("\"channels\":[{\"sampler\":0,\"target\":{\"node\":0,\"path\":\"weights\"}}],");
-    try w.writeAll("\"samplers\":[{\"input\":10,\"output\":11,\"interpolation\":\"LINEAR\"}]}],");
+    try w.writeAll("\"samplers\":[{\"input\":10,\"output\":11,\"interpolation\":\"CUBICSPLINE\"}]}],");
     // buffer
     try w.print("\"buffers\":[{{\"byteLength\":{d}}}]}}", .{bin_total});
     // pad JSON to 4-byte alignment

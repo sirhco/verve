@@ -998,14 +998,38 @@ pub const Reader = struct {
         return @bitCast(std.mem.readInt(u32, self.bytes[off..][0..4], .little));
     }
 
-    /// Weight value of morph target at keyframe `i` from track `t`. comps=1.
+    /// Weight value (point) of morph target at keyframe `i` from track `t`. comps=1.
+    /// For CUBICSPLINE (interp==2) returns the middle slot of the [in, point, out] triple:
+    /// index = i*3 + 1. For LINEAR/STEP: index = i.
     /// Caller must ensure `i < t.key_count`.
     pub fn morphWeightValue(self: *const Reader, t: TrackInfo, i: u32) f32 {
         const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * 6 * 2;
         const wclip_off: usize = @intCast(@as(u64, self.morph_off_) + alignUp(delta_bytes, 4));
         const vbase: usize = wclip_off + @as(usize, t.data_off) + @as(usize, t.key_count) * 4;
-        const vs = valueStride(t.interp);
-        return @bitCast(std.mem.readInt(u32, self.bytes[vbase + @as(usize, i) * vs * 4 ..][0..4], .little));
+        const idx: usize = if (t.interp == 2) @as(usize, i) * 3 + 1 else i;
+        return @bitCast(std.mem.readInt(u32, self.bytes[vbase + idx * 4 ..][0..4], .little));
+    }
+
+    /// In-tangent of morph weight keyframe `i` from CUBICSPLINE track `t`. comps=1.
+    /// Index = i*3 + 0 (first slot of the [in, point, out] triple).
+    /// Caller must ensure track is CUBICSPLINE (interp==2) and `i < t.key_count`.
+    pub fn morphWeightInTangent(self: *const Reader, t: TrackInfo, i: u32) f32 {
+        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * 6 * 2;
+        const wclip_off: usize = @intCast(@as(u64, self.morph_off_) + alignUp(delta_bytes, 4));
+        const vbase: usize = wclip_off + @as(usize, t.data_off) + @as(usize, t.key_count) * 4;
+        const idx: usize = @as(usize, i) * 3; // slot 0 = in-tangent
+        return @bitCast(std.mem.readInt(u32, self.bytes[vbase + idx * 4 ..][0..4], .little));
+    }
+
+    /// Out-tangent of morph weight keyframe `i` from CUBICSPLINE track `t`. comps=1.
+    /// Index = i*3 + 2 (third slot of the [in, point, out] triple).
+    /// Caller must ensure track is CUBICSPLINE (interp==2) and `i < t.key_count`.
+    pub fn morphWeightOutTangent(self: *const Reader, t: TrackInfo, i: u32) f32 {
+        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * 6 * 2;
+        const wclip_off: usize = @intCast(@as(u64, self.morph_off_) + alignUp(delta_bytes, 4));
+        const vbase: usize = wclip_off + @as(usize, t.data_off) + @as(usize, t.key_count) * 4;
+        const idx: usize = @as(usize, i) * 3 + 2; // slot 2 = out-tangent
+        return @bitCast(std.mem.readInt(u32, self.bytes[vbase + idx * 4 ..][0..4], .little));
     }
 
     /// Caller must ensure `i < self.submesh_count`.
@@ -2077,4 +2101,73 @@ test "vmesh v13 morph section round-trips; pre-morph mesh reads as zero morphs" 
     try testing.expectEqual(@as(?TrackInfo, null), rp.morphWeightTrack(0));
     // morph_off header field is 0 (no section).
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, plain[76..80], .little));
+}
+
+test "morphWeight CUBICSPLINE: value reads point slot, tangent readers return in/out" {
+    // Pack a morph mesh with 1 target, 1 vertex, CUBICSPLINE weight track.
+    // CUBICSPLINE layout per key (comps=1): [inTangent, point, outTangent] (3 floats/key).
+    // key0: in=0.1, point=0.5, out=0.9
+    // key1: in=1.1, point=2.5, out=3.9
+    const wc_times = [_]f32{ 0.0, 1.0 };
+    const wc_values = [_]f32{ 0.1, 0.5, 0.9, 1.1, 2.5, 3.9 }; // interleaved in/point/out per key
+
+    const wc_track = Track{ .interp = 2, .times = &wc_times, .values = &wc_values };
+    const wclip = Clip{
+        .name_hash = fnv1a32("morph_weights"),
+        .duration = 1.0,
+        .tracks = &[_]Track{wc_track},
+    };
+
+    // Minimal morph section: 1 target, 1 vertex, zero deltas.
+    const delta_bytes_count: usize = 1 * 1 * 6 * 2;
+    var deltas_buf = [_]u8{0} ** delta_bytes_count;
+    const morph = MorphData{
+        .target_count = 1,
+        .vertex_count = 1,
+        .deltas = &deltas_buf,
+        .weight_clip = wclip,
+    };
+
+    // Minimal geometry: 1 triangle, 3 vertices.
+    const verts = [_]f32{
+        0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0,
+        1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0,
+        0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0,
+    };
+    const idx = [_]u16{ 0, 1, 2 };
+    const sub = Submesh{
+        .index_byte_off = 0,
+        .index_count = 3,
+        .base_color = .{ 1, 1, 1, 1 },
+        .metallic = 0,
+        .roughness = 1,
+        .emissive = .{ 0, 0, 0 },
+        .occlusion_strength = 1,
+        .normal_scale = 1,
+        .tex_base = -1,
+        .tex_mr = -1,
+        .tex_normal = -1,
+        .tex_emissive = -1,
+        .tex_occlusion = -1,
+    };
+    const bytes = try pack(testing.allocator, &verts, &idx, &[_]Submesh{sub}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, morph);
+    defer testing.allocator.free(bytes);
+
+    var r = try Reader.init(bytes);
+    const trk = r.morphWeightTrack(0);
+    try testing.expect(trk != null);
+    try testing.expectEqual(@as(u8, 2), trk.?.interp); // CUBICSPLINE
+    try testing.expectEqual(@as(u32, 2), trk.?.key_count);
+
+    // morphWeightValue must return the POINT (middle slot), not the in-tangent.
+    try testing.expectApproxEqAbs(@as(f32, 0.5), r.morphWeightValue(trk.?, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 2.5), r.morphWeightValue(trk.?, 1), 1e-6);
+
+    // morphWeightInTangent: slot 0 per key (i*3 + 0).
+    try testing.expectApproxEqAbs(@as(f32, 0.1), r.morphWeightInTangent(trk.?, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.1), r.morphWeightInTangent(trk.?, 1), 1e-6);
+
+    // morphWeightOutTangent: slot 2 per key (i*3 + 2).
+    try testing.expectApproxEqAbs(@as(f32, 0.9), r.morphWeightOutTangent(trk.?, 0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 3.9), r.morphWeightOutTangent(trk.?, 1), 1e-6);
 }

@@ -1741,8 +1741,20 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                         const frac: f32 = if (span > 0) (tl - ta) / span else 0;
                         const va = a.morphWeightValue(trk, lo);
                         const vb = a.morphWeightValue(trk, hi);
-                        // STEP interp = 1: hold lo value; LINEAR = 0: lerp.
-                        inst.morph_weights[ti] = if (trk.interp == 1) va else va + (vb - va) * frac;
+                        // STEP interp = 1: hold lo value; LINEAR = 0: lerp;
+                        // CUBICSPLINE = 2: glTF cubic Hermite (h00/h10/h01/h11).
+                        inst.morph_weights[ti] = if (trk.interp == 1) va else if (trk.interp == 2) blk: {
+                            const dt = tb - ta;
+                            const m0 = a.morphWeightOutTangent(trk, lo) * dt;
+                            const m1 = a.morphWeightInTangent(trk, hi) * dt;
+                            const t2 = frac * frac;
+                            const t3 = t2 * frac;
+                            const h00 = 2 * t3 - 3 * t2 + 1;
+                            const h10 = t3 - 2 * t2 + frac;
+                            const h01 = -2 * t3 + 3 * t2;
+                            const h11 = t3 - t2;
+                            break :blk h00 * va + h10 * m0 + h01 * vb + h11 * m1;
+                        } else va + (vb - va) * frac;
                     }
                 }
             }
