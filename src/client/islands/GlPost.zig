@@ -214,7 +214,7 @@ export fn glpost_frame(dt_ms: f32, width: u32, height: u32) u32 {
         @intCast(@intFromPtr(&camera_pos)),
     );
 
-    enc.endPostProcess(&post_ctx);
+    enc.endPostProcess(&post_ctx, true);
     _ = enc.finish();
     return @intCast(@intFromPtr(&cmd_buf));
 }

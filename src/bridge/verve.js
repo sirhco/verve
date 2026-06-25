@@ -8339,6 +8339,14 @@
       const adapter = await navigator.gpu.requestAdapter();
       if (!adapter) return null;
       const device = await adapter.requestDevice();
+      // Surface WebGPU validation/out-of-memory errors that would otherwise be
+      // swallowed (Chrome suppresses repeated warnings) → blank canvas, no error.
+      device.addEventListener("uncapturederror", (e) => {
+        console.error(
+          "[verve gl] WebGPU uncaptured error:",
+          e.error && e.error.message ? e.error.message : e.error,
+        );
+      });
       const ctx = canvas.getContext("webgpu");
       if (!ctx) return null;
       const format = navigator.gpu.getPreferredCanvasFormat();

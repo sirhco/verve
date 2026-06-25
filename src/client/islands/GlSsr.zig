@@ -286,13 +286,11 @@ export fn glssr_frame(dt_ms: f32, width: u32, height: u32) u32 {
     }
 
     // ── 4. bloom bright-pass + composite + fxaa, reading scene_src (set above). ──
-    // `endPostProcess`'s first act is `endOffscreenPass()` (it assumes the scene HDR
-    // pass is still open). We closed the scene pass above so the SSR pass could SAMPLE
-    // h_scene_hdr, so re-open an EMPTY no-op pass (clear flag 0 → h_scene_hdr is left
-    // untouched) for endPostProcess's leading endOffscreenPass to balance. The chain
-    // then reads scene_src = h_scene_ssr (set on the opts above) — not h_scene_hdr.
-    enc.beginOffscreenPass(C.PostCtx.h_scene_hdr, .{ 0, 0, 0, 1 }, 0);
-    enc.endPostProcess(&post_ctx);
+    // The scene HDR pass was already closed above (line ~270) so the SSR pass could
+    // SAMPLE h_scene_hdr. Pass scene_pass_open=false so endPostProcess does NOT issue
+    // its leading endOffscreenPass (no pass is open). The chain then reads
+    // scene_src = h_scene_ssr (set on the opts above) — not h_scene_hdr.
+    enc.endPostProcess(&post_ctx, false);
     _ = enc.finish();
     return @intCast(@intFromPtr(&cmd_buf));
 }

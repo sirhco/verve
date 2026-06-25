@@ -3404,9 +3404,11 @@ pub const Encoder = struct {
     ///   composite → ldr   (begin_offscreen_pass + draw_fullscreen_quad + end_offscreen_pass)
     ///   fxaa  → canvas    (begin_frame + draw_fullscreen_quad + end_frame)
     /// Without fxaa, composite goes straight to the canvas pass.
-    pub fn endPostProcess(self: *Encoder, ctx: *PostCtx) void {
-        // Close the scene HDR pass.
-        self.endOffscreenPass();
+    pub fn endPostProcess(self: *Encoder, ctx: *PostCtx, scene_pass_open: bool) void {
+        // Close the scene HDR pass — but only if the caller left it open. SSR
+        // closes the scene pass early (so its pass can SAMPLE h_scene_hdr) and
+        // passes scene_pass_open=false, so we must not double-close here.
+        if (scene_pass_open) self.endOffscreenPass();
 
         const w = ctx.last_w;
         const h = ctx.last_h;
@@ -4384,7 +4386,7 @@ test "beginPostProcess/endPostProcess emit the bloom+fxaa chain" {
     var enc = Encoder.init(&buf);
     var ctx = PostCtx{};
     enc.beginPostProcess(&ctx, .{ .bloom = .{}, .fxaa = true }, 800, 600);
-    enc.endPostProcess(&ctx);
+    enc.endPostProcess(&ctx, true);
     const out = enc.finish();
     var tag_buf: [64]Tag = undefined;
     const n = collectTags(out, &tag_buf);
@@ -4419,7 +4421,7 @@ test "endPostProcess without fxaa composites straight to canvas" {
     var enc = Encoder.init(&buf);
     var ctx = PostCtx{};
     enc.beginPostProcess(&ctx, .{ .bloom = .{}, .fxaa = false }, 800, 600);
-    enc.endPostProcess(&ctx);
+    enc.endPostProcess(&ctx, true);
     const tags_raw = enc.finish();
     var tag_buf: [64]Tag = undefined;
     const n = collectTags(tags_raw, &tag_buf);
@@ -4692,7 +4694,7 @@ test "endPostProcess scene_src redirects bloom+composite reads (SSR)" {
     var enc = Encoder.init(&buf);
     var ctx = PostCtx{};
     enc.beginPostProcess(&ctx, .{ .bloom = .{}, .fxaa = true, .scene_src = SsrCtx.h_scene_ssr }, 800, 600);
-    enc.endPostProcess(&ctx);
+    enc.endPostProcess(&ctx, true);
     const out = enc.finish();
     // The bright-pass (first draw_fullscreen_quad after the scene pass) must read
     // h_scene_ssr (255), not h_scene_hdr (240).
@@ -5289,7 +5291,7 @@ test "composite param layout: 4 floats [intensity, tonemap, vig_intensity, vig_r
         .tonemap = .reinhard,
         .vignette = .{ .intensity = 0.5, .radius = 0.8 },
     }, 800, 600);
-    enc.endPostProcess(&ctx);
+    enc.endPostProcess(&ctx, true);
     // p_comp[0] = bloom intensity, [1] = tonemap index, [2] = vig_intensity, [3] = vig_radius.
     try testing.expectApproxEqAbs(@as(f32, 0.6), ctx.p_comp[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 1.0), ctx.p_comp[1], 1e-6); // reinhard = 1
@@ -5302,7 +5304,7 @@ test "composite param: aces default writes index 3.0" {
     var enc = Encoder.init(&buf);
     var ctx = PostCtx{};
     enc.beginPostProcess(&ctx, .{ .bloom = .{ .intensity = 0.8 } }, 800, 600);
-    enc.endPostProcess(&ctx);
+    enc.endPostProcess(&ctx, true);
     try testing.expectApproxEqAbs(@as(f32, 3.0), ctx.p_comp[1], 1e-6); // aces = 3
     try testing.expectApproxEqAbs(@as(f32, 0.0), ctx.p_comp[2], 1e-6); // no vignette
 }
@@ -5316,7 +5318,7 @@ test "composite param: no-bloom path still writes tonemap + vignette" {
         .tonemap = .agx,
         .vignette = .{ .intensity = 1.0, .radius = 0.6 },
     }, 800, 600);
-    enc.endPostProcess(&ctx);
+    enc.endPostProcess(&ctx, true);
     try testing.expectApproxEqAbs(@as(f32, 0.0), ctx.p_comp[0], 1e-6); // no bloom
     try testing.expectApproxEqAbs(@as(f32, 4.0), ctx.p_comp[1], 1e-6); // agx = 4
     try testing.expectApproxEqAbs(@as(f32, 1.0), ctx.p_comp[2], 1e-6);
