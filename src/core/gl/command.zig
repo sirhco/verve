@@ -1403,6 +1403,36 @@ pub const ssrFragmentSrc: []const u8 =
     \\}
 ;
 
+// DOF combine (image-quality slice 5) — byte-identical CoC math to wgslDof.
+// u_tex0 = sharp scene HDR (h_scene_hdr); u_tex1 = blurred scene (h_dof_b);
+// u_tex2 = G-buffer (a = -viewZ > 0, linear view depth). u_dof_params =
+// (focus_distance, focal_range, max_blur, _pad). Per pixel: derive a
+// circle-of-confusion from |depth - focus| and lerp sharp→blurred by it.
+pub const dofFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0;       // sharp scene HDR
+    \\uniform sampler2D u_tex1;       // blurred scene
+    \\uniform sampler2D u_tex2;       // G-buffer: a = -viewZ (>0)
+    \\uniform vec4 u_dof_params;      // (focus_distance, focal_range, max_blur, _)
+    \\void main() {
+    \\  vec3 sharp = texture(u_tex0, v_uv).rgb;
+    \\  vec3 blurred = texture(u_tex1, v_uv).rgb;
+    \\  float depth = texture(u_tex2, v_uv).a; // -viewZ (positive); <=0 = background
+    \\  float focus_distance = u_dof_params.x;
+    \\  float focal_range = u_dof_params.y;
+    \\  float max_blur = u_dof_params.z;
+    \\  float coc = 0.0;
+    \\  if (depth > 0.0) {
+    \\    coc = clamp(abs(depth - focus_distance) / focal_range, 0.0, 1.0) * max_blur;
+    \\  }
+    \\  vec3 result = mix(sharp, blurred, coc);
+    \\  frag = vec4(result, 1.0);
+    \\}
+;
+
 // ── WebGPU PBR über-shader (P10 slice 2a) ───────────────────────────
 //
 // One WGSL module holding BOTH stages (vs_main + fs_main), a parallel
@@ -2726,6 +2756,43 @@ pub fn wgslSsr() []const u8 {
     ;
 }
 
+// DOF combine (image-quality slice 5) — byte-identical CoC math to dofFragmentSrc.
+// No matrices → Params is a single vec4 → auto-derived 32B paramsSize (verve.js).
+// tex0 = sharp scene HDR; tex1 = blurred scene; tex2 = G-buffer (a = -viewZ > 0).
+// params.x = focus_distance, .y = focal_range, .z = max_blur, .w = pad.
+pub fn wgslDof() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { params: vec4<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@group(1) @binding(3) var tex2: texture_2d<f32>;
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let sharp = textureSampleLevel(tex0, samp, uv, 0.0).rgb;
+    \\  let blurred = textureSampleLevel(tex1, samp, uv, 0.0).rgb;
+    \\  let depth = textureSampleLevel(tex2, samp, uv, 0.0).a; // -viewZ (positive)
+    \\  let focus_distance = P.params.x;
+    \\  let focal_range = P.params.y;
+    \\  let max_blur = P.params.z;
+    \\  var coc = 0.0;
+    \\  if (depth > 0.0) {
+    \\    coc = clamp(abs(depth - focus_distance) / focal_range, 0.0, 1.0) * max_blur;
+    \\  }
+    \\  let result = mix(sharp, blurred, coc);
+    \\  return vec4<f32>(result, 1.0);
+    \\}
+    ;
+}
+
 // ── Task 3: Post-process effect-graph structs ────────────────────────
 
 /// Tone-mapping operator applied in the composite stage (image-quality slice 2).
@@ -2902,6 +2969,39 @@ pub const SsrCtx = struct {
 
     // Stable param storage (wire record points at this; must outlive the frame).
     p_ssr: [36]f32 = [_]f32{0} ** 36, // (strength,max_dist,thickness,fresnel) + inv_proj + proj
+};
+
+/// Persistent state for the DOF passes (image-quality slice 5). Parallels
+/// `SsrCtx`: fixed handles + a created/last_w/last_h guard + stable param
+/// storage. Handle reservation: 257–260, immediately after SsrCtx's 255–256.
+///
+/// DOF needs NO matrices — it reads linear view depth straight from the G-buffer
+/// alpha. The two blur passes REUSE `PostCtx.sh_blur` (245), the generic separable
+/// Gaussian, so only ONE new shader is created here (`sh_dof`, the CoC combine).
+///   `h_dof_a` (257): blur ping-pong (horizontal pass output).
+///   `h_dof_b` (258): fully blurred scene (vertical pass output).
+///   `h_scene_dof` (259): sharp+blurred composited by CoC — a drop-in scene source
+///                        fed to the composite via `PostProcess.scene_src`.
+///   `sh_dof` (260): the variant_post CoC combine shader (vec4 params → 32B).
+///
+/// `p_dof` packs the 4 combine params: (focus_distance, focal_range, max_blur, _).
+/// `p_blur_h`/`p_blur_v` packs (texel.x, texel.y, dir.x, dir.y) for the two blur
+/// passes (sh_blur reads count=4 — texel + dir), like PostCtx's bloom blur params.
+pub const DofCtx = struct {
+    pub const h_dof_a: u32 = 257; // rgba16f full-res blur ping-pong (H output)
+    pub const h_dof_b: u32 = 258; // rgba16f full-res fully blurred scene (V output)
+    pub const h_scene_dof: u32 = 259; // rgba16f full-res sharp+blur composite RT
+    pub const sh_dof: u32 = 260; // variant_post CoC combine shader
+
+    created: bool = false,
+    last_w: u32 = 0,
+    last_h: u32 = 0,
+    webgpu: bool = false,
+
+    // Stable param storage (wire records point at these; must outlive the frame).
+    p_dof: [4]f32 = .{ 0, 0, 0, 0 }, // (focus_distance, focal_range, max_blur, _)
+    p_blur_h: [4]f32 = .{ 0, 0, 1, 0 }, // [texel.x, texel.y, dir.x=1, dir.y=0]
+    p_blur_v: [4]f32 = .{ 0, 0, 0, 1 }, // [texel.x, texel.y, dir.x=0, dir.y=1]
 };
 
 pub const Encoder = struct {
@@ -3649,6 +3749,78 @@ pub const Encoder = struct {
         // SSR pass: G-buffer (tex0) + scene HDR (tex1) → h_scene_ssr.
         self.beginOffscreenPass(SsrCtx.h_scene_ssr, .{ 0, 0, 0, 1 }, clear_flag_color);
         self.drawFullscreenQuad(SsrCtx.sh_ssr, PrepassCtx.h_gbuffer, PostCtx.h_scene_hdr, 0, @truncate(@intFromPtr(&ctx.p_ssr)), 36);
+        self.endOffscreenPass();
+    }
+
+    /// Run the DOF passes: blur H + blur V (reusing `PostCtx.sh_blur`) then a CoC
+    /// combine (`sh_dof`) → `h_scene_dof`. Must be called AFTER the scene HDR pass
+    /// is closed (so `h_scene_hdr` can be sampled) and AFTER `endPrepass` (so
+    /// `h_gbuffer` holds depth), and BEFORE `endPostProcess` reads `h_scene_dof`
+    /// via `PostProcess.scene_src`. On first call (or resize) creates the three
+    /// full-res rgba16f targets; first call only creates `sh_dof` (the blur shader
+    /// is owned by `PostCtx`, created in `beginPostProcess`). `webgpu` selects
+    /// WGSL vs GLSL.
+    ///
+    /// `focus_distance`/`focal_range` are in linear view-space depth units;
+    /// `max_blur` ∈ [0,1] caps the sharp→blur lerp. Passes:
+    ///   1. sh_blur: h_scene_hdr → h_dof_a  (dir = (1,0), full-res texel)
+    ///   2. sh_blur: h_dof_a    → h_dof_b  (dir = (0,1))
+    ///   3. sh_dof:  (h_scene_hdr sharp, h_dof_b blurred, h_gbuffer depth) → h_scene_dof
+    pub fn runDof(
+        self: *Encoder,
+        ctx: *DofCtx,
+        webgpu: bool,
+        width: u32,
+        height: u32,
+        focus_distance: f32,
+        focal_range: f32,
+        max_blur: f32,
+    ) void {
+        ctx.webgpu = webgpu;
+        const resized = width != ctx.last_w or height != ctx.last_h;
+        if (!ctx.created or resized) {
+            if (resized and ctx.created) {
+                self.deleteResource(.render_target, DofCtx.h_dof_a);
+                self.deleteResource(.render_target, DofCtx.h_dof_b);
+                self.deleteResource(.render_target, DofCtx.h_scene_dof);
+            }
+            self.createRenderTarget(DofCtx.h_dof_a, width, height, .rgba16f, 0);
+            self.createRenderTarget(DofCtx.h_dof_b, width, height, .rgba16f, 0);
+            self.createRenderTarget(DofCtx.h_scene_dof, width, height, .rgba16f, 0);
+            ctx.last_w = width;
+            ctx.last_h = height;
+        }
+        if (!ctx.created) {
+            if (webgpu) {
+                self.createPostShaderWgsl(DofCtx.sh_dof, wgslDof());
+            } else {
+                self.createPostShaderGlsl(DofCtx.sh_dof, dofFragmentSrc);
+            }
+            ctx.created = true;
+        }
+
+        // Full-res texel (1/w, 1/h) for both blur passes.
+        const tx = 1.0 / @as(f32, @floatFromInt(width));
+        const ty = 1.0 / @as(f32, @floatFromInt(height));
+        ctx.p_blur_h[0] = tx;
+        ctx.p_blur_h[1] = ty;
+        ctx.p_blur_v[0] = tx;
+        ctx.p_blur_v[1] = ty;
+        ctx.p_dof[0] = focus_distance;
+        ctx.p_dof[1] = focal_range;
+        ctx.p_dof[2] = max_blur;
+
+        // 1. Blur H: h_scene_hdr → h_dof_a.
+        self.beginOffscreenPass(DofCtx.h_dof_a, .{ 0, 0, 0, 1 }, clear_flag_color);
+        self.drawFullscreenQuad(PostCtx.sh_blur, PostCtx.h_scene_hdr, 0, 0, @truncate(@intFromPtr(&ctx.p_blur_h)), 4);
+        self.endOffscreenPass();
+        // 2. Blur V: h_dof_a → h_dof_b (fully blurred scene).
+        self.beginOffscreenPass(DofCtx.h_dof_b, .{ 0, 0, 0, 1 }, clear_flag_color);
+        self.drawFullscreenQuad(PostCtx.sh_blur, DofCtx.h_dof_a, 0, 0, @truncate(@intFromPtr(&ctx.p_blur_v)), 4);
+        self.endOffscreenPass();
+        // 3. Combine: sharp (tex0) + blurred (tex1) + depth (tex2) → h_scene_dof.
+        self.beginOffscreenPass(DofCtx.h_scene_dof, .{ 0, 0, 0, 1 }, clear_flag_color);
+        self.drawFullscreenQuad(DofCtx.sh_dof, PostCtx.h_scene_hdr, DofCtx.h_dof_b, PrepassCtx.h_gbuffer, @truncate(@intFromPtr(&ctx.p_dof)), 4);
         self.endOffscreenPass();
     }
 };
@@ -4713,6 +4885,111 @@ test "endPostProcess scene_src redirects bloom+composite reads (SSR)" {
         off2 += 4 + sz;
     }
     try testing.expect(seen_bright);
+}
+
+test "DofCtx handles do not collide with Post/Prepass/Ssao/Ssr handles" {
+    // 257–260 sit immediately after SsrCtx's 255–256.
+    try testing.expectEqual(@as(u32, 257), DofCtx.h_dof_a);
+    try testing.expectEqual(@as(u32, 258), DofCtx.h_dof_b);
+    try testing.expectEqual(@as(u32, 259), DofCtx.h_scene_dof);
+    try testing.expectEqual(@as(u32, 260), DofCtx.sh_dof);
+    // Strictly above every Post/Prepass/Ssao/Ssr handle — no overlap.
+    try testing.expect(DofCtx.h_dof_a > SsrCtx.sh_ssr);
+    try testing.expect(DofCtx.h_dof_a > SsaoCtx.sh_ssao_blur);
+    try testing.expect(DofCtx.h_dof_a > PrepassCtx.sh_gdebug);
+    try testing.expect(DofCtx.h_dof_a > PostCtx.sh_fxaa);
+    // DOF reuses PostCtx.sh_blur for the two blur passes — must not be a new handle.
+    try testing.expect(PostCtx.sh_blur < DofCtx.h_dof_a);
+}
+
+test "DOF shader content (both backends)" {
+    // GLSL combine: three samplers, CoC formula, mix(sharp,blurred,coc).
+    const dg = dofFragmentSrc;
+    try testing.expect(std.mem.indexOf(u8, dg, "u_tex0") != null); // sharp
+    try testing.expect(std.mem.indexOf(u8, dg, "u_tex1") != null); // blurred
+    try testing.expect(std.mem.indexOf(u8, dg, "u_tex2") != null); // depth (G-buffer)
+    try testing.expect(std.mem.indexOf(u8, dg, "u_dof_params") != null);
+    try testing.expect(std.mem.indexOf(u8, dg, "abs(depth - focus_distance) / focal_range") != null); // CoC
+    try testing.expect(std.mem.indexOf(u8, dg, "mix(sharp, blurred, coc)") != null); // composite
+    try testing.expect(std.mem.indexOf(u8, dg, "texture(u_tex2, v_uv).a") != null); // depth = gbuffer.a
+    // WGSL: same surface, vec4 params (no matrix → 32B), textureSampleLevel everywhere.
+    const dw = wgslDof();
+    try testing.expect(std.mem.indexOf(u8, dw, "params: vec4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, dw, "mat4x4") == null); // NO matrices → 32B auto-derived
+    try testing.expect(std.mem.indexOf(u8, dw, "abs(depth - focus_distance) / focal_range") != null);
+    try testing.expect(std.mem.indexOf(u8, dw, "mix(sharp, blurred, coc)") != null);
+    try testing.expect(std.mem.indexOf(u8, dw, "textureSampleLevel(tex2, samp, uv, 0.0).a") != null);
+    try testing.expect(std.mem.indexOf(u8, dw, "textureSample(") == null); // never bare
+}
+
+test "golden: DOF shader sources frozen (FNV-1a-64)" {
+    try testing.expectEqual(@as(u64, 6319395803038270956), fnv64(dofFragmentSrc));
+    try testing.expectEqual(@as(u64, 7076316519999668348), fnv64(wgslDof()));
+}
+
+test "runDof emits 2 blur passes + 1 combine" {
+    var buf: [512]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = DofCtx{};
+    enc.runDof(&ctx, false, 640, 400, 6.0, 4.0, 0.8);
+    const out = enc.finish();
+
+    // First call: create_render_target ×3 + create_shader, then 3× begin/draw/end.
+    var tags: [24]Tag = undefined;
+    const n = collectTags(out, &tags);
+    try expectContainsInOrder(tags[0..n], n, &.{
+        .create_render_target, .create_render_target, .create_render_target, .create_shader,
+        .begin_offscreen_pass, .draw_fullscreen_quad, .end_offscreen_pass, // blur H
+        .begin_offscreen_pass, .draw_fullscreen_quad, .end_offscreen_pass, // blur V
+        .begin_offscreen_pass, .draw_fullscreen_quad, .end_offscreen_pass, // combine
+    });
+    // Inspect the three fullscreen draws: blur H (sh_blur, h_scene_hdr→h_dof_a),
+    // blur V (sh_blur, h_dof_a), combine (sh_dof, sharp+blurred+depth, count=4).
+    var off2: usize = 4;
+    var draw_idx: usize = 0;
+    while (off2 < 4 + readU32(out, 0)) {
+        const tag = readU16(out, off2);
+        const sz = readU16(out, off2 + 2);
+        if (tag == @intFromEnum(Tag.draw_fullscreen_quad)) {
+            const shader = readU32(out, off2 + 4);
+            const t0 = readU32(out, off2 + 8);
+            const t1 = readU32(out, off2 + 12);
+            const t2 = readU32(out, off2 + 16);
+            const pc = readU32(out, off2 + 24);
+            switch (draw_idx) {
+                0 => { // blur H
+                    try testing.expectEqual(@as(u32, PostCtx.sh_blur), shader);
+                    try testing.expectEqual(@as(u32, PostCtx.h_scene_hdr), t0);
+                    try testing.expectEqual(@as(u32, 4), pc);
+                },
+                1 => { // blur V
+                    try testing.expectEqual(@as(u32, PostCtx.sh_blur), shader);
+                    try testing.expectEqual(@as(u32, DofCtx.h_dof_a), t0);
+                    try testing.expectEqual(@as(u32, 4), pc);
+                },
+                2 => { // combine
+                    try testing.expectEqual(@as(u32, DofCtx.sh_dof), shader);
+                    try testing.expectEqual(@as(u32, PostCtx.h_scene_hdr), t0); // sharp
+                    try testing.expectEqual(@as(u32, DofCtx.h_dof_b), t1); // blurred
+                    try testing.expectEqual(@as(u32, PrepassCtx.h_gbuffer), t2); // depth
+                    try testing.expectEqual(@as(u32, 4), pc);
+                },
+                else => {},
+            }
+            draw_idx += 1;
+        }
+        off2 += 4 + sz;
+    }
+    try testing.expectEqual(@as(usize, 3), draw_idx);
+
+    // Second runDof call (no resize) re-emits NEITHER create — guard works.
+    var enc2 = Encoder.init(&buf);
+    enc2.runDof(&ctx, false, 640, 400, 6.0, 4.0, 0.8);
+    const out2 = enc2.finish();
+    var tags2: [24]Tag = undefined;
+    const n2 = collectTags(out2, &tags2);
+    try testing.expectEqual(@as(Tag, .begin_offscreen_pass), tags2[0]); // no create_* up front
+    _ = n2;
 }
 
 test "prepass + gdebug shader content (both backends)" {

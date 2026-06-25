@@ -239,3 +239,19 @@ pub const GlSsao = struct {
 pub const GlSsr = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// verve.gl DOF demo (/gl-dof, image-quality slice 5). Renders a row of bright
+/// emissive cubes receding from near to far so each sits at a distinct linear
+/// view depth. The G-buffer prepass → scene → DOF → composite chain: the DOF pass
+/// blurs the scene (two separable Gaussian passes reusing PostCtx.sh_blur) then
+/// composites sharp vs blurred per pixel by a circle-of-confusion derived from
+/// |gbuffer.a (linear view depth) − focus_distance| / focal_range × max_blur,
+/// writing h_scene_dof — read by the composite via `PostProcess.scene_src` so the
+/// blurred scene bloom + tonemaps. DOF needs NO matrices (depth comes straight
+/// from the G-buffer alpha). Controls wire to the `gldof_toggle` /
+/// `gldof_focus_near` / `gldof_focus_far` / `gldof_toggle_view` / `gldof_freeze`
+/// chunk exports. Emits `<canvas data-ref="gldof-canvas">`.
+/// Source: `src/client/islands/GlDof.zig`.
+pub const GlDof = struct {
+    pub const props_schema: []const u8 = "{}";
+};

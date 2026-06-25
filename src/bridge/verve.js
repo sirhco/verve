@@ -5300,6 +5300,8 @@
     if (sh.uVigRadius && count >= 4) gl.uniform1f(sh.uVigRadius, p[3]);
     if (sh.uTexel && count >= 2) gl.uniform2f(sh.uTexel, p[0], p[1]);
     if (sh.uDir && count >= 4) gl.uniform2f(sh.uDir, p[2], p[3]);
+    // DOF (slice 5): vec4 (focus_distance, focal_range, max_blur, _) — count=4.
+    if (sh.uDofParams && count >= 4) gl.uniform4f(sh.uDofParams, p[0], p[1], p[2], p[3]);
     // SSAO (slice 3): params vec4 @0 = (radius,bias,intensity,_); inv_proj @4..20;
     // proj @20..36 (column-major mat4, matches the f32[36] the island packs).
     if (sh.uSsaoParams && count >= 36) {
@@ -5437,6 +5439,8 @@
             sh.uSsaoParams = gl.getUniformLocation(prog, "u_ssao_params");
             sh.uInvProj = gl.getUniformLocation(prog, "u_inv_proj");
             sh.uProj = gl.getUniformLocation(prog, "u_proj");
+            // DOF (slice 5): vec4 (focus_distance, focal_range, max_blur, _).
+            sh.uDofParams = gl.getUniformLocation(prog, "u_dof_params");
           }
           if (variant & 0x10000) { // variant_prepass (1<<16): mvp + mv (view·model)
             // sh.mvp ("u_mvp") is already resolved above; cache the second matrix.

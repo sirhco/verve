@@ -4,6 +4,44 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.16.0] - 2026-06-24
+
+### Added
+
+- **gl DOF — depth of field (image-quality slice 5)**
+  (`src/core/gl/command.zig`, `src/bridge/verve.js`,
+  `src/client/islands/GlDof.zig`, `src/app/{islands,routes,components}.zig`):
+  the third consumer of the slice-1 depth+normal G-buffer — and the simplest
+  (no matrices). A new `DofCtx` (`h_dof_a=257`, `h_dof_b=258`,
+  `h_scene_dof=259`, `sh_dof=260`) and `Encoder.runDof(...)` add a 3-pass
+  depth-of-field effect: two separable Gaussian blur passes (**reusing**
+  `PostCtx.sh_blur=245`, no new blur shader) blur the scene `h_scene_hdr` →
+  `h_dof_a` (horizontal) → `h_dof_b` (vertical), then a CoC **combine** shader
+  (`sh_dof`) composites sharp (`h_scene_hdr`) vs blurred (`h_dof_b`) per pixel
+  by a circle-of-confusion derived from linear view depth read straight from the
+  G-buffer alpha — `coc = clamp(|depth − focus_distance| / focal_range, 0, 1) ×
+  max_blur`, `out = mix(sharp, blurred, coc)` — writing `h_scene_dof`, a drop-in
+  scene source for the bloom + composite chain.
+  - **Scene-source parameterization:** reuses slice-4's `PostProcess.scene_src`
+    (default `0` → `h_scene_hdr=240`). The DOF island sets it to `h_scene_dof`
+    when DOF is on so the blurred scene bloom + tonemaps; leaving it `0` is
+    byte-for-byte the old behavior, so `/gl-post`, `/gl-tonemap`, `/gl-ssao`, and
+    `/gl-ssr` are unchanged (goldens frozen).
+  - DOF needs **NO matrices**: depth is the G-buffer alpha (`-viewZ > 0`). The
+    combine params are a single **vec4** `(focus_distance, focal_range, max_blur,
+    _)` → auto-derived **32B** WebGPU `paramsSize` (the slice-4 WGSL-derived
+    binding-size path needs no change). The only bridge change is a `u_dof_params`
+    uniform mapping for the GLSL combine shader (vec4 at `count=4`). No new wire
+    tags, no Params-size special-casing, PBR_U untouched.
+  - Both backends (WGSL + WebGL2 GLSL ES 3.00) share byte-identical CoC math; all
+    WGSL texture reads use `textureSampleLevel(...,0.0)`.
+  - New `/gl-dof` demo (a row of 7 bright emissive cubes receding from near to far
+    so each sits at a distinct view depth, asset-free — reuses the built-in cube
+    mesh) + `GlDof` island with `gldof_toggle` / `gldof_focus_near` /
+    `gldof_focus_far` / `gldof_toggle_view` / `gldof_freeze`. Per-object
+    `mvp`/`model`/`normal`/`mv`/`material` arrays (the bridge dereferences after
+    the frame returns, so a shared static would alias to the last draw).
+
 ## [0.15.0] - 2026-06-24
 
 ### Added
