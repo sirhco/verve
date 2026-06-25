@@ -2494,7 +2494,9 @@ pub fn wgslSsao() []const u8 {
     \\  return viewRay * (depth / -viewRay.z); // scale so result.z == -depth
     \\}
     \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    \\  let g = textureSample(tex0, samp, uv);
+    \\  // Use textureSampleLevel (mip 0) for all samples — derivative-free, so it is
+    \\  // legal in the non-uniform control flow after the early-out `return` below.
+    \\  let g = textureSampleLevel(tex0, samp, uv, 0.0);
     \\  let depth = g.a;                    // -viewZ (positive)
     \\  if (depth <= 0.0) { return vec4<f32>(1.0, 1.0, 1.0, 1.0); } // background → open
     \\  let radius = P.params.x;
@@ -2522,7 +2524,7 @@ pub fn wgslSsao() []const u8 {
     \\    let sampleView = viewPos + (tbn * kernel[i]) * radius;
     \\    let sclip = P.proj * vec4<f32>(sampleView, 1.0);
     \\    let suv = (sclip.xy / sclip.w) * 0.5 + 0.5;
-    \\    let sampleDepth = textureSample(tex0, samp, suv).a; // stored geom depth (positive)
+    \\    let sampleDepth = textureSampleLevel(tex0, samp, suv, 0.0).a; // stored geom depth (positive)
     \\    let pointDepth = -sampleView.z;                     // sample point depth (positive)
     \\    let rangeCheck = smoothstep(0.0, 1.0, radius / max(abs(depth - sampleDepth), 1e-4));
     \\    if (sampleDepth > 0.0 && sampleDepth <= pointDepth - bias) {
@@ -2556,7 +2558,7 @@ pub fn wgslSsaoBlur() []const u8 {
     \\  for (var x = -2; x < 2; x = x + 1) {
     \\    for (var y = -2; y < 2; y = y + 1) {
     \\      let o = vec2<f32>(f32(x), f32(y)) * P.texel;
-    \\      acc = acc + textureSample(tex0, samp, uv + o).r;
+    \\      acc = acc + textureSampleLevel(tex0, samp, uv + o, 0.0).r;
     \\    }
     \\  }
     \\  let v = acc / 16.0;
@@ -4283,8 +4285,8 @@ test "SSAO shader content (both backends)" {
 test "golden: SSAO shader sources frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0x1765733c3fefc701), fnv64(ssaoFragmentSrc));
     try testing.expectEqual(@as(u64, 0x66559a8dc1ee3409), fnv64(ssaoBlurFragmentSrc));
-    try testing.expectEqual(@as(u64, 0xf26e390d44eeabab), fnv64(wgslSsao()));
-    try testing.expectEqual(@as(u64, 0x461f7fd65496504d), fnv64(wgslSsaoBlur()));
+    try testing.expectEqual(@as(u64, 0xc812e6441af2f15a), fnv64(wgslSsao()));
+    try testing.expectEqual(@as(u64, 0x5409dc9a890c738b), fnv64(wgslSsaoBlur()));
 }
 
 test "runSsao emits createRT×2, createShader×2, then 2 blit passes" {
