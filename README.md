@@ -13,10 +13,10 @@
 
 </div>
 
-> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.17.x. Public
+> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.18.x. Public
 > APIs are not stable and **will** break between minor versions.
 > All three desktop backends (macOS, Windows, Linux GTK4) are validated
-> on real hardware (current as of v0.17.x). Known limitations: desktop auto-updater
+> on real hardware (current as of v0.18.x). Known limitations: desktop auto-updater
 > apply is macOS-only; full a11y provider not yet implemented; Linux
 > image clipboard returns `Unsupported`. Use for learning, experiments,
 > and personal projects. Not production-ready.
@@ -167,7 +167,9 @@ Native 3D, pure Zig + two hand-written interpreters (**WebGL2 and WebGPU**) — 
 - **Engine core** — column-major f32 math, struct-of-arrays scene graph with pre-order dirty propagation, one API-neutral command stream driving both backends, per-submesh shader-variant selection, frustum culling (camera + shadow-light), BVH picking, orbit controls, and declarative `ctx.glScene` scenes.
 - **Materials** — PBR metallic-roughness + image-based lighting (IBL), emissive, double-sided, and alpha **BLEND** / **MASK** (alpha-test cutout, with hole-accurate cast shadows) modes.
 - **Lighting** — directional / spot / point lights with simultaneous multi-light **shadow casters** (tiled 2D + cube atlases), **cascaded shadow maps** for directional light, and **rect area lights** via Linearly Transformed Cosines with soft area shadows.
-- **Skeletal skinning** — GPU skinning with keyframe animation, multiple clips + switching, cross-fade and weighted blending, ping-pong / loop / once modes, scrub, and all glTF interpolation modes (step / linear / cubicspline).
+- **Skeletal skinning** — GPU skinning with keyframe animation, multiple clips + switching, cross-fade and weighted blending, ping-pong / loop / once modes, scrub, and all glTF interpolation modes (step / linear / cubicspline). Demos: `/gl-skin`.
+- **Morph targets** — GPU blend shapes with POSITION + NORMAL + **TANGENT** deltas (correct normal-mapped morphing), up to **32 simultaneous active influences**, cubic-Hermite weight easing, and a **combined skinned + morph** variant (morph deltas applied to local space, then the skin matrix — glTF order). Demos: `/gl-morph`, `/gl-morph16`, `/gl-skin-morph`.
+- **Level of detail (LOD)** — a single `.vmesh` packs multiple LOD levels with squared-distance thresholds; the runtime selects the active level per object by camera distance and narrows every draw pass (opaque, transparent, shadow) to it. Demo: `/gl-lod`.
 - **Image quality** — bloom + FXAA, a depth + view-space-normal prepass (G-buffer), **SSAO**, **screen-space reflections (SSR)**, **depth of field**, **weighted-blended OIT** (order-independent transparency), selectable tone-mappers (ACES / AgX / Reinhard / Reinhard-extended / Uncharted2 / linear), and vignette. Demos: `/gl-ssao`, `/gl-ssr`, `/gl-dof`, `/gl-oit`, `/gl-tonemap`, `/gl-post`.
 - **Asset pipeline** — build-time `.glb` → packed `.vmesh` (`tools/gl_asset_gen`): zero runtime parsing, fetch → linear memory → GPU upload. Pure-Zig PNG decoder, glb parser, and vmesh reader, all hardened against hostile input (errors, never panics). `verve.anim` fusion drives scroll-scrubbed 3D. Demo: [`examples/gl-viewer/`](examples/gl-viewer/README.md).
 
@@ -212,7 +214,7 @@ tour and platform support matrix.
 
 > Pre-1.0 — release artifacts are published for each tag, but
 > behavior is experimental. All three desktop backends (macOS,
-> Windows, Linux GTK4) are validated on real hardware (current as of v0.17.x).
+> Windows, Linux GTK4) are validated on real hardware (current as of v0.18.x).
 
 Tagged releases publish `verve-server` + `verve-cli` tarballs for
 five targets:
@@ -224,7 +226,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.17.0
+VERSION=0.18.1
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256
@@ -245,7 +247,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.17.0
+zig fetch --save git+https://github.com/sirhco/verve#v0.18.1
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -305,7 +307,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.17.0 \
+verve-cli new ~/my-app --release v0.18.1 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 
@@ -338,6 +340,8 @@ Then open:
 - <http://127.0.0.1:8080/smooth> — `verve.anim` ScrollSmoother demo
 - <http://127.0.0.1:8080/gl> — `verve.gl` 3D engine (WebGPU + WebGL2, no three.js)
 - <http://127.0.0.1:8080/gl-scene> — declarative `ctx.glScene` 3D scene
+- <http://127.0.0.1:8080/gl-skin>, `/gl-skin-morph`, `/gl-morph` — skinning, combined skinned+morph, and morph-target demos
+- <http://127.0.0.1:8080/gl-lod> — distance-based level-of-detail (LOD) mesh selection
 - <http://127.0.0.1:8080/gl-ssr>, `/gl-ssao`, `/gl-dof`, `/gl-oit`, `/gl-tonemap` — image-quality demos (SSR, SSAO, depth of field, order-independent transparency, tone-mappers)
 
 Or run the **showcase** for a tour of every feature:
