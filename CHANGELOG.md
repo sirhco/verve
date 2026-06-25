@@ -4,6 +4,23 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.18.1] - 2026-06-25
+
+### Fixed
+
+- **gl standalone skin demos rendered near-black** (`src/client/islands/GlSkin.zig`,
+  `src/client/islands/GlSkinMorph.zig`): `/gl-skin` and `/gl-skin-morph` bound no
+  IBL environment, so the bridge defaulted the irradiance/specular/BRDF cubes to
+  black → zero ambient → the lit bar read as black against the dark scene (the
+  thin-bar geometry also presents grazing faces to the single directional light).
+  Both islands now `gl_load` `/gl/studio.venv` and bind it (irradiance + specular
+  cubes + BRDF LUT via `createTextureEx` + `bindIbl`), exactly like the GlScene
+  demos — the bars are now properly lit on both backends. The lighting pipeline
+  itself was never broken (verified via in-shader instrumentation: `light_count`,
+  intensity and normals all arrive correctly); the missing piece was ambient.
+  (The post-processing demos — `/gl-ssr`, `/gl-dof`, `/gl-post`, `/gl-oit`,
+  `/gl-ssao` — are intentionally dark to showcase their effects and are left as-is.)
+
 ## [0.18.0] - 2026-06-25
 
 ### Added

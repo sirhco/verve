@@ -38,6 +38,11 @@ var elapsed_s: f32 = 0;
 
 // Resolved once the vmesh bytes land.
 var asset: ?gl.vmesh.Reader = null;
+// Resolved once the .venv (IBL environment) bytes land. Provides ambient +
+// reflections so the bar reads against the dark scene (the bridge otherwise
+// defaults the IBL cubes to black → zero ambient → near-black surface).
+var env_reader: ?gl.venv.Reader = null;
+var env_tex_sent: bool = false;
 
 // STABLE statics — the wire records their addresses; read after the frame returns.
 var mvp: [16]f32 = undefined;
@@ -85,9 +90,14 @@ const base_tex: u32 = 1;
 const mr_tex: u32 = 2;
 const occ_tex: u32 = 3;
 const morph_tex_handle: u32 = 4;
+const irr_handle: u32 = 5;
+const spec_handle: u32 = 6;
+const lut_handle: u32 = 7;
 const frame_export = "glskinmorph_frame";
 const vmesh_ready_export = "glskinmorph_vmesh_ready";
 const vmesh_url = "/gl/skinmorph.vmesh";
+const env_ready_export = "glskinmorph_env_ready";
+const env_url = "/gl/studio.venv";
 
 // ── hydrate ─────────────────────────────────────────────────────────────────
 
@@ -99,6 +109,8 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     resources_sent = false;
     morph_tex_sent = false;
     asset = null;
+    env_reader = null;
+    env_tex_sent = false;
     yaw = 0;
     freeze = false;
     elapsed_s = 0;
@@ -112,6 +124,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
             gl_start(h, frame_export.ptr, frame_export.len);
     }
     gl_load(vmesh_url.ptr, vmesh_url.len, vmesh_ready_export.ptr, vmesh_ready_export.len);
+    gl_load(env_url.ptr, env_url.len, env_ready_export.ptr, env_ready_export.len);
 }
 
 // ── asset-ready callback ──────────────────────────────────────────────────────
@@ -120,6 +133,12 @@ export fn glskinmorph_vmesh_ready(ptr: u32, len: u32) void {
     if (ptr == 0) return;
     const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
     asset = gl.vmesh.Reader.init(bytes) catch null;
+}
+
+export fn glskinmorph_env_ready(ptr: u32, len: u32) void {
+    if (ptr == 0) return;
+    const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
+    env_reader = gl.venv.Reader.init(bytes) catch null;
 }
 
 // ── controls ─────────────────────────────────────────────────────────────────
@@ -233,6 +252,15 @@ export fn glskinmorph_frame(dt_ms: f32, width: u32, height: u32) u32 {
             @intCast(deltas.len),
         );
     }
+    // IBL textures: create once the .venv lands (irradiance + specular cubes + BRDF LUT).
+    if (!env_tex_sent) {
+        if (env_reader) |*env| {
+            env_tex_sent = true;
+            enc.createTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));
+            enc.createTextureEx(spec_handle, .cube, .rgba16f, env.spec_size, env.spec_size, env.spec_mip_count, @intCast(@intFromPtr(env.specular.ptr)), @intCast(env.specular.len));
+            enc.createTextureEx(lut_handle, .tex_2d, .rgba16f, env.lut_size, env.lut_size, 1, @intCast(@intFromPtr(env.lut.ptr)), @intCast(env.lut.len));
+        }
+    }
 
     enc.beginFrame(.{ 0.04, 0.05, 0.10, 1.0 }, width, height);
     enc.setPipeline(shader_handle, gl.command.state_depth_test | gl.command.state_cull_back);
@@ -243,6 +271,7 @@ export fn glskinmorph_frame(dt_ms: f32, width: u32, height: u32) u32 {
     enc.bindTexture(0, base_tex);
     enc.bindTexture(1, mr_tex);
     enc.bindTexture(gl.command.tex_slot_occlusion, occ_tex);
+    if (env_reader) |*env| enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
     enc.drawPbr(
         vbuf_handle,
         ibuf_handle,
