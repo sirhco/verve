@@ -3699,6 +3699,131 @@ pub fn morphGlb(alloc: Allocator) ![]u8 {
     return glb;
 }
 
+// ── morphTangentGlb ───────────────────────────────────────────────────────────
+/// Like morphGlb but adds a TANGENT VEC3 accessor to the single morph target.
+/// 2 vertices, 1 triangle, 1 morph target with POSITION + NORMAL + TANGENT deltas.
+/// Target 0, vertex 0: TANGENT delta = (0.75, 0.0, 0.0).
+/// Used to guard the Part B gltf.zig TANGENT accessor parsing path (v14).
+pub fn morphTangentGlb(alloc: Allocator) ![]u8 {
+    // BIN layout:
+    //   off_pos   =   0  3 * 3 * 4 = 36 bytes (POSITION VEC3 f32)
+    //   off_nrm   =  36  3 * 3 * 4 = 36 bytes (NORMAL VEC3 f32)
+    //   off_uv    =  72  3 * 2 * 4 = 24 bytes (TEXCOORD_0 VEC2 f32)
+    //   off_idx   =  96  3 * 2 = 6 bytes (indices u16) + 2 pad → ends at 104
+    //   off_t0pos = 104  3 * 3 * 4 = 36 bytes (target 0 POSITION deltas)
+    //   off_t0nrm = 140  3 * 3 * 4 = 36 bytes (target 0 NORMAL deltas)
+    //   off_t0tan = 176  3 * 3 * 4 = 36 bytes (target 0 TANGENT deltas VEC3)
+    //   bin_total = 212
+    const off_pos: usize = 0;
+    const off_nrm: usize = 36;
+    const off_uv: usize = 72;
+    const off_idx: usize = 96;
+    const off_t0pos: usize = 104;
+    const off_t0nrm: usize = 140;
+    const off_t0tan: usize = 176;
+    const bin_total: usize = 212;
+
+    var bin = try alloc.alloc(u8, bin_total);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    const wf32 = struct {
+        fn w(b: []u8, off: usize, v: f32) void {
+            std.mem.writeInt(u32, b[off..][0..4], @bitCast(v), .little);
+        }
+    }.w;
+
+    // POSITION: 3 vertices forming a triangle
+    wf32(bin, off_pos + 0, 0.0); wf32(bin, off_pos + 4, 0.0); wf32(bin, off_pos + 8, 0.0);
+    wf32(bin, off_pos + 12, 1.0); wf32(bin, off_pos + 16, 0.0); wf32(bin, off_pos + 20, 0.0);
+    wf32(bin, off_pos + 24, 0.0); wf32(bin, off_pos + 28, 1.0); wf32(bin, off_pos + 32, 0.0);
+
+    // NORMAL: all (0, 0, 1)
+    for (0..3) |vi| {
+        wf32(bin, off_nrm + vi * 12 + 8, 1.0); // z=1
+    }
+
+    // TEXCOORD_0: (0,0),(1,0),(0,1)
+    wf32(bin, off_uv + 8, 1.0); wf32(bin, off_uv + 20, 1.0);
+
+    // INDICES: [0, 1, 2]
+    std.mem.writeInt(u16, bin[off_idx..][0..2], 0, .little);
+    std.mem.writeInt(u16, bin[off_idx + 2 ..][0..2], 1, .little);
+    std.mem.writeInt(u16, bin[off_idx + 4 ..][0..2], 2, .little);
+
+    // Target 0 POSITION deltas: vertex 0 = (0.5, 0, 0)
+    wf32(bin, off_t0pos + 0, 0.5);
+
+    // Target 0 NORMAL deltas: all zero
+
+    // Target 0 TANGENT deltas: vertex 0 = (0.75, 0, 0)
+    wf32(bin, off_t0tan + 0, 0.75);
+
+    // JSON
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    try w.writeAll("{\"asset\":{\"version\":\"2.0\"},\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}],");
+    try w.writeAll("\"meshes\":[{\"primitives\":[{");
+    try w.writeAll("\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},");
+    try w.writeAll("\"indices\":3,\"material\":0,");
+    // 1 morph target with POSITION + NORMAL + TANGENT
+    try w.writeAll("\"targets\":[{\"POSITION\":4,\"NORMAL\":5,\"TANGENT\":6}]");
+    try w.writeAll("}]}],");
+
+    // 7 accessors
+    try w.writeAll("\"accessors\":[");
+    try w.writeAll("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},");
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"},");
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"},");
+    // acc 4: target 0 POSITION (VEC3)
+    try w.writeAll("{\"bufferView\":4,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},");
+    // acc 5: target 0 NORMAL (VEC3)
+    try w.writeAll("{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},");
+    // acc 6: target 0 TANGENT (VEC3 — morph tangent deltas are VEC3, not VEC4)
+    try w.writeAll("{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}");
+    try w.writeAll("],");
+
+    // 7 bufferViews
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_pos, 36 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_nrm, 36 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_uv, 24 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_idx, 6 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_t0pos, 36 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ off_t0nrm, 36 });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_t0tan, 36 });
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}]");
+    try w.writeAll("}");
+
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    const bin_padded: u32 = @intCast((bin_total + 3) & ~@as(usize, 3));
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF"); goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little); goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little); goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little); goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON"); goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes); goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little); goff += 4;
+    glb[goff] = 0x42; glb[goff + 1] = 0x49; glb[goff + 2] = 0x4E; glb[goff + 3] = 0x00;
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_total], bin);
+    return glb;
+}
+
 // ── morphDemoGlb ─────────────────────────────────────────────────────────────
 
 /// Builds a VISIBLE morph demo GLB: a 5×5 subdivided plane with 3 morph targets

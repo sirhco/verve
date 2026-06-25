@@ -367,7 +367,7 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\
     ;
     // Morph-target uniforms (variant_morph): sampler2D texture (RGBA16F,
-    // width=vertex_count, height=target_count*2), per-active-target indices +
+    // width=vertex_count, height=target_count*3), per-active-target indices +
     // weights, and the count of active targets (≤ morph_max_active = 32).
     const morph_uniforms =
         \\uniform highp sampler2D u_morph_tex;
@@ -377,17 +377,20 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\
     ;
     // Morph body_open: opens void main(), accumulates morph deltas into m_pos/
-    // m_nrm (frozen texel convention: row 2*t=POS, 2*t+1=NORM, x=gl_VertexID),
-    // then transforms the morphed locals.  Replaces body_open on the morph path.
+    // m_nrm/m_tan (frozen texel convention: row 3*t=POS, 3*t+1=NORM, 3*t+2=TAN,
+    // x=gl_VertexID), then transforms the morphed locals.
+    // Replaces body_open on the morph path.
     const body_open_morph =
         \\void main() {
         \\  vec3 m_pos = a_pos;
         \\  vec3 m_nrm = a_normal;
+        \\  vec3 m_tan = a_tangent.xyz;
         \\  for (int i = 0; i < u_morph_count; i++) {
         \\    int t = u_morph_idx[i];
         \\    float w = u_morph_wt[i];
-        \\    m_pos += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t), 0).xyz;
-        \\    m_nrm += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t + 1), 0).xyz;
+        \\    m_pos += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 3 * t), 0).xyz;
+        \\    m_nrm += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 3 * t + 1), 0).xyz;
+        \\    m_tan += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 3 * t + 2), 0).xyz;
         \\  }
         \\  v_world_pos = (u_model * vec4(m_pos, 1.0)).xyz;
         \\  v_normal = u_normal_mat * m_nrm;
@@ -400,17 +403,19 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
-    // Combined skinned+morph body_open: morph deltas FIRST (local pos/normal),
+    // Combined skinned+morph body_open: morph deltas FIRST (local pos/normal/tangent),
     // then the skin matrix transforms the morphed locals.
     const body_open_skinned_morph =
         \\void main() {
         \\  vec3 m_pos = a_pos;
         \\  vec3 m_nrm = a_normal;
+        \\  vec3 m_tan = a_tangent.xyz;
         \\  for (int i = 0; i < u_morph_count; i++) {
         \\    int t = u_morph_idx[i];
         \\    float w = u_morph_wt[i];
-        \\    m_pos += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t), 0).xyz;
-        \\    m_nrm += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 2 * t + 1), 0).xyz;
+        \\    m_pos += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 3 * t), 0).xyz;
+        \\    m_nrm += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 3 * t + 1), 0).xyz;
+        \\    m_tan += w * texelFetch(u_morph_tex, ivec2(gl_VertexID, 3 * t + 2), 0).xyz;
         \\  }
         \\  mat4 skin = a_weights.x * u_bones[a_joints.x] + a_weights.y * u_bones[a_joints.y] + a_weights.z * u_bones[a_joints.z] + a_weights.w * u_bones[a_joints.w];
         \\  v_world_pos = (u_model * (skin * vec4(m_pos, 1.0))).xyz;
@@ -421,6 +426,18 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
     const body_close_skinned_morph =
         \\  gl_Position = u_mvp * (skin * vec4(m_pos, 1.0));
         \\}
+        \\
+    ;
+    // Normal-map tangent body for morphed (non-skinned): uses m_tan from morph loop.
+    const nm_body_morph =
+        \\  v_tangent = normalize(mat3(u_model) * m_tan);
+        \\  v_bitangent = cross(v_normal, v_tangent) * a_tangent.w;
+        \\
+    ;
+    // Normal-map tangent body for skinned+morphed: skin-rotates the morphed m_tan.
+    const nm_body_skinned_morph =
+        \\  v_tangent = normalize(mat3(u_model) * (mat3(skin) * m_tan));
+        \\  v_bitangent = cross(v_normal, v_tangent) * a_tangent.w;
         \\
     ;
     // Shadow receiver (variant_shadow): light-space positions are computed per
@@ -471,7 +488,17 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
     } else {
         src = src ++ body_open;
     }
-    if (flags & variant_normal_map != 0) src = src ++ (if (skinned) nm_body_skinned else nm_body);
+    if (flags & variant_normal_map != 0) {
+        if (morphed and skinned) {
+            src = src ++ nm_body_skinned_morph;
+        } else if (morphed) {
+            src = src ++ nm_body_morph;
+        } else if (skinned) {
+            src = src ++ nm_body_skinned;
+        } else {
+            src = src ++ nm_body;
+        }
+    }
     if (morphed and skinned) {
         src = src ++ body_close_skinned_morph;
     } else if (morphed) {
@@ -1722,8 +1749,8 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     // caster's light pos & far come from the per-light loop vars lpos/lrange, and
     // pointShadowFactor takes them as args — mirrors the GLSL receiver exactly.)
     // Morph vertex function: adds @builtin(vertex_index) input, accumulates
-    // POSITION + NORMAL deltas, then transforms the morphed locals.
-    // vtx_index drives textureLoad (x-coord = vertex index, y-coord = 2*t or 2*t+1).
+    // POSITION + NORMAL + TANGENT deltas, then transforms the morphed locals.
+    // vtx_index drives textureLoad (x-coord = vertex index, y-coord = 3*t, 3*t+1, 3*t+2).
     const vs_head_morph =
         \\@vertex
         \\fn vs_main(
@@ -1736,11 +1763,13 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  var out: VSOut;
         \\  var m_pos = a_pos;
         \\  var m_nrm = a_normal;
+        \\  var m_tan = a_tangent.xyz;
         \\  for (var i = 0; i < morph.count; i = i + 1) {
         \\    let t = morph.idx[i / 4][i % 4];
         \\    let w = morph.wt[i / 4][i % 4];
-        \\    m_pos = m_pos + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 2 * t), 0).xyz;
-        \\    m_nrm = m_nrm + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 2 * t + 1), 0).xyz;
+        \\    m_pos = m_pos + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 3 * t), 0).xyz;
+        \\    m_nrm = m_nrm + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 3 * t + 1), 0).xyz;
+        \\    m_tan = m_tan + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 3 * t + 2), 0).xyz;
         \\  }
         \\  out.world_pos = (u.model * vec4<f32>(m_pos, 1.0)).xyz;
         \\  out.normal = u.normal_mat * m_nrm;
@@ -1875,6 +1904,20 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  out.bitangent = cross(out.normal, t) * a_tangent.w;
         \\
     ;
+    // Normal-map tangent body for morphed (non-skinned): uses m_tan from morph loop.
+    const vs_nm_morph =
+        \\  let t = normalize((mat3x3<f32>(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz)) * m_tan);
+        \\  out.tangent = t;
+        \\  out.bitangent = cross(out.normal, t) * a_tangent.w;
+        \\
+    ;
+    // Normal-map tangent body for skinned+morphed: skin-rotates the morphed m_tan.
+    const vs_nm_skinned_morph =
+        \\  let t = normalize((mat3x3<f32>(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz)) * (mat3x3<f32>(skin[0].xyz, skin[1].xyz, skin[2].xyz) * m_tan));
+        \\  out.tangent = t;
+        \\  out.bitangent = cross(out.normal, t) * a_tangent.w;
+        \\
+    ;
     const vs_tail =
         \\  out.pos = u.mvp * vec4<f32>(a_pos, 1.0);
         \\  return out;
@@ -1888,7 +1931,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\
     ;
     // Combined skinned+morph vs head: morph deltas FIRST, then skin. Defines
-    // `skin` and `sp = skin * morphed_pos` so vs_nm_skinned + vs_tail_skinned reuse.
+    // `skin`, `sp`, and `m_tan` so vs_nm_skinned_morph + vs_tail_skinned reuse.
     const vs_head_skinned_morph =
         \\@vertex
         \\fn vs_main(
@@ -1903,11 +1946,13 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  var out: VSOut;
         \\  var m_pos = a_pos;
         \\  var m_nrm = a_normal;
+        \\  var m_tan = a_tangent.xyz;
         \\  for (var i = 0; i < morph.count; i = i + 1) {
         \\    let t = morph.idx[i / 4][i % 4];
         \\    let w = morph.wt[i / 4][i % 4];
-        \\    m_pos = m_pos + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 2 * t), 0).xyz;
-        \\    m_nrm = m_nrm + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 2 * t + 1), 0).xyz;
+        \\    m_pos = m_pos + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 3 * t), 0).xyz;
+        \\    m_nrm = m_nrm + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 3 * t + 1), 0).xyz;
+        \\    m_tan = m_tan + w * textureLoad(u_morph_tex, vec2<i32>(i32(vtx_index), 3 * t + 2), 0).xyz;
         \\  }
         \\  let skin = a_weights.x * bones.m[a_joints.x] + a_weights.y * bones.m[a_joints.y] + a_weights.z * bones.m[a_joints.z] + a_weights.w * bones.m[a_joints.w];
         \\  let sp = skin * vec4<f32>(m_pos, 1.0);
@@ -2367,11 +2412,11 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         src = src ++ vs_head_instanced;
     } else if (morphed and skinned) {
         src = src ++ vs_head_skinned_morph;
-        if (nm) src = src ++ vs_nm_skinned;
+        if (nm) src = src ++ vs_nm_skinned_morph;
         src = src ++ vs_tail_skinned;
     } else if (morphed) {
         src = src ++ vs_head_morph;
-        if (nm) src = src ++ vs_nm;
+        if (nm) src = src ++ vs_nm_morph;
         src = src ++ vs_tail_morph;
     } else {
         src = src ++ (if (skinned) vs_head_skinned else vs_head);
@@ -6301,30 +6346,32 @@ test "golden: post shader sources frozen after slice 2 (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0x5396005eb65b17e8), fnv64(wgslComposite()));
 }
 
-// ── Slice 3 (combined skinned+morph): goldens ─────────────────────────────────
+// ── Slice 3 (combined skinned+morph) + Slice 4 (TANGENT morphing): goldens ────
+// Refrozen in Slice 4: morph loops now include row 3*t+2 (TANGENT deltas);
+// height = target_count*3; nm_body_morph / vs_nm_morph use m_tan from loop.
 
 test "golden: plain morph GLSL VS hash frozen (FNV-1a-64)" {
-    // Frozen from first green run — a change here = deliberate GLSL contract bump.
+    // Refrozen Slice 4: m_tan + row 3*t+2 (TANGENT delta) added to morph loop.
     // variant_morph path (no skin).
-    try testing.expectEqual(@as(u64, 0xb8cbafc493520a64), fnv64(pbrVertexSrc(variant_pbr | variant_morph)));
+    try testing.expectEqual(@as(u64, 0x273e12715b502ed0), fnv64(pbrVertexSrc(variant_pbr | variant_morph)));
 }
 
 test "golden: plain morph WGSL VS hash frozen (FNV-1a-64)" {
-    // Frozen from first green run — a change here = deliberate WGSL contract bump.
+    // Refrozen Slice 4: m_tan + row 3*t+2 (TANGENT delta) added to morph loop.
     // variant_morph path (no skin).
-    try testing.expectEqual(@as(u64, 0xa1ef39848f50ca7d), fnv64(wgslPbr(variant_pbr | variant_morph)));
+    try testing.expectEqual(@as(u64, 0x5c0763a41cb48397), fnv64(wgslPbr(variant_pbr | variant_morph)));
 }
 
 test "golden: combined skinned+morph GLSL VS hash frozen (FNV-1a-64)" {
-    // Frozen from first green run — a change here = deliberate GLSL contract bump.
-    // morph-then-skin order; tangent not morphed (Slice 4).
-    try testing.expectEqual(@as(u64, 0xbcafd0d22fe70e28), fnv64(pbrVertexSrc(variant_pbr | variant_skinned | variant_morph)));
+    // Refrozen Slice 4: m_tan + row 3*t+2 (TANGENT delta) in morph loop;
+    // nm_body_skinned_morph uses mat3(skin)*m_tan.
+    try testing.expectEqual(@as(u64, 0x455bd08052fcdff0), fnv64(pbrVertexSrc(variant_pbr | variant_skinned | variant_morph)));
 }
 
 test "golden: combined skinned+morph WGSL VS hash frozen (FNV-1a-64)" {
-    // Frozen from first green run — a change here = deliberate WGSL contract bump.
-    // morph-then-skin order; vs_nm_skinned + vs_tail_skinned reuse sp/skin.
-    try testing.expectEqual(@as(u64, 0x3ea294413da683d3), fnv64(wgslPbr(variant_pbr | variant_skinned | variant_morph)));
+    // Refrozen Slice 4: m_tan + row 3*t+2 (TANGENT delta) in morph loop;
+    // vs_nm_skinned_morph uses mat3(skin)*m_tan.
+    try testing.expectEqual(@as(u64, 0x3e5661b0c86a3071), fnv64(wgslPbr(variant_pbr | variant_skinned | variant_morph)));
 }
 
 test "combined variant: GLSL has morph loop + skin matrix; order morph-before-skin" {

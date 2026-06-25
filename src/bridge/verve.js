@@ -6205,39 +6205,47 @@
         }
         case 30: { // CREATE_MORPH_TEX — build float morph-target texture (RGBA16F).
           // Payload (command.zig Encoder.createMorphTex, 20B):
-          //   handle | width (=vertex_count) | height (=target_count*2) | ptr | byte_len.
-          // Source blob (M2 layout, f16): target-major then vertex-major.
-          // Per (t, v): 3 f16 POSITION then 3 f16 NORMAL (6 u16 per record).
-          // Texture row layout: row 2t = POSITION deltas, row 2t+1 = NORMAL deltas.
-          // Repack: texel(v, 2t)   = blob[(t*vertCount + v)*6 + 0..2] (+ 0 alpha)
-          //         texel(v, 2t+1) = blob[(t*vertCount + v)*6 + 3..5] (+ 0 alpha)
+          //   handle | width (=vertex_count) | height (=target_count*3) | ptr | byte_len.
+          // Source blob (vmesh v14 layout, f16): target-major then vertex-major.
+          // Per (t, v): 3 f16 POSITION, 3 f16 NORMAL, 3 f16 TANGENT (9 u16 per record).
+          // Texture row layout: row 3t = POSITION, row 3t+1 = NORMAL, row 3t+2 = TANGENT.
+          // Repack: texel(v, 3t)   = blob[(t*vertCount + v)*9 + 0..2] (+ 0 alpha)
+          //         texel(v, 3t+1) = blob[(t*vertCount + v)*9 + 3..5] (+ 0 alpha)
+          //         texel(v, 3t+2) = blob[(t*vertCount + v)*9 + 6..8] (+ 0 alpha)
           const handle   = dv.getUint32(off, true);
           const vertCount = dv.getUint32(off + 4, true);  // width
-          const height    = dv.getUint32(off + 8, true);  // target_count * 2
+          const height    = dv.getUint32(off + 8, true);  // target_count * 3
           const blobPtr   = dv.getUint32(off + 12, true);
           // byte_len at off+16 — informational; we derive sizes from w/h.
-          const targCount = height >>> 1; // height = target_count * 2
-          // Source: u16 halves (f16). 6 u16 per (t,v) record.
-          const blob = new Uint16Array(memory.buffer, blobPtr, targCount * vertCount * 6);
+          const targCount = Math.round(height / 3); // height = target_count * 3
+          // Source: u16 halves (f16). 9 u16 per (t,v) record.
+          const blob = new Uint16Array(memory.buffer, blobPtr, targCount * vertCount * 9);
           // Destination: RGBA16F → 4 u16 per texel. Width=vertCount, Height=height.
           const pixels = new Uint16Array(vertCount * height * 4);
           for (let t = 0; t < targCount; t++) {
             for (let v = 0; v < vertCount; v++) {
-              const srcBase = (t * vertCount + v) * 6;
-              // POSITION row (row = 2*t)
-              const posRow = t * 2;
+              const srcBase = (t * vertCount + v) * 9;
+              // POSITION row (row = 3*t)
+              const posRow = t * 3;
               const posDst = (posRow * vertCount + v) * 4;
               pixels[posDst + 0] = blob[srcBase + 0];
               pixels[posDst + 1] = blob[srcBase + 1];
               pixels[posDst + 2] = blob[srcBase + 2];
               pixels[posDst + 3] = 0; // alpha pad
-              // NORMAL row (row = 2*t+1)
-              const nrmRow = t * 2 + 1;
+              // NORMAL row (row = 3*t+1)
+              const nrmRow = t * 3 + 1;
               const nrmDst = (nrmRow * vertCount + v) * 4;
               pixels[nrmDst + 0] = blob[srcBase + 3];
               pixels[nrmDst + 1] = blob[srcBase + 4];
               pixels[nrmDst + 2] = blob[srcBase + 5];
               pixels[nrmDst + 3] = 0; // alpha pad
+              // TANGENT row (row = 3*t+2)
+              const tanRow = t * 3 + 2;
+              const tanDst = (tanRow * vertCount + v) * 4;
+              pixels[tanDst + 0] = blob[srcBase + 6];
+              pixels[tanDst + 1] = blob[srcBase + 7];
+              pixels[tanDst + 2] = blob[srcBase + 8];
+              pixels[tanDst + 3] = 0; // alpha pad
             }
           }
           const tex = gl.createTexture();
@@ -8274,38 +8282,46 @@
         }
         case 30: { // CREATE_MORPH_TEX (WebGPU) — build rgba16float morph-target texture.
           // Payload (command.zig Encoder.createMorphTex, 20B):
-          //   handle | width (=vertex_count) | height (=target_count*2) | ptr | byte_len.
-          // Source blob (M2 layout, f16): target-major then vertex-major.
-          // Per (t, v): 3 f16 POSITION then 3 f16 NORMAL (6 u16 per record).
-          // Texture row layout: row 2t = POSITION deltas, row 2t+1 = NORMAL deltas.
-          // Repack scatter: texel(v, 2t)   = blob[(t*vertCount + v)*6 + 0..2] (+ 0 alpha)
-          //                 texel(v, 2t+1) = blob[(t*vertCount + v)*6 + 3..5] (+ 0 alpha)
+          //   handle | width (=vertex_count) | height (=target_count*3) | ptr | byte_len.
+          // Source blob (vmesh v14 layout, f16): target-major then vertex-major.
+          // Per (t, v): 3 f16 POSITION, 3 f16 NORMAL, 3 f16 TANGENT (9 u16 per record).
+          // Texture row layout: row 3t = POSITION, row 3t+1 = NORMAL, row 3t+2 = TANGENT.
+          // Repack scatter: texel(v, 3t)   = blob[(t*vertCount + v)*9 + 0..2] (+ 0 alpha)
+          //                 texel(v, 3t+1) = blob[(t*vertCount + v)*9 + 3..5] (+ 0 alpha)
+          //                 texel(v, 3t+2) = blob[(t*vertCount + v)*9 + 6..8] (+ 0 alpha)
           const handle    = dv.getUint32(off, true);
           const vertCount = dv.getUint32(off + 4, true);  // width
-          const height    = dv.getUint32(off + 8, true);  // target_count * 2
+          const height    = dv.getUint32(off + 8, true);  // target_count * 3
           const blobPtr   = dv.getUint32(off + 12, true);
           // byte_len at off+16 — informational.
-          const targCount = height >>> 1;
-          const blob = new Uint16Array(memory.buffer, blobPtr, targCount * vertCount * 6);
+          const targCount = Math.round(height / 3);
+          const blob = new Uint16Array(memory.buffer, blobPtr, targCount * vertCount * 9);
           // Repack into RGBA16F row-major: 4 u16 per texel.
           const pixels = new Uint16Array(vertCount * height * 4);
           for (let t = 0; t < targCount; t++) {
             for (let v = 0; v < vertCount; v++) {
-              const srcBase = (t * vertCount + v) * 6;
-              // POSITION row (row = 2*t)
-              const posRow = t * 2;
+              const srcBase = (t * vertCount + v) * 9;
+              // POSITION row (row = 3*t)
+              const posRow = t * 3;
               const posDst = (posRow * vertCount + v) * 4;
               pixels[posDst + 0] = blob[srcBase + 0];
               pixels[posDst + 1] = blob[srcBase + 1];
               pixels[posDst + 2] = blob[srcBase + 2];
               pixels[posDst + 3] = 0; // alpha pad
-              // NORMAL row (row = 2*t+1)
-              const nrmRow = t * 2 + 1;
+              // NORMAL row (row = 3*t+1)
+              const nrmRow = t * 3 + 1;
               const nrmDst = (nrmRow * vertCount + v) * 4;
               pixels[nrmDst + 0] = blob[srcBase + 3];
               pixels[nrmDst + 1] = blob[srcBase + 4];
               pixels[nrmDst + 2] = blob[srcBase + 5];
               pixels[nrmDst + 3] = 0; // alpha pad
+              // TANGENT row (row = 3*t+2)
+              const tanRow = t * 3 + 2;
+              const tanDst = (tanRow * vertCount + v) * 4;
+              pixels[tanDst + 0] = blob[srcBase + 6];
+              pixels[tanDst + 1] = blob[srcBase + 7];
+              pixels[tanDst + 2] = blob[srcBase + 8];
+              pixels[tanDst + 3] = 0; // alpha pad
             }
           }
           const tex = device.createTexture({

@@ -1665,7 +1665,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                 const morph_vertex_count = a.morphVertexCount();
                 const morph_target_count = a.morphTargetCount();
                 const deltas = a.morphDeltas();
-                enc.createMorphTex(morph_tex_handle, morph_vertex_count, morph_target_count * 2, @intCast(@intFromPtr(deltas.ptr)), @intCast(deltas.len));
+                enc.createMorphTex(morph_tex_handle, morph_vertex_count, morph_target_count * 3, @intCast(@intFromPtr(deltas.ptr)), @intCast(deltas.len));
             }
             // P11 task 5: Registry has no recordPointShadow; re-emit createPointShadow
             // when the atlas was previously created (analogous to morph_tex_recorded).
@@ -2316,15 +2316,15 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
         shader_seen[inst_handle] = true;
     }
 
-    // M7: create the morph data texture (ONCE — width=vertexCount, height=targetCount*2).
-    // The morph deltas blob (f16 POSITION+NORMAL interleaved) lives in the asset
-    // region for the page lifetime, so the recorded pointer stays valid.
+    // M7: create the morph data texture (ONCE — width=vertexCount, height=targetCount*3).
+    // The morph deltas blob (f16 POSITION+NORMAL+TANGENT interleaved, v14) lives in the
+    // asset region for the page lifetime, so the recorded pointer stays valid.
     // Registry has no recordMorphTex; instead inst.morph_tex_recorded flags the
     // restore path in glscene_frame to re-emit createMorphTex after registry.replay.
     if (inst.morph_enabled) {
         const morph_vertex_count = a.morphVertexCount();
         const deltas = a.morphDeltas();
-        enc.createMorphTex(morph_tex_handle, morph_vertex_count, morph_target_count * 2, @intCast(@intFromPtr(deltas.ptr)), @intCast(deltas.len));
+        enc.createMorphTex(morph_tex_handle, morph_vertex_count, morph_target_count * 3, @intCast(@intFromPtr(deltas.ptr)), @intCast(deltas.len));
         inst.morph_tex_recorded = true;
     }
 

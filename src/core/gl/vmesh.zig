@@ -7,7 +7,7 @@
 //!
 //! Header layout (88 bytes, all integers little-endian u32):
 //!   [0..4]   magic "VMSH"
-//!   [4..8]   version u32 = 13
+//!   [4..8]   version u32 = 14
 //!   [8..12]  vertex_count
 //!   [12..16] index_count
 //!   [16..20] submesh_count
@@ -31,8 +31,8 @@
 //!
 //! Morph section @ morph_off (16-aligned):
 //!   Deltas blob (texture-upload-ready, target-major then vertex-major):
-//!     morph_target_count × morph_vertex_count × 6 × @sizeOf(f16) bytes.
-//!     Per (target t, vertex v): 3 f16 POSITION delta, then 3 f16 NORMAL delta.
+//!     morph_target_count × morph_vertex_count × morphRecordF16(version) × @sizeOf(f16) bytes.
+//!     Per (target t, vertex v): 3 f16 POSITION delta, 3 f16 NORMAL delta[, 3 f16 TANGENT delta (v14+)].
 //!   Weight clip (appended after deltas, 4-aligned):
 //!     Same wire format as the anim section clip:
 //!       clip_count u32 @0, flags u32 @4,
@@ -75,7 +75,14 @@ const bvh = @import("bvh.zig");
 const command = @import("command.zig");
 
 pub const magic = "VMSH";
-pub const version: u32 = 13;
+pub const version: u32 = 14;
+
+/// Returns the number of f16 values per (target, vertex) morph record.
+/// v13: 6 (pos3 + nrm3). v14+: 9 (pos3 + nrm3 + tan3).
+pub fn morphRecordF16(ver: u32) u32 {
+    return if (ver >= 14) 9 else 6;
+}
+
 pub const vertex_stride: u32 = 48; // pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40
 pub const skinned_vertex_stride: u32 = 56; // …48, then joints uint8x4 @48, weights unorm8x4 @52
 pub const header_size: u32 = 88;
@@ -93,17 +100,20 @@ pub const Clip = struct { name_hash: u32, duration: f32, tracks: []const Track }
 pub const Anims = struct { clips: []const Clip };
 pub const ClipInfo = struct { name_hash: u32, duration: f32 };
 
-/// Morph target data for the vmesh morph section (v13+).
+/// Morph target data for the vmesh morph section (v14+).
 /// `deltas`: raw f16 blob, target-major then vertex-major.
-///   Layout per (target t, vertex v): 3×f16 POSITION delta, 3×f16 NORMAL delta.
-///   len must == target_count * vertex_count * 6 * @sizeOf(f16).
+///   Layout per (target t, vertex v): 3×f16 POSITION delta, 3×f16 NORMAL delta, 3×f16 TANGENT delta (9 f16/record v14+).
+///   len must == target_count * vertex_count * morphRecordF16(14) * @sizeOf(f16) (v14).
+///   When `tangent_deltas` is non-null: `deltas` holds only 6 f16/record (pos+nrm) and
+///   pack() interleaves the tangent channel from `tangent_deltas` to produce the 9-f16 blob.
 /// `weight_clip`: optional weight animation clip. One track per morph target,
 ///   comps=1 (scalar weight). null → empty clip written (0 clips, no animation).
 pub const MorphData = struct {
     target_count: u32,
     vertex_count: u32,
-    deltas: []const u8, // raw f16 bytes; len == target_count * vertex_count * 6 * 2
+    deltas: []const u8, // raw f16 bytes; len == target_count * vertex_count * morphRecordF16(14) * 2 (v14)
     weight_clip: ?Clip = null, // scalar weight animation; null = no animation
+    tangent_deltas: ?[]const f16 = null, // v14: per-(target,vertex) tangent delta xyz; null → zeros
 };
 pub fn animComps(channel: u2) u32 {
     return if (channel == 1) 4 else 3;
@@ -300,8 +310,13 @@ pub fn pack(
     // morph_off == 0 when no morph section. morph_target_count/morph_vertex_count = 0.
     var morph_total: u32 = 0;
     if (morph) |m| {
-        const delta_bytes: u32 = m.target_count * m.vertex_count * 6 * 2; // 6 f16 per vertex per target
-        std.debug.assert(m.deltas.len == delta_bytes);
+        const delta_bytes: u32 = m.target_count * m.vertex_count * morphRecordF16(14) * 2; // 9 f16 per vertex per target (v14)
+        if (m.tangent_deltas != null) {
+            std.debug.assert(m.deltas.len == m.target_count * m.vertex_count * 6 * 2);
+            std.debug.assert(m.tangent_deltas.?.len == m.target_count * m.vertex_count * 3);
+        } else {
+            std.debug.assert(m.deltas.len == delta_bytes);
+        }
         const after_deltas_rel: u32 = delta_bytes;
         var wclip_bytes: u32 = 0;
         if (m.weight_clip) |wc| {
@@ -480,10 +495,29 @@ pub fn pack(
         @memcpy(buf[blob_dst..][0..inst_bytes.len], inst_bytes);
     }
 
-    // Write morph section (v13): deltas blob then weight clip.
+    // Write morph section (v14): deltas blob then weight clip.
     if (morph) |m| {
-        const delta_bytes: u32 = m.target_count * m.vertex_count * 6 * 2;
-        @memcpy(buf[morph_off..][0..delta_bytes], m.deltas);
+        const delta_bytes: u32 = m.target_count * m.vertex_count * morphRecordF16(14) * 2;
+        if (m.tangent_deltas) |tan| {
+            // Interleave 6-f16 (pos+nrm) from m.deltas and 3-f16 tan from tan
+            // into the 9-f16 per-record layout: [pos3][nrm3][tan3].
+            for (0..m.target_count) |ti| {
+                for (0..m.vertex_count) |vi| {
+                    const src_base = ti * m.vertex_count * 6 * 2 + vi * 6 * 2;
+                    const dst_base = morph_off + ti * m.vertex_count * 9 * 2 + vi * 9 * 2;
+                    // pos3 + nrm3 (12 bytes)
+                    @memcpy(buf[dst_base..][0..12], m.deltas[src_base..][0..12]);
+                    // tan3 (3 f16 values)
+                    const tan_base = (ti * m.vertex_count + vi) * 3;
+                    inline for (0..3) |ci| {
+                        const hv: u16 = @bitCast(tan[tan_base + ci]);
+                        std.mem.writeInt(u16, buf[dst_base + 12 + ci * 2 ..][0..2], hv, .little);
+                    }
+                }
+            }
+        } else {
+            @memcpy(buf[morph_off..][0..delta_bytes], m.deltas);
+        }
         const wclip_off_abs: u32 = morph_off + alignUp(delta_bytes, 4);
         if (m.weight_clip) |wc| {
             const track_count: u32 = m.target_count;
@@ -598,6 +632,7 @@ pub const Reader = struct {
     morph_off_: u32, // v13+; 0 when absent or version < 13
     morph_target_count_: u32, // v13+; 0 when absent
     morph_vertex_count_: u32, // v13+; 0 when absent
+    version_: u32, // file format version (13 or 14)
     bytes: []const u8,
 
     pub fn init(bytes: []const u8) error{ BadMagic, BadVersion, Truncated, BadTexIndex }!Reader {
@@ -613,7 +648,7 @@ pub const Reader = struct {
         const blen: u64 = bytes.len;
         if (!std.mem.eql(u8, bytes[0..4], magic)) return error.BadMagic;
         const ver = std.mem.readInt(u32, bytes[4..8], .little);
-        if (ver != version) return error.BadVersion; // only v13 accepted
+        if (ver < 13 or ver > version) return error.BadVersion; // accept v13 and v14
 
         const vertex_count = std.mem.readInt(u32, bytes[8..12], .little);
         const index_count = std.mem.readInt(u32, bytes[12..16], .little);
@@ -776,7 +811,7 @@ pub const Reader = struct {
         // blob bounds, and weight clip header bounds.
         if (morph_off != 0) {
             if (morph_off % 16 != 0) return error.Truncated;
-            const delta_bytes: u64 = @as(u64, morph_target_count) * @as(u64, morph_vertex_count) * 6 * 2;
+            const delta_bytes: u64 = @as(u64, morph_target_count) * @as(u64, morph_vertex_count) * @as(u64, morphRecordF16(ver)) * 2;
             if (@as(u64, morph_off) > blen or delta_bytes > blen - @as(u64, morph_off)) return error.Truncated;
             // Weight clip header: 4-aligned after delta blob, at least 8 bytes (clip_count + flags).
             const wclip_off: u64 = @as(u64, morph_off) + ((@as(u64, @intCast(delta_bytes)) + 3) & ~@as(u64, 3));
@@ -826,11 +861,12 @@ pub const Reader = struct {
             .morph_off_ = morph_off,
             .morph_target_count_ = morph_target_count,
             .morph_vertex_count_ = morph_vertex_count,
+            .version_ = ver,
             .bytes = bytes,
         };
     }
 
-    /// File format version (header [4..8]). Always 13 for files this reader accepts.
+    /// File format version (header [4..8]). 13 or 14 for files this reader accepts.
     pub fn fileVersion(self: *const Reader) u32 {
         return std.mem.readInt(u32, self.bytes[4..8], .little);
     }
@@ -960,12 +996,12 @@ pub const Reader = struct {
     }
 
     /// Raw f16 delta blob: target-major then vertex-major.
-    /// Per (target t, vertex v): 3×f16 POSITION delta, 3×f16 NORMAL delta.
-    /// len == morphTargetCount() * morphVertexCount() * 6 * @sizeOf(f16).
+    /// Per (target t, vertex v): 3×f16 POSITION delta, 3×f16 NORMAL delta[, 3×f16 TANGENT delta (v14+)].
+    /// len == morphTargetCount() * morphVertexCount() * morphRecordF16(fileVersion()) * @sizeOf(f16).
     /// Returns empty slice when no morph section present.
     pub fn morphDeltas(self: *const Reader) []const u8 {
         if (self.morph_off_ == 0) return self.bytes[0..0];
-        const delta_bytes: usize = @as(usize, self.morph_target_count_) * @as(usize, self.morph_vertex_count_) * 6 * 2;
+        const delta_bytes: usize = @as(usize, self.morph_target_count_) * @as(usize, self.morph_vertex_count_) * @as(usize, morphRecordF16(self.version_)) * 2;
         return self.bytes[self.morph_off_..][0..delta_bytes];
     }
 
@@ -974,7 +1010,7 @@ pub const Reader = struct {
     /// Caller must ensure `target_idx < morphTargetCount()`.
     pub fn morphWeightTrack(self: *const Reader, target_idx: u32) ?TrackInfo {
         if (self.morph_off_ == 0) return null;
-        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * 6 * 2;
+        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * morphRecordF16(self.version_) * 2;
         const wclip_off: usize = @intCast(@as(u64, self.morph_off_) + alignUp(delta_bytes, 4));
         const wclip_count = std.mem.readInt(u32, self.bytes[wclip_off..][0..4], .little);
         if (wclip_count == 0) return null;
@@ -992,7 +1028,7 @@ pub const Reader = struct {
     /// Uses wclip_off as base — data_off is relative to the weight clip section start.
     /// Caller must ensure `i < t.key_count`.
     pub fn morphWeightTime(self: *const Reader, t: TrackInfo, i: u32) f32 {
-        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * 6 * 2;
+        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * morphRecordF16(self.version_) * 2;
         const wclip_off: usize = @intCast(@as(u64, self.morph_off_) + alignUp(delta_bytes, 4));
         const off: usize = wclip_off + @as(usize, t.data_off) + @as(usize, i) * 4;
         return @bitCast(std.mem.readInt(u32, self.bytes[off..][0..4], .little));
@@ -1003,7 +1039,7 @@ pub const Reader = struct {
     /// index = i*3 + 1. For LINEAR/STEP: index = i.
     /// Caller must ensure `i < t.key_count`.
     pub fn morphWeightValue(self: *const Reader, t: TrackInfo, i: u32) f32 {
-        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * 6 * 2;
+        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * morphRecordF16(self.version_) * 2;
         const wclip_off: usize = @intCast(@as(u64, self.morph_off_) + alignUp(delta_bytes, 4));
         const vbase: usize = wclip_off + @as(usize, t.data_off) + @as(usize, t.key_count) * 4;
         const idx: usize = if (t.interp == 2) @as(usize, i) * 3 + 1 else i;
@@ -1014,7 +1050,7 @@ pub const Reader = struct {
     /// Index = i*3 + 0 (first slot of the [in, point, out] triple).
     /// Caller must ensure track is CUBICSPLINE (interp==2) and `i < t.key_count`.
     pub fn morphWeightInTangent(self: *const Reader, t: TrackInfo, i: u32) f32 {
-        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * 6 * 2;
+        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * morphRecordF16(self.version_) * 2;
         const wclip_off: usize = @intCast(@as(u64, self.morph_off_) + alignUp(delta_bytes, 4));
         const vbase: usize = wclip_off + @as(usize, t.data_off) + @as(usize, t.key_count) * 4;
         const idx: usize = @as(usize, i) * 3; // slot 0 = in-tangent
@@ -1025,7 +1061,7 @@ pub const Reader = struct {
     /// Index = i*3 + 2 (third slot of the [in, point, out] triple).
     /// Caller must ensure track is CUBICSPLINE (interp==2) and `i < t.key_count`.
     pub fn morphWeightOutTangent(self: *const Reader, t: TrackInfo, i: u32) f32 {
-        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * 6 * 2;
+        const delta_bytes: u32 = self.morph_target_count_ * self.morph_vertex_count_ * morphRecordF16(self.version_) * 2;
         const wclip_off: usize = @intCast(@as(u64, self.morph_off_) + alignUp(delta_bytes, 4));
         const vbase: usize = wclip_off + @as(usize, t.data_off) + @as(usize, t.key_count) * 4;
         const idx: usize = @as(usize, i) * 3 + 2; // slot 2 = out-tangent
@@ -1679,8 +1715,8 @@ test "(j) v5 skinned round-trip: stride 56, 2-joint skeleton" {
     const bytes = try pack(testing.allocator, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints, &weights, &skel, null, &.{}, 0, null);
     defer testing.allocator.free(bytes);
 
-    // Header: version 11, skinned flag set, joint_count == 2.
-    try testing.expectEqual(@as(u32, 13), std.mem.readInt(u32, bytes[4..8], .little));
+    // Header: version 14, skinned flag set, joint_count == 2.
+    try testing.expectEqual(@as(u32, 14), std.mem.readInt(u32, bytes[4..8], .little));
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[56..60], .little));
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[64..68], .little));
     // skeleton_off 16-aligned.
@@ -1751,8 +1787,8 @@ test "vmesh v9: CUBICSPLINE round-trip — in/point/out tangents + LINEAR regres
     const bytes = try pack(testing.allocator, &verts, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, true, &joints_arr, &weights_arr, &skel, anims, &.{}, 0, null);
     defer testing.allocator.free(bytes);
 
-    // Version must be 11.
-    try testing.expectEqual(@as(u32, 13), std.mem.readInt(u32, bytes[4..8], .little));
+    // Version must be 14.
+    try testing.expectEqual(@as(u32, 14), std.mem.readInt(u32, bytes[4..8], .little));
 
     const r = try Reader.init(bytes);
     try testing.expect(r.animPresent());
@@ -1848,7 +1884,7 @@ test "vmesh v10: submesh alpha_mode round-trips" {
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 13), version);
+    try testing.expectEqual(@as(u32, 14), version);
     try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 1), reader.submesh(0).alpha_mode);
 }
@@ -1862,7 +1898,7 @@ test "vmesh v10: submesh alpha_cutoff round-trips" {
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 13), version);
+    try testing.expectEqual(@as(u32, 14), version);
     try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 2), reader.submesh(0).alpha_mode);
     try testing.expectEqual(@as(f32, 0.3), reader.submesh(0).alpha_cutoff);
@@ -1891,7 +1927,7 @@ test "vmesh v11: submesh double_sided round-trips" {
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 13), version);
+    try testing.expectEqual(@as(u32, 14), version);
     try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 1), reader.submesh(0).double_sided);
 }
@@ -1927,7 +1963,7 @@ test "vmesh v12: instances section round-trips" {
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &insts, 2, null);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 13), version);
+    try testing.expectEqual(@as(u32, 14), version);
     try testing.expectEqual(@as(u32, 2), reader.instanceCount());
     const blob = reader.instances();
     try testing.expectEqual(@as(usize, 2 * 80), blob.len);
@@ -1967,12 +2003,12 @@ fn buildMorphFixture(
     };
 
     // Build delta blob: target-major, vertex-major.
-    // Per (target t, vertex v): 3 f16 POSITION delta, 3 f16 NORMAL delta.
+    // Per (target t, vertex v): 3 f16 POSITION delta, 3 f16 NORMAL delta, 3 f16 TANGENT delta (v14).
     // We fill with known values so we can spot-check:
     //   target 0, vertex 0, POSITION.x = @as(f16, 0.5)
     const target_count: u32 = opts.targets;
     const vertex_count: u32 = opts.verts;
-    const delta_f16_count: usize = @as(usize, target_count) * @as(usize, vertex_count) * 6;
+    const delta_f16_count: usize = @as(usize, target_count) * @as(usize, vertex_count) * 9; // 9 f16/record (v14)
     const delta_bytes_count: usize = delta_f16_count * 2;
     const delta_buf = try alloc.alloc(u8, delta_bytes_count);
     defer alloc.free(delta_buf);
@@ -2060,10 +2096,10 @@ test "vmesh v13 morph section round-trips; pre-morph mesh reads as zero morphs" 
     defer testing.allocator.free(bytes);
 
     var r = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 13), r.fileVersion());
+    try testing.expectEqual(@as(u32, 14), r.fileVersion());
     try testing.expectEqual(@as(u32, 2), r.morphTargetCount());
     try testing.expectEqual(@as(u32, 3), r.morphVertexCount());
-    try testing.expectEqual(@as(usize, 2 * 3 * 6 * @sizeOf(f16)), r.morphDeltas().len);
+    try testing.expectEqual(@as(usize, 2 * 3 * 9 * @sizeOf(f16)), r.morphDeltas().len);
 
     // Spot-check: target 0, vertex 0, POSITION.x = 0.5 (f16 round-trip).
     const deltas = r.morphDeltas();
@@ -2119,7 +2155,7 @@ test "morphWeight CUBICSPLINE: value reads point slot, tangent readers return in
     };
 
     // Minimal morph section: 1 target, 1 vertex, zero deltas.
-    const delta_bytes_count: usize = 1 * 1 * 6 * 2;
+    const delta_bytes_count: usize = 1 * 1 * 9 * 2;
     var deltas_buf = [_]u8{0} ** delta_bytes_count;
     const morph = MorphData{
         .target_count = 1,
@@ -2170,4 +2206,73 @@ test "morphWeight CUBICSPLINE: value reads point slot, tangent readers return in
     // morphWeightOutTangent: slot 2 per key (i*3 + 2).
     try testing.expectApproxEqAbs(@as(f32, 0.9), r.morphWeightOutTangent(trk.?, 0), 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 3.9), r.morphWeightOutTangent(trk.?, 1), 1e-6);
+}
+
+test "vmesh v13 back-compat: morphRecordF16 branching" {
+    // Verify morphRecordF16 returns correct values for v13 vs v14+.
+    // This tests the branching logic without needing a hand-crafted v13 buffer.
+    try testing.expectEqual(@as(u32, 6), morphRecordF16(13));
+    try testing.expectEqual(@as(u32, 9), morphRecordF16(14));
+    try testing.expectEqual(@as(u32, 9), morphRecordF16(15)); // future versions
+}
+
+test "vmesh v14 morph tangent round-trip" {
+    // Pack with tangent_deltas (6-f16 pos+nrm in deltas, separate tan channel),
+    // verify morphDeltas().len == tc*vc*9*2 and tangent values round-trip.
+    const tc: u32 = 1;
+    const vc: u32 = 2;
+
+    // 6-f16 pos+nrm deltas (all zeros)
+    const deltas_6 = [_]u8{0} ** (1 * 2 * 6 * 2);
+    // tangent deltas: tc*vc*3 f16 values
+    const tan_deltas_f16 = [_]f16{
+        0.25, 0.0, 0.0, // target 0, vertex 0
+        0.0,  0.5, 0.0, // target 0, vertex 1
+    };
+
+    const verts = [_]f32{
+        0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0,
+        1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0,
+        0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0,
+    };
+    const idx = [_]u16{ 0, 1, 2 };
+    const sub = Submesh{
+        .index_byte_off = 0,
+        .index_count = 3,
+        .base_color = .{ 1, 1, 1, 1 },
+        .metallic = 0,
+        .roughness = 1,
+        .emissive = .{ 0, 0, 0 },
+        .occlusion_strength = 1,
+        .normal_scale = 1,
+        .tex_base = -1,
+        .tex_mr = -1,
+        .tex_normal = -1,
+        .tex_emissive = -1,
+        .tex_occlusion = -1,
+    };
+    const morph = MorphData{
+        .target_count = tc,
+        .vertex_count = vc,
+        .deltas = &deltas_6,
+        .tangent_deltas = &tan_deltas_f16,
+    };
+    const bytes = try pack(testing.allocator, &verts, &idx, &[_]Submesh{sub}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, morph);
+    defer testing.allocator.free(bytes);
+
+    var r = try Reader.init(bytes);
+    try testing.expectEqual(@as(u32, 14), r.fileVersion());
+    // Each record is 9 f16 = 18 bytes; 1 target × 2 vertices = 2 records = 36 bytes.
+    try testing.expectEqual(@as(usize, 1 * 2 * 9 * @sizeOf(f16)), r.morphDeltas().len);
+
+    const d = r.morphDeltas();
+    // Record layout: [pos.x, pos.y, pos.z, nrm.x, nrm.y, nrm.z, tan.x, tan.y, tan.z] × 2 bytes each.
+    // Record 0 (target 0, vertex 0): tan.x = 0.25 at byte offset 12.
+    const tan_x_v0: f16 = @bitCast(std.mem.readInt(u16, d[12..14], .little));
+    try testing.expectApproxEqAbs(@as(f16, 0.25), tan_x_v0, 0.001);
+
+    // Record 1 (target 0, vertex 1) starts at byte offset 18 (9 f16 × 2 bytes).
+    // tan.y = 0.5 at byte offset 18 + 14 = 32 (6th f16 within record = tan.y).
+    const tan_y_v1: f16 = @bitCast(std.mem.readInt(u16, d[18 + 14 ..][0..2], .little));
+    try testing.expectApproxEqAbs(@as(f16, 0.5), tan_y_v1, 0.001);
 }

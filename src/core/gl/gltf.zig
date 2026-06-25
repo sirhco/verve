@@ -748,8 +748,9 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         const vc: u32 = @intCast(first_pos.len / 3);
         const tc: u32 = @intCast(targets.len);
 
-        // Build delta blob: target-major, vertex-major; 3 f16 pos + 3 f16 nrm per vertex
-        const delta_bytes = @as(usize, tc) * @as(usize, vc) * 6 * 2;
+        // Build delta blob: target-major, vertex-major; 9 f16 per vertex (v14: pos3 + nrm3 + tan3).
+        // Tangent deltas are zero-filled here (Part A: placeholder for Part B TANGENT accessor parse).
+        const delta_bytes = @as(usize, tc) * @as(usize, vc) * 9 * 2;
         const delta_buf = try aa.alloc(u8, delta_bytes);
         @memset(delta_buf, 0);
 
@@ -758,7 +759,7 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                 .object => |o| o,
                 else => continue,
             };
-            const tgt_off = ti * @as(usize, vc) * 12; // bytes offset for this target
+            const tgt_off = ti * @as(usize, vc) * 18; // bytes offset for this target (9 f16 × 2 bytes)
 
             // POSITION deltas
             const dp: []const f32 = if (tgt.get("POSITION")) |pv|
@@ -772,19 +773,31 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
             else
                 &.{};
 
+            // TANGENT deltas (optional, v14+; zero if absent). glTF morph TANGENT is VEC3.
+            const dt: []const f32 = if (tgt.get("TANGENT")) |tv|
+                try readAccessorF32(accessors, buffer_views, bin, @intCast(jsonInt(tv) orelse return error.Malformed), aa)
+            else
+                &.{};
+
             for (0..vc) |vi| {
-                const voff = tgt_off + vi * 12;
-                // 3 f16 position
+                const voff = tgt_off + vi * 18;
+                // 3 f16 position (bytes 0-5)
                 inline for (0..3) |ci| {
                     const val: f32 = if (dp.len > vi * 3 + ci) dp[vi * 3 + ci] else 0;
                     const h: u16 = @bitCast(@as(f16, @floatCast(val)));
                     std.mem.writeInt(u16, delta_buf[voff + ci * 2 ..][0..2], h, .little);
                 }
-                // 3 f16 normal
+                // 3 f16 normal (bytes 6-11)
                 inline for (0..3) |ci| {
                     const val: f32 = if (dn.len > vi * 3 + ci) dn[vi * 3 + ci] else 0;
                     const h: u16 = @bitCast(@as(f16, @floatCast(val)));
                     std.mem.writeInt(u16, delta_buf[voff + 6 + ci * 2 ..][0..2], h, .little);
+                }
+                // 3 f16 tangent (bytes 12-17); zero when no TANGENT accessor
+                inline for (0..3) |ci| {
+                    const val: f32 = if (dt.len > vi * 3 + ci) dt[vi * 3 + ci] else 0;
+                    const h: u16 = @bitCast(@as(f16, @floatCast(val)));
+                    std.mem.writeInt(u16, delta_buf[voff + 12 + ci * 2 ..][0..2], h, .little);
                 }
             }
         }
@@ -2779,4 +2792,24 @@ test "gl_asset_gen path: morphDemoGlb morph section survives parseGlb + pack (C1
     // morphDemoGlb: 5×5 plane → 25 vertices, 3 targets (Bulge/Wave/Twist)
     try testing.expectEqual(@as(u32, 3), r.morphTargetCount());
     try testing.expectEqual(@as(u32, 25), r.morphVertexCount());
+}
+
+test "glTF morph TANGENT accessor (v14): nonzero tangent deltas survive parseGlb + pack" {
+    // Build a minimal GLB with 1 morph target that includes a TANGENT VEC3 accessor.
+    // Asserts that the tangent bytes [12..17] in the delta blob are nonzero.
+    const fixture = @import("fixture.zig");
+    const glb = try fixture.morphTangentGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    const bytes = try toVmesh(testing.allocator, glb);
+    defer testing.allocator.free(bytes);
+    var r = try vmesh.Reader.init(bytes);
+    try testing.expectEqual(@as(u32, 14), r.fileVersion());
+    try testing.expectEqual(@as(u32, 1), r.morphTargetCount());
+    // morphDeltas() must have 9-f16 stride (v14).
+    const vc = r.morphVertexCount();
+    try testing.expectEqual(@as(usize, 1 * @as(usize, vc) * 9 * @sizeOf(f16)), r.morphDeltas().len);
+    // Target 0, vertex 0: tangent delta (bytes 12-13) must be nonzero (fixture sets 0.75).
+    const d = r.morphDeltas();
+    const tan_x: f16 = @bitCast(std.mem.readInt(u16, d[12..14], .little));
+    try testing.expectApproxEqAbs(@as(f16, 0.75), tan_x, 0.01);
 }
