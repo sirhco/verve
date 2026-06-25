@@ -89,6 +89,14 @@ pub const Tag = enum(u16) {
     //   the depth-based WBOIT weight from -mv·pos.z and writes accum = vec4(rgb*a, a)*w and reveal = a. WebGPU: one draw
     //   into the MRT pass (fs returns @location(0) accum + @location(1) reveal). WebGL2: replayed once per single-target
     //   pass — the bound program (sh_oit accum-out / sh_oit_reveal reveal-out) + global blend selects which output lands.
+    // ── Slice 1: camera-facing billboards (Points / Sprites) ────────────
+    draw_billboards = 42, // {vbuf_instance, count, tex_handle, view_ptr, proj_ptr, flags} — `count` camera-facing
+    //   textured quads from ONE per-instance buffer (36B/record: center vec3@0, size f32@12, color vec4@16, rot f32@32;
+    //   per-instance attribs loc0=center,1=size,2=color,3=rot). tex_handle=0 → white dummy (mirrors draw_fullscreen_quad).
+    //   view_ptr/proj_ptr → 16 f32 each, passed SEPARATELY (camera-facing expansion happens in VIEW space, then proj).
+    //   flags bit0=sizeAttenuation (world-unit size; off → screen-constant), bit1=round (FS discards outside the unit
+    //   circle). VBO-less quad: the VS derives 6 corners (2 tris) from gl_VertexID / @builtin(vertex_index). Standalone
+    //   variant_billboard shader pair (own VS+FS + own U{view,proj,flags}). Draw = drawArraysInstanced(TRIANGLES,0,6,count).
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -132,6 +140,7 @@ pub const variant_morph: u32 = 1 << 14; // requires variant_pbr; texture-blended
 pub const variant_shadow_point: u32 = 1 << 15; // requires variant_pbr; omnidirectional point-light shadow receiver (RGBA8 atlas)
 pub const variant_prepass: u32 = 1 << 16; // depth + view-space normal prepass; rgba16f G-buffer (rgb=n*0.5+0.5, a=-viewPos.z). Standalone shader pair (mvp+mv UBO), not a PBR add-on.
 pub const variant_oit: u32 = 1 << 17; // Weighted-Blended OIT transparent-geometry shader. Standalone (mvp+mv+color UBO), NOT a PBR add-on. On WebGPU it builds an MRT pipeline (2 color targets, per-target blend, depth-write off); on WebGL2 it is one of two single-out programs replayed per pass.
+pub const variant_billboard: u32 = 1 << 18; // Camera-facing billboard quads (Points / Sprites). Standalone shader pair (own VS+FS + own U{view,proj,flags}), NOT a PBR add-on. Per-instance attribs loc0=center,1=size,2=color,3=rot (36B/record); the 6 quad corners come from the vertex index (VBO-less). FS samples tex0 × instance color; flags bit0=sizeAttenuation, bit1=round.
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -739,6 +748,92 @@ pub fn oitResolveFragmentSrc() []const u8 {
     \\  vec3 opaque = texture(u_tex2, v_uv).rgb;
     \\  vec3 avg = accum.rgb / max(accum.a, 1e-5);
     \\  frag = vec4(avg * (1.0 - reveal) + opaque * reveal, 1.0);
+    \\}
+    \\
+    ;
+}
+
+// ── Slice 1: camera-facing billboard (Points / Sprites) GLSL ────────
+//
+// A billboard is a camera-facing textured quad — the shared rendering path for
+// three.js PointsMaterial (a particle = one billboard from an instance buffer)
+// and SpriteMaterial (a sprite = a single billboard). The standalone shader pair
+// (variant_billboard) owns its own UBO {u_view, u_proj, u_flags}; it is NOT a PBR
+// add-on. There is NO base vertex buffer: the VS derives the 6 quad corners (2
+// triangles) from gl_VertexID, and the ONLY bound buffer is the per-instance
+// buffer (divisor 1). Per-instance attribute locations (matched by the bridge
+// tasks): loc0 = center vec3, loc1 = size f32, loc2 = color vec4, loc3 = rot f32.
+//
+// Camera-facing expansion happens in VIEW space (view + proj kept SEPARATE):
+//   viewPos = u_view · vec4(center, 1)
+//   sizeAttenuation (flags bit0): viewPos.xy += rotatedCorner · size  (world units)
+//                                 gl_Position = u_proj · viewPos
+//   screen-constant (bit0 off):   clip = u_proj · viewPos;
+//                                 clip.xy += rotatedCorner · size · clip.w
+//                                 (×clip.w cancels the perspective divide → constant on screen)
+// `rot` (radians) rotates the corner in the quad plane before expansion.
+
+/// Billboard vertex shader (GLSL, variant_billboard). Derives the quad corner
+/// from gl_VertexID, rotates it by the per-instance `a_rot`, expands camera-facing
+/// in view space (world-unit size if sizeAttenuation, else screen-constant via
+/// ×clip.w). Outputs uv (corner+0.5) + the per-instance color to the fragment.
+pub fn billboardVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_center;
+    \\layout(location = 1) in float a_size;
+    \\layout(location = 2) in vec4 a_color;
+    \\layout(location = 3) in float a_rot;
+    \\uniform mat4 u_view;
+    \\uniform mat4 u_proj;
+    \\uniform uint u_flags;
+    \\out vec2 v_uv;
+    \\out vec4 v_color;
+    \\const vec2 corners[6] = vec2[6](
+    \\  vec2(-0.5, -0.5), vec2(0.5, -0.5), vec2(0.5, 0.5),
+    \\  vec2(-0.5, -0.5), vec2(0.5, 0.5), vec2(-0.5, 0.5)
+    \\);
+    \\void main() {
+    \\  vec2 corner = corners[gl_VertexID];
+    \\  v_uv = corner + 0.5;
+    \\  v_color = a_color;
+    \\  float s = sin(a_rot);
+    \\  float c = cos(a_rot);
+    \\  vec2 rc = vec2(corner.x * c - corner.y * s, corner.x * s + corner.y * c);
+    \\  vec4 viewPos = u_view * vec4(a_center, 1.0);
+    \\  if ((u_flags & 1u) != 0u) {
+    \\    viewPos.xy += rc * a_size; // world-unit size in view space
+    \\    gl_Position = u_proj * viewPos;
+    \\  } else {
+    \\    vec4 clip = u_proj * viewPos;
+    \\    clip.xy += rc * a_size * clip.w; // ×clip.w → screen-constant
+    \\    gl_Position = clip;
+    \\  }
+    \\}
+    \\
+    ;
+}
+
+/// Billboard fragment shader (GLSL, variant_billboard). Samples tex0 at the
+/// quad uv and multiplies by the per-instance color (a = opacity). When the
+/// `round` flag (bit1) is set, discards fragments outside the unit circle for a
+/// soft round point. Output is STRAIGHT (no tonemap — these are emissive UI /
+/// particle quads; matches the unlit/oit convention of no ACES here).
+pub fn billboardFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\in vec4 v_color;
+    \\uniform sampler2D u_tex0;
+    \\uniform uint u_flags;
+    \\out vec4 o_color;
+    \\void main() {
+    \\  vec4 tex = texture(u_tex0, v_uv);
+    \\  if ((u_flags & 2u) != 0u) {
+    \\    if (length(v_uv * 2.0 - 1.0) > 1.0) discard; // round point
+    \\  }
+    \\  o_color = tex * v_color;
     \\}
     \\
     ;
@@ -3064,6 +3159,79 @@ pub fn wgslOit() []const u8 {
     ;
 }
 
+/// Camera-facing billboard WGSL (variant_billboard). Standalone shader pair —
+/// own UBO U{view, proj, flags} (offsets: view@0, proj@64, flags@128; _pad0/1/2
+/// fill to a 16-aligned 144-byte buffer). The bridge MUST write these uniforms at
+/// these exact offsets (offset mismatch = visually-silent WebGPU breakage). Group
+/// 1 binds the sampler (binding 0) + tex0 (binding 1). Per-instance vertex attribs
+/// loc0=center, loc1=size, loc2=color, loc3=rot; the 6 quad corners come from
+/// @builtin(vertex_index) (VBO-less). Camera-facing expansion is in VIEW space:
+/// sizeAttenuation (flags bit0) offsets viewPos.xy by world-unit size, else the
+/// offset is applied in clip space ×clip.w (screen-constant). round (bit1) discards
+/// outside the unit circle. Output STRAIGHT (no tonemap; unlit/oit convention).
+///
+/// WGSL FREE-FN TRAP: no free function references `in.<field>` — all logic lives
+/// inline in vs_main/fs_main, and every varying is threaded as a named parameter.
+pub fn wgslBillboard() []const u8 {
+    return
+    \\struct U {
+    \\  view: mat4x4<f32>,
+    \\  proj: mat4x4<f32>,
+    \\  flags: u32,
+    \\  _pad0: u32,
+    \\  _pad1: u32,
+    \\  _pad2: u32,
+    \\};
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\struct VsOut {
+    \\  @builtin(position) pos: vec4<f32>,
+    \\  @location(0) uv: vec2<f32>,
+    \\  @location(1) color: vec4<f32>,
+    \\};
+    \\@vertex
+    \\fn vs_main(
+    \\  @builtin(vertex_index) vid: u32,
+    \\  @location(0) a_center: vec3<f32>,
+    \\  @location(1) a_size: f32,
+    \\  @location(2) a_color: vec4<f32>,
+    \\  @location(3) a_rot: f32,
+    \\) -> VsOut {
+    \\  var corners = array<vec2<f32>, 6>(
+    \\    vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5), vec2<f32>(0.5, 0.5),
+    \\    vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, 0.5), vec2<f32>(-0.5, 0.5)
+    \\  );
+    \\  let corner = corners[vid];
+    \\  let s = sin(a_rot);
+    \\  let c = cos(a_rot);
+    \\  let rc = vec2<f32>(corner.x * c - corner.y * s, corner.x * s + corner.y * c);
+    \\  var view_pos = u.view * vec4<f32>(a_center, 1.0);
+    \\  var out: VsOut;
+    \\  out.uv = corner + vec2<f32>(0.5, 0.5);
+    \\  out.color = a_color;
+    \\  if ((u.flags & 1u) != 0u) {
+    \\    view_pos = vec4<f32>(view_pos.xy + rc * a_size, view_pos.z, view_pos.w);
+    \\    out.pos = u.proj * view_pos;
+    \\  } else {
+    \\    var clip = u.proj * view_pos;
+    \\    clip = vec4<f32>(clip.xy + rc * a_size * clip.w, clip.z, clip.w);
+    \\    out.pos = clip;
+    \\  }
+    \\  return out;
+    \\}
+    \\@fragment
+    \\fn fs_main(@location(0) uv: vec2<f32>, @location(1) color: vec4<f32>) -> @location(0) vec4<f32> {
+    \\  let tex = textureSample(tex0, samp, uv);
+    \\  if ((u.flags & 2u) != 0u) {
+    \\    if (length(uv * 2.0 - 1.0) > 1.0) { discard; }
+    \\  }
+    \\  return tex * color;
+    \\}
+    \\
+    ;
+}
+
 /// WBOIT resolve WGSL (variant_post). tex0 = accum, tex1 = reveal, tex2 = opaque
 /// scene HDR. Uses textureSampleLevel(...,0.0) (derivative-free). Identical math
 /// to `oitResolveFragmentSrc`.
@@ -3655,6 +3823,25 @@ pub const Encoder = struct {
         self.putU32(mvp_ptr);
         self.putU32(mv_ptr);
         self.putU32(color_ptr);
+    }
+
+    /// Camera-facing billboard draw (Slice 1 — Points / Sprites). Renders `count`
+    /// textured quads from `vbuf_instance` (36B/instance: center vec3@0, size f32@12,
+    /// color vec4@16, rot f32@32). `tex_handle`=0 → white dummy (mirrors the
+    /// fullscreen-quad tex=0 convention). `view_ptr` / `proj_ptr` → 16 f32 each,
+    /// passed SEPARATELY (camera-facing expansion happens in view space, then proj).
+    /// `flags` bit0 = sizeAttenuation (world-unit size; off → screen-constant),
+    /// bit1 = round (FS discards outside the unit circle). VBO-less quad: the VS
+    /// derives the 6 corners from the vertex index; backend draw =
+    /// drawArraysInstanced(TRIANGLES, 0, 6, count) / draw(6, count).
+    pub fn drawBillboards(self: *Encoder, vbuf_instance: u32, count: u32, tex_handle: u32, view_ptr: u32, proj_ptr: u32, flags: u32) void {
+        self.header(.draw_billboards, 24);
+        self.putU32(vbuf_instance);
+        self.putU32(count);
+        self.putU32(tex_handle);
+        self.putU32(view_ptr);
+        self.putU32(proj_ptr);
+        self.putU32(flags);
     }
 
     /// Alpha-tested depth draw (MASK cutout shadows): binds `shader` (the depth-at
@@ -6420,4 +6607,116 @@ test "combined variant: single-variant outputs unchanged" {
     const mo_only = pbrVertexSrc(variant_pbr | variant_morph);
     try testing.expect(std.mem.indexOf(u8, mo_only, "u_bones") == null); // no skin vars
     try testing.expect(std.mem.indexOf(u8, mo_only, "a_joints") == null);
+}
+
+test "golden: DRAW_BILLBOARDS (tag 42) byte layout" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.drawBillboards(7, 100, 3, 0x3000, 0x3100, 3);
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // DRAW_BILLBOARDS 4 + 24 = 28 = 0x1c -> length header "1c000000".
+    try testing.expectEqualStrings(
+        "1c000000" ++ // length header: 28 record bytes
+            // DRAW_BILLBOARDS tag=42=0x2a payload=24=0x18
+            // vbuf_instance=7 count=100 tex=3 view=0x3000 proj=0x3100 flags=3
+            "2a00" ++ "1800" ++ "07000000" ++ "64000000" ++ "03000000" ++ "00300000" ++ "00310000" ++ "03000000",
+        hex,
+    );
+}
+
+test "variant_billboard bit value (1<<18) is free + collision-free" {
+    try testing.expectEqual(@as(u32, 1 << 18), variant_billboard);
+    // No overlap with any existing variant bit (the PBR über-shader bits + standalone prepass/oit).
+    try testing.expect(variant_billboard & variant_oit == 0);
+    try testing.expect(variant_billboard & variant_prepass == 0);
+    try testing.expect(variant_billboard & variant_post == 0);
+    try testing.expect(variant_billboard & variant_pbr == 0);
+    try testing.expect(variant_billboard & variant_shadow_point == 0);
+}
+
+test "billboard shader: VS expands quad + FS samples tex, variant-gated" {
+    // VS: per-instance attribs + corner-from-vertex-id + camera-facing view-space math.
+    const vs = billboardVertexSrc();
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 0) in vec3 a_center;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 1) in float a_size;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 2) in vec4 a_color;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 3) in float a_rot;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "corners[gl_VertexID]") != null);
+    // 2D rotation of the corner by a_rot.
+    try testing.expect(std.mem.indexOf(u8, vs, "vec2(corner.x * c - corner.y * s, corner.x * s + corner.y * c)") != null);
+    // Camera-facing in view space; view + proj kept separate.
+    try testing.expect(std.mem.indexOf(u8, vs, "vec4 viewPos = u_view * vec4(a_center, 1.0)") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "viewPos.xy += rc * a_size;") != null); // sizeAttenuation
+    try testing.expect(std.mem.indexOf(u8, vs, "clip.xy += rc * a_size * clip.w;") != null); // screen-constant
+    try testing.expect(std.mem.indexOf(u8, vs, "gl_Position = u_proj * viewPos;") != null);
+
+    // FS: sample tex0 × instance color + round-discard path.
+    const fs = billboardFragmentSrc();
+    try testing.expect(std.mem.indexOf(u8, fs, "vec4 tex = texture(u_tex0, v_uv);") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "o_color = tex * v_color;") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "if (length(v_uv * 2.0 - 1.0) > 1.0) discard;") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "(u_flags & 2u)") != null); // round flag gate
+    // No tonemap (emissive UI/particle convention) — these are NOT in the billboard FS.
+    try testing.expect(std.mem.indexOf(u8, fs, "aces") == null);
+    try testing.expect(std.mem.indexOf(u8, fs, "pow(") == null);
+
+    // Variant-gating: the camera-facing billboard math must NOT leak into other
+    // shaders (e.g. the PBR fragment), which is how variant_billboard is off.
+    const pbr_fs = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, pbr_fs, "a_center") == null);
+    try testing.expect(std.mem.indexOf(u8, pbr_fs, "corners[gl_VertexID]") == null);
+    const pbr_vs = pbrVertexSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, pbr_vs, "corners[gl_VertexID]") == null);
+    try testing.expect(std.mem.indexOf(u8, pbr_vs, "rc * a_size") == null);
+}
+
+test "WGSL billboard: both stages + uniform present, no in.* in free fns" {
+    const w = wgslBillboard();
+    // Both stages.
+    try testing.expect(std.mem.indexOf(u8, w, "@vertex") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@fragment") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fn vs_main(") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fn fs_main(") != null);
+    // Standalone billboard UBO {view, proj, flags}.
+    try testing.expect(std.mem.indexOf(u8, w, "view: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "proj: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "flags: u32") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(0) var<uniform> u: U;") != null);
+    // Per-instance attribs + vertex_index quad expansion.
+    try testing.expect(std.mem.indexOf(u8, w, "@builtin(vertex_index) vid: u32") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@location(0) a_center: vec3<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "corners[vid]") != null);
+    // Camera-facing view-space expansion, both size modes.
+    try testing.expect(std.mem.indexOf(u8, w, "var view_pos = u.view * vec4<f32>(a_center, 1.0)") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "view_pos.xy + rc * a_size") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "clip.xy + rc * a_size * clip.w") != null);
+    // FS samples tex0 × color + round-discard; fs_main threads varyings as params.
+    try testing.expect(std.mem.indexOf(u8, w, "fn fs_main(@location(0) uv: vec2<f32>, @location(1) color: vec4<f32>) -> @location(0) vec4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "textureSample(tex0, samp, uv)") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "return tex * color;") != null);
+
+    // ── WGSL FREE-FN TRAP (defended explicitly) ─────────────────────────
+    // A WGSL free function CANNOT reference `in.<field>` (that name exists only
+    // inside the fs_main parameter). This billboard shader has NO free functions
+    // and never uses a parameter named `in`, so the substring "in." must be ABSENT
+    // anywhere in the source — proving no helper dereferences a varying it cannot see.
+    try testing.expect(std.mem.indexOf(u8, w, "in.") == null);
+}
+
+test "golden: billboard GLSL+WGSL hashes frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = a deliberate shader contract bump
+    // (the verve.js WebGL2 + WebGPU billboard backends lockstep to these strings).
+    try testing.expectEqual(@as(u64, 0x5a5d1ebaab664952), fnv64(billboardVertexSrc()));
+    try testing.expectEqual(@as(u64, 0xad2e38eff9cb1f19), fnv64(billboardFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xaf366ee313c1b7ac), fnv64(wgslBillboard()));
+
+    // The pre-existing standalone shader hashes MUST be UNCHANGED — variant_billboard
+    // is purely additive; it must not perturb any existing shader source.
+    try testing.expectEqual(@as(u64, 0xd1361f6ee14770d3), fnv64(oitVertexSrc()));
+    try testing.expectEqual(@as(u64, 0x18b4d245c2daf1da), fnv64(oitAccumFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0x8a0704bc93d3b602), fnv64(wgslOit()));
+    try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(variant_pbr)));
+    try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(variant_pbr)));
 }
