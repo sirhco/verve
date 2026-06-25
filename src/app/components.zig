@@ -1250,6 +1250,55 @@ pub fn glSsao(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl SSR demo — /gl-ssr (image-quality slice 4).
+/// Renders a reflective floor with bright emissive cubes floating above it through
+/// the G-buffer prepass → scene → SSR → composite chain. SSR ray-marches the
+/// reflected view vector against the G-buffer and adds the inverted reflection of
+/// the cubes into the floor. Toggle SSR compares the reflective vs matte floor;
+/// Toggle View blits the raw SSR target (scene + reflections). WebGPU when
+/// available, else WebGL2.
+pub fn glSsr(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "glssr-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#0a0b0f;border-radius:8px;"),
+    });
+
+    // Controls wired to the GlSsr chunk's no-arg exports via z-on-click.
+    // Must live INSIDE the island subtree so events route to this chunk.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glssr_toggle").text("Toggle SSR"),
+        ctx.el("button").attr("z-on-click", "glssr_toggle_view").text("Toggle View"),
+        ctx.el("button").attr("z-on-click", "glssr_freeze").text("Freeze"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Reflective floor — screen-space reflections"),
+        canvas,
+        controls,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlSsr" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — SSR"),
+        ctx.p().text("Bright emissive cubes floating above a dark, smooth floor, rendered " ++
+            "through the depth + view-space-normal G-buffer prepass and a screen-space " ++
+            "reflection pass. SSR reconstructs view-space position from the G-buffer " ++
+            "(inv_proj), reflects the view vector around the surface normal, ray-marches " ++
+            "that reflection in screen space (re-projecting each step with proj), samples " ++
+            "the lit scene at hits, and adds the reflection — modulated by a uniform " ++
+            "strength and a Schlick Fresnel term — into the scene before bloom + " ++
+            "tonemapping. Toggle SSR compares the reflective floor (inverted reflections " ++
+            "of the cubes appear below the surface) with a matte floor; Toggle View shows " ++
+            "the raw scene + reflections target. GLOBAL SSR — material-aware / " ++
+            "roughness-weighted reflections are deferred (the G-buffer has no roughness " ++
+            "channel; it needs MRT). Renders through WebGPU when available, else WebGL2."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a

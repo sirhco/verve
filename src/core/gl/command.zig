@@ -1341,6 +1341,68 @@ pub const ssaoBlurFragmentSrc: []const u8 =
     \\}
 ;
 
+// SSR (image-quality slice 4) — byte-identical math to wgslSsr (same reconstruction,
+// reflect, fixed 32-step march, reprojection, Schlick Fresnel, screen-edge fade).
+// u_tex0 = G-buffer; u_tex1 = scene HDR; u_ssao_params =
+// (reflection_strength, max_distance, thickness, fresnel_power); u_inv_proj/u_proj.
+pub const ssrFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0;       // G-buffer: rgb=n*0.5+0.5, a=-viewZ (>0)
+    \\uniform sampler2D u_tex1;       // scene HDR color
+    \\uniform vec4 u_ssao_params;     // (strength, max_distance, thickness, fresnel_power)
+    \\uniform mat4 u_inv_proj;
+    \\uniform mat4 u_proj;
+    \\vec3 reconstructView(vec2 uv, float depth) {
+    \\  vec2 ndc = uv * 2.0 - 1.0;
+    \\  vec4 v = u_inv_proj * vec4(ndc, 1.0, 1.0);
+    \\  vec3 viewRay = v.xyz / v.w;
+    \\  return viewRay * (depth / -viewRay.z); // result.z == -depth
+    \\}
+    \\void main() {
+    \\  vec4 g = texture(u_tex0, v_uv);
+    \\  vec3 scene = texture(u_tex1, v_uv).rgb;
+    \\  float depth = g.a;
+    \\  if (depth <= 0.0) { frag = vec4(scene, 1.0); return; }
+    \\  float strength = u_ssao_params.x;
+    \\  float max_distance = u_ssao_params.y;
+    \\  float thickness = u_ssao_params.z;
+    \\  float fresnel_power = u_ssao_params.w;
+    \\  vec3 n = normalize(g.rgb * 2.0 - 1.0);
+    \\  vec3 viewPos = reconstructView(v_uv, depth);
+    \\  vec3 viewDir = normalize(viewPos);
+    \\  vec3 refl = reflect(viewDir, n);
+    \\  float step_len = max_distance / 32.0;
+    \\  bool hit = false;
+    \\  vec2 hit_uv = vec2(0.0);
+    \\  const int STEPS = 32;
+    \\  for (int i = 1; i <= STEPS; i++) {
+    \\    vec3 p = viewPos + refl * (step_len * float(i));
+    \\    if (p.z >= 0.0) { break; }
+    \\    vec4 sclip = u_proj * vec4(p, 1.0);
+    \\    vec2 suv = (sclip.xy / sclip.w) * 0.5 + 0.5;
+    \\    if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) { break; }
+    \\    float storedDepth = texture(u_tex0, suv).a;
+    \\    float pointDepth = -p.z;
+    \\    float diff = pointDepth - storedDepth;
+    \\    if (storedDepth > 0.0 && diff > 0.0 && diff < thickness) {
+    \\      hit = true;
+    \\      hit_uv = suv;
+    \\      break;
+    \\    }
+    \\  }
+    \\  if (!hit) { frag = vec4(scene, 1.0); return; }
+    \\  vec3 reflColor = texture(u_tex1, hit_uv).rgb;
+    \\  float fresnel = pow(1.0 - max(dot(-viewDir, n), 0.0), fresnel_power);
+    \\  float edge = min(min(hit_uv.x, 1.0 - hit_uv.x), min(hit_uv.y, 1.0 - hit_uv.y));
+    \\  float mask = clamp(edge / 0.1, 0.0, 1.0);
+    \\  vec3 result = scene + reflColor * (strength * fresnel * mask);
+    \\  frag = vec4(result, 1.0);
+    \\}
+;
+
 // ── WebGPU PBR über-shader (P10 slice 2a) ───────────────────────────
 //
 // One WGSL module holding BOTH stages (vs_main + fs_main), a parallel
@@ -2567,6 +2629,103 @@ pub fn wgslSsaoBlur() []const u8 {
     ;
 }
 
+// ── Image-quality slice 4: SSR (screen-space reflections) ────────────
+//
+// GLOBAL SSR: a single uniform reflection strength × Fresnel, NOT material-aware.
+// The G-buffer stores only normal+depth (no roughness/metalness), so roughness-
+// weighted / material-aware SSR is deferred (it needs a G-buffer material channel,
+// i.e. MRT, which the foundation deliberately rejected).
+//
+// Inputs: tex0 = h_gbuffer (rgb = viewNormal*0.5+0.5, a = -viewPos.z > 0),
+//         tex1 = h_scene_hdr (lit linear HDR scene color). tex2 unused (white dummy).
+// Output: scene color + screen-space reflections (the SSR pass ADDS reflections to
+//         the scene it read from tex1) into h_scene_ssr — a drop-in scene source.
+//
+// Params (the SAME 144B post Params as SSAO): params: vec4 @0, inv_proj: mat4 @16,
+// proj: mat4 @80, where
+//   params.x = reflection_strength   (uniform reflectivity, e.g. 0.6)
+//   params.y = max_distance          (view-space march length, e.g. 8.0)
+//   params.z = thickness             (depth-compare tolerance, e.g. 0.5)
+//   params.w = fresnel_power         (Schlick exponent, e.g. 5.0)
+//
+// View-pos reconstruction reuses the SSAO `reconstructView` VERBATIM (same sign
+// convention: gbuffer alpha = -viewPos.z > 0; camera looks down -Z). Reprojection
+// of a marched view-space point to screen UV: clip = proj*vec4(p,1);
+// uv = clip.xy/clip.w*0.5+0.5 — identical to SSAO's hemisphere reprojection.
+//
+// March: a FIXED `STEPS = 32` loop with an internal `break` on hit (both backends
+// use the same constant bound). All texture reads use textureSampleLevel(...,0.0)
+// — derivative-free, legal in the non-uniform control flow inside/after the loop.
+
+pub fn wgslSsr() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { params: vec4<f32>, inv_proj: mat4x4<f32>, proj: mat4x4<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@group(1) @binding(3) var tex2: texture_2d<f32>;
+    \\// Reconstruct view-space position from stored linear depth (depth = -viewZ > 0).
+    \\fn reconstructView(uv: vec2<f32>, depth: f32, inv_proj: mat4x4<f32>) -> vec3<f32> {
+    \\  let ndc = uv * 2.0 - 1.0;
+    \\  let clip = vec4<f32>(ndc, 1.0, 1.0);
+    \\  let v = inv_proj * clip;
+    \\  let viewRay = v.xyz / v.w;
+    \\  return viewRay * (depth / -viewRay.z); // result.z == -depth
+    \\}
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let g = textureSampleLevel(tex0, samp, uv, 0.0);
+    \\  let scene = textureSampleLevel(tex1, samp, uv, 0.0).rgb;
+    \\  let depth = g.a;                       // -viewZ (positive)
+    \\  if (depth <= 0.0) { return vec4<f32>(scene, 1.0); } // background → no reflection
+    \\  let strength = P.params.x;
+    \\  let max_distance = P.params.y;
+    \\  let thickness = P.params.z;
+    \\  let fresnel_power = P.params.w;
+    \\  let n = normalize(g.rgb * 2.0 - 1.0);
+    \\  let viewPos = reconstructView(uv, depth, P.inv_proj);
+    \\  let viewDir = normalize(viewPos);      // camera at origin in view space
+    \\  let refl = reflect(viewDir, n);
+    \\  // March STEPS fixed steps along the reflection ray up to max_distance.
+    \\  let step_len = max_distance / 32.0;
+    \\  var hit = false;
+    \\  var hit_uv = vec2<f32>(0.0, 0.0);
+    \\  for (var i = 1; i <= 32; i = i + 1) {
+    \\    let p = viewPos + refl * (step_len * f32(i));
+    \\    if (p.z >= 0.0) { break; }           // marched behind the camera
+    \\    let sclip = P.proj * vec4<f32>(p, 1.0);
+    \\    let suv = (sclip.xy / sclip.w) * 0.5 + 0.5;
+    \\    if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) { break; }
+    \\    let storedDepth = textureSampleLevel(tex0, samp, suv, 0.0).a; // -viewZ at hit pixel
+    \\    let pointDepth = -p.z;               // marched point depth (positive)
+    \\    let diff = pointDepth - storedDepth; // >0 = marched point is BEHIND geometry
+    \\    if (storedDepth > 0.0 && diff > 0.0 && diff < thickness) {
+    \\      hit = true;
+    \\      hit_uv = suv;
+    \\      break;
+    \\    }
+    \\  }
+    \\  if (!hit) { return vec4<f32>(scene, 1.0); }
+    \\  let reflColor = textureSampleLevel(tex1, samp, hit_uv, 0.0).rgb;
+    \\  // Schlick Fresnel: grazing angles reflect more.
+    \\  let fresnel = pow(1.0 - max(dot(-viewDir, n), 0.0), fresnel_power);
+    \\  // Screen-edge fade: ramp reflection down near the UV borders.
+    \\  let edge = min(min(hit_uv.x, 1.0 - hit_uv.x), min(hit_uv.y, 1.0 - hit_uv.y));
+    \\  let mask = clamp(edge / 0.1, 0.0, 1.0);
+    \\  let result = scene + reflColor * (strength * fresnel * mask);
+    \\  return vec4<f32>(result, 1.0);
+    \\}
+    ;
+}
+
 // ── Task 3: Post-process effect-graph structs ────────────────────────
 
 /// Tone-mapping operator applied in the composite stage (image-quality slice 2).
@@ -2628,6 +2787,14 @@ pub const PostProcess = struct {
     /// `0` (default) → the bridge binds a 1×1 WHITE dummy (AO=1.0, no-op), so
     /// `/gl-post` and `/gl-tonemap` render byte-for-byte as before.
     ao_tex: u32 = 0,
+    /// Image-quality slice 4 (SSR): the render-target handle the bloom bright-pass
+    /// and composite read as the scene HDR input. `0` (default) → `h_scene_hdr`
+    /// (240), so every pre-slice-4 path is byte-for-byte unchanged. The SSR island
+    /// sets this to `SsrCtx.h_scene_ssr` (255) so reflections feed bloom + tonemap.
+    /// NOTE: `beginPostProcess` still renders the scene INTO `h_scene_hdr`; this
+    /// only redirects the read side of `endPostProcess` (the SSR pass reads
+    /// `h_scene_hdr`, adds reflections, and writes `h_scene_ssr`).
+    scene_src: u32 = 0,
 };
 
 /// Persistent state owned by the island (one static per GL canvas island).
@@ -2705,6 +2872,36 @@ pub const SsaoCtx = struct {
     // Stable param storage (wire records point at these; must outlive the frame).
     p_ssao: [36]f32 = [_]f32{0} ** 36, // (radius,bias,intensity,_) + inv_proj + proj
     p_blur: [4]f32 = .{ 0, 0, 0, 0 }, // [texel.x, texel.y, 0, 0]
+};
+
+/// Persistent state for the SSR pass (image-quality slice 4). Parallels
+/// `SsaoCtx`: fixed handles + a created/last_w/last_h guard + stable param
+/// storage. Handle reservation: 255–256, immediately after SsaoCtx's 251–254.
+///
+/// `h_scene_ssr` (255) is a FULL-res rgba16f render target holding scene color +
+/// reflections — a drop-in replacement for `h_scene_hdr` (240) as the bloom +
+/// composite chain's scene source (the island passes it via `PostProcess.scene_src`
+/// when SSR is on, else leaves it 0 → `h_scene_hdr`). `sh_ssr` (256) is the SSR
+/// fullscreen shader (variant_post). It reads `h_gbuffer` (tex0) + `h_scene_hdr`
+/// (tex1) and writes `h_scene_ssr`.
+///
+/// `p_ssr` packs the SAME 144B post Params as SSAO (so the bridge's 144B
+/// binding-size path is reused):
+///   [0..4)   = (reflection_strength, max_distance, thickness, fresnel_power)
+///   [4..20)  = inv_proj (mat4, column-major)
+///   [20..36) = proj     (mat4, column-major)
+/// The island fills inv_proj/proj each frame (computed from the camera proj).
+pub const SsrCtx = struct {
+    pub const h_scene_ssr: u32 = 255; // rgba16f full-res scene+reflections RT
+    pub const sh_ssr: u32 = 256; // variant_post SSR shader (gbuffer+scene → scene+refl)
+
+    created: bool = false,
+    last_w: u32 = 0,
+    last_h: u32 = 0,
+    webgpu: bool = false,
+
+    // Stable param storage (wire record points at this; must outlive the frame).
+    p_ssr: [36]f32 = [_]f32{0} ** 36, // (strength,max_dist,thickness,fresnel) + inv_proj + proj
 };
 
 pub const Encoder = struct {
@@ -3225,11 +3422,17 @@ pub const Encoder = struct {
         ctx.p_comp[2] = vig.intensity;
         ctx.p_comp[3] = vig.radius;
 
+        // Image-quality slice 4: the scene HDR SOURCE the bloom bright-pass and
+        // composite read. Default (scene_src==0) → `h_scene_hdr`, so every
+        // pre-slice-4 path is byte-for-byte unchanged. SSR sets it to
+        // `SsrCtx.h_scene_ssr` (scene + reflections) so reflections bloom/tonemap.
+        const scene_src: u32 = if (ctx.opts.scene_src != 0) ctx.opts.scene_src else PostCtx.h_scene_hdr;
+
         if (ctx.opts.bloom) |b| {
-            // bright-pass: scene_hdr -> bloom_a (½-res)
+            // bright-pass: scene_src -> bloom_a (½-res)
             ctx.p_bright[0] = b.threshold;
             self.beginOffscreenPass(PostCtx.h_bloom_a, .{ 0, 0, 0, 1 }, clear_flag_color);
-            self.drawFullscreenQuad(PostCtx.sh_bright, PostCtx.h_scene_hdr, 0, 0, @truncate(@intFromPtr(&ctx.p_bright)), 1);
+            self.drawFullscreenQuad(PostCtx.sh_bright, scene_src, 0, 0, @truncate(@intFromPtr(&ctx.p_bright)), 1);
             self.endOffscreenPass();
             // blur H: bloom_a -> bloom_b
             ctx.p_blur_h = .{ hw, hh, 1, 0 };
@@ -3251,7 +3454,7 @@ pub const Encoder = struct {
         if (ctx.opts.fxaa) {
             // composite (scene_hdr + bloom_a × AO) -> ldr offscreen; 4 params = all of p_comp.
             self.beginOffscreenPass(PostCtx.h_ldr, .{ 0, 0, 0, 1 }, clear_flag_color);
-            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, ao, @truncate(@intFromPtr(&ctx.p_comp)), 4);
+            self.drawFullscreenQuad(PostCtx.sh_composite, scene_src, PostCtx.h_bloom_a, ao, @truncate(@intFromPtr(&ctx.p_comp)), 4);
             self.endOffscreenPass();
             // fxaa: ldr -> canvas
             ctx.p_fxaa = .{ fw, fh, 0, 0 };
@@ -3261,7 +3464,7 @@ pub const Encoder = struct {
         } else {
             // composite straight to canvas; 4 params = all of p_comp.
             self.beginFrame(.{ 0, 0, 0, 1 }, w, h);
-            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, ao, @truncate(@intFromPtr(&ctx.p_comp)), 4);
+            self.drawFullscreenQuad(PostCtx.sh_composite, scene_src, PostCtx.h_bloom_a, ao, @truncate(@intFromPtr(&ctx.p_comp)), 4);
             self.endFrame();
         }
     }
@@ -3382,6 +3585,68 @@ pub const Encoder = struct {
         ctx.p_blur = .{ fw, fh, 0, 0 };
         self.beginOffscreenPass(SsaoCtx.h_ao_blur, .{ 1, 1, 1, 1 }, clear_flag_color);
         self.drawFullscreenQuad(SsaoCtx.sh_ssao_blur, SsaoCtx.h_ao_raw, 0, 0, @truncate(@intFromPtr(&ctx.p_blur)), 2);
+        self.endOffscreenPass();
+    }
+
+    // ── Image-quality slice 4: SSR API ───────────────────────────────
+
+    /// Run the SSR pass: (`h_gbuffer` + `h_scene_hdr`) → `h_scene_ssr`.
+    /// Must be called AFTER the scene HDR pass is closed (so `h_scene_hdr` is
+    /// populated) and AFTER `endPrepass` (so `h_gbuffer` is populated), and BEFORE
+    /// `endPostProcess` reads `h_scene_ssr` via `PostProcess.scene_src`. On first
+    /// call (or resize) creates the scene+reflections target (full-res rgba16f) and
+    /// (first call only) the SSR shader. `webgpu` selects WGSL vs GLSL.
+    ///
+    /// `strength`/`max_distance`/`thickness`/`fresnel_power` are the SSR tunables;
+    /// `inv_proj`/`proj` are the caller's stable mat4 storage (column-major, 16 f32
+    /// each), COPIED into `ctx.p_ssr` (which the wire record points at). The pass
+    /// reads `h_gbuffer` at tex0, `h_scene_hdr` at tex1, and uploads the 144B params.
+    pub fn runSsr(
+        self: *Encoder,
+        ctx: *SsrCtx,
+        webgpu: bool,
+        width: u32,
+        height: u32,
+        strength: f32,
+        max_distance: f32,
+        thickness: f32,
+        fresnel_power: f32,
+        inv_proj: *const [16]f32,
+        proj: *const [16]f32,
+    ) void {
+        ctx.webgpu = webgpu;
+        const resized = width != ctx.last_w or height != ctx.last_h;
+        if (!ctx.created or resized) {
+            if (resized and ctx.created) {
+                self.deleteResource(.render_target, SsrCtx.h_scene_ssr);
+            }
+            self.createRenderTarget(SsrCtx.h_scene_ssr, width, height, .rgba16f, 0);
+            ctx.last_w = width;
+            ctx.last_h = height;
+        }
+        if (!ctx.created) {
+            if (webgpu) {
+                self.createPostShaderWgsl(SsrCtx.sh_ssr, wgslSsr());
+            } else {
+                self.createPostShaderGlsl(SsrCtx.sh_ssr, ssrFragmentSrc);
+            }
+            ctx.created = true;
+        }
+
+        // Pack SSR params: (strength,max_distance,thickness,fresnel) + inv_proj + proj.
+        ctx.p_ssr[0] = strength;
+        ctx.p_ssr[1] = max_distance;
+        ctx.p_ssr[2] = thickness;
+        ctx.p_ssr[3] = fresnel_power;
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            ctx.p_ssr[4 + i] = inv_proj[i];
+            ctx.p_ssr[20 + i] = proj[i];
+        }
+
+        // SSR pass: G-buffer (tex0) + scene HDR (tex1) → h_scene_ssr.
+        self.beginOffscreenPass(SsrCtx.h_scene_ssr, .{ 0, 0, 0, 1 }, clear_flag_color);
+        self.drawFullscreenQuad(SsrCtx.sh_ssr, PrepassCtx.h_gbuffer, PostCtx.h_scene_hdr, 0, @truncate(@intFromPtr(&ctx.p_ssr)), 36);
         self.endOffscreenPass();
     }
 };
@@ -4333,6 +4598,119 @@ test "runSsao emits createRT×2, createShader×2, then 2 blit passes" {
     const n2 = collectTags(out2, &tags2);
     try testing.expectEqual(@as(Tag, .begin_offscreen_pass), tags2[0]); // no create_* up front
     _ = n2;
+}
+
+// ── Image-quality slice 4: SSR wire + shader goldens ─────────────────
+
+test "SsrCtx handles do not collide with Post/Prepass/Ssao handles" {
+    // 255–256 sit immediately after SsaoCtx's 251–254.
+    try testing.expectEqual(@as(u32, 255), SsrCtx.h_scene_ssr);
+    try testing.expectEqual(@as(u32, 256), SsrCtx.sh_ssr);
+    // Strictly above every Post/Prepass/Ssao handle — no overlap.
+    try testing.expect(SsrCtx.h_scene_ssr > SsaoCtx.sh_ssao_blur);
+    try testing.expect(SsrCtx.h_scene_ssr > PrepassCtx.sh_gdebug);
+    try testing.expect(SsrCtx.h_scene_ssr > PostCtx.sh_fxaa);
+}
+
+test "SSR shader content (both backends)" {
+    // GLSL: gbuffer + scene samplers, reconstruction, reflect, reprojection, march.
+    const sg = ssrFragmentSrc;
+    try testing.expect(std.mem.indexOf(u8, sg, "u_tex0") != null); // G-buffer
+    try testing.expect(std.mem.indexOf(u8, sg, "u_tex1") != null); // scene HDR
+    try testing.expect(std.mem.indexOf(u8, sg, "u_inv_proj") != null);
+    try testing.expect(std.mem.indexOf(u8, sg, "u_proj") != null);
+    try testing.expect(std.mem.indexOf(u8, sg, "reconstructView") != null);
+    try testing.expect(std.mem.indexOf(u8, sg, "reflect(viewDir, n)") != null);
+    try testing.expect(std.mem.indexOf(u8, sg, "const int STEPS = 32") != null); // fixed bound
+    try testing.expect(std.mem.indexOf(u8, sg, "(sclip.xy / sclip.w) * 0.5 + 0.5") != null); // reprojection
+    try testing.expect(std.mem.indexOf(u8, sg, "depth / -viewRay.z") != null); // sign convention
+    try testing.expect(std.mem.indexOf(u8, sg, "pow(1.0 - max(dot(-viewDir, n), 0.0), fresnel_power)") != null); // Fresnel
+    // WGSL: same surface, threads uv as fs_main param; textureSampleLevel everywhere.
+    const sw = wgslSsr();
+    try testing.expect(std.mem.indexOf(u8, sw, "inv_proj: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, sw, "proj: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, sw, "reflect(viewDir, n)") != null);
+    try testing.expect(std.mem.indexOf(u8, sw, "i <= 32") != null); // fixed bound
+    try testing.expect(std.mem.indexOf(u8, sw, "(sclip.xy / sclip.w) * 0.5 + 0.5") != null);
+    try testing.expect(std.mem.indexOf(u8, sw, "depth / -viewRay.z") != null);
+    try testing.expect(std.mem.indexOf(u8, sw, "pow(1.0 - max(dot(-viewDir, n), 0.0), fresnel_power)") != null);
+    // Uniform-control-flow rule: NO bare textureSample inside the WGSL march.
+    try testing.expect(std.mem.indexOf(u8, sw, "textureSampleLevel(tex0, samp, suv, 0.0)") != null);
+    try testing.expect(std.mem.indexOf(u8, sw, "textureSample(") == null); // never bare
+}
+
+test "golden: SSR shader sources frozen (FNV-1a-64)" {
+    try testing.expectEqual(@as(u64, 0x628b76d61fb2cfb3), fnv64(ssrFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x56435eea376646d3), fnv64(wgslSsr()));
+}
+
+test "runSsr emits createRT, createShader, then 1 SSR pass" {
+    var buf: [512]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = SsrCtx{};
+    var inv_proj = [_]f32{0} ** 16;
+    var proj = [_]f32{0} ** 16;
+    enc.runSsr(&ctx, false, 640, 400, 0.6, 8.0, 0.5, 5.0, &inv_proj, &proj);
+    const out = enc.finish();
+
+    // First call: create_render_target (255) + create_shader (256), then begin/draw/end.
+    var tags: [16]Tag = undefined;
+    const n = collectTags(out, &tags);
+    try expectContainsInOrder(tags[0..n], n, &.{
+        .create_render_target, .create_shader,
+        .begin_offscreen_pass, .draw_fullscreen_quad,
+        .end_offscreen_pass,
+    });
+    // The SSR draw binds the G-buffer at tex0, scene HDR at tex1, uploads 36 params.
+    var off2: usize = 4;
+    while (off2 < 4 + readU32(out, 0)) {
+        const tag = readU16(out, off2);
+        const sz = readU16(out, off2 + 2);
+        if (tag == @intFromEnum(Tag.draw_fullscreen_quad)) {
+            try testing.expectEqual(@as(u32, SsrCtx.sh_ssr), readU32(out, off2 + 4)); // shader
+            try testing.expectEqual(@as(u32, PrepassCtx.h_gbuffer), readU32(out, off2 + 8)); // tex0
+            try testing.expectEqual(@as(u32, PostCtx.h_scene_hdr), readU32(out, off2 + 12)); // tex1
+            try testing.expectEqual(@as(u32, 0), readU32(out, off2 + 16)); // tex2
+            try testing.expectEqual(@as(u32, 36), readU32(out, off2 + 24)); // param_count
+            break;
+        }
+        off2 += 4 + sz;
+    }
+    // Second runSsr call (no resize) re-emits NEITHER create — guard works.
+    var enc2 = Encoder.init(&buf);
+    enc2.runSsr(&ctx, false, 640, 400, 0.6, 8.0, 0.5, 5.0, &inv_proj, &proj);
+    const out2 = enc2.finish();
+    var tags2: [16]Tag = undefined;
+    const n2 = collectTags(out2, &tags2);
+    try testing.expectEqual(@as(Tag, .begin_offscreen_pass), tags2[0]); // no create_* up front
+    _ = n2;
+}
+
+test "endPostProcess scene_src redirects bloom+composite reads (SSR)" {
+    // Default (scene_src==0) reads h_scene_hdr; SSR sets scene_src=h_scene_ssr.
+    var buf: [2048]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = PostCtx{};
+    enc.beginPostProcess(&ctx, .{ .bloom = .{}, .fxaa = true, .scene_src = SsrCtx.h_scene_ssr }, 800, 600);
+    enc.endPostProcess(&ctx);
+    const out = enc.finish();
+    // The bright-pass (first draw_fullscreen_quad after the scene pass) must read
+    // h_scene_ssr (255), not h_scene_hdr (240).
+    var off2: usize = 4;
+    var seen_bright = false;
+    while (off2 < 4 + readU32(out, 0)) {
+        const tag = readU16(out, off2);
+        const sz = readU16(out, off2 + 2);
+        if (tag == @intFromEnum(Tag.draw_fullscreen_quad)) {
+            const shader = readU32(out, off2 + 4);
+            if (shader == PostCtx.sh_bright) {
+                try testing.expectEqual(@as(u32, SsrCtx.h_scene_ssr), readU32(out, off2 + 8)); // tex0
+                seen_bright = true;
+            }
+        }
+        off2 += 4 + sz;
+    }
+    try testing.expect(seen_bright);
 }
 
 test "prepass + gdebug shader content (both backends)" {

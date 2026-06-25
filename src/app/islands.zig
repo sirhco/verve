@@ -222,3 +222,20 @@ pub const GlTonemap = struct {
 pub const GlSsao = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// verve.gl SSR demo (/gl-ssr, image-quality slice 4). Renders a reflective floor
+/// plane with several bright emissive cubes floating above it; screen-space
+/// reflections of the cubes appear inverted in the floor. The G-buffer prepass →
+/// scene → SSR → composite chain: SSR reconstructs view-space position from the
+/// slice-1 G-buffer (inv_proj), ray-marches the reflected view vector, re-projects
+/// each step to screen UV (proj), samples the scene HDR at hits, and adds the
+/// reflection (uniform strength × Schlick Fresnel) into a scene+reflections target
+/// (h_scene_ssr) that the composite reads via `PostProcess.scene_src` so the
+/// reflections bloom + tonemap. GLOBAL SSR — material-aware/roughness-weighted SSR
+/// is deferred (the G-buffer has no roughness channel; it needs MRT). Controls wire
+/// to the `glssr_toggle` / `glssr_toggle_view` / `glssr_freeze` chunk exports.
+/// Emits `<canvas data-ref="glssr-canvas">`.
+/// Source: `src/client/islands/GlSsr.zig`.
+pub const GlSsr = struct {
+    pub const props_schema: []const u8 = "{}";
+};

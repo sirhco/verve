@@ -4,6 +4,48 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.15.0] - 2026-06-24
+
+### Added
+
+- **gl SSR — screen-space reflections (image-quality slice 4)**
+  (`src/core/gl/command.zig`, `src/bridge/verve.js`,
+  `src/client/islands/GlSsr.zig`, `src/app/{islands,routes,components}.zig`):
+  the second consumer of the slice-1 depth+normal G-buffer. A new `SsrCtx`
+  (`h_scene_ssr=255`, `sh_ssr=256`) and `Encoder.runSsr(...)` add a single
+  fullscreen reflection pass. Per fragment it reconstructs view-space position
+  from the G-buffer (`inv_proj`, the exact slice-3 ray method), reflects the
+  view vector around the surface normal, ray-marches that reflection in screen
+  space over a **fixed 32-step** loop (re-projecting each step to screen UV via
+  `proj`), depth-compares against the stored G-buffer depth within a `thickness`
+  tolerance, and — on a hit — adds the scene color sampled at the hit, modulated
+  by a uniform `reflection_strength`, a Schlick **Fresnel** term, and a
+  screen-edge fade. Output is **scene color + reflections** written to
+  `h_scene_ssr` — a drop-in replacement for `h_scene_hdr` as the bloom +
+  composite chain's scene source.
+  - **Scene-source parameterization:** `PostProcess.scene_src` (default `0` →
+    `h_scene_hdr=240`) redirects the read side of `endPostProcess` (bright-pass +
+    composite). The SSR island sets it to `h_scene_ssr` when SSR is on so
+    reflections bloom + tonemap; leaving it `0` is byte-for-byte the old behavior,
+    so `/gl-post`, `/gl-tonemap`, and `/gl-ssao` are unchanged (goldens frozen).
+  - SSR rides the **existing 144B post Params** (`{params:vec4 @0, inv_proj:mat4
+    @16, proj:mat4 @80}`, where `params = (strength, max_distance, thickness,
+    fresnel_power)`) and the existing shared 3-texture bind group (tex0=G-buffer,
+    tex1=scene HDR, tex2=unused white dummy). No new wire tags, no Params-size
+    change, no bind-group surgery; PBR_U is untouched. The only bridge change is
+    adding `sh_ssr=256` to the 144B WebGPU binding-size branch.
+  - Both backends (WGSL + WebGL2 GLSL ES 3.00) share byte-identical
+    reconstruction, `reflect`, fixed 32-step march, reprojection, and Fresnel.
+    All WGSL texture reads use `textureSampleLevel(...,0.0)` (derivative-free,
+    legal in the non-uniform march control flow).
+  - **GLOBAL SSR** with uniform reflectivity × Fresnel — **NOT material-aware**.
+    Roughness-weighted / material-aware SSR is **deferred**: the G-buffer stores
+    only normal + depth (no roughness/metalness), which would need a G-buffer
+    material channel, i.e. MRT, that the foundation deliberately rejected.
+  - New `/gl-ssr` demo (a reflective floor with bright emissive cubes above it,
+    asset-free — reuses the built-in plane/cube meshes) + `GlSsr` island with
+    `glssr_toggle` / `glssr_toggle_view` / `glssr_freeze`.
+
 ## [0.14.0] - 2026-06-24
 
 ### Added
