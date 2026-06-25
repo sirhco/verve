@@ -75,10 +75,12 @@ var normal9: [obj_count][9]f32 = undefined;
 var mv_mat: [obj_count][16]f32 = undefined;
 var camera_pos: [3]f32 = .{ 4.0, 3.0, 4.5 };
 
-// Per-object material (rewritten before each cube draw + once for the floor).
-// baseColor.rgba, [metallic, roughness, occlusion_strength, normal_scale],
-// emissive.rgb, pad.
-var material: [12]f32 = undefined;
+// Per-object material — ONE slot per object. The command stream stores the
+// address of each material; the bridge dereferences it AFTER the frame returns,
+// so a single shared static would alias to the last-written value (the floor)
+// for every draw. Must be per-object, exactly like mvp/model_mat/normal9.
+// Each slot: baseColor.rgba, [metallic, roughness, occlusion_strength, normal_scale], emissive.rgb, pad.
+var material: [obj_count][12]f32 = undefined;
 
 // SSR matrices (stable; runSsr copies them into its param buffer).
 var inv_proj_mat: [16]f32 = undefined;
@@ -157,12 +159,12 @@ fn objTransforms(i: usize, pos: [3]f32, scale: gl.math.Vec3, view: gl.math.Mat4,
 fn setCubeMaterial(i: usize) void {
     // Bright low-roughness dielectric; the per-cube emissive makes each reflection
     // a distinct colour in the floor.
-    material = .{ 0.8, 0.8, 0.8, 1, 0, 0.4, 1, 1, cube_emissive[i][0], cube_emissive[i][1], cube_emissive[i][2], 0 };
+    material[i] = .{ 0.8, 0.8, 0.8, 1, 0, 0.4, 1, 1, cube_emissive[i][0], cube_emissive[i][1], cube_emissive[i][2], 0 };
 }
 
-fn setFloorMaterial() void {
+fn setFloorMaterial(i: usize) void {
     // Dark, smooth, non-emissive floor — reads as a near-mirror so reflections pop.
-    material = .{ 0.04, 0.04, 0.05, 1, 0, 0.1, 1, 1, 0, 0, 0, 0 };
+    material[i] = .{ 0.04, 0.04, 0.05, 1, 0, 0.1, 1, 1, 0, 0, 0, 0 };
 }
 
 // ── frame export ──────────────────────────────────────────────────────────────
@@ -244,7 +246,7 @@ export fn glssr_frame(dt_ms: f32, width: u32, height: u32) u32 {
     enc.setLights(1, @intCast(@intFromPtr(&light)));
     oi = 0;
     while (oi < obj_count) : (oi += 1) {
-        if (oi < cube_count) setCubeMaterial(oi) else setFloorMaterial();
+        if (oi < cube_count) setCubeMaterial(oi) else setFloorMaterial(oi);
         enc.bindTexture(C.tex_slot_base, base_tex);
         enc.bindTexture(C.tex_slot_mr, mr_tex);
         enc.bindTexture(C.tex_slot_emissive, emis_tex);
@@ -260,7 +262,7 @@ export fn glssr_frame(dt_ms: f32, width: u32, height: u32) u32 {
             @intCast(@intFromPtr(&mvp[oi])),
             @intCast(@intFromPtr(&model_mat[oi])),
             @intCast(@intFromPtr(&normal9[oi])),
-            @intCast(@intFromPtr(&material)),
+            @intCast(@intFromPtr(&material[oi])),
             @intCast(@intFromPtr(&camera_pos)),
         );
     }

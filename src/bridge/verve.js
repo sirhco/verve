@@ -6817,13 +6817,19 @@
                 { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } }, // slice 3 tex2 (SSAO/SSR)
               ],
             });
-            // Params binding size: the SSAO shader (sh_ssao=253) and the SSR shader
-            // (sh_ssr=256, slice 4) both use a 144B Params {params vec4 @0, inv_proj
-            // mat4 @16, proj mat4 @80}; the G-buffer debug shader (sh_gdebug=250) uses
-            // 80B {params vec4 @0, inv_proj mat4 @16}; the bloom/fxaa/composite/
-            // ssao_blur modules use ≤32B. The bind-group binding size at draw time
-            // (case 25) must be ≥ what the shader reads.
-            const paramsSize = (handle === 253 || handle === 256) ? 144 : (handle === 250) ? 80 : 32;
+            // Params binding size: derived from the post shader's DECLARED Params
+            // struct so every post handle (SSAO sh_ssao=253, SSR sh_ssr=256, the
+            // G-buffer debug sh_gdebug=250, and any future post shader) gets the
+            // right binding size without enumerating magic handle numbers. Layout:
+            //   params vec4 @0 (16B) [always]
+            //   + inv_proj mat4 @16 (64B) → 80B total (sh_gdebug)
+            //   + proj    mat4 @80 (64B) → 144B total (sh_ssao / sh_ssr)
+            // bloom/fxaa/composite/ssao_blur declare neither matrix → 32B. The bind-
+            // group binding size at draw time (case 25) must be ≥ what the shader
+            // reads, so the SSR pipeline + its draw bind group land on 144B (not 32B).
+            const hasProj = /\bproj\s*:\s*mat4x4/.test(code);
+            const hasInvProj = /\binv_proj\s*:\s*mat4x4/.test(code);
+            const paramsSize = hasProj ? 144 : hasInvProj ? 80 : 32;
             st.pipelines[handle] = { module, bgl0, bgl1, kind: "post", byFormat: {}, paramsSize };
             break;
           }
