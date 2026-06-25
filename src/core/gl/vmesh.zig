@@ -126,10 +126,10 @@ pub const MorphData = struct {
     tangent_deltas: ?[]const f16 = null, // v14: per-(target,vertex) tangent delta xyz; null → zeros
 };
 pub const LodLevel = extern struct {
-    dist_min_sq: f32,   // squared world distance threshold; level 0 == 0
-    submesh_first: u32,  // first submesh index of this level
-    submesh_count: u32,  // submeshes in this level
-    reserved: u32 = 0,   // pad to 16 B
+    dist_min_sq: f32, // squared world distance threshold; level 0 == 0
+    submesh_first: u32, // first submesh index of this level
+    submesh_count: u32, // submeshes in this level
+    reserved: u32 = 0, // pad to 16 B
 };
 pub const LodData = struct {
     levels: []const LodLevel, // lod_level_count entries (≤ 8), 16 B each
@@ -2328,7 +2328,7 @@ test "vmesh v14 morph tangent round-trip" {
     // tangent deltas: tc*vc*3 f16 values
     const tan_deltas_f16 = [_]f16{
         0.25, 0.0, 0.0, // target 0, vertex 0
-        0.0,  0.5, 0.0, // target 0, vertex 1
+        0.0, 0.5, 0.0, // target 0, vertex 1
     };
 
     const verts = [_]f32{
@@ -2526,9 +2526,11 @@ test "pack() returns LodRange when level 0 dist_min_sq != 0" {
     const subs = [_]Submesh{
         .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 0.5, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1 },
     };
-    const bad_lod = LodData{ .levels = &[_]LodLevel{
-        .{ .dist_min_sq = 5.0, .submesh_first = 0, .submesh_count = 1 }, // level 0 must have dist_min_sq == 0
-    } };
+    const bad_lod = LodData{
+        .levels = &[_]LodLevel{
+            .{ .dist_min_sq = 5.0, .submesh_first = 0, .submesh_count = 1 }, // level 0 must have dist_min_sq == 0
+        },
+    };
     try std.testing.expectError(error.LodRange, pack(alloc, &v12, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null, bad_lod));
 }
 

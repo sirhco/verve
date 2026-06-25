@@ -1259,7 +1259,10 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
     {
         var found_any_lod = false;
         for (name_list.items) |nm| {
-            if (lodLevelFromName(nm) >= 0) { found_any_lod = true; break; }
+            if (lodLevelFromName(nm) >= 0) {
+                found_any_lod = true;
+                break;
+            }
         }
         if (found_any_lod) {
             var levels_buf: [8]vmesh.LodLevel = undefined;
@@ -1267,7 +1270,10 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
             var si: u32 = 0;
             while (si < @as(u32, @intCast(name_list.items.len))) {
                 const lvl = lodLevelFromName(name_list.items[si]);
-                if (lvl < 0) { si += 1; continue; }
+                if (lvl < 0) {
+                    si += 1;
+                    continue;
+                }
                 const first = si;
                 var count: u32 = 0;
                 while (si < @as(u32, @intCast(name_list.items.len)) and lodLevelFromName(name_list.items[si]) == lvl) {

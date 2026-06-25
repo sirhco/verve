@@ -3734,9 +3734,15 @@ pub fn morphTangentGlb(alloc: Allocator) ![]u8 {
     }.w;
 
     // POSITION: 3 vertices forming a triangle
-    wf32(bin, off_pos + 0, 0.0); wf32(bin, off_pos + 4, 0.0); wf32(bin, off_pos + 8, 0.0);
-    wf32(bin, off_pos + 12, 1.0); wf32(bin, off_pos + 16, 0.0); wf32(bin, off_pos + 20, 0.0);
-    wf32(bin, off_pos + 24, 0.0); wf32(bin, off_pos + 28, 1.0); wf32(bin, off_pos + 32, 0.0);
+    wf32(bin, off_pos + 0, 0.0);
+    wf32(bin, off_pos + 4, 0.0);
+    wf32(bin, off_pos + 8, 0.0);
+    wf32(bin, off_pos + 12, 1.0);
+    wf32(bin, off_pos + 16, 0.0);
+    wf32(bin, off_pos + 20, 0.0);
+    wf32(bin, off_pos + 24, 0.0);
+    wf32(bin, off_pos + 28, 1.0);
+    wf32(bin, off_pos + 32, 0.0);
 
     // NORMAL: all (0, 0, 1)
     for (0..3) |vi| {
@@ -3744,7 +3750,8 @@ pub fn morphTangentGlb(alloc: Allocator) ![]u8 {
     }
 
     // TEXCOORD_0: (0,0),(1,0),(0,1)
-    wf32(bin, off_uv + 8, 1.0); wf32(bin, off_uv + 20, 1.0);
+    wf32(bin, off_uv + 8, 1.0);
+    wf32(bin, off_uv + 20, 1.0);
 
     // INDICES: [0, 1, 2]
     std.mem.writeInt(u16, bin[off_idx..][0..2], 0, .little);
@@ -3811,14 +3818,24 @@ pub fn morphTangentGlb(alloc: Allocator) ![]u8 {
     const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
     var glb = try alloc.alloc(u8, glb_len);
     var goff: usize = 0;
-    @memcpy(glb[goff..][0..4], "glTF"); goff += 4;
-    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little); goff += 4;
-    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little); goff += 4;
-    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little); goff += 4;
-    @memcpy(glb[goff..][0..4], "JSON"); goff += 4;
-    @memcpy(glb[goff..][0..json_len], json_bytes); goff += json_len;
-    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little); goff += 4;
-    glb[goff] = 0x42; glb[goff + 1] = 0x49; glb[goff + 2] = 0x4E; glb[goff + 3] = 0x00;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42;
+    glb[goff + 1] = 0x49;
+    glb[goff + 2] = 0x4E;
+    glb[goff + 3] = 0x00;
     goff += 4;
     @memcpy(glb[goff..][0..bin_total], bin);
     return glb;
@@ -3984,10 +4001,10 @@ pub fn morphDemoGlb(alloc: Allocator) ![]u8 {
     // k2: in=[0,0,0] point=[0,0,1] out=[0,0,0]   (Twist fully active)
     // k3: in=[0,0,0] point=[0,0,0] out=[0,0,0]   (return to rest)
     const anim_weights = [36]f32{
-        0, 0, 0,  0, 0, 0,  0, 0, 0, // k0: in, point, out
-        0, 0, 0,  0, 1, 0,  0, 0, 0, // k1: in, point, out
-        0, 0, 0,  0, 0, 1,  0, 0, 0, // k2: in, point, out
-        0, 0, 0,  0, 0, 0,  0, 0, 0, // k3: in, point, out
+        0, 0, 0, 0, 0, 0, 0, 0, 0, // k0: in, point, out
+        0, 0, 0, 0, 1, 0, 0, 0, 0, // k1: in, point, out
+        0, 0, 0, 0, 0, 1, 0, 0, 0, // k2: in, point, out
+        0, 0, 0, 0, 0, 0, 0, 0, 0, // k3: in, point, out
     };
     for (anim_weights, 0..) |wt, wi| {
         wf32(bin, off_wts + wi * 4, wt);
@@ -4095,9 +4112,9 @@ pub fn morphDemo16Glb(alloc: Allocator) ![]u8 {
     const N_VERTS: usize = 25;
     const N_INDICES: usize = 96;
     // Per-buffer-view sizes
-    const SZ_POS: usize = N_VERTS * 12;  // VEC3 f32 → 300
-    const SZ_NRM: usize = N_VERTS * 12;  // VEC3 f32 → 300
-    const SZ_UV: usize = N_VERTS * 8;    // VEC2 f32 → 200
+    const SZ_POS: usize = N_VERTS * 12; // VEC3 f32 → 300
+    const SZ_NRM: usize = N_VERTS * 12; // VEC3 f32 → 300
+    const SZ_UV: usize = N_VERTS * 8; // VEC2 f32 → 200
     const SZ_IDX: usize = N_INDICES * 2; // u16 → 192
     const SZ_DELTA: usize = N_VERTS * 12; // per-target POSITION delta → 300
     // NORMAL deltas omitted (all zero) — not required; only POSITION deltas.
@@ -4112,9 +4129,9 @@ pub fn morphDemo16Glb(alloc: Allocator) ![]u8 {
     const SZ_WEIGHTS: usize = N_KEYS * N_TARGETS * 4; // 192 bytes
     // Padding: off_idx must be 4-aligned; 300+300+200=800, 192 idx → off_idx=800
     const off_pos: usize = 0;
-    const off_nrm: usize = off_pos + SZ_POS;    // 300
-    const off_uv: usize = off_nrm + SZ_NRM;     // 600
-    const off_idx: usize = off_uv + SZ_UV;      // 800
+    const off_nrm: usize = off_pos + SZ_POS; // 300
+    const off_uv: usize = off_nrm + SZ_NRM; // 600
+    const off_idx: usize = off_uv + SZ_UV; // 800
     const off_deltas: usize = off_idx + SZ_IDX; // 992
     const off_times: usize = off_deltas + N_TARGETS * SZ_TARGET; // 992 + 16*600 = 10592
     const off_weights: usize = off_times + SZ_TIMES; // 10604
@@ -4299,14 +4316,24 @@ pub fn morphDemo16Glb(alloc: Allocator) ![]u8 {
     const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
     var glb = try alloc.alloc(u8, glb_len);
     var goff: usize = 0;
-    @memcpy(glb[goff..][0..4], "glTF"); goff += 4;
-    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little); goff += 4;
-    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little); goff += 4;
-    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little); goff += 4;
-    @memcpy(glb[goff..][0..4], "JSON"); goff += 4;
-    @memcpy(glb[goff..][0..json_len], json_bytes); goff += json_len;
-    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little); goff += 4;
-    glb[goff] = 0x42; glb[goff + 1] = 0x49; glb[goff + 2] = 0x4E; glb[goff + 3] = 0x00;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42;
+    glb[goff + 1] = 0x49;
+    glb[goff + 2] = 0x4E;
+    glb[goff + 3] = 0x00;
     goff += 4;
     @memcpy(glb[goff..][0..bin_total], bin);
     return glb;
@@ -4421,15 +4448,37 @@ pub fn skinmorphBarGlb(alloc: Allocator) ![]u8 {
             const rs = ring_skin[r];
             const cols = [2][2]f32{ .{ s.lx, s.lz }, .{ s.rx, s.rz } };
             for (cols, 0..) |c, col| {
-                wf(bin, pc + 0, c[0]); wf(bin, pc + 4, y); wf(bin, pc + 8, c[1]); pc += 12;
-                wf(bin, nc + 0, s.nx); wf(bin, nc + 4, 0); wf(bin, nc + 8, s.nz); nc += 12;
-                wf(bin, uc + 0, @floatFromInt(col)); wf(bin, uc + 4, y / 3.0); uc += 8;
-                bin[jc + 0] = rs.j0; bin[jc + 1] = rs.j1; bin[jc + 2] = 0; bin[jc + 3] = 0; jc += 4;
-                wf(bin, wc + 0, rs.w0); wf(bin, wc + 4, rs.w1); wf(bin, wc + 8, 0); wf(bin, wc + 12, 0); wc += 16;
+                wf(bin, pc + 0, c[0]);
+                wf(bin, pc + 4, y);
+                wf(bin, pc + 8, c[1]);
+                pc += 12;
+                wf(bin, nc + 0, s.nx);
+                wf(bin, nc + 4, 0);
+                wf(bin, nc + 8, s.nz);
+                nc += 12;
+                wf(bin, uc + 0, @floatFromInt(col));
+                wf(bin, uc + 4, y / 3.0);
+                uc += 8;
+                bin[jc + 0] = rs.j0;
+                bin[jc + 1] = rs.j1;
+                bin[jc + 2] = 0;
+                bin[jc + 3] = 0;
+                jc += 4;
+                wf(bin, wc + 0, rs.w0);
+                wf(bin, wc + 4, rs.w1);
+                wf(bin, wc + 8, 0);
+                wf(bin, wc + 12, 0);
+                wc += 16;
                 // morph target 0: outward bulge along face normal
-                wf(bin, mc + 0, s.nx * morph_delta); wf(bin, mc + 4, 0); wf(bin, mc + 8, s.nz * morph_delta); mc += 12;
+                wf(bin, mc + 0, s.nx * morph_delta);
+                wf(bin, mc + 4, 0);
+                wf(bin, mc + 8, s.nz * morph_delta);
+                mc += 12;
                 // normal delta: same direction (push outward)
-                wf(bin, mn + 0, s.nx * 0.5); wf(bin, mn + 4, 0); wf(bin, mn + 8, s.nz * 0.5); mn += 12;
+                wf(bin, mn + 0, s.nx * 0.5);
+                wf(bin, mn + 4, 0);
+                wf(bin, mn + 8, s.nz * 0.5);
+                mn += 12;
             }
         }
     }
@@ -4573,14 +4622,24 @@ pub fn skinmorphBarGlb(alloc: Allocator) ![]u8 {
     const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
     var glb = try alloc.alloc(u8, glb_len);
     var goff: usize = 0;
-    @memcpy(glb[goff..][0..4], "glTF"); goff += 4;
-    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little); goff += 4;
-    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little); goff += 4;
-    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little); goff += 4;
-    @memcpy(glb[goff..][0..4], "JSON"); goff += 4;
-    @memcpy(glb[goff..][0..json_len], json_bytes); goff += json_len;
-    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little); goff += 4;
-    glb[goff] = 0x42; glb[goff + 1] = 0x49; glb[goff + 2] = 0x4E; glb[goff + 3] = 0x00;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42;
+    glb[goff + 1] = 0x49;
+    glb[goff + 2] = 0x4E;
+    glb[goff + 3] = 0x00;
     goff += 4;
     @memcpy(glb[goff..][0..bin_padded], bin);
     return glb;
@@ -4779,10 +4838,23 @@ test "lodGlb: 3 LOD meshes → lodLevelCount == 3 after parseGlb + pack" {
     try testing.expectEqual(@as(f32, 0), model.lod.?.levels[0].dist_min_sq);
     const anim: ?vmesh.Anims = if (model.anim_clips.len > 0) .{ .clips = model.anim_clips } else null;
     const bytes = try vmesh.pack(
-        testing.allocator, model.vertices, model.indices, model.submeshes,
-        model.textures, &.{}, &.{}, model.names, model.skinned,
-        model.joints, model.weights, model.skel, anim,
-        model.instances, model.instance_count, model.morph, model.lod,
+        testing.allocator,
+        model.vertices,
+        model.indices,
+        model.submeshes,
+        model.textures,
+        &.{},
+        &.{},
+        model.names,
+        model.skinned,
+        model.joints,
+        model.weights,
+        model.skel,
+        anim,
+        model.instances,
+        model.instance_count,
+        model.morph,
+        model.lod,
     );
     defer testing.allocator.free(bytes);
     const r = try vmesh.Reader.init(bytes);
