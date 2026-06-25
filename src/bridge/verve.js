@@ -601,7 +601,7 @@
     const active = packed & 0xff;
     const total  = (packed >>> 8) & 0xff;
     const subs   = (packed >>> 16) & 0xffff;
-    hudEl.textContent = total === 0 ? "LOD off" : `LOD ${active} / ${total - 1} · ${subs} submesh`;
+    hudEl.textContent = total === 0 ? "LOD off" : `LOD ${active} / ${total} · ${subs} submesh`;
   };
 
   const dispatchEventId = (e, attr, prevent) => {

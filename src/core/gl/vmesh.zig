@@ -89,6 +89,13 @@ pub fn morphRecordF16(ver: u32) u32 {
 pub const vertex_stride: u32 = 48; // pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40
 pub const skinned_vertex_stride: u32 = 56; // …48, then joints uint8x4 @48, weights unorm8x4 @52
 pub const header_size: u32 = 100;
+
+/// Returns the on-disk header size in bytes for the given vmesh version.
+/// v15+ added 3 LOD fields at [88..100], so v15 has a 100-byte header.
+/// v13/v14 have an 88-byte header.
+pub fn headerSize(ver: u32) u32 {
+    return if (ver >= 15) 100 else 88;
+}
 pub const submesh_size: u32 = 84;
 pub const tex_entry_size: u32 = 20;
 pub const name_entry_size: u32 = 12;
@@ -242,10 +249,11 @@ pub fn pack(
     const bvh_node_count: u32 = @intCast(bvh_nodes.len);
     const name_count: u32 = @intCast(names.len);
 
-    // Layout: header(88) → submesh_table → tex_table → [align16] → vertices →
+    // Layout: header(100, v15) → submesh_table → tex_table → [align16] → vertices →
     //   [align4] → indices → [align4] → tex_blob → [align16] → bvh_nodes →
     //   tri_perm → [align4] → name_table → name_blob → [align16] → skeleton →
-    //   [align16] → anim → [align16] → instances → [align16] → morph
+    //   [align16] → anim → [align16] → instances → [align16] → morph → [align16] → lod
+    // pack() always writes v15 (header_size == 100).
     const submesh_table_off: u32 = header_size;
     const tex_table_off: u32 = submesh_table_off + submesh_count * submesh_size;
     const after_tex_table: u32 = tex_table_off + texture_count * tex_entry_size;
@@ -363,11 +371,11 @@ pub fn pack(
     // LOD section (16-aligned): lod_level_count × 16 B. Absent when null/empty.
     var lod_total: u32 = 0;
     if (lod) |l| {
-        std.debug.assert(l.levels.len <= 8);
-        std.debug.assert(l.levels.len > 0);
-        std.debug.assert(l.levels[0].dist_min_sq == 0);
+        if (l.levels.len == 0) return error.LodLevelCount;
+        if (l.levels.len > 8) return error.LodRange;
+        if (l.levels[0].dist_min_sq != 0) return error.LodRange;
         for (l.levels) |lv| {
-            std.debug.assert(lv.submesh_first + lv.submesh_count <= submesh_count);
+            if (lv.submesh_first + lv.submesh_count > submesh_count) return error.LodRange;
         }
         lod_total = @as(u32, @intCast(l.levels.len)) * 16;
     }
@@ -684,7 +692,6 @@ pub const Reader = struct {
     bytes: []const u8,
 
     pub fn init(bytes: []const u8) error{ BadMagic, BadVersion, Truncated, BadTexIndex }!Reader {
-        if (bytes.len < header_size) return error.Truncated;
         // Capture the buffer length ONCE at entry, BEFORE the readInt header block
         // below. Zig 0.16.0's self-hosted x86_64 backend (the Debug default on
         // x86_64-linux) miscompiles a `bytes.len` read taken AFTER that block:
@@ -694,9 +701,14 @@ pub const Reader = struct {
         // never hit it (which is why only ubuntu CI was red). Reading len here,
         // ahead of the miscompiled region, sidesteps it.
         const blen: u64 = bytes.len;
+        // Need at least 8 bytes to read magic + version before we can determine
+        // the version-specific header size.
+        if (blen < 8) return error.Truncated;
         if (!std.mem.eql(u8, bytes[0..4], magic)) return error.BadMagic;
         const ver = std.mem.readInt(u32, bytes[4..8], .little);
         if (ver < 13 or ver > version) return error.BadVersion; // accept v13, v14, v15
+        // Version-aware minimum length: v13/v14 have an 88-byte header; v15+ has 100 bytes.
+        if (blen < @as(u64, headerSize(ver))) return error.Truncated;
 
         const vertex_count = std.mem.readInt(u32, bytes[8..12], .little);
         const index_count = std.mem.readInt(u32, bytes[12..16], .little);
@@ -715,8 +727,8 @@ pub const Reader = struct {
         const joint_count = std.mem.readInt(u32, bytes[64..68], .little);
         const anim_off = std.mem.readInt(u32, bytes[68..72], .little);
         const instance_off = std.mem.readInt(u32, bytes[72..76], .little);
-        // v13 morph header fields: only read when buffer is large enough (≥88 B).
-        // A v13 file always has header_size == 88, and init already checked bytes.len ≥ 88.
+        // v13/v14 morph header fields: always present at bytes[76..88] for v13+.
+        // init already checked bytes.len ≥ headerSize(ver) (≥88 for v13/v14, ≥100 for v15).
         const morph_off = std.mem.readInt(u32, bytes[76..80], .little);
         const morph_target_count = std.mem.readInt(u32, bytes[80..84], .little);
         const morph_vertex_count = std.mem.readInt(u32, bytes[84..88], .little);
@@ -738,9 +750,11 @@ pub const Reader = struct {
         if (@as(u64, index_off) > blen or need_idx > blen - @as(u64, index_off)) return error.Truncated;
         const index_bytes: usize = @intCast(need_idx);
 
-        // Bounds-check submesh table (u64 to prevent u32 multiply wrap)
+        // Bounds-check submesh table (u64 to prevent u32 multiply wrap).
+        // The submesh table immediately follows the header; v13/v14 header is 88 B,
+        // v15+ header is 100 B — use the version-aware headerSize() here.
         const need_subs: u64 = @as(u64, sub_count) * @as(u64, submesh_size);
-        const sub_table_off: u32 = header_size;
+        const sub_table_off: u32 = headerSize(ver);
         if (@as(u64, sub_table_off) > blen or need_subs > blen - @as(u64, sub_table_off)) return error.Truncated;
         const sub_table_bytes: usize = @intCast(need_subs);
 
@@ -1390,6 +1404,11 @@ test "reader rejects bad magic and truncation" {
     @memcpy(junk[0..4], magic);
     std.mem.writeInt(u32, junk[4..8], 99, .little);
     try testing.expectError(error.BadVersion, Reader.init(&junk));
+    // Buffer too short to hold even magic+version → Truncated (< 8 bytes).
+    try testing.expectError(error.Truncated, Reader.init(junk[0..4]));
+    // Buffer with valid magic + valid version but shorter than the version-specific
+    // header size → Truncated (e.g. v15 needs 100 bytes; 10-byte buffer is too short).
+    std.mem.writeInt(u32, junk[4..8], 15, .little); // version = 15 (current)
     try testing.expectError(error.Truncated, Reader.init(junk[0..10]));
 }
 
@@ -2413,4 +2432,126 @@ test "vmesh v15 null LOD: lodLevelCount == 0" {
     defer alloc.free(bytes);
     const r = try Reader.init(bytes);
     try std.testing.expectEqual(@as(u32, 0), r.lodLevelCount());
+}
+
+// ── v14 header back-compat: submesh table at offset 88, not 100 ───────────────
+
+// Hand-builds a minimal v14 vmesh buffer with:
+//   - 88-byte header (version=14, vertex_count=3, index_count=3, sub_count=1, tex_count=0)
+//   - 1 submesh at offset 88 (index_count=3, all tex=-1)
+//   - 3 vertices at offset 176 (align16 after submesh table ends at 172)
+//   - 3 u16 indices at offset 320
+//   - total buffer size = 328 bytes
+//
+// This test MUST fail against the pre-fix code where sub_table_off==header_size==100
+// (the submesh table would be read from offset 100 instead of 88, yielding garbage
+// index_count and/or a BadTexIndex error). After the fix, sub_table_off = headerSize(14) = 88.
+test "vmesh v14 back-compat: hand-crafted 88-byte header, submesh table at offset 88" {
+    // Layout:
+    //   [0..88]   header (v14, 88 bytes)
+    //   [88..172] submesh table (1 × 84 bytes)
+    //   [172..176] padding to align16
+    //   [176..320] vertices (3 × 48 bytes)
+    //   [320..326] indices (3 × u16)
+    //   [326..328] padding to align4 → total 328 bytes
+
+    const v14_header_size: usize = 88;
+    const sub_off: usize = v14_header_size; // 88
+    const tex_table_off_val: usize = sub_off + 84; // 172
+    const vertex_off_val: usize = 176; // alignUp(172, 16)
+    const index_off_val: usize = vertex_off_val + 3 * 48; // 320
+    const tex_data_off_val: usize = index_off_val + 3 * 2; // 326, align4=328 → use 328
+    const total: usize = 328;
+
+    var buf = [_]u8{0} ** total;
+
+    // Header
+    @memcpy(buf[0..4], magic);
+    std.mem.writeInt(u32, buf[4..8], 14, .little); // version = 14
+    std.mem.writeInt(u32, buf[8..12], 3, .little); // vertex_count
+    std.mem.writeInt(u32, buf[12..16], 3, .little); // index_count
+    std.mem.writeInt(u32, buf[16..20], 1, .little); // sub_count
+    std.mem.writeInt(u32, buf[20..24], 0, .little); // tex_count
+    std.mem.writeInt(u32, buf[24..28], @intCast(vertex_off_val), .little);
+    std.mem.writeInt(u32, buf[28..32], @intCast(index_off_val), .little);
+    std.mem.writeInt(u32, buf[32..36], @intCast(tex_table_off_val), .little);
+    std.mem.writeInt(u32, buf[36..40], @intCast(tex_data_off_val), .little);
+    // bvh_off=0 @40, bvh_node_count=0 @44, name_table_off=0 @48, name_count=0 @52
+    // skinned=0 @56, skeleton_off=0 @60, joint_count=0 @64, anim_off=0 @68
+    // instance_off=0 @72, morph_off=0 @76, morph_target_count=0 @80, morph_vertex_count=0 @84
+    // (no LOD fields — v14 header ends at 88)
+
+    // Submesh at offset 88:
+    //   @0: index_byte_off=0, @4: index_count=3
+    //   @8..@52: base_color, metallic, roughness, emissive, occlusion_strength, normal_scale (leave 0)
+    //   @52..@72: tex_base, tex_mr, tex_normal, tex_emissive, tex_occlusion (all -1 = 0xFFFFFFFF as i32)
+    std.mem.writeInt(u32, buf[sub_off + 0 ..][0..4], 0, .little); // index_byte_off
+    std.mem.writeInt(u32, buf[sub_off + 4 ..][0..4], 3, .little); // index_count = 3
+    // base_color = (1,1,1,1)
+    const f1: u32 = @bitCast(@as(f32, 1.0));
+    std.mem.writeInt(u32, buf[sub_off + 8 ..][0..4], f1, .little);
+    std.mem.writeInt(u32, buf[sub_off + 12 ..][0..4], f1, .little);
+    std.mem.writeInt(u32, buf[sub_off + 16 ..][0..4], f1, .little);
+    std.mem.writeInt(u32, buf[sub_off + 20 ..][0..4], f1, .little);
+    // roughness = 1 @28, normal_scale = 1 @48, occlusion_strength = 1 @44
+    std.mem.writeInt(u32, buf[sub_off + 44 ..][0..4], f1, .little); // occlusion_strength
+    std.mem.writeInt(u32, buf[sub_off + 48 ..][0..4], f1, .little); // normal_scale
+    // tex indices = -1 (5 × i32)
+    std.mem.writeInt(i32, buf[sub_off + 52 ..][0..4], -1, .little);
+    std.mem.writeInt(i32, buf[sub_off + 56 ..][0..4], -1, .little);
+    std.mem.writeInt(i32, buf[sub_off + 60 ..][0..4], -1, .little);
+    std.mem.writeInt(i32, buf[sub_off + 64 ..][0..4], -1, .little);
+    std.mem.writeInt(i32, buf[sub_off + 68 ..][0..4], -1, .little);
+
+    // Minimal vertices (zeroed — 3 × 48 bytes already zero)
+
+    // Indices: 0, 1, 2
+    std.mem.writeInt(u16, buf[index_off_val..][0..2], 0, .little);
+    std.mem.writeInt(u16, buf[index_off_val + 2 ..][0..2], 1, .little);
+    std.mem.writeInt(u16, buf[index_off_val + 4 ..][0..2], 2, .little);
+
+    const r = try Reader.init(&buf);
+    try std.testing.expectEqual(@as(u32, 14), r.fileVersion());
+    try std.testing.expectEqual(@as(u32, 3), r.submesh(0).index_count);
+    try std.testing.expectEqual(@as(i32, -1), r.submesh(0).tex_base);
+    try std.testing.expectEqual(@as(u32, 0), r.lodLevelCount());
+}
+
+// ── pack() LOD validation: assert → return error ──────────────────────────────
+
+test "pack() returns LodRange when level 0 dist_min_sq != 0" {
+    const alloc = std.testing.allocator;
+    const v12 = [12]f32{ 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1 };
+    const idx = [_]u16{ 0, 0, 0 };
+    const subs = [_]Submesh{
+        .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 0.5, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1 },
+    };
+    const bad_lod = LodData{ .levels = &[_]LodLevel{
+        .{ .dist_min_sq = 5.0, .submesh_first = 0, .submesh_count = 1 }, // level 0 must have dist_min_sq == 0
+    } };
+    try std.testing.expectError(error.LodRange, pack(alloc, &v12, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null, bad_lod));
+}
+
+test "pack() returns LodLevelCount when levels slice is empty" {
+    const alloc = std.testing.allocator;
+    const v12 = [12]f32{ 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1 };
+    const idx = [_]u16{ 0, 0, 0 };
+    const subs = [_]Submesh{
+        .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 0.5, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1 },
+    };
+    const bad_lod = LodData{ .levels = &[_]LodLevel{} }; // empty → LodLevelCount
+    try std.testing.expectError(error.LodLevelCount, pack(alloc, &v12, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null, bad_lod));
+}
+
+test "pack() returns LodRange when levels.len > 8" {
+    const alloc = std.testing.allocator;
+    const v12 = [12]f32{ 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1 };
+    const idx = [_]u16{ 0, 0, 0 };
+    const subs = [_]Submesh{
+        .{ .index_byte_off = 0, .index_count = 3, .base_color = .{ 1, 1, 1, 1 }, .metallic = 0, .roughness = 0.5, .emissive = .{ 0, 0, 0 }, .occlusion_strength = 1, .normal_scale = 1, .tex_base = -1, .tex_mr = -1, .tex_normal = -1, .tex_emissive = -1, .tex_occlusion = -1 },
+    };
+    // 9 levels → exceeds max of 8
+    const lev = LodLevel{ .dist_min_sq = 0, .submesh_first = 0, .submesh_count = 1 };
+    const bad_lod = LodData{ .levels = &[_]LodLevel{ lev, lev, lev, lev, lev, lev, lev, lev, lev } };
+    try std.testing.expectError(error.LodRange, pack(alloc, &v12, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null, bad_lod));
 }
