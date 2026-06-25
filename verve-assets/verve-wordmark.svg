@@ -1,0 +1,29 @@
+<svg width="460" height="200" viewBox="0 0 460 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Verve wordmark">
+  <defs>
+    <linearGradient id="verveWord" gradientUnits="userSpaceOnUse" x1="44" y1="60" x2="416" y2="150">
+      <stop offset="0" stop-color="#FF4D8D"/>
+      <stop offset="0.5" stop-color="#A02BFF"/>
+      <stop offset="1" stop-color="#5566FF"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="url(#verveWord)" stroke-width="22"
+     stroke-linecap="round" stroke-linejoin="round">
+    <!-- V -->
+    <path d="M44 52 L72 150 L100 52"/>
+    <!-- E -->
+    <path d="M128 52 V150"/>
+    <path d="M128 52 H176"/>
+    <path d="M128 101 H166"/>
+    <path d="M128 150 H176"/>
+    <!-- R -->
+    <path d="M204 150 V52 H234 C 256 52 256 100 234 100 H204"/>
+    <path d="M226 100 L254 150"/>
+    <!-- V -->
+    <path d="M284 52 L312 150 L340 52"/>
+    <!-- E -->
+    <path d="M368 52 V150"/>
+    <path d="M368 52 H416"/>
+    <path d="M368 101 H406"/>
+    <path d="M368 150 H416"/>
+  </g>
+</svg>

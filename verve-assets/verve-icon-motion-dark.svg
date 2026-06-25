@@ -1,0 +1,19 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Verve logo">
+  <defs>
+    <linearGradient id="verveGrad" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#FF4D8D"/>
+      <stop offset="0.5" stop-color="#A02BFF"/>
+      <stop offset="1" stop-color="#5566FF"/>
+    </linearGradient>
+    <linearGradient id="verveTile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1C1430"/>
+      <stop offset="1" stop-color="#110B22"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="256" height="256" rx="58" fill="url(#verveTile)"/>
+  <rect x="1.5" y="1.5" width="253" height="253" rx="56.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="1.5"/>
+  <!-- dynamic V: two motion arcs meeting at a vertex, right arm overshoots like animation follow-through -->
+  <path d="M64 70 C 86 126 106 162 126 182 C 150 158 176 110 198 60"
+        fill="none" stroke="url(#verveGrad)" stroke-width="30"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

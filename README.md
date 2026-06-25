@@ -1,9 +1,22 @@
-# Verve
+<div align="center">
 
-> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.6.x. Public
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="verve-assets/verve-icon-motion-dark.svg">
+  <img src="verve-assets/verve-icon-motion-light.svg" alt="Verve" width="84" height="84">
+</picture>
+
+<img src="verve-assets/verve-wordmark.svg" alt="Verve" width="260">
+
+**Full-stack pure-Zig framework for web _and_ native desktop apps.**
+
+📚 **[verveframework.dev](https://verveframework.dev)** · [Guides](docs/README.md) · [Examples](examples/README.md) · [Changelog](CHANGELOG.md) · [Roadmap](ROADMAP.md)
+
+</div>
+
+> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.17.x. Public
 > APIs are not stable and **will** break between minor versions.
 > All three desktop backends (macOS, Windows, Linux GTK4) are validated
-> on real hardware (current as of v0.6.x). Known limitations: desktop auto-updater
+> on real hardware (current as of v0.17.x). Known limitations: desktop auto-updater
 > apply is macOS-only; full a11y provider not yet implemented; Linux
 > image clipboard returns `Unsupported`. Use for learning, experiments,
 > and personal projects. Not production-ready.
@@ -17,15 +30,12 @@ native window backed by the OS webview (WKWebView / WebView2 /
 WebKitGTK) — pick the target at `zig build` time. No VDOM. No macros.
 No Chromium. No Electron. No third-party dependencies.
 
-Targets **Zig 0.16.0**.
-
-📚 **[Documentation](docs/README.md)** — 24 topic guides covering every feature.
-🧪 **[Examples](examples/README.md)** — runnable sample apps including a full [showcase](examples/showcase/).
+Targets **Zig 0.16.0**. Full documentation lives at **[verveframework.dev](https://verveframework.dev)**.
 
 ```sh
 # Web app — HTTP server + wasm hydration
 zig build                           # native server + wasm client + per-island chunks
-zig build test --summary all        # 721 tests across core + server + client + desktop + integration
+zig build test --summary all        # 984 tests across core + server + client + desktop + integration
 zig build docs                      # zig-out/docs/api/index.html — Zig autodoc for the public verve module
 ./zig-out/bin/verve-server          # open http://127.0.0.1:8080
 
@@ -153,12 +163,13 @@ GSAP-class animation engine, pure Zig + one hand-written JS interpreter — no G
 - **SplitText + FLIP** — chars/words/`graphemes` (UAX#29 extended grapheme clusters, zero JS) split **server-side**; `rtl_aware` wraps RTL runs in `<span dir="rtl">`; line grouping at hydrate; FLIP layout animation with optional **nested counter-scale** (`counter_scale`) over the keyed reconciler.
 
 ### 3D engine (`verve.gl`)
-Native 3D, pure Zig + one dumb WebGL2 interpreter — no three.js. The whole engine (scene graph, transforms, draw ordering, asset parsing) runs in wasm and emits a flat binary command stream into linear memory; the bridge walks it with zero-copy typed-array views. Wire contract frozen by byte-exact golden tests (the anim `serialize.zig` pattern). Guide: [`docs/24-gl.md`](docs/24-gl.md). Demo: the `/gl` route (`zig build run`).
-- **Engine core** — column-major f32 math, struct-of-arrays scene graph with pre-order dirty propagation, API-neutral command stream (WebGPU later = a second interpreter, same bytes), unlit vertex-color + textured/lit shader variants.
-- **Asset pipeline** — build-time `.glb` → packed `.vmesh` (`tools/gl_asset_gen`): zero runtime parsing, fetch → linear memory → GPU upload. Pure-Zig PNG decoder, glb parser, and vmesh reader, all hardened against hostile input (errors, never panics). Demo asset is fully procedural — no binaries in the repo.
-- **Runtime loading** — islands fetch `.vmesh` over `gl_load` into the chunk arena; failed fetches degrade to clear-only frames with a structured console error.
-- **v1 complete** — PBR metallic-roughness + IBL (P3), orbit controls + BVH picking + declarative `ctx.glScene` (P4), `verve.anim` fusion with scroll-scrubbed 3D turntable (P5). Demo: [`examples/gl-viewer/`](examples/gl-viewer/README.md).
-- **Render quality (P9)** — per-submesh shader-variant selection (leanest correct PBR program per submesh), per-node frustum culling (CPU-side, wire-invisible), and a single directional shadow map (depth pass into a `DEPTH_COMPONENT24` FBO + 3×3 PCF). Demos: the `/gl-mixed` (variants) and `/gl-shadow` (cast shadow) routes.
+Native 3D, pure Zig + two hand-written interpreters (**WebGL2 and WebGPU**) — no three.js. The whole engine (scene graph, transforms, draw ordering, lighting, asset parsing) runs in wasm and emits a flat binary command stream into linear memory; each backend walks the same bytes with zero-copy typed-array views. Backend chosen at runtime (WebGPU when `navigator.gpu` is present, WebGL2 otherwise). Wire contract frozen by byte-exact golden tests (the anim `serialize.zig` pattern). Guide: [`docs/24-gl.md`](docs/24-gl.md). Demos: `/gl`, `/gl-scene`, and the per-feature `/gl-*` routes (`zig build run`).
+- **Engine core** — column-major f32 math, struct-of-arrays scene graph with pre-order dirty propagation, one API-neutral command stream driving both backends, per-submesh shader-variant selection, frustum culling (camera + shadow-light), BVH picking, orbit controls, and declarative `ctx.glScene` scenes.
+- **Materials** — PBR metallic-roughness + image-based lighting (IBL), emissive, double-sided, and alpha **BLEND** / **MASK** (alpha-test cutout, with hole-accurate cast shadows) modes.
+- **Lighting** — directional / spot / point lights with simultaneous multi-light **shadow casters** (tiled 2D + cube atlases), **cascaded shadow maps** for directional light, and **rect area lights** via Linearly Transformed Cosines with soft area shadows.
+- **Skeletal skinning** — GPU skinning with keyframe animation, multiple clips + switching, cross-fade and weighted blending, ping-pong / loop / once modes, scrub, and all glTF interpolation modes (step / linear / cubicspline).
+- **Image quality** — bloom + FXAA, a depth + view-space-normal prepass (G-buffer), **SSAO**, **screen-space reflections (SSR)**, **depth of field**, **weighted-blended OIT** (order-independent transparency), selectable tone-mappers (ACES / AgX / Reinhard / Reinhard-extended / Uncharted2 / linear), and vignette. Demos: `/gl-ssao`, `/gl-ssr`, `/gl-dof`, `/gl-oit`, `/gl-tonemap`, `/gl-post`.
+- **Asset pipeline** — build-time `.glb` → packed `.vmesh` (`tools/gl_asset_gen`): zero runtime parsing, fetch → linear memory → GPU upload. Pure-Zig PNG decoder, glb parser, and vmesh reader, all hardened against hostile input (errors, never panics). `verve.anim` fusion drives scroll-scrubbed 3D. Demo: [`examples/gl-viewer/`](examples/gl-viewer/README.md).
 
 ### Markdown & syntax highlighting
 Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed at SSR time into the `Node` tree; no client wasm, no JavaScript. Guide: [`docs/21-markdown-and-highlighting.md`](docs/21-markdown-and-highlighting.md). Demo: [`examples/markdown/`](examples/markdown/README.md).
@@ -201,7 +212,7 @@ tour and platform support matrix.
 
 > Pre-1.0 — release artifacts are published for each tag, but
 > behavior is experimental. All three desktop backends (macOS,
-> Windows, Linux GTK4) are validated on real hardware (current as of v0.6.x).
+> Windows, Linux GTK4) are validated on real hardware (current as of v0.17.x).
 
 Tagged releases publish `verve-server` + `verve-cli` tarballs for
 five targets:
@@ -213,7 +224,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.5.19
+VERSION=0.17.0
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256
@@ -234,7 +245,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.5.19
+zig fetch --save git+https://github.com/sirhco/verve#v0.17.0
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -294,7 +305,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.5.19 \
+verve-cli new ~/my-app --release v0.17.0 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 
@@ -325,8 +336,9 @@ Then open:
 - <http://127.0.0.1:8080/viz> — `verve.viz` charts + node-link graphs (SVG, JS-off)
 - <http://127.0.0.1:8080/anim> — `verve.anim` engine: tweens, timelines, ScrollTrigger
 - <http://127.0.0.1:8080/smooth> — `verve.anim` ScrollSmoother demo
-- <http://127.0.0.1:8080/gl> — `verve.gl` 3D engine (WebGL2, no three.js)
+- <http://127.0.0.1:8080/gl> — `verve.gl` 3D engine (WebGPU + WebGL2, no three.js)
 - <http://127.0.0.1:8080/gl-scene> — declarative `ctx.glScene` 3D scene
+- <http://127.0.0.1:8080/gl-ssr>, `/gl-ssao`, `/gl-dof`, `/gl-oit`, `/gl-tonemap` — image-quality demos (SSR, SSAO, depth of field, order-independent transparency, tone-mappers)
 
 Or run the **showcase** for a tour of every feature:
 
