@@ -751,7 +751,8 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
         const tc: u32 = @intCast(targets.len);
 
         // Build delta blob: target-major, vertex-major; 9 f16 per vertex (v14: pos3 + nrm3 + tan3).
-        // Tangent deltas are zero-filled here (Part A: placeholder for Part B TANGENT accessor parse).
+        // Zero-initialized; pos/nrm always written below, tan written when the target has a
+        // TANGENT accessor (else left zero, so the morph leaves the tangent unchanged).
         const delta_bytes = @as(usize, tc) * @as(usize, vc) * 9 * 2;
         const delta_buf = try aa.alloc(u8, delta_bytes);
         @memset(delta_buf, 0);
