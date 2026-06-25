@@ -77,6 +77,18 @@ pub const Tag = enum(u16) {
     //   Mirrors draw_depth (tag 19) + a second mat4 pointer. The prepass program (variant_prepass) reads pos+normal of
     //   the stride-48 PBR layout and writes rgb=viewNormal*0.5+0.5, a=-viewPos.z into the rgba16f G-buffer (h_gbuffer).
     //   mvp = proj·view·model (clip pos); mv = view·model (no projection; transforms normals + gives viewPos).
+    // ── Image-quality slice 6: Weighted-Blended OIT (WBOIT) ─────────────
+    begin_mrt_pass = 40, // {accum_handle, reveal_handle, depth_src_handle} — WebGPU MRT pass: open a render pass with
+    //   TWO color attachments (accum cleared to 0,0,0,0; reveal cleared to 1,1,1,1) sharing the depth buffer of
+    //   `depth_src_handle` (h_scene_hdr) READ-ONLY (depthWrite off, depthCompare less). The MRT-OIT pipeline's
+    //   per-target blend (accum ONE/ONE additive, reveal ZERO/ONE_MINUS_SRC) is baked at create_shader. WebGPU ONLY;
+    //   the WebGL2 fallback (no per-attachment blend) replays geometry in two single-target begin_offscreen_pass blocks
+    //   with global blend, so the WebGL2 interpreter treats this tag as a no-op.
+    draw_oit = 41, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr, mv_ptr, color_ptr} — transparent geometry draw
+    //   into the OIT accum+reveal targets. color_ptr → 4 f32 (rgba; a = transparency). The variant_oit program computes
+    //   the depth-based WBOIT weight from -mv·pos.z and writes accum = vec4(rgb*a, a)*w and reveal = a. WebGPU: one draw
+    //   into the MRT pass (fs returns @location(0) accum + @location(1) reveal). WebGL2: replayed once per single-target
+    //   pass — the bound program (sh_oit accum-out / sh_oit_reveal reveal-out) + global blend selects which output lands.
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -88,6 +100,9 @@ pub const state_depth_test: u32 = 1 << 0;
 pub const state_cull_back: u32 = 1 << 1;
 pub const state_blend: u32 = 1 << 2; // src-alpha over; depth-write off (transparency)
 pub const state_cull_front: u32 = 1 << 3; // enable CULL_FACE + cullFace(FRONT) — renders back faces (double-sided BLEND back pass)
+// ── Image-quality slice 6: WBOIT global blend modes (WebGL2 two-pass fallback) ──
+pub const state_blend_add: u32 = 1 << 4; // additive: gl.blendFunc(ONE, ONE); depth-write off — the OIT accum pass.
+pub const state_blend_mult: u32 = 1 << 5; // multiplicative: gl.blendFunc(ZERO, ONE_MINUS_SRC_COLOR); depth-write off — the OIT revealage pass (dst *= 1-alpha). On WebGPU the per-target blend is baked into the MRT-OIT pipeline, so these bits only steer the WebGL2 fallback.
 
 /// CREATE_SHADER variant bits.
 pub const variant_vertex_color: u32 = 1 << 0;
@@ -116,6 +131,7 @@ pub const variant_fog: u32 = 1 << 13; // requires variant_pbr; distance fog mix 
 pub const variant_morph: u32 = 1 << 14; // requires variant_pbr; texture-blended POSITION+NORMAL morph deltas
 pub const variant_shadow_point: u32 = 1 << 15; // requires variant_pbr; omnidirectional point-light shadow receiver (RGBA8 atlas)
 pub const variant_prepass: u32 = 1 << 16; // depth + view-space normal prepass; rgba16f G-buffer (rgb=n*0.5+0.5, a=-viewPos.z). Standalone shader pair (mvp+mv UBO), not a PBR add-on.
+pub const variant_oit: u32 = 1 << 17; // Weighted-Blended OIT transparent-geometry shader. Standalone (mvp+mv+color UBO), NOT a PBR add-on. On WebGPU it builds an MRT pipeline (2 color targets, per-target blend, depth-write off); on WebGL2 it is one of two single-out programs replayed per pass.
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -567,6 +583,109 @@ pub fn gbufferDebugFragmentSrc() []const u8 {
     \\  } else {
     \\    o_color = vec4(g.rgb, 1.0);
     \\  }
+    \\}
+    \\
+    ;
+}
+
+// ── Image-quality slice 6: Weighted-Blended OIT (WBOIT) GLSL ─────────
+//
+// McGuire/Bavoil WBOIT. Transparent geometry is rendered ONCE (no depth sort)
+// into an accumulation buffer (additive) + a revealage buffer (multiplicative),
+// then a fullscreen resolve composites them over the opaque scene — the result
+// is order-independent (rotating the camera does not change the blend).
+//
+// WebGL2 (GLES 3.0) has NO per-draw-buffer separate blend in core (the indexed-
+// blend extension is not universal), so the two targets — which need DIFFERENT
+// blend funcs — are filled by TWO separate single-target passes over the same
+// geometry: an accum pass (program `sh_oit`, global blend ONE/ONE) then a reveal
+// pass (program `sh_oit_reveal`, global blend ZERO/ONE_MINUS_SRC_COLOR). Both
+// programs share the SAME vertex stage + the SAME weight math; only the fragment
+// output differs. The WGSL twin uses ONE MRT pipeline (two targets) instead.
+//
+// Weight (McGuire eq.10 variant; IDENTICAL in WGSL):
+//   d = clamp(viewDepth / OIT_FAR, 0, 1)               (viewDepth = -mv·pos .z > 0)
+//   w = clamp(pow(min(1, a*10)+0.01, 3) * 1e8 * pow(1 - d*0.9, 3), 1e-2, 3e3)
+//   accum  = vec4(color.rgb * a, a) * w
+//   reveal = a   (the reveal pass blend ZERO/ONE_MINUS_SRC_COLOR → dst *= 1-a)
+// OIT_FAR (100.0) matches the demo's perspective far plane; documented constant.
+
+/// WBOIT transparent-geometry vertex shader (GLSL). Reads pos (location 0) of the
+/// stride-48 PBR layout. Outputs clip position + linear view depth (-mv·pos .z),
+/// shared by both the accum and the reveal fragment programs. Uniforms: u_mvp
+/// (clip), u_mv (view; depth). Does NOT touch PBR_U.
+pub fn oitVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\uniform mat4 u_mvp;
+    \\uniform mat4 u_mv;
+    \\out float v_view_depth;
+    \\void main() {
+    \\  v_view_depth = -(u_mv * vec4(a_pos, 1.0)).z; // positive linear view depth
+    \\  gl_Position = u_mvp * vec4(a_pos, 1.0);
+    \\}
+    \\
+    ;
+}
+
+/// WBOIT accumulation fragment (GLSL). Outputs vec4(color.rgb*alpha, alpha)*weight
+/// into the accum buffer; the accum pass binds this with a global ONE/ONE blend.
+/// `u_oit_color` = the transparent surface color (rgb) + alpha (a). The weight
+/// math is byte-identical to `oitRevealFragmentSrc` and the WGSL twin.
+pub fn oitAccumFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in float v_view_depth;
+    \\uniform vec4 u_oit_color;
+    \\out vec4 o_accum;
+    \\void main() {
+    \\  float a = u_oit_color.a;
+    \\  float d = clamp(v_view_depth / 100.0, 0.0, 1.0);
+    \\  float w = clamp(pow(min(1.0, a * 10.0) + 0.01, 3.0) * 1e8 * pow(1.0 - d * 0.9, 3.0), 1e-2, 3e3);
+    \\  o_accum = vec4(u_oit_color.rgb * a, a) * w;
+    \\}
+    \\
+    ;
+}
+
+/// WBOIT revealage fragment (GLSL). Outputs vec4(alpha); the reveal pass binds
+/// this with a global ZERO/ONE_MINUS_SRC_COLOR blend so the destination becomes
+/// dst*(1-alpha) (the running product of transparency). Same uniforms + same
+/// implicit weight (revealage does not use it, but the vertex stage is shared).
+pub fn oitRevealFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in float v_view_depth;
+    \\uniform vec4 u_oit_color;
+    \\out vec4 o_reveal;
+    \\void main() {
+    \\  o_reveal = vec4(u_oit_color.a);
+    \\}
+    \\
+    ;
+}
+
+/// WBOIT resolve fragment (GLSL, variant_post). tex0 = accum, tex1 = reveal,
+/// tex2 = opaque scene HDR (h_scene_hdr). avg = accum.rgb/max(accum.a,1e-5);
+/// out = avg*(1-reveal) + opaque*reveal. Identical math to the WGSL twin.
+pub fn oitResolveFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\uniform sampler2D u_tex0; // accum
+    \\uniform sampler2D u_tex1; // revealage (.r)
+    \\uniform sampler2D u_tex2; // opaque scene HDR
+    \\out vec4 frag;
+    \\void main() {
+    \\  vec4 accum = texture(u_tex0, v_uv);
+    \\  float reveal = texture(u_tex1, v_uv).r;
+    \\  vec3 opaque = texture(u_tex2, v_uv).rgb;
+    \\  vec3 avg = accum.rgb / max(accum.a, 1e-5);
+    \\  frag = vec4(avg * (1.0 - reveal) + opaque * reveal, 1.0);
     \\}
     \\
     ;
@@ -2793,6 +2912,85 @@ pub fn wgslDof() []const u8 {
     ;
 }
 
+// ── Image-quality slice 6: WBOIT WGSL ────────────────────────────────
+//
+// The WGSL transparent-geometry shader is an MRT shader: `fs_main` returns a
+// struct with @location(0) = accum and @location(1) = reveal. The MRT pipeline
+// (built at create_shader for variant_oit) binds the two targets with PER-TARGET
+// blend (accum ONE/ONE additive, reveal ZERO/ONE_MINUS_SRC) — WebGPU's native
+// per-attachment blend, so ONE pass fills both. The weight math is byte-identical
+// to the GLSL accum/reveal twins (OIT_FAR = 100.0). UBO U{mvp, mv, color} (144B).
+
+/// WBOIT transparent-geometry WGSL (variant_oit). MRT: fs returns accum @0 +
+/// reveal @1. Private UBO {mvp @0, mv @64, color @128} — does NOT touch PBR_U.
+/// Threads `view_depth` as a fs_main param (WGSL free-fn restriction).
+pub fn wgslOit() []const u8 {
+    return
+    \\struct U {
+    \\  mvp: mat4x4<f32>,
+    \\  mv: mat4x4<f32>,
+    \\  color: vec4<f32>,
+    \\};
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\struct VsOut {
+    \\  @builtin(position) pos: vec4<f32>,
+    \\  @location(0) view_depth: f32,
+    \\};
+    \\struct FsOut {
+    \\  @location(0) accum: vec4<f32>,
+    \\  @location(1) reveal: vec4<f32>,
+    \\};
+    \\@vertex
+    \\fn vs_main(@location(0) a_pos: vec3<f32>) -> VsOut {
+    \\  var out: VsOut;
+    \\  out.view_depth = -(u.mv * vec4<f32>(a_pos, 1.0)).z; // positive linear view depth
+    \\  out.pos = u.mvp * vec4<f32>(a_pos, 1.0);
+    \\  return out;
+    \\}
+    \\@fragment
+    \\fn fs_main(@location(0) view_depth: f32) -> FsOut {
+    \\  let a = u.color.a;
+    \\  let d = clamp(view_depth / 100.0, 0.0, 1.0);
+    \\  let w = clamp(pow(min(1.0, a * 10.0) + 0.01, 3.0) * 1e8 * pow(1.0 - d * 0.9, 3.0), 1e-2, 3e3);
+    \\  var out: FsOut;
+    \\  out.accum = vec4<f32>(u.color.rgb * a, a) * w;
+    \\  out.reveal = vec4<f32>(a);
+    \\  return out;
+    \\}
+    \\
+    ;
+}
+
+/// WBOIT resolve WGSL (variant_post). tex0 = accum, tex1 = reveal, tex2 = opaque
+/// scene HDR. Uses textureSampleLevel(...,0.0) (derivative-free). Identical math
+/// to `oitResolveFragmentSrc`.
+pub fn wgslOitResolve() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { _pad: vec4<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@group(1) @binding(3) var tex2: texture_2d<f32>;
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let accum = textureSampleLevel(tex0, samp, uv, 0.0);
+    \\  let reveal = textureSampleLevel(tex1, samp, uv, 0.0).r;
+    \\  let opaque = textureSampleLevel(tex2, samp, uv, 0.0).rgb;
+    \\  let avg = accum.rgb / max(accum.a, 1e-5);
+    \\  return vec4<f32>(avg * (1.0 - reveal) + opaque * reveal, 1.0);
+    \\}
+    \\
+    ;
+}
+
 // ── Task 3: Post-process effect-graph structs ────────────────────────
 
 /// Tone-mapping operator applied in the composite stage (image-quality slice 2).
@@ -3002,6 +3200,63 @@ pub const DofCtx = struct {
     p_dof: [4]f32 = .{ 0, 0, 0, 0 }, // (focus_distance, focal_range, max_blur, _)
     p_blur_h: [4]f32 = .{ 0, 0, 1, 0 }, // [texel.x, texel.y, dir.x=1, dir.y=0]
     p_blur_v: [4]f32 = .{ 0, 0, 0, 1 }, // [texel.x, texel.y, dir.x=0, dir.y=1]
+};
+
+/// Persistent state for the Weighted-Blended OIT passes (image-quality slice 6,
+/// the FINAL slice). Parallels `DofCtx`: fixed handles + a created/last_w/last_h
+/// guard. Handle reservation: 261–266, immediately after DofCtx's 257–260.
+///
+/// WBOIT introduces the engine's first MULTI-target (MRT-style) output. Two
+/// rgba16f buffers — `h_accum` (additive) + `h_reveal` (multiplicative, .r used)
+/// — collect every transparent fragment with no depth sort, then a fullscreen
+/// resolve (`sh_oit_resolve`) composites them over the opaque scene (`h_scene_hdr`)
+/// into `h_scene_oit`, a drop-in scene source fed to the composite via
+/// `PostProcess.scene_src`.
+///
+/// Backend divergence (the riskiest backend-parity point of the whole workstream):
+/// WebGPU fills both targets in ONE MRT pass (per-target blend, `sh_oit`'s pipeline
+/// binds two color attachments). WebGL2 (GLES 3.0) has no per-attachment blend, so
+/// it replays the SAME geometry in TWO single-target passes — an accum pass
+/// (`sh_oit`, global ONE/ONE) then a reveal pass (`sh_oit_reveal`, global
+/// ZERO/ONE_MINUS_SRC). The RESOLVE and the weight/blend MATH are identical, so
+/// both backends produce the same composited image.
+///   `h_accum`   (261): rgba16f accumulation (additive ONE/ONE).
+///   `h_reveal`  (262): rgba16f revealage (.r; multiplicative; cleared to 1.0).
+///   `h_scene_oit` (263): rgba16f resolved scene+transparency — composite scene_src.
+///   `sh_oit`        (264): variant_oit transparent-geometry shader (WGSL MRT /
+///                          GLSL accum-out). Built per backend at first call.
+///   `sh_oit_reveal` (265): GLSL revealage-out program — WEBGL2 ONLY (unused on
+///                          WebGPU, whose single MRT shader writes both targets).
+///   `sh_oit_resolve`(266): variant_post fullscreen resolve (accum+reveal+opaque).
+pub const OitCtx = struct {
+    pub const h_accum: u32 = 261; // rgba16f accumulation buffer (additive)
+    pub const h_reveal: u32 = 262; // rgba16f revealage buffer (.r; multiplicative)
+    pub const h_scene_oit: u32 = 263; // rgba16f resolved scene+transparency RT
+    pub const sh_oit: u32 = 264; // variant_oit geometry shader (WGSL MRT / GLSL accum)
+    pub const sh_oit_reveal: u32 = 265; // GLSL revealage-out geometry shader (WebGL2 only)
+    pub const sh_oit_resolve: u32 = 266; // variant_post resolve (accum+reveal+opaque)
+
+    created: bool = false,
+    last_w: u32 = 0,
+    last_h: u32 = 0,
+    webgpu: bool = false,
+
+    // Resolve shader has no wire params; the resolve count is 0 and the bridge
+    // binds a zero-padded params slot. No stable param storage needed here.
+};
+
+/// One transparent draw for `runOit`: the geometry buffers + the per-object MVP /
+/// MV matrix pointers + the per-object color pointer (4 f32 rgba, a = alpha). The
+/// island builds a `[]const OitDraw` from PER-OBJECT arrays (a single shared static
+/// would alias to the last value for every draw — the slice-4 black-scene bug).
+pub const OitDraw = struct {
+    vbuf: u32,
+    ibuf: u32,
+    index_byte_off: u32,
+    index_count: u32,
+    mvp_ptr: u32,
+    mv_ptr: u32,
+    color_ptr: u32,
 };
 
 pub const Encoder = struct {
@@ -3271,6 +3526,32 @@ pub const Encoder = struct {
         self.putU32(index_count);
         self.putU32(mvp_ptr);
         self.putU32(mv_ptr);
+    }
+
+    /// WebGPU MRT pass: open a render pass with TWO color attachments — `accum`
+    /// (cleared to 0,0,0,0) and `reveal` (cleared to 1,1,1,1) — sharing the depth
+    /// buffer of `depth_src` (h_scene_hdr) read-only. The MRT-OIT pipeline's
+    /// per-target blend is baked at create_shader. WebGL2 treats this as a no-op
+    /// (it uses two single-target begin_offscreen_pass blocks instead).
+    pub fn beginMrtPass(self: *Encoder, accum: u32, reveal: u32, depth_src: u32) void {
+        self.header(.begin_mrt_pass, 12);
+        self.putU32(accum);
+        self.putU32(reveal);
+        self.putU32(depth_src);
+    }
+
+    /// Transparent-geometry draw into the OIT targets. `color_ptr` → 4 f32 rgba
+    /// (a = transparency). On WebGPU one draw fills accum+reveal (MRT); on WebGL2
+    /// it is replayed once per single-target pass.
+    pub fn drawOit(self: *Encoder, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, mvp_ptr: u32, mv_ptr: u32, color_ptr: u32) void {
+        self.header(.draw_oit, 28);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(mvp_ptr);
+        self.putU32(mv_ptr);
+        self.putU32(color_ptr);
     }
 
     /// Alpha-tested depth draw (MASK cutout shadows): binds `shader` (the depth-at
@@ -3821,6 +4102,94 @@ pub const Encoder = struct {
         // 3. Combine: sharp (tex0) + blurred (tex1) + depth (tex2) → h_scene_dof.
         self.beginOffscreenPass(DofCtx.h_scene_dof, .{ 0, 0, 0, 1 }, clear_flag_color);
         self.drawFullscreenQuad(DofCtx.sh_dof, PostCtx.h_scene_hdr, DofCtx.h_dof_b, PrepassCtx.h_gbuffer, @truncate(@intFromPtr(&ctx.p_dof)), 4);
+        self.endOffscreenPass();
+    }
+
+    // ── Image-quality slice 6: Weighted-Blended OIT API ──────────────
+
+    /// Run the WBOIT passes: transparent geometry → `h_accum` + `h_reveal`, then a
+    /// fullscreen resolve over the opaque scene → `h_scene_oit`. Must be called
+    /// AFTER the scene HDR pass is closed (so `h_scene_hdr` is the opaque scene and
+    /// can be sampled by the resolve) and BEFORE `endPostProcess` reads
+    /// `h_scene_oit` via `PostProcess.scene_src`. On first call (or resize) creates
+    /// the three rgba16f targets (`h_accum`/`h_reveal` WITH depth so the WebGL2
+    /// passes can depth-test against `h_scene_hdr`'s opaque depth via the shared
+    /// canvas depth path, and `h_scene_oit` without); first call only creates the
+    /// shaders. `webgpu` selects the MRT-1-pass vs two-pass structure.
+    ///
+    /// `draws` is the per-object transparent draw list (PER-OBJECT pointers — see
+    /// `OitDraw`). The SAME list is submitted ONCE on WebGPU (MRT) and TWICE on
+    /// WebGL2 (accum pass + reveal pass) — the backend divergence lives here, behind
+    /// a wire-tested structure, so the island just builds the list.
+    pub fn runOit(
+        self: *Encoder,
+        ctx: *OitCtx,
+        webgpu: bool,
+        width: u32,
+        height: u32,
+        draws: []const OitDraw,
+    ) void {
+        ctx.webgpu = webgpu;
+        const resized = width != ctx.last_w or height != ctx.last_h;
+        if (!ctx.created or resized) {
+            if (resized and ctx.created) {
+                self.deleteResource(.render_target, OitCtx.h_accum);
+                self.deleteResource(.render_target, OitCtx.h_reveal);
+                self.deleteResource(.render_target, OitCtx.h_scene_oit);
+            }
+            // accum + reveal carry depth so the WebGL2 fallback can depth-test the
+            // transparent geometry; h_scene_oit is a plain color RT.
+            self.createRenderTarget(OitCtx.h_accum, width, height, .rgba16f, rt_flag_with_depth);
+            self.createRenderTarget(OitCtx.h_reveal, width, height, .rgba16f, rt_flag_with_depth);
+            self.createRenderTarget(OitCtx.h_scene_oit, width, height, .rgba16f, 0);
+            ctx.last_w = width;
+            ctx.last_h = height;
+        }
+        if (!ctx.created) {
+            if (webgpu) {
+                // One MRT shader writes both targets; no separate reveal program.
+                self.createShader(OitCtx.sh_oit, variant_oit, @truncate(@intFromPtr(wgslOit().ptr)), @intCast(wgslOit().len), 0, 0);
+                self.createPostShaderWgsl(OitCtx.sh_oit_resolve, wgslOitResolve());
+            } else {
+                const vs = oitVertexSrc();
+                const fa = oitAccumFragmentSrc();
+                const fr = oitRevealFragmentSrc();
+                self.createShader(OitCtx.sh_oit, variant_oit, @truncate(@intFromPtr(vs.ptr)), @intCast(vs.len), @truncate(@intFromPtr(fa.ptr)), @intCast(fa.len));
+                self.createShader(OitCtx.sh_oit_reveal, variant_oit, @truncate(@intFromPtr(vs.ptr)), @intCast(vs.len), @truncate(@intFromPtr(fr.ptr)), @intCast(fr.len));
+                self.createPostShaderGlsl(OitCtx.sh_oit_resolve, oitResolveFragmentSrc());
+            }
+            ctx.created = true;
+        }
+
+        if (webgpu) {
+            // ── WebGPU: ONE MRT pass fills accum + reveal (per-target blend). ──
+            self.beginMrtPass(OitCtx.h_accum, OitCtx.h_reveal, PostCtx.h_scene_hdr);
+            self.setPipeline(OitCtx.sh_oit, state_blend); // → entry.pipeline = MRT-OIT pipeline
+            for (draws) |d| {
+                self.drawOit(d.vbuf, d.ibuf, d.index_byte_off, d.index_count, d.mvp_ptr, d.mv_ptr, d.color_ptr);
+            }
+            self.endOffscreenPass();
+        } else {
+            // ── WebGL2: TWO single-target passes (no per-attachment blend). ──
+            // Accum pass: clear (0,0,0,0), additive ONE/ONE.
+            self.beginOffscreenPass(OitCtx.h_accum, .{ 0, 0, 0, 0 }, clear_flag_color | clear_flag_depth);
+            self.setPipeline(OitCtx.sh_oit, state_blend_add);
+            for (draws) |d| {
+                self.drawOit(d.vbuf, d.ibuf, d.index_byte_off, d.index_count, d.mvp_ptr, d.mv_ptr, d.color_ptr);
+            }
+            self.endOffscreenPass();
+            // Reveal pass: clear (1,1,1,1), multiplicative ZERO/ONE_MINUS_SRC_COLOR.
+            self.beginOffscreenPass(OitCtx.h_reveal, .{ 1, 1, 1, 1 }, clear_flag_color | clear_flag_depth);
+            self.setPipeline(OitCtx.sh_oit_reveal, state_blend_mult);
+            for (draws) |d| {
+                self.drawOit(d.vbuf, d.ibuf, d.index_byte_off, d.index_count, d.mvp_ptr, d.mv_ptr, d.color_ptr);
+            }
+            self.endOffscreenPass();
+        }
+
+        // ── Resolve (identical both backends): accum + reveal + opaque → h_scene_oit. ──
+        self.beginOffscreenPass(OitCtx.h_scene_oit, .{ 0, 0, 0, 1 }, clear_flag_color);
+        self.drawFullscreenQuad(OitCtx.sh_oit_resolve, OitCtx.h_accum, OitCtx.h_reveal, PostCtx.h_scene_hdr, 0, 0);
         self.endOffscreenPass();
     }
 };
@@ -4990,6 +5359,210 @@ test "runDof emits 2 blur passes + 1 combine" {
     const n2 = collectTags(out2, &tags2);
     try testing.expectEqual(@as(Tag, .begin_offscreen_pass), tags2[0]); // no create_* up front
     _ = n2;
+}
+
+// ── Image-quality slice 6: WBOIT tests ───────────────────────────────
+
+test "variant_oit bit value (1<<17) is free + collision-free" {
+    try testing.expectEqual(@as(u32, 1 << 17), variant_oit);
+    // No overlap with any existing variant bit (the PBR über-shader bits + prepass).
+    try testing.expect(variant_oit & variant_prepass == 0);
+    try testing.expect(variant_oit & variant_post == 0);
+    try testing.expect(variant_oit & variant_pbr == 0);
+    try testing.expect(variant_oit & variant_shadow_point == 0);
+}
+
+test "OIT state-blend bit values do not collide with existing state bits" {
+    try testing.expectEqual(@as(u32, 16), state_blend_add);
+    try testing.expectEqual(@as(u32, 32), state_blend_mult);
+    // distinct from depth(1)/cull_back(2)/blend(4)/cull_front(8) and each other.
+    try testing.expect(state_blend_add & (state_depth_test | state_cull_back | state_blend | state_cull_front) == 0);
+    try testing.expect(state_blend_mult & (state_depth_test | state_cull_back | state_blend | state_cull_front) == 0);
+    try testing.expect(state_blend_add & state_blend_mult == 0);
+}
+
+test "OitCtx handles do not collide with Post/Prepass/Ssao/Ssr/Dof handles" {
+    try testing.expectEqual(@as(u32, 261), OitCtx.h_accum);
+    try testing.expectEqual(@as(u32, 262), OitCtx.h_reveal);
+    try testing.expectEqual(@as(u32, 263), OitCtx.h_scene_oit);
+    try testing.expectEqual(@as(u32, 264), OitCtx.sh_oit);
+    try testing.expectEqual(@as(u32, 265), OitCtx.sh_oit_reveal);
+    try testing.expectEqual(@as(u32, 266), OitCtx.sh_oit_resolve);
+    // Strictly above every prior image-quality handle (DofCtx tops out at 260).
+    try testing.expect(OitCtx.h_accum > DofCtx.sh_dof);
+    try testing.expect(OitCtx.h_accum > SsrCtx.sh_ssr);
+    try testing.expect(OitCtx.h_accum > SsaoCtx.sh_ssao_blur);
+    try testing.expect(OitCtx.h_accum > PrepassCtx.sh_gdebug);
+    try testing.expect(OitCtx.h_accum > PostCtx.sh_fxaa);
+    // The six OIT handles are mutually distinct + contiguous.
+    try testing.expectEqual(@as(u32, 266 - 261 + 1), 6);
+}
+
+test "OIT shader content (both backends) — identical weight + resolve math" {
+    // GLSL geometry: shared vertex (view depth), accum/reveal fragment twins.
+    const ov = oitVertexSrc();
+    try testing.expect(std.mem.indexOf(u8, ov, "v_view_depth = -(u_mv * vec4(a_pos, 1.0)).z") != null);
+    const oa = oitAccumFragmentSrc();
+    // The exact McGuire weight formula (frozen string).
+    try testing.expect(std.mem.indexOf(u8, oa, "pow(min(1.0, a * 10.0) + 0.01, 3.0) * 1e8 * pow(1.0 - d * 0.9, 3.0)") != null);
+    try testing.expect(std.mem.indexOf(u8, oa, "v_view_depth / 100.0") != null);
+    try testing.expect(std.mem.indexOf(u8, oa, "vec4(u_oit_color.rgb * a, a) * w") != null);
+    const orv = oitRevealFragmentSrc();
+    try testing.expect(std.mem.indexOf(u8, orv, "o_reveal = vec4(u_oit_color.a)") != null);
+    const ores = oitResolveFragmentSrc();
+    try testing.expect(std.mem.indexOf(u8, ores, "accum.rgb / max(accum.a, 1e-5)") != null);
+    try testing.expect(std.mem.indexOf(u8, ores, "avg * (1.0 - reveal) + opaque * reveal") != null);
+
+    // WGSL geometry: MRT (FsOut with @location(0) accum + @location(1) reveal),
+    // byte-identical weight, threads view_depth as the fs_main param.
+    const ww = wgslOit();
+    try testing.expect(std.mem.indexOf(u8, ww, "@location(0) accum: vec4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, ww, "@location(1) reveal: vec4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, ww, "pow(min(1.0, a * 10.0) + 0.01, 3.0) * 1e8 * pow(1.0 - d * 0.9, 3.0)") != null);
+    try testing.expect(std.mem.indexOf(u8, ww, "view_depth / 100.0") != null);
+    try testing.expect(std.mem.indexOf(u8, ww, "fn fs_main(@location(0) view_depth: f32) -> FsOut") != null);
+    // WGSL resolve: textureSampleLevel (never bare textureSample), same composite.
+    const wr = wgslOitResolve();
+    try testing.expect(std.mem.indexOf(u8, wr, "accum.rgb / max(accum.a, 1e-5)") != null);
+    try testing.expect(std.mem.indexOf(u8, wr, "avg * (1.0 - reveal) + opaque * reveal") != null);
+    try testing.expect(std.mem.indexOf(u8, wr, "textureSampleLevel(tex0, samp, uv, 0.0)") != null);
+    try testing.expect(std.mem.indexOf(u8, wr, "textureSample(") == null); // never bare
+}
+
+test "golden: OIT shader sources frozen (FNV-1a-64)" {
+    try testing.expectEqual(@as(u64, 0xd1361f6ee14770d3), fnv64(oitVertexSrc()));
+    try testing.expectEqual(@as(u64, 0x18b4d245c2daf1da), fnv64(oitAccumFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xdefe5d87f3ed54aa), fnv64(oitRevealFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xf700fa5e9a65b15e), fnv64(oitResolveFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0x8a0704bc93d3b602), fnv64(wgslOit()));
+    try testing.expectEqual(@as(u64, 0x58fc879f0920889c), fnv64(wgslOitResolve()));
+}
+
+test "golden: draw_oit + begin_mrt_pass wire records" {
+    var buf: [128]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.beginMrtPass(261, 262, 240);
+    enc.drawOit(1, 2, 12, 36, 0x3000, 0x3100, 0x3200);
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // BEGIN_MRT_PASS 4 + 12 = 16 ; DRAW_OIT 4 + 28 = 32 ; total 48 = 0x30.
+    try testing.expectEqualStrings(
+        "30000000" ++ // length header: 48 record bytes
+            // BEGIN_MRT_PASS (tag 40 = 0x28) accum=261 reveal=262 depth_src=240
+            "2800" ++ "0c00" ++ "05010000" ++ "06010000" ++ "f0000000" ++
+            // DRAW_OIT (tag 41 = 0x29) vbuf=1 ibuf=2 off=12 count=36 mvp=0x3000 mv=0x3100 color=0x3200
+            "2900" ++ "1c00" ++ "01000000" ++ "02000000" ++ "0c000000" ++ "24000000" ++ "00300000" ++ "00310000" ++ "00320000",
+        hex,
+    );
+}
+
+test "runOit WebGPU emits 1 MRT pass + resolve (per-target blend)" {
+    var buf: [1024]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = OitCtx{};
+    const draws = [_]OitDraw{
+        .{ .vbuf = 1, .ibuf = 2, .index_byte_off = 0, .index_count = 36, .mvp_ptr = 0x100, .mv_ptr = 0x200, .color_ptr = 0x300 },
+        .{ .vbuf = 1, .ibuf = 2, .index_byte_off = 0, .index_count = 36, .mvp_ptr = 0x400, .mv_ptr = 0x500, .color_ptr = 0x600 },
+    };
+    enc.runOit(&ctx, true, 800, 600, &draws);
+    const out = enc.finish();
+    var tags: [32]Tag = undefined;
+    const n = collectTags(out, &tags);
+    // First call: 3 create_render_target + 2 create_shader (MRT geom + resolve),
+    // then ONE MRT pass (begin_mrt_pass + set_pipeline + 2× draw_oit + end), then
+    // resolve (begin_offscreen_pass + draw_fullscreen_quad + end).
+    try expectContainsInOrder(tags[0..n], n, &.{
+        .create_render_target, .create_render_target, .create_render_target,
+        .create_shader,        .create_shader,        .begin_mrt_pass,
+        .set_pipeline,         .draw_oit,             .draw_oit,
+        .end_offscreen_pass,   .begin_offscreen_pass, .draw_fullscreen_quad,
+        .end_offscreen_pass,
+    });
+    // Exactly ONE begin_mrt_pass (single MRT pass) and TWO draw_oit (no replay).
+    var mrt: usize = 0;
+    var doit: usize = 0;
+    for (tags[0..n]) |t| {
+        if (t == .begin_mrt_pass) mrt += 1;
+        if (t == .draw_oit) doit += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), mrt);
+    try testing.expectEqual(@as(usize, 2), doit);
+
+    // Second call (no resize) re-emits NEITHER create — guard works.
+    var enc2 = Encoder.init(&buf);
+    enc2.runOit(&ctx, true, 800, 600, &draws);
+    const out2 = enc2.finish();
+    var tags2: [32]Tag = undefined;
+    const n2 = collectTags(out2, &tags2);
+    try testing.expectEqual(@as(Tag, .begin_mrt_pass), tags2[0]); // no create_* up front
+    _ = n2;
+}
+
+test "runOit WebGL2 emits 2 single-target passes + resolve (geometry replayed)" {
+    var buf: [1024]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = OitCtx{};
+    const draws = [_]OitDraw{
+        .{ .vbuf = 1, .ibuf = 2, .index_byte_off = 0, .index_count = 36, .mvp_ptr = 0x100, .mv_ptr = 0x200, .color_ptr = 0x300 },
+    };
+    enc.runOit(&ctx, false, 800, 600, &draws);
+    const out = enc.finish();
+    var tags: [32]Tag = undefined;
+    const n = collectTags(out, &tags);
+    // First call: 3 create_render_target + 3 create_shader (accum geom + reveal
+    // geom + resolve), then accum pass (begin/set_pipeline/draw/end), reveal pass
+    // (begin/set_pipeline/draw/end), resolve (begin/draw_fullscreen_quad/end).
+    try expectContainsInOrder(tags[0..n], n, &.{
+        .create_render_target, .create_render_target, .create_render_target,
+        .create_shader,        .create_shader,        .create_shader,
+        .begin_offscreen_pass, .set_pipeline, .draw_oit, .end_offscreen_pass, // accum
+        .begin_offscreen_pass, .set_pipeline, .draw_oit, .end_offscreen_pass, // reveal
+        .begin_offscreen_pass, .draw_fullscreen_quad, .end_offscreen_pass, // resolve
+    });
+    // NO begin_mrt_pass on WebGL2; geometry replayed (2 draw_oit for 1 object).
+    var mrt: usize = 0;
+    var doit: usize = 0;
+    for (tags[0..n]) |t| {
+        if (t == .begin_mrt_pass) mrt += 1;
+        if (t == .draw_oit) doit += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), mrt);
+    try testing.expectEqual(@as(usize, 2), doit);
+
+    // Verify the two geometry passes use the add/mult blend state + correct shaders,
+    // and the resolve reads accum(tex0)+reveal(tex1)+opaque h_scene_hdr(tex2).
+    var off2: usize = 4;
+    var sp_idx: usize = 0;
+    while (off2 < 4 + readU32(out, 0)) {
+        const tag = readU16(out, off2);
+        const sz = readU16(out, off2 + 2);
+        if (tag == @intFromEnum(Tag.set_pipeline)) {
+            const shader = readU32(out, off2 + 4);
+            const state = readU32(out, off2 + 8);
+            switch (sp_idx) {
+                0 => {
+                    try testing.expectEqual(@as(u32, OitCtx.sh_oit), shader);
+                    try testing.expectEqual(@as(u32, state_blend_add), state);
+                },
+                1 => {
+                    try testing.expectEqual(@as(u32, OitCtx.sh_oit_reveal), shader);
+                    try testing.expectEqual(@as(u32, state_blend_mult), state);
+                },
+                else => {},
+            }
+            sp_idx += 1;
+        }
+        if (tag == @intFromEnum(Tag.draw_fullscreen_quad)) {
+            try testing.expectEqual(@as(u32, OitCtx.sh_oit_resolve), readU32(out, off2 + 4));
+            try testing.expectEqual(@as(u32, OitCtx.h_accum), readU32(out, off2 + 8)); // tex0
+            try testing.expectEqual(@as(u32, OitCtx.h_reveal), readU32(out, off2 + 12)); // tex1
+            try testing.expectEqual(@as(u32, PostCtx.h_scene_hdr), readU32(out, off2 + 16)); // tex2 opaque
+            try testing.expectEqual(@as(u32, 0), readU32(out, off2 + 24)); // param count
+        }
+        off2 += 4 + sz;
+    }
+    try testing.expectEqual(@as(usize, 2), sp_idx);
 }
 
 test "prepass + gdebug shader content (both backends)" {

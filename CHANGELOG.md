@@ -4,6 +4,52 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.17.0] - 2026-06-25
+
+### Added
+
+- **gl Weighted-Blended OIT — order-independent transparency (image-quality
+  slice 6, the FINAL slice)** (`src/core/gl/command.zig`, `src/bridge/verve.js`,
+  `src/client/islands/GlOit.zig`, `src/app/{islands,routes,components}.zig`):
+  the engine's **first multi-target (MRT) output**. Transparent geometry is
+  rendered ONCE with no depth sort into two rgba16f buffers — an **additive**
+  accumulation buffer (`accum += vec4(color·alpha, alpha)·weight`, blend ONE/ONE)
+  and a **multiplicative** revealage buffer (`reveal ·= 1−alpha`, blend
+  ZERO/ONE_MINUS_SRC, cleared to 1.0) — then a fullscreen resolve composites them
+  over the opaque scene: `avg = accum.rgb/max(accum.a, 1e-5); out = avg·(1−reveal)
+  + opaque·reveal`. The blend is **order-independent** (rotating the camera does
+  not change it). Depth-based weight (McGuire eq.10 variant, **identical both
+  backends**): `w = clamp(pow(min(1, a·10)+0.01, 3)·1e8·pow(1 − d·0.9, 3), 1e-2,
+  3e3)` with `d = clamp(viewDepth/100, 0, 1)`.
+  - New `OitCtx` (`h_accum=261`, `h_reveal=262`, `h_scene_oit=263`, `sh_oit=264`,
+    `sh_oit_reveal=265`, `sh_oit_resolve=266`), `variant_oit=1<<17`, wire tags
+    `begin_mrt_pass=40` + `draw_oit=41`, WebGL2 global-blend state flags
+    `state_blend_add=1<<4` / `state_blend_mult=1<<5`, and `Encoder.runOit(ctx,
+    webgpu, w, h, draws)` (draws = a PER-OBJECT `OitDraw` list).
+  - **WebGPU↔WebGL2 backend divergence (handled, not discovered in CDP):** accum
+    needs additive blend, revealage needs multiply blend — DIFFERENT blend per
+    target. **WebGPU** does this natively in ONE MRT pass (a 2-target pipeline
+    with per-target blend, depth-write off, sharing the opaque scene depth
+    read-only via `begin_mrt_pass`). **WebGL2 (GLES 3.0)** has no per-draw-buffer
+    separate blend in core (the indexed-blend extension is not universal), so it
+    uses the robust fallback: **two separate single-target passes** over the same
+    geometry (accum pass, global ONE/ONE; reveal pass, global
+    ZERO/ONE_MINUS_SRC_COLOR). `runOit` emits the right structure per backend; the
+    RESOLVE and the weight/blend MATH are identical, so both produce the same image.
+  - **Scene-source parameterization:** reuses `PostProcess.scene_src` (default `0`
+    → `h_scene_hdr=240`). The OIT island sets it to `h_scene_oit` when WBOIT is on;
+    leaving it `0` is byte-for-byte the old behavior, so `/gl-post`, `/gl-tonemap`,
+    `/gl-ssao`, `/gl-ssr`, and `/gl-dof` are unchanged (goldens frozen).
+  - New `/gl-oit` demo + `GlOit` island: opaque cube backdrop + 5 overlapping
+    translucent quads (alpha 0.5, distinct colors). Per-object mvp/mv/color arrays
+    (`[N][..]f32`). `gloit_toggle` (WBOIT on/off — off = naive order-dependent
+    alpha-over, for contrast) / `gloit_freeze`. WebGPU when available, else WebGL2.
+  - Tests: variant_oit bit value + collision, OitCtx handle collision, state-blend
+    bit collision, both-backend shader content (identical weight + resolve math),
+    6 FNV-1a-64 shader goldens, `draw_oit`/`begin_mrt_pass` wire-record golden, and
+    `runOit` emit-order tests for BOTH backends (1 MRT pass vs 2 single-target
+    passes + resolve). Suite **976 → 984** (`zig build test --summary all`).
+
 ## [0.16.0] - 2026-06-24
 
 ### Added

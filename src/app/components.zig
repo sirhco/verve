@@ -1350,6 +1350,54 @@ pub fn glDof(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl Weighted-Blended OIT demo — /gl-oit (image-quality slice 6, FINAL).
+/// An opaque backdrop of lit cubes plus several overlapping translucent quads
+/// (alpha ~0.5) at varying depth. WBOIT accumulates every transparent fragment
+/// with NO depth sort into an additive accum buffer + a multiplicative revealage
+/// buffer, then a fullscreen resolve composites them over the opaque scene. The
+/// result is order-INDEPENDENT — rotating the camera does not change the blend.
+/// Toggle WBOIT compares the order-independent blend with naive alpha-over (which
+/// pops as the draw order vs camera order diverges); Freeze pins the orbit.
+/// WebGPU fills both buffers in one MRT pass; WebGL2 in two single-target passes.
+pub fn glOit(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "gloit-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#0a0b0f;border-radius:8px;"),
+    });
+
+    // Controls wired to the GlOit chunk's no-arg exports via z-on-click.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "gloit_toggle").text("Toggle WBOIT"),
+        ctx.el("button").attr("z-on-click", "gloit_freeze").text("Freeze"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Overlapping translucent layers — order-independent transparency"),
+        canvas,
+        controls,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlOit" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — Weighted-Blended OIT"),
+        ctx.p().text("An opaque backdrop of lit cubes plus several overlapping translucent " ++
+            "quads (alpha ~0.5) at varying depth. Weighted-Blended OIT renders the transparent " ++
+            "geometry ONCE with no depth sort into two buffers — an additive accumulation buffer " ++
+            "(accum += vec4(color·alpha, alpha)·weight) and a multiplicative revealage buffer " ++
+            "(reveal ·= 1−alpha) — then a fullscreen resolve composites them over the opaque " ++
+            "scene: avg = accum.rgb/max(accum.a, 1e-5); out = avg·(1−reveal) + opaque·reveal. " ++
+            "The blend is ORDER-INDEPENDENT: rotate the camera and the overlap stays stable. " ++
+            "Toggle WBOIT switches to naive alpha-over blending, which pops and flickers as the " ++
+            "draw order diverges from the camera order. WebGPU fills both buffers in a single " ++
+            "MRT pass with per-target blend; WebGL2 (no per-attachment blend) replays the " ++
+            "geometry in two single-target passes — same resolve, same image."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a

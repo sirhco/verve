@@ -5446,6 +5446,14 @@
             // sh.mvp ("u_mvp") is already resolved above; cache the second matrix.
             sh.mv = gl.getUniformLocation(prog, "u_mv");
           }
+          if (variant & 0x20000) { // variant_oit (1<<17): WBOIT transparent geometry — mvp + mv + color
+            // sh.mvp ("u_mvp") resolved above. Two single-out GLSL programs share
+            // this layout (accum-out / reveal-out); the fragment differs, the
+            // uniforms do not. WebGL2 has no per-attachment blend, so the engine
+            // replays the geometry once per single-target pass.
+            sh.mv = gl.getUniformLocation(prog, "u_mv");
+            sh.oitColor = gl.getUniformLocation(prog, "u_oit_color");
+          }
           if (variant & 0x1000) { // variant_instanced: u_vp replaces u_mvp/u_model
             sh.vp = gl.getUniformLocation(prog, "u_vp");
           }
@@ -5487,7 +5495,16 @@
             gl.enable(gl.CULL_FACE);
             gl.cullFace(gl.BACK);
           } else gl.disable(gl.CULL_FACE);
-          if (state & 4) { // state_blend: src-alpha over; depth-write off
+          if (state & 16) { // state_blend_add: WBOIT accum (additive ONE/ONE); depth-write off
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.ONE, gl.ONE);
+            gl.depthMask(false);
+          } else if (state & 32) { // state_blend_mult: WBOIT revealage (dst *= 1-alpha); depth-write off
+            // reveal pass outputs vec4(alpha); ZERO/ONE_MINUS_SRC_COLOR → dst*(1-alpha) per channel.
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_COLOR);
+            gl.depthMask(false);
+          } else if (state & 4) { // state_blend: src-alpha over; depth-write off
             gl.enable(gl.BLEND);
             gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
             gl.depthMask(false);
@@ -6111,6 +6128,44 @@
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
           break;
         }
+        case 40: { // BEGIN_MRT_PASS — WebGPU MRT pass; WebGL2 fallback uses two single-target
+          // passes (already emitted by runOit), so this is a no-op here.
+          break;
+        }
+        case 41: { // DRAW_OIT — WBOIT transparent geometry (image-quality slice 6).
+          // Payload (28B): vbuf | ibuf | idx_byte_off | count | mvp_ptr | mv_ptr | color_ptr.
+          // The active program is the OIT geometry shader (variant_oit, set by the
+          // preceding SET_PIPELINE — sh_oit accum-out or sh_oit_reveal reveal-out).
+          // Uploads u_mvp + u_mv + u_oit_color, then draws over a pos-only VAO.
+          const vh = dv.getUint32(off, true);
+          const ih = dv.getUint32(off + 4, true);
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const mvpPtr = dv.getUint32(off + 16, true);
+          const mvPtr = dv.getUint32(off + 20, true);
+          const colorPtr = dv.getUint32(off + 24, true);
+          const vb = st.buffers[vh];
+          const ib = st.buffers[ih];
+          if (!vb || !ib || !st.active) break;
+          if (st.active.mvp) gl.uniformMatrix4fv(st.active.mvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
+          if (st.active.mv) gl.uniformMatrix4fv(st.active.mv, false, new Float32Array(memory.buffer, mvPtr, 16));
+          if (st.active.oitColor) gl.uniform4fv(st.active.oitColor, new Float32Array(memory.buffer, colorPtr, 4));
+          // Dedicated pos-only VAO keyed "oit" (stride 48, pos loc0 @0) — never collides.
+          const oitKey = `${vh}:${ih}:oit`;
+          let oitVao = st.vaos.get(oitKey);
+          if (!oitVao) {
+            oitVao = gl.createVertexArray();
+            gl.bindVertexArray(oitVao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0); // pos
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
+            st.vaos.set(oitKey, oitVao);
+          }
+          gl.bindVertexArray(oitVao);
+          gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
         case 28: { // SET_FOG — set fog uniforms on the active program (per-program; follows SET_PIPELINE)
           const ptr = dv.getUint32(off, true);
           const f = new Float32Array(memory.buffer, ptr, 8);
@@ -6626,6 +6681,26 @@
     }
     return st.prepassUniform;
   };
+  // Lazily create the WBOIT geometry uniform (per draw: mvp 64B + mv 64B +
+  // color vec4 16B = 144B, padded to the DEPTH_STRIDE 256B dynamic-offset slot)
+  // + its bind group against the OIT MRT pipeline's dynamic-offset layout.
+  // Reused across frames; dropped on device loss. (image-quality slice 6)
+  const gpuEnsureOitUniform = (st, oitPipe) => {
+    if (!st.oitUniform) {
+      st.oitUniform = st.device.createBuffer({
+        size: DEPTH_STRIDE * MAX_DRAWS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    if (!st.oitBindGroup && oitPipe) {
+      st.oitBindGroup = st.device.createBindGroup({
+        layout: oitPipe.bgl0,
+        // size = mvp(64) + mv(64) + color(16) = 144B; dynamic offset selects the slot.
+        entries: [{ binding: 0, resource: { buffer: st.oitUniform, offset: 0, size: 144 } }],
+      });
+    }
+    return st.oitUniform;
+  };
   // Lazily create the depth-at uniform (per draw: mvp 64B + material 48B = 112B,
   // padded to the DEPTH_STRIDE 256B dynamic-offset slot). The bind group is built
   // per draw_depth_at (binding 1 = base texture view varies), so only the buffer
@@ -6874,6 +6949,65 @@
               },
             });
             st.pipelines[handle] = { pipeline, bgl0, kind: "prepass" };
+            break;
+          }
+          // variant_oit = 1 << 17 (0x20000) — Weighted-Blended OIT transparent
+          // geometry. The engine's first MULTI-target output: TWO color targets
+          // (accum rgba16float ONE/ONE additive; reveal rgba16float ZERO/ONE_MINUS_SRC
+          // multiplicative), per-target blend baked here, depth-write OFF (the pass
+          // shares the opaque scene depth read-only). Standalone pos-only vertex over
+          // the stride-48 PBR layout + a 144B group(0) UBO {mvp@0, mv@64, color@128}.
+          // The WGSL fs_main returns @location(0) accum + @location(1) reveal. WebGL2
+          // cannot do per-attachment blend, so it uses two single-target passes
+          // instead — this MRT pipeline is the WebGPU-only fast path.
+          if ((variant & 0x20000) !== 0) {
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform", hasDynamicOffset: true },
+              }],
+            });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
+            const pipeline = device.createRenderPipeline({
+              layout,
+              vertex: {
+                module,
+                entryPoint: "vs_main",
+                buffers: [{
+                  arrayStride: 48, // PBR layout: pos @0 (loc0); normal/uv ignored.
+                  attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
+                }],
+              },
+              fragment: {
+                module,
+                entryPoint: "fs_main",
+                targets: [
+                  { // @location(0) accum — additive ONE/ONE.
+                    format: "rgba16float",
+                    blend: {
+                      color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+                      alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+                    },
+                  },
+                  { // @location(1) reveal — multiplicative dst*(1-src).
+                    format: "rgba16float",
+                    blend: {
+                      color: { srcFactor: "zero", dstFactor: "one-minus-src", operation: "add" },
+                      alpha: { srcFactor: "zero", dstFactor: "one-minus-src", operation: "add" },
+                    },
+                  },
+                ],
+              },
+              primitive: { topology: "triangle-list", cullMode: "none" },
+              // Depth-TEST against the opaque scene depth, depth-WRITE off.
+              depthStencil: {
+                format: "depth24plus",
+                depthWriteEnabled: false,
+                depthCompare: "less",
+              },
+            });
+            st.pipelines[handle] = { pipeline, bgl0, kind: "oit" };
             break;
           }
           // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
@@ -7995,6 +8129,66 @@
           if (st.pass) { st.pass.end(); st.pass = null; }
           break;
         }
+        case 40: { // BEGIN_MRT_PASS — WBOIT MRT pass (image-quality slice 6, WebGPU only).
+          // Payload (12B): accum_handle | reveal_handle | depth_src_handle.
+          // Opens a render pass with TWO color attachments — accum (cleared 0,0,0,0,
+          // additive) + reveal (cleared 1,1,1,1, multiplicative) — sharing the
+          // OPAQUE scene depth of depth_src (h_scene_hdr) READ-ONLY (depthLoadOp
+          // "load"; the OIT pipeline has depthWriteEnabled false). Per-target blend
+          // is baked into the OIT pipeline (kind "oit").
+          const accum = st.renderTargets[dv.getUint32(off, true)];
+          const reveal = st.renderTargets[dv.getUint32(off + 4, true)];
+          const depthSrc = st.renderTargets[dv.getUint32(off + 8, true)];
+          if (!accum || !reveal) break;
+          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; st.prepassSlot = 0; }
+          // The opaque depth lives on depth_src (h_scene_hdr, created WITH depth);
+          // fall back to accum's own depth if the source lacks one.
+          const oitDepthView = (depthSrc && depthSrc.depthView) ? depthSrc.depthView : accum.depthView;
+          st.pass = st.encoder.beginRenderPass({
+            colorAttachments: [
+              { view: accum.view, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+              { view: reveal.view, clearValue: { r: 1, g: 1, b: 1, a: 1 }, loadOp: "clear", storeOp: "store" },
+            ],
+            depthStencilAttachment: oitDepthView ? {
+              view: oitDepthView,
+              // Read-only: do NOT clear, do NOT write. depthWriteEnabled is false
+              // in the OIT pipeline, so "store" leaves the opaque depth intact.
+              depthLoadOp: "load",
+              depthStoreOp: "store",
+            } : undefined,
+          });
+          st.curTargetFormat = accum.format;
+          st.curPassHasDepth = !!oitDepthView;
+          st.active = null; // force pipeline re-bind (SET_PIPELINE selects the OIT pipe)
+          st.oitSlot = 0; // reset per-pass dynamic-offset slot counter
+          break;
+        }
+        case 41: { // DRAW_OIT — WBOIT transparent geometry into the MRT pass (slice 6).
+          // Payload (28B): vbuf | ibuf | idx_byte_off | count | mvp_ptr | mv_ptr | color_ptr.
+          // Writes {mvp@0, mv@64, color@128} into a 144B dynamic-offset slot; one
+          // draw fills BOTH targets (the fs returns accum @0 + reveal @1).
+          const vb = st.buffers[dv.getUint32(off, true)];
+          const ib = st.buffers[dv.getUint32(off + 4, true)];
+          const byteOff = dv.getUint32(off + 8, true);
+          const count = dv.getUint32(off + 12, true);
+          const mvpPtr = dv.getUint32(off + 16, true);
+          const mvPtr = dv.getUint32(off + 20, true);
+          const colorPtr = dv.getUint32(off + 24, true);
+          if (!vb || !ib || !st.pass || !st.active || st.active.kind !== "oit") break;
+          const oslot = (st.oitSlot = (st.oitSlot || 0) + 1) - 1;
+          if (oslot >= MAX_DRAWS) break; // per-frame draw cap
+          const obase = oslot * DEPTH_STRIDE;
+          const ubuf = gpuEnsureOitUniform(st, st.active);
+          device.queue.writeBuffer(ubuf, obase, new Float32Array(memory.buffer, mvpPtr, 16)); // mvp @0
+          device.queue.writeBuffer(ubuf, obase + 64, new Float32Array(memory.buffer, mvPtr, 16)); // mv @64
+          device.queue.writeBuffer(ubuf, obase + 128, new Float32Array(memory.buffer, colorPtr, 4)); // color @128
+          st.pass.setPipeline(st.active.pipeline);
+          st.pass.setVertexBuffer(0, vb.buf);
+          st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
+          st.pass.setBindGroup(0, st.oitBindGroup, [obase]);
+          st.pass.drawIndexed(count);
+          break;
+        }
         case 25: { // DRAW_FULLSCREEN_QUAD — post effect into the current pass.
           // Payload (24B): shader | tex0 | tex1 | tex2 | params_ptr | param_count.
           const shHandle = dv.getUint32(off, true);
@@ -8760,6 +8954,8 @@
       // Multi-caster: pointShadowBuf (dead bg0 binding 5) removed — nothing to destroy.
       st.morphTexView = null;
       st.pbrUniform = null;
+      st.oitUniform = null; // slice-6 WBOIT geometry UBO
+      st.oitBindGroup = null;
       st.bonesBuf = null;
       st.uniformBuf = null; // slice-1 basic-draw path's persistent buffer
       st.bindGroup = null;

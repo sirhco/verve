@@ -255,3 +255,19 @@ pub const GlSsr = struct {
 pub const GlDof = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// verve.gl Weighted-Blended OIT demo (/gl-oit, image-quality slice 6, the FINAL
+/// slice). Renders an opaque backdrop (lit cubes) + several overlapping translucent
+/// quads (alpha ~0.5) at varying depth. WBOIT accumulates every transparent
+/// fragment with NO depth sort into an additive accum buffer + a multiplicative
+/// revealage buffer (the engine's first MULTI-target output), then a fullscreen
+/// resolve composites them over the opaque scene → `h_scene_oit`, read by the
+/// composite via `PostProcess.scene_src`. Order-INDEPENDENT: rotating the camera
+/// does not change the blend. WebGPU fills both targets in ONE MRT pass; WebGL2
+/// (no per-attachment blend) replays geometry in TWO single-target passes — same
+/// resolve, same image. Controls wire to `gloit_toggle` (WBOIT on/off; off = naive
+/// order-dependent alpha-over) / `gloit_freeze`. Emits `<canvas data-ref="gloit-canvas">`.
+/// Source: `src/client/islands/GlOit.zig`.
+pub const GlOit = struct {
+    pub const props_schema: []const u8 = "{}";
+};

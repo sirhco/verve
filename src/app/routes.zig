@@ -38,6 +38,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/gl-ssao", renderGlSsao),
     verve.Route.init("/gl-ssr", renderGlSsr),
     verve.Route.init("/gl-dof", renderGlDof),
+    verve.Route.init("/gl-oit", renderGlOit),
     verve.Route.init("/push-multi", renderPushMulti),
     verve.Route.init("/todos", renderTodos),
     verve.Route.init("/work/:slug", renderWorkDetail),
@@ -200,6 +201,11 @@ fn renderGlSsr(ctx: *verve.Context) !*verve.Node {
 
 fn renderGlDof(ctx: *verve.Context) !*verve.Node {
     const body = try components.glDof(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderGlOit(ctx: *verve.Context) !*verve.Node {
+    const body = try components.glOit(ctx);
     return components.page(ctx, body);
 }
 
