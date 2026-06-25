@@ -4,6 +4,39 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.18.0] - 2026-06-25
+
+### Added
+
+- **gl Geometry/Animation (three.js parity) + LOD — five features**
+  (`src/core/gl/{vmesh,gltf,command,fixture}.zig`, `src/bridge/verve.js`,
+  `src/client/islands/{GlScene,GlSkinMorph}.zig`,
+  `src/app/{islands,routes,components}.zig`, `tools/gen_{skinmorph,lod}_glb.zig`):
+  - **Cubic Hermite easing of morph weights** — morph weight tracks now play
+    CUBICSPLINE (glTF Hermite) interpolation, matching skeletal clips. Fixes
+    `Reader.morphWeightValue` to read the keyframe POINT for CUBICSPLINE (was
+    returning the in-tangent) + adds `morphWeightInTangent`/`morphWeightOutTangent`.
+  - **>8 active morph influences (cap 8 → 32)** — morph weight UBO widened to
+    `array<vec4,8>` / `u_morph_idx[32]` (272-byte UBO, idx@0/wt@128/count@256),
+    GlScene active-set `[32]`, both backends. `/gl-morph16` demo drives 16
+    simultaneous targets.
+  - **Combined skinned+morph variant** — removes the `variant_morph +
+    variant_skinned` `@compileError`; morph deltas apply to local pos/normal
+    FIRST, then the skin matrix (glTF order), both GLSL + WGSL. New `GlSkinMorph`
+    island + `/gl-skin-morph` demo. 4 frozen morph-VS golden hashes.
+  - **Morph TANGENT deltas (vmesh v13 → v14)** — morph delta record 6 → 9 f16
+    (pos+nrm+**tan**); version-aware `morphRecordF16(ver)` keeps v13 readable;
+    morph data texture grows to 3 rows/target; shaders accumulate `m_tan` and
+    feed the normal-map TBN; glTF morph TANGENT accessor parsed (zero-filled when
+    absent). Goldens refrozen.
+  - **Distance-based LOD (vmesh v14 → v15)** — a single `.vmesh` packs N LOD
+    levels (contiguous submesh runs + **squared** distance thresholds);
+    `headerSize(ver)` makes the submesh-table offset version-aware (88/100). The
+    runtime picks the active level per object by camera distance and narrows the
+    opaque, transparent, AND shadow draw loops to that level. glTF `_lodN`
+    mesh-name grouping; `glscene_lod_stats` HUD (cull-HUD pattern). `/gl-lod`
+    demo (3-level UV sphere; HUD shows LOD 0→2 as you zoom).
+
 ## [0.17.0] - 2026-06-25
 
 ### Added
