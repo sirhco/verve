@@ -183,7 +183,7 @@ export fn glpost_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // Debug blit: gdebug fullscreen → canvas. params.x = mode (0 normals, 1 depth).
         gdebug_params[0] = gbuffer_mode;
         enc.beginFrame(.{ 0, 0, 0, 1 }, width, height);
-        enc.drawFullscreenQuad(C.PrepassCtx.sh_gdebug, C.PrepassCtx.h_gbuffer, 0, @intCast(@intFromPtr(&gdebug_params)), 1);
+        enc.drawFullscreenQuad(C.PrepassCtx.sh_gdebug, C.PrepassCtx.h_gbuffer, 0, 0, @intCast(@intFromPtr(&gdebug_params)), 1);
         enc.endFrame();
 
         _ = enc.finish();

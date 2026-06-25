@@ -47,7 +47,7 @@ pub const Tag = enum(u16) {
     create_render_target = 22, // {handle, width, height, format, flags(bit0=with_depth)} — color RT (+optional depth)
     begin_offscreen_pass = 23, // {target_handle, clear_rgba(4 f32), clear_flags(bit0=color,bit1=depth)} — bind RT
     end_offscreen_pass = 24, // {} — close the offscreen pass; next begin_* rebinds
-    draw_fullscreen_quad = 25, // {shader, tex0, tex1, params_ptr, param_count} — VBO-less 3-vert triangle
+    draw_fullscreen_quad = 25, // {shader, tex0, tex1, tex2, params_ptr, param_count} — VBO-less 3-vert triangle (tex2 = SSAO/SSR input; 0 → white dummy)
     draw_depth_at = 26, // {shader, vbuf, ibuf, index_byte_off, index_count, mvp_ptr, material_ptr} — alpha-tested depth draw (MASK shadows)
     draw_pbr_instanced = 27, // {vbuf, ibuf, off, count, instance_ptr, instance_count, vp_ptr, material_ptr, camera_ptr}
     set_fog = 28, // {ptr -> 8 f32 FogParams}
@@ -1157,6 +1157,7 @@ pub const compositeFragmentSrc: []const u8 =
     \\out vec4 frag;
     \\uniform sampler2D u_tex0;      // scene HDR
     \\uniform sampler2D u_tex1;      // bloom
+    \\uniform sampler2D u_tex2;      // SSAO blur (.r); white dummy when unbound (slice 3)
     \\uniform float u_intensity;     // bloom intensity   (p_comp[0])
     \\uniform float u_tonemap;       // operator index    (p_comp[1])
     \\uniform float u_vig_intensity; // vignette strength (p_comp[2])
@@ -1203,7 +1204,10 @@ pub const compositeFragmentSrc: []const u8 =
     \\  return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
     \\}
     \\void main() {
-    \\  vec3 hdr = texture(u_tex0, v_uv).rgb + u_intensity * texture(u_tex1, v_uv).rgb;
+    \\  // slice 3: AO (u_tex2.r) multiplies the scene term before bloom. u_tex2 = a
+    \\  // 1×1 white texture (1.0) when SSAO is not bound, so /gl-post is unaffected.
+    \\  float ao = texture(u_tex2, v_uv).r;
+    \\  vec3 hdr = texture(u_tex0, v_uv).rgb * ao + u_intensity * texture(u_tex1, v_uv).rgb;
     \\  int op = int(u_tonemap + 0.5);
     \\  vec3 rgb;
     \\  if (op == 0) {
@@ -1253,6 +1257,87 @@ pub const fxaaFragmentSrc: []const u8 =
     \\  vec3 a = texture(u_tex0, v_uv + dir * u_texel).rgb;
     \\  vec3 b = texture(u_tex0, v_uv - dir * u_texel).rgb;
     \\  frag = vec4(0.5 * (a + b), 1.0);
+    \\}
+;
+
+// ── Image-quality slice 3: SSAO GLSL twins ──────────────────────────
+// Byte-identical math to wgslSsao/wgslSsaoBlur (same kernel constants, hash,
+// reconstruction, AO formula). Uniforms: u_tex0 = G-buffer; u_ssao_params =
+// (radius, bias, intensity, _); u_inv_proj / u_proj = camera matrices.
+pub const ssaoFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0;       // G-buffer: rgb=n*0.5+0.5, a=-viewZ (>0)
+    \\uniform vec4 u_ssao_params;     // (radius, bias, intensity, _)
+    \\uniform mat4 u_inv_proj;
+    \\uniform mat4 u_proj;
+    \\float hash12(vec2 p) {
+    \\  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+    \\}
+    \\vec3 reconstructView(vec2 uv, float depth) {
+    \\  vec2 ndc = uv * 2.0 - 1.0;
+    \\  vec4 v = u_inv_proj * vec4(ndc, 1.0, 1.0);
+    \\  vec3 viewRay = v.xyz / v.w;           // viewRay.z < 0
+    \\  return viewRay * (depth / -viewRay.z); // result.z == -depth
+    \\}
+    \\void main() {
+    \\  vec4 g = texture(u_tex0, v_uv);
+    \\  float depth = g.a;
+    \\  if (depth <= 0.0) { frag = vec4(1.0); return; }
+    \\  float radius = u_ssao_params.x;
+    \\  float bias = u_ssao_params.y;
+    \\  float intensity = u_ssao_params.z;
+    \\  vec3 n = normalize(g.rgb * 2.0 - 1.0);
+    \\  vec3 viewPos = reconstructView(v_uv, depth);
+    \\  vec3 rnd = vec3(hash12(v_uv) * 2.0 - 1.0, hash12(v_uv + vec2(0.137, 0.219)) * 2.0 - 1.0, 0.0);
+    \\  vec3 tangent = normalize(rnd - n * dot(rnd, n));
+    \\  vec3 bitangent = cross(n, tangent);
+    \\  mat3 tbn = mat3(tangent, bitangent, n);
+    \\  vec3 kernel[16];
+    \\  kernel[0]=vec3( 0.0490,-0.0190, 0.0246); kernel[1]=vec3(-0.0633, 0.0476, 0.0760);
+    \\  kernel[2]=vec3( 0.0210, 0.0964, 0.0479); kernel[3]=vec3(-0.0908,-0.0673, 0.0556);
+    \\  kernel[4]=vec3( 0.1187, 0.0451, 0.0916); kernel[5]=vec3( 0.0349,-0.1438, 0.0639);
+    \\  kernel[6]=vec3(-0.1206, 0.1186, 0.0894); kernel[7]=vec3( 0.1841, 0.0307, 0.0512);
+    \\  kernel[8]=vec3(-0.0420,-0.1798, 0.1696); kernel[9]=vec3(-0.1573, 0.1351, 0.1928);
+    \\  kernel[10]=vec3( 0.2406,-0.0773, 0.1140); kernel[11]=vec3( 0.0521, 0.2659, 0.1604);
+    \\  kernel[12]=vec3(-0.2876,-0.0884, 0.2266); kernel[13]=vec3( 0.1716,-0.2891, 0.2475);
+    \\  kernel[14]=vec3(-0.0683, 0.3878, 0.3293); kernel[15]=vec3( 0.4083, 0.2017, 0.4426);
+    \\  float occlusion = 0.0;
+    \\  for (int i = 0; i < 16; i++) {
+    \\    vec3 sampleView = viewPos + (tbn * kernel[i]) * radius;
+    \\    vec4 sclip = u_proj * vec4(sampleView, 1.0);
+    \\    vec2 suv = (sclip.xy / sclip.w) * 0.5 + 0.5;
+    \\    float sampleDepth = texture(u_tex0, suv).a;
+    \\    float pointDepth = -sampleView.z;
+    \\    float rangeCheck = smoothstep(0.0, 1.0, radius / max(abs(depth - sampleDepth), 1e-4));
+    \\    if (sampleDepth > 0.0 && sampleDepth <= pointDepth - bias) {
+    \\      occlusion += rangeCheck;
+    \\    }
+    \\  }
+    \\  float ao = clamp(1.0 - (occlusion / 16.0) * intensity, 0.0, 1.0);
+    \\  frag = vec4(ao, ao, ao, 1.0);
+    \\}
+;
+
+pub const ssaoBlurFragmentSrc: []const u8 =
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\out vec4 frag;
+    \\uniform sampler2D u_tex0;
+    \\uniform vec2 u_texel;
+    \\void main() {
+    \\  float acc = 0.0;
+    \\  for (int x = -2; x < 2; x++) {
+    \\    for (int y = -2; y < 2; y++) {
+    \\      vec2 o = vec2(float(x), float(y)) * u_texel;
+    \\      acc += texture(u_tex0, v_uv + o).r;
+    \\    }
+    \\  }
+    \\  float v = acc / 16.0;
+    \\  frag = vec4(v, v, v, 1.0);
     \\}
 ;
 
@@ -2156,6 +2241,7 @@ pub fn wgslGbufferDebug() []const u8 {
     \\@group(1) @binding(0) var samp: sampler;
     \\@group(1) @binding(1) var tex0: texture_2d<f32>;
     \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@group(1) @binding(3) var tex2: texture_2d<f32>;
     \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     \\  let g = textureSample(tex0, samp, uv);
     \\  if (P.params.x > 0.5) {
@@ -2192,6 +2278,7 @@ pub fn wgslBright() []const u8 {
     \\@group(1) @binding(0) var samp: sampler;
     \\@group(1) @binding(1) var tex0: texture_2d<f32>;
     \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@group(1) @binding(3) var tex2: texture_2d<f32>;
     \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     \\  let c = textureSample(tex0, samp, uv).rgb;
     \\  let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -2215,6 +2302,7 @@ pub fn wgslBlur() []const u8 {
     \\@group(1) @binding(0) var samp: sampler;
     \\@group(1) @binding(1) var tex0: texture_2d<f32>;
     \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@group(1) @binding(3) var tex2: texture_2d<f32>;
     \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     \\  let w0 = 0.227027; let w1 = 0.194595; let w2 = 0.121622; let w3 = 0.054054; let w4 = 0.016216;
     \\  var acc = textureSample(tex0, samp, uv).rgb * w0;
@@ -2249,6 +2337,7 @@ pub fn wgslComposite() []const u8 {
     \\@group(1) @binding(0) var samp: sampler;
     \\@group(1) @binding(1) var tex0: texture_2d<f32>;
     \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@group(1) @binding(3) var tex2: texture_2d<f32>;
     \\fn aces(x: vec3<f32>) -> vec3<f32> {
     \\  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
     \\  return clamp((x*(a*x+b))/(x*(c*x+d)+e), vec3<f32>(0.0), vec3<f32>(1.0));
@@ -2291,7 +2380,10 @@ pub fn wgslComposite() []const u8 {
     \\  return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
     \\}
     \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    \\  let hdr = textureSample(tex0, samp, uv).rgb + P.intensity * textureSample(tex1, samp, uv).rgb;
+    \\  // slice 3: AO (tex2.r) multiplies the scene term before bloom. tex2 = white
+    \\  // dummy (1.0) when SSAO is not bound, so this is a no-op for /gl-post etc.
+    \\  let ao = textureSample(tex2, samp, uv).r;
+    \\  let hdr = textureSample(tex0, samp, uv).rgb * ao + P.intensity * textureSample(tex1, samp, uv).rgb;
     \\  let op = i32(P.tonemap + 0.5);
     \\  var rgb: vec3<f32>;
     \\  if (op == 0) {
@@ -2337,6 +2429,7 @@ pub fn wgslFxaa() []const u8 {
     \\@group(1) @binding(0) var samp: sampler;
     \\@group(1) @binding(1) var tex0: texture_2d<f32>;
     \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@group(1) @binding(3) var tex2: texture_2d<f32>;
     \\fn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }
     \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     \\  let m  = textureSampleLevel(tex0, samp, uv, 0.0).rgb;
@@ -2353,6 +2446,121 @@ pub fn wgslFxaa() []const u8 {
     \\  let b = textureSampleLevel(tex0, samp, uv - dir * P.texel, 0.0).rgb;
     \\  let blended = mix(m, 0.5 * (a + b), edge);
     \\  return vec4<f32>(blended, 1.0);
+    \\}
+    ;
+}
+
+// ── Image-quality slice 3: SSAO (screen-space ambient occlusion) ─────
+//
+// SSAO consumes the slice-1 G-buffer (tex0 = h_gbuffer: rgb = viewNormal*0.5+0.5,
+// a = -viewPos.z, i.e. POSITIVE linear view-space depth; camera looks down -Z).
+// It reconstructs view-space position per fragment from `inv_proj`, samples a
+// hemisphere kernel around it, projects each sample with `proj`, and counts how
+// many samples are occluded by nearer stored geometry. Output `.r` = ambient
+// access in [0,1] (1 = fully open, 0 = fully occluded).
+//
+// Params (144B, the widened post params buffer): params: vec4 @0 =
+// (radius, bias, intensity, _), inv_proj: mat4 @16, proj: mat4 @80. radius is in
+// VIEW-SPACE units; bias guards self-occlusion; intensity scales the AO term.
+//
+// The 16-sample kernel + the per-pixel hash rotation are HARDCODED and identical
+// to the GLSL twin (`ssaoFragmentSrc`) — no noise texture, no kernel UBO.
+
+pub fn wgslSsao() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { params: vec4<f32>, inv_proj: mat4x4<f32>, proj: mat4x4<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@group(1) @binding(3) var tex2: texture_2d<f32>;
+    \\fn hash12(p: vec2<f32>) -> f32 {
+    \\  return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    \\}
+    \\// Reconstruct view-space position from stored linear depth (depth = -viewZ > 0).
+    \\fn reconstructView(uv: vec2<f32>, depth: f32, inv_proj: mat4x4<f32>) -> vec3<f32> {
+    \\  let ndc = uv * 2.0 - 1.0;
+    \\  let clip = vec4<f32>(ndc, 1.0, 1.0);
+    \\  let v = inv_proj * clip;
+    \\  let viewRay = v.xyz / v.w;          // direction from origin (viewRay.z < 0)
+    \\  return viewRay * (depth / -viewRay.z); // scale so result.z == -depth
+    \\}
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  let g = textureSample(tex0, samp, uv);
+    \\  let depth = g.a;                    // -viewZ (positive)
+    \\  if (depth <= 0.0) { return vec4<f32>(1.0, 1.0, 1.0, 1.0); } // background → open
+    \\  let radius = P.params.x;
+    \\  let bias = P.params.y;
+    \\  let intensity = P.params.z;
+    \\  let n = normalize(g.rgb * 2.0 - 1.0);
+    \\  let viewPos = reconstructView(uv, depth, P.inv_proj);
+    \\  // Per-pixel rotation vector from a hash → Gram-Schmidt TBN.
+    \\  let rnd = vec3<f32>(hash12(uv) * 2.0 - 1.0, hash12(uv + vec2<f32>(0.137, 0.219)) * 2.0 - 1.0, 0.0);
+    \\  let tangent = normalize(rnd - n * dot(rnd, n));
+    \\  let bitangent = cross(n, tangent);
+    \\  let tbn = mat3x3<f32>(tangent, bitangent, n);
+    \\  // 16-sample hemisphere kernel (tangent space; z toward the normal).
+    \\  var kernel = array<vec3<f32>, 16>(
+    \\    vec3<f32>( 0.0490, -0.0190,  0.0246), vec3<f32>(-0.0633,  0.0476,  0.0760),
+    \\    vec3<f32>( 0.0210,  0.0964,  0.0479), vec3<f32>(-0.0908, -0.0673,  0.0556),
+    \\    vec3<f32>( 0.1187,  0.0451,  0.0916), vec3<f32>( 0.0349, -0.1438,  0.0639),
+    \\    vec3<f32>(-0.1206,  0.1186,  0.0894), vec3<f32>( 0.1841,  0.0307,  0.0512),
+    \\    vec3<f32>(-0.0420, -0.1798,  0.1696), vec3<f32>(-0.1573,  0.1351,  0.1928),
+    \\    vec3<f32>( 0.2406, -0.0773,  0.1140), vec3<f32>( 0.0521,  0.2659,  0.1604),
+    \\    vec3<f32>(-0.2876, -0.0884,  0.2266), vec3<f32>( 0.1716, -0.2891,  0.2475),
+    \\    vec3<f32>(-0.0683,  0.3878,  0.3293), vec3<f32>( 0.4083,  0.2017,  0.4426));
+    \\  var occlusion = 0.0;
+    \\  for (var i = 0; i < 16; i = i + 1) {
+    \\    let sampleView = viewPos + (tbn * kernel[i]) * radius;
+    \\    let sclip = P.proj * vec4<f32>(sampleView, 1.0);
+    \\    let suv = (sclip.xy / sclip.w) * 0.5 + 0.5;
+    \\    let sampleDepth = textureSample(tex0, samp, suv).a; // stored geom depth (positive)
+    \\    let pointDepth = -sampleView.z;                     // sample point depth (positive)
+    \\    let rangeCheck = smoothstep(0.0, 1.0, radius / max(abs(depth - sampleDepth), 1e-4));
+    \\    if (sampleDepth > 0.0 && sampleDepth <= pointDepth - bias) {
+    \\      occlusion = occlusion + rangeCheck;
+    \\    }
+    \\  }
+    \\  let ao = clamp(1.0 - (occlusion / 16.0) * intensity, 0.0, 1.0);
+    \\  return vec4<f32>(ao, ao, ao, 1.0);
+    \\}
+    ;
+}
+
+pub fn wgslSsaoBlur() []const u8 {
+    return
+    \\struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+    \\@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    \\  var o: VsOut;
+    \\  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+    \\  o.uv = p;
+    \\  o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+    \\  return o;
+    \\}
+    \\struct Params { texel: vec2<f32>, _pad: vec2<f32> };
+    \\@group(0) @binding(0) var<uniform> P: Params;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\@group(1) @binding(2) var tex1: texture_2d<f32>;
+    \\@group(1) @binding(3) var tex2: texture_2d<f32>;
+    \\@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    \\  var acc = 0.0;
+    \\  for (var x = -2; x < 2; x = x + 1) {
+    \\    for (var y = -2; y < 2; y = y + 1) {
+    \\      let o = vec2<f32>(f32(x), f32(y)) * P.texel;
+    \\      acc = acc + textureSample(tex0, samp, uv + o).r;
+    \\    }
+    \\  }
+    \\  let v = acc / 16.0;
+    \\  return vec4<f32>(v, v, v, 1.0);
     \\}
     ;
 }
@@ -2413,6 +2621,11 @@ pub const PostProcess = struct {
     /// Optional vignette applied after tone-mapping.
     /// `null` = off (vig_intensity=0 in the shader, no effect).
     vignette: ?Vignette = null,
+    /// Image-quality slice 3: SSAO blur render-target handle bound at the
+    /// composite's tex2 slot; its `.r` multiplies the scene term before bloom.
+    /// `0` (default) → the bridge binds a 1×1 WHITE dummy (AO=1.0, no-op), so
+    /// `/gl-post` and `/gl-tonemap` render byte-for-byte as before.
+    ao_tex: u32 = 0,
 };
 
 /// Persistent state owned by the island (one static per GL canvas island).
@@ -2456,13 +2669,40 @@ pub const PrepassCtx = struct {
     pub const h_gbuffer: u32 = 248; // rgba16f color RT (+depth) — public G-buffer handle
     pub const sh_prepass: u32 = 249; // variant_prepass shader (mvp+mv UBO)
     pub const sh_gdebug: u32 = 250; // variant_post G-buffer debug-viz shader
-    // 251 spare.
 
     /// True once the shaders + target have been emitted for the first time.
     created: bool = false,
     last_w: u32 = 0,
     last_h: u32 = 0,
     webgpu: bool = false,
+};
+
+/// Persistent state for the SSAO passes (image-quality slice 3). Parallels
+/// `PostCtx`/`PrepassCtx`: fixed handles + a created/last_w/last_h guard + stable
+/// param storage. Handle reservation: 251–254, immediately after PrepassCtx's
+/// 248–250 (251 was the documented spare). The AO render targets are FULL-res
+/// rgba16f (AO stored in .r; the other channels carry the same value, alpha 1)
+/// so the existing post-RT/sampler path needs no single-channel-format support.
+///
+/// `p_ssao` packs the 144B SSAO params consumed by `wgslSsao`/`ssaoFragmentSrc`:
+///   [0..4)   = (radius, bias, intensity, _)
+///   [4..20)  = inv_proj (mat4, column-major)
+///   [20..36) = proj     (mat4, column-major)
+/// The island fills inv_proj/proj each frame (computed from the camera proj).
+pub const SsaoCtx = struct {
+    pub const h_ao_raw: u32 = 251; // rgba16f full-res AO accumulation (.r used)
+    pub const h_ao_blur: u32 = 252; // rgba16f full-res blurred AO (composite tex2)
+    pub const sh_ssao: u32 = 253; // variant_post SSAO shader (G-buffer → AO)
+    pub const sh_ssao_blur: u32 = 254; // variant_post 4×4 box blur of AO
+
+    created: bool = false,
+    last_w: u32 = 0,
+    last_h: u32 = 0,
+    webgpu: bool = false,
+
+    // Stable param storage (wire records point at these; must outlive the frame).
+    p_ssao: [36]f32 = [_]f32{0} ** 36, // (radius,bias,intensity,_) + inv_proj + proj
+    p_blur: [4]f32 = .{ 0, 0, 0, 0 }, // [texel.x, texel.y, 0, 0]
 };
 
 pub const Encoder = struct {
@@ -2856,13 +3096,17 @@ pub const Encoder = struct {
         self.header(.end_offscreen_pass, 0);
     }
 
-    /// Draw a VBO-less fullscreen triangle with `shader`, binding `tex0`/`tex1` to
-    /// samplers 0/1, and pointing the uniform block to `params_ptr` (`param_count` f32s).
-    pub fn drawFullscreenQuad(self: *Encoder, shader: u32, tex0: u32, tex1: u32, params_ptr: u32, param_count: u32) void {
-        self.header(.draw_fullscreen_quad, 20);
+    /// Draw a VBO-less fullscreen triangle with `shader`, binding `tex0`/`tex1`/`tex2`
+    /// to samplers 0/1/2, and pointing the uniform block to `params_ptr`
+    /// (`param_count` f32s). `tex2` is the slice-3 SSAO/SSR/DOF input slot — when 0
+    /// the bridge binds a 1×1 WHITE dummy (AO=1.0, a visual no-op), so pre-slice-3
+    /// effects (bloom/composite/fxaa) are unaffected.
+    pub fn drawFullscreenQuad(self: *Encoder, shader: u32, tex0: u32, tex1: u32, tex2: u32, params_ptr: u32, param_count: u32) void {
+        self.header(.draw_fullscreen_quad, 24);
         self.putU32(shader);
         self.putU32(tex0);
         self.putU32(tex1);
+        self.putU32(tex2);
         self.putU32(params_ptr);
         self.putU32(param_count);
     }
@@ -2983,37 +3227,39 @@ pub const Encoder = struct {
             // bright-pass: scene_hdr -> bloom_a (½-res)
             ctx.p_bright[0] = b.threshold;
             self.beginOffscreenPass(PostCtx.h_bloom_a, .{ 0, 0, 0, 1 }, clear_flag_color);
-            self.drawFullscreenQuad(PostCtx.sh_bright, PostCtx.h_scene_hdr, 0, @truncate(@intFromPtr(&ctx.p_bright)), 1);
+            self.drawFullscreenQuad(PostCtx.sh_bright, PostCtx.h_scene_hdr, 0, 0, @truncate(@intFromPtr(&ctx.p_bright)), 1);
             self.endOffscreenPass();
             // blur H: bloom_a -> bloom_b
             ctx.p_blur_h = .{ hw, hh, 1, 0 };
             self.beginOffscreenPass(PostCtx.h_bloom_b, .{ 0, 0, 0, 1 }, clear_flag_color);
-            self.drawFullscreenQuad(PostCtx.sh_blur, PostCtx.h_bloom_a, 0, @truncate(@intFromPtr(&ctx.p_blur_h)), 4);
+            self.drawFullscreenQuad(PostCtx.sh_blur, PostCtx.h_bloom_a, 0, 0, @truncate(@intFromPtr(&ctx.p_blur_h)), 4);
             self.endOffscreenPass();
             // blur V: bloom_b -> bloom_a
             ctx.p_blur_v = .{ hw, hh, 0, 1 };
             self.beginOffscreenPass(PostCtx.h_bloom_a, .{ 0, 0, 0, 1 }, clear_flag_color);
-            self.drawFullscreenQuad(PostCtx.sh_blur, PostCtx.h_bloom_b, 0, @truncate(@intFromPtr(&ctx.p_blur_v)), 4);
+            self.drawFullscreenQuad(PostCtx.sh_blur, PostCtx.h_bloom_b, 0, 0, @truncate(@intFromPtr(&ctx.p_blur_v)), 4);
             self.endOffscreenPass();
             ctx.p_comp[0] = b.intensity;
         } else {
             ctx.p_comp[0] = 0; // no bloom contribution
         }
 
+        // composite tex2 = AO blur (slice 3); 0 → bridge binds white dummy → AO=1.
+        const ao = ctx.opts.ao_tex;
         if (ctx.opts.fxaa) {
-            // composite (scene_hdr + bloom_a) -> ldr offscreen; 4 params = all of p_comp.
+            // composite (scene_hdr + bloom_a × AO) -> ldr offscreen; 4 params = all of p_comp.
             self.beginOffscreenPass(PostCtx.h_ldr, .{ 0, 0, 0, 1 }, clear_flag_color);
-            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 4);
+            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, ao, @truncate(@intFromPtr(&ctx.p_comp)), 4);
             self.endOffscreenPass();
             // fxaa: ldr -> canvas
             ctx.p_fxaa = .{ fw, fh, 0, 0 };
             self.beginFrame(.{ 0, 0, 0, 1 }, w, h);
-            self.drawFullscreenQuad(PostCtx.sh_fxaa, PostCtx.h_ldr, 0, @truncate(@intFromPtr(&ctx.p_fxaa)), 2);
+            self.drawFullscreenQuad(PostCtx.sh_fxaa, PostCtx.h_ldr, 0, 0, @truncate(@intFromPtr(&ctx.p_fxaa)), 2);
             self.endFrame();
         } else {
             // composite straight to canvas; 4 params = all of p_comp.
             self.beginFrame(.{ 0, 0, 0, 1 }, w, h);
-            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, @truncate(@intFromPtr(&ctx.p_comp)), 4);
+            self.drawFullscreenQuad(PostCtx.sh_composite, PostCtx.h_scene_hdr, PostCtx.h_bloom_a, ao, @truncate(@intFromPtr(&ctx.p_comp)), 4);
             self.endFrame();
         }
     }
@@ -3061,6 +3307,79 @@ pub const Encoder = struct {
     /// Close the G-buffer prepass pass. The next `begin_*` rebinds.
     pub fn endPrepass(self: *Encoder, ctx: *PrepassCtx) void {
         _ = ctx;
+        self.endOffscreenPass();
+    }
+
+    // ── Image-quality slice 3: SSAO API ──────────────────────────────
+
+    /// Run the full two-pass SSAO chain: G-buffer → `h_ao_raw` → `h_ao_blur`.
+    /// Must be called AFTER `endPrepass` (so `h_gbuffer` is populated) and BEFORE
+    /// the composite samples `h_ao_blur` as its tex2. On first call (or resize)
+    /// creates the two AO render targets (full-res rgba16f) and (first call only)
+    /// the SSAO + blur shaders. `webgpu` selects WGSL vs GLSL like the other ctxs.
+    ///
+    /// `radius`/`bias`/`intensity` are the SSAO tunables; `inv_proj`/`proj` are the
+    /// caller's stable mat4 storage (column-major, 16 f32 each). The matrices are
+    /// COPIED into `ctx.p_ssao` (which the wire record points at), so they need not
+    /// outlive this call. The AO pass reads `h_gbuffer` at tex0 and uploads the
+    /// 144B params; the blur pass box-filters `h_ao_raw`. Output is `h_ao_blur`.
+    pub fn runSsao(
+        self: *Encoder,
+        ctx: *SsaoCtx,
+        webgpu: bool,
+        width: u32,
+        height: u32,
+        radius: f32,
+        bias: f32,
+        intensity: f32,
+        inv_proj: *const [16]f32,
+        proj: *const [16]f32,
+    ) void {
+        ctx.webgpu = webgpu;
+        const resized = width != ctx.last_w or height != ctx.last_h;
+        if (!ctx.created or resized) {
+            if (resized and ctx.created) {
+                self.deleteResource(.render_target, SsaoCtx.h_ao_raw);
+                self.deleteResource(.render_target, SsaoCtx.h_ao_blur);
+            }
+            self.createRenderTarget(SsaoCtx.h_ao_raw, width, height, .rgba16f, 0);
+            self.createRenderTarget(SsaoCtx.h_ao_blur, width, height, .rgba16f, 0);
+            ctx.last_w = width;
+            ctx.last_h = height;
+        }
+        if (!ctx.created) {
+            if (webgpu) {
+                self.createPostShaderWgsl(SsaoCtx.sh_ssao, wgslSsao());
+                self.createPostShaderWgsl(SsaoCtx.sh_ssao_blur, wgslSsaoBlur());
+            } else {
+                self.createPostShaderGlsl(SsaoCtx.sh_ssao, ssaoFragmentSrc);
+                self.createPostShaderGlsl(SsaoCtx.sh_ssao_blur, ssaoBlurFragmentSrc);
+            }
+            ctx.created = true;
+        }
+
+        // Pack SSAO params: (radius,bias,intensity,_) + inv_proj + proj into p_ssao.
+        ctx.p_ssao[0] = radius;
+        ctx.p_ssao[1] = bias;
+        ctx.p_ssao[2] = intensity;
+        ctx.p_ssao[3] = 0;
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            ctx.p_ssao[4 + i] = inv_proj[i];
+            ctx.p_ssao[20 + i] = proj[i];
+        }
+
+        // AO pass: G-buffer (tex0) → h_ao_raw. 36 params = vec4 + inv_proj + proj.
+        self.beginOffscreenPass(SsaoCtx.h_ao_raw, .{ 1, 1, 1, 1 }, clear_flag_color);
+        self.drawFullscreenQuad(SsaoCtx.sh_ssao, PrepassCtx.h_gbuffer, 0, 0, @truncate(@intFromPtr(&ctx.p_ssao)), 36);
+        self.endOffscreenPass();
+
+        // Blur pass: h_ao_raw (tex0) → h_ao_blur. params = [texel.x, texel.y, 0, 0].
+        const fw: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, width)));
+        const fh: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, height)));
+        ctx.p_blur = .{ fw, fh, 0, 0 };
+        self.beginOffscreenPass(SsaoCtx.h_ao_blur, .{ 1, 1, 1, 1 }, clear_flag_color);
+        self.drawFullscreenQuad(SsaoCtx.sh_ssao_blur, SsaoCtx.h_ao_raw, 0, 0, @truncate(@intFromPtr(&ctx.p_blur)), 2);
         self.endOffscreenPass();
     }
 };
@@ -3632,7 +3951,7 @@ test "golden: post-process wire records (tags 22-25)" {
     var enc = Encoder.init(&buf);
     enc.createRenderTarget(5, 800, 600, .rgba16f, rt_flag_with_depth);
     enc.beginOffscreenPass(5, .{ 0, 0, 0, 1 }, clear_flag_color | clear_flag_depth);
-    enc.drawFullscreenQuad(3, 5, 0, 0x2000, 1);
+    enc.drawFullscreenQuad(3, 5, 0, 7, 0x2000, 1);
     enc.endOffscreenPass();
     const out = enc.finish();
 
@@ -3653,15 +3972,16 @@ test "golden: post-process wire records (tags 22-25)" {
     try testing.expectEqual(@as(u32, 5), readU32(out, off + 4));
     try testing.expectEqual(clear_flag_color | clear_flag_depth, readU32(out, off + 24));
     off += 4 + 24;
-    // draw_fullscreen_quad: shader,tex0,tex1,params_ptr,param_count = 20B
+    // draw_fullscreen_quad: shader,tex0,tex1,tex2,params_ptr,param_count = 24B
     try testing.expectEqual(@as(u16, @intFromEnum(Tag.draw_fullscreen_quad)), readU16(out, off));
-    try testing.expectEqual(@as(u16, 20), readU16(out, off + 2));
-    try testing.expectEqual(@as(u32, 3), readU32(out, off + 4));
-    try testing.expectEqual(@as(u32, 5), readU32(out, off + 8));
-    try testing.expectEqual(@as(u32, 0), readU32(out, off + 12));
-    try testing.expectEqual(@as(u32, 0x2000), readU32(out, off + 16));
-    try testing.expectEqual(@as(u32, 1), readU32(out, off + 20));
-    off += 4 + 20;
+    try testing.expectEqual(@as(u16, 24), readU16(out, off + 2));
+    try testing.expectEqual(@as(u32, 3), readU32(out, off + 4)); // shader
+    try testing.expectEqual(@as(u32, 5), readU32(out, off + 8)); // tex0
+    try testing.expectEqual(@as(u32, 0), readU32(out, off + 12)); // tex1
+    try testing.expectEqual(@as(u32, 7), readU32(out, off + 16)); // tex2 (slice 3)
+    try testing.expectEqual(@as(u32, 0x2000), readU32(out, off + 20)); // params_ptr
+    try testing.expectEqual(@as(u32, 1), readU32(out, off + 24)); // param_count
+    off += 4 + 24;
     // end_offscreen_pass: 0B payload
     try testing.expectEqual(@as(u16, @intFromEnum(Tag.end_offscreen_pass)), readU16(out, off));
     try testing.expectEqual(@as(u16, 0), readU16(out, off + 2));
@@ -3742,10 +4062,12 @@ test "golden: post shader sources frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xceff6b2f105a92ec), fnv64(brightFragmentSrc));
     try testing.expectEqual(@as(u64, 0x221d8b95dd9492ba), fnv64(blurFragmentSrc));
     try testing.expectEqual(@as(u64, 0x9d052976fb0b2105), fnv64(fxaaFragmentSrc));
-    // WGSL (composite intentionally changed in slice 2 — see slice-2 golden test below)
-    try testing.expectEqual(@as(u64, 0xefa46fcd8c5003b6), fnv64(wgslBright()));
-    try testing.expectEqual(@as(u64, 0xb93270d3619361ca), fnv64(wgslBlur()));
-    try testing.expectEqual(@as(u64, 0xe8ac45e2d1276dfd), fnv64(wgslFxaa()));
+    // WGSL — re-frozen slice 3: tex2 binding (@group(1) @binding(3)) added to ALL
+    // post WGSL modules for the SSAO/SSR input slot (GLSL bright/blur/fxaa don't
+    // sample tex2 so their hashes are unchanged; only the GLSL composite changed).
+    try testing.expectEqual(@as(u64, 0x470c9cf45dbe2e12), fnv64(wgslBright()));
+    try testing.expectEqual(@as(u64, 0x49747ec6c5aee28c), fnv64(wgslBlur()));
+    try testing.expectEqual(@as(u64, 0x8adb9a5b5290f719), fnv64(wgslFxaa()));
     // linear-output PBR variant (omits tonemap+gamma; post composite pass tonemaps instead)
     // wgslPbr(variant_linear_output) bumped T3: lights 8→16 vec4, 4-vec4 loop.
     // Re-frozen (Slice 3 LTC): area uniforms + LTC eval added to all PBR fragments.
@@ -3923,6 +4245,94 @@ test "PrepassCtx handles do not collide with PostCtx handles" {
     try testing.expect(PrepassCtx.h_gbuffer > PostCtx.sh_fxaa);
 }
 
+// ── Image-quality slice 3: SSAO goldens ──────────────────────────────
+
+test "SsaoCtx handles do not collide with Post/Prepass handles" {
+    // 251–254 sit immediately after PrepassCtx's 248–250 (251 was the spare).
+    try testing.expectEqual(@as(u32, 251), SsaoCtx.h_ao_raw);
+    try testing.expectEqual(@as(u32, 252), SsaoCtx.h_ao_blur);
+    try testing.expectEqual(@as(u32, 253), SsaoCtx.sh_ssao);
+    try testing.expectEqual(@as(u32, 254), SsaoCtx.sh_ssao_blur);
+    // Strictly above every Prepass/Post handle (248–250 / 240–247) — no overlap.
+    try testing.expect(SsaoCtx.h_ao_raw > PrepassCtx.sh_gdebug);
+    try testing.expect(SsaoCtx.h_ao_raw > PostCtx.sh_fxaa);
+}
+
+test "SSAO shader content (both backends)" {
+    // GLSL: G-buffer sampler, 16-sample kernel, inv_proj/proj reconstruction, AO out.
+    const sg = ssaoFragmentSrc;
+    try testing.expect(std.mem.indexOf(u8, sg, "u_inv_proj") != null);
+    try testing.expect(std.mem.indexOf(u8, sg, "u_proj") != null);
+    try testing.expect(std.mem.indexOf(u8, sg, "kernel[15]") != null); // 16-sample kernel
+    try testing.expect(std.mem.indexOf(u8, sg, "reconstructView") != null);
+    try testing.expect(std.mem.indexOf(u8, sg, "occlusion / 16.0") != null);
+    // WGSL: same surface, threads uv as fs_main param (free-fn restriction).
+    const sw = wgslSsao();
+    try testing.expect(std.mem.indexOf(u8, sw, "inv_proj: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, sw, "proj: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, sw, "array<vec3<f32>, 16>") != null);
+    try testing.expect(std.mem.indexOf(u8, sw, "occlusion / 16.0") != null);
+    // The reconstruction makes result.z == -depth (camera looks down -Z).
+    try testing.expect(std.mem.indexOf(u8, sw, "depth / -viewRay.z") != null);
+    try testing.expect(std.mem.indexOf(u8, sg, "depth / -viewRay.z") != null);
+    // Blur: 4×4 box of the .r channel.
+    try testing.expect(std.mem.indexOf(u8, ssaoBlurFragmentSrc, "acc / 16.0") != null);
+    try testing.expect(std.mem.indexOf(u8, wgslSsaoBlur(), "acc / 16.0") != null);
+}
+
+test "golden: SSAO shader sources frozen (FNV-1a-64)" {
+    try testing.expectEqual(@as(u64, 0x1765733c3fefc701), fnv64(ssaoFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x66559a8dc1ee3409), fnv64(ssaoBlurFragmentSrc));
+    try testing.expectEqual(@as(u64, 0xf26e390d44eeabab), fnv64(wgslSsao()));
+    try testing.expectEqual(@as(u64, 0x461f7fd65496504d), fnv64(wgslSsaoBlur()));
+}
+
+test "runSsao emits createRT×2, createShader×2, then 2 blit passes" {
+    var buf: [512]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    var ctx = SsaoCtx{};
+    var inv_proj = [_]f32{0} ** 16;
+    var proj = [_]f32{0} ** 16;
+    enc.runSsao(&ctx, false, 640, 400, 0.5, 0.025, 1.0, &inv_proj, &proj);
+    const out = enc.finish();
+
+    // First call: 2× create_render_target (251,252) + 2× create_shader (253,254),
+    // then begin/draw/end for the AO pass and the blur pass.
+    var tags: [16]Tag = undefined;
+    const n = collectTags(out, &tags);
+    try expectContainsInOrder(tags[0..n], n, &.{
+        .create_render_target, .create_render_target,
+        .create_shader,        .create_shader,
+        .begin_offscreen_pass, .draw_fullscreen_quad,
+        .end_offscreen_pass,   .begin_offscreen_pass,
+        .draw_fullscreen_quad, .end_offscreen_pass,
+    });
+    // The AO pass binds the G-buffer at tex0 and uploads 36 params (vec4+2 mat4).
+    // The first draw_fullscreen_quad: shader=253, tex0=248, tex1=0, tex2=0, …, count=36.
+    var off2: usize = 4;
+    while (off2 < 4 + readU32(out, 0)) {
+        const tag = readU16(out, off2);
+        const sz = readU16(out, off2 + 2);
+        if (tag == @intFromEnum(Tag.draw_fullscreen_quad)) {
+            try testing.expectEqual(@as(u32, SsaoCtx.sh_ssao), readU32(out, off2 + 4));
+            try testing.expectEqual(@as(u32, PrepassCtx.h_gbuffer), readU32(out, off2 + 8));
+            try testing.expectEqual(@as(u32, 0), readU32(out, off2 + 12)); // tex1
+            try testing.expectEqual(@as(u32, 0), readU32(out, off2 + 16)); // tex2
+            try testing.expectEqual(@as(u32, 36), readU32(out, off2 + 24)); // param_count
+            break;
+        }
+        off2 += 4 + sz;
+    }
+    // Second runSsao call (no resize) re-emits NEITHER create — guard works.
+    var enc2 = Encoder.init(&buf);
+    enc2.runSsao(&ctx, false, 640, 400, 0.5, 0.025, 1.0, &inv_proj, &proj);
+    const out2 = enc2.finish();
+    var tags2: [16]Tag = undefined;
+    const n2 = collectTags(out2, &tags2);
+    try testing.expectEqual(@as(Tag, .begin_offscreen_pass), tags2[0]); // no create_* up front
+    _ = n2;
+}
+
 test "prepass + gdebug shader content (both backends)" {
     // GLSL prepass: pos + normal in, view normal/pos out, mv+mvp uniforms, gbuffer out.
     const pv = prepassVertexSrc();
@@ -3952,7 +4362,9 @@ test "golden: prepass + gdebug shader sources frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0x177573915216ade5), fnv64(prepassFragmentSrc()));
     try testing.expectEqual(@as(u64, 0xfe0b7897c73027c0), fnv64(gbufferDebugFragmentSrc()));
     try testing.expectEqual(@as(u64, 0x30c9a8f934c49b91), fnv64(wgslPrepass()));
-    try testing.expectEqual(@as(u64, 0x10e6f50be5ce2b92), fnv64(wgslGbufferDebug()));
+    // wgslGbufferDebug re-frozen slice 3: tex2 binding added to the shared post
+    // bind group (GLSL gdebug doesn't sample tex2 → its hash is unchanged).
+    try testing.expectEqual(@as(u64, 0x6f3a51e39ec69c10), fnv64(wgslGbufferDebug()));
 }
 
 test "variant_double_sided flips normal; non-DS frozen; state_cull_front" {
@@ -4576,11 +4988,13 @@ test "golden: post shader sources frozen after slice 2 (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xceff6b2f105a92ec), fnv64(brightFragmentSrc));
     try testing.expectEqual(@as(u64, 0x221d8b95dd9492ba), fnv64(blurFragmentSrc));
     try testing.expectEqual(@as(u64, 0x9d052976fb0b2105), fnv64(fxaaFragmentSrc));
-    try testing.expectEqual(@as(u64, 0xefa46fcd8c5003b6), fnv64(wgslBright()));
-    try testing.expectEqual(@as(u64, 0xb93270d3619361ca), fnv64(wgslBlur()));
-    try testing.expectEqual(@as(u64, 0xe8ac45e2d1276dfd), fnv64(wgslFxaa()));
-    // Composite goldens UPDATED for AgX fix (real Sobotka/Filament minimal AgX —
-    // replaces the mislabeled Reinhard-variant that shipped in commit ebe2373):
-    try testing.expectEqual(@as(u64, 0xeaacf23156d5b2bd), fnv64(compositeFragmentSrc));
-    try testing.expectEqual(@as(u64, 0x0d62d18cbf80d694), fnv64(wgslComposite()));
+    // WGSL re-frozen slice 3 (tex2 binding added to all post WGSL modules):
+    try testing.expectEqual(@as(u64, 0x470c9cf45dbe2e12), fnv64(wgslBright()));
+    try testing.expectEqual(@as(u64, 0x49747ec6c5aee28c), fnv64(wgslBlur()));
+    try testing.expectEqual(@as(u64, 0x8adb9a5b5290f719), fnv64(wgslFxaa()));
+    // Composite goldens UPDATED for slice 3: AO (tex2.r) multiplies the scene term
+    // before bloom (GLSL u_tex2 + WGSL @binding(3) tex2). White dummy when unbound
+    // → /gl-post + /gl-tonemap unchanged.
+    try testing.expectEqual(@as(u64, 0xa3323897aa626eb7), fnv64(compositeFragmentSrc));
+    try testing.expectEqual(@as(u64, 0x5396005eb65b17e8), fnv64(wgslComposite()));
 }

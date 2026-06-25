@@ -4,6 +4,34 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.14.0] - 2026-06-24
+
+### Added
+
+- **gl SSAO — screen-space ambient occlusion (image-quality slice 3)**
+  (`src/core/gl/command.zig`, `src/bridge/verve.js`,
+  `src/client/islands/GlSsao.zig`, `src/app/{islands,routes,components}.zig`):
+  the first consumer of the slice-1 depth+normal G-buffer. A new `SsaoCtx`
+  (`h_ao_raw=251`, `h_ao_blur=252`, `sh_ssao=253`, `sh_ssao_blur=254`) and
+  `Encoder.runSsao(...)` run a two-pass chain — an SSAO pass that reconstructs
+  view-space position from the G-buffer (`inv_proj`), samples a hardcoded
+  16-point hemisphere kernel with a procedural per-pixel hash rotation,
+  re-projects each sample (`proj`), and accumulates occlusion; then a 4×4 box
+  blur. The composite multiplies the blurred AO into the scene term before
+  bloom + tonemapping. Both backends (WGSL + WebGL2 GLSL) share byte-identical
+  kernel constants, hash, reconstruction, and AO formula. Self-contained: no
+  noise texture, no kernel UBO, no new asset files.
+  - The shared post bind group grows to a **third texture** (`tex2`,
+    `@group(1) @binding(3)` / `u_tex2`); `draw_fullscreen_quad` (tag 25) grows
+    by one u32 (`{shader, tex0, tex1, tex2, params_ptr, param_count}`, 24B). The
+    `tex2` dummy is a **1×1 WHITE** texture (AO=1.0), so `/gl-post` and
+    `/gl-tonemap` (which never bind AO) are byte-for-byte unchanged.
+  - The post params buffer carries `inv_proj` (already plumbed in slice 1) plus
+    a new `proj` mat4; SSAO uploads both (36 f32 = 144B Params
+    `{params:vec4 @0, inv_proj:mat4 @16, proj:mat4 @80}`). PBR_U is untouched.
+  - New `/gl-ssao` demo (cubes on a floor) + `GlSsao` island with
+    `glssao_toggle` / `glssao_toggle_view` / `glssao_freeze`.
+
 ## [0.13.0] - 2026-06-24
 
 ### Added

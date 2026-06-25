@@ -1205,6 +1205,51 @@ pub fn glTonemap(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl SSAO demo — /gl-ssao (image-quality slice 3).
+/// Renders a floor with cubes resting on it through the G-buffer prepass → SSAO
+/// → composite chain. SSAO darkens cube-cube gaps and cube-floor contacts.
+/// Toggle SSAO compares the lit scene with and without ambient occlusion; Toggle
+/// AO View blits the raw AO buffer (dark in crevices, white on open surfaces).
+/// Renders through WebGPU when available, else WebGL2.
+pub fn glSsao(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "glssao-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#0a0b0f;border-radius:8px;"),
+    });
+
+    // Controls wired to the GlSsao chunk's no-arg exports via z-on-click.
+    // Must live INSIDE the island subtree so events route to this chunk.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glssao_toggle").text("Toggle SSAO"),
+        ctx.el("button").attr("z-on-click", "glssao_toggle_view").text("Toggle AO View"),
+        ctx.el("button").attr("z-on-click", "glssao_freeze").text("Freeze"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Cubes on a floor — screen-space ambient occlusion"),
+        canvas,
+        controls,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlSsao" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — SSAO"),
+        ctx.p().text("Several cubes resting on a floor, rendered through the depth + " ++
+            "view-space-normal G-buffer prepass and a screen-space ambient occlusion " ++
+            "pass. SSAO reconstructs view-space position from the G-buffer (inv_proj), " ++
+            "samples a 16-point hemisphere kernel around each fragment, re-projects each " ++
+            "sample (proj), and counts occluded samples — the result is blurred and " ++
+            "multiplied into the scene before bloom + tonemapping. Toggle SSAO compares " ++
+            "the contact shadows with and without AO; Toggle AO View shows the raw AO " ++
+            "buffer (dark in crevices, white on open surfaces). Renders through WebGPU " ++
+            "when available, else WebGL2."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a

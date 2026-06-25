@@ -5276,6 +5276,20 @@
   // bright: p[0]=threshold; blur: p[0..1]=texel, p[2..3]=dir;
   // composite: p[0]=intensity, p[1]=tonemap, p[2]=vig_intensity, p[3]=vig_radius;
   // fxaa: p[0..1]=texel.
+  // Lazy 1×1 WHITE texture (slice 3): the default for the post tex2 slot so the
+  // composite's AO multiply is a no-op (AO=1.0) when SSAO is not bound.
+  const glWhiteTex = (st) => {
+    const gl = st.gl;
+    if (!st.whiteTex) {
+      st.whiteTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, st.whiteTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    }
+    return st.whiteTex;
+  };
+
   const applyPostParams = (gl, sh, dv, ptr, count) => {
     const p = [];
     for (let i = 0; i < count; i++) p.push(dv.getFloat32(ptr + i * 4, true));
@@ -5286,6 +5300,13 @@
     if (sh.uVigRadius && count >= 4) gl.uniform1f(sh.uVigRadius, p[3]);
     if (sh.uTexel && count >= 2) gl.uniform2f(sh.uTexel, p[0], p[1]);
     if (sh.uDir && count >= 4) gl.uniform2f(sh.uDir, p[2], p[3]);
+    // SSAO (slice 3): params vec4 @0 = (radius,bias,intensity,_); inv_proj @4..20;
+    // proj @20..36 (column-major mat4, matches the f32[36] the island packs).
+    if (sh.uSsaoParams && count >= 36) {
+      gl.uniform4f(sh.uSsaoParams, p[0], p[1], p[2], p[3]);
+      gl.uniformMatrix4fv(sh.uInvProj, false, new Float32Array(p.slice(4, 20)));
+      gl.uniformMatrix4fv(sh.uProj, false, new Float32Array(p.slice(20, 36)));
+    }
   };
 
   const glInterpret = (st, ptr) => {
@@ -5403,6 +5424,7 @@
           if (variant & 0x100) { // variant_post: cache post-process uniform locations
             sh.tex0 = gl.getUniformLocation(prog, "u_tex0");
             sh.tex1 = gl.getUniformLocation(prog, "u_tex1");
+            sh.tex2 = gl.getUniformLocation(prog, "u_tex2"); // slice 3: SSAO/SSR input
             sh.uThreshold = gl.getUniformLocation(prog, "u_threshold");
             sh.uTexel = gl.getUniformLocation(prog, "u_texel");
             sh.uDir = gl.getUniformLocation(prog, "u_dir");
@@ -5411,6 +5433,10 @@
             sh.uTonemap = gl.getUniformLocation(prog, "u_tonemap");
             sh.uVigIntensity = gl.getUniformLocation(prog, "u_vig_intensity");
             sh.uVigRadius = gl.getUniformLocation(prog, "u_vig_radius");
+            // SSAO (slice 3): params vec4 + inv_proj + proj matrices.
+            sh.uSsaoParams = gl.getUniformLocation(prog, "u_ssao_params");
+            sh.uInvProj = gl.getUniformLocation(prog, "u_inv_proj");
+            sh.uProj = gl.getUniformLocation(prog, "u_proj");
           }
           if (variant & 0x10000) { // variant_prepass (1<<16): mvp + mv (view·model)
             // sh.mvp ("u_mvp") is already resolved above; cache the second matrix.
@@ -5966,12 +5992,13 @@
           gl.bindFramebuffer(gl.FRAMEBUFFER, null);
           break;
         }
-        case 25: { // DRAW_FULLSCREEN_QUAD {shader, tex0, tex1, params_ptr, param_count}
+        case 25: { // DRAW_FULLSCREEN_QUAD {shader, tex0, tex1, tex2, params_ptr, param_count}
           const shHandle = dv.getUint32(off, true);
           const t0 = dv.getUint32(off + 4, true);
           const t1 = dv.getUint32(off + 8, true);
-          const pPtr = dv.getUint32(off + 12, true);
-          const pCount = dv.getUint32(off + 16, true);
+          const t2 = dv.getUint32(off + 12, true); // slice 3: SSAO/SSR input (0 → white dummy)
+          const pPtr = dv.getUint32(off + 16, true);
+          const pCount = dv.getUint32(off + 20, true);
           const sh = st.shaders[shHandle];
           if (!sh) break;
           gl.useProgram(sh.prog);
@@ -5983,6 +6010,13 @@
             gl.activeTexture(gl.TEXTURE1);
             gl.bindTexture(gl.TEXTURE_2D, st.renderTargets[t1].colorTex);
             if (sh.tex1) gl.uniform1i(sh.tex1, 1);
+          }
+          // tex2 (unit 2): the SSAO/SSR input. When unbound (t2===0) bind a 1×1
+          // WHITE texture so AO=1.0 in the composite — /gl-post stays a no-op.
+          if (sh.tex2) {
+            gl.activeTexture(gl.TEXTURE2);
+            gl.bindTexture(gl.TEXTURE_2D, (t2 !== 0 && st.renderTargets[t2]) ? st.renderTargets[t2].colorTex : glWhiteTex(st));
+            gl.uniform1i(sh.tex2, 2);
           }
           applyPostParams(gl, sh, dv, pPtr, pCount);
           if (!st.emptyVao) st.emptyVao = gl.createVertexArray();
@@ -6524,6 +6558,21 @@
     }
     return st.postUniform;
   };
+  // Lazy 1×1 WHITE texture view (slice 3): the default for the post tex2 slot so
+  // the composite's AO multiply is a no-op (AO=1.0) when SSAO is not bound. Note
+  // the EXISTING st.dummyTexView is BLACK (used for the unused bloom tex1 slot);
+  // tex2 needs WHITE so /gl-post + /gl-tonemap render unchanged.
+  const gpuWhiteTexView = (st) => {
+    if (!st.whiteTexView) {
+      const t = st.device.createTexture({
+        size: [1, 1], format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      });
+      st.device.queue.writeTexture({ texture: t }, new Uint8Array([255, 255, 255, 255]), { bytesPerRow: 4, rowsPerImage: 1 }, [1, 1]);
+      st.whiteTexView = t.createView();
+    }
+    return st.whiteTexView;
+  };
   // Lazily create the shared bones palette uniform (64 mat4 = 4096 B), bound at
   // @group(0) @binding(1) for skinned variants. set_bones (tag 21) writes it;
   // skinned bg0 binds the whole buffer (static, no dynamic offset).
@@ -6765,15 +6814,15 @@
                 { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
                 { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
                 { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+                { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } }, // slice 3 tex2 (SSAO/SSR)
               ],
             });
-            // Params binding size: the G-buffer debug shader (handle sh_gdebug=250)
-            // uses an 80B Params struct {params vec4 @0, inv_proj mat4 @16}; the
-            // four bloom/fxaa modules use 32B (f32 + vec3 padded to struct align 16
-            // = 32; vec2+vec2 = 16 but kept at 32 to match the prior binding). The
-            // bind-group binding size at draw time (case 25) must be ≥ what the
-            // shader reads, so record it here.
-            const paramsSize = (handle === 250) ? 80 : 32;
+            // Params binding size: the SSAO shader (sh_ssao=253) uses a 144B Params
+            // {params vec4 @0, inv_proj mat4 @16, proj mat4 @80}; the G-buffer debug
+            // shader (sh_gdebug=250) uses 80B {params vec4 @0, inv_proj mat4 @16};
+            // the bloom/fxaa/composite/ssao_blur modules use ≤32B. The bind-group
+            // binding size at draw time (case 25) must be ≥ what the shader reads.
+            const paramsSize = (handle === 253) ? 144 : (handle === 250) ? 80 : 32;
             st.pipelines[handle] = { module, bgl0, bgl1, kind: "post", byFormat: {}, paramsSize };
             break;
           }
@@ -7936,35 +7985,37 @@
           break;
         }
         case 25: { // DRAW_FULLSCREEN_QUAD — post effect into the current pass.
-          // Payload (20B): shader | tex0 | tex1 | params_ptr | param_count.
+          // Payload (24B): shader | tex0 | tex1 | tex2 | params_ptr | param_count.
           const shHandle = dv.getUint32(off, true);
           const t0 = dv.getUint32(off + 4, true);
           const t1 = dv.getUint32(off + 8, true);
-          const pPtr = dv.getUint32(off + 12, true);
-          const pCount = dv.getUint32(off + 16, true);
+          const t2 = dv.getUint32(off + 12, true); // slice 3: SSAO/SSR input (0 → white dummy)
+          const pPtr = dv.getUint32(off + 16, true);
+          const pCount = dv.getUint32(off + 20, true);
           const entry = st.pipelines[shHandle];
           const src0rt = st.renderTargets[t0];
           if (!entry || entry.kind !== "post" || !st.pass || !src0rt) break;
           const format = st.curTargetFormat || st.format;
           const pipe = getOrCreatePostPipeline(st, entry, format, !!st.curPassHasDepth);
-          // Params: up to 4 f32 from the wire (zero-padded), written into this
+          // Params: up to 36 f32 from the wire (zero-padded), written into this
           // draw's own 256-aligned slot so a later draw's writeBuffer can't clobber
           // it before the single end-of-frame submit (see POST_STRIDE note above).
           const pubuf = gpuEnsurePostUniform(st);
           const pslot = st.postSlot++;
           if (pslot >= MAX_POST_DRAWS) break; // per-frame cap (silently drop extras)
           const pbase = pslot * POST_STRIDE;
-          // The binding size matches the shader's Params struct: 16B for the four
-          // bloom/fxaa modules, 80B for the G-buffer debug shader {params vec4 @0,
-          // inv_proj mat4 @16} (grown from 32; inv_proj rides this widened post
-          // params path for downstream slices, currently unread by the debug viz).
-          // Write a full-size zero-padded array so the inv_proj region never leaks
-          // stale slot data.  Wire params (up to 4 f32) land at @0.
+          // The binding size matches the shader's Params struct: ≤32B for the
+          // bloom/fxaa/composite/ssao_blur modules, 80B for the G-buffer debug
+          // shader, 144B for SSAO {params vec4 @0, inv_proj mat4 @16, proj mat4 @80}.
+          // Write a full-size zero-padded array (covers up to 36 f32 = 144B) so the
+          // matrix regions never leak stale slot data. Wire params land at @0.
           const paramsSize = entry.paramsSize || 32;
           const arr = new Float32Array(paramsSize / 4);
-          for (let i = 0; i < pCount && i < 4; i++) arr[i] = dv.getFloat32(pPtr + i * 4, true);
+          for (let i = 0; i < pCount && i < 36 && i < arr.length; i++) arr[i] = dv.getFloat32(pPtr + i * 4, true);
           device.queue.writeBuffer(pubuf, pbase, arr);
           const src1 = (t1 !== 0 && st.renderTargets[t1]) ? st.renderTargets[t1].view : st.dummyTexView;
+          // tex2 = SSAO/SSR input; WHITE dummy when unbound (AO=1.0, no-op).
+          const src2 = (t2 !== 0 && st.renderTargets[t2]) ? st.renderTargets[t2].view : gpuWhiteTexView(st);
           const bg0 = device.createBindGroup({
             layout: entry.bgl0,
             entries: [{ binding: 0, resource: { buffer: pubuf, offset: pbase, size: paramsSize } }],
@@ -7975,6 +8026,7 @@
               { binding: 0, resource: st.linearSampler },
               { binding: 1, resource: src0rt.view },
               { binding: 2, resource: src1 },
+              { binding: 3, resource: src2 },
             ],
           });
           st.pass.setPipeline(pipe);
@@ -8365,6 +8417,7 @@
       pointDepthProg: null, // lazy — compiled on first CREATE_POINT_SHADOW (case 31)
       vaos: new Map(),
       emptyVao: null, // lazy-created VAO for fullscreen-quad draw (case 25)
+      whiteTex: null, // slice 3: lazy 1×1 WHITE texture for the post tex2 dummy (AO=1.0)
       instanceBuf: null, // lazy-created ARRAY_BUFFER for per-instance mat4+color (case 27)
       morphTextures: [], // morph-target RGBA16F textures (case 30), indexed by handle
       morphTex: null, // active morph texture bound to TEXTURE9 (most recently created)
@@ -8484,6 +8537,9 @@
       st.ltcMag = null;
       st.ltcDummy = null;
       st.ltcLoading = false;
+      // Slice 3: the white tex2 dummy + fullscreen VAO died with the context.
+      st.whiteTex = null;
+      st.emptyVao = null;
       // Re-hide poster only after the first new frame draws again.
       st.posterHidden = false;
       st.lost = false;
@@ -8548,6 +8604,7 @@
       curTargetFormat: null, // color format of the active pass (post pipeline keying)
       curPassHasDepth: false, // true when the active render pass has a depth attachment
       postUniform: null, // slotted params buffer for draw_fullscreen_quad (lazy)
+      whiteTexView: null, // slice 3: lazy 1×1 WHITE view for the post tex2 dummy (AO=1.0)
       postSlot: 0, // per-frame fullscreen-draw slot counter (reset at encoder start)
       // Linear/clamp sampler + 1×1 dummy view for the unused tex1 post slot. Eager
       // (cheap, always needed by the post chain when present); clamp avoids UV wrap.

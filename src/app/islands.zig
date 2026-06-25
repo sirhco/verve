@@ -209,3 +209,16 @@ pub const GlScene = struct {
 pub const GlTonemap = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// verve.gl SSAO demo (/gl-ssao, image-quality slice 3). Renders a floor plane
+/// with several cubes resting on it (contact/crease geometry) through the
+/// G-buffer prepass → SSAO → composite chain: SSAO reconstructs view-space
+/// position from the slice-1 G-buffer (inv_proj) and re-projects a 16-sample
+/// hemisphere kernel (proj) to compute ambient occlusion, which the composite
+/// multiplies into the scene before bloom + tonemapping. Controls wire to the
+/// `glssao_toggle` / `glssao_toggle_view` / `glssao_freeze` chunk exports.
+/// SSR emits `<canvas data-ref="glssao-canvas">`.
+/// Source: `src/client/islands/GlSsao.zig`.
+pub const GlSsao = struct {
+    pub const props_schema: []const u8 = "{}";
+};
