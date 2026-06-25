@@ -51,8 +51,9 @@ var gdebug_params: [4]f32 = .{ 0, 0, 0, 0 };
 // emissive.rgb, pad. High emissive (2.5 linear) so the bloom halo is clearly visible.
 var material: [12]f32 = .{ 0.1, 0.1, 0.2, 1, 0, 0.9, 1, 1, 2.5, 2.5, 2.5, 0 };
 
-// One directional light: [type(0=dir), intensity, dir.xyz, color.rgb].
-var light: [8]f32 = .{ 0, 2.0, -0.4, -0.7, -0.5, 1, 1, 1 };
+// One directional light, 16 f32 (the set_lights wire format = 4 vec4/light):
+//   v0 = type/intensity/pos.xy, v1 = pos.z/dir.xyz, v2 = color.rgb/range, v3 = shadow.
+var light: [16]f32 = .{ 0, 2.0, 0, 0, 0, -0.4, -0.7, -0.5, 1, 1, 1, 0, 0, 0, 0, 0 };
 
 // 1×1 white base-color (the emissive term dominates appearance).
 const base_rgba = [_]u8{ 255, 255, 255, 255 };

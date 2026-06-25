@@ -98,8 +98,10 @@ var t_color: [trans_count][4]f32 = undefined;
 
 var camera_pos: [3]f32 = .{ 0, 1.5, 10 };
 
-// One directional light from above-front for the opaque backdrop.
-var light: [8]f32 = .{ 0, 1.6, -0.3, -0.7, -0.5, 1, 1, 1 };
+// One directional light from above-front for the opaque backdrop, 16 f32
+// (set_lights wire = 4 vec4/light): v0 type/intensity/pos.xy, v1 pos.z/dir.xyz,
+// v2 color.rgb/range, v3 shadow.
+var light: [16]f32 = .{ 0, 1.6, 0, 0, 0, -0.3, -0.7, -0.5, 1, 1, 1, 0, 0, 0, 0, 0 };
 
 // 1×1 white maps (baseColor dominates the opaque cubes' appearance).
 const base_rgba = [_]u8{ 255, 255, 255, 255 };

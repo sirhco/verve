@@ -102,8 +102,9 @@ var material: [obj_count][12]f32 = undefined;
 // gdebug params (DOF-view blit): params.x = 0 → pass rgb (the composited DOF) through.
 var gdebug_params: [4]f32 = .{ 0, 0, 0, 0 };
 
-// One directional light from above-front: [type(0=dir), intensity, dir.xyz, color.rgb].
-var light: [8]f32 = .{ 0, 1.5, -0.3, -0.7, -0.5, 1, 1, 1 };
+// One directional light from above-front, 16 f32 (set_lights wire = 4 vec4/light):
+//   v0 = type/intensity/pos.xy, v1 = pos.z/dir.xyz, v2 = color.rgb/range, v3 = shadow.
+var light: [16]f32 = .{ 0, 1.5, 0, 0, 0, -0.3, -0.7, -0.5, 1, 1, 1, 0, 0, 0, 0, 0 };
 
 // 1×1 white maps (baseColor + emissive factors dominate appearance).
 const base_rgba = [_]u8{ 255, 255, 255, 255 };

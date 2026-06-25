@@ -4,6 +4,26 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.18.2] - 2026-06-25
+
+### Fixed
+
+- **gl standalone-island directional light was malformed** (`src/client/islands/`
+  `Gl{Skin,Ssr,Dof,Post,Oit,Ssao}.zig`): each declared its light as `[8]f32`, but
+  the `set_lights` wire format is 16 f32 per light (4 vec4: `v0` type/intensity/
+  pos.xy, `v1` pos.z/dir.xyz, `v2` color.rgb/range, `v3` shadow). The bridge reads
+  `count*16`, so the shader pulled each light's **color** (and shadow fields) from
+  whatever followed the array in wasm memory — undefined. All six now use the
+  correct `[16]f32` layout. (Masked in practice — these scenes are dark/emissive
+  or IBL-lit — but the direct light color was garbage.)
+
+### Docs
+
+- `docs/24-gl.md`: corrected two stale "Deferred" notes (multi-light shadow
+  casters / CSM / area lights, and skinning/morph in the asset pipeline — all
+  shipped); `docs/01-getting-started.md`: genericized the stale hard-coded test
+  count; `README.md`: scaffold snippet said `zig build cli` (no such step) → `zig build`.
+
 ## [0.18.1] - 2026-06-25
 
 ### Fixed

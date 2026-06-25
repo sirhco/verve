@@ -73,8 +73,9 @@ var camera_pos: [3]f32 = .{ 4, 2.2, 5.5 };
 // Material: baseColor.rgba, [metallic, roughness, occlusion, normalScale],
 // emissive.rgb, pad. Matte dielectric so the direct-light shading reads the bend.
 var material: [12]f32 = .{ 1, 1, 1, 1, 0, 0.6, 1, 1, 0, 0, 0, 0 };
-// One directional light: [type(0=dir), intensity, dir.xyz, color.rgb].
-var light: [8]f32 = .{ 0, 3, -0.4, -0.7, -0.5, 1, 1, 1 };
+// One directional light, 16 f32 (the set_lights wire format = 4 vec4/light):
+//   v0 = type/intensity/pos.xy, v1 = pos.z/dir.xyz, v2 = color.rgb/range, v3 = shadow.
+var light: [16]f32 = .{ 0, 3, 0, 0, 0, -0.4, -0.7, -0.5, 1, 1, 1, 0, 0, 0, 0, 0 };
 
 // Bone palette (skinMat per joint) pushed via set_bones each frame, + the joint
 // world-matrix scratch used to compose it. STABLE: drawn-after-return.
