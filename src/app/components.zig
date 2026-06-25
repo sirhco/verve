@@ -2198,7 +2198,34 @@ pub fn glSceneMorph(ctx: *const verve.Context) !*verve.Node {
             "drives target 0 at runtime (morph_runtime_set[0]=true), adding a centre " ++
             "bulge on top of the ongoing animation; \u{201c}Reset\u{201d} releases it. " ++
             "Runtime weights override the baked clip per index. " ++
-            "Deferred: skinned+morph, TANGENT deltas, >8 active targets."),
+            "Deferred: skinned+morph, TANGENT deltas."),
+    });
+}
+
+/// verve.gl 16-target morph demo — /gl-morph16.
+/// A 5×5 plane with 16 blend shapes, each deforming a DISTINCT single vertex
+/// upward by 1.0. The baked LINEAR clip sets ALL 16 weights to 0.5 at t=1s so
+/// all 16 active simultaneously — only possible with cap-32 (was cap-8).
+/// CDP differentiator: with old cap-8 only 8 vertices lift; with cap-32 all 16.
+pub fn glSceneMorph16(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/morph16.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%230d0f17'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EMorph16%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 3.5, .pitch = 0.7, .yaw = 0.4 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.5 })
+        .autoRotate(0.2)
+        .build();
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — 16 simultaneous morph targets (cap-32)"),
+        ctx.p().text("A 5×5 subdivided plane with 16 blend shapes (T0..T15), each " ++
+            "deforming a DISTINCT single vertex upward. A LINEAR clip sets ALL 16 " ++
+            "weights to 0.5 simultaneously at t=1s — previously impossible with the " ++
+            "old cap-8 active-set limit. With cap-32, all 16 vertices lift at once. " ++
+            "Validates the morph active-set widening on both WebGL2 and WebGPU."),
+        scene,
     });
 }
 

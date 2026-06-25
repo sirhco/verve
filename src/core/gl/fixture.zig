@@ -3955,6 +3955,238 @@ pub fn morphDemoGlb(alloc: Allocator) ![]u8 {
     return glb;
 }
 
+// ── morphDemo16Glb ────────────────────────────────────────────────────────────
+
+/// Builds a 16-target morph demo GLB on a 5×5 subdivided plane.
+/// Each of the 16 targets bumps a DISTINCT single vertex upward (Y+1.0),
+/// so with the old cap-8 only 8 vertices lift; with cap-32 all 16 lift
+/// simultaneously. The baked LINEAR clip sets all 16 weights to 0.5 at t=1s
+/// so ≥12 are simultaneously nonzero — the CDP gate differentiator.
+///
+/// Used by gen_morph16_glb.zig → gl_asset_gen → morph16.vmesh.
+pub fn morphDemo16Glb(alloc: Allocator) ![]u8 {
+    // ── constants ────────────────────────────────────────────────────────────
+    const N_TARGETS: usize = 16;
+    const N_VERTS: usize = 25;
+    const N_INDICES: usize = 96;
+    // Per-buffer-view sizes
+    const SZ_POS: usize = N_VERTS * 12;  // VEC3 f32 → 300
+    const SZ_NRM: usize = N_VERTS * 12;  // VEC3 f32 → 300
+    const SZ_UV: usize = N_VERTS * 8;    // VEC2 f32 → 200
+    const SZ_IDX: usize = N_INDICES * 2; // u16 → 192
+    const SZ_DELTA: usize = N_VERTS * 12; // per-target POSITION delta → 300
+    // NORMAL deltas omitted (all zero) — not required; only POSITION deltas.
+    // But glTF requires NORMAL alongside POSITION in morph targets.
+    const SZ_NRMDT: usize = N_VERTS * 12; // per-target NORMAL delta (all zero) → 300
+    // Each target contributes SZ_DELTA + SZ_NRMDT = 600 bytes
+    const SZ_TARGET: usize = SZ_DELTA + SZ_NRMDT;
+    // Anim: LINEAR, 3 keyframes (t=0: all 0.0, t=1: all 0.5, t=2: all 0.0)
+    // weights accessor count = 3 × N_TARGETS = 48 scalars
+    const N_KEYS: usize = 3;
+    const SZ_TIMES: usize = N_KEYS * 4; // 12 bytes
+    const SZ_WEIGHTS: usize = N_KEYS * N_TARGETS * 4; // 192 bytes
+    // Padding: off_idx must be 4-aligned; 300+300+200=800, 192 idx → off_idx=800
+    const off_pos: usize = 0;
+    const off_nrm: usize = off_pos + SZ_POS;    // 300
+    const off_uv: usize = off_nrm + SZ_NRM;     // 600
+    const off_idx: usize = off_uv + SZ_UV;      // 800
+    const off_deltas: usize = off_idx + SZ_IDX; // 992
+    const off_times: usize = off_deltas + N_TARGETS * SZ_TARGET; // 992 + 16*600 = 10592
+    const off_weights: usize = off_times + SZ_TIMES; // 10604
+    const bin_total: usize = off_weights + SZ_WEIGHTS; // 10796
+
+    const bin = try alloc.alloc(u8, bin_total);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // Helper: write f32 LE
+    const wf32 = struct {
+        fn w(b: []u8, off: usize, v: f32) void {
+            std.mem.writeInt(u32, b[off..][0..4], @bitCast(v), .little);
+        }
+    }.w;
+    // Helper: write u16 LE
+    const wu16 = struct {
+        fn w(b: []u8, off: usize, v: u16) void {
+            std.mem.writeInt(u16, b[off..][0..2], v, .little);
+        }
+    }.w;
+
+    // ── POSITION (5×5 grid, XZ plane, Y=0) ───────────────────────────────────
+    for (0..5) |j| {
+        for (0..5) |i| {
+            const vi: usize = j * 5 + i;
+            const x: f32 = -1.0 + @as(f32, @floatFromInt(i)) * 0.5;
+            const z: f32 = -1.0 + @as(f32, @floatFromInt(j)) * 0.5;
+            wf32(bin, off_pos + vi * 12 + 0, x);
+            wf32(bin, off_pos + vi * 12 + 4, 0.0);
+            wf32(bin, off_pos + vi * 12 + 8, z);
+        }
+    }
+
+    // ── NORMAL (all 0,1,0) ────────────────────────────────────────────────────
+    for (0..N_VERTS) |vi| {
+        wf32(bin, off_nrm + vi * 12 + 0, 0.0);
+        wf32(bin, off_nrm + vi * 12 + 4, 1.0);
+        wf32(bin, off_nrm + vi * 12 + 8, 0.0);
+    }
+
+    // ── TEXCOORD_0 ───────────────────────────────────────────────────────────
+    for (0..5) |j| {
+        for (0..5) |i| {
+            const vi: usize = j * 5 + i;
+            wf32(bin, off_uv + vi * 8 + 0, @as(f32, @floatFromInt(i)) / 4.0);
+            wf32(bin, off_uv + vi * 8 + 4, @as(f32, @floatFromInt(j)) / 4.0);
+        }
+    }
+
+    // ── INDICES (4×4 quads × 2 tris × 3 verts = 96) ─────────────────────────
+    var iidx: usize = 0;
+    for (0..4) |j| {
+        for (0..4) |i| {
+            const base: u16 = @intCast(j * 5 + i);
+            wu16(bin, off_idx + iidx * 2 + 0, base);
+            wu16(bin, off_idx + iidx * 2 + 2, base + 1);
+            wu16(bin, off_idx + iidx * 2 + 4, base + 5);
+            wu16(bin, off_idx + iidx * 2 + 6, base + 1);
+            wu16(bin, off_idx + iidx * 2 + 8, base + 6);
+            wu16(bin, off_idx + iidx * 2 + 10, base + 5);
+            iidx += 6;
+        }
+    }
+
+    // ── Per-target POSITION deltas: target T bumps vertex T upward by 1.0 ───
+    // Vertices 0..15 → each target deforms exactly ONE distinct vertex.
+    // With old cap-8 only first 8 vertices lift; cap-32 all 16 lift at once.
+    for (0..N_TARGETS) |t| {
+        const tpos_off = off_deltas + t * SZ_TARGET;
+        wf32(bin, tpos_off + t * 12 + 4, 1.0); // dY = 1.0 for vertex t
+    }
+    // NORMAL deltas remain zero (already zeroed by @memset above)
+
+    // ── Anim times: [0.0, 1.0, 2.0] ─────────────────────────────────────────
+    wf32(bin, off_times + 0, 0.0);
+    wf32(bin, off_times + 4, 1.0);
+    wf32(bin, off_times + 8, 2.0);
+
+    // ── Anim weights: LINEAR, 3 keys × 16 targets ────────────────────────────
+    // k0: all 0.0  (rest)
+    // k1: all 0.5  (all 16 simultaneously at half-weight — the differentiator)
+    // k2: all 0.0  (return)
+    for (0..N_TARGETS) |t| {
+        wf32(bin, off_weights + 0 * N_TARGETS * 4 + t * 4, 0.0); // k0
+        wf32(bin, off_weights + 1 * N_TARGETS * 4 + t * 4, 0.5); // k1 — 16 simultaneous
+        wf32(bin, off_weights + 2 * N_TARGETS * 4 + t * 4, 0.0); // k2
+    }
+
+    // ── JSON ──────────────────────────────────────────────────────────────────
+    // bufferViews:
+    //  0=pos, 1=nrm, 2=uv, 3=idx
+    //  4..35 = 16 targets × (pos_delta, nrm_delta) = 32 entries
+    //  36=times, 37=weights
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+    try w.writeAll("{\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"scene\":0,\"scenes\":[{\"nodes\":[0]}],");
+    try w.writeAll("\"nodes\":[{\"mesh\":0}],");
+    // bufferViews
+    try w.writeAll("\"bufferViews\":[");
+    // 0=pos
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_pos, SZ_POS });
+    try w.writeAll(",");
+    // 1=nrm
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_nrm, SZ_NRM });
+    try w.writeAll(",");
+    // 2=uv
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_uv, SZ_UV });
+    try w.writeAll(",");
+    // 3=idx
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_idx, SZ_IDX });
+    // 4..35: per-target pos+nrm deltas
+    for (0..N_TARGETS) |t| {
+        const toff = off_deltas + t * SZ_TARGET;
+        try w.writeAll(",");
+        try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ toff, SZ_DELTA }); // pos
+        try w.writeAll(",");
+        try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ toff + SZ_DELTA, SZ_NRMDT }); // nrm
+    }
+    try w.writeAll(",");
+    // 36=times
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_times, SZ_TIMES });
+    try w.writeAll(",");
+    // 37=weights
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ off_weights, SZ_WEIGHTS });
+    try w.writeAll("],");
+    // accessors
+    try w.writeAll("\"accessors\":[");
+    // 0=pos
+    try w.writeAll("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":25,\"type\":\"VEC3\",\"min\":[-1.0,0.0,-1.0],\"max\":[1.0,0.0,1.0]},");
+    // 1=nrm
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":25,\"type\":\"VEC3\"},");
+    // 2=uv
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":25,\"type\":\"VEC2\"},");
+    // 3=idx
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":96,\"type\":\"SCALAR\"},");
+    // 4..35: per-target pos+nrm delta accessors
+    for (0..N_TARGETS) |t| {
+        const acc_bv_pos = 4 + t * 2;
+        const acc_bv_nrm = acc_bv_pos + 1;
+        try w.print("{{\"bufferView\":{d},\"byteOffset\":0,\"componentType\":5126,\"count\":25,\"type\":\"VEC3\"}},", .{acc_bv_pos});
+        try w.print("{{\"bufferView\":{d},\"byteOffset\":0,\"componentType\":5126,\"count\":25,\"type\":\"VEC3\"}},", .{acc_bv_nrm});
+    }
+    // 36=times
+    try w.writeAll("{\"bufferView\":36,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"SCALAR\",\"min\":[0.0],\"max\":[2.0]},");
+    // 37=weights (LINEAR: count = N_KEYS × N_TARGETS = 48)
+    try w.print("{{\"bufferView\":37,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"SCALAR\"}}", .{N_KEYS * N_TARGETS});
+    try w.writeAll("],");
+    // mesh: targetNames T0..T15
+    try w.writeAll("\"meshes\":[{\"name\":\"MorphPlane16\",\"extras\":{\"targetNames\":[");
+    for (0..N_TARGETS) |t| {
+        if (t > 0) try w.writeAll(",");
+        try w.print("\"T{d}\"", .{t});
+    }
+    try w.writeAll("]},");
+    try w.writeAll("\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0,");
+    try w.writeAll("\"targets\":[");
+    for (0..N_TARGETS) |t| {
+        if (t > 0) try w.writeAll(",");
+        const tgt_acc_pos = 4 + t * 2;
+        const tgt_acc_nrm = tgt_acc_pos + 1;
+        try w.print("{{\"POSITION\":{d},\"NORMAL\":{d}}}", .{ tgt_acc_pos, tgt_acc_nrm });
+    }
+    try w.writeAll("]}]}],");
+    // material
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.3,0.7,0.9,1.0],\"metallicFactor\":0.0,\"roughnessFactor\":0.5}}],");
+    // animation
+    try w.writeAll("\"animations\":[{\"name\":\"MorphDemo16Anim\",");
+    try w.writeAll("\"channels\":[{\"sampler\":0,\"target\":{\"node\":0,\"path\":\"weights\"}}],");
+    try w.writeAll("\"samplers\":[{\"input\":36,\"output\":37,\"interpolation\":\"LINEAR\"}]}],");
+    // buffer
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}]}}", .{bin_total});
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    const bin_padded: u32 = @intCast((bin_total + 3) & ~@as(usize, 3));
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF"); goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little); goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little); goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little); goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON"); goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes); goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little); goff += 4;
+    glb[goff] = 0x42; glb[goff + 1] = 0x49; glb[goff + 2] = 0x4E; glb[goff + 3] = 0x00;
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_total], bin);
+    return glb;
+}
+
 // ── morphDemoGlb tests ────────────────────────────────────────────────────────
 
 test "morphDemoGlb: parses as valid glb with 3 targets" {
@@ -3963,6 +4195,15 @@ test "morphDemoGlb: parses as valid glb with 3 targets" {
     var model = try gltf_mod.parseGlb(testing.allocator, glb);
     defer model.deinit();
     try testing.expectEqual(@as(u32, 3), model.morph.?.target_count);
+    try testing.expect(model.morph.?.weight_clip != null);
+}
+
+test "morphDemo16Glb: parses as valid glb with 16 targets" {
+    const glb = try morphDemo16Glb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try gltf_mod.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    try testing.expectEqual(@as(u32, 16), model.morph.?.target_count);
     try testing.expect(model.morph.?.weight_clip != null);
 }
 

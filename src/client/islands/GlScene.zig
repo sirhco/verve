@@ -312,12 +312,12 @@ const Inst = struct {
     inst_time_ms: f32 = 0,
 
     // M7: morph-target state. Lives in Inst (static pool) — NOT on the frame
-    // stack. morph_weights is indexed by target; active set is the top-8 by
+    // stack. morph_weights is indexed by target; active set is the top-32 by
     // |weight|. Zeroed by default (Inst{} = no morph animation).
     morph_enabled: bool = false,
     morph_weights: [max_morph_targets]f32 = .{0} ** max_morph_targets,
-    morph_active_idx: [8]u32 = .{0} ** 8,
-    morph_active_wt: [8]f32 = .{0} ** 8,
+    morph_active_idx: [32]u32 = .{0} ** 32,
+    morph_active_wt: [32]f32 = .{0} ** 32,
     morph_count: u32 = 0,
     morph_tex_recorded: bool = false, // true once createMorphTex emitted (for restore)
     // M8: per-index runtime-set flag. When set, the per-frame baked-clip advance
@@ -1758,7 +1758,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     }
                 }
             }
-            // Select the top-8 by |weight| into the active set.
+            // Select the top-32 by |weight| into the active set.
             // Initialise with the first `n` candidates; then displace the
             // weakest if a later target is stronger.
             inst.morph_count = 0;
@@ -1766,7 +1766,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             while (wi < n_targets) : (wi += 1) {
                 const w = inst.morph_weights[wi];
                 const aw = if (w < 0) -w else w;
-                if (inst.morph_count < 8) {
+                if (inst.morph_count < 32) {
                     inst.morph_active_idx[inst.morph_count] = wi;
                     inst.morph_active_wt[inst.morph_count] = w;
                     inst.morph_count += 1;
@@ -1775,7 +1775,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     var min_slot: u32 = 0;
                     var min_aw: f32 = if (inst.morph_active_wt[0] < 0) -inst.morph_active_wt[0] else inst.morph_active_wt[0];
                     var ms: u32 = 1;
-                    while (ms < 8) : (ms += 1) {
+                    while (ms < 32) : (ms += 1) {
                         const caw = if (inst.morph_active_wt[ms] < 0) -inst.morph_active_wt[ms] else inst.morph_active_wt[ms];
                         if (caw < min_aw) {
                             min_aw = caw;

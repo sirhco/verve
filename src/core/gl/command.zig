@@ -183,7 +183,7 @@ pub const shadow_tiles_per_row: u32 = 4;
 pub const point_atlas_w: u32 = 1536; // 3 × 512
 pub const point_atlas_h: u32 = 4096; // 8 × 512 (was effectively 1024 for one caster)
 pub const fog_params_f32: u32 = 8; // [mode, r,g,b, near, far, density, _pad]
-pub const morph_max_active: u32 = 8; // K: max simultaneously-active morph influences
+pub const morph_max_active: u32 = 32; // K: max simultaneously-active morph influences
 pub const material_len_f32: u32 = 12; // base_color rgba | metallic, roughness, occlusion_strength, normal_scale | emissive rgb, 0
 
 pub const tex_slot_base: u32 = 0;
@@ -368,11 +368,11 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
     ;
     // Morph-target uniforms (variant_morph): sampler2D texture (RGBA16F,
     // width=vertex_count, height=target_count*2), per-active-target indices +
-    // weights, and the count of active targets (≤ morph_max_active = 8).
+    // weights, and the count of active targets (≤ morph_max_active = 32).
     const morph_uniforms =
         \\uniform highp sampler2D u_morph_tex;
-        \\uniform int u_morph_idx[8];
-        \\uniform float u_morph_wt[8];
+        \\uniform int u_morph_idx[32];
+        \\uniform float u_morph_wt[32];
         \\uniform int u_morph_count;
         \\
     ;
@@ -1680,14 +1680,14 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     ;
     // Morph-target parameters (variant_morph). SEPARATE group(0) bindings at
     // @binding(3) (UBO) and @binding(4) (texture), both VERTEX-visible.
-    // UBO layout (std140-compatible, 80 bytes):
-    //   offset   0: idx: array<vec4<i32>, 2>  → 2×16 bytes = 32 bytes (8 i32 slots)
-    //   offset  32: wt:  array<vec4<f32>, 2>  → 2×16 bytes = 32 bytes (8 f32 slots)
-    //   offset  64: count: i32                → 4 bytes (followed by 12 bytes implicit pad)
+    // UBO layout (std140-compatible, 272 bytes):
+    //   offset   0: idx: array<vec4<i32>, 8>  → 8×16 bytes = 128 bytes (32 i32 slots)
+    //   offset 128: wt:  array<vec4<f32>, 8>  → 8×16 bytes = 128 bytes (32 f32 slots)
+    //   offset 256: count: i32                → 4 bytes (followed by 12 bytes implicit pad)
     // Access: morph.idx[i / 4][i % 4]  morph.wt[i / 4][i % 4]  morph.count
     // M6 writes the UBO matching this exact layout.
     const uniforms_morph =
-        \\struct Morph { idx: array<vec4<i32>, 2>, wt: array<vec4<f32>, 2>, count: i32 };
+        \\struct Morph { idx: array<vec4<i32>, 8>, wt: array<vec4<f32>, 8>, count: i32 };
         \\@group(0) @binding(3) var<uniform> morph: Morph;
         \\@group(0) @binding(4) var u_morph_tex: texture_2d<f32>;
         \\
@@ -5689,7 +5689,7 @@ test "morph: variant bit + tags + encoder payloads" {
     try testing.expectEqual(@as(u32, 1 << 14), variant_morph);
     try testing.expectEqual(@as(u8, 29), @intFromEnum(Tag.set_morph_weights));
     try testing.expectEqual(@as(u8, 30), @intFromEnum(Tag.create_morph_tex));
-    try testing.expectEqual(@as(u32, 8), morph_max_active);
+    try testing.expectEqual(@as(u32, 32), morph_max_active);
 
     var buf: [128]u8 = undefined;
     var enc = Encoder.init(&buf);
@@ -5735,6 +5735,18 @@ test "morph WGSL: variant emits morph binding + textureLoad; non-morph frozen" {
     try testing.expect(std.mem.indexOf(u8, w, "morph.count") != null);
     const plain = wgslPbr(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, plain, "u_morph_tex") == null);
+}
+
+test "morph cap-32: GLSL declares [32] arrays; WGSL declares 8 vec4 arrays" {
+    // Validates the slice-2 widening: any change to these sizes is a wire break.
+    const glsl = pbrVertexSrc(variant_pbr | variant_morph);
+    try testing.expect(std.mem.indexOf(u8, glsl, "u_morph_idx[32]") != null);
+    try testing.expect(std.mem.indexOf(u8, glsl, "u_morph_wt[32]") != null);
+    const wgsl = wgslPbr(variant_pbr | variant_morph);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "array<vec4<i32>, 8>") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "array<vec4<f32>, 8>") != null);
+    // morph_max_active must be 32
+    try testing.expectEqual(@as(u32, 32), morph_max_active);
 }
 
 // ── Point-light shadow: variant + tags + encoder payloads ─────────────────────

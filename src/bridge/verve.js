@@ -6175,23 +6175,23 @@
         }
         case 29: { // SET_MORPH_WEIGHTS — upload idx/wt/count uniforms + bind morph texture (unit 9)
           // Payload (command.zig Encoder.setMorphWeights, 12B): count | idx_ptr | wt_ptr.
-          // idx_ptr → count u32 indices; wt_ptr → count f32 weights.  Pad both to 8
-          // entries before uploading (the GLSL arrays are fixed-size 8).
+          // idx_ptr → count u32 indices; wt_ptr → count f32 weights.  Pad both to 32
+          // entries before uploading (the GLSL arrays are fixed-size 32).
           const count   = dv.getUint32(off, true);
           const idxPtr  = dv.getUint32(off + 4, true);
           const wtPtr   = dv.getUint32(off + 8, true);
           const sh = st.active;
           if (!sh) break;
           if (sh.morphIdx) {
-            const idx = new Int32Array(8);
-            const src = new Uint32Array(memory.buffer, idxPtr, count);
-            for (let i = 0; i < count; i++) idx[i] = src[i];
+            const idx = new Int32Array(32);
+            const src = new Uint32Array(memory.buffer, idxPtr, Math.min(count, 32));
+            for (let i = 0; i < Math.min(count, 32); i++) idx[i] = src[i];
             gl.uniform1iv(sh.morphIdx, idx);
           }
           if (sh.morphWt) {
-            const wt = new Float32Array(8);
-            const src = new Float32Array(memory.buffer, wtPtr, count);
-            for (let i = 0; i < count; i++) wt[i] = src[i];
+            const wt = new Float32Array(32);
+            const src = new Float32Array(memory.buffer, wtPtr, Math.min(count, 32));
+            for (let i = 0; i < Math.min(count, 32); i++) wt[i] = src[i];
             gl.uniform1fv(sh.morphWt, wt);
           }
           if (sh.morphCount) gl.uniform1i(sh.morphCount, count);
@@ -7230,7 +7230,7 @@
             }
             const hasMorph = (variant & 0x4000) !== 0; // variant_morph: morph-target UBO + texture
             if (hasMorph) {
-              // binding 3: morph weights UBO (80 bytes: idx[8] + wt[8] + count + pad),
+              // binding 3: morph weights UBO (272 bytes: idx[32]@0 + wt[32]@128 + count@256 + pad),
               // VERTEX-visible (the vertex shader applies morph deltas).
               bgl0Entries.push({
                 binding: 3,
@@ -7890,10 +7890,10 @@
               if (!st.fogBuf) st.fogBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
               bg0Entries.push({ binding: 2, resource: { buffer: st.fogBuf } });
             }
-            // binding 3: morph weights UBO (80B), binding 4: morph texture (VERTEX-visible).
+            // binding 3: morph weights UBO (272B), binding 4: morph texture (VERTEX-visible).
             // Layout has bindings 3+4 iff hasMorph — must match bgl0 exactly.
             if (active.hasMorph) {
-              if (!st.morphBuf) st.morphBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+              if (!st.morphBuf) st.morphBuf = device.createBuffer({ size: 272, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
               const mte = st.morphTexView;
               if (mte) {
                 bg0Entries.push({ binding: 3, resource: { buffer: st.morphBuf } });
@@ -8248,26 +8248,26 @@
           device.queue.writeBuffer(st.fogBuf, 0, memory.buffer, dv.getUint32(off, true), 32);
           break;
         }
-        case 29: { // SET_MORPH_WEIGHTS (WebGPU) — write 80-byte UBO at group(0) binding(3).
+        case 29: { // SET_MORPH_WEIGHTS (WebGPU) — write 272-byte UBO at group(0) binding(3).
           // Payload (command.zig Encoder.setMorphWeights, 12B): count | idx_ptr | wt_ptr.
-          // UBO layout (80 bytes): idx 8×i32 @0 (as 2×vec4i), wt 8×f32 @32 (as 2×vec4),
-          // count i32 @64, pad 12 to 80 bytes total.
+          // UBO layout (272 bytes): idx 32×i32 @0 (as 8×vec4i), wt 32×f32 @128 (as 8×vec4),
+          // count i32 @256, pad 12 to 272 bytes total.
           const count  = dv.getUint32(off, true);
           const idxPtr = dv.getUint32(off + 4, true);
           const wtPtr  = dv.getUint32(off + 8, true);
-          if (!st.morphBuf) st.morphBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-          // idx: 8 i32 at offset 0 (pad unused with 0)
-          const idx = new Int32Array(8);
-          const idxSrc = new Uint32Array(memory.buffer, idxPtr, Math.min(count, 8));
-          for (let i = 0; i < Math.min(count, 8); i++) idx[i] = idxSrc[i];
-          device.queue.writeBuffer(st.morphBuf, 0, idx.buffer, 0, 32);
-          // wt: 8 f32 at offset 32 (pad unused with 0)
-          const wt = new Float32Array(8);
-          const wtSrc = new Float32Array(memory.buffer, wtPtr, Math.min(count, 8));
-          for (let i = 0; i < Math.min(count, 8); i++) wt[i] = wtSrc[i];
-          device.queue.writeBuffer(st.morphBuf, 32, wt.buffer, 0, 32);
-          // count: i32 at offset 64 (4B, then 12B pad implicit to end of 80B buffer)
-          device.queue.writeBuffer(st.morphBuf, 64, new Int32Array([count]).buffer, 0, 4);
+          if (!st.morphBuf) st.morphBuf = device.createBuffer({ size: 272, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          // idx: 32 i32 at offset 0 (pad unused with 0)
+          const idx = new Int32Array(32);
+          const idxSrc = new Uint32Array(memory.buffer, idxPtr, Math.min(count, 32));
+          for (let i = 0; i < Math.min(count, 32); i++) idx[i] = idxSrc[i];
+          device.queue.writeBuffer(st.morphBuf, 0, idx.buffer, 0, 128);
+          // wt: 32 f32 at offset 128 (pad unused with 0)
+          const wt = new Float32Array(32);
+          const wtSrc = new Float32Array(memory.buffer, wtPtr, Math.min(count, 32));
+          for (let i = 0; i < Math.min(count, 32); i++) wt[i] = wtSrc[i];
+          device.queue.writeBuffer(st.morphBuf, 128, wt.buffer, 0, 128);
+          // count: i32 at offset 256 (4B, then 12B pad implicit to end of 272B buffer)
+          device.queue.writeBuffer(st.morphBuf, 256, new Int32Array([count]).buffer, 0, 4);
           // Invalidate bg0 so the next DRAW_PBR rebuilds it with fresh morphBuf data.
           st.bg0Layout = null;
           break;
@@ -8842,7 +8842,7 @@
       bindGroup: null,
       instanceBuf: null, // lazy GPUBuffer (VERTEX|COPY_DST) for per-instance mat4+color (case 27)
       fogBuf: null, // lazy 32-byte UBO (UNIFORM|COPY_DST) for distance fog (case 28/binding 2)
-      morphBuf: null, // lazy 80-byte UBO (UNIFORM|COPY_DST) for morph weights (case 29/binding 3)
+      morphBuf: null, // lazy 272-byte UBO (UNIFORM|COPY_DST) for morph weights (case 29/binding 3)
       morphTexView: null, // GPUTextureView for morph-target data texture (case 30/binding 4)
       pbrUniform: null, // shared PBR uniform buffer (lazy; PBR_U.size bytes)
       bonesBuf: null, // shared bones palette uniform (lazy; 64 mat4) — skinned
