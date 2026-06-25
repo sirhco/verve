@@ -581,10 +581,11 @@ verve-server [--host HOST] [--port PORT] [--body-limit SIZE]
 ## Scaffolding a new app
 
 ```sh
-zig build cli                                  # builds zig-out/bin/verve-cli
+# from the Verve framework checkout — plain `zig build` produces verve-cli:
+zig build                                      # builds zig-out/bin/{verve-server,verve-cli}
 ./zig-out/bin/verve-cli new ~/code/my-app
 cd ~/code/my-app
-zig build && ./zig-out/bin/verve-server
+zig build && ./zig-out/bin/verve-server        # or: zig build run
 ```
 
 The scaffolder embeds the entire Verve source tree at build time and writes it into the target directory. The generated app is self-contained — no Zig package-manager dependency, no git clone.
