@@ -43,11 +43,20 @@ var asset: ?gl.vmesh.Reader = null;
 var mvp: [16]f32 = undefined;
 var model_mat: [16]f32 = undefined;
 var normal9: [9]f32 = undefined;
-var camera_pos: [3]f32 = .{ 4, 2.2, 5.5 };
+var camera_pos: [3]f32 = .{ 2.6, 1.3, 3.4 };
 // Material: baseColor.rgba, [metallic, roughness, occlusion, normalScale], emissive.rgb, pad.
-var material: [12]f32 = .{ 0.8, 0.8, 1.0, 1.0, 0, 0.5, 1, 1, 0, 0, 0, 0 };
-// One directional light.
-var light: [8]f32 = .{ 0, 3, -0.4, -0.7, -0.5, 1, 1, 1 };
+var material: [12]f32 = .{ 0.85, 0.85, 1.0, 1.0, 0, 0.45, 1, 1, 0, 0, 0, 0 };
+// Two directional lights, 16 f32 each (4 vec4/light, the set_lights wire format):
+//   v0 = type/intensity/pos.xy, v1 = pos.z/dir.xyz, v2 = color.rgb/range, v3 = cosIn/cosOut/shadow.
+// No IBL is bound on this standalone island, so a key + camera-side fill keep both the lit
+// and shadowed faces of the bar readable as it bends + bulges.
+const light_count: u32 = 2;
+var light: [light_count * 16]f32 = .{
+    // key — upper-right-front, warm-white
+    0, 5.0, 0, 0, 0, -0.4,  -0.7,  -0.5,  1.0,  0.98, 0.92, 0, 0, 0, 0, 0,
+    // fill — from the camera direction (target − camera), cooler, softer
+    0, 2.6, 0, 0, 0, -0.59, -0.08, -0.80, 0.85, 0.9,  1.0,  0, 0, 0, 0, 0,
+};
 
 // Bone palette (one mat4 per joint).
 var bones: [max_bones * 16]f32 = [_]f32{0} ** (max_bones * 16);
@@ -180,7 +189,7 @@ export fn glskinmorph_frame(dt_ms: f32, width: u32, height: u32) u32 {
     const proj = gl.math.Mat4.perspective(1.0, aspect, 0.1, 100.0);
     const view = gl.math.Mat4.lookAt(
         gl.math.Vec3.init(camera_pos[0], camera_pos[1], camera_pos[2]),
-        gl.math.Vec3.init(0, 1.3, 0),
+        gl.math.Vec3.init(0, 0.95, 0),
         gl.math.Vec3.init(0, 1, 0),
     );
     const model = gl.math.Mat4.fromTrs(
@@ -219,7 +228,7 @@ export fn glskinmorph_frame(dt_ms: f32, width: u32, height: u32) u32 {
         enc.createMorphTex(
             morph_tex_handle,
             a.morphVertexCount(),
-            a.morphTargetCount() * 2, // height = target_count * 2 (pos row + nrm row per target)
+            a.morphTargetCount() * 3, // height = target_count * 3 (pos + nrm + tan rows per target; vmesh v14)
             @intCast(@intFromPtr(deltas.ptr)),
             @intCast(deltas.len),
         );
@@ -227,7 +236,7 @@ export fn glskinmorph_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
     enc.beginFrame(.{ 0.04, 0.05, 0.10, 1.0 }, width, height);
     enc.setPipeline(shader_handle, gl.command.state_depth_test | gl.command.state_cull_back);
-    enc.setLights(1, @intCast(@intFromPtr(&light)));
+    enc.setLights(light_count, @intCast(@intFromPtr(&light)));
     enc.setBones(@min(a.jointCount(), max_bones), @intCast(@intFromPtr(&bones)));
     // Upload morph weights (count=1, target index 0, weight oscillating).
     enc.setMorphWeights(1, @intCast(@intFromPtr(&morph_idx)), @intCast(@intFromPtr(&morph_wt)));
