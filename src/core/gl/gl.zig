@@ -16,6 +16,7 @@ pub const orbit = @import("orbit.zig");
 pub const ray = @import("ray.zig");
 pub const bvh = @import("bvh.zig");
 pub const cull = @import("cull.zig");
+pub const decal = @import("decal.zig");
 pub const registry = @import("registry.zig");
 pub const anim_target = @import("anim_target.zig");
 // Native-side asset pipeline (std.json / decoder allocations). Island
@@ -50,6 +51,7 @@ test {
     _ = ray;
     _ = bvh;
     _ = cull;
+    _ = decal;
     _ = registry;
     _ = anim_target;
     _ = png;
