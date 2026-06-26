@@ -1,8 +1,8 @@
 //! verve.gl decal demo — drives the /gl-decals canvas.
 //!
-//! Renders a UV sphere (target surface, variant_lit_uv) with a crosshair/ring
-//! decal (variant_decal, wire tag 44) projected onto it via
-//! `gl.decal.projectDecal`. The decal basis is built from the sphere normal
+//! Renders a UV sphere (target surface, variant_pbr — the proven both-backend
+//! mesh path) with a crosshair/ring decal (variant_decal, wire tag 44) projected
+//! onto it via `gl.decal.projectDecal`. The decal basis is built from the sphere normal
 //! at the chosen point so the overlay conforms to the surface curvature.
 //!
 //! STRUCTURE: singleton statics (sphere + decal buffers in chunk linear memory,
@@ -34,10 +34,20 @@ const h_sphere_shader: u32 = 1;
 const h_decal_shader: u32 = 2;
 const h_sphere_vbuf: u32 = 3;
 const h_sphere_ibuf: u32 = 4;
-const h_sphere_tex: u32 = 5;
-const h_decal_tex: u32 = 6;
-const h_decal_vbuf: u32 = 7;
-const h_decal_ibuf: u32 = 8;
+const h_base_tex: u32 = 5; // 1×1 base color (PBR slot 0)
+const h_mr_tex: u32 = 6; // 1×1 metallic-roughness (PBR slot 1)
+const h_occ_tex: u32 = 7; // 1×1 occlusion (PBR slot 4)
+const h_decal_tex: u32 = 8;
+const h_decal_vbuf: u32 = 9;
+const h_decal_ibuf: u32 = 10;
+
+/// Sphere render variant: plain PBR (Cook-Torrance + IBL + in-shader ACES
+/// tonemap). Rendered direct-to-canvas (no post path) so we keep the in-shader
+/// tonemap — i.e. NOT variant_linear_output. Same comptime source path on both
+/// backends (wgslPbr / pbrVertexSrc+pbrFragmentSrc) → the bridge builds its real
+/// PBR pipeline. This is the proven both-backend mesh path (mirrors GlSsao /
+/// GlSsr / GlDof scene draws, minus the post chain).
+const sphere_variant: u32 = gl.command.variant_pbr;
 
 /// Frame fn name passed to gl_start / gl_start_gpu.
 const frame_export: []const u8 = "gldecals_frame";
@@ -58,9 +68,11 @@ var decal_dirty: bool = true; // triggers re-projection (+ re-upload) on first f
 
 // ── Sphere geometry (chunk static) ───────────────────────────────────────────
 
-/// Interleaved vertex buffer: pos(12B)@0, normal(12B)@12, uv(8B)@24, stride=32B.
-/// 525 verts × 32B = 16 800B.
-var sphere_verts: [N_VERTS * 8]f32 = undefined;
+/// PBR-layout interleaved vertex buffer (stride-48):
+///   pos vec3@0, normal vec3@12, tangent vec4@24, uv vec2@40.
+/// 525 verts × 48B = 25 200B. Tangent is the longitude direction (w=1) — decals
+/// don't need correct tangents and the sphere isn't normal-mapped.
+var sphere_verts: [N_VERTS * 12]f32 = undefined;
 
 /// u16 index buffer for the sphere: 2880 × 2B = 5 760B.
 var sphere_indices: [N_INDICES]u16 = undefined;
@@ -80,32 +92,53 @@ var decal_out_indices: [gl.decal.max_decal_indices]u16 = undefined;
 var decal_vert_count: u32 = 0;
 var decal_index_count: u32 = 0;
 
-// ── Textures ──────────────────────────────────────────────────────────────────
+// ── Textures (1×1 PBR material maps + decal sticker) ─────────────────────────
 
-/// 1×1 neutral-grey RGBA8 texture for the sphere surface.
-var sphere_tex_data: [4]u8 = .{ 200, 200, 200, 255 };
+/// 1×1 light-grey base color (sRGB). Material baseColor factor multiplies this.
+var base_rgba: [4]u8 = .{ 200, 200, 205, 255 };
+/// 1×1 white metallic-roughness (R=occ unused, G=roughness, B=metallic); the
+/// material factors (metallic 0, roughness 0.6) scale these down.
+var mr_rgba: [4]u8 = .{ 255, 255, 255, 255 };
+/// 1×1 white occlusion (AO = 1, no-op).
+var occ_rgba: [4]u8 = .{ 255, 255, 255, 255 };
 
 /// 32×32 RGBA8 ring-and-crosshair decal texture (alpha=0 outside shapes).
 var decal_tex_data: [32 * 32 * 4]u8 = undefined;
 
 // ── STABLE statics (addresses carried in draw records) ────────────────────────
 
-/// Combined MVP matrix (proj·view; model = identity) passed to both draws.
+/// Combined MVP matrix (clipFix·proj·view; model = identity) for both draws.
 var mvp_mat: [16]f32 = undefined;
 
-/// Tint for the sphere surface draw (white, full alpha).
-var sphere_color: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
+/// Sphere model matrix (identity — sphere is the unit sphere at the origin).
+var model_mat: [16]f32 = undefined;
+
+/// Inverse-transpose upper-3×3 of the model matrix (identity here).
+var normal9: [9]f32 = undefined;
+
+/// Camera world position (= lookAt eye), threaded to drawPbr for specular V.
+var camera_pos: [3]f32 = .{ 3.5, 1.2, 0.0 };
+
+/// PBR material block (12 f32, command.zig layout):
+///   baseColor.rgba | metallic, roughness, occlusion_strength, normal_scale |
+///   emissive.rgb, pad. Matte light-grey dielectric so the directional + ambient
+///   IBL terms read clearly under the decal.
+var material: [12]f32 = .{ 0.8, 0.8, 0.82, 1, 0, 0.6, 1, 1, 0, 0, 0, 0 };
+
+/// One directional light (16 f32, set_lights wire = 4 vec4/light):
+///   v0 = type/intensity/pos.xy, v1 = pos.z/dir.xyz, v2 = color.rgb/range, v3 = shadow.
+var light: [16]f32 = .{ 0, 2.4, 0, 0, 0, -0.3, -0.8, -0.4, 1, 1, 1, 0, 0, 0, 0, 0 };
 
 /// Tint for the decal draw (orange-red, 90% opacity).
 var decal_color: [4]f32 = .{ 1.0, 0.45, 0.1, 0.9 };
 
 // cmd_buf sizing:
-//   resources (once): createShader×2(56) + createTexture×2(48) + createBuffer sphere×2(40) = 144B
+//   resources (once): createShader×2(56) + createTexture×3(72) + createBuffer sphere×2(40) = 168B
 //   decal dirty: createBuffer decal×2(40)
-//   per-frame: beginFrame(28) + setPipeline×2(24) + bindTexture(12) + drawSub(28)
-//              + drawDecal(32) + endFrame(8) = 132B
+//   per-frame: beginFrame(28) + setPipeline×2(24) + setLights(12) + bindTexture×3(36)
+//              + drawPbr(40) + drawDecal(36) + endFrame(8) = 184B
 //   header: 4B
-//   total first frame: 4 + 144 + 40 + 132 = 320B → 2048B ample.
+//   total first frame: 4 + 168 + 40 + 184 = 396B → 2048B ample.
 var cmd_buf: [2048]u8 = undefined;
 
 // ── WebGPU depth-range fix ────────────────────────────────────────────────────
@@ -150,15 +183,20 @@ fn initSphere() void {
             const z = sin_t * sin_p;
             const u_coord: f32 = @as(f32, @floatFromInt(sector)) / @as(f32, @floatFromInt(SECTORS));
             const v_coord: f32 = @as(f32, @floatFromInt(ring)) / @as(f32, @floatFromInt(RINGS));
-            // Stride-32 interleaved: pos(3f) + normal(3f) + uv(2f)
-            sphere_verts[vi * 8 + 0] = x;
-            sphere_verts[vi * 8 + 1] = y;
-            sphere_verts[vi * 8 + 2] = z;
-            sphere_verts[vi * 8 + 3] = x; // unit sphere: normal == position
-            sphere_verts[vi * 8 + 4] = y;
-            sphere_verts[vi * 8 + 5] = z;
-            sphere_verts[vi * 8 + 6] = u_coord;
-            sphere_verts[vi * 8 + 7] = v_coord;
+            // Tangent = longitude direction (d pos / d phi normalized) = (-sin_p, 0, cos_p), w=1.
+            // PBR-layout stride-48 interleaved: pos(3f) + normal(3f) + tangent(4f) + uv(2f)
+            sphere_verts[vi * 12 + 0] = x;
+            sphere_verts[vi * 12 + 1] = y;
+            sphere_verts[vi * 12 + 2] = z;
+            sphere_verts[vi * 12 + 3] = x; // unit sphere: normal == position
+            sphere_verts[vi * 12 + 4] = y;
+            sphere_verts[vi * 12 + 5] = z;
+            sphere_verts[vi * 12 + 6] = -sin_p; // tangent.x
+            sphere_verts[vi * 12 + 7] = 0; // tangent.y
+            sphere_verts[vi * 12 + 8] = cos_p; // tangent.z
+            sphere_verts[vi * 12 + 9] = 1; // tangent.w (handedness)
+            sphere_verts[vi * 12 + 10] = u_coord;
+            sphere_verts[vi * 12 + 11] = v_coord;
             // Flat positions for projectDecal
             sphere_pos_flat[vi * 3 + 0] = x;
             sphere_pos_flat[vi * 3 + 1] = y;
@@ -290,6 +328,17 @@ export fn hydrate(props_ptr: [*]const u8, props_len: u32) void {
     buildDecalTexture();
     // decal_dirty is already true; first frame will reproject.
 
+    // Sphere model = identity (unit sphere at the origin). Compute its
+    // inverse-transpose normal matrix once (also identity); both are stable
+    // statics carried by the drawPbr record.
+    const model = gl.math.Mat4.fromTrs(
+        gl.math.Vec3.init(0, 0, 0),
+        gl.math.Quat.fromAxisAngle(gl.math.Vec3.init(0, 1, 0), 0),
+        gl.math.Vec3.init(1, 1, 1),
+    );
+    model_mat = model.m;
+    normal9 = gl.math.normalMatrix(model);
+
     if (canvas_handle) |h| {
         if (use_webgpu)
             gl_start_gpu(h, frame_export.ptr, frame_export.len)
@@ -312,13 +361,15 @@ export fn gldecals_frame(dt_ms: f32, width: u32, height: u32) u32 {
     // ── Camera ───────────────────────────────────────────────────────────────
     const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(@max(height, 1)));
     const proj = gl.math.Mat4.perspective(pi / 3.5, aspect, 0.1, 20.0);
-    const eye = gl.math.Vec3.init(@cos(yaw) * 3.5, 1.2, @sin(yaw) * 3.5);
+    camera_pos = .{ @cos(yaw) * 3.5, 1.2, @sin(yaw) * 3.5 };
+    const eye = gl.math.Vec3.init(camera_pos[0], camera_pos[1], camera_pos[2]);
     const view = gl.math.Mat4.lookAt(
         eye,
         gl.math.Vec3.init(0, 0, 0),
         gl.math.Vec3.init(0, 1, 0),
     );
-    // clipFix remaps depth to [0,1] on WebGPU; identity on WebGL2.
+    // clipFix remaps depth to [0,1] on WebGPU; identity on WebGL2. Model is
+    // identity so mvp == clipFix·proj·view; drawPbr derives world pos from model.
     mvp_mat = clipFix().mul(proj).mul(view).m;
 
     // ── Encode ───────────────────────────────────────────────────────────────
@@ -328,27 +379,29 @@ export fn gldecals_frame(dt_ms: f32, width: u32, height: u32) u32 {
     if (!resources_sent) {
         resources_sent = true;
 
-        // Sphere shader (variant_lit_uv — standard lit pipeline, no depth bias).
-        // WebGPU: reuse the decal WGSL source (same stride-32 lit mesh layout);
-        // only the variant flag differs so the bridge creates a standard pipeline.
+        // Sphere shader (variant_pbr — the bridge's real PBR pipeline on BOTH
+        // backends: WGSL from wgslPbr, GLSL from pbrVertexSrc/pbrFragmentSrc.
+        // stride-48 vertex layout matches the pipeline's VertexState).
         if (use_webgpu) {
-            const wgsl = gl.command.wgslDecal();
+            const wgsl = gl.command.wgslPbr(sphere_variant);
             enc.createShader(
                 h_sphere_shader,
-                gl.command.variant_lit_uv,
+                sphere_variant,
                 @intCast(@intFromPtr(wgsl.ptr)),
                 @intCast(wgsl.len),
                 0,
                 0,
             );
         } else {
+            const vs = gl.command.pbrVertexSrc(sphere_variant);
+            const fs = gl.command.pbrFragmentSrc(sphere_variant);
             enc.createShader(
                 h_sphere_shader,
-                gl.command.variant_lit_uv,
-                @intCast(@intFromPtr(gl.command.lit_vs.ptr)),
-                @intCast(gl.command.lit_vs.len),
-                @intCast(@intFromPtr(gl.command.lit_fs.ptr)),
-                @intCast(gl.command.lit_fs.len),
+                sphere_variant,
+                @intCast(@intFromPtr(vs.ptr)),
+                @intCast(vs.len),
+                @intCast(@intFromPtr(fs.ptr)),
+                @intCast(fs.len),
             );
         }
 
@@ -376,13 +429,29 @@ export fn gldecals_frame(dt_ms: f32, width: u32, height: u32) u32 {
             );
         }
 
-        // 1×1 neutral-grey sphere texture.
+        // 1×1 PBR material maps. base is sRGB (color); mr + occlusion linear.
+        // No IBL bound — the bridge auto-binds default 1×1 IBL units, so the
+        // directional light gives a visibly-lit hemisphere without studio.venv.
+        enc.createTextureSrgb(
+            h_base_tex,
+            1,
+            1,
+            @intCast(@intFromPtr(&base_rgba)),
+            @sizeOf(@TypeOf(base_rgba)),
+        );
         enc.createTexture(
-            h_sphere_tex,
+            h_mr_tex,
             1,
             1,
-            @intCast(@intFromPtr(&sphere_tex_data)),
-            @sizeOf(@TypeOf(sphere_tex_data)),
+            @intCast(@intFromPtr(&mr_rgba)),
+            @sizeOf(@TypeOf(mr_rgba)),
+        );
+        enc.createTexture(
+            h_occ_tex,
+            1,
+            1,
+            @intCast(@intFromPtr(&occ_rgba)),
+            @sizeOf(@TypeOf(occ_rgba)),
         );
 
         // 32×32 ring+crosshair decal texture.
@@ -409,25 +478,12 @@ export fn gldecals_frame(dt_ms: f32, width: u32, height: u32) u32 {
         );
     }
 
-    // ── Upload decal geometry when dirty (or first frame) ────────────────────
-    // decal_dirty was cleared by reproject() above; upload the result.
-    // We only create/re-upload the decal buffers when the geometry changed.
-    // `decal_dirty` was already cleared above — track uploads separately.
+    // ── Upload decal geometry ────────────────────────────────────────────────
+    // projectDecal output is stride-32 (8 f32/vert: pos3, normal3, uv2). We
+    // re-upload every frame the decal mesh is non-empty; the mesh is small and
+    // createBuffer is idempotent. (Re-projection itself is gated by decal_dirty
+    // above — only the GPU upload is unconditional here.)
     if (decal_vert_count > 0 and decal_index_count > 0) {
-        // Always upload on first frame; after that only when the user moved/
-        // resized the decal.  We use a simple pattern: resources_sent was just
-        // set above on the first frame, and reproject() is called whenever
-        // decal_dirty is true (controls or first frame).  The dirty flag being
-        // true on entry means we just re-projected → upload the new mesh.
-        // On other frames (frozen and not moved) we skip the upload.
-        // Implementation: re-project sets decal_dirty = false; we track whether
-        // we uploaded this frame via a local bool derived from the initial dirty
-        // value captured before the reproject call above.  To keep it simple:
-        // we always upload on the first call (resources_sent just became true)
-        // and whenever the user interacted (the reproject() call above ran).
-        // Since we cannot easily distinguish those cases here cheaply, we just
-        // always upload — the decal mesh is small (~4 KB indices + 32 KB verts
-        // at cap, far less typically) and createBuffer is idempotent.
         enc.createBuffer(
             h_decal_vbuf,
             .vertex,
@@ -446,16 +502,24 @@ export fn gldecals_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
     enc.beginFrame(.{ 0.05, 0.05, 0.1, 1.0 }, width, height);
 
-    // 1. Sphere surface (lit, depth-test + cull back faces).
+    // 1. Sphere surface (PBR mesh, depth-test + cull back faces). setLights
+    //    follows setPipeline (stream-order rule — writes uniforms on the active
+    //    program). Material maps bound before drawPbr.
     enc.setPipeline(h_sphere_shader, gl.command.state_depth_test | gl.command.state_cull_back);
-    enc.bindTexture(0, h_sphere_tex);
-    enc.drawSub(
+    enc.setLights(1, @intCast(@intFromPtr(&light)));
+    enc.bindTexture(gl.command.tex_slot_base, h_base_tex);
+    enc.bindTexture(gl.command.tex_slot_mr, h_mr_tex);
+    enc.bindTexture(gl.command.tex_slot_occlusion, h_occ_tex);
+    enc.drawPbr(
         h_sphere_vbuf,
         h_sphere_ibuf,
         0,
         @as(u32, N_INDICES),
         @intCast(@intFromPtr(&mvp_mat)),
-        @intCast(@intFromPtr(&sphere_color)),
+        @intCast(@intFromPtr(&model_mat)),
+        @intCast(@intFromPtr(&normal9)),
+        @intCast(@intFromPtr(&material)),
+        @intCast(@intFromPtr(&camera_pos)),
     );
 
     // 2. Decal overlay (depth-biased via bridge, alpha blended on top).
