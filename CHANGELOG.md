@@ -4,6 +4,24 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.21.0] - 2026-06-26
+
+### Added
+
+- **gl primitives — decals (forward `DecalGeometry`)**: project a texture onto
+  existing mesh geometry so it conforms to the surface. A new pure-Zig projector
+  `gl.decal.projectDecal` (src/core/gl/decal.zig) clips a target mesh's triangles
+  against an oriented decal box (Sutherland–Hodgman against the 6 box planes),
+  derives UVs from the box-local position, and emits a small stride-32
+  (pos/normal/uv) decal mesh — allocation-free, native-golden-tested. The mesh is
+  drawn by `draw_decal` (wire tag 44) + `variant_decal` (1<<20, a standalone
+  shader pair) as a textured, tinted overlay with a **depth bias** (WebGL2
+  `polygonOffset`, WebGPU baked pipeline `depthBias`) so it doesn't z-fight the
+  surface it sits on. New `/gl-decals` demo: a crosshair/ring decal projected onto
+  a lit PBR sphere, with move/grow/shrink controls (live re-projection) and an
+  orbit camera. Forward projection (no deferred/G-buffer coupling); the projector
+  runs in the wasm chunk at placement time.
+
 ## [0.20.0] - 2026-06-26
 
 ### Added
