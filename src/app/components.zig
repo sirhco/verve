@@ -1433,6 +1433,49 @@ pub fn glOit(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl billboard / points demo — /gl-points (Slice 1 — Points/Sprites).
+/// A 2000-particle upward-drift cloud rendered as round soft additive points
+/// (variant_billboard, tex_handle 0, flags bit0=sizeAttenuation + bit1=round)
+/// plus one textured disc sprite above the cloud (sizeAttenuation OFF, alpha blend,
+/// tex = procedural 16×16 golden/white disc). Demonstrates both billboard paths.
+pub fn glPoints(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "glpoints-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#000;border-radius:8px;"),
+    });
+
+    // Controls wired to the GlPoints chunk's no-arg exports via z-on-click.
+    // Must live INSIDE the island subtree so events route to this chunk.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glpoints_toggle_attenuation").text("Toggle Attenuation"),
+        ctx.el("button").attr("z-on-click", "glpoints_toggle_additive").text("Toggle Additive"),
+        ctx.el("button").attr("z-on-click", "glpoints_freeze").text("Freeze"),
+        ctx.el("button").attr("z-on-click", "glpoints_unfreeze").text("Unfreeze"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Particle cloud + sprite — billboard primitive"),
+        canvas,
+        controls,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlPoints" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — billboards (Points / Sprites)"),
+        ctx.p().text("A 2000-particle upward-drift cloud rendered as camera-facing " ++
+            "billboard quads (variant_billboard, wire tag 42). Particles use " ++
+            "sizeAttenuation ON (world-unit radius) + round discard (soft disc FS) " ++
+            "with additive blend — classic GPU particle system. The golden disc " ++
+            "above the cloud is a single textured sprite: sizeAttenuation OFF " ++
+            "(screen-constant size) and normal alpha blend, demonstrating the " ++
+            "SpriteMaterial path. Both backends: WebGPU (WGSL) and WebGL2 (GLSL)."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a

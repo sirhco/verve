@@ -281,3 +281,15 @@ pub const GlDof = struct {
 pub const GlOit = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// verve.gl billboard / points demo (/gl-points, Slice 1 — Points/Sprites).
+/// Renders a 2000-particle CPU-simulated cloud (round soft points, additive
+/// blend, sizeAttenuation ON) plus a single textured disc sprite (alpha blend,
+/// sizeAttenuation OFF). Both use `Encoder.drawBillboards` (wire tag 42,
+/// variant_billboard). Toggle buttons wire to `glpoints_toggle_attenuation` /
+/// `glpoints_toggle_additive` / `glpoints_freeze` / `glpoints_unfreeze`.
+/// SSR emits `<canvas data-ref="glpoints-canvas">`.
+/// Source: `src/client/islands/GlPoints.zig`.
+pub const GlPoints = struct {
+    pub const props_schema: []const u8 = "{}";
+};
