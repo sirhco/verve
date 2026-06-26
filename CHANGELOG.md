@@ -4,6 +4,25 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.19.0] - 2026-06-26
+
+### Added
+
+- **gl primitives — points & sprites (billboards)**: the first non-triangle-mesh
+  primitive. `draw_billboards` (wire tag 42) + `variant_billboard` (1<<18, a
+  standalone shader pair) render camera-facing textured quads on both backends —
+  the shared path for three.js `PointsMaterial` (a particle = one instance) and
+  `SpriteMaterial` (a sprite = a single instance). Instance record is 36 bytes
+  (center vec3, size f32, color vec4, rot f32); the quad is generated in the
+  vertex shader (no base/index buffer) and expanded camera-facing in view space.
+  Flags: `sizeAttenuation` (world-unit vs screen-constant size) and `round`
+  (soft round point via FS unit-circle discard). Blend is driven by `set_pipeline`
+  state bits — additive (`state_blend_add`) for particle clouds, alpha
+  (`state_blend`) for sprites — honored on both backends (WebGPU bakes two
+  pipelines and selects by state bit, consuming no extra variant bit). New
+  `/gl-points` demo: a ~2000-point additive drifting cloud + a textured sprite,
+  with attenuation / additive / freeze controls and an orbit camera.
+
 ## [0.18.2] - 2026-06-25
 
 ### Fixed
