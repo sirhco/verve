@@ -6436,15 +6436,19 @@
           const projPtr = dv.getUint32(off + 16, true);
           const flags   = dv.getUint32(off + 20, true);
           const vb = st.buffers[vbh];
-          if (!vb || !st.active) break;
-          // Upload uniforms: view + proj matrices, flags uint.
+          // Guard: bail unless the active program is the billboard variant (mirrors the
+          // WebGPU `active.kind !== "billboard"` guard — without it a stray non-billboard
+          // SET_PIPELINE would draw with undefined uniforms + the wrong attrib layout).
+          if (!vb || !st.active || !(st.active.variant & 0x40000)) break;
+          // Upload uniforms: view + proj matrices, flags uint. Blend/depth come from the
+          // preceding SET_PIPELINE (case 4) state bits — additive via state_blend_add.
           if (st.active.bbView)  gl.uniformMatrix4fv(st.active.bbView,  false, new Float32Array(memory.buffer, viewPtr, 16));
           if (st.active.bbProj)  gl.uniformMatrix4fv(st.active.bbProj,  false, new Float32Array(memory.buffer, projPtr, 16));
           if (st.active.bbFlags) gl.uniform1ui(st.active.bbFlags, flags);
           // Texture unit 0: tex_handle 0 → white 1×1 dummy (same convention as case 25).
+          // u_tex0 sampler is bound to unit 0 at link time (case 3) — no per-draw re-set.
           gl.activeTexture(gl.TEXTURE0);
           gl.bindTexture(gl.TEXTURE_2D, (texH !== 0 && st.textures[texH]) ? st.textures[texH].tex : glWhiteTex(st));
-          if (st.active.bbTex0) gl.uniform1i(st.active.bbTex0, 0);
           // Dedicated per-instance VAO keyed by vbuf handle. Stride=36, four attribs,
           // all divisor=1. No ELEMENT_ARRAY_BUFFER — draw uses drawArraysInstanced.
           const bbKey = `${vbh}:bb`;
@@ -7114,7 +7118,12 @@
             // Vertex slot 0 = instance buffer (stride 36, stepMode "instance"):
             //   loc0=center vec3 @0, loc1=size f32 @12, loc2=color vec4 @16, loc3=rot f32 @32.
             // Quad (6 verts) is generated in the vertex shader from @builtin(vertex_index).
-            // Blend: standard src-alpha / one-minus-src-alpha. Depth-test ON, depth-write OFF.
+            // WebGPU bakes blend into the pipeline, so we pre-build BOTH blend modes and
+            // case 42 picks one from the SET_PIPELINE state bits (state_blend_add 1<<4):
+            //   alpha    = src-alpha / one-minus-src-alpha  (matches WebGL2 state_blend)
+            //   additive = one / one                        (matches WebGL2 state_blend_add)
+            // Depth-test ON, depth-write OFF for both. This keeps additive parity with the
+            // WebGL2 runtime-state path WITHOUT consuming a variant bit.
             const bgl0 = device.createBindGroupLayout({
               entries: [{
                 binding: 0,
@@ -7129,41 +7138,38 @@
               ],
             });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
-            const pipeline = device.createRenderPipeline({
+            const bbVertex = {
+              module,
+              entryPoint: "vs_main",
+              buffers: [{
+                arrayStride: 36,
+                stepMode: "instance",
+                attributes: [
+                  { shaderLocation: 0, offset: 0,  format: "float32x3" }, // center
+                  { shaderLocation: 1, offset: 12, format: "float32"   }, // size
+                  { shaderLocation: 2, offset: 16, format: "float32x4" }, // color
+                  { shaderLocation: 3, offset: 32, format: "float32"   }, // rot
+                ],
+              }],
+            };
+            const bbPrimitive = { topology: "triangle-list", cullMode: "none" };
+            const bbDepth = { format: "depth24plus", depthWriteEnabled: false, depthCompare: "less" };
+            const mkBillboardPipe = (blend) => device.createRenderPipeline({
               layout,
-              vertex: {
-                module,
-                entryPoint: "vs_main",
-                buffers: [{
-                  arrayStride: 36,
-                  stepMode: "instance",
-                  attributes: [
-                    { shaderLocation: 0, offset: 0,  format: "float32x3" }, // center
-                    { shaderLocation: 1, offset: 12, format: "float32"   }, // size
-                    { shaderLocation: 2, offset: 16, format: "float32x4" }, // color
-                    { shaderLocation: 3, offset: 32, format: "float32"   }, // rot
-                  ],
-                }],
-              },
-              fragment: {
-                module,
-                entryPoint: "fs_main",
-                targets: [{
-                  format: st.format,
-                  blend: {
-                    color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
-                    alpha: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
-                  },
-                }],
-              },
-              primitive: { topology: "triangle-list", cullMode: "none" },
-              depthStencil: {
-                format: "depth24plus",
-                depthWriteEnabled: false,
-                depthCompare: "less",
-              },
+              vertex: bbVertex,
+              fragment: { module, entryPoint: "fs_main", targets: [{ format: st.format, blend }] },
+              primitive: bbPrimitive,
+              depthStencil: bbDepth,
             });
-            st.pipelines[handle] = { pipeline, bgl0, bgl1, kind: "billboard" };
+            const pipeline = mkBillboardPipe({ // alpha (default)
+              color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+              alpha: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+            });
+            const pipelineAdd = mkBillboardPipe({ // additive — mirrors WebGL2 blendFunc(ONE, ONE)
+              color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+            });
+            st.pipelines[handle] = { pipeline, pipelineAdd, bgl0, bgl1, kind: "billboard" };
             break;
           }
           // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
@@ -7589,6 +7595,7 @@
             }
             st.pass.setPipeline(pipe);
             st.active = entry;
+            st.activeState = state; // remembered so case 42 can pick a billboard blend pipeline
           }
           break;
         }
@@ -8729,7 +8736,11 @@
             ],
           });
           // ── Draw: instance buffer as slot 0, no index buffer, 6-vert quad per instance. ──
-          st.pass.setPipeline(active.pipeline);
+          // Blend parity: pick the pre-baked additive pipeline when the preceding
+          // SET_PIPELINE carried state_blend_add (1<<4); else the alpha pipeline. This
+          // mirrors the WebGL2 runtime blendFunc(ONE,ONE) vs (SRC_ALPHA,1-SRC_ALPHA).
+          const bbPipe = ((st.activeState & 16) && active.pipelineAdd) ? active.pipelineAdd : active.pipeline;
+          st.pass.setPipeline(bbPipe);
           st.pass.setVertexBuffer(0, vb.buf);
           st.pass.setBindGroup(0, st.billBg0, [bbase]);
           st.pass.setBindGroup(1, bg1);
