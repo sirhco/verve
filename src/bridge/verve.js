@@ -5511,6 +5511,15 @@
             sh.flWidth      = gl.getUniformLocation(prog, "u_width");
             sh.flFlags      = gl.getUniformLocation(prog, "u_flags");
           }
+          if (variant & 0x100000) { // variant_decal (1<<20): indexed mesh decal with depth bias.
+            // Standalone shader — uniforms: u_mvp mat4, u_color vec4, u_tex0 sampler2D.
+            // Per-vertex attribs (divisor 0): loc0=pos vec3@0, loc1=normal vec3@12, loc2=uv vec2@24. Stride=32.
+            sh.dcMvp   = gl.getUniformLocation(prog, "u_mvp");
+            sh.dcColor = gl.getUniformLocation(prog, "u_color");
+            sh.dcTex0  = gl.getUniformLocation(prog, "u_tex0");
+            gl.useProgram(prog);
+            if (sh.dcTex0) gl.uniform1i(sh.dcTex0, 0); // u_tex0 → TEXTURE0 (fixed at link time)
+          }
           st.shaders[handle] = sh;
           break;
         }
@@ -6534,6 +6543,58 @@
           gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
           break;
         }
+        case 44: { // DRAW_DECAL — one indexed decal mesh with polygonOffset depth bias.
+          // Payload (28B / 7 u32): vbuf | ibuf | index_byte_off | index_count | mvp_ptr | tex_handle | color_ptr.
+          // Vertex layout stride 32: pos f32x3 @0 (loc0), normal f32x3 @12 (loc1), uv f32x2 @24 (loc2).
+          // Depth bias via polygonOffset(-1,-1) around draw; restored after to avoid leaking state.
+          // Blend/depth state is set by the preceding SET_PIPELINE — not hard-coded here.
+          const vbh        = dv.getUint32(off, true);
+          const ibh        = dv.getUint32(off + 4, true);
+          const byteOff    = dv.getUint32(off + 8, true);
+          const indexCount = dv.getUint32(off + 12, true);
+          const mvpPtr     = dv.getUint32(off + 16, true);
+          const texH       = dv.getUint32(off + 20, true);
+          const colorPtr   = dv.getUint32(off + 24, true);
+          const vb = st.buffers[vbh];
+          const ib = st.buffers[ibh];
+          // Guard: bail unless the active program is the decal variant (mirrors billboard/fatline guard).
+          if (!vb || !ib || !st.active || !(st.active.variant & 0x100000)) break;
+          // Upload uniforms: MVP matrix + RGBA tint.
+          if (st.active.dcMvp)   gl.uniformMatrix4fv(st.active.dcMvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
+          if (st.active.dcColor) gl.uniform4fv(st.active.dcColor, new Float32Array(memory.buffer, colorPtr, 4));
+          // Texture unit 0: tex_handle 0 → white 1×1 dummy (same convention as case 42).
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, (texH !== 0 && st.textures[texH]) ? st.textures[texH].tex : glWhiteTex(st));
+          // Dedicated per-mesh VAO keyed by (vbuf,ibuf) pair. Stride=32, 3 per-vertex attribs.
+          // Decal draws per-vertex (divisor 0) unlike billboard/fatline (divisor 1).
+          const dcKey = `${vbh}:${ibh}:dcl`;
+          let dcVao = st.vaos.get(dcKey);
+          if (!dcVao) {
+            dcVao = gl.createVertexArray();
+            gl.bindVertexArray(dcVao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
+            // loc 0: pos    vec3 f32  @0,  stride 32
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 32, 0);
+            // loc 1: normal vec3 f32  @12, stride 32
+            gl.enableVertexAttribArray(1);
+            gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 32, 12);
+            // loc 2: uv     vec2 f32  @24, stride 32
+            gl.enableVertexAttribArray(2);
+            gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 32, 24);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
+            st.vaos.set(dcKey, dcVao);
+          }
+          gl.bindVertexArray(dcVao);
+          // Depth bias: pull decal toward camera so it passes the depth test against
+          // the coincident host surface. MUST restore after draw — polygonOffset leaks.
+          gl.enable(gl.POLYGON_OFFSET_FILL);
+          gl.polygonOffset(-1.0, -1.0);
+          gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, byteOff);
+          gl.polygonOffset(0.0, 0.0);
+          gl.disable(gl.POLYGON_OFFSET_FILL);
+          break;
+        }
 
         default:
           break; // unknown tag: size-skip = forward compatible
@@ -6882,6 +6943,17 @@
     }
     return st.lineUbo;
   };
+  // variant_decal (1<<20) uniform buffer: {mvp@0 mat4(64B), color@64 vec4(16B)} = 80B struct
+  // in DEPTH_STRIDE (256B) dynamic-offset slots. One slot per draw_decal call, up to MAX_DRAWS.
+  const gpuEnsureDecalUniform = (st) => {
+    if (!st.decalUbo) {
+      st.decalUbo = st.device.createBuffer({
+        size: DEPTH_STRIDE * MAX_DRAWS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    return st.decalUbo;
+  };
   // Resolve a material slot (0=base,1=mr,2=normal,3=emissive,4=occlusion — the
   // bind_texture wire numbering) to a texture view, falling back to a device
   // default per gpuMakeDefaults' documented mapping. IBL slots (irradiance/
@@ -6999,8 +7071,9 @@
             st.lastH = h;
           }
           st.pbrSlot = 0;  // reset per-draw uniform slot allocation for this frame
-          st.billSlot = 0; // reset per-frame billboard draw slot counter
-          st.lineSlot = 0; // reset per-frame fat-line draw slot counter
+          st.billSlot = 0;  // reset per-frame billboard draw slot counter
+          st.lineSlot = 0;  // reset per-frame fat-line draw slot counter
+          st.decalSlot = 0; // reset per-frame decal draw slot counter
           st.frameCascadeCount = 0; // default CSM off; set_csm (36) re-enables per frame
           st.frameAreaCount = 0; // default no area lights; set_area_lights (37) re-enables per frame
           st.curTargetFormat = st.format; // canvas pass: post draws target st.format
@@ -7296,6 +7369,66 @@
               depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "less" },
             });
             st.pipelines[handle] = { pipeline, pipelineAlpha, bgl0, kind: "fatline" };
+            break;
+          }
+          if ((variant & 0x100000) !== 0) { // variant_decal (1<<20) — indexed mesh decal with depth bias.
+            // Standalone pipeline. group(0) binding(0): 80B {mvp@0 mat4(64B), color@64 vec4(16B)}
+            // dynamic-offset UBO. group(1): texture_2d binding(0) + sampler binding(1).
+            // Vertex slot 0 = per-vertex mesh (stride 32, stepMode "vertex"):
+            //   loc0=pos vec3@0, loc1=normal vec3@12, loc2=uv vec2@24.
+            // Depth bias baked: depthBias -1 / depthBiasSlopeScale -1 (toward camera),
+            // depthWriteEnabled false (overlay), depthCompare "less-equal" (coincident surface passes).
+            // Alpha blend baked: src-alpha/one-minus-src-alpha (decals have soft alpha edges).
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform", hasDynamicOffset: true },
+              }],
+            });
+            const bgl1 = device.createBindGroupLayout({
+              entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+              ],
+            });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
+            const pipeline = device.createRenderPipeline({
+              layout,
+              vertex: {
+                module,
+                entryPoint: "vs_main",
+                buffers: [{
+                  arrayStride: 32,
+                  stepMode: "vertex",
+                  attributes: [
+                    { shaderLocation: 0, offset: 0,  format: "float32x3" }, // pos
+                    { shaderLocation: 1, offset: 12, format: "float32x3" }, // normal
+                    { shaderLocation: 2, offset: 24, format: "float32x2" }, // uv
+                  ],
+                }],
+              },
+              fragment: {
+                module,
+                entryPoint: "fs_main",
+                targets: [{
+                  format: st.format,
+                  blend: {
+                    color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+                    alpha: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+                  },
+                }],
+              },
+              primitive: { topology: "triangle-list", cullMode: "none" },
+              depthStencil: {
+                format: "depth24plus",
+                depthWriteEnabled: false,
+                depthCompare: "less-equal",
+                depthBias: -1,
+                depthBiasSlopeScale: -1.0,
+              },
+            });
+            st.pipelines[handle] = { pipeline, bgl0, bgl1, kind: "decal" };
             break;
           }
           // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
@@ -8913,6 +9046,56 @@
           st.pass.setVertexBuffer(0, vb.buf);
           st.pass.setBindGroup(0, st.lineBg0, [lbase]);
           st.pass.draw(6, count);
+          break;
+        }
+        case 44: { // DRAW_DECAL — one indexed decal mesh with depth bias baked in pipeline.
+          // Payload (28B / 7 u32): vbuf | ibuf | index_byte_off | index_count | mvp_ptr | tex_handle | color_ptr.
+          // group(0): 80B {mvp@0 mat4(64B), color@64 vec4(16B)} dynamic-offset UBO.
+          // group(1): decal texture view + sampler. Depth bias baked (depthBias -1, slopeScale -1,
+          // depthWriteEnabled false, depthCompare less-equal) — cannot be a runtime state in WebGPU.
+          const vbh        = dv.getUint32(off, true);
+          const ibh        = dv.getUint32(off + 4, true);
+          const byteOff    = dv.getUint32(off + 8, true);
+          const indexCount = dv.getUint32(off + 12, true);
+          const mvpPtr     = dv.getUint32(off + 16, true);
+          const texH       = dv.getUint32(off + 20, true);
+          const colorPtr   = dv.getUint32(off + 24, true);
+          const vb = st.buffers[vbh];
+          const ib = st.buffers[ibh];
+          const active = st.active;
+          if (!vb || !ib || !active || active.kind !== "decal" || !st.pass) break;
+          // ── Per-draw uniform slot: mvp@0(64B), color@64(16B). 80B in 256B dynamic-offset slot. ──
+          const dslot = st.decalSlot++;
+          if (dslot >= MAX_DRAWS) break;
+          const dbase = dslot * DEPTH_STRIDE;
+          const dubuf = gpuEnsureDecalUniform(st);
+          device.queue.writeBuffer(dubuf, dbase,      new Float32Array(memory.buffer, mvpPtr,   16)); // mvp   @0  (64B)
+          device.queue.writeBuffer(dubuf, dbase + 64, new Float32Array(memory.buffer, colorPtr,  4)); // color @64 (16B)
+          // ── Bind group 0: dynamic-offset uniform. Cached per pipeline layout. ──
+          if (!st.decalBg0 || st.decalBg0Layout !== active.bgl0) {
+            st.decalBg0 = device.createBindGroup({
+              layout: active.bgl0,
+              entries: [{ binding: 0, resource: { buffer: dubuf, offset: 0, size: DEPTH_STRIDE } }],
+            });
+            st.decalBg0Layout = active.bgl0;
+          }
+          // ── Bind group 1: decal texture + sampler. Created fresh per draw (tex may change). ──
+          const texView = (texH !== 0 && st.textures[texH]) ? st.textures[texH].view : gpuWhiteTexView(st);
+          const bg1 = device.createBindGroup({
+            layout: active.bgl1,
+            entries: [
+              { binding: 0, resource: texView },
+              { binding: 1, resource: st.defaults.sampler },
+            ],
+          });
+          // ── Draw: vertex buffer as slot 0, u16 index buffer, indexed draw. ──
+          // Depth bias is baked into the pipeline — no runtime state change needed.
+          st.pass.setPipeline(active.pipeline);
+          st.pass.setVertexBuffer(0, vb.buf);
+          st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
+          st.pass.setBindGroup(0, st.decalBg0, [dbase]);
+          st.pass.setBindGroup(1, bg1);
+          st.pass.drawIndexed(indexCount);
           break;
         }
 
