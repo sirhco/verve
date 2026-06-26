@@ -321,6 +321,14 @@ export fn hydrate(props_ptr: [*]const u8, props_len: u32) void {
     _ = props_ptr;
     _ = props_len;
 
+    // Reset statics so a remount that reuses the wasm instance re-creates its GPU
+    // resources (mirrors GlPoints/GlLines) — otherwise resources_sent stays true
+    // against torn-down handles and the scene renders blank.
+    resources_sent = false;
+    frozen = false;
+    yaw = 0;
+    decal_dirty = true;
+
     use_webgpu = gl_webgpu_available() != 0;
     canvas_handle = verve.queryRef(@as([]const u8, "gldecals-canvas"));
 

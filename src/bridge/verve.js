@@ -7255,7 +7255,8 @@
           }
           if ((variant & 0x40000) !== 0) { // variant_billboard (1<<18) — per-instance screen-facing sprites.
             // Standalone pipeline. group(0) binding(0): 144B {view@0, proj@64, flags@128}
-            // dynamic-offset UBO. group(1) binding(0): sprite texture; binding(1): sampler.
+            // dynamic-offset UBO. group(1) binding(0): sampler; binding(1): sprite texture
+            // (order MUST match wgslBillboard: @binding(0) sampler, @binding(1) texture_2d).
             // Vertex slot 0 = instance buffer (stride 36, stepMode "instance"):
             //   loc0=center vec3 @0, loc1=size f32 @12, loc2=color vec4 @16, loc3=rot f32 @32.
             // Quad (6 verts) is generated in the vertex shader from @builtin(vertex_index).
@@ -7274,8 +7275,8 @@
             });
             const bgl1 = device.createBindGroupLayout({
               entries: [
-                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
               ],
             });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
@@ -8986,13 +8987,14 @@
             });
             st.billBg0Layout = active.bgl0;
           }
-          // ── Bind group 1: sprite texture + sampler. Created fresh per draw (tex changes). ──
+          // ── Bind group 1: sampler + sprite texture. Created fresh per draw (tex changes). ──
+          // Order MUST match wgslBillboard group(1): binding(0) sampler, binding(1) texture.
           const texView = (texH !== 0 && st.textures[texH]) ? st.textures[texH].view : gpuWhiteTexView(st);
           const bg1 = device.createBindGroup({
             layout: active.bgl1,
             entries: [
-              { binding: 0, resource: texView },
-              { binding: 1, resource: st.defaults.sampler },
+              { binding: 0, resource: st.defaults.sampler },
+              { binding: 1, resource: texView },
             ],
           });
           // ── Draw: instance buffer as slot 0, no index buffer, 6-vert quad per instance. ──
