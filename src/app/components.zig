@@ -1520,6 +1520,54 @@ pub fn glLines(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl decal demo — /gl-decals (Slice 3 — Decals).
+/// UV sphere (variant_lit_uv) with a crosshair/ring decal (variant_decal, wire
+/// tag 44) projected via `gl.decal.projectDecal`. The decal conforms to the
+/// sphere curvature. Move/grow/shrink re-project on demand; freeze pins orbit.
+/// Canvas `data-ref="gldecals-canvas"`.
+pub fn glDecals(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "gldecals-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#000;border-radius:8px;"),
+    });
+
+    // Controls wired to the GlDecals chunk's no-arg exports via z-on-click.
+    // Must live INSIDE the island subtree so events route to this chunk.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "gldecals_move_left").text("← Left"),
+        ctx.el("button").attr("z-on-click", "gldecals_move_right").text("Right →"),
+        ctx.el("button").attr("z-on-click", "gldecals_move_up").text("↑ Up"),
+        ctx.el("button").attr("z-on-click", "gldecals_move_down").text("↓ Down"),
+        ctx.el("button").attr("z-on-click", "gldecals_grow").text("Grow"),
+        ctx.el("button").attr("z-on-click", "gldecals_shrink").text("Shrink"),
+        ctx.el("button").attr("z-on-click", "gldecals_freeze").text("Freeze"),
+        ctx.el("button").attr("z-on-click", "gldecals_unfreeze").text("Unfreeze"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("UV sphere + projected decal — decal primitive"),
+        canvas,
+        controls,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlDecals" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — decals"),
+        ctx.p().text("A procedural UV sphere rendered with the lit shader " ++
+            "(variant_lit_uv) and a crosshair/ring decal (variant_decal, " ++
+            "wire tag 44) projected via gl.decal.projectDecal. The decal " ++
+            "conforms to the sphere curvature — its basis forward vector equals " ++
+            "the sphere normal at the placement point. Move/grow/shrink re-project " ++
+            "on demand (dirty flag). Depth bias is applied by the bridge so the " ++
+            "coplanar overlay wins the z-test without z-fighting. Both backends: " ++
+            "WebGPU (WGSL) and WebGL2 (GLSL)."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a

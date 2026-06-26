@@ -304,3 +304,14 @@ pub const GlPoints = struct {
 pub const GlLines = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// verve.gl decal demo (/gl-decals, Slice 3 — Decals).
+/// Renders a procedural UV sphere (variant_lit_uv) with a crosshair/ring decal
+/// (variant_decal, wire tag 44) projected onto it via `gl.decal.projectDecal`.
+/// The decal basis is built from the sphere normal so the overlay conforms to the
+/// surface curvature. Move/grow/shrink controls re-project on demand (dirty flag).
+/// Freeze pins the orbit camera. SSR emits `<canvas data-ref="gldecals-canvas">`.
+/// Source: `src/client/islands/GlDecals.zig`.
+pub const GlDecals = struct {
+    pub const props_schema: []const u8 = "{}";
+};
