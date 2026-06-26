@@ -7373,7 +7373,7 @@
           }
           if ((variant & 0x100000) !== 0) { // variant_decal (1<<20) — indexed mesh decal with depth bias.
             // Standalone pipeline. group(0) binding(0): 80B {mvp@0 mat4(64B), color@64 vec4(16B)}
-            // dynamic-offset UBO. group(1): texture_2d binding(0) + sampler binding(1).
+            // dynamic-offset UBO. group(1): sampler binding(0) + texture_2d binding(1) (matches wgslDecal).
             // Vertex slot 0 = per-vertex mesh (stride 32, stepMode "vertex"):
             //   loc0=pos vec3@0, loc1=normal vec3@12, loc2=uv vec2@24.
             // Depth bias baked: depthBias -1 / depthBiasSlopeScale -1 (toward camera),
@@ -7387,9 +7387,10 @@
               }],
             });
             const bgl1 = device.createBindGroupLayout({
+              // Order MUST match wgslDecal: @group(1) @binding(0) sampler, @binding(1) texture_2d.
               entries: [
-                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
-                { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
               ],
             });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
@@ -9083,9 +9084,10 @@
           const texView = (texH !== 0 && st.textures[texH]) ? st.textures[texH].view : gpuWhiteTexView(st);
           const bg1 = device.createBindGroup({
             layout: active.bgl1,
+            // Order MUST match wgslDecal group(1): binding(0) sampler, binding(1) texture.
             entries: [
-              { binding: 0, resource: texView },
-              { binding: 1, resource: st.defaults.sampler },
+              { binding: 0, resource: st.defaults.sampler },
+              { binding: 1, resource: texView },
             ],
           });
           // ── Draw: vertex buffer as slot 0, u16 index buffer, indexed draw. ──
