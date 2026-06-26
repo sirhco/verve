@@ -5502,6 +5502,15 @@
             gl.useProgram(prog);
             if (sh.bbTex0) gl.uniform1i(sh.bbTex0, 0); // u_tex0 → TEXTURE0 (fixed at link time)
           }
+          if (variant & 0x80000) { // variant_fatline (1<<19): 3D fat lines via instanced quads.
+            // Standalone shader — uniforms: u_vp mat4 (combined VP), u_resolution vec2, u_width f32, u_flags uint.
+            // Vertex shader generates the 6-vert quad from gl_VertexID; no position attrib.
+            // Instance attribs (all divisor 1): loc0=p0 vec3@0, loc1=p1 vec3@12, loc2=color vec4@24. Stride=40.
+            sh.flVp         = gl.getUniformLocation(prog, "u_vp");
+            sh.flResolution = gl.getUniformLocation(prog, "u_resolution");
+            sh.flWidth      = gl.getUniformLocation(prog, "u_width");
+            sh.flFlags      = gl.getUniformLocation(prog, "u_flags");
+          }
           st.shaders[handle] = sh;
           break;
         }
@@ -6479,6 +6488,52 @@
           gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
           break;
         }
+        case 43: { // DRAW_LINES — N 3D fat-line segments via instanced quads.
+          // Payload (24B / 6 u32): vbuf_segments | count | width_bits | vp_ptr | resolution_ptr | flags.
+          // width_bits = f32 bit-cast to u32 — read as float via getFloat32.
+          // Instance record (40B stride): p0 vec3@0 (loc0), p1 vec3@12 (loc1), color vec4@24 (loc2).
+          // All divisor=1. Quad (6 verts, 2 triangles) generated in vertex shader; no base/index buffer.
+          // Blend/depth state is set by the preceding SET_PIPELINE — not hard-coded here.
+          const vbh   = dv.getUint32(off, true);
+          const count = dv.getUint32(off + 4, true);
+          const width = dv.getFloat32(off + 8, true); // width_bits: f32 bit-cast to u32; read as float
+          const vpPtr = dv.getUint32(off + 12, true);
+          const resPtr = dv.getUint32(off + 16, true);
+          const flags = dv.getUint32(off + 20, true);
+          const vb = st.buffers[vbh];
+          // Guard: bail unless the active program is the fat-line variant (mirrors billboard guard).
+          if (!vb || !st.active || !(st.active.variant & 0x80000)) break;
+          // Upload uniforms: combined VP matrix, resolution vec2, width f32, flags uint.
+          if (st.active.flVp)         gl.uniformMatrix4fv(st.active.flVp, false, new Float32Array(memory.buffer, vpPtr, 16));
+          if (st.active.flResolution) gl.uniform2fv(st.active.flResolution, new Float32Array(memory.buffer, resPtr, 2));
+          if (st.active.flWidth)      gl.uniform1f(st.active.flWidth, width);
+          if (st.active.flFlags)      gl.uniform1ui(st.active.flFlags, flags);
+          // Dedicated per-instance VAO keyed by vbuf handle. Stride=40, three attribs, all divisor=1.
+          // No ELEMENT_ARRAY_BUFFER — draw uses drawArraysInstanced.
+          const flKey = `${vbh}:fl`;
+          let flVao = st.vaos.get(flKey);
+          if (!flVao) {
+            flVao = gl.createVertexArray();
+            gl.bindVertexArray(flVao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
+            // loc 0: p0    vec3 f32  @0,  stride 40
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 40, 0);
+            gl.vertexAttribDivisor(0, 1);
+            // loc 1: p1    vec3 f32  @12, stride 40
+            gl.enableVertexAttribArray(1);
+            gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 40, 12);
+            gl.vertexAttribDivisor(1, 1);
+            // loc 2: color vec4 f32  @24, stride 40
+            gl.enableVertexAttribArray(2);
+            gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 40, 24);
+            gl.vertexAttribDivisor(2, 1);
+            st.vaos.set(flKey, flVao);
+          }
+          gl.bindVertexArray(flVao);
+          gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
+          break;
+        }
 
         default:
           break; // unknown tag: size-skip = forward compatible
@@ -6815,6 +6870,18 @@
     }
     return st.billUbo;
   };
+  // variant_fatline (1<<19) uniform buffer: {vp@0 mat4(64B), resolution@64 vec2(8B),
+  // width@72 f32(4B), flags@76 u32(4B)} = 80B struct in DEPTH_STRIDE (256B) dynamic-offset
+  // slots. One slot per draw_lines call, up to MAX_DRAWS per frame.
+  const gpuEnsureLineUniform = (st) => {
+    if (!st.lineUbo) {
+      st.lineUbo = st.device.createBuffer({
+        size: DEPTH_STRIDE * MAX_DRAWS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    return st.lineUbo;
+  };
   // Resolve a material slot (0=base,1=mr,2=normal,3=emissive,4=occlusion — the
   // bind_texture wire numbering) to a texture view, falling back to a device
   // default per gpuMakeDefaults' documented mapping. IBL slots (irradiance/
@@ -6933,6 +7000,7 @@
           }
           st.pbrSlot = 0;  // reset per-draw uniform slot allocation for this frame
           st.billSlot = 0; // reset per-frame billboard draw slot counter
+          st.lineSlot = 0; // reset per-frame fat-line draw slot counter
           st.frameCascadeCount = 0; // default CSM off; set_csm (36) re-enables per frame
           st.frameAreaCount = 0; // default no area lights; set_area_lights (37) re-enables per frame
           st.curTargetFormat = st.format; // canvas pass: post draws target st.format
@@ -7170,6 +7238,64 @@
               alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
             });
             st.pipelines[handle] = { pipeline, pipelineAdd, bgl0, bgl1, kind: "billboard" };
+            break;
+          }
+          if ((variant & 0x80000) !== 0) { // variant_fatline (1<<19) — 3D fat-line segments via instanced quads.
+            // Standalone pipeline. group(0) binding(0): 80B {vp@0 mat4(64B), resolution@64 vec2(8B),
+            // width@72 f32(4B), flags@76 u32(4B)} dynamic-offset UBO. No texture group.
+            // Vertex slot 0 = segment instance buffer (stride 40, stepMode "instance"):
+            //   loc0=p0 vec3@0, loc1=p1 vec3@12, loc2=color vec4@24.
+            // Quad (6 verts) is generated in vertex shader from @builtin(vertex_index).
+            // Two pipelines: opaque (depthWrite ON, no blend) and alpha-blend (depthWrite OFF,
+            // src-alpha/one-minus-src-alpha). case 43 selects via state_blend (1<<2).
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform", hasDynamicOffset: true },
+              }],
+            });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
+            const flVertex = {
+              module,
+              entryPoint: "vs_main",
+              buffers: [{
+                arrayStride: 40,
+                stepMode: "instance",
+                attributes: [
+                  { shaderLocation: 0, offset: 0,  format: "float32x3" }, // p0
+                  { shaderLocation: 1, offset: 12, format: "float32x3" }, // p1
+                  { shaderLocation: 2, offset: 24, format: "float32x4" }, // color
+                ],
+              }],
+            };
+            const flPrimitive = { topology: "triangle-list", cullMode: "none" };
+            // Opaque: depth-write ON, no blend — lines occlude and are occluded by scene geometry.
+            const pipeline = device.createRenderPipeline({
+              layout,
+              vertex: flVertex,
+              fragment: { module, entryPoint: "fs_main", targets: [{ format: st.format }] },
+              primitive: flPrimitive,
+              depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+            });
+            // Alpha-blend: depth-test ON, depth-write OFF — for translucent/trail lines.
+            const pipelineAlpha = device.createRenderPipeline({
+              layout,
+              vertex: flVertex,
+              fragment: {
+                module, entryPoint: "fs_main",
+                targets: [{
+                  format: st.format,
+                  blend: {
+                    color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+                    alpha: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+                  },
+                }],
+              },
+              primitive: flPrimitive,
+              depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "less" },
+            });
+            st.pipelines[handle] = { pipeline, pipelineAlpha, bgl0, kind: "fatline" };
             break;
           }
           // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
@@ -8744,6 +8870,48 @@
           st.pass.setVertexBuffer(0, vb.buf);
           st.pass.setBindGroup(0, st.billBg0, [bbase]);
           st.pass.setBindGroup(1, bg1);
+          st.pass.draw(6, count);
+          break;
+        }
+        case 43: { // DRAW_LINES — N 3D fat-line segments via instanced quads.
+          // Payload (24B / 6 u32): vbuf_segments | count | width_bits | vp_ptr | resolution_ptr | flags.
+          // width_bits = f32 bit-cast to u32 — read as float via getFloat32.
+          // Instance buffer (handle vbh) has stride-40 records; created as BufferKind.vertex.
+          // group(0): 80B {vp@0 mat4(64B), resolution@64 vec2(8B), width@72 f32(4B), flags@76 u32(4B)}
+          // dynamic-offset UBO (DEPTH_STRIDE=256B slot). No texture group.
+          const vbh    = dv.getUint32(off, true);
+          const count  = dv.getUint32(off + 4, true);
+          const width  = dv.getFloat32(off + 8, true); // width_bits: f32 bit-cast to u32; read as float
+          const vpPtr  = dv.getUint32(off + 12, true);
+          const resPtr = dv.getUint32(off + 16, true);
+          const flags  = dv.getUint32(off + 20, true);
+          const vb = st.buffers[vbh];
+          const active = st.active;
+          if (!vb || !active || active.kind !== "fatline" || !st.pass) break;
+          // ── Per-draw uniform slot: 80B in 256B dynamic-offset slot. ──
+          const lslot = st.lineSlot++;
+          if (lslot >= MAX_DRAWS) break;
+          const lbase = lslot * DEPTH_STRIDE;
+          const lubuf = gpuEnsureLineUniform(st);
+          device.queue.writeBuffer(lubuf, lbase,      new Float32Array(memory.buffer, vpPtr, 16));  // vp         @0  (64B)
+          device.queue.writeBuffer(lubuf, lbase + 64, new Float32Array(memory.buffer, resPtr, 2));  // resolution @64 (8B)
+          device.queue.writeBuffer(lubuf, lbase + 72, new Float32Array([width]));                   // width      @72 (4B)
+          device.queue.writeBuffer(lubuf, lbase + 76, new Uint32Array([flags]));                    // flags      @76 (4B)
+          // ── Bind group 0: dynamic-offset uniform. Cached per pipeline layout. ──
+          if (!st.lineBg0 || st.lineBg0Layout !== active.bgl0) {
+            st.lineBg0 = device.createBindGroup({
+              layout: active.bgl0,
+              entries: [{ binding: 0, resource: { buffer: lubuf, offset: 0, size: DEPTH_STRIDE } }],
+            });
+            st.lineBg0Layout = active.bgl0;
+          }
+          // ── Draw: instance buffer as slot 0, no index buffer, 6-vert quad per instance. ──
+          // Pipeline selection: state_blend (1<<2) → alpha-blend pipeline; else opaque.
+          // Mirrors billboard's additive-vs-alpha selection from st.activeState.
+          const flPipe = ((st.activeState & 4) && active.pipelineAlpha) ? active.pipelineAlpha : active.pipeline;
+          st.pass.setPipeline(flPipe);
+          st.pass.setVertexBuffer(0, vb.buf);
+          st.pass.setBindGroup(0, st.lineBg0, [lbase]);
           st.pass.draw(6, count);
           break;
         }
