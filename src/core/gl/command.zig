@@ -108,6 +108,20 @@ pub const Tag = enum(u16) {
     //   pixels). VBO-less quad: the VS derives 6 verts (2 tris) param by (t,side) from gl_VertexID / @builtin(vertex_index).
     //   Standalone variant_fatline shader pair (own VS+FS + own U{vp,resolution,width,flags}). Square caps only (no joins/round
     //   caps) — intended v1 scope. Draw = drawArraysInstanced(TRIANGLES, 0, 6, count) / draw(6, count).
+
+    // ── Slice 3: decals (DecalGeometry projector) ───────────────────────
+    draw_decal = 44, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr, tex_handle, color_ptr} — draws the projected decal
+    //   mesh from Task A's decal.zig (DecalGeometry) as a textured, depth-biased overlay clinging to the host surface it was
+    //   projected onto. vbuf = a BufferKind.vertex buffer of stride-32 decal verts (pos vec3@0 loc0, normal vec3@12 loc1,
+    //   uv vec2@24 loc2). ibuf = a BufferKind.index buffer of u16 indices; index_byte_off = byte offset into ibuf;
+    //   index_count = number of indices to draw. mvp_ptr → 16 f32 model-view-projection (proj*view*model). tex_handle = the
+    //   decal texture handle (0 ⇒ white dummy). color_ptr → 4 f32 tint rgba (.a = overall opacity multiplier). Same shape
+    //   family as draw_sub (tag 9) but with a texture handle + a STANDALONE decal program (variant_decal). The decal shares
+    //   the billboard's group(1) texture+sampler binding convention so the bridge reuses that path. Draw =
+    //   drawElements(TRIANGLES, index_count, UNSIGNED_SHORT, index_byte_off) / drawIndexed(index_count, 1, off/2, 0, 0).
+    //   PIPELINE NOTE: the bridge MUST create the decal pipeline with a NEGATIVE depth bias (WebGL2 polygonOffset / WebGPU
+    //   pipeline depthBias, biased toward the camera) so the overlay wins the z-test against its coplanar host surface and
+    //   does NOT z-fight. The bias is pipeline state — it is NOT encoded in the shader.
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -153,6 +167,7 @@ pub const variant_prepass: u32 = 1 << 16; // depth + view-space normal prepass; 
 pub const variant_oit: u32 = 1 << 17; // Weighted-Blended OIT transparent-geometry shader. Standalone (mvp+mv+color UBO), NOT a PBR add-on. On WebGPU it builds an MRT pipeline (2 color targets, per-target blend, depth-write off); on WebGL2 it is one of two single-out programs replayed per pass.
 pub const variant_billboard: u32 = 1 << 18; // Camera-facing billboard quads (Points / Sprites). Standalone shader pair (own VS+FS + own U{view,proj,flags}), NOT a PBR add-on. Per-instance attribs loc0=center,1=size,2=color,3=rot (36B/record); the 6 quad corners come from the vertex index (VBO-less). FS samples tex0 × instance color; flags bit0=sizeAttenuation, bit1=round.
 pub const variant_fatline: u32 = 1 << 19; // Fat lines (Line2 / LineSegments2): wide segments as instanced screen-space quads, NOT native lineWidth. Standalone shader pair (own VS+FS + own U{vp,resolution,width,flags}), NOT a PBR add-on. Per-instance attribs loc0=p0,1=p1,2=color (40B/record); the 6 quad verts ((t,side)) come from the vertex index (VBO-less). VS projects both endpoints with the COMBINED VP, then offsets perpendicular in screen space (×clip.w → pixel-constant width). flags bit0=worldUnits. Square caps only (no joins/round caps).
+pub const variant_decal: u32 = 1 << 20; // Decals (DecalGeometry projector): the projected stride-32 decal mesh (pos@0 loc0, normal@12 loc1, uv@24 loc2) drawn as a textured, depth-biased overlay on its host surface. Standalone shader pair (own VS+FS + own U{mvp,color}), NOT a PBR add-on. VS = u_mvp*pos; FS = texture(tex0,uv) × u_color with a fixed-constant directional light term (ambient floor 0.4 + 0.6*ndl, L a shader constant — no extra uniform) and alpha = tex.a × color.a; no tonemap (unlit/billboard convention). Texture+sampler at group(1) (mirrors the billboard binding). PIPELINE: the bridge MUST create this pipeline with a NEGATIVE depth bias (WebGL2 polygonOffset / WebGPU depthBias, toward the camera) so the coplanar overlay wins the z-test and does NOT z-fight against the host surface — bias is pipeline state, NOT encoded in the shader.
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -932,6 +947,69 @@ pub fn fatlineFragmentSrc() []const u8 {
     \\out vec4 o_color;
     \\void main() {
     \\  o_color = v_color;
+    \\}
+    \\
+    ;
+}
+
+// ── Slice 3: decals (DecalGeometry projector) GLSL ──────────────────
+//
+// A decal is the projected mesh produced by Task A's decal.zig (DecalGeometry)
+// drawn as a textured overlay clinging to the surface it was projected onto
+// (three.js DecalGeometry). The standalone shader pair (variant_decal) owns its
+// own UBO {u_mvp, u_color}; it is NOT a PBR add-on. The decal vertex buffer has
+// stride 32 — pos vec3@0 (loc 0), normal vec3@12 (loc 1), uv vec2@24 (loc 2);
+// the program reads pos (→ u_mvp) and uv (→ texture), plus normal for a touch of
+// fixed directional shading so the decal reads as sitting on the surface. The
+// texture+sampler live at group(1) (mirroring the billboard binding) so the
+// bridge reuses that path. DEPTH BIAS: the bridge MUST give this pipeline a
+// negative polygon-offset / depthBias (toward the camera) so the coplanar decal
+// wins the z-test against its host surface — that is pipeline state, NOT encoded
+// here.
+
+/// Decal vertex shader (GLSL, variant_decal). Transforms pos by u_mvp and passes
+/// uv + normal to the fragment. Vertex layout: pos@0 (loc0), normal@12 (loc1),
+/// uv@24 (loc2) — the stride-32 decal mesh from decal.zig.
+pub fn decalVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\layout(location = 1) in vec3 a_normal;
+    \\layout(location = 2) in vec2 a_uv;
+    \\uniform mat4 u_mvp;
+    \\out vec2 v_uv;
+    \\out vec3 v_normal;
+    \\void main() {
+    \\  v_uv = a_uv;
+    \\  v_normal = a_normal;
+    \\  gl_Position = u_mvp * vec4(a_pos, 1.0);
+    \\}
+    \\
+    ;
+}
+
+/// Decal fragment shader (GLSL, variant_decal). Samples the decal texture × tint
+/// color, alpha = tex.a × color.a, with a fixed-constant directional light term
+/// (ambient floor 0.4 + 0.6*ndl, L a shader constant — no extra uniform) so the
+/// decal isn't flat. No tonemap (matches the unlit/billboard convention). Alpha
+/// blending is handled by the pipeline state (straight alpha output).
+pub fn decalFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec2 v_uv;
+    \\in vec3 v_normal;
+    \\uniform sampler2D u_tex0;
+    \\uniform vec4 u_color;
+    \\out vec4 o_color;
+    \\const vec3 L = normalize(vec3(0.3, 0.7, 0.6));
+    \\void main() {
+    \\  vec4 t = texture(u_tex0, v_uv);
+    \\  vec3 rgb = t.rgb * u_color.rgb;
+    \\  float a = t.a * u_color.a;
+    \\  float ndl = clamp(dot(normalize(v_normal), L), 0.0, 1.0);
+    \\  rgb *= (0.4 + 0.6 * ndl);
+    \\  o_color = vec4(rgb, a);
     \\}
     \\
     ;
@@ -3396,6 +3474,63 @@ pub fn wgslFatline() []const u8 {
     ;
 }
 
+/// Decal WGSL (variant_decal). Standalone shader pair — own UBO U{mvp, color}.
+/// EXACT byte offsets (the bridge MUST write uniforms at these offsets; mismatch
+/// = visually-silent WebGPU breakage):
+///   mvp:   mat4x4<f32> @0   (64B)
+///   color: vec4<f32>   @64  (16B, align 16)
+///   struct size = 80B (16-aligned; 80 = 16×5).
+/// Texture+sampler at group(1) (mirrors wgslBillboard so the bridge reuses that
+/// path): @group(1) @binding(0) sampler, @binding(1) the decal texture.
+/// Vertex attribs loc0=pos, loc1=normal, loc2=uv (stride-32 decal mesh). VS =
+/// u_mvp*pos; FS = textureSample(tex0,samp,uv) × u.color with a fixed-constant
+/// directional term (ambient floor + ndl) and alpha = tex.a × color.a; no tonemap.
+/// Alpha blending is pipeline state; the FS returns straight alpha. DEPTH BIAS is
+/// pipeline state (negative depthBias toward camera) applied by the bridge — NOT
+/// encoded here.
+///
+/// WGSL FREE-FN TRAP: no free function references `in.<field>` — all logic lives
+/// inline in vs_main/fs_main, and every varying is threaded as a named parameter.
+pub fn wgslDecal() []const u8 {
+    return
+    \\struct U {
+    \\  mvp: mat4x4<f32>,
+    \\  color: vec4<f32>,
+    \\};
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\@group(1) @binding(0) var samp: sampler;
+    \\@group(1) @binding(1) var tex0: texture_2d<f32>;
+    \\struct VsOut {
+    \\  @builtin(position) pos: vec4<f32>,
+    \\  @location(0) uv: vec2<f32>,
+    \\  @location(1) normal: vec3<f32>,
+    \\};
+    \\@vertex
+    \\fn vs_main(
+    \\  @location(0) a_pos: vec3<f32>,
+    \\  @location(1) a_normal: vec3<f32>,
+    \\  @location(2) a_uv: vec2<f32>,
+    \\) -> VsOut {
+    \\  var out: VsOut;
+    \\  out.uv = a_uv;
+    \\  out.normal = a_normal;
+    \\  out.pos = u.mvp * vec4<f32>(a_pos, 1.0);
+    \\  return out;
+    \\}
+    \\@fragment
+    \\fn fs_main(@location(0) uv: vec2<f32>, @location(1) normal: vec3<f32>) -> @location(0) vec4<f32> {
+    \\  let L = normalize(vec3<f32>(0.3, 0.7, 0.6));
+    \\  let t = textureSample(tex0, samp, uv);
+    \\  var rgb = t.rgb * u.color.rgb;
+    \\  let a = t.a * u.color.a;
+    \\  let ndl = clamp(dot(normalize(normal), L), 0.0, 1.0);
+    \\  rgb = rgb * (0.4 + 0.6 * ndl);
+    \\  return vec4<f32>(rgb, a);
+    \\}
+    \\
+    ;
+}
+
 /// WBOIT resolve WGSL (variant_post). tex0 = accum, tex1 = reveal, tex2 = opaque
 /// scene HDR. Uses textureSampleLevel(...,0.0) (derivative-free). Identical math
 /// to `oitResolveFragmentSrc`.
@@ -4025,6 +4160,29 @@ pub const Encoder = struct {
         self.putU32(vp_ptr);
         self.putU32(resolution_ptr);
         self.putU32(flags);
+    }
+
+    /// Decal draw (Slice 3 — DecalGeometry projector). Draws the projected stride-32
+    /// decal mesh (from decal.zig: pos vec3@0 loc0, normal vec3@12 loc1, uv vec2@24
+    /// loc2) as a textured, depth-biased overlay clinging to its host surface. `vbuf`
+    /// = the decal vertex buffer; `ibuf` = a u16 index buffer; `index_byte_off` = byte
+    /// offset into `ibuf`; `index_count` = indices to draw. `mvp_ptr` → 16 f32
+    /// model-view-projection (proj·view·model). `tex_handle` = the decal texture (0 ⇒
+    /// white dummy). `color_ptr` → 4 f32 tint rgba (.a = overall opacity multiplier).
+    /// Standalone variant_decal program (own U{mvp,color}); texture+sampler at group(1)
+    /// (billboard binding convention). The bridge MUST give the pipeline a NEGATIVE
+    /// depth bias (toward camera) so the coplanar overlay does not z-fight the host
+    /// surface. Backend draw = drawElements(TRIANGLES, index_count, UNSIGNED_SHORT,
+    /// index_byte_off) / drawIndexed(index_count, 1, off/2, 0, 0).
+    pub fn drawDecal(self: *Encoder, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, mvp_ptr: u32, tex_handle: u32, color_ptr: u32) void {
+        self.header(.draw_decal, 28);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(mvp_ptr);
+        self.putU32(tex_handle);
+        self.putU32(color_ptr);
     }
 
     /// Alpha-tested depth draw (MASK cutout shadows): binds `shader` (the depth-at
@@ -7031,6 +7189,126 @@ test "golden: fatline GLSL+WGSL hashes frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xd1361f6ee14770d3), fnv64(oitVertexSrc()));
     try testing.expectEqual(@as(u64, 0x18b4d245c2daf1da), fnv64(oitAccumFragmentSrc()));
     try testing.expectEqual(@as(u64, 0x8a0704bc93d3b602), fnv64(wgslOit()));
+    try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(variant_pbr)));
+    try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(variant_pbr)));
+}
+
+test "golden: DRAW_DECAL (tag 44) byte layout" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    // vbuf=5 ibuf=6 index_byte_off=0x40 index_count=36 mvp=0x3000 tex=3 color=0x3100
+    enc.drawDecal(5, 6, 0x40, 36, 0x3000, 3, 0x3100);
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // DRAW_DECAL 4 + 28 = 32 = 0x20 -> length header "20000000".
+    try testing.expectEqualStrings(
+        "20000000" ++ // length header: 32 record bytes
+            // DRAW_DECAL tag=44=0x2c payload=28=0x1c
+            // vbuf=5 ibuf=6 index_byte_off=0x40 index_count=36=0x24 mvp=0x3000 tex=3 color=0x3100
+            "2c00" ++ "1c00" ++ "05000000" ++ "06000000" ++ "40000000" ++ "24000000" ++ "00300000" ++ "03000000" ++ "00310000",
+        hex,
+    );
+}
+
+test "variant_decal bit value (1<<20) is free + collision-free" {
+    try testing.expectEqual(@as(u32, 1 << 20), variant_decal);
+    // No overlap with any existing variant bit (the PBR über-shader bits + the
+    // standalone prepass/oit/billboard/fatline primitives).
+    try testing.expect(variant_decal & variant_fatline == 0);
+    try testing.expect(variant_decal & variant_billboard == 0);
+    try testing.expect(variant_decal & variant_oit == 0);
+    try testing.expect(variant_decal & variant_prepass == 0);
+    try testing.expect(variant_decal & variant_post == 0);
+    try testing.expect(variant_decal & variant_pbr == 0);
+    try testing.expect(variant_decal & variant_shadow_point == 0);
+}
+
+test "decal shader: VS mvp transform + FS texture*color, variant-gated" {
+    const vs = decalVertexSrc();
+    // Stride-32 decal attribs (loc0=pos, loc1=normal, loc2=uv).
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 0) in vec3 a_pos;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 1) in vec3 a_normal;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 2) in vec2 a_uv;") != null);
+    // mvp transform + pass-through varyings.
+    try testing.expect(std.mem.indexOf(u8, vs, "gl_Position = u_mvp * vec4(a_pos, 1.0);") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "v_uv = a_uv;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "v_normal = a_normal;") != null);
+
+    const fs = decalFragmentSrc();
+    // texture × color, alpha = tex.a × color.a.
+    try testing.expect(std.mem.indexOf(u8, fs, "vec4 t = texture(u_tex0, v_uv);") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "vec3 rgb = t.rgb * u_color.rgb;") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "float a = t.a * u_color.a;") != null);
+    // Fixed-constant directional term + ambient floor (no extra uniform).
+    try testing.expect(std.mem.indexOf(u8, fs, "const vec3 L = normalize(vec3(0.3, 0.7, 0.6));") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "float ndl = clamp(dot(normalize(v_normal), L), 0.0, 1.0);") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "rgb *= (0.4 + 0.6 * ndl);") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "o_color = vec4(rgb, a);") != null);
+    // No tonemap (unlit/billboard convention).
+    try testing.expect(std.mem.indexOf(u8, fs, "aces") == null);
+    try testing.expect(std.mem.indexOf(u8, fs, "pow(") == null);
+
+    // Variant-gating: the decal math must NOT leak into the PBR shaders. (pos/mvp
+    // attrib names are shared across standalone programs, so gate on decal-specific
+    // tokens: the texture×tint FS path and the decal varying wiring.)
+    const pbr_fs = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, pbr_fs, "u_color.rgb") == null);
+    try testing.expect(std.mem.indexOf(u8, pbr_fs, "rgb *= (0.4 + 0.6 * ndl);") == null);
+    const pbr_vs = pbrVertexSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, pbr_vs, "v_normal = a_normal;") == null);
+}
+
+test "WGSL decal: both stages + uniform + texture binding present, no in.* in free fns" {
+    const w = wgslDecal();
+    // Both stages.
+    try testing.expect(std.mem.indexOf(u8, w, "@vertex") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@fragment") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fn vs_main(") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fn fs_main(") != null);
+    // Standalone decal UBO {mvp, color}.
+    try testing.expect(std.mem.indexOf(u8, w, "mvp: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "color: vec4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(0) var<uniform> u: U;") != null);
+    // Texture+sampler at group(1) (billboard binding convention).
+    try testing.expect(std.mem.indexOf(u8, w, "@group(1) @binding(0) var samp: sampler;") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@group(1) @binding(1) var tex0: texture_2d<f32>;") != null);
+    // Vertex attribs loc0=pos, loc1=normal, loc2=uv.
+    try testing.expect(std.mem.indexOf(u8, w, "@location(0) a_pos: vec3<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@location(1) a_normal: vec3<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@location(2) a_uv: vec2<f32>") != null);
+    // VS mvp transform.
+    try testing.expect(std.mem.indexOf(u8, w, "out.pos = u.mvp * vec4<f32>(a_pos, 1.0);") != null);
+    // FS samples tex0 × color + threads varyings as params.
+    try testing.expect(std.mem.indexOf(u8, w, "fn fs_main(@location(0) uv: vec2<f32>, @location(1) normal: vec3<f32>) -> @location(0) vec4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "let t = textureSample(tex0, samp, uv);") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "let a = t.a * u.color.a;") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "return vec4<f32>(rgb, a);") != null);
+
+    // ── WGSL FREE-FN TRAP (defended explicitly) ─────────────────────────
+    // A WGSL free function CANNOT reference `in.<field>` (that name exists only
+    // inside the fs_main parameter list). This decal shader has NO free functions
+    // and never uses a parameter named `in`, so "in." must be ABSENT anywhere in the
+    // source — proving no helper dereferences a varying it cannot see.
+    try testing.expect(std.mem.indexOf(u8, w, "in.") == null);
+}
+
+test "golden: decal GLSL+WGSL hashes frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = a deliberate shader contract bump
+    // (the verve.js WebGL2 + WebGPU decal backends lockstep to these strings).
+    try testing.expectEqual(@as(u64, 0xbb3f2c2e0adf8140), fnv64(decalVertexSrc()));
+    try testing.expectEqual(@as(u64, 0xd26427e5ff6813f7), fnv64(decalFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0x81397d859cb5676a), fnv64(wgslDecal()));
+
+    // The pre-existing standalone + billboard + fatline shader hashes MUST be
+    // UNCHANGED — variant_decal is purely additive; it must not perturb any existing
+    // source.
+    try testing.expectEqual(@as(u64, 0x489b5cbff4719f7b), fnv64(fatlineVertexSrc()));
+    try testing.expectEqual(@as(u64, 0x346bab2aeda734f7), fnv64(fatlineFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xcbe33585ea405469), fnv64(wgslFatline()));
+    try testing.expectEqual(@as(u64, 0x5a5d1ebaab664952), fnv64(billboardVertexSrc()));
+    try testing.expectEqual(@as(u64, 0xad2e38eff9cb1f19), fnv64(billboardFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xaf366ee313c1b7ac), fnv64(wgslBillboard()));
     try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(variant_pbr)));
     try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(variant_pbr)));
 }
