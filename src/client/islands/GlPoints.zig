@@ -36,6 +36,7 @@ var canvas_handle: ?i32 = null;
 var use_webgpu: bool = false;
 var resources_sent: bool = false;
 var frozen: bool = false;
+var yaw: f32 = 0; // orbit azimuth (advances per frame unless frozen)
 
 /// Toggles wired to z-on-click controls.
 var attenuation_on: bool = true; // sizeAttenuation: particle size in world-units
@@ -178,6 +179,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     frozen = false;
     attenuation_on = true;
     additive_on = true;
+    yaw = 0;
     use_webgpu = gl_webgpu_available() != 0;
     canvas_handle = verve.queryRef(@as([]const u8, "glpoints-canvas"));
 
@@ -195,17 +197,29 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
 // ── frame export ──────────────────────────────────────────────────────────────
 
 export fn glpoints_frame(dt_ms: f32, width: u32, height: u32) u32 {
-    // Advance particle simulation (capped at 100ms to avoid spiral on tab hide).
+    // Particle drift sim always runs (capped at 100ms to avoid spiral on tab hide).
     const dt_s = @min(dt_ms, 100.0) * 0.001;
-    if (!frozen) tickParticles(dt_s);
+    tickParticles(dt_s);
 
-    // Camera: fixed position looking at the origin (no orbit — particle motion
-    // provides the visual dynamics; freeze stops the sim, not the camera).
+    // Orbit camera (GlScene/GlPost convention): yaw advances per frame UNLESS
+    // frozen. Freeze pins the orbit so the user can inspect the cloud — the
+    // particle sim keeps running. Orbiting is what makes the camera-facing
+    // billboard behaviour visible (a static quad would look identical otherwise).
+    if (!frozen) yaw += dt_s * 0.5; // ~0.5 rad/s slow circle
+
+    const radius: f32 = 13.0;
+    const height_y: f32 = 2.5;
+    const eye = gl.math.Vec3.init(
+        @sin(yaw) * radius,
+        height_y,
+        @cos(yaw) * radius,
+    );
+
     const aspect = @as(f32, @floatFromInt(width)) /
         @as(f32, @floatFromInt(@max(height, 1)));
     proj_mat = gl.math.Mat4.perspective(1.0, aspect, 0.1, 200.0).m;
     view_mat = gl.math.Mat4.lookAt(
-        gl.math.Vec3.init(3.0, 2.5, 12.0),
+        eye,
         gl.math.Vec3.init(0.0, 0.0, 0.0),
         gl.math.Vec3.init(0.0, 1.0, 0.0),
     ).m;
