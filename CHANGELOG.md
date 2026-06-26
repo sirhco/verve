@@ -4,6 +4,25 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.20.0] - 2026-06-26
+
+### Added
+
+- **gl primitives — fat lines (`Line2` / `LineSegments2`)**: wide 3D line segments
+  rendered as instanced screen-space quads — `draw_lines` (wire tag 43) +
+  `variant_fatline` (1<<19, a standalone shader pair). Each segment's instance
+  record is 40 bytes (`p0` vec3, `p1` vec3, `color` vec4); the vertex shader
+  projects both endpoints to clip space and expands the quad perpendicular to the
+  segment **in screen space**, scaled by `clip.w` so the line holds a constant
+  pixel width at any depth — it never relies on the native `lineWidth` (which most
+  WebGL2 drivers cap at 1px and WebGPU locks to 1px). Width is set per draw;
+  `worldUnits` flag switches to world-space width. Blend is driven by `set_pipeline`
+  state — opaque (`state_depth_test`) for wireframes, alpha (`+ state_blend`) for
+  translucent trails — on both backends (WebGPU bakes opaque + alpha pipelines and
+  selects by state bit). Square caps (round caps/joins deferred). New `/gl-lines`
+  demo: an animated translucent trajectory trail + an opaque wireframe cube, with
+  width and world/screen-units controls and an orbit camera.
+
 ## [0.19.0] - 2026-06-26
 
 ### Added
