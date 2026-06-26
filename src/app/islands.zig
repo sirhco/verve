@@ -306,7 +306,7 @@ pub const GlLines = struct {
 };
 
 /// verve.gl decal demo (/gl-decals, Slice 3 — Decals).
-/// Renders a procedural UV sphere (variant_lit_uv) with a crosshair/ring decal
+/// Renders a procedural UV sphere (variant_pbr) with a crosshair/ring decal
 /// (variant_decal, wire tag 44) projected onto it via `gl.decal.projectDecal`.
 /// The decal basis is built from the sphere normal so the overlay conforms to the
 /// surface curvature. Move/grow/shrink controls re-project on demand (dirty flag).

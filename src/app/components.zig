@@ -1521,7 +1521,7 @@ pub fn glLines(ctx: *const verve.Context) !*verve.Node {
 }
 
 /// verve.gl decal demo — /gl-decals (Slice 3 — Decals).
-/// UV sphere (variant_lit_uv) with a crosshair/ring decal (variant_decal, wire
+/// UV sphere (variant_pbr) with a crosshair/ring decal (variant_decal, wire
 /// tag 44) projected via `gl.decal.projectDecal`. The decal conforms to the
 /// sphere curvature. Move/grow/shrink re-project on demand; freeze pins orbit.
 /// Canvas `data-ref="gldecals-canvas"`.
@@ -1556,8 +1556,8 @@ pub fn glDecals(ctx: *const verve.Context) !*verve.Node {
 
     return ctx.main_().class("home").children(.{
         ctx.h1("verve.gl — decals"),
-        ctx.p().text("A procedural UV sphere rendered with the lit shader " ++
-            "(variant_lit_uv) and a crosshair/ring decal (variant_decal, " ++
+        ctx.p().text("A procedural UV sphere rendered with the PBR shader " ++
+            "(variant_pbr) and a crosshair/ring decal (variant_decal, " ++
             "wire tag 44) projected via gl.decal.projectDecal. The decal " ++
             "conforms to the sphere curvature — its basis forward vector equals " ++
             "the sphere normal at the placement point. Move/grow/shrink re-project " ++
