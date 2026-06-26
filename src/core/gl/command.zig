@@ -97,6 +97,17 @@ pub const Tag = enum(u16) {
     //   flags bit0=sizeAttenuation (world-unit size; off → screen-constant), bit1=round (FS discards outside the unit
     //   circle). VBO-less quad: the VS derives 6 corners (2 tris) from gl_VertexID / @builtin(vertex_index). Standalone
     //   variant_billboard shader pair (own VS+FS + own U{view,proj,flags}). Draw = drawArraysInstanced(TRIANGLES,0,6,count).
+    // ── Slice 2: fat lines (Line2 / LineSegments2) ──────────────────────
+    draw_lines = 43, // {vbuf_segments, count, width_bits, vp_ptr, resolution_ptr, flags} — `count` wide line SEGMENTS,
+    //   each rendered as an instanced screen-space quad (NOT native lineWidth, which WebGPU locks to 1px / most WebGL2
+    //   drivers cap at 1). vbuf_segments = a BufferKind.vertex buffer of `count` 40B segment records (p0 vec3@0, p1 vec3@12,
+    //   color vec4@24; per-instance attribs loc0=p0, loc1=p1, loc2=color — divisor 1 / stepMode 'instance'). width_bits =
+    //   the line width as f32 @bitCast to u32 (pixels in screen-space; world units if flags bit0). vp_ptr → 16 f32 COMBINED
+    //   view-projection (proj*view) — fat lines project both endpoints with ONE VP then offset in screen space. resolution_ptr
+    //   → 2 f32 (viewport w,h) — converts the pixel width to an NDC offset. flags bit0 = worldUnits (default off = screen-space
+    //   pixels). VBO-less quad: the VS derives 6 verts (2 tris) param by (t,side) from gl_VertexID / @builtin(vertex_index).
+    //   Standalone variant_fatline shader pair (own VS+FS + own U{vp,resolution,width,flags}). Square caps only (no joins/round
+    //   caps) — intended v1 scope. Draw = drawArraysInstanced(TRIANGLES, 0, 6, count) / draw(6, count).
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -141,6 +152,7 @@ pub const variant_shadow_point: u32 = 1 << 15; // requires variant_pbr; omnidire
 pub const variant_prepass: u32 = 1 << 16; // depth + view-space normal prepass; rgba16f G-buffer (rgb=n*0.5+0.5, a=-viewPos.z). Standalone shader pair (mvp+mv UBO), not a PBR add-on.
 pub const variant_oit: u32 = 1 << 17; // Weighted-Blended OIT transparent-geometry shader. Standalone (mvp+mv+color UBO), NOT a PBR add-on. On WebGPU it builds an MRT pipeline (2 color targets, per-target blend, depth-write off); on WebGL2 it is one of two single-out programs replayed per pass.
 pub const variant_billboard: u32 = 1 << 18; // Camera-facing billboard quads (Points / Sprites). Standalone shader pair (own VS+FS + own U{view,proj,flags}), NOT a PBR add-on. Per-instance attribs loc0=center,1=size,2=color,3=rot (36B/record); the 6 quad corners come from the vertex index (VBO-less). FS samples tex0 × instance color; flags bit0=sizeAttenuation, bit1=round.
+pub const variant_fatline: u32 = 1 << 19; // Fat lines (Line2 / LineSegments2): wide segments as instanced screen-space quads, NOT native lineWidth. Standalone shader pair (own VS+FS + own U{vp,resolution,width,flags}), NOT a PBR add-on. Per-instance attribs loc0=p0,1=p1,2=color (40B/record); the 6 quad verts ((t,side)) come from the vertex index (VBO-less). VS projects both endpoints with the COMBINED VP, then offsets perpendicular in screen space (×clip.w → pixel-constant width). flags bit0=worldUnits. Square caps only (no joins/round caps).
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -834,6 +846,92 @@ pub fn billboardFragmentSrc() []const u8 {
     \\    if (length(v_uv * 2.0 - 1.0) > 1.0) discard; // round point
     \\  }
     \\  o_color = tex * v_color;
+    \\}
+    \\
+    ;
+}
+
+// ── Slice 2: fat lines (Line2 / LineSegments2) GLSL ─────────────────
+//
+// A fat line is a wide line SEGMENT rendered as an instanced screen-space quad
+// (three.js Line2 / LineSegments2). Native lineWidth is unusable (WebGPU locks
+// it to 1px; most WebGL2 drivers cap it at 1), so each segment is expanded
+// perpendicular to itself in SCREEN space into a quad. The standalone shader
+// pair (variant_fatline) owns its own UBO {u_vp, u_resolution, u_width, u_flags};
+// it is NOT a PBR add-on. There is NO base vertex buffer: the VS derives the 6
+// quad verts (2 triangles) from gl_VertexID, parameterized by (t, side) where
+// t∈{0,1} selects the endpoint and side∈{-1,+1} selects the edge. The ONLY bound
+// buffer is the per-instance segment buffer (divisor 1). Per-instance attribute
+// locations (matched by the bridge tasks): loc0 = p0 vec3, loc1 = p1 vec3,
+// loc2 = color vec4.
+//
+// Screen-space expansion (worldUnits OFF — the primary path the demo exercises):
+//   clip0 = u_vp·vec4(p0,1)   clip1 = u_vp·vec4(p1,1)   (ONE combined VP)
+//   ndc0 = clip0.xy/clip0.w    ndc1 = clip1.xy/clip1.w
+//   dir = normalize((ndc1-ndc0)·resolution)      (pixel-space direction)
+//   nrm = vec2(-dir.y, dir.x)                     (perpendicular, pixel space)
+//   clip = mix(clip0, clip1, t)                   (pick endpoint by t)
+//   offset_ndc = nrm·side·(width·0.5)/resolution  (pixels → NDC)
+//   clip.xy += offset_ndc·clip.w                  (×clip.w → pixel-constant width at any depth)
+// worldUnits ON (flags bit0): the SAME perpendicular, but the offset is applied
+// WITHOUT the ×clip.w compensation, so the subsequent perspective divide shrinks
+// the width with depth — a simple, documented world-unit-ish approximation
+// (u_width is then read as world units). The screen-space path is the calibrated
+// one; the visual gate focuses on it. Square caps only (no joins / round caps).
+
+/// Fat-line vertex shader (GLSL, variant_fatline). Derives the quad vertex from
+/// gl_VertexID → (t, side), projects both endpoints with the combined VP, and
+/// offsets the chosen endpoint perpendicular in screen space (×clip.w for a
+/// pixel-constant width; without it for the worldUnits path). Passes the
+/// per-instance color through to the fragment.
+pub fn fatlineVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_p0;
+    \\layout(location = 1) in vec3 a_p1;
+    \\layout(location = 2) in vec4 a_color;
+    \\uniform mat4 u_vp;
+    \\uniform vec2 u_resolution;
+    \\uniform float u_width;
+    \\uniform uint u_flags;
+    \\out vec4 v_color;
+    \\// 6 verts = 2 tris. (t, side): (0,-1)(1,-1)(1,+1) (0,-1)(1,+1)(0,+1)
+    \\const float ts[6] = float[6](0.0, 1.0, 1.0, 0.0, 1.0, 0.0);
+    \\const float sides[6] = float[6](-1.0, -1.0, 1.0, -1.0, 1.0, 1.0);
+    \\void main() {
+    \\  v_color = a_color;
+    \\  float t = ts[gl_VertexID];
+    \\  float side = sides[gl_VertexID];
+    \\  vec4 clip0 = u_vp * vec4(a_p0, 1.0);
+    \\  vec4 clip1 = u_vp * vec4(a_p1, 1.0);
+    \\  vec2 ndc0 = clip0.xy / clip0.w;
+    \\  vec2 ndc1 = clip1.xy / clip1.w;
+    \\  vec2 dir = normalize((ndc1 - ndc0) * u_resolution);
+    \\  vec2 nrm = vec2(-dir.y, dir.x);
+    \\  vec4 clip = mix(clip0, clip1, t);
+    \\  vec2 offset_ndc = nrm * side * (u_width * 0.5) / u_resolution;
+    \\  if ((u_flags & 1u) != 0u) {
+    \\    clip.xy += offset_ndc; // worldUnits: skip ×clip.w → perspective shrinks width with depth
+    \\  } else {
+    \\    clip.xy += offset_ndc * clip.w; // screen-space: ×clip.w → pixel-constant width at any depth
+    \\  }
+    \\  gl_Position = clip;
+    \\}
+    \\
+    ;
+}
+
+/// Fat-line fragment shader (GLSL, variant_fatline). Emits the interpolated
+/// per-instance color straight (a = opacity), no tonemap — matches the
+/// unlit/oit/billboard convention (these are flat line primitives).
+pub fn fatlineFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\in vec4 v_color;
+    \\out vec4 o_color;
+    \\void main() {
+    \\  o_color = v_color;
     \\}
     \\
     ;
@@ -3232,6 +3330,72 @@ pub fn wgslBillboard() []const u8 {
     ;
 }
 
+/// Fat-line WGSL (variant_fatline). Standalone shader pair — own UBO
+/// U{vp, resolution, width, flags}. EXACT byte offsets (the bridge MUST write
+/// uniforms at these offsets; mismatch = visually-silent WebGPU breakage):
+///   vp:         mat4x4<f32> @0   (64B)
+///   resolution: vec2<f32>   @64  (8B, align 8)
+///   width:      f32         @72
+///   flags:      u32         @76
+///   struct size = 80B (16-aligned; mat4x4 forces 16-byte struct align → 80 = 16×5).
+/// Per-instance vertex attribs loc0=p0, loc1=p1, loc2=color; the 6 quad verts
+/// (param by (t,side)) come from @builtin(vertex_index) (VBO-less). Both endpoints
+/// project with the combined VP, then the chosen endpoint offsets perpendicular in
+/// screen space (×clip.w → pixel-constant; worldUnits flag skips it). FS emits the
+/// color straight (no tonemap; unlit/oit convention).
+///
+/// WGSL FREE-FN TRAP: no free function references `in.<field>` — all logic lives
+/// inline in vs_main/fs_main, and every varying is threaded as a named parameter.
+pub fn wgslFatline() []const u8 {
+    return
+    \\struct U {
+    \\  vp: mat4x4<f32>,
+    \\  resolution: vec2<f32>,
+    \\  width: f32,
+    \\  flags: u32,
+    \\};
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\struct VsOut {
+    \\  @builtin(position) pos: vec4<f32>,
+    \\  @location(0) color: vec4<f32>,
+    \\};
+    \\@vertex
+    \\fn vs_main(
+    \\  @builtin(vertex_index) vid: u32,
+    \\  @location(0) a_p0: vec3<f32>,
+    \\  @location(1) a_p1: vec3<f32>,
+    \\  @location(2) a_color: vec4<f32>,
+    \\) -> VsOut {
+    \\  var ts = array<f32, 6>(0.0, 1.0, 1.0, 0.0, 1.0, 0.0);
+    \\  var sides = array<f32, 6>(-1.0, -1.0, 1.0, -1.0, 1.0, 1.0);
+    \\  let t = ts[vid];
+    \\  let side = sides[vid];
+    \\  let clip0 = u.vp * vec4<f32>(a_p0, 1.0);
+    \\  let clip1 = u.vp * vec4<f32>(a_p1, 1.0);
+    \\  let ndc0 = clip0.xy / clip0.w;
+    \\  let ndc1 = clip1.xy / clip1.w;
+    \\  let dir = normalize((ndc1 - ndc0) * u.resolution);
+    \\  let nrm = vec2<f32>(-dir.y, dir.x);
+    \\  var clip = mix(clip0, clip1, t);
+    \\  let offset_ndc = nrm * side * (u.width * 0.5) / u.resolution;
+    \\  var out: VsOut;
+    \\  out.color = a_color;
+    \\  if ((u.flags & 1u) != 0u) {
+    \\    clip = vec4<f32>(clip.xy + offset_ndc, clip.z, clip.w);
+    \\  } else {
+    \\    clip = vec4<f32>(clip.xy + offset_ndc * clip.w, clip.z, clip.w);
+    \\  }
+    \\  out.pos = clip;
+    \\  return out;
+    \\}
+    \\@fragment
+    \\fn fs_main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
+    \\  return color;
+    \\}
+    \\
+    ;
+}
+
 /// WBOIT resolve WGSL (variant_post). tex0 = accum, tex1 = reveal, tex2 = opaque
 /// scene HDR. Uses textureSampleLevel(...,0.0) (derivative-free). Identical math
 /// to `oitResolveFragmentSrc`.
@@ -3841,6 +4005,25 @@ pub const Encoder = struct {
         self.putU32(tex_handle);
         self.putU32(view_ptr);
         self.putU32(proj_ptr);
+        self.putU32(flags);
+    }
+
+    /// Fat-line draw (Slice 2 — Line2 / LineSegments2). Renders `count` wide line
+    /// SEGMENTS as instanced screen-space quads (NOT native lineWidth). `vbuf_segments`
+    /// = a vertex buffer of `count` 40B segment records (p0 vec3@0, p1 vec3@12, color
+    /// vec4@24; per-instance attribs loc0=p0, loc1=p1, loc2=color). `width` (pixels in
+    /// screen-space; world units if `flags` bit0) is @bitCast to u32 in the stream.
+    /// `vp_ptr` → 16 f32 COMBINED view-projection (proj·view), `resolution_ptr` → 2 f32
+    /// (viewport w,h). `flags` bit0 = worldUnits (default off = screen-space pixels).
+    /// VBO-less quad: the VS derives the 6 verts ((t,side)) from the vertex index;
+    /// backend draw = drawArraysInstanced(TRIANGLES, 0, 6, count) / draw(6, count).
+    pub fn drawLines(self: *Encoder, vbuf_segments: u32, count: u32, width: f32, vp_ptr: u32, resolution_ptr: u32, flags: u32) void {
+        self.header(.draw_lines, 24);
+        self.putU32(vbuf_segments);
+        self.putU32(count);
+        self.putU32(@bitCast(width));
+        self.putU32(vp_ptr);
+        self.putU32(resolution_ptr);
         self.putU32(flags);
     }
 
@@ -6714,6 +6897,137 @@ test "golden: billboard GLSL+WGSL hashes frozen (FNV-1a-64)" {
 
     // The pre-existing standalone shader hashes MUST be UNCHANGED — variant_billboard
     // is purely additive; it must not perturb any existing shader source.
+    try testing.expectEqual(@as(u64, 0xd1361f6ee14770d3), fnv64(oitVertexSrc()));
+    try testing.expectEqual(@as(u64, 0x18b4d245c2daf1da), fnv64(oitAccumFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0x8a0704bc93d3b602), fnv64(wgslOit()));
+    try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(variant_pbr)));
+    try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(variant_pbr)));
+}
+
+test "golden: DRAW_LINES (tag 43) byte layout" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    // width 4.0 → @bitCast(u32) = 0x40800000 (LE "00008040").
+    enc.drawLines(5, 50, 4.0, 0x3000, 0x3100, 0);
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // DRAW_LINES 4 + 24 = 28 = 0x1c -> length header "1c000000".
+    try testing.expectEqualStrings(
+        "1c000000" ++ // length header: 28 record bytes
+            // DRAW_LINES tag=43=0x2b payload=24=0x18
+            // vbuf_segments=5 count=50 width_bits=0x40800000 vp=0x3000 resolution=0x3100 flags=0
+            "2b00" ++ "1800" ++ "05000000" ++ "32000000" ++ "00008040" ++ "00300000" ++ "00310000" ++ "00000000",
+        hex,
+    );
+    // The width arg is f32, bit-cast into the u32 slot — confirm a non-trivial width
+    // (3.5 → 0x40600000) round-trips through the stream untouched.
+    var buf2: [64]u8 = undefined;
+    var enc2 = Encoder.init(&buf2);
+    enc2.drawLines(1, 1, 3.5, 0, 0, 1);
+    const hex2 = try hexAlloc(testing.allocator, enc2.finish());
+    defer testing.allocator.free(hex2);
+    try testing.expect(std.mem.indexOf(u8, hex2, "00006040") != null); // 3.5 f32 LE
+}
+
+test "variant_fatline bit value (1<<19) is free + collision-free" {
+    try testing.expectEqual(@as(u32, 1 << 19), variant_fatline);
+    // No overlap with any existing variant bit (the PBR über-shader bits + the
+    // standalone prepass/oit/billboard primitives).
+    try testing.expect(variant_fatline & variant_billboard == 0);
+    try testing.expect(variant_fatline & variant_oit == 0);
+    try testing.expect(variant_fatline & variant_prepass == 0);
+    try testing.expect(variant_fatline & variant_post == 0);
+    try testing.expect(variant_fatline & variant_pbr == 0);
+    try testing.expect(variant_fatline & variant_shadow_point == 0);
+}
+
+test "fatline shader: VS screen-space perpendicular expand, variant-gated" {
+    const vs = fatlineVertexSrc();
+    // Per-instance segment attribs (loc0=p0, loc1=p1, loc2=color).
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 0) in vec3 a_p0;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 1) in vec3 a_p1;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 2) in vec4 a_color;") != null);
+    // Combined VP, both endpoints projected.
+    try testing.expect(std.mem.indexOf(u8, vs, "vec4 clip0 = u_vp * vec4(a_p0, 1.0);") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "vec4 clip1 = u_vp * vec4(a_p1, 1.0);") != null);
+    // NDC perpendicular in pixel space.
+    try testing.expect(std.mem.indexOf(u8, vs, "vec2 dir = normalize((ndc1 - ndc0) * u_resolution);") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "vec2 nrm = vec2(-dir.y, dir.x);") != null);
+    // Endpoint pick by t + pixel-width → NDC offset.
+    try testing.expect(std.mem.indexOf(u8, vs, "vec4 clip = mix(clip0, clip1, t);") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "vec2 offset_ndc = nrm * side * (u_width * 0.5) / u_resolution;") != null);
+    // ×clip.w → pixel-constant width (screen-space path) + worldUnits path (no ×clip.w).
+    try testing.expect(std.mem.indexOf(u8, vs, "clip.xy += offset_ndc * clip.w;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "clip.xy += offset_ndc;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "(u_flags & 1u)") != null); // worldUnits gate
+    // Quad verts from the vertex id.
+    try testing.expect(std.mem.indexOf(u8, vs, "ts[gl_VertexID]") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "sides[gl_VertexID]") != null);
+
+    // FS emits color straight, no tonemap.
+    const fs = fatlineFragmentSrc();
+    try testing.expect(std.mem.indexOf(u8, fs, "o_color = v_color;") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "aces") == null);
+    try testing.expect(std.mem.indexOf(u8, fs, "pow(") == null);
+
+    // Variant-gating: the fat-line math must NOT leak into the PBR shaders.
+    const pbr_fs = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, pbr_fs, "a_p0") == null);
+    try testing.expect(std.mem.indexOf(u8, pbr_fs, "ts[gl_VertexID]") == null);
+    const pbr_vs = pbrVertexSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, pbr_vs, "ts[gl_VertexID]") == null);
+    try testing.expect(std.mem.indexOf(u8, pbr_vs, "offset_ndc") == null);
+}
+
+test "WGSL fatline: both stages + uniform present, no in.* in free fns" {
+    const w = wgslFatline();
+    // Both stages.
+    try testing.expect(std.mem.indexOf(u8, w, "@vertex") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@fragment") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fn vs_main(") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fn fs_main(") != null);
+    // Standalone fat-line UBO {vp, resolution, width, flags}.
+    try testing.expect(std.mem.indexOf(u8, w, "vp: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "resolution: vec2<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "width: f32") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "flags: u32") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(0) var<uniform> u: U;") != null);
+    // Per-instance attribs + vertex_index quad expansion.
+    try testing.expect(std.mem.indexOf(u8, w, "@builtin(vertex_index) vid: u32") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@location(0) a_p0: vec3<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@location(1) a_p1: vec3<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@location(2) a_color: vec4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "ts[vid]") != null);
+    // Combined-VP projection + screen-space perpendicular + both width modes.
+    try testing.expect(std.mem.indexOf(u8, w, "let clip0 = u.vp * vec4<f32>(a_p0, 1.0);") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "let nrm = vec2<f32>(-dir.y, dir.x);") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "clip.xy + offset_ndc * clip.w") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "clip.xy + offset_ndc,") != null); // worldUnits path
+    // FS threads the varying as a param + emits straight.
+    try testing.expect(std.mem.indexOf(u8, w, "fn fs_main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "return color;") != null);
+
+    // ── WGSL FREE-FN TRAP (defended explicitly) ─────────────────────────
+    // A WGSL free function CANNOT reference `in.<field>` (that name exists only
+    // inside the fs_main parameter list). This fat-line shader has NO free functions
+    // and never uses a parameter named `in`, so "in." must be ABSENT anywhere in the
+    // source — proving no helper dereferences a varying it cannot see.
+    try testing.expect(std.mem.indexOf(u8, w, "in.") == null);
+}
+
+test "golden: fatline GLSL+WGSL hashes frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = a deliberate shader contract bump
+    // (the verve.js WebGL2 + WebGPU fat-line backends lockstep to these strings).
+    try testing.expectEqual(@as(u64, 0x489b5cbff4719f7b), fnv64(fatlineVertexSrc()));
+    try testing.expectEqual(@as(u64, 0x346bab2aeda734f7), fnv64(fatlineFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xcbe33585ea405469), fnv64(wgslFatline()));
+
+    // The pre-existing standalone + billboard shader hashes MUST be UNCHANGED —
+    // variant_fatline is purely additive; it must not perturb any existing source.
+    try testing.expectEqual(@as(u64, 0x5a5d1ebaab664952), fnv64(billboardVertexSrc()));
+    try testing.expectEqual(@as(u64, 0xad2e38eff9cb1f19), fnv64(billboardFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xaf366ee313c1b7ac), fnv64(wgslBillboard()));
     try testing.expectEqual(@as(u64, 0xd1361f6ee14770d3), fnv64(oitVertexSrc()));
     try testing.expectEqual(@as(u64, 0x18b4d245c2daf1da), fnv64(oitAccumFragmentSrc()));
     try testing.expectEqual(@as(u64, 0x8a0704bc93d3b602), fnv64(wgslOit()));
