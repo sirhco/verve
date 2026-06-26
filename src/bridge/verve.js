@@ -5491,6 +5491,17 @@
             // Multi-caster: u_point_light_pos/u_point_far removed (Task 1) — the
             // receiver reads each caster's lpos/far from the per-light loop vars.
           }
+          if (variant & 0x40000) { // variant_billboard (1<<18): screen-facing quad sprites.
+            // Standalone shader — uniforms: u_view mat4, u_proj mat4, u_flags uint, u_tex0 sampler2D.
+            // Vertex shader generates the 6-vert quad from gl_VertexID; no position attrib.
+            // Instance attribs (all divisor 1): loc0=center vec3, loc1=size f32, loc2=color vec4, loc3=rot f32.
+            sh.bbView  = gl.getUniformLocation(prog, "u_view");
+            sh.bbProj  = gl.getUniformLocation(prog, "u_proj");
+            sh.bbFlags = gl.getUniformLocation(prog, "u_flags");
+            sh.bbTex0  = gl.getUniformLocation(prog, "u_tex0");
+            gl.useProgram(prog);
+            if (sh.bbTex0) gl.uniform1i(sh.bbTex0, 0); // u_tex0 → TEXTURE0 (fixed at link time)
+          }
           st.shaders[handle] = sh;
           break;
         }
@@ -6412,6 +6423,58 @@
             gl.uniform1i(st.active.pointAtlas, slot);
           break;
         }
+        case 42: { // DRAW_BILLBOARDS — N screen-facing quads via per-instance attribs.
+          // Payload (24B / 6 u32): vbuf_instance | count | tex_handle | view_ptr | proj_ptr | flags.
+          // Instance record (36B stride): center vec3 @0 (loc0), size f32 @12 (loc1),
+          //   color vec4 @16 (loc2), rot f32 @32 (loc3). All divisor=1, no base buffer.
+          // Quad (6 verts, 2 triangles) is generated in the vertex shader from gl_VertexID.
+          // Blend/depth state is set by the preceding SET_PIPELINE — not hard-coded here.
+          const vbh     = dv.getUint32(off, true);
+          const count   = dv.getUint32(off + 4, true);
+          const texH    = dv.getUint32(off + 8, true);
+          const viewPtr = dv.getUint32(off + 12, true);
+          const projPtr = dv.getUint32(off + 16, true);
+          const flags   = dv.getUint32(off + 20, true);
+          const vb = st.buffers[vbh];
+          if (!vb || !st.active) break;
+          // Upload uniforms: view + proj matrices, flags uint.
+          if (st.active.bbView)  gl.uniformMatrix4fv(st.active.bbView,  false, new Float32Array(memory.buffer, viewPtr, 16));
+          if (st.active.bbProj)  gl.uniformMatrix4fv(st.active.bbProj,  false, new Float32Array(memory.buffer, projPtr, 16));
+          if (st.active.bbFlags) gl.uniform1ui(st.active.bbFlags, flags);
+          // Texture unit 0: tex_handle 0 → white 1×1 dummy (same convention as case 25).
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, (texH !== 0 && st.textures[texH]) ? st.textures[texH].tex : glWhiteTex(st));
+          if (st.active.bbTex0) gl.uniform1i(st.active.bbTex0, 0);
+          // Dedicated per-instance VAO keyed by vbuf handle. Stride=36, four attribs,
+          // all divisor=1. No ELEMENT_ARRAY_BUFFER — draw uses drawArraysInstanced.
+          const bbKey = `${vbh}:bb`;
+          let bbVao = st.vaos.get(bbKey);
+          if (!bbVao) {
+            bbVao = gl.createVertexArray();
+            gl.bindVertexArray(bbVao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
+            // loc 0: center  vec3 f32  @0,  stride 36
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 36, 0);
+            gl.vertexAttribDivisor(0, 1);
+            // loc 1: size    f32       @12, stride 36
+            gl.enableVertexAttribArray(1);
+            gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 36, 12);
+            gl.vertexAttribDivisor(1, 1);
+            // loc 2: color   vec4 f32  @16, stride 36
+            gl.enableVertexAttribArray(2);
+            gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 36, 16);
+            gl.vertexAttribDivisor(2, 1);
+            // loc 3: rot     f32       @32, stride 36
+            gl.enableVertexAttribArray(3);
+            gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 36, 32);
+            gl.vertexAttribDivisor(3, 1);
+            st.vaos.set(bbKey, bbVao);
+          }
+          gl.bindVertexArray(bbVao);
+          gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
+          break;
+        }
 
         default:
           break; // unknown tag: size-skip = forward compatible
@@ -6736,6 +6799,18 @@
     }
     return st.depthAtUniform;
   };
+  // variant_billboard (1<<18) uniform buffer: {view@0 mat4(64B), proj@64 mat4(64B),
+  // flags@128 u32(4B), pad@132(12B)} = 144B struct in DEPTH_STRIDE (256B) dynamic-offset
+  // slots. One slot per draw_billboards call, up to MAX_DRAWS per frame.
+  const gpuEnsureBillUniform = (st) => {
+    if (!st.billUbo) {
+      st.billUbo = st.device.createBuffer({
+        size: DEPTH_STRIDE * MAX_DRAWS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    return st.billUbo;
+  };
   // Resolve a material slot (0=base,1=mr,2=normal,3=emissive,4=occlusion — the
   // bind_texture wire numbering) to a texture view, falling back to a device
   // default per gpuMakeDefaults' documented mapping. IBL slots (irradiance/
@@ -6852,7 +6927,8 @@
             st.lastW = w;
             st.lastH = h;
           }
-          st.pbrSlot = 0; // reset per-draw uniform slot allocation for this frame
+          st.pbrSlot = 0;  // reset per-draw uniform slot allocation for this frame
+          st.billSlot = 0; // reset per-frame billboard draw slot counter
           st.frameCascadeCount = 0; // default CSM off; set_csm (36) re-enables per frame
           st.frameAreaCount = 0; // default no area lights; set_area_lights (37) re-enables per frame
           st.curTargetFormat = st.format; // canvas pass: post draws target st.format
@@ -7030,6 +7106,64 @@
               },
             });
             st.pipelines[handle] = { pipeline, bgl0, kind: "oit" };
+            break;
+          }
+          if ((variant & 0x40000) !== 0) { // variant_billboard (1<<18) — per-instance screen-facing sprites.
+            // Standalone pipeline. group(0) binding(0): 144B {view@0, proj@64, flags@128}
+            // dynamic-offset UBO. group(1) binding(0): sprite texture; binding(1): sampler.
+            // Vertex slot 0 = instance buffer (stride 36, stepMode "instance"):
+            //   loc0=center vec3 @0, loc1=size f32 @12, loc2=color vec4 @16, loc3=rot f32 @32.
+            // Quad (6 verts) is generated in the vertex shader from @builtin(vertex_index).
+            // Blend: standard src-alpha / one-minus-src-alpha. Depth-test ON, depth-write OFF.
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform", hasDynamicOffset: true },
+              }],
+            });
+            const bgl1 = device.createBindGroupLayout({
+              entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+              ],
+            });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
+            const pipeline = device.createRenderPipeline({
+              layout,
+              vertex: {
+                module,
+                entryPoint: "vs_main",
+                buffers: [{
+                  arrayStride: 36,
+                  stepMode: "instance",
+                  attributes: [
+                    { shaderLocation: 0, offset: 0,  format: "float32x3" }, // center
+                    { shaderLocation: 1, offset: 12, format: "float32"   }, // size
+                    { shaderLocation: 2, offset: 16, format: "float32x4" }, // color
+                    { shaderLocation: 3, offset: 32, format: "float32"   }, // rot
+                  ],
+                }],
+              },
+              fragment: {
+                module,
+                entryPoint: "fs_main",
+                targets: [{
+                  format: st.format,
+                  blend: {
+                    color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+                    alpha: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+                  },
+                }],
+              },
+              primitive: { topology: "triangle-list", cullMode: "none" },
+              depthStencil: {
+                format: "depth24plus",
+                depthWriteEnabled: false,
+                depthCompare: "less",
+              },
+            });
+            st.pipelines[handle] = { pipeline, bgl0, bgl1, kind: "billboard" };
             break;
           }
           // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
@@ -8552,6 +8686,54 @@
             st.pointAtlasView = ps.atlasView;
           }
           st.bg1Dirty = true; // trigger bg1 rebuild before next DRAW_PBR
+          break;
+        }
+        case 42: { // DRAW_BILLBOARDS — N screen-facing quads via per-instance attribs.
+          // Payload (24B / 6 u32): vbuf_instance | count | tex_handle | view_ptr | proj_ptr | flags.
+          // Instance buffer (handle vbh) has stride-36 records; it was created as BufferKind.vertex
+          // (ARRAY_BUFFER) and is bound here as vertex slot 0 with stepMode "instance".
+          // group(0): 144B {view@0, proj@64, flags@128} dynamic-offset UBO (DEPTH_STRIDE=256B slot).
+          // group(1): sprite texture view + sampler; tex_handle 0 → white 1×1 dummy.
+          const vbh      = dv.getUint32(off, true);
+          const count    = dv.getUint32(off + 4, true);
+          const texH     = dv.getUint32(off + 8, true);
+          const viewPtr  = dv.getUint32(off + 12, true);
+          const projPtr  = dv.getUint32(off + 16, true);
+          const flags    = dv.getUint32(off + 20, true);
+          const vb = st.buffers[vbh];
+          const active = st.active;
+          if (!vb || !active || active.kind !== "billboard" || !st.pass) break;
+          // ── Per-draw uniform slot: view@0(64B), proj@64(64B), flags@128(4B). 144B in 256B slot. ──
+          const bslot = st.billSlot++;
+          if (bslot >= MAX_DRAWS) break;
+          const bbase = bslot * DEPTH_STRIDE;
+          const ubuf = gpuEnsureBillUniform(st);
+          device.queue.writeBuffer(ubuf, bbase,       new Float32Array(memory.buffer, viewPtr, 16)); // view  @0
+          device.queue.writeBuffer(ubuf, bbase + 64,  new Float32Array(memory.buffer, projPtr, 16)); // proj  @64
+          device.queue.writeBuffer(ubuf, bbase + 128, new Uint32Array([flags]));                     // flags @128
+          // ── Bind group 0: dynamic-offset uniform. Cached per pipeline layout. ──
+          if (!st.billBg0 || st.billBg0Layout !== active.bgl0) {
+            st.billBg0 = device.createBindGroup({
+              layout: active.bgl0,
+              entries: [{ binding: 0, resource: { buffer: ubuf, offset: 0, size: DEPTH_STRIDE } }],
+            });
+            st.billBg0Layout = active.bgl0;
+          }
+          // ── Bind group 1: sprite texture + sampler. Created fresh per draw (tex changes). ──
+          const texView = (texH !== 0 && st.textures[texH]) ? st.textures[texH].view : gpuWhiteTexView(st);
+          const bg1 = device.createBindGroup({
+            layout: active.bgl1,
+            entries: [
+              { binding: 0, resource: texView },
+              { binding: 1, resource: st.defaults.sampler },
+            ],
+          });
+          // ── Draw: instance buffer as slot 0, no index buffer, 6-vert quad per instance. ──
+          st.pass.setPipeline(active.pipeline);
+          st.pass.setVertexBuffer(0, vb.buf);
+          st.pass.setBindGroup(0, st.billBg0, [bbase]);
+          st.pass.setBindGroup(1, bg1);
+          st.pass.draw(6, count);
           break;
         }
 
