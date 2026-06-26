@@ -293,3 +293,14 @@ pub const GlOit = struct {
 pub const GlPoints = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// verve.gl fat-line demo (/gl-lines, Slice 2 — Fat Lines).
+/// Renders an animated translucent trail (Lissajous curve, 63 segments,
+/// alpha-fading tail → opaque head, state_depth_test | state_blend) and a
+/// static opaque wireframe cube (12 edges, state_depth_test) via
+/// `Encoder.drawLines` (wire tag 43, variant_fatline). Width-step controls,
+/// worldUnits toggle, freeze. SSR emits `<canvas data-ref="gllines-canvas">`.
+/// Source: `src/client/islands/GlLines.zig`.
+pub const GlLines = struct {
+    pub const props_schema: []const u8 = "{}";
+};

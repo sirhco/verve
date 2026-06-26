@@ -1476,6 +1476,50 @@ pub fn glPoints(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl fat-line demo — /gl-lines (Slice 2 — Fat Lines).
+/// Animated Lissajous trail (63 segments, alpha fade, state_depth_test|state_blend)
+/// and a static opaque wireframe cube (12 edges, state_depth_test). Both rendered
+/// via `Encoder.drawLines` (wire tag 43, variant_fatline). Width-step controls,
+/// worldUnits toggle, freeze. Canvas `data-ref="gllines-canvas"`.
+pub fn glLines(ctx: *const verve.Context) !*verve.Node {
+    const canvas = ctx.div().class("gl-wrap").children(.{
+        ctx.el("canvas")
+            .attr("data-ref", "gllines-canvas")
+            .attr("width", "640")
+            .attr("height", "400")
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#000;border-radius:8px;"),
+    });
+
+    // Controls wired to the GlLines chunk's no-arg exports via z-on-click.
+    // Must live INSIDE the island subtree so events route to this chunk.
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "gllines_width_up").text("Width +"),
+        ctx.el("button").attr("z-on-click", "gllines_width_down").text("Width -"),
+        ctx.el("button").attr("z-on-click", "gllines_toggle_worldunits").text("Toggle World Units"),
+        ctx.el("button").attr("z-on-click", "gllines_freeze").text("Freeze"),
+        ctx.el("button").attr("z-on-click", "gllines_unfreeze").text("Unfreeze"),
+    });
+
+    const inner = ctx.section().class("card").children(.{
+        ctx.h2("Animated trail + wireframe cube — fat-line primitive"),
+        canvas,
+        controls,
+    });
+    const demo_island = verve.island(ctx, .{ .name = "GlLines" }, inner);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.gl — fat lines"),
+        ctx.p().text("An animated Lissajous-curve trail (63 segments, alpha-fading " ++
+            "from transparent tail to opaque head) and a static wireframe cube " ++
+            "(12 edges, opaque) rendered via Encoder.drawLines (wire tag 43, " ++
+            "variant_fatline). Screen-space width is pixel-constant at any depth. " ++
+            "Toggle World Units to see perspective-shrink; Freeze pins the orbit " ++
+            "camera while the trail keeps animating. Both backends: WebGPU (WGSL) " ++
+            "and WebGL2 (GLSL)."),
+        demo_island,
+    });
+}
+
 /// verve.gl declarative scene demo — /gl-scene.
 /// Uses the GlSceneBuilder fluent API (ctx.glScene → chain → .build()).
 /// Picking: `.onPickExport("Cube", "verve:glpick")` (P8) wires the cube to a
