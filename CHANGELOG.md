@@ -4,6 +4,25 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.24.0] - 2026-06-29
+
+### Added
+
+- **gl — wireframe mode**: `GlSceneBuilder.wireframe(.{ .color = .{r,g,b} })` renders a
+  mesh's triangle edges as thin native lines (`three.js material.wireframe` parity). The
+  chunk builds an edge index buffer at runtime from the mesh's triangle index list — each
+  triangle emits 3 edge pairs (6 indices) reusing the existing vertex buffer — and submits
+  the result as `GL_LINES` (WebGL2) / `line-list` (WebGPU). A standalone unlit flat-color
+  shader draws each edge; the scene color is serialized out-of-band as the `data-glwire`
+  canvas attribute (`r,g,b` floats) and read via `refGetAttr` before the first frame. Mode
+  is **pure-replace**: the PBR/lit surface pass is skipped (no double-draw, no shadow cast).
+  The edge buffer tracks the **active LOD level** selected each frame, so wireframe edge
+  count is always correct on LOD meshes. Both WebGL2 and WebGPU backends. New
+  `/gl-wireframe` demo. v1 limitations (deferred): per-scene edge cap (~8 192 triangles;
+  larger meshes partially skipped); no edge dedup (shared edges drawn twice); no line width
+  control (fat-line infra not wired); no overlay mode (shaded + wire); per-material/object
+  wireframe not supported; unlit only; no frustum cull in the wireframe pass.
+
 ## [0.23.1] - 2026-06-29
 
 ### Fixed
