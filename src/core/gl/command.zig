@@ -129,6 +129,16 @@ pub const Tag = enum(u16) {
     //   xyz = world-space normal, w = constant; keep iff dot(n,worldPos) + w >= 0.0). Per-frame transient.
     //   The bridge uploads into u_clip_planes[]/u_clip_count (GLSL) or u.clip_planes/u.clip_count (WGSL)
     //   on each PBR draw with variant_clipping. Mirror of set_area_lights (tag 37).
+
+    // ── Wireframe (variant_wireframe) ────────────────────────────────────
+    draw_wireframe = 46, // {vbuf, ibuf, index_byte_off, index_count, mvp_ptr, color_ptr} — draws
+    //   triangle edges as thin lines using LINES / line-list topology (set by the bridge, NOT the shader).
+    //   vbuf = stride-48 vertex buffer (only pos vec3@0 loc0 is read). ibuf = u16 line index buffer;
+    //   index_byte_off = byte offset into ibuf; index_count = number of indices to draw. mvp_ptr → 16 f32
+    //   model-view-projection (proj*view*model). color_ptr → 4 f32 rgba line color. Standalone
+    //   variant_wireframe program (own U{mvp,color} — no texture, no lighting, no tonemap). Same
+    //   shape family as draw_sub (tag 9) minus the texture handle. Backend draw =
+    //   drawElements(LINES, index_count, UNSIGNED_SHORT, index_byte_off) / drawIndexed(index_count,1,off/2,0,0).
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -180,6 +190,12 @@ pub const variant_clipping: u32 = 1 << 21; // requires variant_pbr; world-space 
 // u_clip_planes[4]+u_clip_count + discard loop at top of main() (before lighting). WGSL: fields
 // clip_planes/clip_count appended at END of PBR U (after shadow block when present); discard
 // loop in fs_main(). Forward/PBR draws ONLY — do NOT set on depth/shadow pass draws.
+pub const variant_wireframe: u32 = 1 << 22; // Wireframe overlay (three.js material.wireframe parity): triangle
+// edges drawn as thin lines via LINES topology (bridge pipeline state — NOT the shader). Standalone
+// shader pair (own VS+FS + own U{mvp,color}), NOT a PBR add-on. VS reads only pos@0 (loc0) from
+// the stride-48 vbuf; FS emits flat u_color (no texture, no lighting, no tonemap). GLSL: individual
+// uniforms u_mvp (mat4) + u_color (vec4). WGSL: struct U { mvp: mat4x4<f32>, color: vec4<f32> }
+// @group(0)@binding(0); size=80B (mvp@0 64B + color@64 16B, 16-aligned). NO @group(1) bindings.
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -1023,6 +1039,45 @@ pub fn decalFragmentSrc() []const u8 {
     \\  float ndl = clamp(dot(normalize(v_normal), L), 0.0, 1.0);
     \\  rgb *= (0.4 + 0.6 * ndl);
     \\  o_color = vec4(rgb, a);
+    \\}
+    \\
+    ;
+}
+
+// ── Wireframe (variant_wireframe) GLSL ──────────────────────────────────────
+//
+// Draws triangle edges as thin lines (LINES topology set by the bridge). The
+// standalone shader pair (variant_wireframe) owns its own individual uniforms
+// {u_mvp, u_color}. Only pos@0 (loc0) is read from the stride-48 vbuf. No
+// texture, no lighting, no tonemap — pure flat-color output. Same vertex layout
+// as the depth shader (attrib 0 only) so the same VBO works for both passes.
+
+/// Wireframe vertex shader (GLSL, variant_wireframe). Reads only a_pos (loc0)
+/// from the stride-48 vbuf; transforms by u_mvp. Topology (LINES) is pipeline
+/// state — the shader is topology-agnostic.
+pub fn wireframeVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\uniform mat4 u_mvp;
+    \\void main() {
+    \\  gl_Position = u_mvp * vec4(a_pos, 1.0);
+    \\}
+    \\
+    ;
+}
+
+/// Wireframe fragment shader (GLSL, variant_wireframe). Emits flat u_color.
+/// No texture, no lighting, no tonemap. Alpha is passed through (pipeline sets
+/// blend state if transparency is desired).
+pub fn wireframeFragmentSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\precision highp float;
+    \\uniform vec4 u_color;
+    \\out vec4 frag_color;
+    \\void main() {
+    \\  frag_color = u_color;
     \\}
     \\
     ;
@@ -3591,6 +3646,37 @@ pub fn wgslDecal() []const u8 {
     ;
 }
 
+/// Wireframe WGSL (variant_wireframe). Standalone shader pair — own UBO U{mvp, color}.
+/// EXACT byte offsets (the bridge MUST write uniforms at these offsets; mismatch
+/// = visually-silent WebGPU breakage):
+///   mvp:   mat4x4<f32> @0   (64B)
+///   color: vec4<f32>   @64  (16B, align 16)
+///   struct size = 80B (16-aligned; 80 = 16×5). Task B bind-group binding size = 80.
+/// NO @group(1) bindings — no texture, no sampler.
+/// Vertex attrib loc0=pos (stride-48 VBO; only pos read). VS = u.mvp*pos;
+/// FS = u.color. Topology (LINES) is pipeline state set by the bridge — NOT the shader.
+///
+/// WGSL FREE-FN TRAP: no free function references `in.<field>` — all logic lives
+/// inline in vs_main/fs_main. No parameter named `in` exists anywhere.
+pub fn wgslWireframe() []const u8 {
+    return
+    \\struct U {
+    \\  mvp: mat4x4<f32>,
+    \\  color: vec4<f32>,
+    \\};
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\@vertex
+    \\fn vs_main(@location(0) a_pos: vec3<f32>) -> @builtin(position) vec4<f32> {
+    \\  return u.mvp * vec4<f32>(a_pos, 1.0);
+    \\}
+    \\@fragment
+    \\fn fs_main() -> @location(0) vec4<f32> {
+    \\  return u.color;
+    \\}
+    \\
+    ;
+}
+
 /// WBOIT resolve WGSL (variant_post). tex0 = accum, tex1 = reveal, tex2 = opaque
 /// scene HDR. Uses textureSampleLevel(...,0.0) (derivative-free). Identical math
 /// to `oitResolveFragmentSrc`.
@@ -4253,6 +4339,25 @@ pub const Encoder = struct {
         self.putU32(index_count);
         self.putU32(mvp_ptr);
         self.putU32(tex_handle);
+        self.putU32(color_ptr);
+    }
+
+    /// Wireframe draw (variant_wireframe). Draws triangle edges as thin lines
+    /// (bridge sets LINES / line-list topology — NOT this shader). `vbuf` = stride-48
+    /// vertex buffer (only pos@0 loc0 is read); `ibuf` = u16 line index buffer;
+    /// `index_byte_off` = byte offset into ibuf; `index_count` = indices to draw.
+    /// `mvp_ptr` → 16 f32 model-view-projection (proj·view·model). `color_ptr` → 4 f32
+    /// rgba line color (.a = opacity). Standalone variant_wireframe program (own
+    /// U{mvp,color} — no texture bindings at any group). Backend draw =
+    /// drawElements(LINES, index_count, UNSIGNED_SHORT, index_byte_off) /
+    /// drawIndexed(index_count, 1, off/2, 0, 0).
+    pub fn drawWireframe(self: *Encoder, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, mvp_ptr: u32, color_ptr: u32) void {
+        self.header(.draw_wireframe, 24);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(mvp_ptr);
         self.putU32(color_ptr);
     }
 
@@ -7610,4 +7715,117 @@ test "golden: instanced+clip WGSL hash frozen (FNV-1a-64)" {
     // clip_planes@832, clip_count@896. variant_shadow+instanced is @compileError → no shadow case.
     const IC = variant_pbr | variant_instanced | variant_clipping;
     try testing.expectEqual(@as(u64, 0x7bdfd5a78e14acde), fnv64(wgslPbr(IC)));
+}
+
+// ── Wireframe (variant_wireframe = 1<<22, draw_wireframe = 46) ───────────
+
+test "variant_wireframe bit value (1<<22) is free + collision-free" {
+    try testing.expectEqual(@as(u32, 1 << 22), variant_wireframe);
+    // No overlap with any existing variant bit.
+    try testing.expect(variant_wireframe & variant_clipping == 0);
+    try testing.expect(variant_wireframe & variant_decal == 0);
+    try testing.expect(variant_wireframe & variant_fatline == 0);
+    try testing.expect(variant_wireframe & variant_billboard == 0);
+    try testing.expect(variant_wireframe & variant_oit == 0);
+    try testing.expect(variant_wireframe & variant_prepass == 0);
+    try testing.expect(variant_wireframe & variant_post == 0);
+    try testing.expect(variant_wireframe & variant_pbr == 0);
+    try testing.expect(variant_wireframe & variant_shadow_point == 0);
+}
+
+test "wireframe: tag + constant values" {
+    try testing.expectEqual(@as(u16, 46), @intFromEnum(Tag.draw_wireframe));
+}
+
+test "golden: DRAW_WIREFRAME (tag 46) byte layout" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    // vbuf=5 ibuf=6 index_byte_off=0x40 index_count=36 mvp=0x3000 color=0x3100
+    enc.drawWireframe(5, 6, 0x40, 36, 0x3000, 0x3100);
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // DRAW_WIREFRAME: 4-byte length + 4-byte (tag+payload_size) + 24-byte payload = 32 bytes total.
+    // Length field = bytes after it = 2+2+24 = 28 = 0x1c → "1c000000".
+    try testing.expectEqualStrings(
+        "1c000000" ++ // length header: 28 record bytes follow
+            // DRAW_WIREFRAME tag=46=0x2e payload=24=0x18
+            // vbuf=5 ibuf=6 index_byte_off=0x40 index_count=36=0x24 mvp=0x3000 color=0x3100
+            "2e00" ++ "1800" ++ "05000000" ++ "06000000" ++ "40000000" ++ "24000000" ++ "00300000" ++ "00310000",
+        hex,
+    );
+}
+
+test "wireframe GLSL: VS reads a_pos + u_mvp only; FS emits u_color flat" {
+    const vs = wireframeVertexSrc();
+    // Only loc0 pos attrib — no normal, no uv.
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 0) in vec3 a_pos;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 1)") == null);
+    try testing.expect(std.mem.indexOf(u8, vs, "layout(location = 2)") == null);
+    // MVP transform.
+    try testing.expect(std.mem.indexOf(u8, vs, "uniform mat4 u_mvp;") != null);
+    try testing.expect(std.mem.indexOf(u8, vs, "gl_Position = u_mvp * vec4(a_pos, 1.0);") != null);
+    // No varyings (standalone flat-color shader).
+    try testing.expect(std.mem.indexOf(u8, vs, "out ") == null);
+
+    const fs = wireframeFragmentSrc();
+    // Flat color uniform, no texture, no lighting, no tonemap.
+    try testing.expect(std.mem.indexOf(u8, fs, "uniform vec4 u_color;") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "frag_color = u_color;") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "sampler") == null);
+    try testing.expect(std.mem.indexOf(u8, fs, "texture(") == null);
+    try testing.expect(std.mem.indexOf(u8, fs, "aces") == null);
+    try testing.expect(std.mem.indexOf(u8, fs, "pow(") == null);
+
+    // Variant-gating: wireframe math must NOT leak into PBR shaders.
+    const pbr_fs = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, pbr_fs, "frag_color = u_color;") == null);
+}
+
+test "WGSL wireframe: both stages present, U{mvp,color} at group0, no group1, no in.*" {
+    const w = wgslWireframe();
+    // Both stages.
+    try testing.expect(std.mem.indexOf(u8, w, "@vertex") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@fragment") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fn vs_main(") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "fn fs_main(") != null);
+    // Standalone wireframe UBO {mvp, color}.
+    try testing.expect(std.mem.indexOf(u8, w, "mvp: mat4x4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "color: vec4<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@group(0) @binding(0) var<uniform> u: U;") != null);
+    // NO group(1) — no texture, no sampler.
+    try testing.expect(std.mem.indexOf(u8, w, "@group(1)") == null);
+    // Only loc0 input.
+    try testing.expect(std.mem.indexOf(u8, w, "@location(0) a_pos: vec3<f32>") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "@location(1)") == null);
+    // Transform and flat color output.
+    try testing.expect(std.mem.indexOf(u8, w, "u.mvp * vec4<f32>(a_pos, 1.0)") != null);
+    try testing.expect(std.mem.indexOf(u8, w, "return u.color;") != null);
+    // No tonemap, no texture sampling.
+    try testing.expect(std.mem.indexOf(u8, w, "textureSample") == null);
+    try testing.expect(std.mem.indexOf(u8, w, "aces") == null);
+    // WGSL FREE-FN TRAP: no free functions, no `in.` dereference.
+    try testing.expect(std.mem.indexOf(u8, w, "in.") == null);
+}
+
+test "golden: wireframe GLSL+WGSL hashes frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = a deliberate shader contract bump
+    // (the verve.js WebGL2 + WebGPU wireframe backends lockstep to these strings).
+    try testing.expectEqual(@as(u64, 0x5bd62d643af5c2d5), fnv64(wireframeVertexSrc()));
+    try testing.expectEqual(@as(u64, 0x9f89a30c2d571130), fnv64(wireframeFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xb06025d15e2cfde8), fnv64(wgslWireframe()));
+
+    // The pre-existing standalone shader hashes MUST be UNCHANGED — variant_wireframe
+    // is purely additive; it must not perturb any existing source.
+    try testing.expectEqual(@as(u64, 0xbb3f2c2e0adf8140), fnv64(decalVertexSrc()));
+    try testing.expectEqual(@as(u64, 0xd26427e5ff6813f7), fnv64(decalFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0x81397d859cb5676a), fnv64(wgslDecal()));
+    try testing.expectEqual(@as(u64, 0x489b5cbff4719f7b), fnv64(fatlineVertexSrc()));
+    try testing.expectEqual(@as(u64, 0x346bab2aeda734f7), fnv64(fatlineFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xcbe33585ea405469), fnv64(wgslFatline()));
+    try testing.expectEqual(@as(u64, 0x5a5d1ebaab664952), fnv64(billboardVertexSrc()));
+    try testing.expectEqual(@as(u64, 0xad2e38eff9cb1f19), fnv64(billboardFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0xaf366ee313c1b7ac), fnv64(wgslBillboard()));
+    try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(variant_pbr)));
+    try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(variant_pbr)));
 }
