@@ -152,6 +152,13 @@ pub const ClipPlane = struct {
 /// uniform array capacity wired in Task D).
 pub const max_clip = 4;
 
+/// Options for wireframe overlay. `color` is the line color (default white).
+/// Transported outside Props via `data-glwire` (CSV "r,g,b") so Props stays
+/// 14 fields. Field order frozen — Task D parseWireframe reads this exact layout.
+pub const WireframeOpts = struct {
+    color: [3]f32 = .{ 1, 1, 1 },
+};
+
 /// Fluent builder. Returned by `ctx.glScene`; finalize with `.build()`.
 /// All setters return `*GlSceneBuilder` so calls chain; `build()` returns
 /// the island-wrapped `*verve.Node` (or a poison node carrying the error,
@@ -172,6 +179,8 @@ pub const GlSceneBuilder = struct {
     area_count: usize = 0,
     clip_buf: [max_clip]ClipPlane = undefined,
     clip_count: usize = 0,
+    wire_on: bool = false,
+    wire_color: [3]f32 = .{ 1, 1, 1 },
     pick_names_buf: [max_picks][]const u8 = undefined,
     pick_ids_buf: [max_picks]u32 = undefined,
     pick_export_buf: [max_picks][]const u8 = undefined,
@@ -256,6 +265,16 @@ pub const GlSceneBuilder = struct {
         if (self.area_count >= max_area_lights) return self;
         self.area_lights_buf[self.area_count] = a;
         self.area_count += 1;
+        return self;
+    }
+
+    /// Wireframe overlay. When called, the chunk renders scene geometry as
+    /// wire edges in the given color. Transported outside Props via `data-glwire`
+    /// (CSV "r,g,b") so Props stays 14 fields. Not calling `.wireframe()` emits
+    /// no attribute and leaves the chunk in its default filled-mesh mode.
+    pub fn wireframe(self: *GlSceneBuilder, o: WireframeOpts) *GlSceneBuilder {
+        self.wire_on = true;
+        self.wire_color = o.color;
         return self;
     }
 
@@ -510,6 +529,19 @@ pub const GlSceneBuilder = struct {
                 if (clip_attr) |ca| _ = canvas.attr("data-glclip", ca);
             }
         }
+
+        // Wireframe overlay travels OUTSIDE Props as `data-glwire`: r,g,b.
+        // Only emitted when wireframe mode was enabled via `.wireframe(...)`.
+        const wire_attr: ?[]const u8 = if (!self.wire_on) null else std.fmt.allocPrint(
+            self.ctx.allocator,
+            "{d},{d},{d}",
+            .{
+                self.wire_color[0],
+                self.wire_color[1],
+                self.wire_color[2],
+            },
+        ) catch null;
+        if (wire_attr) |wa| _ = canvas.attr("data-glwire", wa);
 
         const inner_wrapper = self.ctx.div()
             .attr("style", "position:relative;display:block;width:100%;height:100%");
@@ -1072,4 +1104,26 @@ test "glScene .clipPlanes caps at max_clip" {
         if (c == ';') semis += 1;
     }
     try testing.expectEqual(@as(usize, max_clip - 1), semis);
+}
+
+test "glScene .wireframe emits data-glwire attribute" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .wireframe(.{ .color = .{ 1, 0, 0 } })
+        .build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glwire=\"1,0,0\"") != null);
+}
+
+test "glScene no .wireframe call emits no data-glwire" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glwire") == null);
 }
