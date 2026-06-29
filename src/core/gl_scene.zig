@@ -139,6 +139,19 @@ pub const AreaLight = struct {
 /// `gl.command.max_area_lights` (the shader UBO `area_lights[16]` = 4 vec4 each).
 pub const max_area_lights = 4;
 
+/// Describes one clipping plane for the `data-glclip` out-of-band attribute.
+/// `normal` is the plane normal (normalized on write); `constant` is the signed
+/// distance from the origin (keep test: `dot(n, p) + constant >= 0`). Field
+/// order frozen — Task D parseClipPlanes reads this exact CSV layout.
+pub const ClipPlane = struct {
+    normal: [3]f32 = .{ 0, 1, 0 },
+    constant: f32 = 0,
+};
+
+/// Max number of clipping planes accumulated per scene (matches the WGSL
+/// uniform array capacity wired in Task D).
+pub const max_clip = 4;
+
 /// Fluent builder. Returned by `ctx.glScene`; finalize with `.build()`.
 /// All setters return `*GlSceneBuilder` so calls chain; `build()` returns
 /// the island-wrapped `*verve.Node` (or a poison node carrying the error,
@@ -157,6 +170,8 @@ pub const GlSceneBuilder = struct {
     light_count: usize = 0,
     area_lights_buf: [max_area_lights]AreaLight = undefined,
     area_count: usize = 0,
+    clip_buf: [max_clip]ClipPlane = undefined,
+    clip_count: usize = 0,
     pick_names_buf: [max_picks][]const u8 = undefined,
     pick_ids_buf: [max_picks]u32 = undefined,
     pick_export_buf: [max_picks][]const u8 = undefined,
@@ -241,6 +256,17 @@ pub const GlSceneBuilder = struct {
         if (self.area_count >= max_area_lights) return self;
         self.area_lights_buf[self.area_count] = a;
         self.area_count += 1;
+        return self;
+    }
+
+    /// Set clipping planes (up to `max_clip`; extra entries are dropped).
+    /// Each plane's normal is normalized at `build()` time via `normalize3`.
+    /// Transported outside Props via `data-glclip` so Props stays 14 fields.
+    /// No attribute is emitted when the slice is empty.
+    pub fn clipPlanes(self: *GlSceneBuilder, ps: []const ClipPlane) *GlSceneBuilder {
+        const n = @min(ps.len, max_clip);
+        @memcpy(self.clip_buf[0..n], ps[0..n]);
+        self.clip_count = n;
         return self;
     }
 
@@ -455,6 +481,33 @@ pub const GlSceneBuilder = struct {
             if (apos > 0) {
                 const area_attr = std.fmt.allocPrint(self.ctx.allocator, "{s}", .{abuf[0..apos]}) catch null;
                 if (area_attr) |aa| _ = canvas.attr("data-glarealights", aa);
+            }
+        }
+
+        // Clipping planes travel OUTSIDE Props as a semicolon-separated list of
+        // 4-value comma-separated records (nx,ny,nz,constant). Only emitted when
+        // at least one plane was set. Normals are normalized on write.
+        // parseClipPlanes reads this EXACT layout — field order frozen.
+        if (self.clip_count > 0) {
+            // Upper bound per plane: 4 fields × 20 chars + 3 commas + 1 semi ≈ 84 B.
+            // 4 planes × 84 = 336; round up to 400 for safety.
+            var cbuf: [400]u8 = undefined;
+            var cpos: usize = 0;
+            for (self.clip_buf[0..self.clip_count], 0..) |cp, ci| {
+                const cn = normalize3(cp.normal);
+                const sep: []const u8 = if (ci != 0) ";" else "";
+                const cchunk = std.fmt.bufPrint(cbuf[cpos..], "{s}{d},{d},{d},{d}", .{
+                    sep,
+                    cn[0],
+                    cn[1],
+                    cn[2],
+                    cp.constant,
+                }) catch break;
+                cpos += cchunk.len;
+            }
+            if (cpos > 0) {
+                const clip_attr = std.fmt.allocPrint(self.ctx.allocator, "{s}", .{cbuf[0..cpos]}) catch null;
+                if (clip_attr) |ca| _ = canvas.attr("data-glclip", ca);
             }
         }
 
@@ -942,4 +995,81 @@ test "glScene perspective default emits no data-glcam" {
     const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
     const html = try renderHtml(scene, arena.allocator());
     try testing.expect(std.mem.indexOf(u8, html, "data-glcam") == null);
+}
+
+test "glScene .clipPlanes emits data-glclip" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .clipPlanes(&.{.{ .normal = .{ 1, 0, 0 }, .constant = 0 }})
+        .build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glclip=\"1,0,0,0\"") != null);
+}
+
+test "glScene no .clipPlanes call emits no data-glclip" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glclip") == null);
+}
+
+test "glScene .clipPlanes normalizes non-unit normals" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .clipPlanes(&.{.{ .normal = .{ 0, 2, 0 }, .constant = -1 }})
+        .build();
+    const html = try renderHtml(scene, arena.allocator());
+    // .{0,2,0} normalizes to .{0,1,0}; constant passes through.
+    try testing.expect(std.mem.indexOf(u8, html, "data-glclip=\"0,1,0,-1\"") != null);
+}
+
+test "glScene .clipPlanes two planes emit semicolon-joined record" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .clipPlanes(&.{
+            .{ .normal = .{ 0, 1, 0 }, .constant = -1 },
+            .{ .normal = .{ 1, 0, 0 }, .constant = 0 },
+        })
+        .build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glclip=\"0,1,0,-1;1,0,0,0\"") != null);
+}
+
+test "glScene .clipPlanes caps at max_clip" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    var b = ctx.glScene(.{ .src = "s", .env = "e" });
+    // Pass more than max_clip planes; extras must be dropped.
+    _ = b.clipPlanes(&.{
+        .{ .normal = .{ 1, 0, 0 }, .constant = 0 },
+        .{ .normal = .{ 0, 1, 0 }, .constant = 0 },
+        .{ .normal = .{ 0, 0, 1 }, .constant = 0 },
+        .{ .normal = .{ 1, 0, 0 }, .constant = 1 },
+        .{ .normal = .{ 0, 1, 0 }, .constant = 2 }, // 5th — beyond cap
+    });
+    const scene = b.build();
+    const html = try renderHtml(scene, arena.allocator());
+    // Exactly max_clip records → max_clip-1 semicolons.
+    const key = "data-glclip=\"";
+    const start = std.mem.indexOf(u8, html, key).? + key.len;
+    const end = start + std.mem.indexOfScalar(u8, html[start..], '"').?;
+    var semis: usize = 0;
+    for (html[start..end]) |c| {
+        if (c == ';') semis += 1;
+    }
+    try testing.expectEqual(@as(usize, max_clip - 1), semis);
 }
