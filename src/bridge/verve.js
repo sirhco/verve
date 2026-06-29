@@ -5359,6 +5359,9 @@
           // Default no area lights each frame; set_area_lights (tag 37) re-enables.
           st.frameAreaCount = 0;
           st.frameAreaLights = null;
+          // Default no clip planes each frame; set_clip_planes (tag 45) re-enables.
+          st.frameClipCount = 0;
+          st.frameClipPlanes = null;
           // Ensure the 1×1 rgba16f LTC dummy is bound to units 10/11 by default so
           // every PBR draw has valid (incomplete-free) textures at those samplers
           // even before /gl/ltc.bin loads. Real LUTs (tag 38) override these binds.
@@ -5401,6 +5404,10 @@
             // S3 area lights (LTC): count + the area_lights[] vec4 array base.
             sh.areaCount = gl.getUniformLocation(prog, "u_area_count");
             sh.areaLights = gl.getUniformLocation(prog, "u_area_lights[0]");
+            if (variant & 0x200000) { // variant_clipping: cache clip-plane uniform locations.
+              sh.clipPlanes = gl.getUniformLocation(prog, "u_clip_planes[0]");
+              sh.clipCount = gl.getUniformLocation(prog, "u_clip_count");
+            }
             // Sampler units are fixed at link time. Only set the ones that exist
             // in this variant's compiled program (variant-stripped samplers
             // return a null location). useProgram is required before uniform1i;
@@ -5734,6 +5741,17 @@
           }
           break;
         }
+        case 45: { // SET_CLIP_PLANES — cache per-frame clip-plane array (variant_clipping).
+          // Payload (command.zig Encoder.setClipPlanes, 8B): count | ptr. Each plane =
+          // 4 f32 (nx,ny,nz,constant) world-space, pre-normalized. Max 4 planes.
+          // DRAW_PBR uploads u_clip_planes/u_clip_count on the active program.
+          const count = dv.getUint32(off, true);
+          const p = dv.getUint32(off + 4, true);
+          const n = Math.min(count, 4);
+          st.frameClipCount = n;
+          st.frameClipPlanes = (n > 0) ? new Float32Array(memory.buffer, p, n * 4).slice() : null;
+          break;
+        }
         case 13: { // DRAW_PBR — full PBR submesh draw
           const vh = dv.getUint32(off, true);
           const ih = dv.getUint32(off + 4, true);
@@ -5762,6 +5780,12 @@
             gl.uniform1i(st.active.areaCount, st.frameAreaCount | 0);
           if (st.active.areaLights && st.frameAreaCount > 0 && st.frameAreaLights)
             gl.uniform4fv(st.active.areaLights, st.frameAreaLights);
+          // S4 clip planes (set_clip_planes, tag 45): upload u_clip_count + u_clip_planes[].
+          // Locations are null when variant_clipping absent — guards make writes safe.
+          if (st.active.clipCount)
+            gl.uniform1i(st.active.clipCount, st.frameClipCount | 0);
+          if (st.active.clipPlanes && st.frameClipCount > 0 && st.frameClipPlanes)
+            gl.uniform4fv(st.active.clipPlanes, st.frameClipPlanes);
           gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, byteOff);
           break;
         }
@@ -5828,6 +5852,11 @@
             gl2.uniform3fv(st.active.cameraPos, new Float32Array(memory.buffer, cameraPtr, 3));
           // Instanced is non-area: zero area_count so the shader skips the LTC loop.
           if (st.active.areaCount) gl2.uniform1i(st.active.areaCount, 0);
+          // S4 clip planes: upload if the instanced shader has variant_clipping.
+          if (st.active.clipCount)
+            gl2.uniform1i(st.active.clipCount, st.frameClipCount | 0);
+          if (st.active.clipPlanes && st.frameClipCount > 0 && st.frameClipPlanes)
+            gl2.uniform4fv(st.active.clipPlanes, st.frameClipPlanes);
           gl2.drawElementsInstanced(gl2.TRIANGLES, count, gl2.UNSIGNED_SHORT, byteOff, instanceCount);
           break;
         }
@@ -6788,6 +6817,15 @@
     // size 1328, stride 1536
     size: 1328,
   };
+  // Clip-plane WGSL byte offsets are VARIANT-DEPENDENT (Task A golden values):
+  //   base (non-shadow, non-instanced): clip_planes @768,  clip_count @832
+  //   shadow (flags & 0x20):            clip_planes @1328, clip_count @1392
+  //   instanced (flags & 0x1000):       clip_planes @832,  clip_count @896
+  // shadow|instanced is unreachable (@compileError in Zig — no 4th case).
+  const clipPlanesOffset = (flags) =>
+    (flags & 0x20) ? 1328 : (flags & 0x1000) ? 832 : 768;
+  const clipCountOffset = (flags) =>
+    (flags & 0x20) ? 1392 : (flags & 0x1000) ? 896 : 832;
   // Multiple draws per frame each need isolated uniforms: WebGPU defers draws, so
   // a single shared buffer would let the last writeBuffer clobber earlier draws.
   // Solution: dynamic uniform offsets — each draw writes its full struct to its
@@ -7076,6 +7114,7 @@
           st.decalSlot = 0; // reset per-frame decal draw slot counter
           st.frameCascadeCount = 0; // default CSM off; set_csm (36) re-enables per frame
           st.frameAreaCount = 0; // default no area lights; set_area_lights (37) re-enables per frame
+          st.frameClipCount = 0; // default no clip planes; set_clip_planes (45) re-enables per frame
           st.curTargetFormat = st.format; // canvas pass: post draws target st.format
           st.curPassHasDepth = true; // canvas pass always has depth24plus
           // Reuse the encoder if a shadow/offscreen pass already opened one this
@@ -8031,6 +8070,17 @@
           st.bg1Dirty = true;
           break;
         }
+        case 45: { // SET_CLIP_PLANES — cache per-frame clip-plane array (variant_clipping).
+          // Payload (command.zig Encoder.setClipPlanes, 8B): count | ptr. Each plane =
+          // 4 f32 (nx,ny,nz,constant) world-space, pre-normalized. Max 4 planes.
+          // draw_pbr writes clip_count + clip_planes at variant-dependent UBO offsets.
+          const count = dv.getUint32(off, true);
+          const p = dv.getUint32(off + 4, true);
+          const n = Math.min(count, 4);
+          st.frameClipCount = n;
+          st.frameClipPlanes = (n > 0) ? new Float32Array(memory.buffer, p, n * 4).slice() : null;
+          break;
+        }
         case 21: { // SET_BONES — upload the bone palette to bones @group(0)@binding(1).
           // Payload (command.zig Encoder.setBones, 8B): count | ptr. count = number
           // of mat4 (≤64); ptr → count*16 f32 column-major. Writes the whole
@@ -8281,6 +8331,18 @@
             device.queue.writeBuffer(ubuf, base + PBR_U.areaLights,
               st.frameAreaLights.buffer, st.frameAreaLights.byteOffset, (st.frameAreaCount | 0) * 16 * 4);
           }
+          // S4 clip planes (set_clip_planes, tag 45): clip_count i32 + clip_planes array<vec4,4>.
+          // Offsets are VARIANT-DEPENDENT — clipPlanesOffset/clipCountOffset use active.flags.
+          // Write every draw so a stale UBO value never persists when count drops to 0.
+          if (active.flags & 0x200000) {
+            device.queue.writeBuffer(ubuf, base + clipCountOffset(active.flags),
+              new Int32Array([st.frameClipCount | 0]));
+            if (st.frameClipCount > 0 && st.frameClipPlanes) {
+              device.queue.writeBuffer(ubuf, base + clipPlanesOffset(active.flags),
+                st.frameClipPlanes.buffer, st.frameClipPlanes.byteOffset,
+                (st.frameClipCount | 0) * 16);
+            }
+          }
           if (st.frameShadowVp && st.frameShadowVpCount > 0) {
             // shadow_vp[count] → U.shadow_vp @768. writeBuffer dataOffset/size are
             // ELEMENTS for a TypedArray, so pass .buffer/.byteOffset + the byte size.
@@ -8435,6 +8497,16 @@
           device.queue.writeBuffer(ubuf, base + PBR_U.prefMips, new Float32Array([st.framePrefMips || 0]));
           // Instanced is non-area: zero area_count so the shader skips the area loop.
           device.queue.writeBuffer(ubuf, base + PBR_U.areaCount, new Int32Array([0]));
+          // S4 clip planes: upload at instanced-variant offset (clip_planes@832, clip_count@896).
+          if (active.flags & 0x200000) {
+            device.queue.writeBuffer(ubuf, base + clipCountOffset(active.flags),
+              new Int32Array([st.frameClipCount | 0]));
+            if (st.frameClipCount > 0 && st.frameClipPlanes) {
+              device.queue.writeBuffer(ubuf, base + clipPlanesOffset(active.flags),
+                st.frameClipPlanes.buffer, st.frameClipPlanes.byteOffset,
+                (st.frameClipCount | 0) * 16);
+            }
+          }
           // ── Bind group 0: dynamic-offset uniform. Instanced has no bones. ──
           if (!st.bg0 || st.bg0Layout !== active.bgl0) {
             const bg0Entries = [{ binding: 0, resource: { buffer: ubuf, offset: 0, size: PBR_U.size } }];
@@ -9215,6 +9287,8 @@
       extColorBufferFloat: null, // EXT_color_buffer_float, enabled on first rgba16f target
       frameAreaCount: 0, // S3 area lights: active count (set_area_lights, tag 37; 0 = none)
       frameAreaLights: null, // S3: Float32Array(count*16) area_lights[] cached per frame
+      frameClipCount: 0,    // S4 clip planes: active count (set_clip_planes, tag 45; 0 = none)
+      frameClipPlanes: null, // S4: Float32Array(count*4) clip_planes[] cached per frame
       ltcMat: null, // S3: ltc_mat 64×64 rgba16f LUT (fetched from /gl/ltc.bin once)
       ltcMag: null, // S3: ltc_mag 64×64 rgba16f LUT
       ltcDummy: null, // S3: 1×1 rgba16f dummy bound to units 10/11 by default
@@ -9386,6 +9460,8 @@
       frameViewForward: null, // CSM: Float32Array(3) normalized camera look dir
       frameAreaCount: 0, // S3 area lights: active count (set_area_lights, tag 37; 0 = none)
       frameAreaLights: null, // S3: Float32Array(count*16) area_lights[] cached per frame
+      frameClipCount: 0,    // S4 clip planes: active count (set_clip_planes, tag 45; 0 = none)
+      frameClipPlanes: null, // S4: Float32Array(count*4) clip_planes[] cached per frame
       ltcMat: null, // S3: ltc_mat 64×64 rgba16f LUT (bridge fetches /gl/ltc.bin once)
       ltcMag: null, // S3: ltc_mag 64×64 rgba16f LUT
       ltcLoading: false, // S3: guards the one-shot /gl/ltc.bin fetch
