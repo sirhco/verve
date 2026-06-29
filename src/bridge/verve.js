@@ -5527,6 +5527,12 @@
             gl.useProgram(prog);
             if (sh.dcTex0) gl.uniform1i(sh.dcTex0, 0); // u_tex0 → TEXTURE0 (fixed at link time)
           }
+          if (variant & 0x400000) { // variant_wireframe (1<<22): thin-line indexed mesh draw.
+            // Standalone shader — uniforms: u_mvp mat4, u_color vec4. No texture.
+            // Per-vertex attrib (divisor 0): loc0=pos vec3@0, stride 48 (shared with depth vbuf).
+            sh.wfMvp   = gl.getUniformLocation(prog, "u_mvp");
+            sh.wfColor = gl.getUniformLocation(prog, "u_color");
+          }
           st.shaders[handle] = sh;
           break;
         }
@@ -6624,6 +6630,41 @@
           gl.disable(gl.POLYGON_OFFSET_FILL);
           break;
         }
+        case 46: { // DRAW_WIREFRAME — one indexed mesh drawn as thin LINES.
+          // Payload (24B / 6 u32): vbuf | ibuf | index_byte_off | index_count | mvp_ptr | color_ptr.
+          // Vertex layout: only loc0=pos vec3@0 read from stride-48 vbuf; no other attribs.
+          // Topology: gl.LINES (thin native lines; topology is draw-call-level, not the shader).
+          const vbh        = dv.getUint32(off, true);
+          const ibh        = dv.getUint32(off + 4, true);
+          const byteOff    = dv.getUint32(off + 8, true);
+          const indexCount = dv.getUint32(off + 12, true);
+          const mvpPtr     = dv.getUint32(off + 16, true);
+          const colorPtr   = dv.getUint32(off + 20, true);
+          const vb = st.buffers[vbh];
+          const ib = st.buffers[ibh];
+          // Guard: bail unless the active program is the wireframe variant (mirrors billboard/fatline guard).
+          if (!vb || !ib || !st.active || !(st.active.variant & 0x400000)) break;
+          // Upload uniforms: MVP matrix + RGBA line color.
+          if (st.active.wfMvp)   gl.uniformMatrix4fv(st.active.wfMvp, false, new Float32Array(memory.buffer, mvpPtr, 16));
+          if (st.active.wfColor) gl.uniform4fv(st.active.wfColor, new Float32Array(memory.buffer, colorPtr, 4));
+          // Dedicated per-mesh VAO keyed by (vbuf,ibuf) pair. Stride=48, pos-only attrib at loc0.
+          // Wireframe draws per-vertex (divisor 0) with the u16 edge index buffer.
+          const wfKey = `${vbh}:${ibh}:wf`;
+          let wfVao = st.vaos.get(wfKey);
+          if (!wfVao) {
+            wfVao = gl.createVertexArray();
+            gl.bindVertexArray(wfVao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
+            // loc 0: pos vec3 f32 @0, stride 48 (only attrib read by the wireframe VS).
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
+            st.vaos.set(wfKey, wfVao);
+          }
+          gl.bindVertexArray(wfVao);
+          gl.drawElements(gl.LINES, indexCount, gl.UNSIGNED_SHORT, byteOff);
+          break;
+        }
 
         default:
           break; // unknown tag: size-skip = forward compatible
@@ -6995,6 +7036,17 @@
     }
     return st.decalUbo;
   };
+  // variant_wireframe (1<<22) uniform buffer: {mvp@0 mat4(64B), color@64 vec4(16B)} = 80B struct
+  // in DEPTH_STRIDE (256B) dynamic-offset slots. One slot per draw_wireframe call, up to MAX_DRAWS.
+  const gpuEnsureWireframeUniform = (st) => {
+    if (!st.wireframeUbo) {
+      st.wireframeUbo = st.device.createBuffer({
+        size: DEPTH_STRIDE * MAX_DRAWS,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    return st.wireframeUbo;
+  };
   // Resolve a material slot (0=base,1=mr,2=normal,3=emissive,4=occlusion — the
   // bind_texture wire numbering) to a texture view, falling back to a device
   // default per gpuMakeDefaults' documented mapping. IBL slots (irradiance/
@@ -7113,8 +7165,9 @@
           }
           st.pbrSlot = 0;  // reset per-draw uniform slot allocation for this frame
           st.billSlot = 0;  // reset per-frame billboard draw slot counter
-          st.lineSlot = 0;  // reset per-frame fat-line draw slot counter
-          st.decalSlot = 0; // reset per-frame decal draw slot counter
+          st.lineSlot = 0;       // reset per-frame fat-line draw slot counter
+          st.decalSlot = 0;      // reset per-frame decal draw slot counter
+          st.wireframeSlot = 0;  // reset per-frame wireframe draw slot counter
           st.frameCascadeCount = 0; // default CSM off; set_csm (36) re-enables per frame
           st.frameAreaCount = 0; // default no area lights; set_area_lights (37) re-enables per frame
           st.frameClipCount = 0; // default no clip planes; set_clip_planes (45) re-enables per frame
@@ -7473,6 +7526,49 @@
               },
             });
             st.pipelines[handle] = { pipeline, bgl0, bgl1, kind: "decal" };
+            break;
+          }
+          if ((variant & 0x400000) !== 0) { // variant_wireframe (1<<22) — thin-line indexed mesh draw.
+            // Standalone pipeline. group(0) binding(0): 80B {mvp@0 mat4(64B), color@64 vec4(16B)}
+            // dynamic-offset UBO. NO group(1) — no texture, no sampler.
+            // Vertex slot 0 = per-vertex mesh (stride 48, stepMode "vertex"):
+            //   loc0=pos vec3@0 (only attrib read; stride-48 shared with depth/PBR vbuf).
+            // Topology: line-list (first native-line path in the engine).
+            // Depth: depth24plus, less, depthWriteEnabled true (opaque scene pass consistency).
+            const bgl0 = device.createBindGroupLayout({
+              entries: [{
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                buffer: { type: "uniform", hasDynamicOffset: true },
+              }],
+            });
+            const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
+            const pipeline = device.createRenderPipeline({
+              layout,
+              vertex: {
+                module,
+                entryPoint: "vs_main",
+                buffers: [{
+                  arrayStride: 48,
+                  stepMode: "vertex",
+                  attributes: [
+                    { shaderLocation: 0, offset: 0, format: "float32x3" }, // pos
+                  ],
+                }],
+              },
+              fragment: {
+                module,
+                entryPoint: "fs_main",
+                targets: [{ format: st.format }],
+              },
+              primitive: { topology: "line-list", cullMode: "none" },
+              depthStencil: {
+                format: "depth24plus",
+                depthWriteEnabled: true,
+                depthCompare: "less",
+              },
+            });
+            st.pipelines[handle] = { pipeline, bgl0, kind: "wireframe" };
             break;
           }
           // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
@@ -9174,6 +9270,45 @@
           st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
           st.pass.setBindGroup(0, st.decalBg0, [dbase]);
           st.pass.setBindGroup(1, bg1);
+          st.pass.drawIndexed(indexCount);
+          break;
+        }
+        case 46: { // DRAW_WIREFRAME — one indexed mesh drawn as thin lines (line-list topology).
+          // Payload (24B / 6 u32): vbuf | ibuf | index_byte_off | index_count | mvp_ptr | color_ptr.
+          // group(0): 80B {mvp@0 mat4(64B), color@64 vec4(16B)} dynamic-offset UBO. NO group(1).
+          // Topology: line-list (baked into the wireframe pipeline — first native-line path).
+          const vbh        = dv.getUint32(off, true);
+          const ibh        = dv.getUint32(off + 4, true);
+          const byteOff    = dv.getUint32(off + 8, true);
+          const indexCount = dv.getUint32(off + 12, true);
+          const mvpPtr     = dv.getUint32(off + 16, true);
+          const colorPtr   = dv.getUint32(off + 20, true);
+          const vb = st.buffers[vbh];
+          const ib = st.buffers[ibh];
+          const active = st.active;
+          if (!vb || !ib || !active || active.kind !== "wireframe" || !st.pass) break;
+          // ── Per-draw uniform slot: mvp@0(64B), color@64(16B). 80B in 256B dynamic-offset slot. ──
+          const wslot = st.wireframeSlot++;
+          if (wslot >= MAX_DRAWS) break;
+          const wbase = wslot * DEPTH_STRIDE;
+          const wubuf = gpuEnsureWireframeUniform(st);
+          device.queue.writeBuffer(wubuf, wbase,      new Float32Array(memory.buffer, mvpPtr,   16)); // mvp   @0  (64B)
+          device.queue.writeBuffer(wubuf, wbase + 64, new Float32Array(memory.buffer, colorPtr,  4)); // color @64 (16B)
+          // ── Bind group 0: dynamic-offset uniform. Cached per pipeline layout. ──
+          // Binding size = 80 (exact struct size: mvp 64B + color 16B). hasDynamicOffset=true.
+          if (!st.wireframeBg0 || st.wireframeBg0Layout !== active.bgl0) {
+            st.wireframeBg0 = device.createBindGroup({
+              layout: active.bgl0,
+              entries: [{ binding: 0, resource: { buffer: wubuf, offset: 0, size: 80 } }],
+            });
+            st.wireframeBg0Layout = active.bgl0;
+          }
+          // ── Draw: vertex buffer slot 0, u16 edge index buffer, indexed draw. ──
+          // Line-list topology is baked into the pipeline (not a runtime state).
+          st.pass.setPipeline(active.pipeline);
+          st.pass.setVertexBuffer(0, vb.buf);
+          st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
+          st.pass.setBindGroup(0, st.wireframeBg0, [wbase]);
           st.pass.drawIndexed(indexCount);
           break;
         }
