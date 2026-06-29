@@ -2408,7 +2408,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     // WGSL free functions CANNOT reference in.<field>; the loop stays in fs_main() to avoid the trap.
     // Convention: keep iff dot(clip_planes[i].xyz, worldPos) + clip_planes[i].w >= 0.0.
     const fs_clip_discard =
-        \\  for (var ci: i32 = 0; ci < u.clip_count; ci = ci + 1) {
+        \\  for (var ci: u32 = 0u; ci < u.clip_count; ci = ci + 1u) {
         \\    if (dot(u.clip_planes[ci].xyz, in.world_pos) + u.clip_planes[ci].w < 0.0) { discard; }
         \\  }
         \\
@@ -7492,8 +7492,8 @@ test "golden: clipping shader FNV hashes frozen (FNV-1a-64)" {
     const CS = variant_pbr | variant_shadow | variant_clipping;
     // New clipping variant hashes (expected to differ from non-clipping path):
     try testing.expectEqual(@as(u64, 0x5da93749b39c138c), fnv64(pbrFragmentSrc(C)));
-    try testing.expectEqual(@as(u64, 0x39e3087efe56ee58), fnv64(wgslPbr(C)));
-    try testing.expectEqual(@as(u64, 0x7a46b2e838a3663a), fnv64(wgslPbr(CS)));
+    try testing.expectEqual(@as(u64, 0x86046f2f8749bbf2), fnv64(wgslPbr(C)));
+    try testing.expectEqual(@as(u64, 0x5d5f238efda65e30), fnv64(wgslPbr(CS)));
     // Non-clipping path UNCHANGED — variant_clipping code is only emitted under variant_clipping.
     // clip_count=0 is a no-op; a scene without clip planes is byte-identical to pre-change.
     try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(variant_pbr)));
@@ -7609,5 +7609,5 @@ test "golden: instanced+clip WGSL hash frozen (FNV-1a-64)" {
     // Fix 2: freeze the variant_pbr|variant_instanced|variant_clipping shader hash.
     // clip_planes@832, clip_count@896. variant_shadow+instanced is @compileError → no shadow case.
     const IC = variant_pbr | variant_instanced | variant_clipping;
-    try testing.expectEqual(@as(u64, 0x30ce18fcf4173a9c), fnv64(wgslPbr(IC)));
+    try testing.expectEqual(@as(u64, 0x7bdfd5a78e14acde), fnv64(wgslPbr(IC)));
 }
