@@ -6814,8 +6814,11 @@
     cascadeSplits: 1296, // vec4 @1296 (16-aligned, 1296..1312) view-space FAR per cascade
     viewForward: 1312,   // vec3 @1312 (1312..1324, +4B pad → 1328) normalized camera look dir
     // area @504/512..768; shadowVp @768 (512B, 768..1280); cascade fields 1280..1328;
-    // size 1328, stride 1536
-    size: 1328,
+    // variant_clipping appends clip_planes@1328 + clip_count@1392 (+pad) → shadow+clip struct = 1408.
+    // This is the bind-group BINDING SIZE (group0/binding0), distinct from PBR_STRIDE (slot stride).
+    // It must be >= the LARGEST variant struct the binding serves = shadow+clip = 1408, else WebGPU
+    // rejects the draw ("buffer bound with size 1328 ... requires at least 1408 bytes"). stride 1536.
+    size: 1408,
   };
   // Clip-plane WGSL byte offsets are VARIANT-DEPENDENT (Task A golden values):
   //   base (non-shadow, non-instanced): clip_planes @768,  clip_count @832
