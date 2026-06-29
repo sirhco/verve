@@ -2193,12 +2193,13 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // ── Wireframe draw — pure replace ─────────────────────────────────────
         // When wire_on and edge data are ready: emit thin-line draws per submesh,
         // then return early — skipping T6-instanced, PBR-opaque, and transparent.
-        // No LOD narrowing and no frustum culling in v1 (correctness over throughput).
+        // No frustum culling in v1 (correctness over throughput); LOD-narrowed below.
         // The frame still returns non-zero (cmd_buf address) so the bridge stays live.
         if (inst.wire_on and inst.wire_total > 0) {
             enc.setPipeline(wire_shader, gl.command.state_depth_test);
-            var ws: u32 = 0;
-            const w_hi: u32 = @min(a.submesh_count, max_submesh);
+            const w_lo: u32 = if (inst.lod_level_count > 0) inst.lod_first[inst.lod_active] else 0;
+            const w_hi: u32 = @min(if (inst.lod_level_count > 0) w_lo + inst.lod_count[inst.lod_active] else a.submesh_count, max_submesh);
+            var ws: u32 = w_lo;
             while (ws < w_hi) : (ws += 1) {
                 if (inst.wire_count[ws] == 0) continue;
                 inst.mvps[ws] = pv.mul(inst.scene.world[ws + 1]).m;
