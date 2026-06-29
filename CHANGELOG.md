@@ -4,6 +4,21 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.23.1] - 2026-06-29
+
+### Fixed
+
+- **gl ortho-aware cascaded shadow maps**: directional CSM shadows now render correctly
+  under orthographic projection. `cascadeLightVp` previously reconstructed each cascade
+  slice as a perspective frustum wedge (half-extents growing with depth via `tan(fov/2)`),
+  which mis-sized the light frustum when the camera used parallel projection. Under
+  orthographic mode each slice is now fit as a rectangular slab — constant half-extents
+  (`ortho_height` × `ortho_height·aspect`) at every depth — so a directional CSM caster
+  lands correctly with no foreshortening. The cascade split depths and per-fragment cascade
+  selection were already projection-agnostic and are unchanged. New demo `/gl-ortho-csm`
+  (orthographic camera + directional CSM caster on the shadow floor). This clears the last
+  deferral from the orthographic-projection slice (v0.22.0).
+
 ## [0.23.0] - 2026-06-29
 
 ### Added

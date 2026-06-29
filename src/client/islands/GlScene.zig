@@ -1658,11 +1658,15 @@ fn cascadeLightVp(inst: *const Inst, light_idx: u32, near_d: f32, far_d: f32, as
     const inv_view = gl.math.invert(view);
     const tan_half = std.math.tan(inst.cam_fov_y * 0.5);
     // 8 view-space corners (camera looks down -Z → forward distance d → z=-d).
+    // Perspective: the slice is a frustum wedge — half-extents grow with depth
+    // (hh = d·tan(fov/2)). Orthographic: the slice is a rectangular SLAB —
+    // half-extents are constant (hh = ortho_height) at every depth, so the cascade
+    // fits the parallel-projection view volume instead of a non-existent cone.
     var corners: [8]Vec3 = undefined;
     const depths = [2]f32{ near_d, far_d };
     var ci: usize = 0;
     for (depths) |d| {
-        const hh = d * tan_half;
+        const hh = if (inst.proj_mode == 1) inst.ortho_height else d * tan_half;
         const hw = hh * aspect;
         const z = -d;
         // 4 corners at this depth: (±hw, ±hh, z), transformed to world.

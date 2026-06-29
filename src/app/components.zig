@@ -2032,6 +2032,64 @@ pub fn glSceneCsm(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-ortho-csm: CSM under an ORTHOGRAPHIC camera. Same single directional caster
+/// and shadow.vmesh floor as /gl-csm, but the scene renders with parallel projection
+/// (`.projection(.orthographic)`). Exercises the ortho-aware cascade fit: each cascade
+/// slice is a rectangular SLAB (constant width at every depth) rather than a frustum
+/// wedge, so the directional shadow lands correctly on the receding floor with no
+/// perspective foreshortening. The bug this guards: a perspective cascade fit under
+/// ortho mis-sizes the light frustum, smearing or dropping the shadow.
+pub fn glSceneOrthoCsm(ctx: *const verve.Context) !*verve.Node {
+    const lights = [_]verve.GlLight{
+        .{
+            .kind = .directional,
+            .dir = .{ -0.55, -0.72, -0.42 },
+            .color = .{ 1, 0.97, 0.9 },
+            .intensity = 2.6,
+            .casts_shadow = true,
+        },
+    };
+
+    const island_node = ctx.glScene(.{
+        .src = "/gl/shadow.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='40' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EOrtho CSM%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 14.0, .pitch = 0.30, .yaw = 0.55 })
+        // Orthographic projection: cascade slices become rectangular slabs. ortho_height
+        // is the view half-height in world units — sized to frame the cube + floor.
+        .projection(.{ .mode = .orthographic, .ortho_height = 8.0 })
+        .lights(&lights)
+        .autoRotate(0.15)
+        .build();
+
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glscene_freeze").text("Freeze"),
+        ctx.el("button").attr("z-on-click", "glscene_unfreeze").text("Unfreeze"),
+    });
+    _ = island_node.children(.{controls});
+
+    const scene_box = ctx.div().class("gl-wrap").children(.{
+        ctx.div()
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;margin:0 auto")
+            .children(.{island_node}),
+    });
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — Cascaded Shadow Maps under orthographic projection"),
+        ctx.p().text("The same single directional caster + four cascades as /gl-csm, but " ++
+            "the camera uses ORTHOGRAPHIC (parallel) projection. Each cascade slice is fit " ++
+            "as a rectangular slab — constant width at every depth — instead of a frustum " ++
+            "wedge, so the shadow lands correctly on the floor with no perspective " ++
+            "foreshortening. Both WebGL2 and WebGPU."),
+        scene_box,
+        ctx.p().class("hint")
+            .text("Drag to orbit \u{00b7} wheel to zoom \u{00b7} Freeze pins the orbit. " ++
+            "The floor stays the same width front-to-back (parallel projection) and the " ++
+            "cast shadow stays attached to the cube across the cascade bands."),
+    });
+}
+
 /// /gl-area: LTC (Linearly Transformed Cosines, Heitz 2016) rect AREA light demo.
 /// ONE overhead rect area light hovers above the model + floor, facing straight
 /// down (cross(ex,ey) = −Y), and casts a SOFT area shadow. Unlike a point/spot
