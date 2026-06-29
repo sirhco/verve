@@ -123,6 +123,7 @@ const variant_at = gl.command.variant_alpha_test;
 const variant_ds = gl.command.variant_double_sided;
 const variant_inst = gl.command.variant_instanced; // T6: GPU instancing
 const variant_fog = gl.command.variant_fog; // distance fog mix before tonemap
+const variant_clip = gl.command.variant_clipping; // world-space half-space clip planes
 const variant_morph = gl.command.variant_morph; // M7: morph-target blending
 
 // GPU instancing (v1): per-instance mat4(16) + color(4) = 20 f32 = 80 B each.
@@ -588,6 +589,24 @@ fn shaderHandleFor(variant: u32) u32 {
         variant_pbr | variant_nm | variant_at | variant_ds | gl.command.variant_shadow_point => 66,
         variant_pbr | variant_em | variant_at | variant_ds | gl.command.variant_shadow_point => 67,
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds | gl.command.variant_shadow_point => 68,
+        // Clip variants (base+clip → 69–76, ds+clip → 77–84, instanced+clip → 85):
+        variant_pbr | variant_clip => 69,
+        variant_pbr | variant_nm | variant_clip => 70,
+        variant_pbr | variant_em | variant_clip => 71,
+        variant_pbr | variant_nm | variant_em | variant_clip => 72,
+        variant_pbr | variant_at | variant_clip => 73,
+        variant_pbr | variant_nm | variant_at | variant_clip => 74,
+        variant_pbr | variant_em | variant_at | variant_clip => 75,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_clip => 76,
+        variant_pbr | variant_ds | variant_clip => 77,
+        variant_pbr | variant_nm | variant_ds | variant_clip => 78,
+        variant_pbr | variant_em | variant_ds | variant_clip => 79,
+        variant_pbr | variant_nm | variant_em | variant_ds | variant_clip => 80,
+        variant_pbr | variant_at | variant_ds | variant_clip => 81,
+        variant_pbr | variant_nm | variant_at | variant_ds | variant_clip => 82,
+        variant_pbr | variant_em | variant_at | variant_ds | variant_clip => 83,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_clip => 84,
+        variant_pbr | variant_inst | variant_clip => 85,
         else => unreachable,
     };
 }
@@ -737,6 +756,24 @@ fn createShaderForVariant(inst: *Inst, enc: *gl.Encoder, variant: u32) void {
         variant_pbr | variant_nm | variant_at | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_ds),
         variant_pbr | variant_em | variant_at | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds),
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds | gl.command.variant_shadow_point => emitPointShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds),
+        // Clip variants (handles 69–84 via emitShader, 85 via emitInstancedShader):
+        variant_pbr | variant_clip => emitShader(inst, enc, variant_pbr | variant_clip),
+        variant_pbr | variant_nm | variant_clip => emitShader(inst, enc, variant_pbr | variant_nm | variant_clip),
+        variant_pbr | variant_em | variant_clip => emitShader(inst, enc, variant_pbr | variant_em | variant_clip),
+        variant_pbr | variant_nm | variant_em | variant_clip => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_clip),
+        variant_pbr | variant_at | variant_clip => emitShader(inst, enc, variant_pbr | variant_at | variant_clip),
+        variant_pbr | variant_nm | variant_at | variant_clip => emitShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_clip),
+        variant_pbr | variant_em | variant_at | variant_clip => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_clip),
+        variant_pbr | variant_nm | variant_em | variant_at | variant_clip => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_clip),
+        variant_pbr | variant_ds | variant_clip => emitShader(inst, enc, variant_pbr | variant_ds | variant_clip),
+        variant_pbr | variant_nm | variant_ds | variant_clip => emitShader(inst, enc, variant_pbr | variant_nm | variant_ds | variant_clip),
+        variant_pbr | variant_em | variant_ds | variant_clip => emitShader(inst, enc, variant_pbr | variant_em | variant_ds | variant_clip),
+        variant_pbr | variant_nm | variant_em | variant_ds | variant_clip => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_ds | variant_clip),
+        variant_pbr | variant_at | variant_ds | variant_clip => emitShader(inst, enc, variant_pbr | variant_at | variant_ds | variant_clip),
+        variant_pbr | variant_nm | variant_at | variant_ds | variant_clip => emitShader(inst, enc, variant_pbr | variant_nm | variant_at | variant_ds | variant_clip),
+        variant_pbr | variant_em | variant_at | variant_ds | variant_clip => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds | variant_clip),
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_clip => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_clip),
+        variant_pbr | variant_inst | variant_clip => emitInstancedShader(inst, enc), // clip-aware instanced (handle 85)
         else => unreachable,
     }
 }
@@ -2395,10 +2432,11 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     inst.morph_enabled = morph_target_count > 0;
 
     // Create + record only the distinct shader variants the mesh actually uses.
-    // [69]: slots 20–35 = base/ds fog variants; slot 36 = instanced+fog;
+    // [86]: slots 20–35 = base/ds fog variants; slot 36 = instanced+fog;
     //        slots 37–52 = base/ds morph variants (M7);
-    //        slots 53–68 = base/ds point-shadow receiver variants (P11 task 5).
-    var shader_seen: [69]bool = .{false} ** 69;
+    //        slots 53–68 = base/ds point-shadow receiver variants (P11 task 5);
+    //        slots 69–84 = base/ds clip variants; slot 85 = instanced+clip.
+    var shader_seen: [86]bool = .{false} ** 86;
     var sv: u32 = 0;
     while (sv < a.submesh_count) : (sv += 1) {
         if (sv >= max_submesh) break;
@@ -2803,6 +2841,43 @@ test "point-shadow handle table covers every emitted point-shadow combo" {
     // All 16 point-shadow handles must be assigned (53..68 inclusive).
     var hi: u32 = 53;
     while (hi <= 68) : (hi += 1) {
+        try std.testing.expect(seen[hi]);
+    }
+}
+
+test "clip handle table covers every emitted clip combo" {
+    // D1: 17 clip variants (8 base + 8 ds + 1 instanced); handles 69–85.
+    // shaderHandleFor and createShaderForVariant MUST cover the same set.
+    const combos = [_]u32{
+        variant_pbr | variant_clip,
+        variant_pbr | variant_nm | variant_clip,
+        variant_pbr | variant_em | variant_clip,
+        variant_pbr | variant_nm | variant_em | variant_clip,
+        variant_pbr | variant_at | variant_clip,
+        variant_pbr | variant_nm | variant_at | variant_clip,
+        variant_pbr | variant_em | variant_at | variant_clip,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_clip,
+        variant_pbr | variant_ds | variant_clip,
+        variant_pbr | variant_nm | variant_ds | variant_clip,
+        variant_pbr | variant_em | variant_ds | variant_clip,
+        variant_pbr | variant_nm | variant_em | variant_ds | variant_clip,
+        variant_pbr | variant_at | variant_ds | variant_clip,
+        variant_pbr | variant_nm | variant_at | variant_ds | variant_clip,
+        variant_pbr | variant_em | variant_at | variant_ds | variant_clip,
+        variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_clip,
+        variant_pbr | variant_inst | variant_clip,
+    };
+    // Clip handles 69–85; seen array sized to cover that range.
+    var seen = [_]bool{false} ** 86;
+    for (combos) |v| {
+        const h = shaderHandleFor(v);
+        try std.testing.expect(h >= 69 and h < seen.len);
+        try std.testing.expect(!seen[h]); // distinct
+        seen[h] = true;
+    }
+    // All 17 clip handles must be assigned (69..85 inclusive).
+    var hi: u32 = 69;
+    while (hi <= 85) : (hi += 1) {
         try std.testing.expect(seen[hi]);
     }
 }
