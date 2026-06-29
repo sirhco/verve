@@ -125,6 +125,15 @@ const variant_inst = gl.command.variant_instanced; // T6: GPU instancing
 const variant_fog = gl.command.variant_fog; // distance fog mix before tonemap
 const variant_clip = gl.command.variant_clipping; // world-space half-space clip planes
 const variant_morph = gl.command.variant_morph; // M7: morph-target blending
+const variant_wire = gl.command.variant_wireframe; // Task D: thin-line wireframe draw
+
+// Wire-edge-buffer handle — buffer namespace (vbuf=1, ibuf=2; 3 is the next free).
+const wire_ibuf: u32 = 3;
+// Wireframe shader handle — shader namespace (PBR/depth/fog/morph/shadow/clip span 1..85).
+const wire_shader: u32 = 86;
+// Maximum u16 edge indices per Inst (bounded for context-restore pointer stability).
+// 49152 ≈ 96 KB; covers typical meshes. Overflow submeshes are silently skipped.
+const max_wire_edges = 49152;
 
 // GPU instancing (v1): per-instance mat4(16) + color(4) = 20 f32 = 80 B each.
 const max_instances = 1024;
@@ -284,9 +293,22 @@ const Inst = struct {
     clip_planes: [4][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** 4,
     clip_count: u32 = 0,
 
+    // Wireframe (data-glwire). Edge indices generated once in sendResources and
+    // stored in this bounded Inst array so the pointer in registry.recordBuffer
+    // stays valid for context-restore replay. wire_count is zero-initialised so
+    // the per-frame draw loop is a no-op before sendResources runs or when off.
+    wire_on: bool = false,
+    wire_color: [3]f32 = .{ 1, 1, 1 },
+    wire_edge_buf: [max_wire_edges]u16 = undefined,
+    wire_off: [max_submesh]u32 = undefined,
+    wire_count: [max_submesh]u32 = [_]u32{0} ** max_submesh,
+    wire_total: u32 = 0,
+    wire_skipped: bool = false,
+
     // GPU-resource registry for context-restore replay (cap 80; morph adds 16 more
     // shader variants + 1 morph tex: 2 buf + 36 shader + depth + depth_at + shadow
     // + 8 tex + 1 morph_tex + 3 IBL = 54 max; 80 gives comfortable headroom).
+    // Wireframe adds +1 buf + 1 shader (wire_ibuf + wire_shader) — still under 80.
     registry: gl.Registry(80) = .{},
     resources_sent: bool = false,
     needs_replay: bool = false,
@@ -872,6 +894,22 @@ fn emitInstancedShaderVariant(inst: *Inst, enc: *gl.Encoder, comptime v: u32) vo
     inst.registry.recordShader(handle, v, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
 }
 
+// Emit the standalone wireframe shader (variant_wireframe, handle wire_shader=86).
+// Both backends: WGSL combined-module (WebGPU) or GLSL VS+FS pair (WebGL2).
+// Recorded in registry so context-restore replay re-creates it.
+fn emitWireframeShader(inst: *Inst, enc: *gl.Encoder) void {
+    if (use_webgpu) {
+        const w = gl.command.wgslWireframe();
+        enc.createShader(wire_shader, variant_wire, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        inst.registry.recordShader(wire_shader, variant_wire, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        return;
+    }
+    const vs = gl.command.wireframeVertexSrc();
+    const fs = gl.command.wireframeFragmentSrc();
+    enc.createShader(wire_shader, variant_wire, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    inst.registry.recordShader(wire_shader, variant_wire, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+}
+
 // ── hydrate ──────────────────────────────────────────────────────────────────
 
 // Parse a "mode,r,g,b,near,far,density" fog attribute into inst.fog_params.
@@ -908,6 +946,21 @@ fn parseClip(inst: *Inst, s: []const u8) void {
         if (fi == 4) ci += 1;
     }
     inst.clip_count = ci;
+}
+
+// Parse the `data-glwire` attribute: "r,g,b" float CSV → wire_color, wire_on=true.
+// Tolerant: missing/malformed tokens keep their default (1,1,1 = white).
+fn parseWire(inst: *Inst, s: []const u8) void {
+    var vals: [3]f32 = .{ 1, 1, 1 };
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        if (n >= 3) break;
+        vals[n] = std.fmt.parseFloat(f32, tok) catch vals[n];
+        n += 1;
+    }
+    inst.wire_color = vals;
+    inst.wire_on = true;
 }
 
 // Parse the `data-glcam` attribute into inst camera fields.
@@ -1309,6 +1362,14 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         var cbuf: [256]u8 = undefined;
         const ca = verve.refGetAttr(ch, "data-glclip", &cbuf);
         if (ca.len != 0) parseClip(inst, ca);
+    }
+
+    // Wireframe rides on the canvas `data-glwire` attribute (NOT Props — mirrors fog).
+    // Format: "r,g,b" float CSV (0..1). Absent → wireframe stays off (wire_on=false).
+    if (inst.canvas_handle) |ch| {
+        var wbuf: [64]u8 = undefined;
+        const wa = verve.refGetAttr(ch, "data-glwire", &wbuf);
+        if (wa.len != 0) parseWire(inst, wa);
     }
 
     // Kick the asset fetches (geometry + prefiltered IBL).
@@ -1937,136 +1998,141 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         inst.cull_shadow_drawn = 0;
         inst.cull_shadow_culled = 0;
 
-        // ── 2D casters (directional/spot): one tiled pass each into the 4096² atlas.
-        if (inst.n_2d_casters > 0) {
-            var s: u32 = 0;
-            while (s < inst.n_2d_casters) : (s += 1) {
-                const area_li = inst.slot_area_li[s]; // ≥0 → this slot is an area caster
-                // casters_2d[s] is ONLY written for regular (dir/spot/CSM) caster
-                // slots. For an area slot it is undefined/stale, so guard every read
-                // of it (and the inst.lights index it derives) behind area_li < 0 —
-                // a stale li*16 would OOB-index inst.lights[64] and trap in wasm.
-                const li = if (area_li < 0) inst.casters_2d[s] else 0;
-                const caster_base = li * 16;
-                const caster_type = if (area_li < 0) inst.lights[caster_base + 0] else 0;
-                const is_csm = area_li < 0 and inst.cascade_count > 0 and @as(i32, @intCast(li)) == inst.csm_light and s < inst.cascade_count;
-                // clipFix is identity on WebGL2, z-remap on WebGPU.
-                const light_vp = if (area_li >= 0)
-                    // Area caster: spot-like perspective from the rect center along
-                    // its normal (cross(ex,ey)).
-                    clipFix().mul(areaLightVp(inst, @intCast(area_li)))
-                else if (is_csm) blk: {
-                    // Cascade s of the CSM caster: fit ortho VP to this cascade's
-                    // view-frustum depth slice [near_s, far_s].
-                    const near_s: f32 = if (s == 0) cam_near else inst.cascade_splits[s - 1];
-                    const far_s: f32 = inst.cascade_splits[s];
-                    break :blk clipFix().mul(cascadeLightVp(inst, li, near_s, far_s, aspect, view));
-                } else if (caster_type >= 1.5)
-                    clipFix().mul(spotLightVp(inst, li)) // spot: perspective
-                else
-                    clipFix().mul(lightSpaceMatrix(inst, a, li)); // directional: ortho
-                // Store the VP in the CONTIGUOUS array (&shadow_vp_mats[0] + count
-                // feeds one bind_shadow_map; index s == the atlas tile + receiver slot).
-                inst.shadow_vp_mats[s] = light_vp.m;
+        // ── Shadow depth passes — skipped entirely when wireframe is on
+        // (wireframe has no surface geometry; shadow maps are unused in that path).
+        if (!inst.wire_on) {
 
-                // Per-caster light-frustum cull (keeps off-screen casters that cast
-                // into view). Atlas tile = (col=s%4, row=s/4): up to 8 slots span
-                // rows 0..1 (CSM cascades 0..3 + spots/extra-dir after).
-                const lplanes = gl.cull.frustumPlanes(light_vp);
-                enc.beginShadowPass(shadow_handle, depth_shader, s % 4, s / 4, shadow_tile);
-                // NOTE: double-sided shadows back-cull this phase (drawDepth/drawDepthAt
-                // carry no state word; cull is baked into the depth pipeline).
-                {
-                    // Phase A: opaque+blend (alpha_mode != 2) — plain position-only depth.
-                    // depth_mvps_mc[s][sd] precomputed for ALL submeshes (Phase B reuses).
-                    // Narrow to the active LOD level's submesh range (T-LOD).
-                    const s_lo_2d: u32 = if (inst.lod_level_count > 0) inst.lod_first[inst.lod_active] else 0;
-                    const s_hi_2d: u32 = if (inst.lod_level_count > 0) s_lo_2d + inst.lod_count[inst.lod_active] else a.submesh_count;
-                    var sd: u32 = s_lo_2d;
-                    while (sd < s_hi_2d) : (sd += 1) {
-                        if (sd >= max_submesh) break;
-                        const sub = a.submesh(sd);
-                        inst.depth_mvps_mc[s][sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
-                        const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
-                        if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
-                            inst.cull_shadow_culled += 1;
-                            continue;
+            // ── 2D casters (directional/spot): one tiled pass each into the 4096² atlas.
+            if (inst.n_2d_casters > 0) {
+                var s: u32 = 0;
+                while (s < inst.n_2d_casters) : (s += 1) {
+                    const area_li = inst.slot_area_li[s]; // ≥0 → this slot is an area caster
+                    // casters_2d[s] is ONLY written for regular (dir/spot/CSM) caster
+                    // slots. For an area slot it is undefined/stale, so guard every read
+                    // of it (and the inst.lights index it derives) behind area_li < 0 —
+                    // a stale li*16 would OOB-index inst.lights[64] and trap in wasm.
+                    const li = if (area_li < 0) inst.casters_2d[s] else 0;
+                    const caster_base = li * 16;
+                    const caster_type = if (area_li < 0) inst.lights[caster_base + 0] else 0;
+                    const is_csm = area_li < 0 and inst.cascade_count > 0 and @as(i32, @intCast(li)) == inst.csm_light and s < inst.cascade_count;
+                    // clipFix is identity on WebGL2, z-remap on WebGPU.
+                    const light_vp = if (area_li >= 0)
+                        // Area caster: spot-like perspective from the rect center along
+                        // its normal (cross(ex,ey)).
+                        clipFix().mul(areaLightVp(inst, @intCast(area_li)))
+                    else if (is_csm) blk: {
+                        // Cascade s of the CSM caster: fit ortho VP to this cascade's
+                        // view-frustum depth slice [near_s, far_s].
+                        const near_s: f32 = if (s == 0) cam_near else inst.cascade_splits[s - 1];
+                        const far_s: f32 = inst.cascade_splits[s];
+                        break :blk clipFix().mul(cascadeLightVp(inst, li, near_s, far_s, aspect, view));
+                    } else if (caster_type >= 1.5)
+                        clipFix().mul(spotLightVp(inst, li)) // spot: perspective
+                    else
+                        clipFix().mul(lightSpaceMatrix(inst, a, li)); // directional: ortho
+                    // Store the VP in the CONTIGUOUS array (&shadow_vp_mats[0] + count
+                    // feeds one bind_shadow_map; index s == the atlas tile + receiver slot).
+                    inst.shadow_vp_mats[s] = light_vp.m;
+
+                    // Per-caster light-frustum cull (keeps off-screen casters that cast
+                    // into view). Atlas tile = (col=s%4, row=s/4): up to 8 slots span
+                    // rows 0..1 (CSM cascades 0..3 + spots/extra-dir after).
+                    const lplanes = gl.cull.frustumPlanes(light_vp);
+                    enc.beginShadowPass(shadow_handle, depth_shader, s % 4, s / 4, shadow_tile);
+                    // NOTE: double-sided shadows back-cull this phase (drawDepth/drawDepthAt
+                    // carry no state word; cull is baked into the depth pipeline).
+                    {
+                        // Phase A: opaque+blend (alpha_mode != 2) — plain position-only depth.
+                        // depth_mvps_mc[s][sd] precomputed for ALL submeshes (Phase B reuses).
+                        // Narrow to the active LOD level's submesh range (T-LOD).
+                        const s_lo_2d: u32 = if (inst.lod_level_count > 0) inst.lod_first[inst.lod_active] else 0;
+                        const s_hi_2d: u32 = if (inst.lod_level_count > 0) s_lo_2d + inst.lod_count[inst.lod_active] else a.submesh_count;
+                        var sd: u32 = s_lo_2d;
+                        while (sd < s_hi_2d) : (sd += 1) {
+                            if (sd >= max_submesh) break;
+                            const sub = a.submesh(sd);
+                            inst.depth_mvps_mc[s][sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
+                            const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                            if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
+                                inst.cull_shadow_culled += 1;
+                                continue;
+                            }
+                            if (sub.alpha_mode == 2) continue; // MASK: Phase B
+                            inst.cull_shadow_drawn += 1;
+                            enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])));
                         }
-                        if (sub.alpha_mode == 2) continue; // MASK: Phase B
-                        inst.cull_shadow_drawn += 1;
-                        enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])));
+                        // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
+                        sd = s_lo_2d;
+                        while (sd < s_hi_2d) : (sd += 1) {
+                            if (sd >= max_submesh) break;
+                            const sub = a.submesh(sd);
+                            if (sub.alpha_mode != 2) continue;
+                            const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                            if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // counted in Phase A
+                            inst.cull_shadow_drawn += 1;
+                            enc.bindTexture(0, texHandle(sub.tex_base));
+                            enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])), @intCast(@intFromPtr(&inst.mats[sd])));
+                        }
                     }
-                    // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
-                    sd = s_lo_2d;
-                    while (sd < s_hi_2d) : (sd += 1) {
-                        if (sd >= max_submesh) break;
-                        const sub = a.submesh(sd);
-                        if (sub.alpha_mode != 2) continue;
-                        const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
-                        if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // counted in Phase A
-                        inst.cull_shadow_drawn += 1;
-                        enc.bindTexture(0, texHandle(sub.tex_base));
-                        enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])), @intCast(@intFromPtr(&inst.mats[sd])));
-                    }
+                    enc.endShadowPass(width, height);
                 }
-                enc.endShadowPass(width, height);
             }
-        }
 
-        // ── point casters: 6-face distance atlas each. clipFix applied per face.
-        // ALL faces of ALL casters render before the single endPointShadow (the
-        // WebGPU bridge clears the atlas only on col==0&&row==0 = caster 0 face 0;
-        // every later face/caster loads). Tile = (col=face%3, row=pidx*2+face/3).
-        if (inst.n_point_casters > 0) {
-            var pidx: u32 = 0;
-            while (pidx < inst.n_point_casters) : (pidx += 1) {
-                const li = inst.casters_point[pidx];
-                const caster_base = li * 16;
-                const lp = gl.math.Vec3.init(
-                    inst.lights[caster_base + 2],
-                    inst.lights[caster_base + 3],
-                    inst.lights[caster_base + 4],
-                );
-                inst.point_lp_mc[pidx] = .{ lp.x, lp.y, lp.z };
-                // range==far contract: classifyCasters wrote range back into v2.w
-                // (default 25 when ≤0), so the depth-pass far matches the receiver far.
-                const far: f32 = inst.lights[caster_base + 11];
-                inst.point_far_mc[pidx] = far;
-                const near: f32 = 0.05;
-
-                var face: u8 = 0;
-                while (face < 6) : (face += 1) {
-                    const fvp = clipFix().mul(gl.math.cubeFaceVp(lp, face, near, far));
-                    inst.face_vp_mc[pidx][face] = fvp.m;
-                    const col: u32 = @as(u32, face) % 3;
-                    const row: u32 = pidx * 2 + @as(u32, face) / 3;
-                    enc.beginPointShadowFace(
-                        point_atlas_handle,
-                        col,
-                        row,
-                        point_atlas_tile,
-                        @intCast(@intFromPtr(&inst.face_vp_mc[pidx][face])),
-                        @intCast(@intFromPtr(&inst.point_lp_mc[pidx])),
-                        @bitCast(far),
+            // ── point casters: 6-face distance atlas each. clipFix applied per face.
+            // ALL faces of ALL casters render before the single endPointShadow (the
+            // WebGPU bridge clears the atlas only on col==0&&row==0 = caster 0 face 0;
+            // every later face/caster loads). Tile = (col=face%3, row=pidx*2+face/3).
+            if (inst.n_point_casters > 0) {
+                var pidx: u32 = 0;
+                while (pidx < inst.n_point_casters) : (pidx += 1) {
+                    const li = inst.casters_point[pidx];
+                    const caster_base = li * 16;
+                    const lp = gl.math.Vec3.init(
+                        inst.lights[caster_base + 2],
+                        inst.lights[caster_base + 3],
+                        inst.lights[caster_base + 4],
                     );
-                    const s_lo_pt: u32 = if (inst.lod_level_count > 0) inst.lod_first[inst.lod_active] else 0;
-                    const s_hi_pt: u32 = if (inst.lod_level_count > 0) s_lo_pt + inst.lod_count[inst.lod_active] else a.submesh_count;
-                    var sd: u32 = s_lo_pt;
-                    while (sd < s_hi_pt) : (sd += 1) {
-                        if (sd >= max_submesh) break;
-                        const sub = a.submesh(sd);
-                        enc.drawPointDepth(
-                            vbuf,
-                            ibuf,
-                            sub.index_byte_off,
-                            sub.index_count,
-                            @intCast(@intFromPtr(&inst.scene.world[sd + 1].m)),
+                    inst.point_lp_mc[pidx] = .{ lp.x, lp.y, lp.z };
+                    // range==far contract: classifyCasters wrote range back into v2.w
+                    // (default 25 when ≤0), so the depth-pass far matches the receiver far.
+                    const far: f32 = inst.lights[caster_base + 11];
+                    inst.point_far_mc[pidx] = far;
+                    const near: f32 = 0.05;
+
+                    var face: u8 = 0;
+                    while (face < 6) : (face += 1) {
+                        const fvp = clipFix().mul(gl.math.cubeFaceVp(lp, face, near, far));
+                        inst.face_vp_mc[pidx][face] = fvp.m;
+                        const col: u32 = @as(u32, face) % 3;
+                        const row: u32 = pidx * 2 + @as(u32, face) / 3;
+                        enc.beginPointShadowFace(
+                            point_atlas_handle,
+                            col,
+                            row,
+                            point_atlas_tile,
+                            @intCast(@intFromPtr(&inst.face_vp_mc[pidx][face])),
+                            @intCast(@intFromPtr(&inst.point_lp_mc[pidx])),
+                            @bitCast(far),
                         );
+                        const s_lo_pt: u32 = if (inst.lod_level_count > 0) inst.lod_first[inst.lod_active] else 0;
+                        const s_hi_pt: u32 = if (inst.lod_level_count > 0) s_lo_pt + inst.lod_count[inst.lod_active] else a.submesh_count;
+                        var sd: u32 = s_lo_pt;
+                        while (sd < s_hi_pt) : (sd += 1) {
+                            if (sd >= max_submesh) break;
+                            const sub = a.submesh(sd);
+                            enc.drawPointDepth(
+                                vbuf,
+                                ibuf,
+                                sub.index_byte_off,
+                                sub.index_count,
+                                @intCast(@intFromPtr(&inst.scene.world[sd + 1].m)),
+                            );
+                        }
                     }
                 }
+                enc.endPointShadow(width, height);
             }
-            enc.endPointShadow(width, height);
-        }
+        } // end if (!inst.wire_on) — shadow depth passes
 
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
 
@@ -2123,6 +2189,32 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         // Reset per-frame main-pass cull counters (T3). Shadow counters reset above (T4).
         inst.cull_main_drawn = 0;
         inst.cull_main_culled = 0;
+
+        // ── Wireframe draw — pure replace ─────────────────────────────────────
+        // When wire_on and edge data are ready: emit thin-line draws per submesh,
+        // then return early — skipping T6-instanced, PBR-opaque, and transparent.
+        // No LOD narrowing and no frustum culling in v1 (correctness over throughput).
+        // The frame still returns non-zero (cmd_buf address) so the bridge stays live.
+        if (inst.wire_on and inst.wire_total > 0) {
+            enc.setPipeline(wire_shader, gl.command.state_depth_test);
+            var ws: u32 = 0;
+            const w_hi: u32 = @min(a.submesh_count, max_submesh);
+            while (ws < w_hi) : (ws += 1) {
+                if (inst.wire_count[ws] == 0) continue;
+                inst.mvps[ws] = pv.mul(inst.scene.world[ws + 1]).m;
+                enc.drawWireframe(
+                    vbuf,
+                    wire_ibuf,
+                    inst.wire_off[ws] * 2, // byte offset into wire ibuf (u16 × 2 B each)
+                    inst.wire_count[ws],
+                    @intCast(@intFromPtr(&inst.mvps[ws])),
+                    @intCast(@intFromPtr(&inst.wire_color)),
+                );
+            }
+            enc.endFrame();
+            _ = enc.finish();
+            return @intCast(@intFromPtr(&cmd_buf));
+        }
 
         // ── T6: Instanced draw path ───────────────────────────────────────────
         // When the asset carries an instances section (instanceCount > 0), emit ONE
@@ -2477,6 +2569,49 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     inst.registry.recordBuffer(vbuf, .vertex, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
     enc.createBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
     inst.registry.recordBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
+
+    // Wire edge buffer — generated ONLY when wireframe mode is on.
+    // For each submesh: iterate its triangle indices in groups of 3 and emit 6 u16
+    // edge indices per triangle (i0,i1, i1,i2, i2,i0 — no dedup, v1).
+    // Bounded by max_wire_edges; overflow submeshes get wire_count=0 (skipped).
+    // The edge buf lives in Inst (stable pointer) → valid for context-restore.
+    if (inst.wire_on) {
+        const tri = bytesAsU16(a.indices);
+        inst.wire_total = 0;
+        var wv: u32 = 0;
+        while (wv < a.submesh_count) : (wv += 1) {
+            if (wv >= max_submesh) break;
+            const wsub = a.submesh(wv);
+            const first: u32 = wsub.index_byte_off / 2;
+            const count: u32 = wsub.index_count; // number of u16 indices (mult. of 3)
+            const n_edges: u32 = count * 2; // (count/3) triangles × 6 edge indices each
+            inst.wire_off[wv] = inst.wire_total;
+            if (inst.wire_total + n_edges > max_wire_edges) {
+                // Edge buffer full; this and remaining submeshes get wire_count=0.
+                inst.wire_skipped = true;
+                break;
+            }
+            var t: u32 = 0;
+            while (t < count) : (t += 3) {
+                const va = tri[first + t + 0];
+                const vb = tri[first + t + 1];
+                const vc = tri[first + t + 2];
+                inst.wire_edge_buf[inst.wire_total + 0] = va;
+                inst.wire_edge_buf[inst.wire_total + 1] = vb;
+                inst.wire_edge_buf[inst.wire_total + 2] = vb;
+                inst.wire_edge_buf[inst.wire_total + 3] = vc;
+                inst.wire_edge_buf[inst.wire_total + 4] = vc;
+                inst.wire_edge_buf[inst.wire_total + 5] = va;
+                inst.wire_total += 6;
+            }
+            inst.wire_count[wv] = n_edges;
+        }
+        if (inst.wire_total > 0) {
+            enc.createBuffer(wire_ibuf, .index, @intCast(@intFromPtr(&inst.wire_edge_buf)), inst.wire_total * 2);
+            inst.registry.recordBuffer(wire_ibuf, .index, @intCast(@intFromPtr(&inst.wire_edge_buf)), inst.wire_total * 2);
+        }
+        emitWireframeShader(inst, enc);
+    }
 
     // M7: detect morph presence from the vmesh and set inst.morph_enabled.
     const morph_target_count = a.morphTargetCount();
