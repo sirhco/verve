@@ -2384,6 +2384,37 @@ pub fn glSceneFog(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl wireframe demo — /gl-wireframe.
+/// A UV sphere (lodsphere.vmesh, LOD 0 ≈ 2048 triangles) rendered as thin
+/// edge lines using `.wireframe(.{ .color })`.  Surface is replaced entirely —
+/// no shading, no texture, just the triangle grid.  Both WebGL2 and WebGPU
+/// backends draw via the standalone variant_wireframe shader (own U{mvp,color}).
+pub fn glSceneWireframe(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/lodsphere.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%230d0f17'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%2333ff88' text-anchor='middle'%3EWireframe%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 2.5, .pitch = 0.35, .yaw = 0.5 })
+        .wireframe(.{ .color = .{ 0.2, 1.0, 0.5 } })
+        .autoRotate(0.2)
+        .build();
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — wireframe mode"),
+        ctx.p().text("Wireframe mode renders the mesh\u{2019}s triangle edges as thin lines, " ++
+            "replacing the shaded surface (.wireframe parity with three.js). " ++
+            "The UV sphere\u{2019}s latitude\u{2013}longitude grid makes the " ++
+            "triangle topology immediately visible. Rendered via the standalone " ++
+            "variant_wireframe shader (own MVP+color uniforms, no lighting or tonemap). " ++
+            "Both WebGL2 and WebGPU backends."),
+        scene,
+        ctx.p().text("Enable with .wireframe(.{ .color = .{ r, g, b } }) on any GlScene. " ++
+            "Up to 8192 triangles per mesh are supported (edge data pre-computed " ++
+            "at asset-build time). Drag to orbit \u{00b7} wheel to zoom."),
+    });
+}
+
 /// verve.gl morph-targets demo — /gl-morph.
 /// A 5×5 subdivided plane with 3 morph targets (Bulge/Wave/Twist) and a
 /// baked LINEAR weight animation that cycles through the targets. The
