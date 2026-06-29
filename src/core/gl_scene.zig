@@ -86,6 +86,17 @@ pub const FogOpts = struct {
     density: f32 = 0.05,
 };
 
+/// Camera projection mode. `perspective` is the default (attribute omitted).
+/// `orthographic` switches to an ortho matrix driven by `ortho_height`.
+pub const Projection = enum(u32) { perspective = 0, orthographic = 1 };
+pub const ProjectionOpts = struct {
+    mode: Projection = .perspective,
+    ortho_height: f32 = 2,
+    fov_deg: f32 = 57.3,
+    near: f32 = 0.1,
+    far: f32 = 100,
+};
+
 /// Light kind encoded in the `data-gllights` CSV (type column).
 pub const LightKind = enum(u32) { directional = 0, point = 1, spot = 2 };
 
@@ -140,6 +151,7 @@ pub const GlSceneBuilder = struct {
     auto_rotate_rad: f32 = 0,
     scrub_on: bool = false,
     fog_opts: FogOpts = .{},
+    proj_opts: ProjectionOpts = .{},
     morph_weights_buf: []const f32 = &.{},
     lights_buf: [max_lights]Light = undefined,
     light_count: usize = 0,
@@ -176,6 +188,13 @@ pub const GlSceneBuilder = struct {
     /// Distance fog. `mode = .none` (default) disables fog entirely.
     pub fn fog(self: *GlSceneBuilder, f: FogOpts) *GlSceneBuilder {
         self.fog_opts = f;
+        return self;
+    }
+
+    /// Camera projection. Default is `.perspective`; pass `.{ .mode = .orthographic,
+    /// .ortho_height = N }` to switch. Transported as `data-glcam` on the canvas.
+    pub fn projection(self: *GlSceneBuilder, p: ProjectionOpts) *GlSceneBuilder {
+        self.proj_opts = p;
         return self;
     }
 
@@ -323,6 +342,21 @@ pub const GlSceneBuilder = struct {
             .onWheel("glscene_wheel")
             .onClick("glscene_click");
         if (fog_attr) |fa| _ = canvas.attr("data-glfog", fa);
+
+        // Camera projection travels OUTSIDE Props as `data-glcam`: mode,ortho_height,
+        // fov_deg,near,far. Only emitted when projection is non-default (mode != 0).
+        const cam_attr: ?[]const u8 = if (self.proj_opts.mode == .perspective) null else std.fmt.allocPrint(
+            self.ctx.allocator,
+            "{d},{d},{d},{d},{d}",
+            .{
+                @intFromEnum(self.proj_opts.mode),
+                self.proj_opts.ortho_height,
+                self.proj_opts.fov_deg,
+                self.proj_opts.near,
+                self.proj_opts.far,
+            },
+        ) catch null;
+        if (cam_attr) |ca| _ = canvas.attr("data-glcam", ca);
 
         // Morph weights travel OUTSIDE Props as a comma-joined `data-glmorph`
         // attribute ("w0,w1,…") the chunk reads via refGetAttr + parseMorph.
