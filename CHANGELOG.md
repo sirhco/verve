@@ -4,6 +4,23 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.22.0] - 2026-06-29
+
+### Added
+
+- **gl — orthographic projection**: `GlSceneBuilder.projection(ProjectionOpts)` switches
+  the `GlScene` island from perspective to orthographic (`OrthographicCamera` parity, no
+  foreshortening). The builder serializes non-default settings out-of-band as the
+  `data-glcam` canvas attribute — a five-value CSV (`mode,ortho_height,fov_deg,near,far`);
+  perspective (the default) emits no attribute. The chunk reads `data-glcam` via
+  `refGetAttr` and builds the appropriate projection matrix before the first frame.
+  Picking rays are ortho-aware: in orthographic mode the ray origin is derived from the
+  NDC-space canvas pointer position with a parallel (non-perspective) ray direction. Both
+  WebGL2 and WebGPU backends supported. New `/gl-ortho` demo. Known limitation:
+  directional CSM shadows are not ortho-aware (cascade frustum reconstruction remains
+  perspective; combining ortho projection with a CSM caster yields incorrect splits —
+  deferred).
+
 ## [0.21.0] - 2026-06-26
 
 ### Added

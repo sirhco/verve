@@ -921,3 +921,25 @@ test "glScene no lights emits no data-gllights" {
     const html = try renderHtml(scene, arena.allocator());
     try testing.expect(std.mem.indexOf(u8, html, "data-gllights") == null);
 }
+
+test "glScene .projection orthographic emits data-glcam" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .projection(.{ .mode = .orthographic, .ortho_height = 5, .near = 0.2, .far = 80 })
+        .build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glcam=\"1,5,57.3,0.2,80\"") != null);
+}
+
+test "glScene perspective default emits no data-glcam" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glcam") == null);
+}
