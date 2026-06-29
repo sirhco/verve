@@ -69,8 +69,6 @@ extern "verve" fn gl_emit_event(ref_handle: i32, name_ptr: [*]const u8, name_len
 
 const drag_sens: f32 = 0.01; // rad per client px
 const zoom_sens: f32 = 0.005; // distance per wheel deltaY unit
-const fov_y: f32 = 1.0; // vertical fov default (rad) — mirrors cam_fov_y default in Inst
-
 const vmesh_ready_export = "glscene_vmesh_ready";
 const env_ready_export = "glscene_env_ready";
 const tex_ready_export = "glscene_tex_ready";
@@ -865,7 +863,7 @@ fn parseCam(inst: *Inst, s: []const u8) void {
         n += 1;
     }
     if (n < 5) return;
-    inst.proj_mode = @intFromFloat(vals[0]);
+    inst.proj_mode = if (vals[0] >= 0.5) 1 else 0;
     inst.ortho_height = vals[1];
     inst.cam_fov_y = vals[2] * (std.math.pi / 180.0);
     inst.cam_near = vals[3];
