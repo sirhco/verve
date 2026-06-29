@@ -280,6 +280,10 @@ const Inst = struct {
     fog_params: [8]f32 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     fog_enabled: bool = false,
 
+    // World-space clip planes (v1: up to 4; clip⊥fog/morph/point-shadow — see clipActive).
+    clip_planes: [4][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** 4,
+    clip_count: u32 = 0,
+
     // GPU-resource registry for context-restore replay (cap 80; morph adds 16 more
     // shader variants + 1 morph tex: 2 buf + 36 shader + depth + depth_at + shadow
     // + 8 tex + 1 morph_tex + 3 IBL = 54 max; 80 gives comfortable headroom).
@@ -886,6 +890,26 @@ fn parseFog(inst: *Inst, s: []const u8) void {
     inst.fog_enabled = true;
 }
 
+// Parse the `data-glclip` attribute into inst.clip_planes / clip_count.
+// Format: semicolon-separated plane records, each "nx,ny,nz,constant" (4 floats).
+// Tolerant: planes with fewer than 4 fields are skipped; max 4 planes.
+fn parseClip(inst: *Inst, s: []const u8) void {
+    var ci: u32 = 0;
+    var plane_it = std.mem.splitScalar(u8, s, ';');
+    while (plane_it.next()) |rec| {
+        if (ci >= 4) break;
+        var fi: u32 = 0;
+        var field_it = std.mem.splitScalar(u8, rec, ',');
+        while (field_it.next()) |tok| {
+            if (fi >= 4) break;
+            inst.clip_planes[ci][fi] = std.fmt.parseFloat(f32, tok) catch 0;
+            fi += 1;
+        }
+        if (fi == 4) ci += 1;
+    }
+    inst.clip_count = ci;
+}
+
 // Parse the `data-glcam` attribute into inst camera fields.
 // Format: "mode,ortho_height,fov_deg,near,far" (5 fields).
 // Tolerant: needs ≥5 comma fields, else leaves defaults.
@@ -1277,6 +1301,14 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         var mbuf: [512]u8 = undefined;
         const ma = verve.refGetAttr(ch, "data-glmorph", &mbuf);
         if (ma.len != 0) parseMorph(inst, ma);
+    }
+
+    // Clip planes ride on the canvas `data-glclip` attribute (NOT Props).
+    // Format: semicolon-separated "nx,ny,nz,constant" records. Absent → no clipping.
+    if (inst.canvas_handle) |ch| {
+        var cbuf: [256]u8 = undefined;
+        const ca = verve.refGetAttr(ch, "data-glclip", &cbuf);
+        if (ca.len != 0) parseClip(inst, ca);
     }
 
     // Kick the asset fetches (geometry + prefiltered IBL).
@@ -2118,7 +2150,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             // Bind sequence mirrors drawSubmesh: setPipeline→setLights→bindIbl→
             // bindShadowMap→bindTexture 0-4→drawPbrInstanced.
             const sub0 = a.submesh(0);
-            enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
+            enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0) | (if (clipActive(inst)) variant_clip else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
             enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
             enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
             // Instanced shader is a non-receiver (variant_shadow{,_point} are
@@ -2126,6 +2158,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             // shader side; emitted for stream uniformity with the new signatures.
             bindShadowResources(inst, &enc);
             if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
+            if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
             enc.bindTexture(0, texHandle(sub0.tex_base));
             enc.bindTexture(1, texHandle(sub0.tex_mr));
             enc.bindTexture(2, texHandle(sub0.tex_normal));
@@ -2223,6 +2256,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     const v = a.submeshVariant(s) |
                         (if (inst.fog_enabled) variant_fog else 0) |
                         (if (inst.morph_enabled) variant_morph else 0) |
+                        (if (clipActive(inst)) variant_clip else 0) |
                         ds_sbit;
                     const world_s = inst.scene.world[s + 1];
                     inst.model_mats[s] = world_s.m;
@@ -2234,6 +2268,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
                     bindShadowResources(inst, &enc);
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
+                    if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
                     if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
                     enc.bindTexture(0, texHandle(sub.tex_base));
                     enc.bindTexture(1, texHandle(sub.tex_mr));
@@ -2247,6 +2282,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
                     bindShadowResources(inst, &enc);
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
+                    if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
                     if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
                     enc.bindTexture(0, texHandle(sub.tex_base));
                     enc.bindTexture(1, texHandle(sub.tex_mr));
@@ -2346,6 +2382,15 @@ fn pointActive(inst: *const Inst) bool {
     return inst.n_point_casters > 0;
 }
 
+/// True when clip planes are active and the mutual-exclusion constraints are met.
+/// Clipping is silently disabled when fog / morph / a point-shadow caster is active
+/// (no combined handles exist for those combos in v1 — `shaderHandleFor` would hit
+/// `else => unreachable`). This guard MUST be identical at every emit site and the
+/// compile loop to avoid requesting an uncompiled shader handle.
+fn clipActive(inst: *const Inst) bool {
+    return inst.clip_count > 0 and !inst.fog_enabled and !inst.morph_enabled and !pointActive(inst);
+}
+
 /// Emit the receiver shadow binds with the multi-caster signatures, once per
 /// pipeline (re-emitted on WebGL2 because uniform locations are per-program;
 /// idempotent re-stash on WebGPU). bindShadowMap uploads the CONTIGUOUS 2D-caster
@@ -2387,6 +2432,7 @@ fn drawSubmesh(
     const v = a.submeshVariant(s) |
         (if (inst.fog_enabled) variant_fog else 0) |
         (if (inst.morph_enabled) variant_morph else 0) |
+        (if (clipActive(inst)) variant_clip else 0) |
         sbit;
     if (v != last_variant.*) {
         enc.setPipeline(shaderHandleFor(v), state);
@@ -2395,6 +2441,7 @@ fn drawSubmesh(
         // Re-bind per-pipeline (WebGL2 uniforms are per-program; WebGPU re-stash).
         bindShadowResources(inst, enc);
         if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
+        if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
         if (inst.morph_enabled) enc.setMorphWeights(inst.morph_count, @intCast(@intFromPtr(&inst.morph_active_idx)), @intCast(@intFromPtr(&inst.morph_active_wt)));
         last_variant.* = v;
     }
@@ -2442,7 +2489,8 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
         if (sv >= max_submesh) break;
         const variant = a.submeshVariant(sv) |
             (if (inst.fog_enabled) variant_fog else 0) |
-            (if (inst.morph_enabled) variant_morph else 0);
+            (if (inst.morph_enabled) variant_morph else 0) |
+            (if (clipActive(inst)) variant_clip else 0);
         const handle = shaderHandleFor(variant);
         if (shader_seen[handle]) continue;
         shader_seen[handle] = true;
@@ -2467,9 +2515,9 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     }
 
     // T6: emit the instanced shader if this mesh carries an instances section.
-    // Use fog-aware handle (19 without fog, 36 with fog). Morph+instanced is
-    // not supported (both backends @compileError) so no variant_morph here.
-    const inst_handle: usize = shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0));
+    // Use fog-aware handle (19 without fog, 36 with fog, 85 with clip). Morph+instanced
+    // is not supported (both backends @compileError) so no variant_morph here.
+    const inst_handle: usize = shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0) | (if (clipActive(inst)) variant_clip else 0));
     if (a.instanceCount() > 0 and !shader_seen[inst_handle]) {
         emitInstancedShader(inst, enc);
         shader_seen[inst_handle] = true;
