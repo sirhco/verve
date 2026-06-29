@@ -69,7 +69,7 @@ extern "verve" fn gl_emit_event(ref_handle: i32, name_ptr: [*]const u8, name_len
 
 const drag_sens: f32 = 0.01; // rad per client px
 const zoom_sens: f32 = 0.005; // distance per wheel deltaY unit
-const fov_y: f32 = 1.0; // vertical fov (rad) — MUST match the proj below
+const fov_y: f32 = 1.0; // vertical fov default (rad) — mirrors cam_fov_y default in Inst
 
 const vmesh_ready_export = "glscene_vmesh_ready";
 const env_ready_export = "glscene_env_ready";
@@ -221,6 +221,13 @@ const Inst = struct {
     env_reader: ?gl.venv.Reader = null,
 
     camera_pos: [3]f32 = .{ 0, 0, 4 }, // updated each frame to orbit.eye()
+
+    // Camera projection params (from data-glcam; defaults match legacy consts).
+    proj_mode: u32 = 0, // 0 = perspective, 1 = orthographic
+    ortho_height: f32 = 2.0, // ortho view half-height in world units
+    cam_fov_y: f32 = 1.0, // vertical fov (radians); default matches fov_y const
+    cam_near: f32 = 0.1,
+    cam_far: f32 = 100.0,
 
     // Scene graph (P6). Node 0 = root "model"; node s+1 = submesh s.
     scene: gl.Scene(max_submesh + 1) = .{},
@@ -844,6 +851,27 @@ fn parseFog(inst: *Inst, s: []const u8) void {
     inst.fog_enabled = true;
 }
 
+// Parse the `data-glcam` attribute into inst camera fields.
+// Format: "mode,ortho_height,fov_deg,near,far" (5 fields).
+// Tolerant: needs ≥5 comma fields, else leaves defaults.
+// fov_deg is converted to radians for cam_fov_y.
+fn parseCam(inst: *Inst, s: []const u8) void {
+    var vals: [5]f32 = .{ 0, 2.0, 57.29578, 0.1, 100.0 };
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        if (n >= 5) break;
+        vals[n] = std.fmt.parseFloat(f32, tok) catch return;
+        n += 1;
+    }
+    if (n < 5) return;
+    inst.proj_mode = @intFromFloat(vals[0]);
+    inst.ortho_height = vals[1];
+    inst.cam_fov_y = vals[2] * (std.math.pi / 180.0);
+    inst.cam_near = vals[3];
+    inst.cam_far = vals[4];
+}
+
 // Parse the `data-gllights` attribute into inst.lights / light_count, then
 // classify shadow casters into the 2D + point tables.
 // Format: semicolon-separated light records, each a 15-field comma-separated CSV:
@@ -1172,6 +1200,14 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     inst.canvas_handle = verve.queryRef(@as([]const u8, "glscene-canvas"));
     inst.scroll_section_handle = verve.queryRef(@as([]const u8, "glscene-scroll-section"));
 
+    // Camera projection rides on the canvas `data-glcam` attribute (NOT Props).
+    // Format: "mode,ortho_height,fov_deg,near,far". Absent → perspective defaults.
+    if (inst.canvas_handle) |ch| {
+        var cbuf: [128]u8 = undefined;
+        const ca = verve.refGetAttr(ch, "data-glcam", &cbuf);
+        if (ca.len != 0) parseCam(inst, ca);
+    }
+
     // Fog rides on the canvas `data-glfog` attribute (NOT Props — see Props
     // note). Format: "mode,r,g,b,near,far,density". Absent → fog stays off.
     if (inst.canvas_handle) |ch| {
@@ -1444,7 +1480,10 @@ fn nodeXformIdentity(inst: *const Inst) bool {
 /// for the three-path (fast / root-only / slow per-submesh) rationale.
 fn raycastSubmesh(inst: *const Inst, a: *const gl.vmesh.Reader, aspect: f32, ndc_x: f32, ndc_y: f32) ?u32 {
     if (a.bvh_node_count == 0) return null;
-    const r = gl.ray.rayFromCamera(inst.orbit.eye(), inst.orbit.target, up_vec, fov_y, aspect, ndc_x, ndc_y);
+    const r = if (inst.proj_mode == 1)
+        gl.ray.rayFromCameraOrtho(inst.orbit.eye(), inst.orbit.target, up_vec, inst.ortho_height, aspect, ndc_x, ndc_y)
+    else
+        gl.ray.rayFromCamera(inst.orbit.eye(), inst.orbit.target, up_vec, inst.cam_fov_y, aspect, ndc_x, ndc_y);
     const nodes = gl.bvh.nodesFromBytes(a.bvh_nodes);
     const tri_perm = gl.bvh.triPermFromBytes(a.tri_perm);
     const verts_f32 = bytesAsF32(a.vertices);
@@ -1550,7 +1589,7 @@ fn computeCascadeSplits(inst: *Inst, cn: f32, cam_far: f32) void {
 fn cascadeLightVp(inst: *const Inst, light_idx: u32, near_d: f32, far_d: f32, aspect: f32, view: gl.math.Mat4) gl.math.Mat4 {
     const Vec3 = gl.math.Vec3;
     const inv_view = gl.math.invert(view);
-    const tan_half = std.math.tan(fov_y * 0.5);
+    const tan_half = std.math.tan(inst.cam_fov_y * 0.5);
     // 8 view-space corners (camera looks down -Z → forward distance d → z=-d).
     var corners: [8]Vec3 = undefined;
     const depths = [2]f32{ near_d, far_d };
@@ -1620,9 +1659,13 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
     inst.input = .{};
 
     const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(@max(height, 1)));
-    const cam_near: f32 = 0.1;
-    const cam_far: f32 = 100.0;
-    const proj = gl.math.Mat4.perspective(fov_y, aspect, cam_near, cam_far);
+    const cam_near = inst.cam_near;
+    const cam_far = inst.cam_far;
+    const proj = if (inst.proj_mode == 1) blk: {
+        const h = inst.ortho_height;
+        const w = h * aspect;
+        break :blk gl.math.Mat4.ortho(-w, w, -h, h, cam_near, cam_far);
+    } else gl.math.Mat4.perspective(inst.cam_fov_y, aspect, cam_near, cam_far);
     const view = inst.orbit.viewMatrix(up_vec);
     const eye = inst.orbit.eye();
     inst.camera_pos = .{ eye.x, eye.y, eye.z };

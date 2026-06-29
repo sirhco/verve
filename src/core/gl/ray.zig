@@ -66,6 +66,36 @@ pub fn rayFromCamera(
 }
 
 // ---------------------------------------------------------------------------
+// Ray from orthographic camera
+// ---------------------------------------------------------------------------
+
+/// Build the pick ray through NDC point (ndc_x, ndc_y) ∈ [−1, 1]² (y up)
+/// for an **orthographic** projection. All rays are parallel (dir = forward).
+/// ortho_height is the view half-height in world units; width = height * aspect.
+///
+/// origin = eye + right*(ndc_x*ortho_height*aspect) + cam_up*(ndc_y*ortho_height)
+/// dir    = normalize(target − eye)
+pub fn rayFromCameraOrtho(
+    eye: math.Vec3,
+    target: math.Vec3,
+    up: math.Vec3,
+    ortho_height: f32,
+    aspect: f32,
+    ndc_x: f32,
+    ndc_y: f32,
+) Ray {
+    const forward = target.sub(eye).normalize();
+    const right = forward.cross(up).normalize();
+    const cam_up = right.cross(forward); // already unit-length
+
+    const origin = eye
+        .add(right.scale(ndc_x * ortho_height * aspect))
+        .add(cam_up.scale(ndc_y * ortho_height));
+
+    return .{ .origin = origin, .dir = forward };
+}
+
+// ---------------------------------------------------------------------------
 // Ray transform
 // ---------------------------------------------------------------------------
 
@@ -360,4 +390,75 @@ test "intersectTriangle edge graze through vertex" {
     // Behaviour is pinned: this implementation returns a hit (t ≈ 5).
     try testing.expect(t != null);
     try testing.expectApproxEqAbs(@as(f32, 5), t.?, eps5);
+}
+
+test "rayFromCameraOrtho centre → dir parallel to forward" {
+    // eye=(0,0,5) looking at origin, +Y up.  NDC (0,0) = screen centre.
+    // forward = (0,0,−1); dir must equal forward; origin must equal eye.
+    const r = rayFromCameraOrtho(
+        math.Vec3.init(0, 0, 5),
+        math.Vec3.init(0, 0, 0),
+        math.Vec3.init(0, 1, 0),
+        2.0,
+        16.0 / 9.0,
+        0,
+        0,
+    );
+    try testing.expectApproxEqAbs(@as(f32, 0), r.origin.x, eps6);
+    try testing.expectApproxEqAbs(@as(f32, 0), r.origin.y, eps6);
+    try testing.expectApproxEqAbs(@as(f32, 5), r.origin.z, eps6);
+    try testing.expectApproxEqAbs(@as(f32, 0), r.dir.x, eps6);
+    try testing.expectApproxEqAbs(@as(f32, 0), r.dir.y, eps6);
+    try testing.expectApproxEqAbs(@as(f32, -1), r.dir.z, eps6);
+}
+
+test "rayFromCameraOrtho all dirs are parallel" {
+    // Three different NDC points must all share the same direction.
+    const eye = math.Vec3.init(0, 0, 5);
+    const target = math.Vec3.init(0, 0, 0);
+    const up = math.Vec3.init(0, 1, 0);
+    const h: f32 = 2.0;
+    const aspect: f32 = 16.0 / 9.0;
+
+    const r0 = rayFromCameraOrtho(eye, target, up, h, aspect, 0, 0);
+    const r1 = rayFromCameraOrtho(eye, target, up, h, aspect, 1, 1);
+    const r2 = rayFromCameraOrtho(eye, target, up, h, aspect, -0.5, 0.3);
+
+    // All dirs must equal forward (0, 0, −1).
+    try testing.expectApproxEqAbs(r0.dir.x, r1.dir.x, eps6);
+    try testing.expectApproxEqAbs(r0.dir.y, r1.dir.y, eps6);
+    try testing.expectApproxEqAbs(r0.dir.z, r1.dir.z, eps6);
+    try testing.expectApproxEqAbs(r0.dir.x, r2.dir.x, eps6);
+    try testing.expectApproxEqAbs(r0.dir.y, r2.dir.y, eps6);
+    try testing.expectApproxEqAbs(r0.dir.z, r2.dir.z, eps6);
+}
+
+test "rayFromCameraOrtho origin offsets with ndc" {
+    // eye=(0,0,5) target=origin up=+Y ortho_height=2 aspect=1 (square).
+    // right = (1,0,0), cam_up = (0,1,0).
+    // NDC (1, 0): origin.x should be +2 (h*aspect*1 = 2*1*1 = 2), origin.y = 0.
+    const r = rayFromCameraOrtho(
+        math.Vec3.init(0, 0, 5),
+        math.Vec3.init(0, 0, 0),
+        math.Vec3.init(0, 1, 0),
+        2.0,
+        1.0, // square — width == height
+        1,
+        0,
+    );
+    try testing.expectApproxEqAbs(@as(f32, 2.0), r.origin.x, eps5);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), r.origin.y, eps5);
+    try testing.expectApproxEqAbs(@as(f32, 5.0), r.origin.z, eps5);
+    // NDC (0, 1): origin.y should be +2.
+    const r2 = rayFromCameraOrtho(
+        math.Vec3.init(0, 0, 5),
+        math.Vec3.init(0, 0, 0),
+        math.Vec3.init(0, 1, 0),
+        2.0,
+        1.0,
+        0,
+        1,
+    );
+    try testing.expectApproxEqAbs(@as(f32, 0.0), r2.origin.x, eps5);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), r2.origin.y, eps5);
 }
