@@ -2548,6 +2548,39 @@ pub fn glSceneOrtho(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-clip: world-space clipping planes demo.
+/// A cube on a floor (shadow.vmesh) cut by a single diagonal clip plane through
+/// the origin.  Fragments where dot(normal, worldPos) + constant < 0 are
+/// discarded; the surviving half reveals the solid interior cross-section.
+/// No fog / morph / point-shadow — those disable clipping in v1.
+pub fn glSceneClip(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/shadow.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%230d0f17'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EClip%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 9, .pitch = 0.55, .yaw = 0.7 })
+        .light(.{ .dir = .{ -0.45, -0.82, -0.35 }, .intensity = 3.2 })
+        .clipPlanes(&.{.{ .normal = .{ 1, 0.4, 0 }, .constant = 0 }})
+        .autoRotate(0.2)
+        .build();
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — clip planes"),
+        ctx.p().text("World-space clipping: fragments where " ++
+            "dot(normal, worldPos) + constant \u{2265} 0 are kept; " ++
+            "fragments below the plane are discarded. " ++
+            "The diagonal cut through the cube reveals its solid interior. " ++
+            "Up to 4 global clip planes via " ++
+            ".clipPlanes(&.{ ClipPlane{ .normal, .constant } }). " ++
+            "Both WebGL2 and WebGPU backends. " ++
+            "(v1 note: not combinable with fog / morph / point-shadow yet.)"),
+        scene,
+        ctx.p().text("Single plane: normal = (1, 0.4, 0), constant = 0. " ++
+            "Drag to orbit to inspect the cross-section from different angles."),
+    });
+}
+
 pub fn page(ctx: *const verve.Context, body: *verve.Node) !*verve.Node {
     // Provide a default title only if the page didn't set one of its own.
     try ctx.setTitleIfUnset("Verve");

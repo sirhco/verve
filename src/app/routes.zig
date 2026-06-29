@@ -46,6 +46,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/gl-decals", renderGlDecals),
     verve.Route.init("/gl-lod", renderGlLod),
     verve.Route.init("/gl-ortho", renderGlOrtho),
+    verve.Route.init("/gl-clip", renderGlClip),
     verve.Route.init("/push-multi", renderPushMulti),
     verve.Route.init("/todos", renderTodos),
     verve.Route.init("/work/:slug", renderWorkDetail),
@@ -248,6 +249,11 @@ fn renderGlLod(ctx: *verve.Context) !*verve.Node {
 
 fn renderGlOrtho(ctx: *verve.Context) !*verve.Node {
     const body = try components.glSceneOrtho(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderGlClip(ctx: *verve.Context) !*verve.Node {
+    const body = try components.glSceneClip(ctx);
     return components.page(ctx, body);
 }
 
