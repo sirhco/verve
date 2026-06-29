@@ -4,6 +4,25 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.23.0] - 2026-06-29
+
+### Added
+
+- **gl — user clipping planes**: `GlSceneBuilder.clipPlanes(&.{ ClipPlane{ .normal, .constant } })`
+  clips the rendered scene to the intersection of up to 4 world-space half-spaces
+  (`three.js clippingPlanes` parity). Convention: a fragment is **kept** when
+  `dot(normal, worldPos) + constant >= 0` for **all** active planes; failing any plane
+  discards the fragment. The builder serializes planes out-of-band as the `data-glclip`
+  canvas attribute — a semicolon-separated list of `nx,ny,nz,constant` records (normals
+  normalized); the chunk reads it via `refGetAttr` before the first frame and injects the
+  clipping test into both the forward-lit and PBR shader paths using the already-interpolated
+  `v_world_pos` varying (no extra vertex pass required). Both WebGL2 and WebGPU backends
+  supported. New `/gl-clip` demo: a cross-sectioned PBR sphere with a live plane-offset
+  slider. Known limitation (v1): clipping is **mutually exclusive with fog, morph-targets,
+  and point-shadow** — those combos share no shader handle and the chunk silently disables
+  clipping when any is active. Deferred: union (`clipIntersection`) mode, per-material
+  planes, and `clipShadows` (clipping the depth/shadow passes).
+
 ## [0.22.0] - 2026-06-29
 
 ### Added
