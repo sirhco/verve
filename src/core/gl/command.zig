@@ -7499,3 +7499,115 @@ test "golden: clipping shader FNV hashes frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(variant_pbr)));
     try testing.expectEqual(@as(u64, 0xcf13de40f43f4d50), fnv64(wgslPbr(variant_pbr | variant_shadow)));
 }
+
+// ── Clip-offset hardening (Fix 1 + Fix 2) ───────────────────────────────
+//
+// These tests pin the EXACT WGSL byte offsets of clip_planes and clip_count
+// in all reachable clip-variant U structs so any drift breaks a native test
+// before it can silently corrupt the WebGPU bridge (Task B contract).
+//
+// Three reachable clip-offset cases:
+//   base+clip:      clip_planes@768,  clip_count@832  (area_lights ends at 768)
+//   shadow+clip:    clip_planes@1328, clip_count@1392 (view_forward ends at 1328)
+//   instanced+clip: clip_planes@832,  clip_count@896  (vp ends at 832)
+//
+// variant_shadow + variant_instanced is @compileError in v1 (offset 768 collision),
+// so shadow+instanced+clip is unreachable — no fourth case.
+
+/// Walk the first `struct U { … }` block in `src`, accumulate WGSL alignment
+/// and size for each field, and return the byte offset of `field`.
+/// Only handles the type set present in wgslPbr's U struct (test-only helper).
+fn wgslUFieldByteOffset(src: []const u8, field: []const u8) usize {
+    const head = "struct U {\n";
+    const body_start = (std.mem.indexOf(u8, src, head) orelse
+        @panic("wgslUFieldByteOffset: struct U not found")) + head.len;
+    const body_end = std.mem.indexOfPos(u8, src, body_start, "\n};") orelse
+        @panic("wgslUFieldByteOffset: closing }; not found");
+    const body = src[body_start..body_end];
+    var off: usize = 0;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOf(u8, line, ": ") orelse continue;
+        const fname = line[0..colon];
+        const t_end = if (line[line.len - 1] == ',') line.len - 1 else line.len;
+        const tname = line[colon + 2 .. t_end];
+        const al = wgslUAlign(tname);
+        const sz = wgslUSize(tname);
+        off = (off + al - 1) & ~(al - 1);
+        if (std.mem.eql(u8, fname, field)) return off;
+        off += sz;
+    }
+    @panic("wgslUFieldByteOffset: field not found");
+}
+
+fn wgslUAlign(t: []const u8) usize {
+    if (std.mem.eql(u8, t, "mat4x4<f32>")) return 16;
+    if (std.mem.eql(u8, t, "mat3x3<f32>")) return 16;
+    if (std.mem.eql(u8, t, "vec4<f32>")) return 16;
+    if (std.mem.eql(u8, t, "vec3<f32>")) return 16;
+    if (std.mem.eql(u8, t, "i32") or std.mem.eql(u8, t, "f32") or std.mem.eql(u8, t, "u32")) return 4;
+    if (std.mem.startsWith(u8, t, "array<")) return 16;
+    @panic("wgslUAlign: unknown type");
+}
+
+fn wgslUSize(t: []const u8) usize {
+    if (std.mem.eql(u8, t, "mat4x4<f32>")) return 64;
+    if (std.mem.eql(u8, t, "mat3x3<f32>")) return 48; // 3 cols × 16B (WGSL column-major)
+    if (std.mem.eql(u8, t, "vec4<f32>")) return 16;
+    if (std.mem.eql(u8, t, "vec3<f32>")) return 12;
+    if (std.mem.eql(u8, t, "i32") or std.mem.eql(u8, t, "f32") or std.mem.eql(u8, t, "u32")) return 4;
+    if (std.mem.startsWith(u8, t, "array<vec4<f32>, ")) {
+        // t = "array<vec4<f32>, N>" — strip trailing '>'
+        const n_str = t["array<vec4<f32>, ".len .. t.len - 1];
+        const n = std.fmt.parseInt(usize, n_str, 10) catch @panic("wgslUSize: bad N");
+        return n * 16;
+    }
+    if (std.mem.startsWith(u8, t, "array<mat4x4<f32>, ")) {
+        const n_str = t["array<mat4x4<f32>, ".len .. t.len - 1];
+        const n = std.fmt.parseInt(usize, n_str, 10) catch @panic("wgslUSize: bad N");
+        return n * 64;
+    }
+    @panic("wgslUSize: unknown type");
+}
+
+test "WGSL U exact offsets: base+clip (clip_planes@768, clip_count@832)" {
+    // Fix 1: pin exact numeric offsets, not just field ordering.
+    const src = wgslPbr(variant_pbr | variant_clipping);
+    try testing.expectEqual(@as(usize, 768), wgslUFieldByteOffset(src, "clip_planes"));
+    try testing.expectEqual(@as(usize, 832), wgslUFieldByteOffset(src, "clip_count"));
+}
+
+test "WGSL U exact offsets: shadow+clip (clip_planes@1328, clip_count@1392)" {
+    // Fix 1: pin exact numeric offsets, not just field ordering.
+    const src = wgslPbr(variant_pbr | variant_shadow | variant_clipping);
+    try testing.expectEqual(@as(usize, 1328), wgslUFieldByteOffset(src, "clip_planes"));
+    try testing.expectEqual(@as(usize, 1392), wgslUFieldByteOffset(src, "clip_count"));
+}
+
+test "WGSL U exact offsets: instanced+clip (clip_planes@832, clip_count@896)" {
+    // Fix 2: third clip-offset case. variant_instanced appends vp: mat4x4 at 768
+    // (area_lights ends at 768), pushing clip_planes to 832, clip_count to 896.
+    // variant_shadow+instanced is @compileError in v1 → no fourth case.
+    const src = wgslPbr(variant_pbr | variant_instanced | variant_clipping);
+    try testing.expectEqual(@as(usize, 832), wgslUFieldByteOffset(src, "clip_planes"));
+    try testing.expectEqual(@as(usize, 896), wgslUFieldByteOffset(src, "clip_count"));
+}
+
+test "PBR_STRIDE = 1536 (align(1408,256) — shadow+clip dominant struct)" {
+    // shadow+clip: clip_count@1392 + 4B + 12B pad = 1408; align(1408,256) = 1536.
+    // Verify via the parsed offset so the assertion breaks if any preceding field shifts.
+    const src = wgslPbr(variant_pbr | variant_shadow | variant_clipping);
+    const cc = wgslUFieldByteOffset(src, "clip_count");
+    try testing.expectEqual(@as(usize, 1392), cc);
+    // 1392 + sizeof(clip_count u32=4) + 3×pad(u32=4 each) = 1408; align up to 256 boundary.
+    try testing.expectEqual(@as(usize, 1536), (cc + 4 + 12 + 255) & ~@as(usize, 255));
+}
+
+test "golden: instanced+clip WGSL hash frozen (FNV-1a-64)" {
+    // Fix 2: freeze the variant_pbr|variant_instanced|variant_clipping shader hash.
+    // clip_planes@832, clip_count@896. variant_shadow+instanced is @compileError → no shadow case.
+    const IC = variant_pbr | variant_instanced | variant_clipping;
+    try testing.expectEqual(@as(u64, 0x30ce18fcf4173a9c), fnv64(wgslPbr(IC)));
+}
