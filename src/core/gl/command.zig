@@ -122,6 +122,13 @@ pub const Tag = enum(u16) {
     //   PIPELINE NOTE: the bridge MUST create the decal pipeline with a NEGATIVE depth bias (WebGL2 polygonOffset / WebGPU
     //   pipeline depthBias, biased toward the camera) so the overlay wins the z-test against its coplanar host surface and
     //   does NOT z-fight. The bias is pipeline state — it is NOT encoded in the shader.
+
+    // ── User clipping planes ─────────────────────────────────────────────
+    set_clip_planes = 45, // {count, ptr → count*vec4 f32 (nx,ny,nz,constant per plane, world-space)}.
+    //   count = number of active planes (0..max_clip_planes). ptr → count*4 f32 (one vec4 per plane:
+    //   xyz = world-space normal, w = constant; keep iff dot(n,worldPos) + w >= 0.0). Per-frame transient.
+    //   The bridge uploads into u_clip_planes[]/u_clip_count (GLSL) or u.clip_planes/u.clip_count (WGSL)
+    //   on each PBR draw with variant_clipping. Mirror of set_area_lights (tag 37).
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -168,6 +175,11 @@ pub const variant_oit: u32 = 1 << 17; // Weighted-Blended OIT transparent-geomet
 pub const variant_billboard: u32 = 1 << 18; // Camera-facing billboard quads (Points / Sprites). Standalone shader pair (own VS+FS + own U{view,proj,flags}), NOT a PBR add-on. Per-instance attribs loc0=center,1=size,2=color,3=rot (36B/record); the 6 quad corners come from the vertex index (VBO-less). FS samples tex0 × instance color; flags bit0=sizeAttenuation, bit1=round.
 pub const variant_fatline: u32 = 1 << 19; // Fat lines (Line2 / LineSegments2): wide segments as instanced screen-space quads, NOT native lineWidth. Standalone shader pair (own VS+FS + own U{vp,resolution,width,flags}), NOT a PBR add-on. Per-instance attribs loc0=p0,1=p1,2=color (40B/record); the 6 quad verts ((t,side)) come from the vertex index (VBO-less). VS projects both endpoints with the COMBINED VP, then offsets perpendicular in screen space (×clip.w → pixel-constant width). flags bit0=worldUnits. Square caps only (no joins/round caps).
 pub const variant_decal: u32 = 1 << 20; // Decals (DecalGeometry projector): the projected stride-32 decal mesh (pos@0 loc0, normal@12 loc1, uv@24 loc2) drawn as a textured, depth-biased overlay on its host surface. Standalone shader pair (own VS+FS + own U{mvp,color}), NOT a PBR add-on. VS = u_mvp*pos; FS = texture(tex0,uv) × u_color with a fixed-constant directional light term (ambient floor 0.4 + 0.6*ndl, L a shader constant — no extra uniform) and alpha = tex.a × color.a; no tonemap (unlit/billboard convention). Texture+sampler at group(1) (mirrors the billboard binding). PIPELINE: the bridge MUST create this pipeline with a NEGATIVE depth bias (WebGL2 polygonOffset / WebGPU depthBias, toward the camera) so the coplanar overlay wins the z-test and does NOT z-fight against the host surface — bias is pipeline state, NOT encoded in the shader.
+pub const variant_clipping: u32 = 1 << 21; // requires variant_pbr; world-space half-space clip planes.
+// Up to max_clip_planes planes emitted per-frame via set_clip_planes (tag 45). GLSL: uniforms
+// u_clip_planes[4]+u_clip_count + discard loop at top of main() (before lighting). WGSL: fields
+// clip_planes/clip_count appended at END of PBR U (after shadow block when present); discard
+// loop in fs_main(). Forward/PBR draws ONLY — do NOT set on depth/shadow pass draws.
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -188,6 +200,7 @@ pub const max_lights: u32 = 4;
 //   c0 = pos + ex - ey   c1 = pos - ex - ey   c2 = pos - ex + ey   c3 = pos + ex + ey
 pub const max_area_lights: u32 = 4;
 pub const area_light_stride_f32: u32 = 16; // 4 vec4 per area light
+pub const max_clip_planes: u32 = 4; // max simultaneously-active clip planes (matches max_lights / max_area_lights)
 pub const light_stride_f32: u32 = 16; // v0:[type,intensity,pos.x,pos.y]  v1:[pos.z,dir.x,dir.y,dir.z]  v2:[color.r,color.g,color.b,range]  v3:[cos_inner,cos_outer,shadow_index,shadow_kind]
 // v3.z = shadow_index: for a 2D caster → index in shadow_vp[] AND its tile in the 2D atlas (0..3);
 //        for a point caster → its point-caster index (0..3). -1.0 = this light casts no shadow.
@@ -1496,6 +1509,22 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    // Clip-plane uniforms (variant_clipping). Two individual uniforms — no UBO offset sync needed.
+    const clip_uniforms =
+        \\uniform vec4 u_clip_planes[4];
+        \\uniform int u_clip_count;
+        \\
+    ;
+    // Clip-plane discard loop (variant_clipping). Placed near the top of main() before lighting
+    // so discarded fragments skip all expensive lighting work. Reuses the existing v_world_pos
+    // varying (PBR VS always emits it) — no new varying or VS change required.
+    // Convention (three.js Plane): keep iff dot(normal, worldPos) + constant >= 0.0.
+    const clip_discard =
+        \\  for (int i = 0; i < u_clip_count; i++) {
+        \\    if (dot(u_clip_planes[i].xyz, v_world_pos) + u_clip_planes[i].w < 0.0) discard;
+        \\  }
+        \\
+    ;
     const emissive =
         \\  color += emissive_factor * texture(u_emissive_tex, v_uv).rgb;
         \\
@@ -1520,9 +1549,11 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     if (flags & variant_fog != 0) src = src ++ fog_uniforms;
     if (flags & variant_shadow != 0) src = src ++ shadow_decls;
     if (flags & variant_shadow_point != 0) src = src ++ point_shadow_decls;
+    if (flags & variant_clipping != 0) src = src ++ clip_uniforms;
     src = src ++ main_open;
     if (flags & variant_instanced != 0) src = src ++ inst_tint;
     if (flags & variant_alpha_test != 0) src = src ++ alpha_test;
+    if (flags & variant_clipping != 0) src = src ++ clip_discard;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
     if (flags & variant_double_sided != 0) src = src ++ ds_flip;
     src = src ++ lighting_head;
@@ -1978,6 +2009,22 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  vp: mat4x4<f32>,
         \\
     ;
+    // Clip-plane fields (variant_clipping). APPENDED AT THE END of the U struct (after all
+    // other variant-specific fields) so no existing byte offset shifts. Three u32 pads after
+    // clip_count bring the struct to a 16-byte boundary (matches the pad idiom elsewhere).
+    // WGSL U-struct clip offsets (Task B contract):
+    //   base+clip (no shadow):   clip_planes@768,  clip_count@832  (base ends at 768)
+    //   shadow+clip:             clip_planes@1328, clip_count@1392 (shadow ends at 1328)
+    //   instanced+clip:          clip_planes@832,  clip_count@896  (vp ends at 832)
+    // PBR_STRIDE = align(max_struct_size, 256) = align(1408, 256) = 1536 (shadow+clip, unchanged).
+    const uniforms_clip =
+        \\  clip_planes: array<vec4<f32>, 4>,
+        \\  clip_count: u32,
+        \\  _clip_pad0: u32,
+        \\  _clip_pad1: u32,
+        \\  _clip_pad2: u32,
+        \\
+    ;
     const uniforms_tail =
         \\};
         \\@group(0) @binding(0) var<uniform> u: U;
@@ -2356,6 +2403,16 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  if (textureSample(base_tex, samp, in.uv).a * base_color.a < u.material[2].w) { discard; }
         \\
     ;
+    // Clip-plane discard (variant_clipping). Placed at top of fs_main() before any lighting work.
+    // Reuses in.world_pos (already a fragment input — VSOut @location(0)).
+    // WGSL free functions CANNOT reference in.<field>; the loop stays in fs_main() to avoid the trap.
+    // Convention: keep iff dot(clip_planes[i].xyz, worldPos) + clip_planes[i].w >= 0.0.
+    const fs_clip_discard =
+        \\  for (var ci: i32 = 0; ci < u.clip_count; ci = ci + 1) {
+        \\    if (dot(u.clip_planes[ci].xyz, in.world_pos) + u.clip_planes[ci].w < 0.0) { discard; }
+        \\  }
+        \\
+    ;
     // Instanced fs_open: base_color is tinted by the per-instance color varying.
     const fs_open_instanced =
         \\@fragment
@@ -2661,9 +2718,11 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     const lin = flags & variant_linear_output != 0;
     const ds = flags & variant_double_sided != 0;
     const inst = flags & variant_instanced != 0;
+    const clip = flags & variant_clipping != 0;
     comptime var src: []const u8 = uniforms_head;
     if (shadow) src = src ++ uniforms_shadow;
     if (inst) src = src ++ uniforms_vp;
+    if (clip) src = src ++ uniforms_clip;
     src = src ++ uniforms_tail;
     if (skinned) src = src ++ uniforms_bones;
     if (flags & variant_fog != 0) src = src ++ uniforms_fog;
@@ -2699,6 +2758,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (point_shadow) src = src ++ fs_point_shadow_decl;
     src = src ++ (if (inst) fs_open_instanced else (if (ds) fs_open_ds else fs_open));
     if (flags & variant_alpha_test != 0) src = src ++ fs_alpha_test;
+    if (clip) src = src ++ fs_clip_discard;
     src = src ++ (if (nm) (if (ds) fs_normal_nm_ds else fs_normal_nm) else (if (ds) fs_normal_plain_ds else fs_normal_plain));
     if (ds) src = src ++ fs_ds_flip;
     src = src ++ fs_lighting_head;
@@ -4001,6 +4061,17 @@ pub const Encoder = struct {
     /// area_lights@512. Per-frame transient like setLights (not recorded into the registry).
     pub fn setAreaLights(self: *Encoder, count: u32, ptr: u32) void {
         self.header(.set_area_lights, 8);
+        self.putU32(count);
+        self.putU32(ptr);
+    }
+
+    /// Encode set_clip_planes: per-frame half-space clip plane array (≤ max_clip_planes).
+    /// `ptr` → count*4 f32 (one vec4 per plane: xyz = world-space normal, w = constant;
+    /// a fragment is KEPT iff dot(normal, worldPos) + w >= 0.0). Per-frame transient.
+    /// The bridge uploads into u_clip_planes[]/u_clip_count (GLSL) or
+    /// u.clip_planes/u.clip_count (WGSL) on each PBR draw with variant_clipping set.
+    pub fn setClipPlanes(self: *Encoder, count: u32, ptr: u32) void {
+        self.header(.set_clip_planes, 8);
         self.putU32(count);
         self.putU32(ptr);
     }
@@ -7311,4 +7382,120 @@ test "golden: decal GLSL+WGSL hashes frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xaf366ee313c1b7ac), fnv64(wgslBillboard()));
     try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(variant_pbr)));
     try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(variant_pbr)));
+}
+
+// ── Clipping planes (variant_clipping, set_clip_planes = 45) ────────────
+
+test "variant_clipping bit value (1<<21) is free + collision-free" {
+    try testing.expectEqual(@as(u32, 1 << 21), variant_clipping);
+    // No overlap with existing variant bits.
+    try testing.expect(variant_clipping & variant_decal == 0);
+    try testing.expect(variant_clipping & variant_pbr == 0);
+    try testing.expect(variant_clipping & variant_oit == 0);
+    try testing.expect(variant_clipping & variant_post == 0);
+    try testing.expect(variant_clipping & variant_shadow_point == 0);
+    try testing.expect(variant_clipping & variant_prepass == 0);
+    try testing.expect(variant_clipping & variant_billboard == 0);
+    try testing.expect(variant_clipping & variant_fatline == 0);
+}
+
+test "clip planes: tag + constant values" {
+    try testing.expectEqual(@as(u16, 45), @intFromEnum(Tag.set_clip_planes));
+    try testing.expectEqual(@as(u32, 4), max_clip_planes);
+}
+
+test "golden: set_clip_planes (tag 45) 8-byte payload" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.setClipPlanes(2, 0x2000);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "10000000" ++ // 16 record bytes
+            // SET_CLIP_PLANES count=2 ptr=0x2000
+            "2d00" ++ "0800" ++ "02000000" ++ "00200000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "GLSL PBR: clip uniforms present only under variant_clipping" {
+    const clip_fs = pbrFragmentSrc(variant_pbr | variant_clipping);
+    try testing.expect(std.mem.indexOf(u8, clip_fs, "uniform vec4 u_clip_planes[4];") != null);
+    try testing.expect(std.mem.indexOf(u8, clip_fs, "uniform int u_clip_count;") != null);
+    try testing.expect(std.mem.indexOf(u8, clip_fs, "u_clip_count; i++") != null);
+    try testing.expect(std.mem.indexOf(u8, clip_fs, "v_world_pos) + u_clip_planes[i].w < 0.0) discard;") != null);
+    // Without variant_clipping: no clip uniforms or discard loop.
+    const base_fs = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, base_fs, "u_clip_planes") == null);
+    try testing.expect(std.mem.indexOf(u8, base_fs, "u_clip_count") == null);
+    // Variant gating: clip discard must NOT appear in the PBR vertex shader.
+    const pbr_vs = pbrVertexSrc(variant_pbr | variant_clipping);
+    try testing.expect(std.mem.indexOf(u8, pbr_vs, "u_clip_planes") == null);
+}
+
+test "WGSL PBR: clip fields present in U under variant_clipping" {
+    const src = wgslPbr(variant_pbr | variant_clipping);
+    try testing.expect(std.mem.indexOf(u8, src, "clip_planes: array<vec4<f32>, 4>,") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "clip_count: u32,") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "u.clip_count") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "u.clip_planes[ci].xyz, in.world_pos") != null);
+    // WGSL free-fn trap check: discard loop uses in.world_pos (an fs_main param, not a free-fn).
+    try testing.expect(std.mem.indexOf(u8, src, "in.world_pos") != null);
+}
+
+test "WGSL PBR: clip fields absent without variant_clipping" {
+    // Base variant must not leak clip fields.
+    const base = wgslPbr(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, base, "clip_planes") == null);
+    try testing.expect(std.mem.indexOf(u8, base, "clip_count") == null);
+    // Shadow variant without clip: also clean.
+    const shadow_src = wgslPbr(variant_pbr | variant_shadow);
+    try testing.expect(std.mem.indexOf(u8, shadow_src, "clip_planes") == null);
+}
+
+test "WGSL U layout: clip_planes appended AFTER area_lights (base+clip)" {
+    // Non-shadow+clipping: clip_planes must follow area_lights (offset 512..768).
+    // clip_planes@768, clip_count@832. PBR_STRIDE=1536 (dominated by shadow+clip: 1408→1536).
+    const src = wgslPbr(variant_pbr | variant_clipping);
+    const i_alights = std.mem.indexOf(u8, src, "area_lights: array<vec4<f32>, 16>,").?;
+    const i_clip = std.mem.indexOf(u8, src, "clip_planes: array<vec4<f32>, 4>,").?;
+    const i_clip_count = std.mem.indexOf(u8, src, "clip_count: u32,").?;
+    // Order: area_lights < clip_planes < clip_count.
+    try testing.expect(i_alights < i_clip);
+    try testing.expect(i_clip < i_clip_count);
+    // No shadow_vp (non-shadow variant).
+    try testing.expect(std.mem.indexOf(u8, src, "shadow_vp") == null);
+}
+
+test "WGSL U layout: clip_planes appended AFTER shadow block (shadow+clip)" {
+    // Shadow+clipping: clip_planes must follow view_forward (last shadow field).
+    // clip_planes@1328, clip_count@1392. PBR_STRIDE = align(1408, 256) = 1536 (unchanged).
+    const src = wgslPbr(variant_pbr | variant_shadow | variant_clipping);
+    const i_shadow = std.mem.indexOf(u8, src, "shadow_vp: array<mat4x4<f32>, 8>,").?;
+    const i_vfwd = std.mem.indexOf(u8, src, "view_forward: vec3<f32>,").?;
+    const i_clip = std.mem.indexOf(u8, src, "clip_planes: array<vec4<f32>, 4>,").?;
+    const i_clip_count = std.mem.indexOf(u8, src, "clip_count: u32,").?;
+    // Order: shadow_vp < view_forward < clip_planes < clip_count.
+    try testing.expect(i_shadow < i_vfwd);
+    try testing.expect(i_vfwd < i_clip);
+    try testing.expect(i_clip < i_clip_count);
+}
+
+test "golden: clipping shader FNV hashes frozen (FNV-1a-64)" {
+    // Frozen from first green run — a change here = deliberate GLSL/WGSL contract bump.
+    // Only NEW variant paths have new hashes; the non-clipping path hashes are UNCHANGED.
+    const C = variant_pbr | variant_clipping;
+    const CS = variant_pbr | variant_shadow | variant_clipping;
+    // New clipping variant hashes (expected to differ from non-clipping path):
+    try testing.expectEqual(@as(u64, 0x5da93749b39c138c), fnv64(pbrFragmentSrc(C)));
+    try testing.expectEqual(@as(u64, 0x39e3087efe56ee58), fnv64(wgslPbr(C)));
+    try testing.expectEqual(@as(u64, 0x7a46b2e838a3663a), fnv64(wgslPbr(CS)));
+    // Non-clipping path UNCHANGED — variant_clipping code is only emitted under variant_clipping.
+    // clip_count=0 is a no-op; a scene without clip planes is byte-identical to pre-change.
+    try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(variant_pbr)));
+    try testing.expectEqual(@as(u64, 0xcf13de40f43f4d50), fnv64(wgslPbr(variant_pbr | variant_shadow)));
 }
