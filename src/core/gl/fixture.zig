@@ -3223,7 +3223,7 @@ test "cubeGridGlb: N-cube grid round-trips with unique names + distinct position
 /// One mesh + one node with the extension. Each instance has:
 ///   TRANSLATION : grid (spacing 2.5, centered at origin)
 ///   ROTATION    : small per-instance yaw quaternion
-///   SCALE       : uniform 0.4
+///   SCALE       : non-uniform per-instance (sx 0.18..0.33, sy 0.30..1.35, sz 0.18..0.33)
 ///   _COLOR_0    : hue-varied palette (red→green→blue cycle by index)
 ///
 /// Accessors layout in BIN (after geom + PNG):
@@ -3350,13 +3350,20 @@ pub fn cubeFieldGlb(alloc: Allocator) ![]u8 {
             o += 16;
         }
     }
-    // SCALE: uniform 0.4 for all instances
+    // SCALE: non-uniform per-instance — tall thin pillars of varying height.
+    // sx/sz vary by column/row mod (0.18..0.33 thin), sy varies by row (0.30..1.35 tall).
+    // Non-uniform scale exercises the inverse-transpose normal correction in the vertex shader.
     {
         var o: usize = inst_scale_off;
-        for (0..INST_COUNT) |_| {
-            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(@as(f32, 0.4)), .little);
-            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(@as(f32, 0.4)), .little);
-            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(@as(f32, 0.4)), .little);
+        for (0..INST_COUNT) |i| {
+            const row: u32 = @intCast(i / GRID_W);
+            const col: u32 = @intCast(i % GRID_W);
+            const sx: f32 = 0.18 + @as(f32, @floatFromInt(col % 4)) * 0.05; // 0.18..0.33 thin
+            const sy: f32 = 0.30 + @as(f32, @floatFromInt(row)) * 0.07; // 0.30..1.35 tall, varies by row
+            const sz: f32 = 0.18 + @as(f32, @floatFromInt(row % 4)) * 0.05; // 0.18..0.33 thin
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(sx), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(sy), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(sz), .little);
             o += 12;
         }
     }

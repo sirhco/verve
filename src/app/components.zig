@@ -2326,9 +2326,11 @@ pub fn glSceneCull(ctx: *const verve.Context) !*verve.Node {
 
 /// /gl-instanced: 16×16 = 256 cubes drawn in a single instanced draw call.
 /// The vmesh carries EXT_mesh_gpu_instancing data (TRANSLATION/ROTATION/SCALE/
-/// _COLOR_0 per instance). GlScene emits one draw_pbr_instanced command; the
-/// bridge issues a single drawElementsInstanced (WebGL2) / drawIndexed(count, N)
-/// (WebGPU) for all 256.
+/// _COLOR_0 per instance). Each instance has a NON-uniform scale (sx/sz thin,
+/// sy tall and row-varying) so the inverse-transpose normal correction in the
+/// vertex shader is exercised — stretched faces stay correctly lit (three.js parity).
+/// GlScene emits one draw_pbr_instanced command; the bridge issues a single
+/// drawElementsInstanced (WebGL2) / drawIndexed(count, N) (WebGPU) for all 256.
 pub fn glSceneInstanced(ctx: *const verve.Context) !*verve.Node {
     const scene = ctx.glScene(.{
         .src = "/gl/cubefield.vmesh",
@@ -2342,14 +2344,16 @@ pub fn glSceneInstanced(ctx: *const verve.Context) !*verve.Node {
 
     return ctx.main_().class("home gl-scene-page").children(.{
         ctx.h1("verve.gl — GPU instancing"),
-        ctx.p().text("A 16×16 field of 256 hue-varied cubes rendered in a single " ++
-            "instanced draw call. Per-instance TRANSLATION, ROTATION, SCALE, and " ++
-            "_COLOR_0 attributes are stored in the vmesh instances section " ++
-            "(decoded from EXT_mesh_gpu_instancing in the source GLB). GlScene " ++
-            "emits one draw_pbr_instanced command; both WebGL2 and WebGPU backends " ++
+        ctx.p().text("A 16×16 field of 256 hue-varied pillars rendered in a single " ++
+            "instanced draw call. Each instance has a non-uniform scale (sx/sz thin, " ++
+            "sy tall and row-varying), exercising the inverse-transpose normal correction " ++
+            "in the vertex shader so stretched faces remain correctly lit. Per-instance " ++
+            "TRANSLATION, ROTATION, SCALE, and _COLOR_0 attributes are stored in the " ++
+            "vmesh instances section (decoded from EXT_mesh_gpu_instancing in the source GLB). " ++
+            "GlScene emits one draw_pbr_instanced command; both WebGL2 and WebGPU backends " ++
             "dispatch a single instanced draw for all 256 cubes."),
         ctx.div().attr("data-ref", "glinstanced-hint").class("hint")
-            .text("256 cubes · 1 instanced draw call · hue palette cycles red→green→blue"),
+            .text("256 cubes · 1 instanced draw call · non-uniform scale (pillars) · normals corrected via inverse-transpose"),
         scene,
         ctx.p().text("Drag to orbit · wheel to zoom. All 256 cubes are drawn in one " ++
             "GPU call via variant_instanced + draw_pbr_instanced (wire tag 27)."),
