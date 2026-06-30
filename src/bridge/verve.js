@@ -5362,6 +5362,11 @@
           // Default no clip planes each frame; set_clip_planes (tag 45) re-enables.
           st.frameClipCount = 0;
           st.frameClipPlanes = null;
+          // Reset instance-upload dedup key: instance contents change every frame
+          // (animation), so the first case-27 per frame must re-upload even if the
+          // pointer is stable.  Remaining case-27s sharing the same ptr+count skip.
+          st.instUploadedPtr = 0;
+          st.instUploadedCount = 0;
           // Ensure the 1×1 rgba16f LTC dummy is bound to units 10/11 by default so
           // every PBR draw has valid (incomplete-free) textures at those samplers
           // even before /gl/ltc.bin loads. Real LUTs (tag 38) override these binds.
@@ -5810,7 +5815,14 @@
           // 16 f32 mat4 col-major + 4 f32 color rgba). Lazy-create, then stream.
           if (!st.instanceBuf) st.instanceBuf = gl.createBuffer();
           gl.bindBuffer(gl.ARRAY_BUFFER, st.instanceBuf);
-          gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(memory.buffer, instancePtr, instanceCount * 80), gl.DYNAMIC_DRAW);
+          // Upload instance data only once per frame per unique instancePtr+instanceCount.
+          // Multiple submeshes sharing the same buffer would otherwise re-upload identical
+          // data.  The guard is reset at BEGIN_FRAME so every frame gets a fresh upload.
+          if (st.instUploadedPtr !== instancePtr || st.instUploadedCount !== instanceCount) {
+            gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(memory.buffer, instancePtr, instanceCount * 80), gl.DYNAMIC_DRAW);
+            st.instUploadedPtr = instancePtr;
+            st.instUploadedCount = instanceCount;
+          }
           // bindVaoFor uses st.active.variant as the cache key; variant_instanced
           // (0x1000) produces a distinct key from non-instanced PBR, so existing
           // VAOs are untouched. After binding the keyed VAO we layer the instance
@@ -7171,6 +7183,11 @@
           st.frameCascadeCount = 0; // default CSM off; set_csm (36) re-enables per frame
           st.frameAreaCount = 0; // default no area lights; set_area_lights (37) re-enables per frame
           st.frameClipCount = 0; // default no clip planes; set_clip_planes (45) re-enables per frame
+          // Reset instance-upload dedup key: instance contents change every frame
+          // (animation), so the first case-27 per frame must re-upload even if the
+          // pointer is stable.  Remaining case-27s sharing the same ptr+count skip.
+          st.instUploadedPtr = 0;
+          st.instUploadedCount = 0;
           st.curTargetFormat = st.format; // canvas pass: post draws target st.format
           st.curPassHasDepth = true; // canvas pass always has depth24plus
           // Reuse the encoder if a shadow/offscreen pass already opened one this
@@ -8570,7 +8587,15 @@
               usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
             });
           }
-          device.queue.writeBuffer(st.instanceBuf, 0, memory.buffer, instancePtr, instBytes);
+          // Upload instance data only once per frame per unique instancePtr+instanceCount.
+          // Multiple submeshes sharing the same buffer would otherwise re-upload identical
+          // data.  Create/resize runs unconditionally above so the buffer always exists at
+          // adequate size; only the data copy is guarded.
+          if (st.instUploadedPtr !== instancePtr || st.instUploadedCount !== instanceCount) {
+            device.queue.writeBuffer(st.instanceBuf, 0, memory.buffer, instancePtr, instBytes);
+            st.instUploadedPtr = instancePtr;
+            st.instUploadedCount = instanceCount;
+          }
           // ── Per-draw uniform slot (PBR_U layout, instanced U adds vp @ 768). ──
           // The instanced WGSL U struct has all standard fields (mvp, model, …) plus
           // the S3 area block (area_count@504, area_lights@512..768), then a single
@@ -9420,6 +9445,8 @@
       emptyVao: null, // lazy-created VAO for fullscreen-quad draw (case 25)
       whiteTex: null, // slice 3: lazy 1×1 WHITE texture for the post tex2 dummy (AO=1.0)
       instanceBuf: null, // lazy-created ARRAY_BUFFER for per-instance mat4+color (case 27)
+      instUploadedPtr: 0,   // per-frame instance-upload dedup key (reset in BEGIN_FRAME)
+      instUploadedCount: 0, // part of key: ptr+count uniquely identifies the buffer contents
       morphTextures: [], // morph-target RGBA16F textures (case 30), indexed by handle
       morphTex: null, // active morph texture bound to TEXTURE9 (most recently created)
       extColorBufferFloat: null, // EXT_color_buffer_float, enabled on first rgba16f target
@@ -9635,6 +9662,8 @@
       uniformBuf: null,
       bindGroup: null,
       instanceBuf: null, // lazy GPUBuffer (VERTEX|COPY_DST) for per-instance mat4+color (case 27)
+      instUploadedPtr: 0,   // per-frame instance-upload dedup key (reset in BEGIN_FRAME)
+      instUploadedCount: 0, // part of key: ptr+count uniquely identifies the buffer contents
       fogBuf: null, // lazy 32-byte UBO (UNIFORM|COPY_DST) for distance fog (case 28/binding 2)
       morphBuf: null, // lazy 272-byte UBO (UNIFORM|COPY_DST) for morph weights (case 29/binding 3)
       morphTexView: null, // GPUTextureView for morph-target data texture (case 30/binding 4)
