@@ -137,6 +137,10 @@ const max_wire_edges = 49152;
 
 // GPU instancing (v1): per-instance mat4(16) + color(4) = 20 f32 = 80 B each.
 const max_instances = 1024;
+// Per-instance vertical-wave amplitude (world units). Added to ty each frame for
+// the instanced demo's motion; also the AABB y-pad that keeps the (wave-agnostic)
+// gl.cull frustum test conservative — see the instanced branch.
+const inst_wave_amp: f32 = 0.15;
 
 // M7: morph targets. max_morph_targets sizes the per-instance weight array in
 // Inst (static pool, not stack). 64 covers all known real-world rigs.
@@ -2257,16 +2261,40 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             const t_s: f32 = inst.inst_time_ms / 1000.0;
             const n_total = @min(inst_n, max_instances);
             // Cull + compact: only visible instances land in instance_scratch.
+            // The cull runs on the BASE instance matrices (gl.cull is wave-agnostic).
+            // To stay conservative w.r.t. the per-instance vertical wave (applied AFTER
+            // compaction below), pad the model AABB's y-extent by the wave amplitude
+            // (inst_wave_amp = 0.15): |wave| ≤ 0.15, so an instance that waves on-screen
+            // can never be culled at its base position → no popping at the frustum edge.
+            const padded_aabb = gl.cull.Aabb{
+                .min = gl.math.Vec3.init(
+                    inst.model_local_aabb.min.x,
+                    inst.model_local_aabb.min.y - inst_wave_amp,
+                    inst.model_local_aabb.min.z,
+                ),
+                .max = gl.math.Vec3.init(
+                    inst.model_local_aabb.max.x,
+                    inst.model_local_aabb.max.y + inst_wave_amp,
+                    inst.model_local_aabb.max.z,
+                ),
+            };
             const blob = a.instances();
             const blob_f32: [*]const f32 = @ptrCast(@alignCast(blob.ptr));
-            const n_visible = cullCompactInstances(
+            const n_visible = gl.cull.cullCompactInstances(
                 blob_f32[0 .. n_total * 20],
                 n_total,
-                inst.model_local_aabb,
+                padded_aabb,
                 planes,
-                t_s,
-                &inst.instance_scratch,
+                inst.instance_scratch[0..],
             );
+            // Animate: add the per-instance vertical wave to each VISIBLE output record
+            // (column 3, index 13 = ty). Phase keyed by output index k so the visible set
+            // still oscillates with per-instance variety (the conservative pad above
+            // already guarantees the cull never drops an instance the wave moves on-screen).
+            var k: u32 = 0;
+            while (k < n_visible) : (k += 1) {
+                inst.instance_scratch[k][13] += @sin(t_s * 2.0 + @as(f32, @floatFromInt(k)) * 0.7) * inst_wave_amp;
+            }
             inst.inst_drawn = n_visible;
             inst.inst_culled = n_total - n_visible;
             // Store VP (pv = clipFix·proj·view; no model baked in → IS the VP).
@@ -2448,38 +2476,6 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 fn visibleAfterCull(inst: *Inst, planes: [6]gl.cull.Plane, s: u32) bool {
     const wbox = gl.cull.worldAabb(inst.submesh_aabb[s], inst.scene.world[s + 1]);
     return gl.cull.aabbInFrustum(planes, wbox);
-}
-
-/// Cull + compact instances. Reads `blob` (n × 20 f32: col-major mat4 + rgba),
-/// applies the per-instance vertical wave (matching the live draw animation exactly),
-/// tests each animated instance's world AABB against `planes`, and writes visible
-/// records (all 20 f32, color included) compactly into `out`. Returns n_visible.
-/// Pure: no globals — testable natively.
-fn cullCompactInstances(
-    blob: []const f32,
-    n: u32,
-    model_aabb: gl.cull.Aabb,
-    planes: [6]gl.cull.Plane,
-    t_s: f32,
-    out: *[max_instances][20]f32,
-) u32 {
-    var n_visible: u32 = 0;
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        var rec: [20]f32 = blob[i * 20 ..][0..20].*;
-        // Per-instance vertical wave: identical phase/amplitude to the main draw so
-        // the culled set exactly matches the rendered set.
-        const phase: f32 = @as(f32, @floatFromInt(i)) * 0.7;
-        rec[13] += @sin(t_s * 2.0 + phase) * 0.15;
-        // Build world matrix from the animated instance record's first 16 f32.
-        const mat = gl.math.Mat4{ .m = rec[0..16].* };
-        const wbox = gl.cull.worldAabb(model_aabb, mat);
-        if (gl.cull.aabbInFrustum(planes, wbox)) {
-            out[n_visible] = rec;
-            n_visible += 1;
-        }
-    }
-    return n_visible;
 }
 
 /// Return the four per-frame cull counters for the active instance as a packed
@@ -3139,59 +3135,4 @@ test "clip handle table covers every emitted clip combo" {
     while (hi <= 85) : (hi += 1) {
         try std.testing.expect(seen[hi]);
     }
-}
-
-test "cullCompactInstances: in-frustum instances kept, out-of-frustum culled" {
-    // Camera at z=5 looking at origin, 90° FOV, square aspect, near=0.1, far=100.
-    // This is the same camera setup used in cull.zig's unit tests.
-    const proj = gl.math.Mat4.perspective(std.math.pi / 2.0, 1.0, 0.1, 100.0);
-    const view = gl.math.Mat4.lookAt(
-        gl.math.Vec3.init(0, 0, 5),
-        gl.math.Vec3.init(0, 0, 0),
-        gl.math.Vec3.init(0, 1, 0),
-    );
-    const planes = gl.cull.frustumPlanes(proj.mul(view));
-
-    // Model AABB: unit box centred at local origin.
-    const model_aabb = gl.cull.Aabb{
-        .min = gl.math.Vec3.init(-0.5, -0.5, -0.5),
-        .max = gl.math.Vec3.init(0.5, 0.5, 0.5),
-    };
-
-    // Three instance records (each 20 f32: col-major mat4 + rgba).
-    // Translation matrix for (tx,ty,tz): [1,0,0,0, 0,1,0,0, 0,0,1,0, tx,ty,tz,1, r,g,b,a]
-    // Index 12=tx, 13=ty, 14=tz in col-major layout.
-    const blob = [_]f32{
-        // Instance 0: identity (at world origin) — inside frustum.
-        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,   0, 0,  1, 1, 1, 1, 1,
-        // Instance 1: translated far right (100,0,0) — outside frustum.
-        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 100, 0, 0,  1, 1, 0, 0, 1,
-        // Instance 2: translated behind target (0,0,-2) — inside frustum.
-        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,   0, -2, 1, 0, 1, 0, 1,
-    };
-
-    // t_s = 0 → wave = sin(0 + i*0.7)*0.15 = 0 for i=0, ≈0.0964 for i=1, ≈0.1494 for i=2.
-    // Wave only perturbs ty (rec[13]); it does NOT affect the x/z translation.
-    // Instance 0 stays near origin; instance 1 stays at x=100 (still culled); instance 2
-    // stays at z=-2 (still inside). Conservative AABB test → only instance 1 is culled.
-    var out: [max_instances][20]f32 = undefined;
-    const n_visible = cullCompactInstances(&blob, 3, model_aabb, planes, 0.0, &out);
-
-    try std.testing.expectEqual(@as(u32, 2), n_visible);
-
-    // First visible slot = instance 0: tz stays 0.
-    try std.testing.expectApproxEqAbs(@as(f32, 0), out[0][14], 1e-4); // tz
-    try std.testing.expectApproxEqAbs(@as(f32, 0), out[0][12], 1e-4); // tx
-
-    // Second visible slot = instance 2: tz = -2, tx = 0.
-    try std.testing.expectApproxEqAbs(@as(f32, -2), out[1][14], 1e-4); // tz
-    try std.testing.expectApproxEqAbs(@as(f32, 0), out[1][12], 1e-4); // tx
-
-    // n_visible == 0 case: all instances placed far outside (x=500) → no draws.
-    const blob_all_out = [_]f32{
-        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 500, 0, 0, 1, 1, 1, 1, 1,
-        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 500, 0, 0, 1, 1, 1, 1, 1,
-    };
-    const n_zero = cullCompactInstances(&blob_all_out, 2, model_aabb, planes, 0.0, &out);
-    try std.testing.expectEqual(@as(u32, 0), n_zero);
 }

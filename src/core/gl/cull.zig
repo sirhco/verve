@@ -101,6 +101,34 @@ pub fn aabbInFrustum(planes: [6]Plane, a: Aabb) bool {
     return true;
 }
 
+/// Cull + compact instances. Each record in `blob` is 20 f32: a column-major
+/// mat4 (first 16) followed by an rgba color (last 4). Tests each instance's
+/// world AABB (`model_aabb` transformed by the instance matrix) against
+/// `planes`; writes the VISIBLE records (all 20 f32, color included) compactly
+/// into `out`; returns n_visible. Pure: no allocator, no globals. Conservative
+/// — never culls an instance whose world AABB is even partly inside the frustum.
+pub fn cullCompactInstances(
+    blob: []const f32,
+    n: u32,
+    model_aabb: Aabb,
+    planes: [6]Plane,
+    out: [][20]f32,
+) u32 {
+    var n_visible: u32 = 0;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const rec: [20]f32 = blob[i * 20 ..][0..20].*;
+        // Instance world matrix = the record's first 16 floats (col-major mat4).
+        const mat = math.Mat4{ .m = rec[0..16].* };
+        const wbox = worldAabb(model_aabb, mat);
+        if (aabbInFrustum(planes, wbox)) {
+            out[n_visible] = rec;
+            n_visible += 1;
+        }
+    }
+    return n_visible;
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -163,6 +191,56 @@ test "golden: worldAabb of 45°-Y-rotated unit cube, translated +x10" {
     try testing.expectApproxEqAbs(@as(f32, 0.5), wb.max.y, eps);
     try testing.expectApproxEqAbs(-ext, wb.min.z, eps);
     try testing.expectApproxEqAbs(ext, wb.max.z, eps);
+}
+
+test "cullCompactInstances: in-frustum kept, out-of-frustum culled, compacted in order" {
+    // Same camera as the aabbInFrustum test: at +z=5 looking at origin, 90° FOV.
+    const proj = math.Mat4.perspective(std.math.pi / 2.0, 1.0, 0.1, 100.0);
+    const view = math.Mat4.lookAt(
+        math.Vec3.init(0, 0, 5),
+        math.Vec3.init(0, 0, 0),
+        math.Vec3.init(0, 1, 0),
+    );
+    const planes = frustumPlanes(proj.mul(view));
+
+    // Model-local AABB: unit box centred at local origin.
+    const model_aabb = unitBoxAt(0, 0, 0, 0.5);
+
+    // Three 20-float instance records: col-major translation mat4 + rgba.
+    // Translation (tx,ty,tz) lives at col-major indices 12,13,14.
+    const blob = [_]f32{
+        // Instance 0: identity → at world origin → inside frustum.
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,   0, 0,  1, 0.1, 0.2, 0.3, 1,
+        // Instance 1: translated far right (x=100) → outside → culled.
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 100, 0, 0,  1, 0.4, 0.5, 0.6, 1,
+        // Instance 2: translated to z=-2 (toward -Z, in front of camera) → inside.
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,   0, -2, 1, 0.7, 0.8, 0.9, 1,
+    };
+
+    var out: [8][20]f32 = undefined;
+    const n_visible = cullCompactInstances(&blob, 3, model_aabb, planes, out[0..]);
+
+    // Instances 0 and 2 are visible; instance 1 (x=100) is culled.
+    try testing.expectEqual(@as(u32, 2), n_visible);
+
+    // First compacted slot = instance 0: translation (0,0,0), color preserved.
+    try testing.expectApproxEqAbs(@as(f32, 0), out[0][12], eps); // tx
+    try testing.expectApproxEqAbs(@as(f32, 0), out[0][13], eps); // ty
+    try testing.expectApproxEqAbs(@as(f32, 0), out[0][14], eps); // tz
+    try testing.expectApproxEqAbs(@as(f32, 0.2), out[0][17], eps); // color rides along
+
+    // Second compacted slot = instance 2: translation (0,0,-2).
+    try testing.expectApproxEqAbs(@as(f32, 0), out[1][12], eps); // tx
+    try testing.expectApproxEqAbs(@as(f32, -2), out[1][14], eps); // tz
+    try testing.expectApproxEqAbs(@as(f32, 0.9), out[1][18], eps); // color (b) rides along
+
+    // All-outside case: every instance far off-screen → n_visible == 0.
+    const blob_all_out = [_]f32{
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 500, 0, 0, 1, 1, 1, 1, 1,
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 500, 0, 0, 1, 1, 1, 1, 1,
+    };
+    const n_zero = cullCompactInstances(&blob_all_out, 2, model_aabb, planes, out[0..]);
+    try testing.expectEqual(@as(u32, 0), n_zero);
 }
 
 test "light-frustum cull: out-of-volume AABB culled, in-volume kept" {
