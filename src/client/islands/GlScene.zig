@@ -88,6 +88,7 @@ const lut_handle: u32 = 18;
 // bridge's separate `st.shadowMaps[]` namespace.
 const depth_shader: u32 = 5;
 const depth_at_shader: u32 = 10; // alpha-tested depth shader for MASK cutout shadows
+const inst_depth_shader: u32 = 91; // instanced depth shader for shadow casters (4B2b)
 const shadow_handle: u32 = 1;
 // Multi-caster 2D shadow atlas (was a single 1024² map). Now a 4096² atlas tiled
 // into 1024² cells; up to max_2d_casters (4) directional/spot casters share row 0.
@@ -351,6 +352,11 @@ const Inst = struct {
     // Lives in Inst (static) NOT on the frame stack — 1024×80 B = 80 KB would overflow
     // the 64 KB chunk stack (same lesson as the frustum-cull OOB).
     instance_scratch: [max_instances][20]f32 = undefined,
+    // 4B2b: separate scratch for the shadow depth pass — ALL N instances (no camera
+    // cull) animated with the same wave as the main draw.  MUST be distinct from
+    // instance_scratch: the bridge decodes cmd_buf AFTER glscene_frame returns, and
+    // the main draw later overwrites instance_scratch with the camera-culled set.
+    shadow_instance_scratch: [max_instances][20]f32 = undefined,
     // view·proj for the instanced shader (pv, no model baked in).
     vp_mat: [16]f32 = undefined,
     // Accumulated frame time (ms) for instanced animation (wraps at ~1h; fine for animation).
@@ -888,6 +894,22 @@ fn emitDepthAtShader(inst: *Inst, enc: *gl.Encoder) void {
     const fs = gl.command.depthAtFragmentSrc();
     enc.createShader(depth_at_shader, gl.command.variant_depth | gl.command.variant_alpha_test, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
     inst.registry.recordShader(depth_at_shader, gl.command.variant_depth | gl.command.variant_alpha_test, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+}
+
+// 4B2b: Instanced depth shader for shadow casters (handle 91, fixed like depth_shader/depth_at_shader).
+// GLSL: depthInstancedVertexSrc() VS (per-instance mat4 attributes) + depthFragmentSrc() empty FS.
+// WGSL: wgslDepthInstanced() combined module. Recorded in registry for context-restore replay.
+fn emitInstancedDepthShader(inst: *Inst, enc: *gl.Encoder) void {
+    if (use_webgpu) {
+        const w = gl.command.wgslDepthInstanced();
+        enc.createShader(inst_depth_shader, gl.command.variant_depth | variant_inst, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        inst.registry.recordShader(inst_depth_shader, gl.command.variant_depth | variant_inst, @intCast(@intFromPtr(w.ptr)), @intCast(w.len), 0, 0);
+        return;
+    }
+    const vs = gl.command.depthInstancedVertexSrc();
+    const fs = gl.command.depthFragmentSrc();
+    enc.createShader(inst_depth_shader, gl.command.variant_depth | variant_inst, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    inst.registry.recordShader(inst_depth_shader, gl.command.variant_depth | variant_inst, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
 }
 
 // T6: Instanced shader (non-shadow path) — handle 19 without fog, 36 with fog, 85 with clip.
@@ -2063,6 +2085,27 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
             // ── 2D casters (directional/spot): one tiled pass each into the 4096² atlas.
             if (inst.n_2d_casters > 0) {
+                // 4B2b: populate shadow_instance_scratch ONCE per frame when the mesh is
+                // instanced and LOD is not active.  ALL N instances are included (no camera
+                // cull) so objects behind the camera still cast shadows.  The same vertical
+                // wave applied by the main draw is applied here so shadow positions match.
+                // This buffer is SEPARATE from instance_scratch: the bridge decodes cmd_buf
+                // AFTER glscene_frame returns, and the main draw later overwrites
+                // instance_scratch with the camera-culled set (deferred-decode hazard).
+                const n_shadow: u32 = if (a.instanceCount() > 0 and inst.lod_level_count == 0) blk: {
+                    const inst_n = a.instanceCount();
+                    const n_total = @min(inst_n, max_instances);
+                    const blob = a.instances();
+                    const blob_f32: [*]const f32 = @ptrCast(@alignCast(blob.ptr));
+                    const t_s: f32 = inst.inst_time_ms / 1000.0;
+                    var i: u32 = 0;
+                    while (i < n_total) : (i += 1) {
+                        @memcpy(&inst.shadow_instance_scratch[i], blob_f32[i * 20 .. i * 20 + 20]);
+                        inst.shadow_instance_scratch[i][13] += @sin(t_s * 2.0 + @as(f32, @floatFromInt(i)) * 0.7) * inst_wave_amp;
+                    }
+                    break :blk n_total;
+                } else 0;
+
                 var s: u32 = 0;
                 while (s < inst.n_2d_casters) : (s += 1) {
                     const area_li = inst.slot_area_li[s]; // ≥0 → this slot is an area caster
@@ -2093,44 +2136,60 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     // feeds one bind_shadow_map; index s == the atlas tile + receiver slot).
                     inst.shadow_vp_mats[s] = light_vp.m;
 
-                    // Per-caster light-frustum cull (keeps off-screen casters that cast
-                    // into view). Atlas tile = (col=s%4, row=s/4): up to 8 slots span
-                    // rows 0..1 (CSM cascades 0..3 + spots/extra-dir after).
-                    const lplanes = gl.cull.frustumPlanes(light_vp);
+                    // Atlas tile = (col=s%4, row=s/4): up to 8 slots span rows 0..1.
                     enc.beginShadowPass(shadow_handle, depth_shader, s % 4, s / 4, shadow_tile);
-                    // NOTE: double-sided shadows back-cull this phase (drawDepth/drawDepthAt
-                    // carry no state word; cull is baked into the depth pipeline).
-                    {
-                        // Phase A: opaque+blend (alpha_mode != 2) — plain position-only depth.
-                        // depth_mvps_mc[s][sd] precomputed for ALL submeshes (Phase B reuses).
-                        // Narrow to the active LOD level's submesh range (T-LOD).
-                        const s_lo_2d: u32 = if (inst.lod_level_count > 0) inst.lod_first[inst.lod_active] else 0;
-                        const s_hi_2d: u32 = if (inst.lod_level_count > 0) s_lo_2d + inst.lod_count[inst.lod_active] else a.submesh_count;
-                        var sd: u32 = s_lo_2d;
-                        while (sd < s_hi_2d) : (sd += 1) {
+                    if (n_shadow > 0) {
+                        // 4B2b: instanced shadow cast — one drawDepthInstanced per submesh.
+                        // No per-submesh AABB cull: instance positions are independent of the
+                        // node transform so the node-based wbox would be wrong.
+                        // Deferred: MASK alpha-tested instanced shadows (v1: opaque only).
+                        // Deferred: point-caster instanced shadows (handled in point pass).
+                        // Light-frustum cull per submesh: skipped (full set always cast).
+                        var sd: u32 = 0;
+                        while (sd < a.submesh_count) : (sd += 1) {
                             if (sd >= max_submesh) break;
                             const sub = a.submesh(sd);
-                            inst.depth_mvps_mc[s][sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
-                            const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
-                            if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
-                                inst.cull_shadow_culled += 1;
-                                continue;
-                            }
-                            if (sub.alpha_mode == 2) continue; // MASK: Phase B
+                            if (sub.alpha_mode == 2) continue; // MASK: deferred to v2
                             inst.cull_shadow_drawn += 1;
-                            enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])));
+                            enc.drawDepthInstanced(inst_depth_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.shadow_instance_scratch)), n_shadow, @intCast(@intFromPtr(&inst.shadow_vp_mats[s])));
                         }
-                        // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
-                        sd = s_lo_2d;
-                        while (sd < s_hi_2d) : (sd += 1) {
-                            if (sd >= max_submesh) break;
-                            const sub = a.submesh(sd);
-                            if (sub.alpha_mode != 2) continue;
-                            const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
-                            if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // counted in Phase A
-                            inst.cull_shadow_drawn += 1;
-                            enc.bindTexture(0, texHandle(sub.tex_base));
-                            enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])), @intCast(@intFromPtr(&inst.mats[sd])));
+                    } else {
+                        // Non-instanced shadow cast: per-submesh depth draw with AABB cull.
+                        // NOTE: double-sided shadows back-cull this phase (drawDepth/drawDepthAt
+                        // carry no state word; cull is baked into the depth pipeline).
+                        const lplanes = gl.cull.frustumPlanes(light_vp);
+                        {
+                            // Phase A: opaque+blend (alpha_mode != 2) — plain position-only depth.
+                            // depth_mvps_mc[s][sd] precomputed for ALL submeshes (Phase B reuses).
+                            // Narrow to the active LOD level's submesh range (T-LOD).
+                            const s_lo_2d: u32 = if (inst.lod_level_count > 0) inst.lod_first[inst.lod_active] else 0;
+                            const s_hi_2d: u32 = if (inst.lod_level_count > 0) s_lo_2d + inst.lod_count[inst.lod_active] else a.submesh_count;
+                            var sd: u32 = s_lo_2d;
+                            while (sd < s_hi_2d) : (sd += 1) {
+                                if (sd >= max_submesh) break;
+                                const sub = a.submesh(sd);
+                                inst.depth_mvps_mc[s][sd] = light_vp.mul(inst.scene.world[sd + 1]).m;
+                                const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                                if (!gl.cull.aabbInFrustum(lplanes, wbox)) {
+                                    inst.cull_shadow_culled += 1;
+                                    continue;
+                                }
+                                if (sub.alpha_mode == 2) continue; // MASK: Phase B
+                                inst.cull_shadow_drawn += 1;
+                                enc.drawDepth(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])));
+                            }
+                            // Phase B: MASK (alpha_mode == 2) — alpha-tested depth (cutout holes).
+                            sd = s_lo_2d;
+                            while (sd < s_hi_2d) : (sd += 1) {
+                                if (sd >= max_submesh) break;
+                                const sub = a.submesh(sd);
+                                if (sub.alpha_mode != 2) continue;
+                                const wbox = gl.cull.worldAabb(inst.submesh_aabb[sd], inst.scene.world[sd + 1]);
+                                if (!gl.cull.aabbInFrustum(lplanes, wbox)) continue; // counted in Phase A
+                                inst.cull_shadow_drawn += 1;
+                                enc.bindTexture(0, texHandle(sub.tex_base));
+                                enc.drawDepthAt(depth_at_shader, vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.depth_mvps_mc[s][sd])), @intCast(@intFromPtr(&inst.mats[sd])));
+                            }
                         }
                     }
                     enc.endShadowPass(width, height);
@@ -2796,6 +2855,9 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
         }
     }
     if (has_mask) emitDepthAtShader(inst, enc);
+    // 4B2b: instanced depth shader (handle 91) — emit when mesh carries instances.
+    // Fixed handle like depth_shader/depth_at_shader; not tracked in shader_seen.
+    if (a.instanceCount() > 0) emitInstancedDepthShader(inst, enc);
     enc.createShadowMap(shadow_handle, shadow_size);
     inst.registry.recordShadowMap(shadow_handle, shadow_size);
 
