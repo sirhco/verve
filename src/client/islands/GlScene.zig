@@ -2512,6 +2512,14 @@ export fn glscene_lod_stats() u32 {
         ((cnt & 0xffff) << 16);
 }
 
+/// Instanced per-instance frustum-cull stats. drawn @ bits 15:0, culled @ bits 31:16.
+/// Instance counts can exceed 255, so 16-bit fields are used (unlike glscene_cull_stats).
+/// Returns 0 when no instance is selected or the scene is not instanced.
+export fn glscene_inst_cull_stats() u32 {
+    const inst = current orelse return 0;
+    return (inst.inst_drawn & 0xffff) | ((inst.inst_culled & 0xffff) << 16);
+}
+
 // ── /gl-morph runtime controls ────────────────────────────────────────────────
 
 /// Lock target 0 (Bulge) to weight 1.0 at runtime, overriding the baked clip

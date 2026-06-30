@@ -604,6 +604,20 @@
     hudEl.textContent = total === 0 ? "LOD off" : `LOD ${active} / ${total} · ${subs} submesh`;
   };
 
+  // 3B: Write per-frame instanced frustum-cull stats into the [data-ref="glinstcull-hud"] element.
+  // Encoding: glscene_inst_cull_stats() returns (inst_drawn & 0xffff) | ((inst_culled & 0xffff) << 16).
+  // 16-bit fields because instance counts can exceed 255 (unlike glscene_cull_stats byte fields).
+  // Guard: no-op when the function or element is absent (every demo except /gl-instancing-cull).
+  const glInstCullHudUpdate = (exports) => {
+    if (typeof exports.glscene_inst_cull_stats !== "function") return;
+    const hudEl = document.querySelector('[data-ref="glinstcull-hud"]');
+    if (!hudEl) return;
+    const packed = exports.glscene_inst_cull_stats() >>> 0;
+    const d = packed & 0xffff;
+    const c = (packed >>> 16) & 0xffff;
+    hudEl.textContent = `instances drawn ${d} / culled ${c} / ${d + c}`;
+  };
+
   const dispatchEventId = (e, attr, prevent) => {
     const node = e.target.closest(`[${attr}]`);
     if (!node) return false;
@@ -9533,6 +9547,8 @@
         glCullHudUpdate(st.exports);
         // T-LOD: LOD HUD — only present on /gl-lod; no-op on all other demos.
         glLodHudUpdate(st.exports);
+        // 3B: instanced cull HUD — only present on /gl-instancing-cull; no-op on all other demos.
+        glInstCullHudUpdate(st.exports);
       } catch (err) {
         // A corrupt stream/pointer must not kill the loop silently.
         console.error("verve.gl: interpreter fault, loop stopped:", err, err && err.stack);
@@ -9727,6 +9743,8 @@
         glCullHudUpdate(st.exports);
         // T-LOD: LOD HUD — only present on /gl-lod; no-op on all other demos.
         glLodHudUpdate(st.exports);
+        // 3B: instanced cull HUD — only present on /gl-instancing-cull; no-op on all other demos.
+        glInstCullHudUpdate(st.exports);
       } catch (err) {
         console.error("verve.gl: WebGPU interpreter fault, loop stopped:", err);
         glSinks.delete(sink);
