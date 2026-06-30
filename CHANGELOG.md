@@ -4,6 +4,21 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.27.0] - 2026-06-30
+
+### Added
+
+- **gl — per-instance frustum culling**: The GPU-instanced draw path now tests each
+  instance's world-space AABB against the camera frustum every frame. Instances fully
+  outside the frustum are skipped before the GPU draw — no geometry is processed and no
+  draw-call overhead is incurred for off-screen instances. The conservative whole-instance
+  AABB test avoids popping artefacts. A new `glscene_inst_cull_stats` WASM export lets
+  the bridge read the drawn/culled counts; a `glInstCullHudUpdate` bridge updater writes
+  them to any `[data-ref="glinstcull-hud"]` element. Both WebGL2 and WebGPU backends.
+  New `/gl-instanced-cull` demo: a 16×16 field of 256 pillars framed tightly enough that
+  the HUD culled count visibly changes as the camera auto-orbits. This is **slice 3 of 4**
+  in the "Instancing edges" three.js-parity cluster; instanced shadows are still to come.
+
 ## [0.26.0] - 2026-06-29
 
 ### Added

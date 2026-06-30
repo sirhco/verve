@@ -2360,6 +2360,35 @@ pub fn glSceneInstanced(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-instanced-cull: 16×16 = 256-instance cube field with per-instance frustum culling.
+/// Framed tightly (distance 14) so the field overflows the horizontal frustum; as the
+/// camera auto-orbits, edge instances leave/re-enter view and the HUD culled count changes.
+pub fn glSceneInstancedCull(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/cubefield.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EInstanced Culling%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 14.0, .pitch = 0.5, .yaw = 0.4 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .autoRotate(0.2)
+        .build();
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — per-instance frustum culling"),
+        ctx.p().text("A 16×16 field of 256 hue-varied pillars drawn with GPU instancing. " ++
+            "Each instance's world-space AABB is tested against the camera frustum every frame; " ++
+            "instances fully outside the frustum are skipped before the GPU draw — no draw call " ++
+            "overhead and no geometry processed for off-screen instances. The conservative " ++
+            "whole-instance AABB test means no popping artefacts. The HUD below shows how many " ++
+            "instances are culled as the camera orbits the field."),
+        ctx.div().attr("data-ref", "glinstcull-hud").class("hint"),
+        scene,
+        ctx.p().text("Drag to orbit · wheel to zoom. Edge instances leave/enter the frustum " ++
+            "as the camera orbits — watch the culled count in the HUD change."),
+    });
+}
+
 /// /gl-instanced-multi: 8×8 = 64 instances of a two-material cube model.
 /// The model has ONE mesh with TWO primitives (2 glTF materials):
 ///   primitive 0 = faces 0-2 → warm orange (baseColorFactor 0.9/0.45/0.1)
