@@ -350,6 +350,11 @@ const Inst = struct {
     vp_mat: [16]f32 = undefined,
     // Accumulated frame time (ms) for instanced animation (wraps at ~1h; fine for animation).
     inst_time_ms: f32 = 0,
+    // Model-local AABB (union of all submesh AABBs) for per-instance frustum cull (3A).
+    model_local_aabb: gl.cull.Aabb = undefined,
+    // Per-frame instancing stats: visible/culled instance counts (exposed by 3B).
+    inst_drawn: u32 = 0,
+    inst_culled: u32 = 0,
 
     // M7: morph-target state. Lives in Inst (static pool) — NOT on the frame
     // stack. morph_weights is indexed by target; active set is the top-32 by
@@ -1501,6 +1506,28 @@ fn buildScene(inst: *Inst, a: *const gl.vmesh.Reader) void {
         };
         inst.submesh_aabb[s] = submeshLocalAabb(verts_f32, indices_u16, sub.index_byte_off / 2, sub.index_count);
     }
+    // Model-local AABB: union of all per-submesh local AABBs for T6 per-instance cull (3A).
+    // If n == 0, model_local_aabb is left undefined; the instanced branch already guards
+    // a.submesh_count > 0 so this path is never reached with n == 0.
+    if (n > 0) {
+        var umin = inst.submesh_aabb[0].min;
+        var umax = inst.submesh_aabb[0].max;
+        var si: u32 = 1;
+        while (si < n) : (si += 1) {
+            const sub_aabb = inst.submesh_aabb[si];
+            umin = gl.math.Vec3.init(
+                @min(umin.x, sub_aabb.min.x),
+                @min(umin.y, sub_aabb.min.y),
+                @min(umin.z, sub_aabb.min.z),
+            );
+            umax = gl.math.Vec3.init(
+                @max(umax.x, sub_aabb.max.x),
+                @max(umax.y, sub_aabb.max.y),
+                @max(umax.z, sub_aabb.max.z),
+            );
+        }
+        inst.model_local_aabb = .{ .min = umin, .max = umax };
+    }
     // LOD: populate from vmesh LOD section (v15+).
     inst.lod_level_count = a.lodLevelCount();
     if (inst.lod_level_count > 0) {
@@ -2228,46 +2255,51 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
         if (inst_n > 0 and a.submesh_count > 0 and inst.lod_level_count == 0) {
             // inst_time_ms already advanced above (unconditional, for morph + instanced).
             const t_s: f32 = inst.inst_time_ms / 1000.0;
-            const n = @min(inst_n, max_instances);
-            // Seed from baked blob (instanceCount × 80 B = 20 f32 each).
+            const n_total = @min(inst_n, max_instances);
+            // Cull + compact: only visible instances land in instance_scratch.
             const blob = a.instances();
             const blob_f32: [*]const f32 = @ptrCast(@alignCast(blob.ptr));
-            var i: u32 = 0;
-            while (i < n) : (i += 1) {
-                // Copy baked mat4 + color (20 f32) into scratch.
-                const src = blob_f32[i * 20 ..][0..20];
-                inst.instance_scratch[i] = src.*;
-                // Animate: add a per-instance vertical wave to the translation column
-                // (column 3 = indices 12,13,14 in col-major mat4).  Each instance
-                // oscillates at a unique phase so CDP can observe motion.
-                const phase: f32 = @as(f32, @floatFromInt(i)) * 0.7;
-                inst.instance_scratch[i][13] += @sin(t_s * 2.0 + phase) * 0.15;
-            }
+            const n_visible = cullCompactInstances(
+                blob_f32[0 .. n_total * 20],
+                n_total,
+                inst.model_local_aabb,
+                planes,
+                t_s,
+                &inst.instance_scratch,
+            );
+            inst.inst_drawn = n_visible;
+            inst.inst_culled = n_total - n_visible;
             // Store VP (pv = clipFix·proj·view; no model baked in → IS the VP).
             inst.vp_mat = pv.m;
-            // Pipeline/lights/IBL/shadow/fog/clip binds are identical for all submeshes
-            // (same variant, same environment) — emit ONCE before the per-submesh loop.
-            enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0) | (if (clipActive(inst)) variant_clip else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
-            enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
-            enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-            // Instanced shader is a non-receiver (variant_shadow{,_point} are
-            // @compileError with variant_inst), so these binds are inert on the
-            // shader side; emitted for stream uniformity with the new signatures.
-            bindShadowResources(inst, &enc);
-            if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
-            if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
-            // Per-submesh loop: bind each submesh's textures + material block, draw.
-            // instance_scratch / n / vp_mat / camera_pos are shared across all submeshes
-            // (same instances, same camera — only index range + material differ).
-            var s: u32 = 0;
-            while (s < a.submesh_count and s < max_submesh) : (s += 1) {
-                const sub = a.submesh(s);
-                enc.bindTexture(0, texHandle(sub.tex_base));
-                enc.bindTexture(1, texHandle(sub.tex_mr));
-                enc.bindTexture(2, texHandle(sub.tex_normal));
-                enc.bindTexture(3, texHandle(sub.tex_emissive));
-                enc.bindTexture(4, texHandle(sub.tex_occlusion));
-                enc.drawPbrInstanced(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.instance_scratch)), n, @intCast(@intFromPtr(&inst.vp_mat)), @intCast(@intFromPtr(&inst.mats[s])), @intCast(@intFromPtr(&inst.camera_pos)));
+            // Pipeline/lights/IBL/shadow/fog/clip + per-submesh draws are guarded on
+            // n_visible > 0 so we never emit a draw with a zero instance count.
+            // endFrame/finish/return run unconditionally so the bridge always receives
+            // a valid (non-zero) cmd_buf even when every instance is culled.
+            if (n_visible > 0) {
+                // Pipeline/lights/IBL/shadow/fog/clip binds are identical for all submeshes
+                // (same variant, same environment) — emit ONCE before the per-submesh loop.
+                enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0) | (if (clipActive(inst)) variant_clip else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
+                enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
+                enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+                // Instanced shader is a non-receiver (variant_shadow{,_point} are
+                // @compileError with variant_inst), so these binds are inert on the
+                // shader side; emitted for stream uniformity with the new signatures.
+                bindShadowResources(inst, &enc);
+                if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
+                if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
+                // Per-submesh loop: bind each submesh's textures + material block, draw.
+                // instance_scratch / n_visible / vp_mat / camera_pos shared across all
+                // submeshes (same instances, same camera — only index range + material differ).
+                var s: u32 = 0;
+                while (s < a.submesh_count and s < max_submesh) : (s += 1) {
+                    const sub = a.submesh(s);
+                    enc.bindTexture(0, texHandle(sub.tex_base));
+                    enc.bindTexture(1, texHandle(sub.tex_mr));
+                    enc.bindTexture(2, texHandle(sub.tex_normal));
+                    enc.bindTexture(3, texHandle(sub.tex_emissive));
+                    enc.bindTexture(4, texHandle(sub.tex_occlusion));
+                    enc.drawPbrInstanced(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.instance_scratch)), n_visible, @intCast(@intFromPtr(&inst.vp_mat)), @intCast(@intFromPtr(&inst.mats[s])), @intCast(@intFromPtr(&inst.camera_pos)));
+                }
             }
             enc.endFrame();
             // finish() stamps the cmd_buf length header (buf[0..4]); without it the
@@ -2416,6 +2448,38 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 fn visibleAfterCull(inst: *Inst, planes: [6]gl.cull.Plane, s: u32) bool {
     const wbox = gl.cull.worldAabb(inst.submesh_aabb[s], inst.scene.world[s + 1]);
     return gl.cull.aabbInFrustum(planes, wbox);
+}
+
+/// Cull + compact instances. Reads `blob` (n × 20 f32: col-major mat4 + rgba),
+/// applies the per-instance vertical wave (matching the live draw animation exactly),
+/// tests each animated instance's world AABB against `planes`, and writes visible
+/// records (all 20 f32, color included) compactly into `out`. Returns n_visible.
+/// Pure: no globals — testable natively.
+fn cullCompactInstances(
+    blob: []const f32,
+    n: u32,
+    model_aabb: gl.cull.Aabb,
+    planes: [6]gl.cull.Plane,
+    t_s: f32,
+    out: *[max_instances][20]f32,
+) u32 {
+    var n_visible: u32 = 0;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        var rec: [20]f32 = blob[i * 20 ..][0..20].*;
+        // Per-instance vertical wave: identical phase/amplitude to the main draw so
+        // the culled set exactly matches the rendered set.
+        const phase: f32 = @as(f32, @floatFromInt(i)) * 0.7;
+        rec[13] += @sin(t_s * 2.0 + phase) * 0.15;
+        // Build world matrix from the animated instance record's first 16 f32.
+        const mat = gl.math.Mat4{ .m = rec[0..16].* };
+        const wbox = gl.cull.worldAabb(model_aabb, mat);
+        if (gl.cull.aabbInFrustum(planes, wbox)) {
+            out[n_visible] = rec;
+            n_visible += 1;
+        }
+    }
+    return n_visible;
 }
 
 /// Return the four per-frame cull counters for the active instance as a packed
@@ -3075,4 +3139,59 @@ test "clip handle table covers every emitted clip combo" {
     while (hi <= 85) : (hi += 1) {
         try std.testing.expect(seen[hi]);
     }
+}
+
+test "cullCompactInstances: in-frustum instances kept, out-of-frustum culled" {
+    // Camera at z=5 looking at origin, 90° FOV, square aspect, near=0.1, far=100.
+    // This is the same camera setup used in cull.zig's unit tests.
+    const proj = gl.math.Mat4.perspective(std.math.pi / 2.0, 1.0, 0.1, 100.0);
+    const view = gl.math.Mat4.lookAt(
+        gl.math.Vec3.init(0, 0, 5),
+        gl.math.Vec3.init(0, 0, 0),
+        gl.math.Vec3.init(0, 1, 0),
+    );
+    const planes = gl.cull.frustumPlanes(proj.mul(view));
+
+    // Model AABB: unit box centred at local origin.
+    const model_aabb = gl.cull.Aabb{
+        .min = gl.math.Vec3.init(-0.5, -0.5, -0.5),
+        .max = gl.math.Vec3.init(0.5, 0.5, 0.5),
+    };
+
+    // Three instance records (each 20 f32: col-major mat4 + rgba).
+    // Translation matrix for (tx,ty,tz): [1,0,0,0, 0,1,0,0, 0,0,1,0, tx,ty,tz,1, r,g,b,a]
+    // Index 12=tx, 13=ty, 14=tz in col-major layout.
+    const blob = [_]f32{
+        // Instance 0: identity (at world origin) — inside frustum.
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,   0, 0,  1, 1, 1, 1, 1,
+        // Instance 1: translated far right (100,0,0) — outside frustum.
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 100, 0, 0,  1, 1, 0, 0, 1,
+        // Instance 2: translated behind target (0,0,-2) — inside frustum.
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,   0, -2, 1, 0, 1, 0, 1,
+    };
+
+    // t_s = 0 → wave = sin(0 + i*0.7)*0.15 = 0 for i=0, ≈0.0964 for i=1, ≈0.1494 for i=2.
+    // Wave only perturbs ty (rec[13]); it does NOT affect the x/z translation.
+    // Instance 0 stays near origin; instance 1 stays at x=100 (still culled); instance 2
+    // stays at z=-2 (still inside). Conservative AABB test → only instance 1 is culled.
+    var out: [max_instances][20]f32 = undefined;
+    const n_visible = cullCompactInstances(&blob, 3, model_aabb, planes, 0.0, &out);
+
+    try std.testing.expectEqual(@as(u32, 2), n_visible);
+
+    // First visible slot = instance 0: tz stays 0.
+    try std.testing.expectApproxEqAbs(@as(f32, 0), out[0][14], 1e-4); // tz
+    try std.testing.expectApproxEqAbs(@as(f32, 0), out[0][12], 1e-4); // tx
+
+    // Second visible slot = instance 2: tz = -2, tx = 0.
+    try std.testing.expectApproxEqAbs(@as(f32, -2), out[1][14], 1e-4); // tz
+    try std.testing.expectApproxEqAbs(@as(f32, 0), out[1][12], 1e-4); // tx
+
+    // n_visible == 0 case: all instances placed far outside (x=500) → no draws.
+    const blob_all_out = [_]f32{
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 500, 0, 0, 1, 1, 1, 1, 1,
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 500, 0, 0, 1, 1, 1, 1, 1,
+    };
+    const n_zero = cullCompactInstances(&blob_all_out, 2, model_aabb, planes, 0.0, &out);
+    try std.testing.expectEqual(@as(u32, 0), n_zero);
 }
