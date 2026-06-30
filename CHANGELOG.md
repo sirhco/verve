@@ -4,6 +4,28 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.28.0] - 2026-06-30
+
+### Added
+
+- **gl — instanced shadows** (slice 4 of 4, cluster finale): GPU-instanced geometry now
+  RECEIVES 2D/directional (including CSM) shadows AND CASTS into the shadow atlas. Both
+  the shadow depth pass and the main PBR pass use the instanced draw path: a new
+  `draw_depth_instanced` wire tag emits one instanced depth draw for all N casters, and
+  the existing `draw_pbr_instanced` path was updated to sample the shadow atlas. The
+  WGSL/GLSL U-struct gained an instanced+shadow layout: the instanced vp block starts at
+  byte offset 1328 (after the per-light shadow block), and the PBR_U binding size grew
+  to 1472 bytes. Both WebGL2 and WebGPU backends. New `/gl-instanced-shadow` demo: a
+  16×16 field of 256 non-uniform-scale pillars lit by a raking directional CSM caster —
+  taller pillars cast shadows onto shorter neighbours and each pillar receives shadows
+  from those around it, all in a single instanced depth pass and a single instanced color
+  pass. **This completes the "Instancing edges" three.js-parity cluster (all 4 slices:
+  slice 1 non-uniform-scale normals, slice 2 multi-mesh instancing, slice 3 per-instance
+  frustum culling, slice 4 instanced shadows).** v1 deferrals: alpha-tested (MASK)
+  instanced shadows, point-light instanced shadows, per-instance light-frustum cull in
+  the shadow pass, and the framing/wave-phase limitation (per-instance camera culling
+  desync — all instances must stay in-frame in v1; v2 fix planned).
+
 ## [0.27.0] - 2026-06-30
 
 ### Added

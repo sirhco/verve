@@ -30,6 +30,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/gl-instanced", renderGlInstanced),
     verve.Route.init("/gl-instanced-multi", renderGlInstancedMulti),
     verve.Route.init("/gl-instanced-cull", renderGlInstancedCull),
+    verve.Route.init("/gl-instanced-shadow", renderGlInstancedShadow),
     verve.Route.init("/gl-fog", renderGlFog),
     verve.Route.init("/gl-morph", renderGlMorph),
     verve.Route.init("/gl-morph16", renderGlMorph16),
@@ -173,6 +174,11 @@ fn renderGlInstancedMulti(ctx: *verve.Context) !*verve.Node {
 
 fn renderGlInstancedCull(ctx: *verve.Context) !*verve.Node {
     const body = try components.glSceneInstancedCull(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderGlInstancedShadow(ctx: *verve.Context) !*verve.Node {
+    const body = try components.glSceneInstancedShadow(ctx);
     return components.page(ctx, body);
 }
 

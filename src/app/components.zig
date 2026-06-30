@@ -2032,6 +2032,72 @@ pub fn glSceneCsm(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-instanced-shadow: Slice 4 capstone — instanced geometry that BOTH casts AND
+/// receives directional shadows. A 16×16 field of 256 pillars (cubefield.vmesh, the
+/// non-uniform-scale fixture from slice 1) is lit by a single raking directional caster
+/// with `casts_shadow = true`: taller pillars cast shadows onto shorter neighbours and
+/// each pillar receives shadows from those around it. Both the shadow depth pass and the
+/// main PBR pass use the instanced draw path (`draw_depth_instanced` / `draw_pbr_instanced`).
+///
+/// FRAMING NOTE: the camera distance (38.0) is chosen so ALL 256 instances remain inside
+/// the frustum through the full auto-orbit. This is required because per-instance frustum
+/// culling (slice 3) renumbers the visible-instance buffer by compaction order, while the
+/// shadow pass records shadows keyed by original instance index. If any instance were
+/// culled from the main draw, its shadow index would no longer align with its draw index
+/// (known v1 limitation — "All instances are kept in frame — per-instance frustum culling
+/// would desync the shadow wave-phase from the mesh (v2 fix)"). At distance 38 the whole
+/// ~37-unit-wide field fits well inside the frustum so n_visible == n_total at all times.
+pub fn glSceneInstancedShadow(ctx: *const verve.Context) !*verve.Node {
+    // Single raking directional caster — same direction as the CSM demo so pillars
+    // cast visible diagonal shadows onto their shorter neighbours (upper-left rake).
+    const lights = [_]verve.GlLight{
+        .{
+            .kind = .directional,
+            .dir = .{ -0.55, -0.72, -0.42 },
+            .color = .{ 1, 0.97, 0.9 },
+            .intensity = 2.6,
+            .casts_shadow = true,
+        },
+    };
+
+    const island_node = ctx.glScene(.{
+        .src = "/gl/cubefield.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='40' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EInstanced Shadows%3C/text%3E%3C/svg%3E",
+    })
+        // Generous distance so ALL 256 instances fit inside the frustum — required to
+        // keep n_visible == n_total (no compaction reorder, shadow indices stay aligned).
+        .camera(.{ .distance = 38.0, .pitch = 0.45, .yaw = 0.5 })
+        .lights(&lights)
+        // Safe to auto-rotate: at distance 38 the ~37-unit-wide field stays fully
+        // in-frame through the full orbit.
+        .autoRotate(0.15)
+        .build();
+
+    const scene_box = ctx.div().class("gl-wrap").children(.{
+        ctx.div()
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;margin:0 auto")
+            .children(.{island_node}),
+    });
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — Instanced Shadows (slice 4)"),
+        ctx.p().text("Slice 4 capstone: GPU-instanced geometry that BOTH casts AND " ++
+            "receives directional (CSM) shadows. A 16\u{00d7}16 field of 256 pillars " ++
+            "is lit by a single raking directional light with shadow casting enabled. " ++
+            "Taller pillars cast diagonal shadows onto shorter neighbours and each pillar " ++
+            "receives shadows from those around it. Both the shadow depth pass and the " ++
+            "main PBR pass use the instanced draw path, so the GPU issues one instanced " ++
+            "draw for all 256 casters in the depth phase and one instanced draw for all " ++
+            "256 receivers in the color phase — WebGL2 and WebGPU backends."),
+        scene_box,
+        ctx.p().class("hint")
+            .text("Drag to orbit \u{00b7} wheel to zoom. " ++
+            "All instances are kept in frame — per-instance frustum culling would " ++
+            "desync the shadow wave-phase from the mesh (v2 fix)."),
+    });
+}
+
 /// /gl-ortho-csm: CSM under an ORTHOGRAPHIC camera. Same single directional caster
 /// and shadow.vmesh floor as /gl-csm, but the scene renders with parallel projection
 /// (`.projection(.orthographic)`). Exercises the ortho-aware cascade fit: each cascade
