@@ -1179,7 +1179,14 @@ pub fn pointDepthWgslSrc() []const u8 {
     ;
 }
 
-pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
+pub const ShaderHooks = struct {
+    frag_albedo_glsl: ?[]const u8 = null,
+    frag_albedo_wgsl: ?[]const u8 = null,
+    frag_final_glsl: ?[]const u8 = null,
+    frag_final_wgsl: ?[]const u8 = null,
+};
+
+pub fn pbrFragmentSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u8 {
     comptime pbrCheck(flags);
     const head =
         \\#version 300 es
@@ -1304,8 +1311,8 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\
     ;
     // Custom-material GLSL uniforms (variant_custom, fragment-stage only in slice 1).
-    // Names u_time / u_params verified not already present in the PBR FS source.
-    // Accessor naming is finalised in Task 1C; a safe unique prefix is used here.
+    // No name collision found; names kept as specified (u_time / u_params).
+    // Accessor name mapping (short names → UBO lanes) is task 1C.
     const custom_uniforms =
         \\uniform float u_time;
         \\uniform vec4 u_params[4];
@@ -1652,6 +1659,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     if (flags & variant_clipping != 0) src = src ++ clip_discard;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
     if (flags & variant_double_sided != 0) src = src ++ ds_flip;
+    if (hooks.frag_albedo_glsl) |snippet| src = src ++ "  vec3 vrv_albedo = albedo;\n" ++ snippet ++ "\n  albedo = vrv_albedo;\n";
     src = src ++ lighting_head;
     if (flags & variant_shadow != 0) src = src ++ lighting_shadow_csm;
     if (flags & variant_shadow_point != 0) src = src ++ lighting_shadow_point;
@@ -1663,9 +1671,14 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     src = src ++ combine_plain;
     if (flags & variant_emissive != 0) src = src ++ emissive;
     if (flags & variant_fog != 0) src = src ++ fog_mix;
+    if (hooks.frag_final_glsl) |snippet| src = src ++ "  vec3 vrv_color = color;\n" ++ snippet ++ "\n  color = vrv_color;\n";
     if (flags & variant_linear_output == 0) src = src ++ tail_tonemap;
     src = src ++ tail_close;
     return src;
+}
+
+pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
+    return pbrFragmentSrcHooked(flags, .{});
 }
 
 // ── Post-processing GLSL sources ────────────────────────────────────
@@ -2063,7 +2076,7 @@ pub const dofFragmentSrc: []const u8 =
 //   1 base (2D), 2 metallic-roughness (2D), (F1) 3 normal (2D),
 //   (F2) 4 emissive (2D), 5 occlusion (2D), 6 irradiance (cube),
 //   7 prefiltered (cube), 8 brdf_lut (2D).
-pub fn wgslPbr(comptime flags: u32) []const u8 {
+fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u8 {
     comptime pbrCheck(flags);
     if (flags & variant_depth != 0) @compileError("wgslPbr: variant_depth uses wgslDepth(), not wgslPbr");
     // variant_instanced + variant_shadow (4A): shadow is emitted BEFORE vp in the U struct
@@ -2559,6 +2572,24 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  let ao_sample = textureSample(occlusion_tex, samp, in.uv).r;
         \\
     ;
+    // Custom-material fs_open: `var albedo` instead of `let albedo` so the frag_albedo
+    // hook snippet can write back to albedo. Selected only when frag_albedo_wgsl != null
+    // (not the raw variant_custom flag), so non-custom paths stay byte-identical.
+    const fs_open_custom =
+        \\@fragment
+        \\fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+        \\  let base_color = u.material[0];
+        \\  let mr = textureSample(mr_tex, samp, in.uv).rgb;
+        \\  let metallic = u.material[1].x * mr.b;
+        \\  let roughness = clamp(u.material[1].y * mr.g, 0.045, 1.0);
+        \\  let occlusion_strength = u.material[1].z;
+        \\  let normal_scale = u.material[1].w;
+        \\  let emissive_factor = u.material[2].rgb;
+        \\  let base_sample = textureSample(base_tex, samp, in.uv).rgb;
+        \\  var albedo = base_sample * base_color.rgb;
+        \\  let ao_sample = textureSample(occlusion_tex, samp, in.uv).r;
+        \\
+    ;
     const fs_normal_nm =
         \\  var n_ts = textureSample(normal_tex, samp, in.uv).xyz * 2.0 - 1.0;
         \\  n_ts = vec3<f32>(n_ts.xy * normal_scale, n_ts.z);
@@ -2888,11 +2919,12 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ helpers;
     if (shadow) src = src ++ fs_shadow_decl;
     if (point_shadow) src = src ++ fs_point_shadow_decl;
-    src = src ++ (if (inst) fs_open_instanced else (if (ds) fs_open_ds else fs_open));
+    src = src ++ (if (inst) fs_open_instanced else (if (ds) fs_open_ds else (if (hooks.frag_albedo_wgsl != null) fs_open_custom else fs_open)));
     if (flags & variant_alpha_test != 0) src = src ++ fs_alpha_test;
     if (clip) src = src ++ fs_clip_discard;
     src = src ++ (if (nm) (if (ds) fs_normal_nm_ds else fs_normal_nm) else (if (ds) fs_normal_plain_ds else fs_normal_plain));
     if (ds) src = src ++ fs_ds_flip;
+    if (hooks.frag_albedo_wgsl) |snippet| src = src ++ "  var vrv_albedo = albedo;\n" ++ snippet ++ "\n  albedo = vrv_albedo;\n";
     src = src ++ fs_lighting_head;
     if (shadow) src = src ++ fs_lighting_shadow_csm;
     if (point_shadow) src = src ++ fs_lighting_shadow_point;
@@ -2904,9 +2936,14 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     src = src ++ fs_combine_plain;
     if (em) src = src ++ fs_emissive;
     if (flags & variant_fog != 0) src = src ++ fs_fog_mix;
+    if (hooks.frag_final_wgsl) |snippet| src = src ++ "  var vrv_color = color;\n" ++ snippet ++ "\n  color = vrv_color;\n";
     if (!lin) src = src ++ fs_tail_tonemap;
     src = src ++ fs_tail_close;
     return src;
+}
+
+pub fn wgslPbr(comptime flags: u32) []const u8 {
+    return wgslPbrHooked(flags, .{});
 }
 
 /// Depth-only WGSL for the WebGPU shadow pass (variant_depth). Reads only
@@ -8086,4 +8123,79 @@ test "variant_custom: GLSL FS contains custom uniforms; non-custom path clean" {
     const plain = pbrFragmentSrc(variant_pbr);
     try testing.expect(std.mem.indexOf(u8, plain, "u_time") == null);
     try testing.expect(std.mem.indexOf(u8, plain, "u_params") == null);
+}
+
+// ── Custom-materials 1B: ShaderHooks comptime seam + fragment insertion ────────
+//
+// Tests (a-e) for the comptime hook seam. Hashes bootstrapped from first green run.
+// Frozen: a hash change here = deliberate contract bump.
+// Lvalue convention (PIN — spec §2 output contract):
+//   frag_albedo GLSL: "  vec3 vrv_albedo = albedo;\n" ++ snippet ++ "\n  albedo = vrv_albedo;\n"
+//   frag_albedo WGSL: "  var vrv_albedo = albedo;\n"  ++ snippet ++ "\n  albedo = vrv_albedo;\n"
+//   frag_final  GLSL: "  vec3 vrv_color = color;\n"   ++ snippet ++ "\n  color = vrv_color;\n"
+//   frag_final  WGSL: "  var vrv_color = color;\n"    ++ snippet ++ "\n  color = vrv_color;\n"
+
+test "golden: fragment hooks WGSL + GLSL FS hashes frozen (FNV-1a-64)" {
+    const fixture = ShaderHooks{
+        .frag_albedo_glsl = "vrv_albedo = vrv_albedo * vec3(v_uv, 1.0);",
+        .frag_albedo_wgsl = "vrv_albedo = vrv_albedo * vec3<f32>(in.uv, 1.0);",
+        .frag_final_glsl = "vrv_color = vrv_color + vec3(0.0, 0.05 * sin(u_time), 0.0);",
+        .frag_final_wgsl = "vrv_color = vrv_color + vec3<f32>(0.0, 0.05 * sin(custom.u_time), 0.0);",
+    };
+    const C = variant_pbr | variant_custom;
+    // (a) WGSL with fixture hooks.
+    try testing.expectEqual(@as(u64, 0x27631ea0d44e64de), fnv64(wgslPbrHooked(C, fixture)));
+    // (b) GLSL FS with fixture hooks.
+    try testing.expectEqual(@as(u64, 0x6c4b7cfdc5c25608), fnv64(pbrFragmentSrcHooked(C, fixture)));
+}
+
+test "fragment hooks structural: WGSL splice content and var albedo" {
+    // (c) Structural: assembled WGSL contains vrv_albedo/vrv_color, snippet substrings,
+    // and `var albedo` (fs_open_custom) when frag_albedo hook is present.
+    const fixture = ShaderHooks{
+        .frag_albedo_glsl = "vrv_albedo = vrv_albedo * vec3(v_uv, 1.0);",
+        .frag_albedo_wgsl = "vrv_albedo = vrv_albedo * vec3<f32>(in.uv, 1.0);",
+        .frag_final_glsl = "vrv_color = vrv_color + vec3(0.0, 0.05 * sin(u_time), 0.0);",
+        .frag_final_wgsl = "vrv_color = vrv_color + vec3<f32>(0.0, 0.05 * sin(custom.u_time), 0.0);",
+    };
+    const C = variant_pbr | variant_custom;
+    const wgsl = wgslPbrHooked(C, fixture);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "vrv_albedo") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "vrv_color") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "vrv_albedo = vrv_albedo * vec3<f32>(in.uv, 1.0);") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "vrv_color = vrv_color + vec3<f32>(0.0, 0.05 * sin(custom.u_time), 0.0);") != null);
+    // fs_open_custom selected: source must contain `var albedo` when frag_albedo hook present.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "var albedo") != null);
+}
+
+test "fragment hooks structural: fs_open_custom gated on hook-presence not raw flag" {
+    // (d) frag_final only (no frag_albedo) → WGSL keeps `let albedo` (fs_open_custom NOT selected).
+    const final_only = ShaderHooks{
+        .frag_final_wgsl = "vrv_color = vrv_color + vec3<f32>(0.0, 0.05 * sin(custom.u_time), 0.0);",
+        .frag_final_glsl = "vrv_color = vrv_color + vec3(0.0, 0.05 * sin(u_time), 0.0);",
+    };
+    const C = variant_pbr | variant_custom;
+    const wgsl = wgslPbrHooked(C, final_only);
+    // Must keep let albedo (immutable path), NOT var albedo.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "let albedo") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "var albedo") == null);
+    // But frag_final splice is still present.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "vrv_color") != null);
+}
+
+test "fragment hooks byte-identity: empty hooks == plain delegator" {
+    // (e) wgslPbrHooked(F, .{}) must produce BYTE-IDENTICAL output to wgslPbr(F),
+    // and pbrFragmentSrcHooked(F, .{}) to pbrFragmentSrc(F), for representative F.
+    // This is the load-bearing guard that no existing golden moves.
+    const F1 = variant_pbr;
+    const F2 = variant_pbr | variant_shadow;
+    const F3 = variant_pbr | variant_custom;
+    // WGSL
+    try testing.expectEqual(fnv64(wgslPbr(F1)), fnv64(wgslPbrHooked(F1, .{})));
+    try testing.expectEqual(fnv64(wgslPbr(F2)), fnv64(wgslPbrHooked(F2, .{})));
+    try testing.expectEqual(fnv64(wgslPbr(F3)), fnv64(wgslPbrHooked(F3, .{})));
+    // GLSL FS
+    try testing.expectEqual(fnv64(pbrFragmentSrc(F1)), fnv64(pbrFragmentSrcHooked(F1, .{})));
+    try testing.expectEqual(fnv64(pbrFragmentSrc(F2)), fnv64(pbrFragmentSrcHooked(F2, .{})));
+    try testing.expectEqual(fnv64(pbrFragmentSrc(F3)), fnv64(pbrFragmentSrcHooked(F3, .{})));
 }
