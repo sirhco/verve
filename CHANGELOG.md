@@ -4,6 +4,21 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.25.0] - 2026-06-29
+
+### Added
+
+- **gl — instanced non-uniform-scale normals**: GPU-instanced meshes are now lit
+  correctly under per-instance non-uniform scale. The vertex shader applies the
+  **inverse-transpose of the per-instance upper-3×3 model matrix** to the normal
+  (was raw `mat3(model)`), matching three.js–parity normal handling. GLSL uses the
+  built-in `inverse()` and `transpose()` functions; WGSL adds a helper `mat3_inverse`
+  free function (WGSL has no built-in matrix inverse). Both WebGL2 and WebGPU backends.
+  The `/gl-instanced` demo now applies non-uniform per-instance scale to visually
+  exercise the fix (stretched + sheared instances render correctly lit). This is
+  **slice 1 of 4** in the "Instancing edges" three.js-parity cluster; multi-mesh
+  instancing, per-instance frustum culling, and instanced shadows are deferred.
+
 ## [0.24.0] - 2026-06-29
 
 ### Added
