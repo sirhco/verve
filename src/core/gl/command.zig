@@ -203,6 +203,10 @@ pub const variant_wireframe: u32 = 1 << 22; // Wireframe overlay (three.js mater
 // the stride-48 vbuf; FS emits flat u_color (no texture, no lighting, no tonemap). GLSL: individual
 // uniforms u_mvp (mat4) + u_color (vec4). WGSL: struct U { mvp: mat4x4<f32>, color: vec4<f32> }
 // @group(0)@binding(0); size=80B (mvp@0 64B + color@64 16B, 16-aligned). NO @group(1) bindings.
+pub const variant_custom: u32 = 1 << 23; // Custom shader materials (comptime-baked injection hooks).
+// WGSL: separate struct Custom + @group(0)@binding(5) var<uniform> custom: Custom (80B, binding 5 free).
+// GLSL: individual uniforms u_time (f32) + u_params[4] (vec4 array). Fragment-only in slice 1.
+// Does NOT touch struct U / PBR_STRIDE — a separate binding preserves all existing byte offsets.
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -1299,6 +1303,14 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
         \\uniform vec4 u_fog1; // [near, far, density, _pad]
         \\
     ;
+    // Custom-material GLSL uniforms (variant_custom, fragment-stage only in slice 1).
+    // Names u_time / u_params verified not already present in the PBR FS source.
+    // Accessor naming is finalised in Task 1C; a safe unique prefix is used here.
+    const custom_uniforms =
+        \\uniform float u_time;
+        \\uniform vec4 u_params[4];
+        \\
+    ;
     const fog_mix =
         \\  float fog_dist = length(u_camera_pos - v_world_pos);
         \\  float fog_factor = 1.0;
@@ -1630,6 +1642,7 @@ pub fn pbrFragmentSrc(comptime flags: u32) []const u8 {
     if (flags & variant_emissive != 0) src = src ++ em_sampler;
     src = src ++ ibl_samplers;
     if (flags & variant_fog != 0) src = src ++ fog_uniforms;
+    if (flags & variant_custom != 0) src = src ++ custom_uniforms;
     if (flags & variant_shadow != 0) src = src ++ shadow_decls;
     if (flags & variant_shadow_point != 0) src = src ++ point_shadow_decls;
     if (flags & variant_clipping != 0) src = src ++ clip_uniforms;
@@ -2146,6 +2159,23 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\struct Morph { idx: array<vec4<i32>, 8>, wt: array<vec4<f32>, 8>, count: i32 };
         \\@group(0) @binding(3) var<uniform> morph: Morph;
         \\@group(0) @binding(4) var u_morph_tex: texture_2d<f32>;
+        \\
+    ;
+    // Custom-material UBO (variant_custom). SEPARATE group(0) binding at @binding(5) — binding 5
+    // is free (0=U, 1=Bones, 2=Fog, 3=Morph UBO, 4=morph tex). Layout (std140, 80 bytes):
+    //   offset  0: u_time: f32  (+3×f32 pad → 16B total for first row)
+    //   offset 16: params: array<vec4<f32>, 4>  → 4×16B = 64B
+    // Declared but UNREFERENCED in slice 1 — valid WGSL (unused uniform binding OK).
+    // Hook insertion sites are added in Task 1B; accessor naming finalised in 1C.
+    const uniforms_custom =
+        \\struct Custom {
+        \\  u_time: f32,
+        \\  _pad0: f32,
+        \\  _pad1: f32,
+        \\  _pad2: f32,
+        \\  params: array<vec4<f32>, 4>,
+        \\};
+        \\@group(0) @binding(5) var<uniform> custom: Custom;
         \\
     ;
     // (variant_shadow_point no longer needs a dedicated PointShadow uniform: each
@@ -2827,6 +2857,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (skinned) src = src ++ uniforms_bones;
     if (flags & variant_fog != 0) src = src ++ uniforms_fog;
     if (morphed) src = src ++ uniforms_morph;
+    if (flags & variant_custom != 0) src = src ++ uniforms_custom;
     src = src ++ samp ++ tex_base;
     if (nm) src = src ++ tex_normal;
     if (em) src = src ++ tex_emissive;
@@ -8002,4 +8033,57 @@ test "golden: DRAW_DEPTH_INSTANCED (tag 47) byte layout" {
             "00200000", //  light_vp_ptr=0x2000
         hex,
     );
+}
+
+// ── Custom-materials 1A: variant_custom + Custom UBO @binding(5) ─────────────
+//
+// Frozen from first green run — a change here = deliberate contract bump.
+// WGSL: struct Custom { u_time:f32, _pad0-2:f32, params:array<vec4<f32>,4> }
+//   @group(0)@binding(5) var<uniform> custom: Custom; (80B, binding 5 free)
+// GLSL: uniform float u_time; uniform vec4 u_params[4]; (fragment-stage only)
+// Neither touches struct U / PBR_STRIDE — separate binding, zero existing offset drift.
+
+test "golden: variant_custom WGSL + GLSL FS hashes frozen (FNV-1a-64)" {
+    const C = variant_pbr | variant_custom;
+    // (a) WGSL PBR with custom bit: Custom UBO struct + @binding(5) appended.
+    try testing.expectEqual(@as(u64, 0x26d0bfa4cfcaae98), fnv64(wgslPbr(C)));
+    // (b) GLSL FS with custom bit: u_time + u_params[4] uniforms appended.
+    try testing.expectEqual(@as(u64, 0xf0e9bc1460c2e1d9), fnv64(pbrFragmentSrc(C)));
+}
+
+test "variant_custom: VS byte-identical (no vertex changes in slice 1)" {
+    // custom uniforms are fragment-only in slice 1 — VS must be untouched.
+    const base = variant_pbr;
+    const C = variant_pbr | variant_custom;
+    try testing.expectEqual(fnv64(pbrVertexSrc(base)), fnv64(pbrVertexSrc(C)));
+}
+
+test "variant_custom: Custom UBO layout order in WGSL source" {
+    // wgslUFieldByteOffset only parses struct U; use structural ordering checks instead.
+    // Verify: u_time field appears before params field, both inside struct Custom.
+    const src = wgslPbr(variant_pbr | variant_custom);
+    const i_struct = std.mem.indexOf(u8, src, "struct Custom {").?;
+    const i_utime = std.mem.indexOfPos(u8, src, i_struct, "u_time: f32,").?;
+    const i_params = std.mem.indexOfPos(u8, src, i_struct, "params: array<vec4<f32>, 4>,").?;
+    const i_binding5 = std.mem.indexOf(u8, src, "@group(0) @binding(5) var<uniform> custom: Custom;").?;
+    // u_time is first field (offset 0 in std140); params follows at offset 16.
+    try testing.expect(i_utime < i_params);
+    // @binding(5) declaration comes after the struct definition.
+    try testing.expect(i_struct < i_binding5);
+    // Custom UBO is ABSENT without the bit.
+    const plain = wgslPbr(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "struct Custom") == null);
+    // group(0) binding(5) must not appear without the bit (group(1) binding(5) for LTC is ok).
+    try testing.expect(std.mem.indexOf(u8, plain, "@group(0) @binding(5)") == null);
+}
+
+test "variant_custom: GLSL FS contains custom uniforms; non-custom path clean" {
+    const C = variant_pbr | variant_custom;
+    const fs = pbrFragmentSrc(C);
+    try testing.expect(std.mem.indexOf(u8, fs, "uniform float u_time;") != null);
+    try testing.expect(std.mem.indexOf(u8, fs, "uniform vec4 u_params[4];") != null);
+    // Without the bit, uniforms must be absent.
+    const plain = pbrFragmentSrc(variant_pbr);
+    try testing.expect(std.mem.indexOf(u8, plain, "u_time") == null);
+    try testing.expect(std.mem.indexOf(u8, plain, "u_params") == null);
 }
