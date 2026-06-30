@@ -5376,6 +5376,9 @@
           // Default no clip planes each frame; set_clip_planes (tag 45) re-enables.
           st.frameClipCount = 0;
           st.frameClipPlanes = null;
+          // Default no shadow VP cache; BIND_SHADOW_MAP (case 20) re-caches per frame.
+          st.frameShadowVp = null;
+          st.frameShadowVpCount = 0;
           // Reset instance-upload dedup key: instance contents change every frame
           // (animation), so the first case-27 per frame must re-upload even if the
           // pointer is stable.  Remaining case-27s sharing the same ptr+count skip.
@@ -5889,6 +5892,18 @@
             gl2.uniform1i(st.active.clipCount, st.frameClipCount | 0);
           if (st.active.clipPlanes && st.frameClipCount > 0 && st.frameClipPlanes)
             gl2.uniform4fv(st.active.clipPlanes, st.frameClipPlanes);
+          // Shadow receiver (instanced+shadow): re-upload shadow uniforms to this program.
+          // BIND_SHADOW_MAP (case 20) uploads to whichever program is active at that time;
+          // the instanced+shadow program is bound later, so we replay from frame cache.
+          if ((st.active.flags & 0x20) && st.frameShadowVp && st.frameShadowVpCount > 0) {
+            if (st.active.shadowVp)
+              gl2.uniformMatrix4fv(st.active.shadowVp, false, st.frameShadowVp);
+            if (st.frameCascadeCount > 0) {
+              if (st.active.cascadeCount) gl2.uniform1i(st.active.cascadeCount, st.frameCascadeCount);
+              if (st.active.cascadeSplits) gl2.uniform4fv(st.active.cascadeSplits, st.frameCascadeSplits);
+              if (st.active.viewForward) gl2.uniform3fv(st.active.viewForward, st.frameViewForward);
+            }
+          }
           gl2.drawElementsInstanced(gl2.TRIANGLES, count, gl2.UNSIGNED_SHORT, byteOff, instanceCount);
           break;
         }
@@ -6022,6 +6037,12 @@
           if (sm) {
             gl.activeTexture(gl.TEXTURE0 + slot);
             gl.bindTexture(gl.TEXTURE_2D, sm.tex);
+          }
+          // Cache shadow VP for instanced+shadow draws (program switch happens after this
+          // command fires; the draw re-uploads from cache when it runs with the instanced program).
+          if (count > 0) {
+            st.frameShadowVp = new Float32Array(memory.buffer, vpPtr, count * 16).slice();
+            st.frameShadowVpCount = count;
           }
           if (st.active && st.active.shadowVp && count > 0)
             gl.uniformMatrix4fv(st.active.shadowVp, false, new Float32Array(memory.buffer, vpPtr, count * 16));
@@ -6854,8 +6875,8 @@
   //   prefiltered_mips:f32 @ 500
   //   area_count : i32     @ 504  (S3 area lights — ALWAYS present)
   //   area_lights: vec4[16]@ 512  (512..768; 4 vec4/area light)
-  //   shadow_vp  : mat4x4[8]@ 768 (variant_shadow; non-shadow ignores; instanced
-  //                                writes its single vp here)
+  //   shadow_vp  : mat4x4[8]@ 768 (variant_shadow receiver AND instanced+shadow receiver;
+  //                                no-shadow instanced writes its single vp mat here)
   //   cascade_count: i32   @1280  cascade_splits: vec4 @1296  view_forward: vec3 @1312
   // base struct = 768; shadow struct = 1328 → PBR_STRIDE = align(1328,256) = 1536.
   const PBR_U = {
@@ -6875,26 +6896,30 @@
     // CSM/Multi-caster: shadow_vp is array<mat4x4<f32>,8> @ 768 (8×64 = 512B, 768..1280),
     // shifted from 512 by the area_lights block. (Instanced variant reuses 768 for its
     // single `vp` mat — same slot, where shadow_vp would be.)
-    shadowVp: 768, // shadow_vp[8] (set by bind_shadow_map; instanced path writes 1 mat here)
+    shadowVp: 768, // shadow_vp[8] (set by bind_shadow_map; no-shadow instanced writes its vp here)
     // CSM frame-globals (shadow variant only), set by set_csm (tag 36):
     cascadeCount: 1280,  // i32  @1280 (1280..1284)
     cascadeSplits: 1296, // vec4 @1296 (16-aligned, 1296..1312) view-space FAR per cascade
     viewForward: 1312,   // vec3 @1312 (1312..1324, +4B pad → 1328) normalized camera look dir
     // area @504/512..768; shadowVp @768 (512B, 768..1280); cascade fields 1280..1328;
-    // variant_clipping appends clip_planes@1328 + clip_count@1392 (+pad) → shadow+clip struct = 1408.
+    // instanced+shadow: vp@1328 (64B, 1328..1392); instanced+shadow+clip: clip_planes@1392,
+    // clip_count@1456 → instanced+shadow+clip struct = 1472 (largest served struct).
     // This is the bind-group BINDING SIZE (group0/binding0), distinct from PBR_STRIDE (slot stride).
-    // It must be >= the LARGEST variant struct the binding serves = shadow+clip = 1408, else WebGPU
-    // rejects the draw ("buffer bound with size 1328 ... requires at least 1408 bytes"). stride 1536.
-    size: 1408,
+    // It must be >= the LARGEST variant struct the binding serves = instanced+shadow+clip = 1472, else
+    // WebGPU rejects the draw ("buffer bound with size X ... requires at least 1472 bytes"). stride 1536.
+    size: 1472,
   };
-  // Clip-plane WGSL byte offsets are VARIANT-DEPENDENT (Task A golden values):
-  //   base (non-shadow, non-instanced): clip_planes @768,  clip_count @832
-  //   shadow (flags & 0x20):            clip_planes @1328, clip_count @1392
-  //   instanced (flags & 0x1000):       clip_planes @832,  clip_count @896
-  // shadow|instanced is unreachable (@compileError in Zig — no 4th case).
+  // Clip-plane WGSL byte offsets are VARIANT-DEPENDENT (Task A/4A1 golden values):
+  //   base (non-shadow, non-instanced):  clip_planes @768,  clip_count @832
+  //   shadow (flags & 0x20):             clip_planes @1328, clip_count @1392
+  //   instanced (flags & 0x1000):        clip_planes @832,  clip_count @896
+  //   instanced+shadow (both bits set):  clip_planes @1392, clip_count @1456
+  // instanced+shadow case MUST be checked first (both bits set → most specific match).
   const clipPlanesOffset = (flags) =>
+    ((flags & 0x20) && (flags & 0x1000)) ? 1392 :
     (flags & 0x20) ? 1328 : (flags & 0x1000) ? 832 : 768;
   const clipCountOffset = (flags) =>
+    ((flags & 0x20) && (flags & 0x1000)) ? 1456 :
     (flags & 0x20) ? 1392 : (flags & 0x1000) ? 896 : 832;
   // Multiple draws per frame each need isolated uniforms: WebGPU defers draws, so
   // a single shared buffer would let the last writeBuffer clobber earlier draws.
@@ -7682,12 +7707,8 @@
           // with two vertex.buffers and stored as kind "pbr-instanced". FRESH
           // descriptor literals — does NOT touch pbrDesc or the non-instanced pipeline.
           if ((variant & 0x1000) !== 0) {
-            // Guard: instanced + shadow (0x1020) share offset 768 in the WGSL U
-            // struct (vp vs shadow_vp[0]) — unsupported in v1.  Fail loud, not garbage.
-            if ((variant & 0x1020) === 0x1020) {
-              console.error("gl: variant_instanced|variant_shadow (0x" + variant.toString(16) + ") unsupported — vp/shadow_vp collision at U offset 768; skipping pipeline build");
-              break;
-            }
+            // instanced+shadow (0x1020) is now supported: 4A1 resolved the vp/shadow_vp
+            // collision by moving instanced vp to @1328 when shadow bit is set.
             const hasNormal = (variant & 0x8) !== 0;
             const hasEmissive = (variant & 0x10) !== 0;
             const hasShadow = (variant & 0x20) !== 0;
@@ -8610,19 +8631,32 @@
             st.instUploadedPtr = instancePtr;
             st.instUploadedCount = instanceCount;
           }
-          // ── Per-draw uniform slot (PBR_U layout, instanced U adds vp @ 768). ──
-          // The instanced WGSL U struct has all standard fields (mvp, model, …) plus
-          // the S3 area block (area_count@504, area_lights@512..768), then a single
-          // `vp: mat4x4<f32>` appended at offset 768 — the SAME slot as PBR_U.shadowVp
-          // (the shadow variant's shadow_vp[0]). We write one mat there. We only write
-          // the fields the shader actually reads: vp, material, camera. Instanced is
-          // non-area (area_count=0), but we still zero area_count for a valid struct.
+          // ── Per-draw uniform slot (PBR_U layout, instanced U offset depends on shadow). ──
+          // No-shadow instanced: vp mat4 at @768 (same slot as PBR_U.shadowVp).
+          // Instanced+shadow: shadow_vp[8] @768..1280, cascade@1280, vp mat4 @1328.
+          // Helper returns the correct vp offset for the active variant flags.
+          const instancedVpOffset = (flags) => (flags & 0x20) ? 1328 : 768;
           const ubuf = gpuEnsurePbrUniform(st);
           const slot = st.pbrSlot++;
           if (slot >= MAX_DRAWS) break;
           const base = slot * PBR_STRIDE;
-          // vp (view-proj): u.vp — offset 768 (= PBR_U.shadowVp in the JS table).
-          device.queue.writeBuffer(ubuf, base + PBR_U.shadowVp, new Float32Array(memory.buffer, vpPtr, 16));
+          // vp (view-proj): offset 768 for no-shadow, 1328 for instanced+shadow.
+          device.queue.writeBuffer(ubuf, base + instancedVpOffset(active.flags), new Float32Array(memory.buffer, vpPtr, 16));
+          // Shadow receiver data (instanced+shadow only): mirror the non-instanced receiver writes.
+          // shadow_vp[8] @768: the full shadow-VP array from frame cache (set by bind_shadow_map).
+          if ((active.flags & 0x20) && st.frameShadowVp && st.frameShadowVpCount > 0) {
+            device.queue.writeBuffer(ubuf, base + PBR_U.shadowVp,
+              st.frameShadowVp.buffer, st.frameShadowVp.byteOffset, st.frameShadowVpCount * 64);
+          }
+          // CSM frame-globals for instanced+shadow: cascade_count @1280, cascade_splits @1296,
+          // view_forward @1312 (same PBR_U offsets as non-instanced — struct layout is identical).
+          if ((active.flags & 0x20) && st.frameCascadeCount > 0) {
+            device.queue.writeBuffer(ubuf, base + PBR_U.cascadeCount, new Int32Array([st.frameCascadeCount | 0]));
+            device.queue.writeBuffer(ubuf, base + PBR_U.cascadeSplits,
+              st.frameCascadeSplits.buffer, st.frameCascadeSplits.byteOffset, 16);
+            device.queue.writeBuffer(ubuf, base + PBR_U.viewForward,
+              st.frameViewForward.buffer, st.frameViewForward.byteOffset, 12);
+          }
           // material: 3×vec4 = 12 f32.
           device.queue.writeBuffer(ubuf, base + PBR_U.material, new Float32Array(memory.buffer, materialPtr, 12));
           // camera_pos: vec3 (3 f32, 4th byte is pad).
@@ -8635,7 +8669,7 @@
           device.queue.writeBuffer(ubuf, base + PBR_U.prefMips, new Float32Array([st.framePrefMips || 0]));
           // Instanced is non-area: zero area_count so the shader skips the area loop.
           device.queue.writeBuffer(ubuf, base + PBR_U.areaCount, new Int32Array([0]));
-          // S4 clip planes: upload at instanced-variant offset (clip_planes@832, clip_count@896).
+          // S4 clip planes: offset depends on variant (instanced, shadow, or instanced+shadow).
           if (active.flags & 0x200000) {
             device.queue.writeBuffer(ubuf, base + clipCountOffset(active.flags),
               new Int32Array([st.frameClipCount | 0]));
