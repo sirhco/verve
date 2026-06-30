@@ -2011,10 +2011,12 @@ pub const dofFragmentSrc: []const u8 =
 // cascade_count / cascade_splits / view_forward live ONLY in the shadow variant.
 // area_count / area_lights are in the BASE U (every PBR variant), offset 504/512.
 //
-// INSTANCED VARIANT (S3 — vp offset MOVED 512→768):
-//   The instanced `vp: mat4x4` now sits AFTER area_lights, at offset 768 (where
-//   shadow_vp would be). Instanced draws are non-shadow + non-area (area_count=0).
-//   struct size = 768 + 64 = 832 (was 576). FLAG for T3: bridge instanced vp offset 512→768.
+// INSTANCED VARIANT (S3 — vp offset; 4A — instanced+shadow now legal):
+//   Without shadow: vp@768 (area_lights ends at 768). struct size = 832.
+//   With shadow (4A): shadow block precedes vp in assembly (uniforms_shadow → uniforms_vp).
+//     shadow_vp[8]@768..1280, cascade_count@1280, cascade_splits@1296, view_forward@1312..1328,
+//     then vp@1328..1392. struct size = 1392; +clip → clip_planes@1392, clip_count@1456 (+pad → 1472).
+//   PBR_STRIDE = align(1472, 256) = 1536 — unchanged (shadow+clip already forced 1536).
 //
 // Bindings (@group(1)): a shared sampler (binding 0) + per-slot textures.
 // Slots mirror the GLSL sampler order / JS texture-unit contract:
@@ -2024,12 +2026,12 @@ pub const dofFragmentSrc: []const u8 =
 pub fn wgslPbr(comptime flags: u32) []const u8 {
     comptime pbrCheck(flags);
     if (flags & variant_depth != 0) @compileError("wgslPbr: variant_depth uses wgslDepth(), not wgslPbr");
-    // variant_instanced appends `vp: mat4x4<f32>` at byte offset 768 (after the S3
-    // area_lights block) — the same slot variant_shadow uses for `shadow_vp`. The two
-    // are mutually exclusive in v1 (instanced draws are non-shadow receivers). Enforce
-    // it here so a future caller cannot silently produce a broken WGSL U struct.
-    if (flags & variant_instanced != 0 and flags & variant_shadow != 0)
-        @compileError("wgslPbr: variant_instanced + variant_shadow unsupported in v1 (vp/shadow_vp slot collision at offset 768)");
+    // variant_instanced + variant_shadow (4A): shadow is emitted BEFORE vp in the U struct
+    // assembly (uniforms_shadow → uniforms_vp order), so the two coexist without collision:
+    //   area_lights ends @768 → shadow_vp[8]@768..1280 → CSM fields → view_forward@1328
+    //   → vp@1328..1392. struct size = 1392; +clip → 1472; PBR_STRIDE = 1536 (unchanged).
+    // variant_instanced + variant_shadow_point remains forbidden (point-shadow bind-group
+    // not wired for instanced draw path — out of scope for 4A).
     if (flags & variant_instanced != 0 and flags & variant_shadow_point != 0)
         @compileError("wgslPbr: variant_instanced + variant_shadow_point unsupported in v1 (point-shadow bind-group not wired for instanced draw path)");
 
@@ -7628,13 +7630,11 @@ test "golden: clipping shader FNV hashes frozen (FNV-1a-64)" {
 // in all reachable clip-variant U structs so any drift breaks a native test
 // before it can silently corrupt the WebGPU bridge (Task B contract).
 //
-// Three reachable clip-offset cases:
-//   base+clip:      clip_planes@768,  clip_count@832  (area_lights ends at 768)
-//   shadow+clip:    clip_planes@1328, clip_count@1392 (view_forward ends at 1328)
-//   instanced+clip: clip_planes@832,  clip_count@896  (vp ends at 832)
-//
-// variant_shadow + variant_instanced is @compileError in v1 (offset 768 collision),
-// so shadow+instanced+clip is unreachable — no fourth case.
+// Four reachable clip-offset cases (4A — instanced+shadow now legal):
+//   base+clip:               clip_planes@768,  clip_count@832  (area_lights ends @768)
+//   shadow+clip:             clip_planes@1328, clip_count@1392 (view_forward ends @1328)
+//   instanced+clip:          clip_planes@832,  clip_count@896  (vp ends @832 without shadow)
+//   instanced+shadow+clip:   clip_planes@1392, clip_count@1456 (vp@1328→1392 after shadow block)
 
 /// Walk the first `struct U { … }` block in `src`, accumulate WGSL alignment
 /// and size for each field, and return the byte offset of `field`.
@@ -7711,7 +7711,7 @@ test "WGSL U exact offsets: shadow+clip (clip_planes@1328, clip_count@1392)" {
 test "WGSL U exact offsets: instanced+clip (clip_planes@832, clip_count@896)" {
     // Fix 2: third clip-offset case. variant_instanced appends vp: mat4x4 at 768
     // (area_lights ends at 768), pushing clip_planes to 832, clip_count to 896.
-    // variant_shadow+instanced is @compileError in v1 → no fourth case.
+    // instanced+shadow+clip is the fourth case (clip_planes@1392, clip_count@1456) — see test below.
     const src = wgslPbr(variant_pbr | variant_instanced | variant_clipping);
     try testing.expectEqual(@as(usize, 832), wgslUFieldByteOffset(src, "clip_planes"));
     try testing.expectEqual(@as(usize, 896), wgslUFieldByteOffset(src, "clip_count"));
@@ -7729,7 +7729,7 @@ test "PBR_STRIDE = 1536 (align(1408,256) — shadow+clip dominant struct)" {
 
 test "golden: instanced+clip WGSL hash frozen (FNV-1a-64)" {
     // Re-frozen (1A normal inverse-transpose): mat3_inverse helper + transpose(mat3_inverse(m3)).
-    // clip_planes@832, clip_count@896. variant_shadow+instanced is @compileError → no shadow case.
+    // clip_planes@832, clip_count@896 (instanced WITHOUT shadow). See instanced+shadow+clip test for the shadow case.
     const IC = variant_pbr | variant_instanced | variant_clipping;
     try testing.expectEqual(@as(u64, 0xc19a2cb740c2b42b), fnv64(wgslPbr(IC)));
 }
@@ -7742,6 +7742,35 @@ test "golden: instanced GLSL VS hash frozen (FNV-1a-64)" {
 test "golden: instanced WGSL hash frozen (FNV-1a-64)" {
     // Frozen (1A normal inverse-transpose): mat3_inverse helper + transpose(mat3_inverse(m3)) in vs_main.
     try testing.expectEqual(@as(u64, 0x7695684124ec8fb9), fnv64(wgslPbr(variant_pbr | variant_instanced)));
+}
+
+// ── Instanced+shadow (4A — combo now legal) ──────────────────────────────
+
+test "WGSL U exact offsets: instanced+shadow (vp@1328, after shadow block)" {
+    // 4A: shadow block precedes vp in assembly → vp moves from 768 to 1328.
+    const src = wgslPbr(variant_pbr | variant_instanced | variant_shadow);
+    try testing.expectEqual(@as(usize, 1328), wgslUFieldByteOffset(src, "vp"));
+}
+
+test "WGSL U exact offsets: instanced+shadow+clip (clip_planes@1392, clip_count@1456)" {
+    // 4A: fourth clip-offset case. vp ends at 1392, clip_planes starts there.
+    const src = wgslPbr(variant_pbr | variant_instanced | variant_shadow | variant_clipping);
+    try testing.expectEqual(@as(usize, 1392), wgslUFieldByteOffset(src, "clip_planes"));
+    try testing.expectEqual(@as(usize, 1456), wgslUFieldByteOffset(src, "clip_count"));
+}
+
+test "golden: instanced+shadow WGSL hash frozen (FNV-1a-64)" {
+    // 4A: instanced+shadow now legal — vp moved to @1328 after the shadow block.
+    const IS = variant_pbr | variant_instanced | variant_shadow;
+    try testing.expectEqual(@as(u64, 0x2d5e6e27c6dc0561), fnv64(wgslPbr(IS)));
+}
+
+test "golden: instanced+shadow GLSL VS+FS hashes frozen (FNV-1a-64)" {
+    // 4A: GLSL had no guard — instanced+shadow already assembled; frozen here.
+    // VS hash = same as instanced-only (shadow adds no VS code; world_pos already output).
+    const IS = variant_pbr | variant_instanced | variant_shadow;
+    try testing.expectEqual(@as(u64, 0xdfd7baeeaa5818bb), fnv64(pbrVertexSrc(IS)));
+    try testing.expectEqual(@as(u64, 0x7c6030c879464428), fnv64(pbrFragmentSrc(IS)));
 }
 
 // ── Wireframe (variant_wireframe = 1<<22, draw_wireframe = 46) ───────────
