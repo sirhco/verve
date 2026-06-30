@@ -4,6 +4,19 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.26.0] - 2026-06-29
+
+### Added
+
+- **gl — multi-submesh GPU instancing**: GPU-instanced meshes now render all submeshes
+  with per-submesh materials and textures, not just submesh 0. The instanced draw path
+  emits one instanced draw call per submesh, each binding its own material and textures,
+  while all draws share the single per-instance buffer. The bridge uploads that buffer
+  once per frame across all per-submesh draws, eliminating per-submesh upload duplication.
+  Both WebGL2 and WebGPU backends. New `/gl-instanced-multi` demo (a 2-material model
+  instanced multiple times). This is **slice 2 of 4** in the "Instancing edges"
+  three.js-parity cluster; per-instance frustum culling and instanced shadows are deferred.
+
 ## [0.25.0] - 2026-06-29
 
 ### Added
