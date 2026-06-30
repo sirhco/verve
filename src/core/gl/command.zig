@@ -139,6 +139,13 @@ pub const Tag = enum(u16) {
     //   variant_wireframe program (own U{mvp,color} — no texture, no lighting, no tonemap). Same
     //   shape family as draw_sub (tag 9) minus the texture handle. Backend draw =
     //   drawElements(LINES, index_count, UNSIGNED_SHORT, index_byte_off) / drawIndexed(index_count,1,off/2,0,0).
+
+    // ── Instanced shadow casting ─────────────────────────────────────────
+    draw_depth_instanced = 47, // {shader, vbuf, ibuf, index_byte_off, index_count, instance_ptr, instance_count, light_vp_ptr}
+    //   Instanced depth-only draw for shadow CASTING. `shader` selects the instanced-depth pipeline
+    //   (overrides the pass's bound depth shader). Per-instance model matrix columns (loc 4-7) come
+    //   from `instance_ptr`; `light_vp_ptr` is the light view-projection matrix. `instance_count`
+    //   objects are rendered in a single draw call into the shadow atlas. 8 × u32 = 32 payload bytes.
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -4427,6 +4434,22 @@ pub const Encoder = struct {
         self.putU32(color_ptr);
     }
 
+    /// Instanced depth draw for shadow casting. `shader` selects the instanced-depth
+    /// pipeline (overrides the pass's bound shader). `instance_ptr` → per-instance model
+    /// matrix columns (loc 4-7). `light_vp_ptr` → the light view-projection mat4. All
+    /// `instance_count` objects are rendered in one draw call into the shadow atlas.
+    pub fn drawDepthInstanced(self: *Encoder, shader: u32, vbuf: u32, ibuf: u32, index_byte_off: u32, index_count: u32, instance_ptr: u32, instance_count: u32, light_vp_ptr: u32) void {
+        self.header(.draw_depth_instanced, 32);
+        self.putU32(shader);
+        self.putU32(vbuf);
+        self.putU32(ibuf);
+        self.putU32(index_byte_off);
+        self.putU32(index_count);
+        self.putU32(instance_ptr);
+        self.putU32(instance_count);
+        self.putU32(light_vp_ptr);
+    }
+
     /// Alpha-tested depth draw (MASK cutout shadows): binds `shader` (the depth-at
     /// program), reads the base texture (bound via bind_texture slot 0) + `u_material`
     /// (from `material_ptr`), discards below the cutoff. `mvp_ptr` = light_vp·world.
@@ -7944,4 +7967,39 @@ test "golden: wireframe GLSL+WGSL hashes frozen (FNV-1a-64)" {
     try testing.expectEqual(@as(u64, 0xaf366ee313c1b7ac), fnv64(wgslBillboard()));
     try testing.expectEqual(@as(u64, 0x6cbcc5ac9026b7b2), fnv64(pbrFragmentSrc(variant_pbr)));
     try testing.expectEqual(@as(u64, 0x9fc619889b5412ca), fnv64(pbrVertexSrc(variant_pbr)));
+}
+
+// ── Instanced shadow cast (draw_depth_instanced = 47) ────────────────────
+
+test "draw_depth_instanced: tag value frozen at 47" {
+    try testing.expectEqual(@as(u16, 47), @intFromEnum(Tag.draw_depth_instanced));
+}
+
+test "golden: DRAW_DEPTH_INSTANCED (tag 47) byte layout" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    // shader=10 vbuf=1 ibuf=2 index_byte_off=48 index_count=36 instance_ptr=0x1000 instance_count=4 light_vp_ptr=0x2000
+    enc.drawDepthInstanced(10, 1, 2, 48, 36, 0x1000, 4, 0x2000);
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // DRAW_DEPTH_INSTANCED: 4-byte length + 4-byte (tag+payload_size) + 32-byte payload = 40 bytes total.
+    // Length field = bytes after it = 2+2+32 = 36 = 0x24 → "24000000".
+    // tag=47=0x2f payload=32=0x20
+    // Field order (bytes 8..39): shader, vbuf, ibuf, index_byte_off, index_count,
+    //   instance_ptr, instance_count, light_vp_ptr.
+    try testing.expectEqualStrings(
+        "24000000" ++ // length header: 36 record bytes follow
+            // tag=47=0x2f  payload_size=32=0x20
+            "2f00" ++ "2000" ++
+            "0a000000" ++ // shader=10
+            "01000000" ++ // vbuf=1
+            "02000000" ++ // ibuf=2
+            "30000000" ++ // index_byte_off=48=0x30
+            "24000000" ++ // index_count=36=0x24
+            "00100000" ++ // instance_ptr=0x1000
+            "04000000" ++ // instance_count=4
+            "00200000", //  light_vp_ptr=0x2000
+        hex,
+    );
 }
