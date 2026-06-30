@@ -9705,8 +9705,10 @@
       }
       // First frame that actually drew geometry: hide the SSR poster (the real
       // scene is now on the canvas). Clear-only frames (assets still loading)
-      // leave pbrSlot at 0, so the poster stays up until the scene renders.
-      if (st.pbrSlot > 0 && !st.posterHidden) {
+      // leave both slots at 0, so the poster stays up until the scene renders.
+      // Wireframe-only scenes (pure-replace) never allocate a pbrSlot — they draw
+      // via wireframeSlot — so include it or the poster covers the rendered lines.
+      if ((st.pbrSlot > 0 || st.wireframeSlot > 0) && !st.posterHidden) {
         if (st.poster === undefined) {
           st.poster = (canvas.parentElement &&
             canvas.parentElement.querySelector("[data-gl-poster]")) || null;
