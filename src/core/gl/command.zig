@@ -526,7 +526,8 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\  mat4 model = mat4(a_inst_model0, a_inst_model1, a_inst_model2, a_inst_model3);
         \\  vec4 world_pos4 = model * vec4(a_pos, 1.0);
         \\  v_world_pos = world_pos4.xyz;
-        \\  v_normal = normalize(mat3(model) * a_normal);
+        \\  mat3 nm = transpose(inverse(mat3(model)));
+        \\  v_normal = normalize(nm * a_normal);
         \\  v_uv = a_uv;
         \\  v_inst_color = a_inst_color;
         \\  gl_Position = u_vp * world_pos4;
@@ -2334,6 +2335,20 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  out.uv = a_uv;
         \\
     ;
+    // mat3_inverse: adjugate/det cross-product formula. Columns of WGSL mat3x3 are the
+    // arguments; transpose(mat3x3(t0,t1,t2)) gives the true inverse (not (M^-1)^T).
+    // Used only by the instanced VS; placed here so no non-instanced variant is touched.
+    const inst_vs_helper =
+        \\fn mat3_inverse(m: mat3x3<f32>) -> mat3x3<f32> {
+        \\  let a = m[0]; let b = m[1]; let c = m[2];
+        \\  let t0 = cross(b, c);
+        \\  let t1 = cross(c, a);
+        \\  let t2 = cross(a, b);
+        \\  let inv_det = 1.0 / dot(t0, a);
+        \\  return transpose(mat3x3<f32>(t0, t1, t2)) * inv_det;
+        \\}
+        \\
+    ;
     // Instanced vs_main: reads per-instance mat4 model (col-major rows at loc 4-7)
     // + per-instance color (loc 8); reconstructs model, transforms position/normal,
     // writes inst_color varying. u.vp (view-proj) replaces u.mvp + u.model.
@@ -2354,7 +2369,8 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
         \\  let model = mat4x4<f32>(inst_m0, inst_m1, inst_m2, inst_m3);
         \\  let world_pos4 = model * vec4<f32>(a_pos, 1.0);
         \\  out.world_pos = world_pos4.xyz;
-        \\  out.normal = normalize(mat3x3<f32>(model[0].xyz, model[1].xyz, model[2].xyz) * a_normal);
+        \\  let m3 = mat3x3<f32>(model[0].xyz, model[1].xyz, model[2].xyz);
+        \\  out.normal = normalize(transpose(mat3_inverse(m3)) * a_normal);
         \\  out.uv = a_uv;
         \\  out.inst_color = inst_color;
         \\  out.pos = u.vp * world_pos4;
@@ -2794,6 +2810,7 @@ pub fn wgslPbr(comptime flags: u32) []const u8 {
     if (inst) src = src ++ vsout_inst_color;
     src = src ++ vsout_tail;
     if (inst) {
+        src = src ++ inst_vs_helper;
         src = src ++ vs_head_instanced;
     } else if (morphed and skinned) {
         src = src ++ vs_head_skinned_morph;
@@ -7711,10 +7728,20 @@ test "PBR_STRIDE = 1536 (align(1408,256) — shadow+clip dominant struct)" {
 }
 
 test "golden: instanced+clip WGSL hash frozen (FNV-1a-64)" {
-    // Fix 2: freeze the variant_pbr|variant_instanced|variant_clipping shader hash.
+    // Re-frozen (1A normal inverse-transpose): mat3_inverse helper + transpose(mat3_inverse(m3)).
     // clip_planes@832, clip_count@896. variant_shadow+instanced is @compileError → no shadow case.
     const IC = variant_pbr | variant_instanced | variant_clipping;
-    try testing.expectEqual(@as(u64, 0x7bdfd5a78e14acde), fnv64(wgslPbr(IC)));
+    try testing.expectEqual(@as(u64, 0xc19a2cb740c2b42b), fnv64(wgslPbr(IC)));
+}
+
+test "golden: instanced GLSL VS hash frozen (FNV-1a-64)" {
+    // Frozen (1A normal inverse-transpose): transpose(inverse(mat3(model))) replaces mat3(model).
+    try testing.expectEqual(@as(u64, 0xdfd7baeeaa5818bb), fnv64(pbrVertexSrc(variant_pbr | variant_instanced)));
+}
+
+test "golden: instanced WGSL hash frozen (FNV-1a-64)" {
+    // Frozen (1A normal inverse-transpose): mat3_inverse helper + transpose(mat3_inverse(m3)) in vs_main.
+    try testing.expectEqual(@as(u64, 0x7695684124ec8fb9), fnv64(wgslPbr(variant_pbr | variant_instanced)));
 }
 
 // ── Wireframe (variant_wireframe = 1<<22, draw_wireframe = 46) ───────────
