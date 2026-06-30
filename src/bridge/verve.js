@@ -5384,6 +5384,9 @@
           // pointer is stable.  Remaining case-27s sharing the same ptr+count skip.
           st.instUploadedPtr = 0;
           st.instUploadedCount = 0;
+          // Shadow-cast instance upload guard (case 47): reset every frame so
+          // animated shadow_instance_scratch data is re-uploaded each frame.
+          st.shadowInstUploadedPtr = 0;
           // Ensure the 1×1 rgba16f LTC dummy is bound to units 10/11 by default so
           // every PBR draw has valid (incomplete-free) textures at those samplers
           // even before /gl/ltc.bin loads. Real LUTs (tag 38) override these binds.
@@ -6712,6 +6715,73 @@
           gl.drawElements(gl.LINES, indexCount, gl.UNSIGNED_SHORT, byteOff);
           break;
         }
+        case 47: { // DRAW_DEPTH_INSTANCED — N instances into the shadow atlas.
+          // Payload (32B / 8 u32):
+          //   shader | vbuf | ibuf | index_byte_off | index_count |
+          //   instance_ptr | instance_count | light_vp_ptr.
+          // Uses the instanced-depth program (4B1, handle from payload). Draws
+          // instance_count copies of the indexed submesh with per-instance model
+          // matrices into the active shadow tile — depth only, no color write.
+          const shH = dv.getUint32(off, true);
+          const vh = dv.getUint32(off + 4, true);
+          const ih = dv.getUint32(off + 8, true);
+          const byteOff47 = dv.getUint32(off + 12, true);
+          const count47 = dv.getUint32(off + 16, true);
+          const instancePtr47 = dv.getUint32(off + 20, true);
+          const instanceCount47 = dv.getUint32(off + 24, true);
+          const lightVpPtr = dv.getUint32(off + 28, true);
+          const sh47 = st.shaders[shH];
+          const vb47 = st.buffers[vh];
+          const ib47 = st.buffers[ih];
+          if (!sh47 || !vb47 || !ib47) break;
+          const gl2 = st.gl;
+          // ── Shadow instance buffer — SEPARATE from the main draw's st.instanceBuf ──
+          // shadow_instance_scratch uses a DIFFERENT wasm pointer than the main
+          // draw's per-instance buffer. A dedicated WebGL buffer (st.shadowInstanceBuf)
+          // keeps the two datasets distinct within one frame regardless of draw order.
+          // The upload-once guard (keyed by shadowInstUploadedPtr) avoids redundant
+          // re-uploads when multiple submeshes share the same shadow scratch.
+          if (!st.shadowInstanceBuf) st.shadowInstanceBuf = gl.createBuffer();
+          gl.bindBuffer(gl.ARRAY_BUFFER, st.shadowInstanceBuf);
+          if (st.shadowInstUploadedPtr !== instancePtr47 || st.shadowInstUploadedCount !== instanceCount47) {
+            gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(memory.buffer, instancePtr47, instanceCount47 * 80), gl.DYNAMIC_DRAW);
+            st.shadowInstUploadedPtr = instancePtr47;
+            st.shadowInstUploadedCount = instanceCount47;
+          }
+          // ── Depth-instanced VAO: pos (loc 0) + per-instance mat4 cols (loc 4-7). ──
+          // Key "di:vh:ih" is distinct from PBR-instanced ("{iVariant}:vh:ih") and
+          // plain depth (bindVaoFor uses "{st.active.variant}:vh:ih"). No normal/uv.
+          const diKey = `${vh}:${ih}:di`;
+          let diVao = st.vaos.get(diKey);
+          if (!diVao) {
+            diVao = gl2.createVertexArray();
+            gl2.bindVertexArray(diVao);
+            // Mesh position from vbuf: loc 0, vec3, stride 48.
+            gl2.bindBuffer(gl2.ARRAY_BUFFER, vb47.buf);
+            gl2.enableVertexAttribArray(0);
+            gl2.vertexAttribPointer(0, 3, gl2.FLOAT, false, 48, 0);
+            gl2.bindBuffer(gl2.ELEMENT_ARRAY_BUFFER, ib47.buf);
+            // Per-instance model matrix cols from st.shadowInstanceBuf:
+            // loc 4-7, vec4 each, stride 80, divisor 1 (advance per instance).
+            gl2.bindBuffer(gl2.ARRAY_BUFFER, st.shadowInstanceBuf);
+            for (let i = 0; i < 4; i++) {
+              gl2.enableVertexAttribArray(4 + i);
+              gl2.vertexAttribPointer(4 + i, 4, gl2.FLOAT, false, 80, i * 16);
+              gl2.vertexAttribDivisor(4 + i, 1);
+            }
+            st.vaos.set(diKey, diVao);
+          }
+          // ── Switch to the instanced-depth program, set light VP, draw. ──
+          gl2.useProgram(sh47.prog);
+          st.active = sh47;
+          // u_vp is not pre-resolved in CREATE_SHADER (which resolves u_mvp by
+          // default). Lazily cache the location on first use.
+          if (sh47.vp === undefined) sh47.vp = gl2.getUniformLocation(sh47.prog, "u_vp");
+          gl2.bindVertexArray(diVao);
+          if (sh47.vp) gl2.uniformMatrix4fv(sh47.vp, false, new Float32Array(memory.buffer, lightVpPtr, 16));
+          gl2.drawElementsInstanced(gl2.TRIANGLES, count47, gl2.UNSIGNED_SHORT, byteOff47, instanceCount47);
+          break;
+        }
 
         default:
           break; // unknown tag: size-skip = forward compatible
@@ -7227,6 +7297,9 @@
           // pointer is stable.  Remaining case-27s sharing the same ptr+count skip.
           st.instUploadedPtr = 0;
           st.instUploadedCount = 0;
+          // Shadow-cast instance upload guard (case 47): reset every frame so
+          // animated shadow_instance_scratch data is re-uploaded each frame.
+          st.shadowInstUploadedPtr = 0;
           st.curTargetFormat = st.format; // canvas pass: post draws target st.format
           st.curPassHasDepth = true; // canvas pass always has depth24plus
           // Reuse the encoder if a shadow/offscreen pass already opened one this
@@ -7673,6 +7746,49 @@
                 },
               });
               st.pipelines[handle] = { pipeline, bgl0, kind: "depthAt" };
+              break;
+            }
+            if ((variant & 0x1000) !== 0) { // + variant_instanced → depth-instanced (two vertex buffers)
+              // Two-buffer depth-only pipeline (wgslDepthInstanced): slot 0 = mesh
+              // position (stride-48, @location 0), slot 1 = per-instance mat4 cols
+              // (stride-80, stepMode "instance", @location 4-7). BGL0 = single
+              // dynamic-offset mat4 uniform (light VP) — same structure as the plain
+              // depth pipeline's bgl0 but a distinct layout object so the pipeline
+              // layout validates. Front-face cull, depth32float, depthWriteEnabled.
+              const bgl0 = device.createBindGroupLayout({
+                entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform", hasDynamicOffset: true } }],
+              });
+              const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
+              const pipeline = device.createRenderPipeline({
+                layout,
+                vertex: {
+                  module,
+                  entryPoint: "vs_main",
+                  buffers: [
+                    {
+                      arrayStride: 48,
+                      attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
+                    },
+                    {
+                      arrayStride: 80,
+                      stepMode: "instance",
+                      attributes: [
+                        { shaderLocation: 4, offset:  0, format: "float32x4" }, // inst_m0
+                        { shaderLocation: 5, offset: 16, format: "float32x4" }, // inst_m1
+                        { shaderLocation: 6, offset: 32, format: "float32x4" }, // inst_m2
+                        { shaderLocation: 7, offset: 48, format: "float32x4" }, // inst_m3
+                      ],
+                    },
+                  ],
+                },
+                primitive: { topology: "triangle-list", cullMode: "front" },
+                depthStencil: {
+                  format: "depth32float",
+                  depthWriteEnabled: true,
+                  depthCompare: "less",
+                },
+              });
+              st.pipelines[handle] = { pipeline, bgl0, kind: "depth-instanced" };
               break;
             }
             // Depth-only pipeline (wgslDepth): position-only vertex, NO color
@@ -9383,6 +9499,70 @@
           st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
           st.pass.setBindGroup(0, st.wireframeBg0, [wbase]);
           st.pass.drawIndexed(indexCount);
+          break;
+        }
+        case 47: { // DRAW_DEPTH_INSTANCED — N instances into the shadow atlas (WebGPU).
+          // Payload (32B / 8 u32):
+          //   shader | vbuf | ibuf | index_byte_off | index_count |
+          //   instance_ptr | instance_count | light_vp_ptr.
+          // shader resolves to a depth-instanced pipeline (kind "depth-instanced",
+          // two vertex buffers). Writes depth only into the active shadow pass.
+          const shH47 = dv.getUint32(off, true);
+          const vb47 = st.buffers[dv.getUint32(off + 4, true)];
+          const ib47 = st.buffers[dv.getUint32(off + 8, true)];
+          const byteOff47 = dv.getUint32(off + 12, true);
+          const count47 = dv.getUint32(off + 16, true);
+          const instancePtr47 = dv.getUint32(off + 20, true);
+          const instanceCount47 = dv.getUint32(off + 24, true);
+          const lightVpPtr47 = dv.getUint32(off + 28, true);
+          const pipe47 = st.pipelines[shH47];
+          if (!pipe47 || pipe47.kind !== "depth-instanced" || !vb47 || !ib47 || !st.shadowPass) break;
+          // ── Shadow instance buffer — SEPARATE from main draw's st.instanceBuf ──
+          // shadow_instance_scratch (instancePtr47) differs from the main draw's
+          // instance buffer (instUploadedPtr). A dedicated GPUBuffer keeps the two
+          // datasets distinct regardless of draw order within the frame.
+          const instBytes47 = instanceCount47 * 80;
+          if (!st.shadowInstanceBuf || st.shadowInstanceBuf.size < instBytes47) {
+            if (st.shadowInstanceBuf) st.shadowInstanceBuf.destroy();
+            st.shadowInstanceBuf = device.createBuffer({
+              size: instBytes47,
+              usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            });
+            st.depthInstBG = null; // buffer replaced — invalidate cached bind group
+          }
+          if (st.shadowInstUploadedPtr !== instancePtr47 || st.shadowInstUploadedCount !== instanceCount47) {
+            device.queue.writeBuffer(st.shadowInstanceBuf, 0, memory.buffer, instancePtr47, instBytes47);
+            st.shadowInstUploadedPtr = instancePtr47;
+            st.shadowInstUploadedCount = instanceCount47;
+          }
+          // ── Per-draw light-VP uniform: share depth uniform buffer + slot counter ──
+          // st.depthUniform is shared with DRAW_DEPTH (tag 19) and DRAW_DEPTH_AT
+          // (tag 26). st.depthSlot is the frame-scoped counter for all shadow draws.
+          const dslot47 = st.depthSlot++;
+          if (dslot47 >= MAX_DRAWS) break;
+          const dbase47 = dslot47 * DEPTH_STRIDE;
+          // Ensure the depth uniform buffer exists (BEGIN_SHADOW_PASS calls
+          // gpuEnsureDepthUniform with the plain depth pipeline; calling with null
+          // only ensures the buffer without touching st.depthBindGroup).
+          gpuEnsureDepthUniform(st, null);
+          device.queue.writeBuffer(st.depthUniform, dbase47, new Float32Array(memory.buffer, lightVpPtr47, 16));
+          // Lazily create a bind group against the depth-instanced pipeline's bgl0.
+          // A separate BG (st.depthInstBG) avoids using a group whose layout object
+          // belongs to the plain depth pipeline — WebGPU validates layout identity.
+          if (!st.depthInstBG || st.depthInstBGLayout !== pipe47.bgl0) {
+            st.depthInstBG = device.createBindGroup({
+              layout: pipe47.bgl0,
+              entries: [{ binding: 0, resource: { buffer: st.depthUniform, offset: 0, size: 64 } }],
+            });
+            st.depthInstBGLayout = pipe47.bgl0;
+          }
+          // ── Draw: mesh at slot 0, per-instance data at slot 1. ──
+          st.shadowPass.setPipeline(pipe47.pipeline);
+          st.shadowPass.setVertexBuffer(0, vb47.buf);
+          st.shadowPass.setVertexBuffer(1, st.shadowInstanceBuf);
+          st.shadowPass.setIndexBuffer(ib47.buf, "uint16", byteOff47);
+          st.shadowPass.setBindGroup(0, st.depthInstBG, [dbase47]);
+          st.shadowPass.drawIndexed(count47, instanceCount47);
           break;
         }
 
