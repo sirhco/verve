@@ -601,6 +601,26 @@ pub fn depthFragmentSrc() []const u8 {
     ;
 }
 
+/// Instanced depth-only vertex shader for the shadow pass. Reads position (loc 0)
+/// and per-instance model matrix columns (loc 4-7); applies u_vp (light view-proj)
+/// to cast instanced geometry into the shadow atlas. FS: reuse depthFragmentSrc().
+pub fn depthInstancedVertexSrc() []const u8 {
+    return
+    \\#version 300 es
+    \\layout(location = 0) in vec3 a_pos;
+    \\layout(location = 4) in vec4 a_inst_model0;
+    \\layout(location = 5) in vec4 a_inst_model1;
+    \\layout(location = 6) in vec4 a_inst_model2;
+    \\layout(location = 7) in vec4 a_inst_model3;
+    \\uniform mat4 u_vp;
+    \\void main() {
+    \\  mat4 model = mat4(a_inst_model0, a_inst_model1, a_inst_model2, a_inst_model3);
+    \\  gl_Position = u_vp * model * vec4(a_pos, 1.0);
+    \\}
+    \\
+    ;
+}
+
 /// Depth-alpha-test vertex shader for the shadow pass. Like depthVertexSrc but
 /// also passes UV to the fragment stage so the fragment can sample the base
 /// texture and discard transparent pixels. Vertex layout: pos at location 0
@@ -2864,6 +2884,33 @@ pub fn wgslDepth() []const u8 {
     \\@vertex
     \\fn vs_main(@location(0) a_pos: vec3<f32>) -> @builtin(position) vec4<f32> {
     \\  return u.mvp * vec4<f32>(a_pos, 1.0);
+    \\}
+    \\@fragment
+    \\fn fs_main() {}
+    \\
+    ;
+}
+
+/// Instanced depth-only WGSL for the WebGPU shadow pass. Mirrors wgslDepth() but
+/// reads per-instance model columns from @location(4..7) vertex attributes and a
+/// u.vp (light view-proj) uniform so instanced geometry can cast into the shadow
+/// atlas. Parallel to depthInstancedVertexSrc (GLSL). FS writes nothing (depth only).
+pub fn wgslDepthInstanced() []const u8 {
+    return
+    \\struct U {
+    \\  vp: mat4x4<f32>,
+    \\};
+    \\@group(0) @binding(0) var<uniform> u: U;
+    \\@vertex
+    \\fn vs_main(
+    \\  @location(0) a_pos: vec3<f32>,
+    \\  @location(4) inst_m0: vec4<f32>,
+    \\  @location(5) inst_m1: vec4<f32>,
+    \\  @location(6) inst_m2: vec4<f32>,
+    \\  @location(7) inst_m3: vec4<f32>,
+    \\) -> @builtin(position) vec4<f32> {
+    \\  let model = mat4x4<f32>(inst_m0, inst_m1, inst_m2, inst_m3);
+    \\  return u.vp * model * vec4<f32>(a_pos, 1.0);
     \\}
     \\@fragment
     \\fn fs_main() {}
@@ -5515,6 +5562,19 @@ test "golden: shadow-variant GLSL hashes frozen (FNV-1a-64)" {
     // Depth-only shadow-pass shader (unchanged — area lighting is PBR-only).
     try testing.expectEqual(@as(u64, 0x5bd62d643af5c2d5), fnv64(depthVertexSrc()));
     try testing.expectEqual(@as(u64, 0xe43018c9a1312d96), fnv64(depthFragmentSrc()));
+}
+
+test "golden: instanced depth shader hashes frozen (FNV-1a-64)" {
+    // Instanced depth VS (variant_instanced|variant_depth GLSL): pos@0 + per-instance
+    // model columns@4-7 + u_vp uniform; FS reuses depthFragmentSrc() (unchanged).
+    // WGSL: mirrors wgslDepth() but with @location(4..7) per-instance inputs + u.vp.
+    // Pre-existing depth/pbr hashes MUST stay unchanged — these are new additions only.
+    try testing.expectEqual(@as(u64, 0x932046f06cc67e10), fnv64(depthInstancedVertexSrc()));
+    try testing.expectEqual(@as(u64, 0x880fe9ba0e472fa6), fnv64(wgslDepthInstanced()));
+    // Confirm pre-existing depth shaders unchanged.
+    try testing.expectEqual(@as(u64, 0x5bd62d643af5c2d5), fnv64(depthVertexSrc()));
+    try testing.expectEqual(@as(u64, 0xe43018c9a1312d96), fnv64(depthFragmentSrc()));
+    try testing.expectEqual(@as(u64, 0x3bb6cf33bcf5f8b1), fnv64(wgslDepth()));
 }
 
 test "shadow variant adds receiver uniforms; base variant has none" {
