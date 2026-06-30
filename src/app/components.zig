@@ -2360,6 +2360,40 @@ pub fn glSceneInstanced(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-instanced-multi: 8×8 = 64 instances of a two-material cube model.
+/// The model has ONE mesh with TWO primitives (2 glTF materials):
+///   primitive 0 = faces 0-2 → warm orange (baseColorFactor 0.9/0.45/0.1)
+///   primitive 1 = faces 3-5 → cool blue   (baseColorFactor 0.1/0.45/0.9)
+/// EXT_mesh_gpu_instancing carries 64 TRANSLATION/ROTATION/SCALE/_COLOR_0 records,
+/// parsed as model-global → both submeshes are drawn for every instance,
+/// each with its own material. Proves the slice-2 per-submesh instancing path.
+pub fn glSceneInstancedMulti(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/cubefieldmulti.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EMulti-Submesh Instancing%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 22.0, .pitch = 0.55, .yaw = 0.5 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .autoRotate(0.15)
+        .build();
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — multi-submesh GPU instancing"),
+        ctx.p().text("An 8×8 field of 64 two-material cubes instanced in a single " ++
+            "scene command. Each cube model has ONE mesh / TWO primitives: " ++
+            "faces 0-2 use a warm-orange material, faces 3-5 use a cool-blue material. " ++
+            "EXT_mesh_gpu_instancing supplies 64 TRANSLATION/ROTATION/SCALE/_COLOR_0 " ++
+            "records parsed as model-global — both submeshes render on every instance, " ++
+            "each with its own PBR material (slice-2 per-submesh instancing)."),
+        ctx.div().attr("data-ref", "glinstanced-multi-hint").class("hint")
+            .text("64 cubes · 2 submeshes each · 2 materials · per-submesh instanced draw"),
+        scene,
+        ctx.p().text("Drag to orbit · wheel to zoom. Both submeshes appear on every instance " ++
+            "with their respective materials via draw_pbr_instanced (wire tag 27)."),
+    });
+}
+
 /// /gl-fog: 7×7 = 49-cube receding grid with distance fog enabled.
 /// Linear fog from near=8 to far=34 with a soft blue-grey fog colour (0.42,0.5,0.62)
 /// so near cubes stay crisp and farther cubes fade into the haze.

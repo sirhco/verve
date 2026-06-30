@@ -3511,6 +3511,259 @@ pub fn cubeFieldGlb(alloc: Allocator) ![]u8 {
     return glb;
 }
 
+// ── cubeFieldMultiGlb fixture (multi-submesh GPU instancing demo) ─────────────
+/// 8×8 = 64 instances of a unit cube split into TWO primitives (two materials).
+/// One mesh with TWO primitives sharing the same geometry buffers
+/// (POSITION/NORMAL/TEXCOORD_0) but distinct index-accessor windows:
+///   primitive 0 = faces 0-2 (indices [0,18))  → material 0 (warm orange)
+///   primitive 1 = faces 3-5 (indices [18,36)) → material 1 (cool blue)
+/// The EXT_mesh_gpu_instancing node carries TRANSLATION/ROTATION/SCALE/_COLOR_0
+/// accessors for all 64 instances — the parser treats this as model-global and
+/// applies it to every submesh, giving 2 submeshes × 64 instances.
+/// Parses via gltf.parseGlb to: submeshes.len == 2, instance_count == 64.
+/// Feeds the /gl-instanced-multi demo (slice-2 per-submesh instancing proof).
+pub fn cubeFieldMultiGlb(alloc: Allocator) ![]u8 {
+    const INST_COUNT: u32 = 64; // 8×8 grid
+    const GRID_W: u32 = 8;
+    const spacing: f32 = 2.5;
+    const center: f32 = @as(f32, @floatFromInt(GRID_W - 1)) * spacing * 0.5; // 8.75
+
+    // ── 1. BIN layout ─────────────────────────────────────────────────────────
+    // Geom section reuses the shared file-level constants:
+    //   pos@bv_pos_off(0,288), nrm@bv_nrm_off(288,288), uv@bv_uv_off(576,192),
+    //   idx@bv_idx_off(768,72)  — 36 u16 indices shared by both primitives.
+    // No PNG texture — both materials use baseColorFactor only.
+    // Instance accessors start immediately at bv_png_off (840).
+    const inst_trans_off: u32 = bv_png_off; // 840
+    const inst_trans_len: u32 = INST_COUNT * 3 * 4; // 64 × VEC3 f32 = 768
+    const inst_rot_off: u32 = inst_trans_off + inst_trans_len;
+    const inst_rot_len: u32 = INST_COUNT * 4 * 4; // 64 × VEC4 f32 = 1024
+    const inst_scale_off: u32 = inst_rot_off + inst_rot_len;
+    const inst_scale_len: u32 = INST_COUNT * 3 * 4; // 64 × VEC3 f32 = 768
+    const inst_color_off: u32 = inst_scale_off + inst_scale_len;
+    const inst_color_len: u32 = INST_COUNT * 4 * 4; // 64 × VEC4 f32 = 1024
+    const bin_total: u32 = inst_color_off + inst_color_len;
+    const bin_padded: u32 = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // POSITION (24-vertex cube — same as cubeFieldGlb, shared by both primitives)
+    {
+        var o: usize = bv_pos_off;
+        for (faces) |face| {
+            for (face.v) |v| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(v[0]), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(v[1]), .little);
+                std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(v[2]), .little);
+                o += 12;
+            }
+        }
+    }
+    // NORMAL
+    {
+        var o: usize = bv_nrm_off;
+        for (faces) |face| {
+            for (0..4) |_| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(face.nx), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(face.ny), .little);
+                std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(face.nz), .little);
+                o += 12;
+            }
+        }
+    }
+    // TEXCOORD_0
+    {
+        var o: usize = bv_uv_off;
+        for (faces) |_| {
+            for (face_uvs) |uv| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(uv[0]), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(uv[1]), .little);
+                o += 8;
+            }
+        }
+    }
+    // INDICES: 6 faces × 6 indices per face = 36 u16 total (shared buffer).
+    // primitive 0 reads [0,18) → faces 0-2; primitive 1 reads [18,36) → faces 3-5.
+    {
+        var o: usize = bv_idx_off;
+        for (0..6) |fi| {
+            const base: u16 = @intCast(fi * 4);
+            for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |v| {
+                std.mem.writeInt(u16, bin[o..][0..2], base + v, .little);
+                o += 2;
+            }
+        }
+    }
+
+    // TRANSLATION: 8×8 grid, spacing 2.5, y=0
+    {
+        var o: usize = inst_trans_off;
+        for (0..INST_COUNT) |i| {
+            const row: u32 = @intCast(i / GRID_W);
+            const col: u32 = @intCast(i % GRID_W);
+            const tx: f32 = @as(f32, @floatFromInt(col)) * spacing - center;
+            const tz: f32 = @as(f32, @floatFromInt(row)) * spacing - center;
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(tx), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(@as(f32, 0.0)), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(tz), .little);
+            o += 12;
+        }
+    }
+    // ROTATION: per-instance yaw quaternion (axis=+Y, angle = i * 0.25 rad)
+    {
+        var o: usize = inst_rot_off;
+        for (0..INST_COUNT) |i| {
+            const angle: f32 = @as(f32, @floatFromInt(i)) * 0.25;
+            const half: f32 = angle * 0.5;
+            const s: f32 = @sin(half);
+            const c: f32 = @cos(half);
+            // xyzw: x=0, y=sin(half), z=0, w=cos(half)
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(@as(f32, 0.0)), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(s), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(@as(f32, 0.0)), .little);
+            std.mem.writeInt(u32, bin[o + 12 ..][0..4], @bitCast(c), .little);
+            o += 16;
+        }
+    }
+    // SCALE: non-uniform — varying width and height per row/col.
+    {
+        var o: usize = inst_scale_off;
+        for (0..INST_COUNT) |i| {
+            const row: u32 = @intCast(i / GRID_W);
+            const col: u32 = @intCast(i % GRID_W);
+            const sx: f32 = 0.25 + @as(f32, @floatFromInt(col % 4)) * 0.1;
+            const sy: f32 = 0.40 + @as(f32, @floatFromInt(row % 4)) * 0.2;
+            const sz: f32 = sx;
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(sx), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(sy), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(sz), .little);
+            o += 12;
+        }
+    }
+    // _COLOR_0: gradient from warm-red (i=0) to cool-blue (i=63)
+    {
+        var o: usize = inst_color_off;
+        for (0..INST_COUNT) |i| {
+            const t: f32 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(INST_COUNT - 1));
+            const r: f32 = 0.2 + (1.0 - t) * 0.7;
+            const g: f32 = 0.3;
+            const bv: f32 = 0.2 + t * 0.7;
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(r), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(g), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(bv), .little);
+            std.mem.writeInt(u32, bin[o + 12 ..][0..4], @bitCast(@as(f32, 1.0)), .little);
+            o += 16;
+        }
+    }
+
+    // ── 2. JSON ───────────────────────────────────────────────────────────────
+    // Accessor indices:
+    //   0=POS  1=NRM  2=UV  3=IDX_PRIM0  4=IDX_PRIM1  5=TRANS  6=ROT  7=SCALE  8=COLOR
+    // BufferView indices:
+    //   0=pos  1=nrm  2=uv  3=idx  4=trans  5=rot  6=scale  7=color
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    try w.writeAll("{");
+    try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"extensionsUsed\":[\"EXT_mesh_gpu_instancing\"],");
+    try w.writeAll("\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0]}],");
+
+    // Single node with EXT_mesh_gpu_instancing (instance accessors 5-8)
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"CubeFieldMulti\",");
+    try w.writeAll("\"extensions\":{\"EXT_mesh_gpu_instancing\":{\"attributes\":{");
+    try w.writeAll("\"TRANSLATION\":5,\"ROTATION\":6,\"SCALE\":7,\"_COLOR_0\":8");
+    try w.writeAll("}}}}],");
+
+    // Single mesh with TWO primitives sharing geometry, distinct index accessors + materials
+    try w.writeAll("\"meshes\":[{\"name\":\"CubeFieldMultiMesh\",\"primitives\":[{");
+    try w.writeAll("\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},");
+    try w.writeAll("\"indices\":3,\"material\":0},{");
+    try w.writeAll("\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},");
+    try w.writeAll("\"indices\":4,\"material\":1}]}],");
+
+    // 9 accessors: geom (0-4) + instance (5-8)
+    try w.writeAll("\"accessors\":[");
+    // 0: POSITION
+    try w.writeAll("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[-1.0,-1.0,-1.0],\"max\":[1.0,1.0,1.0]},");
+    // 1: NORMAL
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
+    // 2: TEXCOORD_0
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
+    // 3: indices prim 0 — faces 0-2 → [0,18) indices, byteOffset=0
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":18,\"type\":\"SCALAR\"},");
+    // 4: indices prim 1 — faces 3-5 → [18,36) indices, byteOffset=36 (18×2 bytes)
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":36,\"componentType\":5123,\"count\":18,\"type\":\"SCALAR\"},");
+    // 5: TRANSLATION
+    try w.print("{{\"bufferView\":4,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{INST_COUNT});
+    // 6: ROTATION
+    try w.print("{{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC4\"}},", .{INST_COUNT});
+    // 7: SCALE
+    try w.print("{{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{INST_COUNT});
+    // 8: _COLOR_0
+    try w.print("{{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC4\"}}", .{INST_COUNT});
+    try w.writeAll("],");
+
+    // 8 bufferViews: geom (0-3) + instance (4-7) — no PNG bufferView
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_pos_off, bv_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_nrm_off, bv_nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_uv_off, bv_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_idx_off, bv_idx_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ inst_trans_off, inst_trans_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ inst_rot_off, inst_rot_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ inst_scale_off, inst_scale_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ inst_color_off, inst_color_len });
+    try w.writeAll("],");
+
+    // 2 materials — visually distinct baseColorFactor (no texture)
+    try w.writeAll("\"materials\":[");
+    try w.writeAll("{\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.9,0.45,0.1,1.0],\"metallicFactor\":0.1,\"roughnessFactor\":0.4}},");
+    try w.writeAll("{\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.1,0.45,0.9,1.0],\"metallicFactor\":0.1,\"roughnessFactor\":0.6}}");
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}]", .{bin_total});
+    try w.writeAll("}");
+
+    // pad JSON to 4-byte alignment
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── 3. Assemble GLB ───────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42; // B
+    glb[goff + 1] = 0x49; // I
+    glb[goff + 2] = 0x4E; // N
+    glb[goff + 3] = 0x00; // \0
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    return glb;
+}
+
 // ── morphGlb fixture ──────────────────────────────────────────────────────────
 // A minimal quad mesh (4 verts, 6 indices) with 2 morph targets and a LINEAR
 // weight animation "MorphAnim". Used to test gltf morph parsing + vmesh round-trip.
@@ -4736,6 +4989,19 @@ test "cubeFieldGlb: 256 instances round-trip via EXT_mesh_gpu_instancing" {
     try testing.expectEqual(@as(u32, 256), model.instance_count);
     // first and last instance colors differ (varied field)
     try testing.expect(model.instances.len == 256 * 20);
+}
+
+test "cubeFieldMultiGlb: 2 submeshes + 64 instances round-trip via EXT_mesh_gpu_instancing" {
+    const glb = try cubeFieldMultiGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try gltf_mod.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    // Two primitives → two submeshes
+    try testing.expectEqual(@as(usize, 2), model.submeshes.len);
+    // 64 instances (8×8 grid)
+    try testing.expectEqual(@as(u32, 64), model.instance_count);
+    // Instance data: 64 × 20 floats (TRANSLATION 3 + ROTATION 4 + SCALE 3 + COLOR 4 + pad 6)
+    try testing.expect(model.instances.len == 64 * 20);
 }
 
 // ── lodGlb fixture ────────────────────────────────────────────────────────────

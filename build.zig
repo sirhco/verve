@@ -508,6 +508,27 @@ pub fn build(b: *std.Build) void {
     const cubefield_dir = gl_asset_gen_cubefield_run.addOutputDirectoryArg("cubefield");
     gl_asset_gen_cubefield_run.addArg("cubefield");
 
+    // Multi-submesh instancing demo: gen_cubefieldmulti_glb → cubefieldmulti.glb → gl_asset_gen → cubefieldmulti.vmesh.
+    const gen_cubefieldmulti_glb_mod = b.createModule(.{
+        .root_source_file = b.path("tools/gen_cubefieldmulti_glb.zig"),
+        .target = host_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "verve_gl", .module = host_gl_mod },
+        },
+    });
+    const gen_cubefieldmulti_glb_exe = b.addExecutable(.{
+        .name = "verve-gen-cubefieldmulti-glb",
+        .root_module = gen_cubefieldmulti_glb_mod,
+    });
+    const gen_cubefieldmulti_glb_run = b.addRunArtifact(gen_cubefieldmulti_glb_exe);
+    const cubefieldmulti_glb_path = gen_cubefieldmulti_glb_run.addOutputFileArg("cubefieldmulti.glb");
+
+    const gl_asset_gen_cubefieldmulti_run = b.addRunArtifact(gl_asset_gen_exe);
+    gl_asset_gen_cubefieldmulti_run.addFileArg(cubefieldmulti_glb_path);
+    const cubefieldmulti_dir = gl_asset_gen_cubefieldmulti_run.addOutputDirectoryArg("cubefieldmulti");
+    gl_asset_gen_cubefieldmulti_run.addArg("cubefieldmulti");
+
     // Morph-demo asset: gen_morph_glb → morph.glb → gl_asset_gen → morph.vmesh.
     const gen_morph_glb_mod = b.createModule(.{
         .root_source_file = b.path("tools/gen_morph_glb.zig"),
@@ -632,6 +653,7 @@ pub fn build(b: *std.Build) void {
     _ = wf_gl.addCopyFile(double_dir.path(b, "double.vmesh"), "double.vmesh");
     _ = wf_gl.addCopyFile(cubegrid_dir.path(b, "cubegrid.vmesh"), "cubegrid.vmesh");
     _ = wf_gl.addCopyFile(cubefield_dir.path(b, "cubefield.vmesh"), "cubefield.vmesh");
+    _ = wf_gl.addCopyFile(cubefieldmulti_dir.path(b, "cubefieldmulti.vmesh"), "cubefieldmulti.vmesh");
     _ = wf_gl.addCopyFile(morph_dir.path(b, "morph.vmesh"), "morph.vmesh");
     _ = wf_gl.addCopyFile(morph16_dir.path(b, "morph16.vmesh"), "morph16.vmesh");
     _ = wf_gl.addCopyFile(lod_dir.path(b, "lodsphere.vmesh"), "lodsphere.vmesh");
@@ -654,6 +676,7 @@ pub fn build(b: *std.Build) void {
         \\    .{ .name = "double.vmesh", .bytes = @embedFile("double.vmesh") },
         \\    .{ .name = "cubegrid.vmesh", .bytes = @embedFile("cubegrid.vmesh") },
         \\    .{ .name = "cubefield.vmesh", .bytes = @embedFile("cubefield.vmesh") },
+        \\    .{ .name = "cubefieldmulti.vmesh", .bytes = @embedFile("cubefieldmulti.vmesh") },
         \\    .{ .name = "morph.vmesh", .bytes = @embedFile("morph.vmesh") },
         \\    .{ .name = "morph16.vmesh", .bytes = @embedFile("morph16.vmesh") },
         \\    .{ .name = "lodsphere.vmesh", .bytes = @embedFile("lodsphere.vmesh") },
