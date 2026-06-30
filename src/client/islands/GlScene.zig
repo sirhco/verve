@@ -2263,28 +2263,19 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             // Cull + compact: only visible instances land in instance_scratch.
             // The cull runs on the BASE instance matrices (gl.cull is wave-agnostic).
             // To stay conservative w.r.t. the per-instance vertical wave (applied AFTER
-            // compaction below), pad the model AABB's y-extent by the wave amplitude
-            // (inst_wave_amp = 0.15): |wave| ≤ 0.15, so an instance that waves on-screen
-            // can never be culled at its base position → no popping at the frustum edge.
-            const padded_aabb = gl.cull.Aabb{
-                .min = gl.math.Vec3.init(
-                    inst.model_local_aabb.min.x,
-                    inst.model_local_aabb.min.y - inst_wave_amp,
-                    inst.model_local_aabb.min.z,
-                ),
-                .max = gl.math.Vec3.init(
-                    inst.model_local_aabb.max.x,
-                    inst.model_local_aabb.max.y + inst_wave_amp,
-                    inst.model_local_aabb.max.z,
-                ),
-            };
+            // compaction below), pass inst_wave_amp as y_pad_world to the helper.
+            // The pad is applied in WORLD space (after worldAabb), so it is exactly
+            // ±inst_wave_amp world units for every instance regardless of scale_y.
+            // This prevents popping for non-uniform-scale instances (e.g., scale_y < 1)
+            // where a local-space pad would under-cover the wave in world space.
             const blob = a.instances();
             const blob_f32: [*]const f32 = @ptrCast(@alignCast(blob.ptr));
             const n_visible = gl.cull.cullCompactInstances(
                 blob_f32[0 .. n_total * 20],
                 n_total,
-                padded_aabb,
+                inst.model_local_aabb,
                 planes,
+                inst_wave_amp,
                 inst.instance_scratch[0..],
             );
             // Animate: add the per-instance vertical wave to each VISIBLE output record

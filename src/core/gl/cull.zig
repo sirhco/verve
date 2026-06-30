@@ -107,11 +107,18 @@ pub fn aabbInFrustum(planes: [6]Plane, a: Aabb) bool {
 /// `planes`; writes the VISIBLE records (all 20 f32, color included) compactly
 /// into `out`; returns n_visible. Pure: no allocator, no globals. Conservative
 /// — never culls an instance whose world AABB is even partly inside the frustum.
+///
+/// `y_pad_world` expands the world-space AABB by this many units on both the
+/// +y and -y sides before the frustum test. Use it to stay conservative against
+/// a post-transform vertical animation of up to that amplitude. The pad is
+/// applied in WORLD space after `worldAabb`, so it is scale-independent: a pad
+/// of 0.15 always covers a ±0.15 world-unit wave regardless of scale_y.
 pub fn cullCompactInstances(
     blob: []const f32,
     n: u32,
     model_aabb: Aabb,
     planes: [6]Plane,
+    y_pad_world: f32,
     out: [][20]f32,
 ) u32 {
     var n_visible: u32 = 0;
@@ -120,7 +127,9 @@ pub fn cullCompactInstances(
         const rec: [20]f32 = blob[i * 20 ..][0..20].*;
         // Instance world matrix = the record's first 16 floats (col-major mat4).
         const mat = math.Mat4{ .m = rec[0..16].* };
-        const wbox = worldAabb(model_aabb, mat);
+        var wbox = worldAabb(model_aabb, mat);
+        wbox.min.y -= y_pad_world;
+        wbox.max.y += y_pad_world;
         if (aabbInFrustum(planes, wbox)) {
             out[n_visible] = rec;
             n_visible += 1;
@@ -218,7 +227,7 @@ test "cullCompactInstances: in-frustum kept, out-of-frustum culled, compacted in
     };
 
     var out: [8][20]f32 = undefined;
-    const n_visible = cullCompactInstances(&blob, 3, model_aabb, planes, out[0..]);
+    const n_visible = cullCompactInstances(&blob, 3, model_aabb, planes, 0, out[0..]);
 
     // Instances 0 and 2 are visible; instance 1 (x=100) is culled.
     try testing.expectEqual(@as(u32, 2), n_visible);
@@ -239,8 +248,45 @@ test "cullCompactInstances: in-frustum kept, out-of-frustum culled, compacted in
         1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 500, 0, 0, 1, 1, 1, 1, 1,
         1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 500, 0, 0, 1, 1, 1, 1, 1,
     };
-    const n_zero = cullCompactInstances(&blob_all_out, 2, model_aabb, planes, out[0..]);
+    const n_zero = cullCompactInstances(&blob_all_out, 2, model_aabb, planes, 0, out[0..]);
     try testing.expectEqual(@as(u32, 0), n_zero);
+}
+
+test "cullCompactInstances: y_pad_world is scale-independent (world-space pad)" {
+    // Camera at z=5 looking at origin, 90° FOV.  Top frustum plane in world
+    // space: y_w + z_w <= 5  (derived from PV via Gribb-Hartmann).
+    const proj = math.Mat4.perspective(std.math.pi / 2.0, 1.0, 0.1, 100.0);
+    const view = math.Mat4.lookAt(
+        math.Vec3.init(0, 0, 5),
+        math.Vec3.init(0, 0, 0),
+        math.Vec3.init(0, 1, 0),
+    );
+    const planes = frustumPlanes(proj.mul(view));
+    const model_aabb = unitBoxAt(0, 0, 0, 0.5); // unit box at local origin
+
+    // Instance: scale_y = 0.3, translation = (0, 3.72, 2.0).
+    // World AABB y: [3.57, 3.87], z: [1.5, 2.5].
+    // Top-plane p-vertex: min.y + min.z = 3.57 + 1.5 = 5.07 > 5 → OUTSIDE → culled.
+    // With y_pad_world = 0.15: world AABB y expands to [3.42, 4.02].
+    // New p-vertex: 3.42 + 1.5 = 4.92 < 5 → INSIDE → kept.
+    // Scale-independence proof: a local-space ±0.15 pad scaled by 0.3 gives only
+    // ±0.045 in world space, leaving 5.07 - 0.045 = 5.025 > 5 (still culled).
+    // The world-space pad is always exactly 0.15, so it covers any ±0.15 wave.
+    const small_scale_blob = [_]f32{
+        // col-major mat4: scale_x=1 scale_y=0.3 scale_z=1, tx=0 ty=3.72 tz=2.0
+        1, 0, 0, 0, 0, 0.3, 0, 0, 0, 0, 1, 0, 0, 3.72, 2.0, 1,
+        0, 0, 0, 1, // rgba
+    };
+
+    var out2: [4][20]f32 = undefined;
+
+    // pad = 0: p-vertex outside top plane → culled.
+    const n_pad0 = cullCompactInstances(&small_scale_blob, 1, model_aabb, planes, 0, out2[0..]);
+    try testing.expectEqual(@as(u32, 0), n_pad0);
+
+    // pad = 0.15: world y expanded by 0.15 → p-vertex inside → kept.
+    const n_pad15 = cullCompactInstances(&small_scale_blob, 1, model_aabb, planes, 0.15, out2[0..]);
+    try testing.expectEqual(@as(u32, 1), n_pad15);
 }
 
 test "light-frustum cull: out-of-volume AABB culled, in-volume kept" {
