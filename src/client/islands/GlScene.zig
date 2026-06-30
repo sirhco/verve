@@ -312,8 +312,9 @@ const Inst = struct {
     // GPU-resource registry for context-restore replay (cap 80; morph adds 16 more
     // shader variants + 1 morph tex: 2 buf + 36 shader + depth + depth_at + shadow
     // + 8 tex + 1 morph_tex + 3 IBL = 54 max; 80 gives comfortable headroom).
-    // Wireframe adds +1 buf + 1 shader (wire_ibuf + wire_shader) — still under 80.
-    registry: gl.Registry(80) = .{},
+    // Wireframe adds +1 buf + 1 shader (wire_ibuf + wire_shader).
+    // 4A3 instanced+shadow adds up to 4 more shader records → bumped from 80 to 96.
+    registry: gl.Registry(96) = .{},
     resources_sent: bool = false,
     needs_replay: bool = false,
 
@@ -642,6 +643,12 @@ fn shaderHandleFor(variant: u32) u32 {
         variant_pbr | variant_em | variant_at | variant_ds | variant_clip => 83,
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_clip => 84,
         variant_pbr | variant_inst | variant_clip => 85,
+        // Instanced+shadow receiver variants (4A3): handle 86 = wireframe (standalone, not in this table).
+        // Instanced base PBR only (no nm/em/at/ds); fog and clip combos match the instanced draw's capabilities.
+        variant_pbr | variant_inst | gl.command.variant_shadow => 87,
+        variant_pbr | variant_inst | gl.command.variant_shadow | variant_fog => 88,
+        variant_pbr | variant_inst | gl.command.variant_shadow | variant_clip => 89,
+        variant_pbr | variant_inst | gl.command.variant_shadow | variant_fog | variant_clip => 90,
         else => unreachable,
     };
 }
@@ -809,6 +816,11 @@ fn createShaderForVariant(inst: *Inst, enc: *gl.Encoder, variant: u32) void {
         variant_pbr | variant_em | variant_at | variant_ds | variant_clip => emitShader(inst, enc, variant_pbr | variant_em | variant_at | variant_ds | variant_clip),
         variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_clip => emitShader(inst, enc, variant_pbr | variant_nm | variant_em | variant_at | variant_ds | variant_clip),
         variant_pbr | variant_inst | variant_clip => emitInstancedShader(inst, enc), // clip-aware instanced (handle 85)
+        // Instanced+shadow receiver variants (4A3 — handles 87–90):
+        variant_pbr | variant_inst | gl.command.variant_shadow => emitInstancedShadowShader(inst, enc),
+        variant_pbr | variant_inst | gl.command.variant_shadow | variant_fog => emitInstancedShadowShader(inst, enc),
+        variant_pbr | variant_inst | gl.command.variant_shadow | variant_clip => emitInstancedShadowShader(inst, enc),
+        variant_pbr | variant_inst | gl.command.variant_shadow | variant_fog | variant_clip => emitInstancedShadowShader(inst, enc),
         else => unreachable,
     }
 }
@@ -878,14 +890,30 @@ fn emitDepthAtShader(inst: *Inst, enc: *gl.Encoder) void {
     inst.registry.recordShader(depth_at_shader, gl.command.variant_depth | gl.command.variant_alpha_test, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
 }
 
-// T6: Instanced shader — must NOT add variant_shadow (vp/light_vp slot collision →
-// @compileError in both GLSL and WGSL paths). Handle 19 without fog, 36 with fog.
+// T6: Instanced shader (non-shadow path) — handle 19 without fog, 36 with fog, 85 with clip.
 // Uses a comptime-branched helper to keep the variant comptime-known for wgslPbr/pbrVertexSrc.
 fn emitInstancedShader(inst: *Inst, enc: *gl.Encoder) void {
     if (inst.fog_enabled) {
         emitInstancedShaderVariant(inst, enc, variant_pbr | variant_inst | variant_fog);
     } else {
         emitInstancedShaderVariant(inst, enc, variant_pbr | variant_inst);
+    }
+}
+
+// T6+shadow: instanced shadow-receiver shader (4A3) — handle 87 base, 88 fog, 89 clip, 90 fog+clip.
+// The variant carries gl.command.variant_shadow so the bridge feeds shadow_vp + binds the atlas.
+// Pre-emitted at asset load alongside the non-shadow variant so the frame draw path can select
+// either at runtime based on n_2d_casters without waiting for another asset-ready event.
+fn emitInstancedShadowShader(inst: *Inst, enc: *gl.Encoder) void {
+    const vs = gl.command.variant_shadow;
+    if (inst.fog_enabled and clipActive(inst)) {
+        emitInstancedShaderVariant(inst, enc, variant_pbr | variant_inst | vs | variant_fog | variant_clip);
+    } else if (inst.fog_enabled) {
+        emitInstancedShaderVariant(inst, enc, variant_pbr | variant_inst | vs | variant_fog);
+    } else if (clipActive(inst)) {
+        emitInstancedShaderVariant(inst, enc, variant_pbr | variant_inst | vs | variant_clip);
+    } else {
+        emitInstancedShaderVariant(inst, enc, variant_pbr | variant_inst | vs);
     }
 }
 
@@ -2297,12 +2325,19 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             if (n_visible > 0) {
                 // Pipeline/lights/IBL/shadow/fog/clip binds are identical for all submeshes
                 // (same variant, same environment) — emit ONCE before the per-submesh loop.
-                enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0) | (if (clipActive(inst)) variant_clip else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
+                // Shadow receiver: when 2D casters are present use the shadow-capable handle
+                // (87–90); otherwise fall back to the non-shadow handle (19/36/85).
+                // This mirrors the non-instanced predicate (n_2d_casters > 0 → shadow bit).
+                enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst |
+                    (if (inst.fog_enabled) variant_fog else 0) |
+                    (if (clipActive(inst)) variant_clip else 0) |
+                    (if (inst.n_2d_casters > 0) gl.command.variant_shadow else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
                 enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
                 enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
-                // Instanced shader is a non-receiver (variant_shadow{,_point} are
-                // @compileError with variant_inst), so these binds are inert on the
-                // shader side; emitted for stream uniformity with the new signatures.
+                // When variant_shadow is set (n_2d_casters > 0) the bridge feeds shadow_vp
+                // and binds the atlas via the pipeline's variant flag — these binds are live.
+                // When no casters (non-shadow handle), bindShadowResources sends count=0 which
+                // is harmless (bridge guards on count before sampling).
                 bindShadowResources(inst, &enc);
                 if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
                 if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
@@ -2685,11 +2720,13 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     inst.morph_enabled = morph_target_count > 0;
 
     // Create + record only the distinct shader variants the mesh actually uses.
-    // [86]: slots 20–35 = base/ds fog variants; slot 36 = instanced+fog;
+    // [91]: slots 20–35 = base/ds fog variants; slot 36 = instanced+fog;
     //        slots 37–52 = base/ds morph variants (M7);
     //        slots 53–68 = base/ds point-shadow receiver variants (P11 task 5);
     //        slots 69–84 = base/ds clip variants; slot 85 = instanced+clip.
-    var shader_seen: [86]bool = .{false} ** 86;
+    //        slot 86 = wire_shader (NOT tracked here; handled separately).
+    //        slots 87–90 = instanced+shadow receiver variants (4A3).
+    var shader_seen: [91]bool = .{false} ** 91;
     var sv: u32 = 0;
     while (sv < a.submesh_count) : (sv += 1) {
         if (sv >= max_submesh) break;
@@ -2720,13 +2757,21 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
         }
     }
 
-    // T6: emit the instanced shader if this mesh carries an instances section.
-    // Use fog-aware handle (19 without fog, 36 with fog, 85 with clip). Morph+instanced
-    // is not supported (both backends @compileError) so no variant_morph here.
+    // T6: emit the instanced shader(s) if this mesh carries an instances section.
+    // Non-shadow handle: 19 (base), 36 (fog), 85 (clip). Morph+instanced is not supported.
+    // Shadow handle: 87 (base), 88 (fog), 89 (clip), 90 (fog+clip) — pre-emitted at load
+    // so the per-frame draw path can select either handle based on n_2d_casters at runtime.
     const inst_handle: usize = shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0) | (if (clipActive(inst)) variant_clip else 0));
-    if (a.instanceCount() > 0 and !shader_seen[inst_handle]) {
-        emitInstancedShader(inst, enc);
-        shader_seen[inst_handle] = true;
+    const inst_shadow_handle: usize = shaderHandleFor(variant_pbr | variant_inst | gl.command.variant_shadow | (if (inst.fog_enabled) variant_fog else 0) | (if (clipActive(inst)) variant_clip else 0));
+    if (a.instanceCount() > 0) {
+        if (!shader_seen[inst_handle]) {
+            emitInstancedShader(inst, enc);
+            shader_seen[inst_handle] = true;
+        }
+        if (!shader_seen[inst_shadow_handle]) {
+            emitInstancedShadowShader(inst, enc);
+            shader_seen[inst_shadow_handle] = true;
+        }
     }
 
     // M7: create the morph data texture (ONCE — width=vertexCount, height=targetCount*3).
@@ -3132,6 +3177,32 @@ test "clip handle table covers every emitted clip combo" {
     // All 17 clip handles must be assigned (69..85 inclusive).
     var hi: u32 = 69;
     while (hi <= 85) : (hi += 1) {
+        try std.testing.expect(seen[hi]);
+    }
+}
+
+test "instanced-shadow handle table covers every emitted instanced+shadow combo" {
+    // 4A3: 4 instanced+shadow receiver variants (base+shadow, fog+shadow, clip+shadow, fog+clip+shadow).
+    // Handles 87–90; handle 86 = wireframe (standalone, not in this table).
+    // shaderHandleFor and createShaderForVariant MUST cover the same set.
+    const vs = gl.command.variant_shadow;
+    const combos = [_]u32{
+        variant_pbr | variant_inst | vs,
+        variant_pbr | variant_inst | vs | variant_fog,
+        variant_pbr | variant_inst | vs | variant_clip,
+        variant_pbr | variant_inst | vs | variant_fog | variant_clip,
+    };
+    // Instanced+shadow handles 87–90; seen array sized to cover that range.
+    var seen = [_]bool{false} ** 91;
+    for (combos) |v| {
+        const h = shaderHandleFor(v);
+        try std.testing.expect(h >= 87 and h < seen.len);
+        try std.testing.expect(!seen[h]); // distinct
+        seen[h] = true;
+    }
+    // All 4 instanced+shadow handles must be assigned (87..90 inclusive).
+    var hi: u32 = 87;
+    while (hi <= 90) : (hi += 1) {
         try std.testing.expect(seen[hi]);
     }
 }
