@@ -2033,23 +2033,23 @@ pub fn glSceneCsm(ctx: *const verve.Context) !*verve.Node {
 }
 
 /// /gl-instanced-shadow: Slice 4 capstone — instanced geometry that BOTH casts AND
-/// receives directional shadows. A 16×16 field of 256 pillars (cubefield.vmesh, the
-/// non-uniform-scale fixture from slice 1) is lit by a single raking directional caster
-/// with `casts_shadow = true`: taller pillars cast shadows onto shorter neighbours and
-/// each pillar receives shadows from those around it. Both the shadow depth pass and the
-/// main PBR pass use the instanced draw path (`draw_depth_instanced` / `draw_pbr_instanced`).
+/// receives directional shadows. cubeshadow.vmesh has 9 instances of the same unit cube:
+/// instance 0 is a WIDE FLAT FLOOR SLAB (receiver) and instances 1–8 are TALL PILLARS
+/// standing on it that cast clearly-visible diagonal shadows across open slab area.
+/// A single raking directional light (`casts_shadow = true`) drives both the instanced
+/// shadow depth pass (`draw_depth_instanced`) and the instanced PBR pass
+/// (`draw_pbr_instanced`) — one draw call each, WebGL2 and WebGPU backends.
 ///
-/// FRAMING NOTE: the camera distance (38.0) is chosen so ALL 256 instances remain inside
-/// the frustum through the full auto-orbit. This is required because per-instance frustum
-/// culling (slice 3) renumbers the visible-instance buffer by compaction order, while the
-/// shadow pass records shadows keyed by original instance index. If any instance were
-/// culled from the main draw, its shadow index would no longer align with its draw index
-/// (known v1 limitation — "All instances are kept in frame — per-instance frustum culling
-/// would desync the shadow wave-phase from the mesh (v2 fix)"). At distance 38 the whole
-/// ~37-unit-wide field fits well inside the frustum so n_visible == n_total at all times.
+/// FRAMING NOTE: the camera is positioned to frame the whole slab so all pillar shadows
+/// fall on visible open slab area. ALL 9 instances remain inside the frustum at all times.
+/// This is required because per-instance frustum culling (slice 3) renumbers the
+/// visible-instance buffer by compaction order, while the shadow pass records shadows keyed
+/// by original instance index. If any instance were culled, its shadow index would no longer
+/// align with its draw index (known v1 limitation — "All instances are kept in frame —
+/// per-instance frustum culling would desync the shadow wave-phase from the mesh (v2 fix)").
 pub fn glSceneInstancedShadow(ctx: *const verve.Context) !*verve.Node {
-    // Single raking directional caster — same direction as the CSM demo so pillars
-    // cast visible diagonal shadows onto their shorter neighbours (upper-left rake).
+    // Single raking directional caster — light from upper-left so pillar shadows
+    // fall diagonally across the open slab area between pillars.
     const lights = [_]verve.GlLight{
         .{
             .kind = .directional,
@@ -2061,17 +2061,16 @@ pub fn glSceneInstancedShadow(ctx: *const verve.Context) !*verve.Node {
     };
 
     const island_node = ctx.glScene(.{
-        .src = "/gl/cubefield.vmesh",
+        .src = "/gl/cubeshadow.vmesh",
         .env = "/gl/studio.venv",
         .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='40' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EInstanced Shadows%3C/text%3E%3C/svg%3E",
     })
-        // Generous distance so ALL 256 instances fit inside the frustum — required to
-        // keep n_visible == n_total (no compaction reorder, shadow indices stay aligned).
-        .camera(.{ .distance = 38.0, .pitch = 0.45, .yaw = 0.5 })
+        // Lower pitch + generous distance: frame the whole slab so pillar shadows
+        // land on visible open slab between the pillars. All 9 instances stay in frustum.
+        .camera(.{ .distance = 22.0, .pitch = 0.25, .yaw = 0.5 })
         .lights(&lights)
-        // Safe to auto-rotate: at distance 38 the ~37-unit-wide field stays fully
-        // in-frame through the full orbit.
-        .autoRotate(0.15)
+        // Slow rotation keeps the slab + shadows framed and readable.
+        .autoRotate(0.08)
         .build();
 
     const scene_box = ctx.div().class("gl-wrap").children(.{
@@ -2082,14 +2081,11 @@ pub fn glSceneInstancedShadow(ctx: *const verve.Context) !*verve.Node {
 
     return ctx.main_().class("home gl-scene-page").children(.{
         ctx.h1("verve.gl — Instanced Shadows (slice 4)"),
-        ctx.p().text("Slice 4 capstone: GPU-instanced geometry that BOTH casts AND " ++
-            "receives directional (CSM) shadows. A 16\u{00d7}16 field of 256 pillars " ++
-            "is lit by a single raking directional light with shadow casting enabled. " ++
-            "Taller pillars cast diagonal shadows onto shorter neighbours and each pillar " ++
-            "receives shadows from those around it. Both the shadow depth pass and the " ++
-            "main PBR pass use the instanced draw path, so the GPU issues one instanced " ++
-            "draw for all 256 casters in the depth phase and one instanced draw for all " ++
-            "256 receivers in the color phase — WebGL2 and WebGPU backends."),
+        ctx.p().text("Slice 4 capstone: GPU-instanced cubes — one scaled into a wide " ++
+            "floor slab, the rest tall pillars casting directional shadows onto it " ++
+            "(instanced cast + receive). A single raking directional light drives both " ++
+            "the instanced shadow depth pass and the instanced PBR pass — one draw call " ++
+            "each, WebGL2 and WebGPU backends."),
         scene_box,
         ctx.p().class("hint")
             .text("Drag to orbit \u{00b7} wheel to zoom. " ++

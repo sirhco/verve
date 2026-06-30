@@ -3764,6 +3764,283 @@ pub fn cubeFieldMultiGlb(alloc: Allocator) ![]u8 {
     return glb;
 }
 
+// ── cubeShadowFieldGlb fixture (instanced-shadow demo) ────────────────────────
+/// 9 instances of a single unit cube, hand-placed to showcase instanced cast + receive
+/// shadows: instance 0 is a WIDE FLAT SLAB (floor receiver) and instances 1–8 are TALL
+/// PILLARS standing on it that cast clearly-visible directional shadows across the open
+/// slab area between them.
+///
+/// Layout (all resting on the slab whose top is at y = 0):
+///   Instance 0 — floor slab: translation (0, -0.25, 0), scale (14, 0.25, 14),
+///                colour (0.80, 0.80, 0.85) — neutral grey-blue so cast shadows read.
+///   Instances 1–8 — pillars: scale (0.5, H, 0.5), ty = H (base at y = 0),
+///                varied x/z positions spread across the slab, varied heights and
+///                colours. A directional light raking from (-0.55, -0.72, -0.42)
+///                throws each pillar's shadow diagonally onto open slab between pillars.
+///
+/// Parses via gltf.parseGlb to: instance_count == 9, submeshes.len == 1.
+/// Feeds the /gl-instanced-shadow demo (instanced cast + receive proof).
+pub fn cubeShadowFieldGlb(alloc: Allocator) ![]u8 {
+    // Instance table: { tx, ty, tz, sx, sy, sz, r, g, b }
+    // For pillars ty == sy (half-height in world units) so base rests at y = 0.
+    const InstData = struct { tx: f32, ty: f32, tz: f32, sx: f32, sy: f32, sz: f32, r: f32, g: f32, b: f32 };
+    const instances = [9]InstData{
+        // 0: wide flat floor slab — top at y=0 (center y=-0.25, sy=0.25)
+        .{ .tx = 0.0, .ty = -0.25, .tz = 0.0, .sx = 14.0, .sy = 0.25, .sz = 14.0, .r = 0.80, .g = 0.80, .b = 0.85 },
+        // 1: red-orange pillar, left-front
+        .{ .tx = -5.0, .ty = 1.5, .tz = -4.0, .sx = 0.5, .sy = 1.5, .sz = 0.5, .r = 0.90, .g = 0.35, .b = 0.30 },
+        // 2: green pillar, right-front
+        .{ .tx = 2.0, .ty = 2.0, .tz = -5.0, .sx = 0.5, .sy = 2.0, .sz = 0.5, .r = 0.35, .g = 0.80, .b = 0.40 },
+        // 3: blue pillar, far right
+        .{ .tx = 5.5, .ty = 1.8, .tz = -1.5, .sx = 0.5, .sy = 1.8, .sz = 0.5, .r = 0.40, .g = 0.50, .b = 0.90 },
+        // 4: yellow pillar, left-centre — long shadow across open slab
+        .{ .tx = -2.5, .ty = 2.5, .tz = 1.0, .sx = 0.5, .sy = 2.5, .sz = 0.5, .r = 0.90, .g = 0.80, .b = 0.25 },
+        // 5: purple pillar, back-left
+        .{ .tx = -5.5, .ty = 1.6, .tz = 4.5, .sx = 0.5, .sy = 1.6, .sz = 0.5, .r = 0.75, .g = 0.35, .b = 0.90 },
+        // 6: cyan pillar, back-right
+        .{ .tx = 4.0, .ty = 2.2, .tz = 4.5, .sx = 0.5, .sy = 2.2, .sz = 0.5, .r = 0.25, .g = 0.80, .b = 0.80 },
+        // 7: orange pillar, back-centre (tallest — casts the longest shadow)
+        .{ .tx = 1.0, .ty = 3.0, .tz = 3.5, .sx = 0.5, .sy = 3.0, .sz = 0.5, .r = 0.90, .g = 0.55, .b = 0.20 },
+        // 8: lime pillar, left-centre-front
+        .{ .tx = -3.5, .ty = 1.4, .tz = -2.0, .sx = 0.5, .sy = 1.4, .sz = 0.5, .r = 0.55, .g = 0.90, .b = 0.35 },
+    };
+    const INST_COUNT: u32 = instances.len;
+
+    // ── 1. Shared base-colour texture (8×8 checkerboard) ─────────────────────
+    var checker = [_]u8{0} ** (8 * 8 * 4);
+    for (0..8) |row| {
+        for (0..8) |col| {
+            const idx = (row * 8 + col) * 4;
+            const light = (row + col) % 2 == 0;
+            checker[idx + 0] = if (light) @as(u8, 210) else 70;
+            checker[idx + 1] = if (light) @as(u8, 210) else 70;
+            checker[idx + 2] = if (light) @as(u8, 215) else 80;
+            checker[idx + 3] = 255;
+        }
+    }
+    const tex_png = try png.encodeRgba(alloc, &checker, 8, 8);
+    defer alloc.free(tex_png);
+
+    // ── 2. BIN layout ─────────────────────────────────────────────────────────
+    // Geom section reuses the shared file-level constants:
+    //   pos@bv_pos_off(0,288), nrm@bv_nrm_off(288,288), uv@bv_uv_off(576,192),
+    //   idx@bv_idx_off(768,72). PNG at bv_png_off (840).
+    // Instance accessors start after PNG, 4-byte aligned.
+    const png_len: u32 = @intCast(tex_png.len);
+    const inst_trans_off: u32 = (bv_png_off + png_len + 3) & ~@as(u32, 3);
+    const inst_trans_len: u32 = INST_COUNT * 3 * 4; // 9 × VEC3 f32
+    const inst_rot_off: u32 = inst_trans_off + inst_trans_len;
+    const inst_rot_len: u32 = INST_COUNT * 4 * 4; // 9 × VEC4 f32
+    const inst_scale_off: u32 = inst_rot_off + inst_rot_len;
+    const inst_scale_len: u32 = INST_COUNT * 3 * 4; // 9 × VEC3 f32
+    const inst_color_off: u32 = inst_scale_off + inst_scale_len;
+    const inst_color_len: u32 = INST_COUNT * 4 * 4; // 9 × VEC4 f32
+    const bin_total: u32 = inst_color_off + inst_color_len;
+    const bin_padded: u32 = (bin_total + 3) & ~@as(u32, 3);
+
+    var bin = try alloc.alloc(u8, bin_padded);
+    defer alloc.free(bin);
+    @memset(bin, 0);
+
+    // POSITION (shared 24-vertex unit cube)
+    {
+        var o: usize = bv_pos_off;
+        for (faces) |face| {
+            for (face.v) |v| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(v[0]), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(v[1]), .little);
+                std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(v[2]), .little);
+                o += 12;
+            }
+        }
+    }
+    // NORMAL
+    {
+        var o: usize = bv_nrm_off;
+        for (faces) |face| {
+            for (0..4) |_| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(face.nx), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(face.ny), .little);
+                std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(face.nz), .little);
+                o += 12;
+            }
+        }
+    }
+    // TEXCOORD_0
+    {
+        var o: usize = bv_uv_off;
+        for (faces) |_| {
+            for (face_uvs) |uv| {
+                std.mem.writeInt(u32, bin[o..][0..4], @bitCast(uv[0]), .little);
+                std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(uv[1]), .little);
+                o += 8;
+            }
+        }
+    }
+    // indices: 6 faces × 6 indices = 36 u16
+    {
+        var o: usize = bv_idx_off;
+        for (0..6) |fi| {
+            const base: u16 = @intCast(fi * 4);
+            for ([6]u16{ 0, 1, 2, 0, 2, 3 }) |k| {
+                std.mem.writeInt(u16, bin[o..][0..2], base + k, .little);
+                o += 2;
+            }
+        }
+    }
+    // PNG
+    @memcpy(bin[bv_png_off..][0..tex_png.len], tex_png);
+
+    // TRANSLATION: hand-placed slab + pillars
+    {
+        var o: usize = inst_trans_off;
+        for (instances) |inst| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(inst.tx), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(inst.ty), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(inst.tz), .little);
+            o += 12;
+        }
+    }
+    // ROTATION: identity for all instances (xyzw = 0,0,0,1)
+    {
+        var o: usize = inst_rot_off;
+        for (0..INST_COUNT) |_| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(@as(f32, 0.0)), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(@as(f32, 0.0)), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(@as(f32, 0.0)), .little);
+            std.mem.writeInt(u32, bin[o + 12 ..][0..4], @bitCast(@as(f32, 1.0)), .little);
+            o += 16;
+        }
+    }
+    // SCALE: hand-placed (slab wide+flat, pillars thin+tall)
+    {
+        var o: usize = inst_scale_off;
+        for (instances) |inst| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(inst.sx), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(inst.sy), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(inst.sz), .little);
+            o += 12;
+        }
+    }
+    // _COLOR_0: varied colour per instance (alpha = 1.0)
+    {
+        var o: usize = inst_color_off;
+        for (instances) |inst| {
+            std.mem.writeInt(u32, bin[o..][0..4], @bitCast(inst.r), .little);
+            std.mem.writeInt(u32, bin[o + 4 ..][0..4], @bitCast(inst.g), .little);
+            std.mem.writeInt(u32, bin[o + 8 ..][0..4], @bitCast(inst.b), .little);
+            std.mem.writeInt(u32, bin[o + 12 ..][0..4], @bitCast(@as(f32, 1.0)), .little);
+            o += 16;
+        }
+    }
+
+    // ── 3. JSON ────────────────────────────────────────────────────────────────
+    // Accessor indices:
+    //   0=POS  1=NRM  2=UV  3=IDX  4=TRANS  5=ROT  6=SCALE  7=COLOR
+    // BufferView indices:
+    //   0=pos  1=nrm  2=uv  3=idx  4=png  5=trans  6=rot  7=scale  8=color
+    var json_aw: std.Io.Writer.Allocating = .init(alloc);
+    defer json_aw.deinit();
+    const w = &json_aw.writer;
+
+    try w.writeAll("{");
+    try w.writeAll("\"asset\":{\"version\":\"2.0\"},");
+    try w.writeAll("\"extensionsUsed\":[\"EXT_mesh_gpu_instancing\"],");
+    try w.writeAll("\"scene\":0,");
+    try w.writeAll("\"scenes\":[{\"nodes\":[0]}],");
+
+    // Single node with EXT_mesh_gpu_instancing
+    try w.writeAll("\"nodes\":[{\"mesh\":0,\"name\":\"CubeShadow\",");
+    try w.writeAll("\"extensions\":{\"EXT_mesh_gpu_instancing\":{\"attributes\":{");
+    try w.writeAll("\"TRANSLATION\":4,\"ROTATION\":5,\"SCALE\":6,\"_COLOR_0\":7");
+    try w.writeAll("}}}}],");
+
+    // Single mesh
+    try w.writeAll("\"meshes\":[{\"name\":\"CubeShadowMesh\",\"primitives\":[{");
+    try w.writeAll("\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},");
+    try w.writeAll("\"indices\":3,\"material\":0}]}],");
+
+    // 8 accessors: geom (0-3) + instance (4-7)
+    try w.writeAll("\"accessors\":[");
+    // 0: POSITION
+    try w.writeAll("{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\",\"min\":[-1.0,-1.0,-1.0],\"max\":[1.0,1.0,1.0]},");
+    // 1: NORMAL
+    try w.writeAll("{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC3\"},");
+    // 2: TEXCOORD_0
+    try w.writeAll("{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":24,\"type\":\"VEC2\"},");
+    // 3: indices
+    try w.writeAll("{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5123,\"count\":36,\"type\":\"SCALAR\"},");
+    // 4: TRANSLATION
+    try w.print("{{\"bufferView\":5,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{INST_COUNT});
+    // 5: ROTATION
+    try w.print("{{\"bufferView\":6,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC4\"}},", .{INST_COUNT});
+    // 6: SCALE
+    try w.print("{{\"bufferView\":7,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC3\"}},", .{INST_COUNT});
+    // 7: _COLOR_0
+    try w.print("{{\"bufferView\":8,\"byteOffset\":0,\"componentType\":5126,\"count\":{d},\"type\":\"VEC4\"}}", .{INST_COUNT});
+    try w.writeAll("],");
+
+    // 9 bufferViews: geom (0-3) + png (4) + instance (5-8)
+    try w.writeAll("\"bufferViews\":[");
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_pos_off, bv_pos_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_nrm_off, bv_nrm_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_uv_off, bv_uv_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_idx_off, bv_idx_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ bv_png_off, png_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ inst_trans_off, inst_trans_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ inst_rot_off, inst_rot_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}},", .{ inst_scale_off, inst_scale_len });
+    try w.print("{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}", .{ inst_color_off, inst_color_len });
+    try w.writeAll("],");
+
+    try w.print("\"buffers\":[{{\"byteLength\":{d}}}],", .{bin_total});
+
+    // Material
+    try w.writeAll("\"materials\":[{\"pbrMetallicRoughness\":{");
+    try w.writeAll("\"baseColorTexture\":{\"index\":0},");
+    try w.writeAll("\"baseColorFactor\":[1.0,1.0,1.0,1.0],");
+    try w.writeAll("\"metallicFactor\":0.0,\"roughnessFactor\":0.8");
+    try w.writeAll("}}],");
+
+    try w.writeAll("\"textures\":[{\"source\":0}],");
+    try w.print("\"images\":[{{\"bufferView\":4,\"mimeType\":\"image/png\"}}]", .{});
+    try w.writeAll("}");
+
+    // pad JSON to 4-byte alignment
+    while (json_aw.writer.end % 4 != 0) try w.writeByte(0x20);
+
+    const json_bytes = try json_aw.toOwnedSlice();
+    defer alloc.free(json_bytes);
+    const json_len: u32 = @intCast(json_bytes.len);
+
+    // ── 4. Assemble GLB ───────────────────────────────────────────────────────
+    const glb_len: u32 = 12 + 8 + json_len + 8 + bin_padded;
+    var glb = try alloc.alloc(u8, glb_len);
+    var goff: usize = 0;
+    @memcpy(glb[goff..][0..4], "glTF");
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], 2, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], glb_len, .little);
+    goff += 4;
+    std.mem.writeInt(u32, glb[goff..][0..4], json_len, .little);
+    goff += 4;
+    @memcpy(glb[goff..][0..4], "JSON");
+    goff += 4;
+    @memcpy(glb[goff..][0..json_len], json_bytes);
+    goff += json_len;
+    std.mem.writeInt(u32, glb[goff..][0..4], bin_padded, .little);
+    goff += 4;
+    glb[goff] = 0x42; // B
+    glb[goff + 1] = 0x49; // I
+    glb[goff + 2] = 0x4E; // N
+    glb[goff + 3] = 0x00; // \0
+    goff += 4;
+    @memcpy(glb[goff..][0..bin_padded], bin);
+
+    return glb;
+}
+
 // ── morphGlb fixture ──────────────────────────────────────────────────────────
 // A minimal quad mesh (4 verts, 6 indices) with 2 morph targets and a LINEAR
 // weight animation "MorphAnim". Used to test gltf morph parsing + vmesh round-trip.
@@ -5002,6 +5279,19 @@ test "cubeFieldMultiGlb: 2 submeshes + 64 instances round-trip via EXT_mesh_gpu_
     try testing.expectEqual(@as(u32, 64), model.instance_count);
     // Instance data: 64 × 20 floats (TRANSLATION 3 + ROTATION 4 + SCALE 3 + COLOR 4 + pad 6)
     try testing.expect(model.instances.len == 64 * 20);
+}
+
+test "cubeShadowFieldGlb: 9 instances (slab + pillars) round-trip via EXT_mesh_gpu_instancing" {
+    const glb = try cubeShadowFieldGlb(testing.allocator);
+    defer testing.allocator.free(glb);
+    var model = try gltf_mod.parseGlb(testing.allocator, glb);
+    defer model.deinit();
+    // Single primitive → single submesh
+    try testing.expectEqual(@as(usize, 1), model.submeshes.len);
+    // 9 instances (1 slab + 8 pillars)
+    try testing.expectEqual(@as(u32, 9), model.instance_count);
+    // Instance data: 9 × 20 floats (TRANSLATION 3 + ROTATION 4 + SCALE 3 + COLOR 4 + pad 6)
+    try testing.expect(model.instances.len == 9 * 20);
 }
 
 // ── lodGlb fixture ────────────────────────────────────────────────────────────
