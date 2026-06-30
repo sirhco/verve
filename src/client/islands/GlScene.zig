@@ -2219,8 +2219,9 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
         // ── T6: Instanced draw path ───────────────────────────────────────────
         // When the asset carries an instances section (instanceCount > 0), emit ONE
-        // draw_pbr_instanced for mesh 0 INSTEAD of the per-submesh loop.
-        // Non-instanced assets (instanceCount == 0) fall through byte-identical.
+        // draw_pbr_instanced PER SUBMESH (all submeshes, all materials) sharing the
+        // same instance buffer / count / VP. Single-submesh assets are byte-identical
+        // (loop runs once). Non-instanced assets (instanceCount == 0) fall through.
         // LOD is incompatible with instancing (out of scope) — skip instanced fast-path
         // when LOD is active to avoid mismatches.
         const inst_n = a.instanceCount();
@@ -2244,9 +2245,8 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             }
             // Store VP (pv = clipFix·proj·view; no model baked in → IS the VP).
             inst.vp_mat = pv.m;
-            // Bind sequence mirrors drawSubmesh: setPipeline→setLights→bindIbl→
-            // bindShadowMap→bindTexture 0-4→drawPbrInstanced.
-            const sub0 = a.submesh(0);
+            // Pipeline/lights/IBL/shadow/fog/clip binds are identical for all submeshes
+            // (same variant, same environment) — emit ONCE before the per-submesh loop.
             enc.setPipeline(shaderHandleFor(variant_pbr | variant_inst | (if (inst.fog_enabled) variant_fog else 0) | (if (clipActive(inst)) variant_clip else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
             enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
             enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
@@ -2256,12 +2256,19 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             bindShadowResources(inst, &enc);
             if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
             if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
-            enc.bindTexture(0, texHandle(sub0.tex_base));
-            enc.bindTexture(1, texHandle(sub0.tex_mr));
-            enc.bindTexture(2, texHandle(sub0.tex_normal));
-            enc.bindTexture(3, texHandle(sub0.tex_emissive));
-            enc.bindTexture(4, texHandle(sub0.tex_occlusion));
-            enc.drawPbrInstanced(vbuf, ibuf, sub0.index_byte_off, sub0.index_count, @intCast(@intFromPtr(&inst.instance_scratch)), n, @intCast(@intFromPtr(&inst.vp_mat)), @intCast(@intFromPtr(&inst.mats[0])), @intCast(@intFromPtr(&inst.camera_pos)));
+            // Per-submesh loop: bind each submesh's textures + material block, draw.
+            // instance_scratch / n / vp_mat / camera_pos are shared across all submeshes
+            // (same instances, same camera — only index range + material differ).
+            var s: u32 = 0;
+            while (s < a.submesh_count and s < max_submesh) : (s += 1) {
+                const sub = a.submesh(s);
+                enc.bindTexture(0, texHandle(sub.tex_base));
+                enc.bindTexture(1, texHandle(sub.tex_mr));
+                enc.bindTexture(2, texHandle(sub.tex_normal));
+                enc.bindTexture(3, texHandle(sub.tex_emissive));
+                enc.bindTexture(4, texHandle(sub.tex_occlusion));
+                enc.drawPbrInstanced(vbuf, ibuf, sub.index_byte_off, sub.index_count, @intCast(@intFromPtr(&inst.instance_scratch)), n, @intCast(@intFromPtr(&inst.vp_mat)), @intCast(@intFromPtr(&inst.mats[s])), @intCast(@intFromPtr(&inst.camera_pos)));
+            }
             enc.endFrame();
             // finish() stamps the cmd_buf length header (buf[0..4]); without it the
             // bridge reads a stale length and truncates the frame before this draw.
