@@ -88,7 +88,13 @@ const checks = [
   ["h === 256", k.h === 256],
   ["format === 2 (BC7_SRGB)", k.format === 2],
   ["mip_count === 9", k.levels.length === 9],
-  ["sum(level lens) === fileSize - header", sumLen === fileSize - headerBytes],
+  // Real structural check: block-data start (file - blocks) must equal ktx2.zig's
+  // off_mip = ident+header+index (80) + levelCount*24 + DFD (28). Ties the parsed
+  // level sizes back to the known S1 container geometry (catches parser drift).
+  [
+    "header === 80 + levelCount*24 + 28 (ktx2.zig off_mip)",
+    headerBytes === 80 + k.levels.length * 24 + 28,
+  ],
   // largest-first ordering: level 0 is the biggest.
   ["level 0 largest", k.levels[0].len === Math.max(...k.levels.map((l) => l.len))],
   // level offsets are strictly increasing and contiguous.
