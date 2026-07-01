@@ -2296,6 +2296,10 @@ pub fn glSceneCutout(ctx: *const verve.Context) !*verve.Node {
             "and the alpha-test shader discards fragments below the cutoff. The " ++
             "background shows through with a HARD edge — a cutout, not a translucent blend."),
         scene_wrap,
+        // Texture-format indicator (written each frame by glTexFmtHudUpdate via
+        // glscene_tex_format()): "BC7" / "S3TC BC1" / "S3TC BC3" / "PNG". cutout.tex0
+        // has alpha → encodes to BC3, so ?fmt=s3tc shows "S3TC BC3" here.
+        ctx.div().attr("data-ref", "gltex-hud").class("hint"),
         ctx.p().class("hint")
             .text("Keep scrolling — baseColorA fades 1→0 and the cutout silhouette dissolves away."),
         ctx.p().text("Drag to orbit · wheel to zoom · click to pick (verve:glpick-cutout). " ++
