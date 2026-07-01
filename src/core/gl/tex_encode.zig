@@ -39,7 +39,7 @@ pub fn pngToKtx2(alloc: std.mem.Allocator, png_bytes: []const u8, srgb: bool) ![
     }
 
     // Pack mip chain → KTX2 container bytes.
-    return ktx2.write(alloc, levels, img.width, img.height, srgb);
+    return ktx2.write(alloc, levels, img.width, img.height, if (srgb) .bc7_srgb else .bc7_unorm);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

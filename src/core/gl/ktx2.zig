@@ -52,16 +52,28 @@ pub const ktx2_identifier = [12]u8{
 pub const VkFormat = enum(u32) {
     bc7_unorm = 145, // VK_FORMAT_BC7_UNORM_BLOCK
     bc7_srgb = 146, // VK_FORMAT_BC7_SRGB_BLOCK
+    bc1_rgb_unorm = 131, // VK_FORMAT_BC1_RGB_UNORM_BLOCK
+    bc1_rgb_srgb = 132, // VK_FORMAT_BC1_RGB_SRGB_BLOCK
+    bc3_unorm = 137, // VK_FORMAT_BC3_UNORM_BLOCK
+    bc3_srgb = 138, // VK_FORMAT_BC3_SRGB_BLOCK
 };
 
-/// Write a minimal KTX2 container wrapping already-encoded BC7 mip levels
-/// (largest first, matching bc7.encodeImage output). `srgb` selects vkFormat
-/// (146 sRGB / 145 UNORM) AND the DFD transfer function. Caller owns the
-/// returned bytes (free with `alloc.free(result)`).
-pub fn write(alloc: Allocator, levels: []const []const u8, w: u32, h: u32, srgb: bool) ![]u8 {
+/// Returns true iff the vkFormat uses the sRGB transfer function.
+fn isSrgb(vk: VkFormat) bool {
+    return switch (vk) {
+        .bc7_srgb, .bc1_rgb_srgb, .bc3_srgb => true,
+        else => false,
+    };
+}
+
+/// Write a minimal KTX2 container wrapping already-encoded BC mip levels
+/// (largest first). `vk` selects the vkFormat written to the header AND
+/// controls the DFD transfer function (sRGB iff vk is an sRGB variant).
+/// Caller owns the returned bytes (free with `alloc.free(result)`).
+pub fn write(alloc: Allocator, levels: []const []const u8, w: u32, h: u32, vk: VkFormat) ![]u8 {
     const level_count: u32 = @intCast(levels.len);
-    const vk_format: u32 = if (srgb) 146 else 145;
-    const transfer: u8 = if (srgb) 2 else 1; // KHR_DF_TRANSFER_SRGB=2 / LINEAR=1
+    const vk_format: u32 = @intFromEnum(vk);
+    const transfer: u8 = if (isSrgb(vk)) 2 else 1; // KHR_DF_TRANSFER_SRGB=2 / LINEAR=1
 
     // Fixed-size sections.
     const dfd_size: u32 = 28; // 4-byte dfdTotalSize + 24-byte descriptor block
@@ -246,9 +258,13 @@ pub fn read(alloc: Allocator, bytes: []const u8) !Info {
     const vk_format: VkFormat = switch (vk_fmt_raw) {
         145 => .bc7_unorm,
         146 => .bc7_srgb,
+        131 => .bc1_rgb_unorm,
+        132 => .bc1_rgb_srgb,
+        137 => .bc3_unorm,
+        138 => .bc3_srgb,
         else => return error.UnsupportedFormat,
     };
-    const srgb = (vk_format == .bc7_srgb);
+    const srgb = isSrgb(vk_format);
 
     // ── Index (skip — offsets are deterministic from our writer) ─────────────
     // Skip dfdByteOffset(u32) dfdByteLength(u32) kvd*(u32×2) sgd*(u64×2) = 32 bytes
@@ -326,7 +342,7 @@ test "round-trip srgb=false (bc7_unorm)" {
     const chain = try fakeChain(alloc, 8, 8, 3);
     defer freeChain(alloc, chain);
 
-    const blob = try write(alloc, chain, 8, 8, false);
+    const blob = try write(alloc, chain, 8, 8, .bc7_unorm);
     defer alloc.free(blob);
 
     const info = try read(alloc, blob);
@@ -349,7 +365,7 @@ test "round-trip srgb=true (bc7_srgb)" {
     const chain = try fakeChain(alloc, 4, 8, 2);
     defer freeChain(alloc, chain);
 
-    const blob = try write(alloc, chain, 4, 8, true);
+    const blob = try write(alloc, chain, 4, 8, .bc7_srgb);
     defer alloc.free(blob);
 
     const info = try read(alloc, blob);
@@ -384,7 +400,7 @@ test "golden: 1-level 4×4 srgb=false matches frozen bytes" {
     const mip = [16]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const levels = [_][]const u8{&mip};
 
-    const got = try write(alloc, &levels, 4, 4, false);
+    const got = try write(alloc, &levels, 4, 4, .bc7_unorm);
     defer alloc.free(got);
 
     // Frozen expected bytes (148 total).
@@ -454,7 +470,7 @@ test "bc7 compose: encodeImage output wraps and round-trips through ktx2" {
         alloc.free(chain);
     }
 
-    const blob = try write(alloc, chain, w, h, true);
+    const blob = try write(alloc, chain, w, h, .bc7_srgb);
     defer alloc.free(blob);
 
     const info = try read(alloc, blob);
@@ -489,4 +505,144 @@ test "reject: truncated after identifier → error.Truncated" {
     // Provide valid identifier but no header.
     const result = read(testing.allocator, &ktx2_identifier);
     try testing.expectError(error.Truncated, result);
+}
+
+// ── (e) BC1/BC3 round-trip tests ─────────────────────────────────────────────
+
+/// Build fake BC1-shaped mip levels: 8 bytes per 4×4 block.
+fn fakeChainBC1(alloc: Allocator, w: u32, h: u32, levels: u32) ![]const []const u8 {
+    const chain = try alloc.alloc([]const u8, levels);
+    var cw = w;
+    var ch = h;
+    for (0..levels) |i| {
+        const bpr = (cw + 3) / 4;
+        const bpc = (ch + 3) / 4;
+        const sz: usize = @as(usize, bpr) * @as(usize, bpc) * 8; // 8 bytes per BC1 block
+        const lvl = try alloc.alloc(u8, sz);
+        for (lvl, 0..) |*b, j| b.* = @truncate(j + i * 5);
+        chain[i] = lvl;
+        cw = @max(cw / 2, 1);
+        ch = @max(ch / 2, 1);
+    }
+    return chain;
+}
+
+test "round-trip bc1_rgb_unorm" {
+    const alloc = testing.allocator;
+    const chain = try fakeChainBC1(alloc, 8, 8, 2);
+    defer freeChain(alloc, chain);
+
+    const blob = try write(alloc, chain, 8, 8, .bc1_rgb_unorm);
+    defer alloc.free(blob);
+
+    const info = try read(alloc, blob);
+    defer alloc.free(info.levels);
+
+    try testing.expectEqual(@as(u32, 8), info.w);
+    try testing.expectEqual(@as(u32, 8), info.h);
+    try testing.expectEqual(false, info.srgb);
+    try testing.expectEqual(VkFormat.bc1_rgb_unorm, info.vk_format);
+    try testing.expectEqual(@as(u32, 2), info.level_count);
+    for (chain, 0..) |expected, i| {
+        const ref = info.levels[i];
+        try testing.expectEqualSlices(u8, expected, blob[ref.offset .. ref.offset + ref.len]);
+    }
+}
+
+test "round-trip bc1_rgb_srgb" {
+    const alloc = testing.allocator;
+    const chain = try fakeChainBC1(alloc, 4, 4, 1);
+    defer freeChain(alloc, chain);
+
+    const blob = try write(alloc, chain, 4, 4, .bc1_rgb_srgb);
+    defer alloc.free(blob);
+
+    const info = try read(alloc, blob);
+    defer alloc.free(info.levels);
+
+    try testing.expectEqual(@as(u32, 4), info.w);
+    try testing.expectEqual(@as(u32, 4), info.h);
+    try testing.expectEqual(true, info.srgb);
+    try testing.expectEqual(VkFormat.bc1_rgb_srgb, info.vk_format);
+    try testing.expectEqual(@as(u32, 1), info.level_count);
+    for (chain, 0..) |expected, i| {
+        const ref = info.levels[i];
+        try testing.expectEqualSlices(u8, expected, blob[ref.offset .. ref.offset + ref.len]);
+    }
+}
+
+test "round-trip bc3_unorm" {
+    const alloc = testing.allocator;
+    // BC3: 16 bytes per 4×4 block — same size as BC7; reuse fakeChain.
+    const chain = try fakeChain(alloc, 8, 8, 2);
+    defer freeChain(alloc, chain);
+
+    const blob = try write(alloc, chain, 8, 8, .bc3_unorm);
+    defer alloc.free(blob);
+
+    const info = try read(alloc, blob);
+    defer alloc.free(info.levels);
+
+    try testing.expectEqual(@as(u32, 8), info.w);
+    try testing.expectEqual(@as(u32, 8), info.h);
+    try testing.expectEqual(false, info.srgb);
+    try testing.expectEqual(VkFormat.bc3_unorm, info.vk_format);
+    try testing.expectEqual(@as(u32, 2), info.level_count);
+    for (chain, 0..) |expected, i| {
+        const ref = info.levels[i];
+        try testing.expectEqualSlices(u8, expected, blob[ref.offset .. ref.offset + ref.len]);
+    }
+}
+
+test "round-trip bc3_srgb" {
+    const alloc = testing.allocator;
+    // BC3: 16 bytes per 4×4 block; reuse fakeChain.
+    const chain = try fakeChain(alloc, 4, 8, 2);
+    defer freeChain(alloc, chain);
+
+    const blob = try write(alloc, chain, 4, 8, .bc3_srgb);
+    defer alloc.free(blob);
+
+    const info = try read(alloc, blob);
+    defer alloc.free(info.levels);
+
+    try testing.expectEqual(@as(u32, 4), info.w);
+    try testing.expectEqual(@as(u32, 8), info.h);
+    try testing.expectEqual(true, info.srgb);
+    try testing.expectEqual(VkFormat.bc3_srgb, info.vk_format);
+    try testing.expectEqual(@as(u32, 2), info.level_count);
+    for (chain, 0..) |expected, i| {
+        const ref = info.levels[i];
+        try testing.expectEqualSlices(u8, expected, blob[ref.offset .. ref.offset + ref.len]);
+    }
+}
+
+// ── (f) srgb derivation via read ─────────────────────────────────────────────
+
+test "read: bc3_srgb → srgb true; bc1_rgb_unorm → srgb false" {
+    const alloc = testing.allocator;
+
+    // bc3_srgb → srgb == true.
+    {
+        const chain = try fakeChain(alloc, 4, 4, 1);
+        defer freeChain(alloc, chain);
+        const blob = try write(alloc, chain, 4, 4, .bc3_srgb);
+        defer alloc.free(blob);
+        const info = try read(alloc, blob);
+        defer alloc.free(info.levels);
+        try testing.expectEqual(true, info.srgb);
+        try testing.expectEqual(VkFormat.bc3_srgb, info.vk_format);
+    }
+
+    // bc1_rgb_unorm → srgb == false.
+    {
+        const chain = try fakeChainBC1(alloc, 4, 4, 1);
+        defer freeChain(alloc, chain);
+        const blob = try write(alloc, chain, 4, 4, .bc1_rgb_unorm);
+        defer alloc.free(blob);
+        const info = try read(alloc, blob);
+        defer alloc.free(info.levels);
+        try testing.expectEqual(false, info.srgb);
+        try testing.expectEqual(VkFormat.bc1_rgb_unorm, info.vk_format);
+    }
 }
