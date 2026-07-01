@@ -4,7 +4,8 @@
 //!   .glb → gl.gltf.parseGlb + gl.vmesh.pack → writes <out_dir>/<stem>.vmesh
 //!          plus one sibling <out_dir>/<stem>.tex{index}.{ext} per externalized
 //!          (large) texture kept as compressed bytes, and a matching
-//!          <out_dir>/<stem>.tex{index}.ktx2 (BC7/KTX2, DORMANT until S3).
+//!          <out_dir>/<stem>.tex{index}.bc7.ktx2  (BC7/KTX2,  DORMANT until S3)
+//!          <out_dir>/<stem>.tex{index}.s3tc.ktx2 (BC1/BC3 S3TC, DORMANT until S3).
 //!   .hdr → gl.hdr.decode + IBL prefilter chain + gl.venv.pack → writes
 //!          <out_dir>/<stem>.venv
 //!
@@ -142,20 +143,28 @@ fn convertGlb(
     // (texIsSrgb returns true for base-color/emissive maps, false for linear maps).
     const reader = try gl.vmesh.Reader.init(vmesh_bytes);
 
-    // Write each externalized (large) texture as a sibling pair:
-    //   <stem>.tex{index}.{ext}  — original compressed bytes (unchanged)
-    //   <stem>.tex{index}.ktx2   — BC7/KTX2 sibling (DORMANT until S3 loader)
+    // Write each externalized (large) texture as three siblings:
+    //   <stem>.tex{index}.{ext}       — original compressed bytes (unchanged)
+    //   <stem>.tex{index}.bc7.ktx2    — BC7/KTX2 (DORMANT until S3 loader)
+    //   <stem>.tex{index}.s3tc.ktx2   — BC1/BC3 S3TC KTX2 (DORMANT until S3 loader)
     for (model.external_textures) |tex| {
         const tex_name = try std.fmt.allocPrint(alloc, "{s}.tex{d}.{s}", .{ stem, tex.index, tex.ext });
         defer alloc.free(tex_name);
         try writeAsset(io, cwd, alloc, out_dir, tex_name, tex.bytes);
 
-        const ktx2_name = try std.fmt.allocPrint(alloc, "{s}.tex{d}.ktx2", .{ stem, tex.index });
-        defer alloc.free(ktx2_name);
         const srgb = reader.texIsSrgb(tex.index);
-        const ktx2_bytes = try gl.tex_encode.pngToKtx2(alloc, tex.bytes, srgb);
-        defer alloc.free(ktx2_bytes);
-        try writeAsset(io, cwd, alloc, out_dir, ktx2_name, ktx2_bytes);
+
+        const bc7_name = try std.fmt.allocPrint(alloc, "{s}.tex{d}.bc7.ktx2", .{ stem, tex.index });
+        defer alloc.free(bc7_name);
+        const bc7_bytes = try gl.tex_encode.pngToKtx2(alloc, tex.bytes, srgb);
+        defer alloc.free(bc7_bytes);
+        try writeAsset(io, cwd, alloc, out_dir, bc7_name, bc7_bytes);
+
+        const s3tc_name = try std.fmt.allocPrint(alloc, "{s}.tex{d}.s3tc.ktx2", .{ stem, tex.index });
+        defer alloc.free(s3tc_name);
+        const s3tc_bytes = try gl.tex_encode.pngToKtx2S3tc(alloc, tex.bytes, srgb);
+        defer alloc.free(s3tc_bytes);
+        try writeAsset(io, cwd, alloc, out_dir, s3tc_name, s3tc_bytes);
     }
 }
 

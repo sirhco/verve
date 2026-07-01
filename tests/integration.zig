@@ -1283,7 +1283,7 @@ test "/gl-mixed serves GlScene island and /gl/mixed.vmesh serves the asset" {
     try std.testing.expect(vmesh_resp.body.len > 0);
 }
 
-test "/gl/demo.tex0.ktx2 serves a valid KTX2 asset" {
+test "/gl/demo.tex0.bc7.ktx2 serves a valid BC7 KTX2 asset" {
     const gpa = std.testing.allocator;
 
     var threaded: std.Io.Threaded = undefined;
@@ -1292,8 +1292,9 @@ test "/gl/demo.tex0.ktx2 serves a valid KTX2 asset" {
     const io = harness.io();
     const port = harness.port;
 
-    // The KTX2 sibling of demo.tex0.png is served from the embedded gl asset table.
-    var resp = try request(io, gpa, port, "GET", "/gl/demo.tex0.ktx2");
+    // The BC7 KTX2 sibling of demo.tex0.png is served from the embedded gl asset table.
+    // (S3 will add a bare .ktx2 routing alias; .s3tc.ktx2 will also be served then.)
+    var resp = try request(io, gpa, port, "GET", "/gl/demo.tex0.bc7.ktx2");
     defer resp.deinit(gpa);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(resp.body.len > 0);
