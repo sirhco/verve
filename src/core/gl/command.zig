@@ -151,6 +151,13 @@ pub const Tag = enum(u16) {
     set_custom = 48, // {ptr} — ptr -> 80-byte Custom UBO block (u_time f32 + 3×f32 pad + 4×vec4 params)
     //   PTR-based scene-global command (one write per frame). The chunk (1E2) owns the 80-byte block
     //   in Inst; the bridge (1F) reads 80 bytes at `ptr` and uploads to @group(0)@binding(5).
+
+    // ── KTX2/BC7 compressed textures (slice 3) ──────────────────────────────
+    create_compressed_texture = 49, // {handle, w, h, format, mip_count, ptr, byte_len}
+    //   Upload pre-compressed BC7 data from the wasm memory level table written by the JS loader.
+    //   `format` = CompressedFormat (1=BC7_UNORM, 2=BC7_SRGB). RGBA path (tag 7/15) is unaffected.
+    //   `ptr` → level table start: mip_count×{u32 offset, u32 length} followed by the BC7 blocks.
+    //   `byte_len` = mip_count*8 + total_block_bytes (table + all blocks; layer-1 `len - 16`).
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -176,6 +183,9 @@ pub const variant_lit_uv: u32 = 1 << 1;
 // ── P3: PBR / IBL wire surface ──────────────────────────────────────
 pub const TexTarget = enum(u32) { tex_2d = 0, cube = 1 };
 pub const TexFormat = enum(u32) { rgba8 = 0, rgba16f = 1 };
+/// Compressed texture format for `create_compressed_texture` (tag 49, KTX2/BC7 slice 3).
+/// Values match the s3 LAYER-2 wire contract. Format 0 (RGBA) never uses tag 49.
+pub const CompressedFormat = enum(u32) { bc7_unorm = 1, bc7_srgb = 2 };
 
 /// CREATE_SHADER variant bits for the comptime PBR über-shader.
 pub const variant_pbr: u32 = 1 << 2; // stride-48 layout, Cook-Torrance + IBL + tonemap
@@ -4406,6 +4416,22 @@ pub const Encoder = struct {
         self.putU32(@intFromEnum(format));
         self.putU32(width);
         self.putU32(height);
+        self.putU32(mip_count);
+        self.putU32(ptr);
+        self.putU32(byte_len);
+    }
+
+    /// Encode a `create_compressed_texture` (tag 49) command for a pre-compressed BC7 texture.
+    /// Wire payload is 28 bytes (7×u32): handle, w, h, format, mip_count, ptr, byte_len.
+    /// `format` must be `.bc7_unorm` (1) or `.bc7_srgb` (2); RGBA textures use `createTexture`/`createTextureSrgb`.
+    /// `ptr` is the wasm pointer to the level table start (mip_count×{u32 offset, u32 length})
+    /// written by the JS loader. `byte_len` = mip_count*8 + total_block_bytes.
+    pub fn createCompressedTexture(self: *Encoder, handle: u32, width: u32, height: u32, format: CompressedFormat, mip_count: u32, ptr: u32, byte_len: u32) void {
+        self.header(.create_compressed_texture, 28);
+        self.putU32(handle);
+        self.putU32(width);
+        self.putU32(height);
+        self.putU32(@intFromEnum(format));
         self.putU32(mip_count);
         self.putU32(ptr);
         self.putU32(byte_len);
@@ -8795,4 +8821,74 @@ test "golden: variant_custom_tex WGSL + GLSL FS hashes frozen (FNV-1a-64)" {
     // Bootstrapped from first green run — a change here = deliberate contract bump.
     try testing.expectEqual(@as(u64, 0x1b224946171e4f2e), fnv64(wgslPbrHooked(CT, hooks)));
     try testing.expectEqual(@as(u64, 0xe184e8ac7016ca98), fnv64(pbrFragmentSrcHooked(CT, hooks)));
+}
+
+// ── KTX2/BC7 slice 3: tag-49 wire goldens ───────────────────────────────────
+
+test "golden: create_compressed_texture tag 49 bc7_srgb byte layout" {
+    // Wire: [u16 tag=49=0x0031 LE][u16 size=28=0x001c LE][7×u32 LE]
+    //   handle=3       03000000
+    //   w=256          00010000
+    //   h=128          80000000
+    //   format=2(srgb) 02000000
+    //   mip_count=8    08000000
+    //   ptr=0xa000     00a00000
+    //   byte_len=0x8000 00800000
+    // Total record bytes: 4(hdr)+28(payload)+4(endFrame) = 36 = 0x24
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createCompressedTexture(3, 256, 128, .bc7_srgb, 8, 0xa000, 0x8000);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "24000000" ++ // length header: 36 record bytes
+            // CREATE_COMPRESSED_TEXTURE handle=3 w=256 h=128 format=bc7_srgb(2) mips=8 ptr=0xa000 len=0x8000
+            "3100" ++ "1c00" ++ "03000000" ++ "00010000" ++ "80000000" ++ "02000000" ++ "08000000" ++ "00a00000" ++ "00800000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "golden: create_compressed_texture tag 49 bc7_unorm format word differs" {
+    // Same args as the bc7_srgb test; only format word changes: 01000000 instead of 02000000.
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createCompressedTexture(3, 256, 128, .bc7_unorm, 8, 0xa000, 0x8000);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "24000000" ++ // length header: 36 record bytes
+            // CREATE_COMPRESSED_TEXTURE handle=3 w=256 h=128 format=bc7_unorm(1) mips=8 ptr=0xa000 len=0x8000
+            "3100" ++ "1c00" ++ "03000000" ++ "00010000" ++ "80000000" ++ "01000000" ++ "08000000" ++ "00a00000" ++ "00800000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "golden: create_texture (tag 7) RGBA byte-identity guard" {
+    // Verifies that adding tag 49 + CompressedFormat left the RGBA path (tag 7) byte-identical.
+    // The "golden: texture + lit submesh draw" test also freezes tag-7 bytes in a combined
+    // golden; this is a standalone single-command guard for belt-and-suspenders confidence.
+    // Wire: [u16 tag=7=0x0007 LE][u16 size=20=0x0014 LE][handle][w][h][ptr][byte_len]
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createTexture(1, 8, 8, 0x6000, 256);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "1c000000" ++ // length header: 28 record bytes
+            // CREATE_TEXTURE handle=1 w=8 h=8 ptr=0x6000 len=256
+            "0700" ++ "1400" ++ "01000000" ++ "08000000" ++ "08000000" ++ "00600000" ++ "00010000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
 }
