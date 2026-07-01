@@ -663,10 +663,12 @@ pub fn build(b: *std.Build) void {
     _ = wf_gl.addCopyFile(demo_dir.path(b, "demo.vmesh"), "demo.vmesh");
     // Demo's 256² base texture is externalized as a sibling compressed PNG.
     _ = wf_gl.addCopyFile(demo_dir.path(b, "demo.tex0.png"), "demo.tex0.png");
+    _ = wf_gl.addCopyFile(demo_dir.path(b, "demo.tex0.ktx2"), "demo.tex0.ktx2");
     _ = wf_gl.addCopyFile(mixed_dir.path(b, "mixed.vmesh"), "mixed.vmesh");
     _ = wf_gl.addCopyFile(cutout_dir.path(b, "cutout.vmesh"), "cutout.vmesh");
     // Cutout's 256² alpha-hole base texture is externalized as a sibling PNG.
     _ = wf_gl.addCopyFile(cutout_dir.path(b, "cutout.tex0.png"), "cutout.tex0.png");
+    _ = wf_gl.addCopyFile(cutout_dir.path(b, "cutout.tex0.ktx2"), "cutout.tex0.ktx2");
     _ = wf_gl.addCopyFile(shadow_dir.path(b, "shadow.vmesh"), "shadow.vmesh");
     _ = wf_gl.addCopyFile(skin_dir.path(b, "skinbar.vmesh"), "skinbar.vmesh");
     _ = wf_gl.addCopyFile(skinmorph_dir.path(b, "skinmorph.vmesh"), "skinmorph.vmesh");
@@ -688,9 +690,11 @@ pub fn build(b: *std.Build) void {
         \\pub const gl_assets: []const GlAsset = &.{
         \\    .{ .name = "demo.vmesh", .bytes = @embedFile("demo.vmesh") },
         \\    .{ .name = "demo.tex0.png", .bytes = @embedFile("demo.tex0.png") },
+        \\    .{ .name = "demo.tex0.ktx2", .bytes = @embedFile("demo.tex0.ktx2") },
         \\    .{ .name = "mixed.vmesh", .bytes = @embedFile("mixed.vmesh") },
         \\    .{ .name = "cutout.vmesh", .bytes = @embedFile("cutout.vmesh") },
         \\    .{ .name = "cutout.tex0.png", .bytes = @embedFile("cutout.tex0.png") },
+        \\    .{ .name = "cutout.tex0.ktx2", .bytes = @embedFile("cutout.tex0.ktx2") },
         \\    .{ .name = "shadow.vmesh", .bytes = @embedFile("shadow.vmesh") },
         \\    .{ .name = "skinbar.vmesh", .bytes = @embedFile("skinbar.vmesh") },
         \\    .{ .name = "skinmorph.vmesh", .bytes = @embedFile("skinmorph.vmesh") },

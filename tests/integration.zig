@@ -1282,3 +1282,23 @@ test "/gl-mixed serves GlScene island and /gl/mixed.vmesh serves the asset" {
     try std.testing.expectEqual(@as(u16, 200), vmesh_resp.status);
     try std.testing.expect(vmesh_resp.body.len > 0);
 }
+
+test "/gl/demo.tex0.ktx2 serves a valid KTX2 asset" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    var harness = try spawnServer(gpa, &threaded, TEST_PORT + 23);
+    defer harness.deinit();
+    const io = harness.io();
+    const port = harness.port;
+
+    // The KTX2 sibling of demo.tex0.png is served from the embedded gl asset table.
+    var resp = try request(io, gpa, port, "GET", "/gl/demo.tex0.ktx2");
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(resp.body.len > 0);
+    // Validate KTX2 12-byte identifier prefix.
+    const ktx2_id = [12]u8{ 0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A };
+    try std.testing.expect(resp.body.len >= 12);
+    try std.testing.expectEqualSlices(u8, &ktx2_id, resp.body[0..12]);
+}
