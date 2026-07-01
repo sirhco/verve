@@ -64,6 +64,18 @@ fn glslTypeName(comptime kind: UniformKind) []const u8 {
 
 pub const UniformKind = enum { scalar, vec2, vec3, vec4 };
 
+/// A texture slot declared in a custom material's `.textures` option.
+/// `name` = declared field name (e.g. "noise") — identifies the slot for the chunk (3C loads by url).
+///   The declared name does NOT appear in the shader; shaders use FRAMEWORK-FIXED names (custom_tex0, …).
+/// `url`  = asset URL the chunk must load at runtime.
+/// `unit` = GLSL texture unit (12 + i) and WebGL2 bind unit.
+///   WGSL binding = unit + 2 = 14 + i (derivable; both are in the struct for convenience).
+pub const TextureRef = struct {
+    name: []const u8,
+    url: []const u8,
+    unit: u8,
+};
+
 pub const UniformSlot = struct {
     name: []const u8,
     name_id: u32, // fnv32(name) — stable, JS-computable (glmat_set in slice 3)
@@ -74,13 +86,14 @@ pub const UniformSlot = struct {
 };
 
 pub const MaterialDesc = struct {
-    flags: u32, // command.variant_pbr | command.variant_custom
+    flags: u32, // command.variant_pbr | command.variant_custom [| command.variant_custom_tex]
     wgsl: []const u8, // wgslPbrHooked(flags, hooks)
     glsl_vs: []const u8, // pbrVertexSrcHooked(flags, hooks) — hooked when vertex opts present
     glsl_fs: []const u8, // pbrFragmentSrcHooked(flags, hooks)
     uniforms: []const UniformSlot, // declaration order
     param_vec4_count: u8, // K vec4s actually used (must be ≤ 4)
     id: u32, // fnv32(wgsl ++ "|" ++ glsl_fs) — stable identity for data-glmat attribute
+    textures: []const TextureRef, // empty when no .textures declared; carries url for chunk (3C)
 };
 
 // ── builder ────────────────────────────────────────────────────────────────────
@@ -97,13 +110,16 @@ pub const MaterialDesc = struct {
 /// Packed into params[] vec4s (std140-simplified, declaration order).
 /// Alias preambles prepended to each hook snippet so snippets use bare names + `u_time`.
 pub fn Material(comptime opts: anytype) MaterialDesc {
-    const flags = command.variant_pbr | command.variant_custom;
+    comptime var flags: u32 = command.variant_pbr | command.variant_custom;
 
     const has_uniforms = @hasField(@TypeOf(opts), "uniforms");
     const has_frag_albedo = @hasField(@TypeOf(opts), "frag_albedo");
     const has_frag_final = @hasField(@TypeOf(opts), "frag_final");
     const has_vertex_displace = @hasField(@TypeOf(opts), "vertex_displace");
     const has_vertex_normal = @hasField(@TypeOf(opts), "vertex_normal");
+    const has_textures = @hasField(@TypeOf(opts), "textures");
+
+    if (has_textures) flags |= command.variant_custom_tex;
 
     // Validate dual-language requirement
     if (has_frag_albedo) {
@@ -124,8 +140,9 @@ pub fn Material(comptime opts: anytype) MaterialDesc {
     }
 
     const n_uniforms: usize = if (has_uniforms) std.meta.fields(@TypeOf(opts.uniforms)).len else 0;
+    const n_textures: usize = if (has_textures) std.meta.fields(@TypeOf(opts.textures)).len else 0;
 
-    // Use a comptime struct so slots + preambles get static (rodata) lifetime.
+    // Use a comptime struct so slots + preambles + tex metadata get static (rodata) lifetime.
     const S = struct {
         const slots: [n_uniforms]UniformSlot = blk: {
             var s: [n_uniforms]UniformSlot = undefined;
@@ -211,6 +228,49 @@ pub fn Material(comptime opts: anytype) MaterialDesc {
             }
             break :gp pre;
         };
+
+        // Custom texture slots: build TextureRef array from .textures fields (declaration order).
+        // `name` = declared field name (metadata for chunk); `url` = asset URL; `unit` = 12 + i.
+        const tex_slots: [n_textures]TextureRef = ts: {
+            var ts_arr: [n_textures]TextureRef = undefined;
+            if (has_textures) {
+                for (std.meta.fields(@TypeOf(opts.textures)), 0..) |field, i| {
+                    const tex_opts = @field(opts.textures, field.name);
+                    ts_arr[i] = .{
+                        .name = field.name,
+                        .url = tex_opts.url,
+                        .unit = @as(u8, 12) + @as(u8, @intCast(i)),
+                    };
+                }
+            }
+            break :ts ts_arr;
+        };
+
+        // WGSL binding declaration strings for all declared textures.
+        // FRAMEWORK-FIXED names: custom_tex0, custom_tex1, ... (NOT the declared .textures field name).
+        // binding = 14 + i (next free after ltc_mag at 13). One line per texture.
+        const tex_decls_wgsl: []const u8 = tw: {
+            if (!has_textures) break :tw "";
+            var d: []const u8 = "";
+            for (std.meta.fields(@TypeOf(opts.textures)), 0..) |_, i| {
+                const idx_str = std.fmt.comptimePrint("{}", .{i});
+                const binding_str = std.fmt.comptimePrint("{}", .{14 + i});
+                d = d ++ "@group(1) @binding(" ++ binding_str ++ ") var custom_tex" ++ idx_str ++ ": texture_2d<f32>;\n";
+            }
+            break :tw d;
+        };
+
+        // GLSL sampler declaration strings for all declared textures.
+        // FRAMEWORK-FIXED names: u_custom_tex0, u_custom_tex1, ... (texture unit 12+i, bound by 3C).
+        const tex_decls_glsl: []const u8 = tg: {
+            if (!has_textures) break :tg "";
+            var d: []const u8 = "";
+            for (std.meta.fields(@TypeOf(opts.textures)), 0..) |_, i| {
+                const idx_str = std.fmt.comptimePrint("{}", .{i});
+                d = d ++ "uniform sampler2D u_custom_tex" ++ idx_str ++ ";\n";
+            }
+            break :tg d;
+        };
     };
 
     if (S.param_vec4_count > 4) @compileError("custom material exceeds 4 param vec4s");
@@ -235,9 +295,19 @@ pub fn Material(comptime opts: anytype) MaterialDesc {
         hooks.vertex_normal_wgsl = S.wgsl_preamble ++ opts.vertex_normal.wgsl;
         hooks.vertex_normal_glsl = S.glsl_preamble ++ opts.vertex_normal.glsl;
     }
+    // Custom texture binding decl hooks (slice 3B). Only set when .textures non-empty;
+    // when empty these stay null and the assemblers skip the injection entirely (byte-identity).
+    if (has_textures) {
+        hooks.custom_tex_decls_wgsl = S.tex_decls_wgsl;
+        hooks.custom_tex_decls_glsl = S.tex_decls_glsl;
+    }
 
     const mat_wgsl = command.wgslPbrHooked(flags, hooks);
     const mat_glsl_fs = command.pbrFragmentSrcHooked(flags, hooks);
+
+    // Static empty TextureRef slice for the no-texture case — zero-length, rodata lifetime.
+    const empty_tex: []const TextureRef = &[_]TextureRef{};
+
     return MaterialDesc{
         .flags = flags,
         .wgsl = mat_wgsl,
@@ -246,6 +316,7 @@ pub fn Material(comptime opts: anytype) MaterialDesc {
         .uniforms = &S.slots,
         .param_vec4_count = S.param_vec4_count,
         .id = fnv32(mat_wgsl ++ "|" ++ mat_glsl_fs),
+        .textures = if (has_textures) &S.tex_slots else empty_tex,
     };
 }
 
@@ -444,3 +515,76 @@ test "Material: vertex+frag+uniform → WGSL brace-balanced + u_time count per-h
 // Material(.{ .vertex_displace = .{ .glsl = "..." } })  — missing .wgsl —
 // triggers @compileError("vertex_displace requires both .glsl and .wgsl").
 // Likewise for .vertex_normal. Guard mirrors the frag-hook guards above it.
+
+// ── Custom-materials 3B: .textures opt + variant_custom_tex + TextureRef ─────
+//
+// Shader names are FRAMEWORK-FIXED:
+//   WGSL: @group(1) @binding(14+i) var custom_tex<i>: texture_2d<f32>;
+//   GLSL: uniform sampler2D u_custom_tex<i>;  (unit 12+i)
+// The declared .textures field name (e.g. "noise") is carried in MaterialDesc.textures[i].name
+// for chunk use (3C loads the asset by url), but does NOT appear in the shader.
+// Sampling: WGSL textureSample(custom_tex0, samp, in.uv), GLSL texture(u_custom_tex0, v_uv).
+// Textureless custom materials stay byte-identical to slice-2 (no new bytes).
+
+test "Material: .textures → variant_custom_tex set, TextureRef slot shape, fixed-name bindings in shaders" {
+    const Vec3 = math.Vec3;
+    const desc = comptime Material(.{
+        .frag_albedo = .{
+            .glsl = "vrv_albedo = vrv_albedo * texture(u_custom_tex0, v_uv).rgb;",
+            .wgsl = "vrv_albedo = vrv_albedo * textureSample(custom_tex0, samp, in.uv).rgb;",
+        },
+        .textures = .{ .noise = .{ .url = "/gl/x.tex0.png" } },
+        .uniforms = .{ .tint = Vec3 },
+    });
+
+    // variant_custom_tex must be set alongside variant_pbr and variant_custom.
+    try std.testing.expect(desc.flags & command.variant_custom_tex != 0);
+    try std.testing.expect(desc.flags & command.variant_pbr != 0);
+    try std.testing.expect(desc.flags & command.variant_custom != 0);
+    // textures slice: exactly 1 entry with declared name, url, and unit 12.
+    try std.testing.expectEqual(@as(usize, 1), desc.textures.len);
+    try std.testing.expectEqualStrings("noise", desc.textures[0].name);
+    try std.testing.expectEqualStrings("/gl/x.tex0.png", desc.textures[0].url);
+    try std.testing.expectEqual(@as(u8, 12), desc.textures[0].unit);
+    // WGSL: binding 14 with fixed name custom_tex0.
+    try std.testing.expect(std.mem.indexOf(u8, desc.wgsl, "@group(1) @binding(14) var custom_tex0: texture_2d<f32>;") != null);
+    // GLSL FS: fixed sampler name u_custom_tex0.
+    try std.testing.expect(std.mem.indexOf(u8, desc.glsl_fs, "uniform sampler2D u_custom_tex0;") != null);
+    // Snippet present using the fixed names.
+    try std.testing.expect(std.mem.indexOf(u8, desc.wgsl, "textureSample(custom_tex0, samp, in.uv).rgb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc.glsl_fs, "texture(u_custom_tex0, v_uv).rgb") != null);
+    // id non-zero (assembled source changed from textureless).
+    try std.testing.expect(desc.id != 0);
+}
+
+test "Material: no .textures → variant_custom_tex absent, no binding 14, textures empty, byte-identical to slice-2" {
+    const desc = comptime Material(.{
+        .frag_albedo = .{
+            .glsl = "vrv_albedo = vrv_albedo * 0.5;",
+            .wgsl = "vrv_albedo = vrv_albedo * 0.5;",
+        },
+    });
+
+    // variant_custom_tex must NOT be set.
+    try std.testing.expect(desc.flags & command.variant_custom_tex == 0);
+    // flags = variant_pbr | variant_custom only.
+    try std.testing.expectEqual(command.variant_pbr | command.variant_custom, desc.flags);
+    // textures slice is empty.
+    try std.testing.expectEqual(@as(usize, 0), desc.textures.len);
+    // No custom binding 14 in WGSL.
+    try std.testing.expect(std.mem.indexOf(u8, desc.wgsl, "@binding(14)") == null);
+    // No u_custom_tex0 in GLSL FS.
+    try std.testing.expect(std.mem.indexOf(u8, desc.glsl_fs, "u_custom_tex0") == null);
+}
+
+test "golden: Material with .textures - id (fnv32 of wgsl|glsl_fs) pinned after first green run" {
+    const desc = comptime Material(.{
+        .frag_albedo = .{
+            .glsl = "vrv_albedo = vrv_albedo * texture(u_custom_tex0, v_uv).rgb;",
+            .wgsl = "vrv_albedo = vrv_albedo * textureSample(custom_tex0, samp, in.uv).rgb;",
+        },
+        .textures = .{ .noise = .{ .url = "/gl/x.tex0.png" } },
+    });
+    // Bootstrapped from first green run — a change = deliberate contract bump.
+    try std.testing.expectEqual(@as(u32, 0x545ba53b), desc.id);
+}

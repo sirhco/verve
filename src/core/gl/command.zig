@@ -212,6 +212,13 @@ pub const variant_custom: u32 = 1 << 23; // Custom shader materials (comptime-ba
 // WGSL: separate struct Custom + @group(0)@binding(5) var<uniform> custom: Custom (80B, binding 5 free).
 // GLSL: individual uniforms u_time (f32) + u_params[4] (vec4 array). Fragment-only in slice 1.
 // Does NOT touch struct U / PBR_STRIDE — a separate binding preserves all existing byte offsets.
+pub const variant_custom_tex: u32 = 1 << 24; // Custom texture binding for custom shader materials (3B).
+// Set by Material() when .textures is non-empty; gates binding injection in BOTH the shader
+// (this task) and the bridge (3C). Layout ⟺ shader ⟺ bind-group stay in lockstep.
+// WGSL: @group(1) @binding(14+i) var custom_tex<i>: texture_2d<f32>; (framework-fixed names)
+// GLSL: uniform sampler2D u_custom_tex<i>; (texture unit 12+i, bound by name via glUniform1i in 3C)
+// Sampling: WGSL textureSample(custom_tex0, samp, in.uv), GLSL texture(u_custom_tex0, v_uv).
+// Textureless custom materials (no variant_custom_tex) are byte-identical to slice-2.
 
 /// Render-target creation flags.
 pub const rt_flag_with_depth: u32 = 1 << 0;
@@ -1271,6 +1278,13 @@ pub const ShaderHooks = struct {
     frag_emissive_wgsl: ?[]const u8 = null,
     frag_alpha_glsl: ?[]const u8 = null,
     frag_alpha_wgsl: ?[]const u8 = null,
+    // Custom texture binding declarations (slice 3B). Built by Material() from .textures.
+    // Pre-built binding-decl strings; injected into the texture/sampler region of each assembler,
+    // gated on variant_custom_tex in flags (primary gate) AND hook field non-null (belt-and-suspenders).
+    // WGSL form: "@group(1) @binding(14) var custom_tex0: texture_2d<f32>;\n" (per texture, 14+i)
+    // GLSL form: "uniform sampler2D u_custom_tex0;\n"                          (per texture, unit 12+i)
+    custom_tex_decls_wgsl: ?[]const u8 = null,
+    custom_tex_decls_glsl: ?[]const u8 = null,
 };
 
 pub fn pbrFragmentSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u8 {
@@ -1742,6 +1756,9 @@ pub fn pbrFragmentSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []
     src = src ++ ibl_samplers;
     if (flags & variant_fog != 0) src = src ++ fog_uniforms;
     if (flags & variant_custom != 0) src = src ++ custom_uniforms;
+    if (flags & variant_custom_tex != 0) {
+        if (hooks.custom_tex_decls_glsl) |d| src = src ++ d;
+    }
     if (flags & variant_shadow != 0) src = src ++ shadow_decls;
     if (flags & variant_shadow_point != 0) src = src ++ point_shadow_decls;
     if (flags & variant_clipping != 0) src = src ++ clip_uniforms;
@@ -3028,6 +3045,9 @@ pub fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u
     if (shadow) src = src ++ tex_shadow;
     if (point_shadow) src = src ++ tex_point_shadow;
     src = src ++ tex_ltc;
+    if (flags & variant_custom_tex != 0) {
+        if (hooks.custom_tex_decls_wgsl) |d| src = src ++ d;
+    }
     src = src ++ vsout_head;
     if (nm) src = src ++ vsout_nm;
     if (inst) src = src ++ vsout_inst_color;
@@ -8706,4 +8726,73 @@ test "golden: frag_emissive + frag_alpha hooks WGSL + GLSL FS hashes frozen (FNV
     const C = variant_pbr | variant_custom;
     try testing.expectEqual(@as(u64, 0x574cdf16867ebbdb), fnv64(wgslPbrHooked(C, fixture)));
     try testing.expectEqual(@as(u64, 0x12cdea3ca731a5f6), fnv64(pbrFragmentSrcHooked(C, fixture)));
+}
+
+// ── Custom-materials 3B: variant_custom_tex bit + texture binding injection ─────
+//
+// variant_custom_tex = 1 << 24: set by Material() when .textures non-empty.
+// Shader names are FRAMEWORK-FIXED (not per-material declared name):
+//   WGSL: @group(1) @binding(14) var custom_tex0: texture_2d<f32>;  (binding 14+i)
+//   GLSL: uniform sampler2D u_custom_tex0;                          (unit 12+i)
+// Sampling convention: WGSL textureSample(custom_tex0, samp, in.uv), GLSL texture(u_custom_tex0, v_uv).
+// Textureless custom materials (no variant_custom_tex) are byte-identical to slice-2.
+// Goldens bootstrapped from first green run.
+
+test "variant_custom_tex: bit value = 1 << 24" {
+    try testing.expectEqual(@as(u32, 1 << 24), variant_custom_tex);
+}
+
+test "variant_custom_tex: WGSL binding 14 (custom_tex0) injected after ltc bindings when flag set" {
+    const hooks = ShaderHooks{
+        .custom_tex_decls_wgsl = "@group(1) @binding(14) var custom_tex0: texture_2d<f32>;\n",
+        .custom_tex_decls_glsl = "uniform sampler2D u_custom_tex0;\n",
+    };
+    const CT = variant_pbr | variant_custom | variant_custom_tex;
+    const wgsl = wgslPbrHooked(CT, hooks);
+    // custom_tex0 declared at binding 14.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "@group(1) @binding(14) var custom_tex0: texture_2d<f32>;") != null);
+    // ltc binding 13 appears before the custom binding.
+    const i_ltc = std.mem.indexOf(u8, wgsl, "@group(1) @binding(13) var ltc_mag: texture_2d<f32>;").?;
+    const i_cust = std.mem.indexOf(u8, wgsl, "@group(1) @binding(14) var custom_tex0: texture_2d<f32>;").?;
+    try testing.expect(i_ltc < i_cust);
+}
+
+test "variant_custom_tex: GLSL u_custom_tex0 injected when flag set" {
+    const hooks = ShaderHooks{
+        .custom_tex_decls_wgsl = "@group(1) @binding(14) var custom_tex0: texture_2d<f32>;\n",
+        .custom_tex_decls_glsl = "uniform sampler2D u_custom_tex0;\n",
+    };
+    const CT = variant_pbr | variant_custom | variant_custom_tex;
+    const glsl = pbrFragmentSrcHooked(CT, hooks);
+    // custom sampler declared.
+    try testing.expect(std.mem.indexOf(u8, glsl, "uniform sampler2D u_custom_tex0;") != null);
+    // ltc samplers still present.
+    try testing.expect(std.mem.indexOf(u8, glsl, "uniform sampler2D u_ltc_mat;") != null);
+    try testing.expect(std.mem.indexOf(u8, glsl, "uniform sampler2D u_ltc_mag;") != null);
+}
+
+test "variant_custom_tex: no flag → no binding 14, textureless path clean" {
+    // A custom material without variant_custom_tex must NOT get binding 14 or u_custom_tex0.
+    const slice2_hooks = ShaderHooks{
+        .frag_albedo_wgsl = "vrv_albedo = vrv_albedo * 0.5;",
+        .frag_albedo_glsl = "vrv_albedo = vrv_albedo * 0.5;",
+    };
+    const C = variant_pbr | variant_custom;
+    const wgsl_notex = wgslPbrHooked(C, slice2_hooks);
+    const glsl_notex = pbrFragmentSrcHooked(C, slice2_hooks);
+    try testing.expect(std.mem.indexOf(u8, wgsl_notex, "@binding(14)") == null);
+    try testing.expect(std.mem.indexOf(u8, glsl_notex, "u_custom_tex0") == null);
+}
+
+test "golden: variant_custom_tex WGSL + GLSL FS hashes frozen (FNV-1a-64)" {
+    const hooks = ShaderHooks{
+        .frag_albedo_wgsl = "vrv_albedo = vrv_albedo * textureSample(custom_tex0, samp, in.uv).rgb;",
+        .frag_albedo_glsl = "vrv_albedo = vrv_albedo * texture(u_custom_tex0, v_uv).rgb;",
+        .custom_tex_decls_wgsl = "@group(1) @binding(14) var custom_tex0: texture_2d<f32>;\n",
+        .custom_tex_decls_glsl = "uniform sampler2D u_custom_tex0;\n",
+    };
+    const CT = variant_pbr | variant_custom | variant_custom_tex;
+    // Bootstrapped from first green run — a change here = deliberate contract bump.
+    try testing.expectEqual(@as(u64, 0x1b224946171e4f2e), fnv64(wgslPbrHooked(CT, hooks)));
+    try testing.expectEqual(@as(u64, 0xe184e8ac7016ca98), fnv64(pbrFragmentSrcHooked(CT, hooks)));
 }
