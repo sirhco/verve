@@ -5527,6 +5527,10 @@
             // Multi-caster: u_point_light_pos/u_point_far removed (Task 1) — the
             // receiver reads each caster's lpos/far from the per-light loop vars.
           }
+          if (variant & 0x1000000) { // variant_custom_tex: custom texture sampler fixed at unit 12
+            sh.customTex0 = gl.getUniformLocation(prog, "u_custom_tex0");
+            if (sh.customTex0) gl.uniform1i(sh.customTex0, 12);
+          }
           if (variant & 0x40000) { // variant_billboard (1<<18): screen-facing quad sprites.
             // Standalone shader — uniforms: u_view mat4, u_proj mat4, u_flags uint, u_tex0 sampler2D.
             // Vertex shader generates the 6-vert quad from gl_VertexID; no position attrib.
@@ -8026,6 +8030,8 @@
             // (the bind group binds a 1×1 rgba16f dummy otherwise).
             g1.push({ binding: 12, visibility: FRAG, texture: tex2d }); // ltc_mat
             g1.push({ binding: 13, visibility: FRAG, texture: tex2d }); // ltc_mag
+            const hasCustomTex = (variant & 0x1000000) !== 0; // variant_custom_tex: custom texture @group(1) @binding(14)
+            if (hasCustomTex) g1.push({ binding: 14, visibility: FRAG, texture: tex2d });
             const bgl1 = device.createBindGroupLayout({ entries: g1 });
             const layout = device.createPipelineLayout({
               bindGroupLayouts: [bgl0, bgl1],
@@ -8129,6 +8135,7 @@
               hasMorph,
               hasPointShadow,
               hasCustom,
+              hasCustomTex,
             };
             break;
           }
@@ -8728,6 +8735,9 @@
             // area_count=0 (shader never samples them then — content irrelevant).
             e.push({ binding: 12, resource: (st.ltcMat && st.ltcMat.view) ? st.ltcMat.view : d.ltcDummy.view });
             e.push({ binding: 13, resource: (st.ltcMag && st.ltcMag.view) ? st.ltcMag.view : d.ltcDummy.view });
+            if (active.hasCustomTex) {
+              e.push({ binding: 14, resource: gpuSlotView(st, 12, d.white2d) }); // custom_tex0 (variant_custom_tex)
+            }
             st.bg1 = device.createBindGroup({ layout: active.bgl1, entries: e });
             st.bg1Layout = active.bgl1;
             st.bg1Dirty = false;
