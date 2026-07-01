@@ -4,6 +4,26 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.36.0] - 2026-07-01
+
+### Added
+
+- **gl — multi-format compressed textures: S3TC asset pipeline** (slice 2 of 3).
+  The build-time asset pipeline now emits and serves a **BC1/BC3 (S3TC)** `.s3tc.ktx2`
+  sibling next to the BC7 `.bc7.ktx2`, per externalized material texture. Still
+  **dormant** — nothing loads the S3TC sibling at runtime yet (slice 3 wires the caps +
+  loader). This is the compressed asset GPUs without BC7/BPTC will consume.
+  - **`src/core/gl/tex_encode.zig`** — new `pngToKtx2S3tc`: decodes the PNG, scans alpha
+    (any pixel alpha < 255 → **BC3**, else **BC1**), encodes via `bc1.encodeImage`, and
+    packs a KTX2 with the matching vkFormat (BC1 131/132, BC3 137/138) per sRGB role.
+  - **`tools/gl_asset_gen.zig`** — `convertGlb` emits both `<stem>.tex{N}.bc7.ktx2`
+    (renamed from `.ktx2`) and `<stem>.tex{N}.s3tc.ktx2`, reusing the existing
+    `texIsSrgb` role mapping.
+  - **`build.zig`** — serves both siblings under `/gl/`, plus a temporary bare `.ktx2`
+    alias (BC7 bytes) so the shipped runtime keeps working until slice 3 re-points the
+    request. `scripts/ktx2_parse_check.mjs` validates a real `.s3tc.ktx2` (raw KTX2
+    header). Opaque `demo.tex0` → BC1 (43 KB, half of BC7); alpha `cutout.tex0` → BC3.
+
 ## [0.35.0] - 2026-07-01
 
 ### Added
