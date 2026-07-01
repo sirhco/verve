@@ -2076,7 +2076,7 @@ pub const dofFragmentSrc: []const u8 =
 //   1 base (2D), 2 metallic-roughness (2D), (F1) 3 normal (2D),
 //   (F2) 4 emissive (2D), 5 occlusion (2D), 6 irradiance (cube),
 //   7 prefiltered (cube), 8 brdf_lut (2D).
-fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u8 {
+pub fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u8 {
     comptime pbrCheck(flags);
     if (flags & variant_depth != 0) @compileError("wgslPbr: variant_depth uses wgslDepth(), not wgslPbr");
     // variant_instanced + variant_shadow (4A): shadow is emitted BEFORE vp in the U struct
@@ -2919,6 +2919,12 @@ fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u8 {
     src = src ++ helpers;
     if (shadow) src = src ++ fs_shadow_decl;
     if (point_shadow) src = src ++ fs_point_shadow_decl;
+    // NOTE: the `inst` and `ds` paths use fs_open_instanced / fs_open_ds, which keep `let albedo`
+    // (immutable). Only fs_open_custom (selected for the plain path when a frag_albedo hook is present)
+    // makes `albedo` a `var`. Combining a frag_albedo_wgsl hook with instanced or double_sided would emit
+    // an illegal `albedo = vrv_albedo` writeback to an immutable binding. Task 1D's builder MUST reject
+    // custom × instanced and custom × double_sided (v1 exclusions) until a future slice adds
+    // fs_open_ds_custom / fs_open_instanced_custom.
     src = src ++ (if (inst) fs_open_instanced else (if (ds) fs_open_ds else (if (hooks.frag_albedo_wgsl != null) fs_open_custom else fs_open)));
     if (flags & variant_alpha_test != 0) src = src ++ fs_alpha_test;
     if (clip) src = src ++ fs_clip_discard;
