@@ -9953,7 +9953,7 @@
     // BPTC and S3TC are INDEPENDENT WebGL2 extensions — probe separately.
     st.extTextureCompressionBptc = ctx.getExtension("EXT_texture_compression_bptc");
     st.extTextureCompressionS3tc = ctx.getExtension("WEBGL_compressed_texture_s3tc");
-    st.extTextureCompressionS3tcSrgb = ctx.getExtension("EXT_texture_compression_s3tc_srgb");
+    st.extTextureCompressionS3tcSrgb = ctx.getExtension("WEBGL_compressed_texture_s3tc_srgb");
     glTexCaps.bc7 = !!st.extTextureCompressionBptc;
     glTexCaps.s3tc = !!st.extTextureCompressionS3tc;
     // Sink driven by the master anim rAF (animTick) — see glSinks. Same body
