@@ -5143,6 +5143,10 @@
   const glSetActiveChunk = (exports) => {
     glActiveChunkExports = exports;
   };
+  // BC7 compressed-texture capability flag — set by whichever backend (WebGPU or
+  // WebGL2) initialises first, then readable by gl_load (:10183) and the upload
+  // path (tag 49, 3D) throughout the session. False until a backend initialises.
+  let glBc7Supported = false;
 
   // Per-canvas frame callbacks driven by the master anim rAF (animTick).
   // Membership == "this canvas's loop is running": sinks delete themselves
@@ -9631,7 +9635,11 @@
       if (typeof navigator === "undefined" || !navigator.gpu) return null;
       const adapter = await navigator.gpu.requestAdapter();
       if (!adapter) return null;
-      const device = await adapter.requestDevice();
+      const wantBc = adapter.features.has("texture-compression-bc");
+      const device = await adapter.requestDevice(
+        wantBc ? { requiredFeatures: ["texture-compression-bc"] } : undefined,
+      );
+      glBc7Supported = wantBc;
       // Surface WebGPU validation/out-of-memory errors that would otherwise be
       // swallowed (Chrome suppresses repeated warnings) → blank canvas, no error.
       device.addEventListener("uncapturederror", (e) => {
@@ -9726,6 +9734,7 @@
       morphTextures: [], // morph-target RGBA16F textures (case 30), indexed by handle
       morphTex: null, // active morph texture bound to TEXTURE9 (most recently created)
       extColorBufferFloat: null, // EXT_color_buffer_float, enabled on first rgba16f target
+      extTextureCompressionBptc: null, // EXT_texture_compression_bptc (BC7); probed at init
       frameAreaCount: 0, // S3 area lights: active count (set_area_lights, tag 37; 0 = none)
       frameAreaLights: null, // S3: Float32Array(count*16) area_lights[] cached per frame
       frameClipCount: 0,    // S4 clip planes: active count (set_clip_planes, tag 45; 0 = none)
@@ -9748,6 +9757,11 @@
       // the chunk renders THIS instance's state. 0 for single-instance chunks.
       vid: vidOfEl(canvas),
     };
+    // Probe BC7/BPTC compressed-texture support (dormant until tag-49 upload in 3D).
+    // Cache the extension object on st so the upload path has the format enums;
+    // also set the module-scoped flag so gl_load (3C) can decide .ktx2 vs .png.
+    st.extTextureCompressionBptc = ctx.getExtension("EXT_texture_compression_bptc");
+    glBc7Supported = !!st.extTextureCompressionBptc;
     // Sink driven by the master anim rAF (animTick) — see glSinks. Same body
     // as the old self-rescheduling step(), except stop paths remove the sink
     // from glSinks instead of skipping a requestAnimationFrame(step) self-call.
