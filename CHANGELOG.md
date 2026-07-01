@@ -4,6 +4,26 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.29.0] - 2026-06-30
+
+### Added
+
+- **gl — custom shader materials** (slice 1 of 3, fragment hooks): comptime-baked
+  injection-hook materials splice custom GLSL/WGSL into the PBR über-shader at two
+  fragment insertion points — `frag_albedo` (before PBR lighting, override albedo/roughness/
+  metallic) and `frag_final` (after lighting, before tonemap, overlay effects). A separate
+  **Custom UBO** at `@group(0)@binding(5)` carries `u_time` (auto-advanced each frame) plus
+  packed uniform params (`f32`, `gl.Vec2`, `gl.Vec3`, `gl.Vec4`, `std140` lanes); both
+  WebGL2 and WebGPU backends. Scene binding via `GlSceneBuilder.material(desc, params)` →
+  `data-glmat` out-of-band attribute; a `set_custom` wire tag (47) uploads the Custom UBO
+  each frame. `verve.gl.Material(opts)` is the comptime material descriptor; the frozen
+  shader is FNV-hashed like every PBR variant. New `/gl-material` demo. **Deferrals
+  (slices 2–3):** `frag_emissive` / `frag_alpha` / `vertex_displace` / `vertex_normal`
+  hooks; custom textures; live `glmat_set` setter. **v1 exclusions:** custom × instanced /
+  × wireframe / × double_sided / × morph-skinning, per-submesh materials, runtime/data-
+  driven shader source, whole-program ShaderMaterial, app-authored materials via
+  build-module bridge.
+
 ## [0.28.0] - 2026-06-30
 
 ### Added
