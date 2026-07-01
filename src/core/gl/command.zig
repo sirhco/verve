@@ -381,7 +381,7 @@ fn pbrCheck(comptime flags: u32) void {
     if (flags & variant_pbr == 0) @compileError("PBR shader requires variant_pbr");
 }
 
-pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
+pub fn pbrVertexSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u8 {
     comptime pbrCheck(flags);
     const head =
         \\#version 300 es
@@ -444,6 +444,36 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
     ;
     const body_close_skinned =
         \\  gl_Position = u_mvp * (skin * vec4(a_pos, 1.0));
+        \\}
+        \\
+    ;
+    // Custom VS pieces (slice 2A, plain path only). Selected when a vertex hook is present.
+    // body_open_custom_a: opens void main(), declares vrv_pos/vrv_normal at function scope
+    //   so the block-scoped hook splices can write them (outer-var assignment from nested block).
+    // body_open_custom_b: world/normal/uv transforms using the (possibly displaced/rotated) vars.
+    // body_close_custom: clip transform using vrv_pos (not a_pos), so displace affects both
+    //   the world position AND the clip position consistently.
+    // custom_uniforms_vs: custom UBO uniforms (u_time / u_params) for vertex-hook use.
+    //   Appended to the global declarations section when a vertex hook is present.
+    const custom_uniforms_vs =
+        \\uniform float u_time;
+        \\uniform vec4 u_params[4];
+        \\
+    ;
+    const body_open_custom_a =
+        \\void main() {
+        \\  vec3 vrv_pos = a_pos;
+        \\  vec3 vrv_normal = a_normal;
+        \\
+    ;
+    const body_open_custom_b =
+        \\  v_world_pos = (u_model * vec4(vrv_pos, 1.0)).xyz;
+        \\  v_normal = u_normal_mat * vrv_normal;
+        \\  v_uv = a_uv;
+        \\
+    ;
+    const body_close_custom =
+        \\  gl_Position = u_mvp * vec4(vrv_pos, 1.0);
         \\}
         \\
     ;
@@ -550,6 +580,11 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         \\}
         \\
     ;
+    // Vertex-hook presence gate (slice 2A). Custom VS pieces (body_open_custom_*,
+    // body_close_custom) are selected ONLY when a vertex hook is present — NOT on the raw
+    // variant_custom flag alone. This keeps frag-only-custom materials (variant_custom set
+    // but no vertex hooks) byte-identical to the plain VS (invariant 2).
+    const has_vhook_glsl = hooks.vertex_displace_glsl != null or hooks.vertex_normal_glsl != null;
     const skinned = flags & variant_skinned != 0;
     const morphed = flags & variant_morph != 0;
     comptime var src: []const u8 = head;
@@ -561,12 +596,24 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
     if (flags & variant_normal_map != 0) src = src ++ nm_outs;
     if (skinned) src = src ++ skin_decl;
     if (morphed) src = src ++ morph_uniforms;
+    // Custom UBO uniforms (u_time / u_params) appended to the global declarations section
+    // when a vertex hook is present so that vertex snippets can reference them. Gated on
+    // vertex-hook presence (not raw variant_custom) to preserve slice-1 byte-identity.
+    if (has_vhook_glsl) src = src ++ custom_uniforms_vs;
     if (morphed and skinned) {
         src = src ++ body_open_skinned_morph;
     } else if (morphed) {
         src = src ++ body_open_morph;
     } else if (skinned) {
         src = src ++ body_open_skinned;
+    } else if (has_vhook_glsl) {
+        // Custom plain path: declare vrv_pos/vrv_normal at function scope, run block-scoped
+        // hook splices (C1: each in its own { } to prevent cross-hook identifier collision),
+        // then transform the (possibly displaced/rotated) locals into world/clip positions.
+        src = src ++ body_open_custom_a;
+        if (hooks.vertex_displace_glsl) |s| src = src ++ "  {\n" ++ s ++ "\n  }\n";
+        if (hooks.vertex_normal_glsl) |s| src = src ++ "  {\n" ++ s ++ "\n  }\n";
+        src = src ++ body_open_custom_b;
     } else {
         src = src ++ body_open;
     }
@@ -587,10 +634,17 @@ pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
         src = src ++ body_close_morph;
     } else if (skinned) {
         src = src ++ body_close_skinned;
+    } else if (has_vhook_glsl) {
+        // Custom close: gl_Position uses vrv_pos (displaced) instead of a_pos.
+        src = src ++ body_close_custom;
     } else {
         src = src ++ body_close;
     }
     return src;
+}
+
+pub fn pbrVertexSrc(comptime flags: u32) []const u8 {
+    return pbrVertexSrcHooked(flags, .{});
 }
 
 /// Depth-only shader for the shadow pass. Uses the PBR vertex layout but reads
@@ -1189,6 +1243,19 @@ pub const ShaderHooks = struct {
     frag_albedo_wgsl: ?[]const u8 = null,
     frag_final_glsl: ?[]const u8 = null,
     frag_final_wgsl: ?[]const u8 = null,
+    // Vertex hooks (slice 2A). Selected on vertex-hook presence only; frag-only-custom and
+    // non-custom VS stay byte-identical to the plain path (no gating on variant_custom).
+    // vertex_displace: writes vrv_pos (local-space position, initialized from a_pos).
+    //   Consumed by BOTH the world transform AND the clip transform.
+    // vertex_normal: writes vrv_normal (local-space normal, initialized from a_normal).
+    //   Engine then applies normal_mat → out.normal → feeds TBN (composes with normal mapping).
+    //   Tangent stays from a_tangent (not recomputed — accepted v1 caveat if normal deviates).
+    // Both hooks run before transforms, in declaration order (displace then normal).
+    // Each splice is block-scoped { } (C1 fix: prevents cross-hook identifier redeclaration).
+    vertex_displace_glsl: ?[]const u8 = null,
+    vertex_displace_wgsl: ?[]const u8 = null,
+    vertex_normal_glsl: ?[]const u8 = null,
+    vertex_normal_wgsl: ?[]const u8 = null,
 };
 
 pub fn pbrFragmentSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u8 {
@@ -2375,6 +2442,38 @@ pub fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u
         \\}
         \\
     ;
+    // Custom VS pieces (slice 2A, plain path only). Selected when a vertex hook is present.
+    // vs_head_custom_a: function signature + vrv_pos/vrv_normal declarations at function scope.
+    //   Block-scoped hook splices write outer vars from nested scope — legal in WGSL.
+    // vs_head_custom_b: world/normal/uv assignments using the (possibly modified) vrv_pos/vrv_normal.
+    // vs_tail_custom: clip transform using vrv_pos (not a_pos) — displacement affects both stages.
+    // WGSL: uniforms_custom is already module-global (appended at module level when variant_custom
+    //   is set), so it is already in scope inside vs_main without any per-stage addition.
+    const vs_head_custom_a =
+        \\@vertex
+        \\fn vs_main(
+        \\  @location(0) a_pos: vec3<f32>,
+        \\  @location(1) a_normal: vec3<f32>,
+        \\  @location(2) a_tangent: vec4<f32>,
+        \\  @location(3) a_uv: vec2<f32>,
+        \\) -> VSOut {
+        \\  var out: VSOut;
+        \\  var vrv_pos = a_pos;
+        \\  var vrv_normal = a_normal;
+        \\
+    ;
+    const vs_head_custom_b =
+        \\  out.world_pos = (u.model * vec4<f32>(vrv_pos, 1.0)).xyz;
+        \\  out.normal = u.normal_mat * vrv_normal;
+        \\  out.uv = a_uv;
+        \\
+    ;
+    const vs_tail_custom =
+        \\  out.pos = u.mvp * vec4<f32>(vrv_pos, 1.0);
+        \\  return out;
+        \\}
+        \\
+    ;
     const vs_tail_skinned =
         \\  out.pos = u.mvp * sp;
         \\  return out;
@@ -2917,9 +3016,29 @@ pub fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u
         if (nm) src = src ++ vs_nm_morph;
         src = src ++ vs_tail_morph;
     } else {
-        src = src ++ (if (skinned) vs_head_skinned else vs_head);
-        if (nm) src = src ++ (if (skinned) vs_nm_skinned else vs_nm);
-        src = src ++ (if (skinned) vs_tail_skinned else vs_tail);
+        // Plain (non-inst, non-morphed) path. Vertex hooks (slice 2A) only supported here.
+        // Skinned path is unchanged; vertex hooks on skinned/morphed deferred to a future slice.
+        const has_vhook_wgsl = hooks.vertex_displace_wgsl != null or hooks.vertex_normal_wgsl != null;
+        if (skinned) {
+            src = src ++ vs_head_skinned;
+            if (nm) src = src ++ vs_nm_skinned;
+            src = src ++ vs_tail_skinned;
+        } else if (has_vhook_wgsl) {
+            // Custom plain path: vs_head_custom_a declares vrv_pos/vrv_normal at function scope;
+            // block-scoped hook splices (C1: each in { }) write them before the world transform;
+            // vs_head_custom_b applies the transforms using the (possibly modified) vars;
+            // vs_tail_custom uses vrv_pos in the clip transform (not a_pos).
+            src = src ++ vs_head_custom_a;
+            if (hooks.vertex_displace_wgsl) |s| src = src ++ "  {\n" ++ s ++ "\n  }\n";
+            if (hooks.vertex_normal_wgsl) |s| src = src ++ "  {\n" ++ s ++ "\n  }\n";
+            src = src ++ vs_head_custom_b;
+            if (nm) src = src ++ vs_nm;
+            src = src ++ vs_tail_custom;
+        } else {
+            src = src ++ vs_head;
+            if (nm) src = src ++ vs_nm;
+            src = src ++ vs_tail;
+        }
     }
     src = src ++ helpers;
     if (shadow) src = src ++ fs_shadow_decl;
@@ -8269,6 +8388,141 @@ test "both-hook scope: preamble decls in separate blocks, not redeclared in same
     try testing.expect(glsl_brace < glsl_second);
     // No third occurrence.
     try testing.expect(std.mem.indexOfPos(u8, glsl, glsl_second + 1, "vec3 tint = u_params[0].xyz;") == null);
+}
+
+// ── Custom-materials 2A: vertex hook splices (displace+normal) + hooked VS assembler ─────────
+//
+// Frozen from first green run — a change here = deliberate contract bump.
+// Vertex-hook convention (PIN — slice 2A design decision):
+//   vertex_displace: writes vrv_pos (local-space), applied to BOTH world+clip transforms.
+//   vertex_normal:   writes vrv_normal (local-space), applied through normal_mat → TBN (composes).
+//   Both hooks block-scoped { } (C1 mirror): alias preamble per hook lands in its own scope.
+//   Custom VS selected ONLY on vertex-hook presence; frag-only-custom keeps plain VS (byte-identity).
+// WGSL: "  {\n" ++ snippet ++ "\n  }\n"  (vrv_pos/vrv_normal already declared at function scope)
+// GLSL: "  {\n" ++ snippet ++ "\n  }\n"  (same outer-var assignment pattern)
+
+test "golden: vertex hooks WGSL (wgslPbrHooked) hash frozen (FNV-1a-64)" {
+    const fixture = ShaderHooks{
+        .vertex_displace_wgsl = "vrv_pos.y = vrv_pos.y + 0.1;",
+        .vertex_normal_wgsl = "vrv_normal = normalize(vrv_normal + vec3<f32>(0.0, 0.1, 0.0));",
+    };
+    const C = variant_pbr | variant_custom;
+    // Bootstrapped from first green run — a change here = deliberate WGSL VS contract bump.
+    try testing.expectEqual(@as(u64, 0xec2d03240b9e6ed2), fnv64(wgslPbrHooked(C, fixture)));
+}
+
+test "golden: vertex hooks GLSL VS (pbrVertexSrcHooked) hash frozen (FNV-1a-64)" {
+    const fixture = ShaderHooks{
+        .vertex_displace_glsl = "vrv_pos.y = vrv_pos.y + 0.1;",
+        .vertex_normal_glsl = "vrv_normal = normalize(vrv_normal + vec3(0.0, 0.1, 0.0));",
+    };
+    const C = variant_pbr | variant_custom;
+    // Bootstrapped from first green run — a change here = deliberate GLSL VS contract bump.
+    try testing.expectEqual(@as(u64, 0xc90b478f5783a246), fnv64(pbrVertexSrcHooked(C, fixture)));
+}
+
+test "vertex hooks structural: WGSL VS contains vrv_pos/vrv_normal and uses them in both transforms" {
+    const fixture = ShaderHooks{
+        .vertex_displace_wgsl = "vrv_pos.y = vrv_pos.y + 0.1;",
+        .vertex_normal_wgsl = "vrv_normal = normalize(vrv_normal + vec3<f32>(0.0, 0.1, 0.0));",
+    };
+    const C = variant_pbr | variant_custom;
+    const wgsl = wgslPbrHooked(C, fixture);
+    // vrv_pos and vrv_normal declared at function scope in vs_main.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "var vrv_pos = a_pos;") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "var vrv_normal = a_normal;") != null);
+    // vrv_pos used in BOTH the world transform AND the clip transform.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "u.model * vec4<f32>(vrv_pos, 1.0)") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "u.mvp * vec4<f32>(vrv_pos, 1.0)") != null);
+    // vrv_normal used in the normal transform.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "u.normal_mat * vrv_normal") != null);
+    // Fixture snippet substrings present.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "vrv_pos.y = vrv_pos.y + 0.1;") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "vrv_normal = normalize(vrv_normal + vec3<f32>(0.0, 0.1, 0.0));") != null);
+}
+
+test "vertex hooks structural: GLSL VS contains vrv_pos/vrv_normal, both transforms, custom uniforms" {
+    const fixture = ShaderHooks{
+        .vertex_displace_glsl = "vrv_pos.y = vrv_pos.y + 0.1;",
+        .vertex_normal_glsl = "vrv_normal = normalize(vrv_normal + vec3(0.0, 0.1, 0.0));",
+    };
+    const C = variant_pbr | variant_custom;
+    const glsl = pbrVertexSrcHooked(C, fixture);
+    // vrv_pos and vrv_normal declared at function scope.
+    try testing.expect(std.mem.indexOf(u8, glsl, "vec3 vrv_pos = a_pos;") != null);
+    try testing.expect(std.mem.indexOf(u8, glsl, "vec3 vrv_normal = a_normal;") != null);
+    // vrv_pos used in BOTH world AND clip transforms.
+    try testing.expect(std.mem.indexOf(u8, glsl, "u_model * vec4(vrv_pos, 1.0)") != null);
+    try testing.expect(std.mem.indexOf(u8, glsl, "u_mvp * vec4(vrv_pos, 1.0)") != null);
+    // vrv_normal used in the normal transform.
+    try testing.expect(std.mem.indexOf(u8, glsl, "u_normal_mat * vrv_normal") != null);
+    // custom uniforms appended to the global declarations section.
+    try testing.expect(std.mem.indexOf(u8, glsl, "uniform float u_time;") != null);
+    // Fixture snippet substrings present.
+    try testing.expect(std.mem.indexOf(u8, glsl, "vrv_pos.y = vrv_pos.y + 0.1;") != null);
+    try testing.expect(std.mem.indexOf(u8, glsl, "vrv_normal = normalize(vrv_normal + vec3(0.0, 0.1, 0.0));") != null);
+}
+
+test "vertex hooks byte-identity: empty hooks == plain delegators; frag-only-custom VS unchanged" {
+    // pbrVertexSrcHooked(F, .{}) must be BYTE-IDENTICAL to pbrVertexSrc(F) for all F.
+    const F1 = variant_pbr;
+    const F2 = variant_pbr | variant_shadow;
+    const F3 = variant_pbr | variant_custom;
+    try testing.expectEqual(fnv64(pbrVertexSrc(F1)), fnv64(pbrVertexSrcHooked(F1, .{})));
+    try testing.expectEqual(fnv64(pbrVertexSrc(F2)), fnv64(pbrVertexSrcHooked(F2, .{})));
+    try testing.expectEqual(fnv64(pbrVertexSrc(F3)), fnv64(pbrVertexSrcHooked(F3, .{})));
+    // WGSL: wgslPbrHooked(F, .{}) must be byte-identical to wgslPbr(F).
+    try testing.expectEqual(fnv64(wgslPbr(F1)), fnv64(wgslPbrHooked(F1, .{})));
+    try testing.expectEqual(fnv64(wgslPbr(F2)), fnv64(wgslPbrHooked(F2, .{})));
+    try testing.expectEqual(fnv64(wgslPbr(F3)), fnv64(wgslPbrHooked(F3, .{})));
+    // Frag-only-custom material (frag hooks but NO vertex hooks): VS must be byte-identical to
+    // the plain VS — vs_head_custom is NOT selected without a vertex hook (invariant 2).
+    const frag_only = ShaderHooks{
+        .frag_albedo_glsl = "vrv_albedo = vrv_albedo * 0.9;",
+        .frag_albedo_wgsl = "vrv_albedo = vrv_albedo * 0.9;",
+    };
+    const C = variant_pbr | variant_custom;
+    // GLSL VS: frag-only-custom must equal the plain VS (no vertex modification).
+    try testing.expectEqual(fnv64(pbrVertexSrc(variant_pbr)), fnv64(pbrVertexSrcHooked(C, frag_only)));
+    // WGSL full source: the VS section must match plain VS — check structural absence.
+    const wgsl_frag_only = wgslPbrHooked(C, frag_only);
+    try testing.expect(std.mem.indexOf(u8, wgsl_frag_only, "var vrv_pos") == null);
+    try testing.expect(std.mem.indexOf(u8, wgsl_frag_only, "var vrv_normal") == null);
+}
+
+test "vertex hooks both-hook scope: preamble decls in separate blocks, not redeclared in same scope" {
+    // Mirror of the fragment C1 regression test, applied to vertex hooks.
+    // Each snippet manually includes the same alias preamble identifier —
+    // block-scoping prevents cross-hook identifier collision.
+    const wgsl_preamble = "  let custom_u = custom.u_time;\n  let tparam = custom.params[0].x;\n";
+    const glsl_preamble = "  float custom_u = u_time;\n";
+
+    const both = ShaderHooks{
+        .vertex_displace_wgsl = wgsl_preamble ++ "vrv_pos.y = vrv_pos.y + custom_u * 0.1;",
+        .vertex_normal_wgsl = wgsl_preamble ++ "vrv_normal = normalize(vrv_normal + vec3<f32>(tparam, 0.0, 0.0));",
+        .vertex_displace_glsl = glsl_preamble ++ "vrv_pos.y = vrv_pos.y + custom_u * 0.1;",
+        .vertex_normal_glsl = glsl_preamble ++ "vrv_normal = normalize(vrv_normal + vec3(0.0, 0.0, 0.1));",
+    };
+    const C = variant_pbr | variant_custom;
+    const wgsl = wgslPbrHooked(C, both);
+    const glsl = pbrVertexSrcHooked(C, both);
+
+    // WGSL: `let custom_u = custom.u_time;` appears exactly twice (once per hook block).
+    // A closing `}` must appear between the two occurrences — proves first block closed.
+    const wgsl_first = std.mem.indexOf(u8, wgsl, "let custom_u = custom.u_time;").?;
+    const wgsl_second = std.mem.indexOfPos(u8, wgsl, wgsl_first + 1, "let custom_u = custom.u_time;").?;
+    const wgsl_brace = std.mem.indexOfPos(u8, wgsl, wgsl_first, "}").?;
+    try testing.expect(wgsl_brace < wgsl_second);
+    // No third occurrence (only 2 vertex hooks).
+    try testing.expect(std.mem.indexOfPos(u8, wgsl, wgsl_second + 1, "let custom_u = custom.u_time;") == null);
+
+    // GLSL: `float custom_u = u_time;` appears exactly twice, with a `}` between.
+    const glsl_first = std.mem.indexOf(u8, glsl, "float custom_u = u_time;").?;
+    const glsl_second = std.mem.indexOfPos(u8, glsl, glsl_first + 1, "float custom_u = u_time;").?;
+    const glsl_brace = std.mem.indexOfPos(u8, glsl, glsl_first, "}").?;
+    try testing.expect(glsl_brace < glsl_second);
+    // No third occurrence.
+    try testing.expect(std.mem.indexOfPos(u8, glsl, glsl_second + 1, "float custom_u = u_time;") == null);
 }
 
 // ── Custom-materials 1E1: set_custom wire tag (48) + Encoder.setCustom ──────────
