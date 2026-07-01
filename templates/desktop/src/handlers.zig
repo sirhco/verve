@@ -430,9 +430,12 @@ const Routes = struct {
             // spins → the app hangs here.
             std.log.info("smoke_done: taking snapshot → '{s}'", .{png_path});
             c.window.takeSnapshotPng(png_path) catch |err| {
-                std.log.err("smoke_done: snapshot failed: {s}", .{@errorName(err)});
-                c.window.terminate();
-                return .{ .ok = false };
+                // Best-effort: a headless / off-screen web view (e.g. a CI
+                // runner with no display) can't snapshot — the WKWebView
+                // completion never fires. Log + CONTINUE so the deterministic
+                // checksum is still written and the app still terminates
+                // (the harness validates the checksum; the PNG is optional).
+                std.log.warn("smoke_done: snapshot unavailable ({s}); continuing with checksum only", .{@errorName(err)});
             };
 
             // Write checksum as a single base-10 line (matches the
@@ -445,7 +448,7 @@ const Routes = struct {
                 return .{ .ok = false };
             };
 
-            std.log.info("smoke_done: shot.png + checksum.txt written to '{s}'", .{dir});
+            std.log.info("smoke_done: checksum.txt written to '{s}' (shot.png best-effort)", .{dir});
             c.window.terminate();
             return .{ .ok = true };
         }

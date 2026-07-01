@@ -61,17 +61,25 @@ while kill -0 "$APP_PID" 2>/dev/null; do
 done
 wait "$APP_PID" 2>/dev/null || true
 
-if [[ ! -f "$SHOT" || ! -f "$CKSUM" ]]; then
-  echo "smoke: FAIL — smoke artifacts missing (shot.png and/or checksum.txt)" >&2
-  echo "       Check console output for snapshot/IPC errors." >&2
+# The checksum is the deterministic assertion and is REQUIRED; a missing
+# checksum means the app never reached smoke_done (hydration / IPC / hang).
+# The PNG snapshot is best-effort — a headless CI runner (no display) can't
+# snapshot the WKWebView, so shot.png may be absent; validate the checksum
+# regardless (PNG comparison is not enforced anyway).
+if [[ ! -f "$CKSUM" ]]; then
+  echo "smoke: FAIL — checksum.txt missing (app never reached smoke_done)" >&2
+  echo "       Check console output for hydration / IPC / snapshot errors." >&2
   exit 2
+fi
+if [[ ! -f "$SHOT" ]]; then
+  echo "smoke: WARN — shot.png missing (headless snapshot unavailable); validating checksum only" >&2
 fi
 
 # First run: capture the golden + tell the caller to commit it.
 if [[ ! -f "$GOLDEN_CKSUM" ]]; then
   mkdir -p "$GOLDEN_DIR"
   cp "$CKSUM" "$GOLDEN_CKSUM"
-  cp "$SHOT" "$GOLDEN_DIR/shot.png"
+  [[ -f "$SHOT" ]] && cp "$SHOT" "$GOLDEN_DIR/shot.png"
   echo "smoke: captured initial golden at $GOLDEN_DIR; commit it" >&2
   exit 65
 fi
