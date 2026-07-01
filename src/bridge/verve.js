@@ -8390,7 +8390,8 @@
               { texture: tex, mipLevel: i },
               data,
               { bytesPerRow: Math.ceil(wi / 4) * 16, rowsPerImage: Math.ceil(hi / 4) },
-              [wi, hi],
+              // block-aligned copy extent required for compressed formats (sub-4 mips pad to a full 4×4 block)
+              [Math.ceil(wi / 4) * 4, Math.ceil(hi / 4) * 4],
             );
           }
           st.textures[handle] = { tex, view: tex.createView(), w, h };
