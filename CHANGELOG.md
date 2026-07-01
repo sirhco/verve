@@ -4,6 +4,31 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.32.0] - 2026-07-01
+
+### Added
+
+- **gl — KTX2 / BC7 compressed textures: encoder + container foundation** (slice 1 of
+  3). Pure-Zig, zero-dep, build-time only — no runtime, no bridge, no wire changes yet
+  (the encoded assets are consumed starting in a later slice). Delivers ~4:1 VRAM/
+  bandwidth for 2D LDR material maps, with a host-transparent PNG fallback planned for
+  GPUs lacking BC7.
+  - **`src/core/gl/bc7.zig`** — pure-Zig **BC7 mode-6** block encoder: `encodeBlock`
+    (one 4×4 RGBA block → 16-byte BC7 block), `encodeImage` (full box-filtered mip
+    chain, largest-first; non-multiple-of-4 dims edge-clamp padded, sub-4 mips padded to
+    a 4×4 block), plus a test-only `decodeBlock` used as the round-trip PSNR oracle.
+    Endpoints fit via deterministic principal-axis (power-iteration) selection; 7-bit
+    channels + shared p-bit; anchor-index MSB-implicit-0 handled by endpoint swap +
+    index inversion. Native goldens + PSNR round-trip tests (smooth gradient ≥40 dB).
+  - **`src/core/gl/ktx2.zig`** — minimal KTX2 container `write`/`read` for our subset:
+    12-byte identifier, header (`vkFormat` = BC7 UNORM 145 / SRGB 146, `typeSize=1`,
+    dims, `levelCount`, no supercompression), index, per-mip level index, and a minimal
+    DFD encoding the sRGB-vs-linear transfer function (vkFormat is the srgb source of
+    truth). Round-trip + frozen-bytes golden tests; the byte layout is the contract a
+    later-slice JS parser mirrors.
+  - Scope: **BC7 mode 6 only**, no runtime transcode (full Basis Universal transcode is
+    future work); IBL cubemaps + HDR env excluded.
+
 ## [0.31.0] - 2026-07-01
 
 ### Added
