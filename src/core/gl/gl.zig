@@ -36,6 +36,9 @@ pub const demo_materials = @import("demo_materials.zig");
 /// Pure-Zig BC7 mode-6 texture encoder (KTX2/BC7 compressed-texture pipeline).
 /// Build/comptime + native-test only; no runtime/wasm references.
 pub const bc7 = @import("bc7.zig");
+/// Minimal KTX2 container writer + reader wrapping BC7 mip levels.
+/// Build/comptime + native-test only; no runtime/wasm references.
+pub const ktx2 = @import("ktx2.zig");
 /// Framework demo holographic custom material. Importable from app code
 /// and wasm chunks. Provides a comptime `MaterialDesc` with a non-zero `.id`
 /// (fnv32 of its assembled shader source) and `.flags == variant_pbr | variant_custom`.
@@ -79,4 +82,5 @@ test {
     _ = material;
     _ = demo_materials;
     _ = bc7;
+    _ = ktx2;
 }
