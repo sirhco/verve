@@ -1256,6 +1256,21 @@ pub const ShaderHooks = struct {
     vertex_displace_wgsl: ?[]const u8 = null,
     vertex_normal_glsl: ?[]const u8 = null,
     vertex_normal_wgsl: ?[]const u8 = null,
+    // Fragment hooks (slice 3A).
+    // frag_emissive: block-scoped splice inserted immediately before the engine emissive append.
+    //   Declares vrv_emissive (vec3, init 0) inside the block; `color += vrv_emissive` closes it.
+    //   Composes with variant_emissive (engine emissive still appends after the hook block).
+    // frag_alpha: fn-scope var vrv_alpha = base_color.a (declared once, outside all blocks),
+    //   then a block-scoped snippet that writes vrv_alpha (and may call discard;), then a
+    //   CUSTOM tail that outputs vec4(color, vrv_alpha) instead of vec4(color, base_color.a).
+    //   All three pieces (fn-scope var, block, custom tail) gated on frag_alpha PRESENCE.
+    //   WGSL: base_color is `let` (immutable), so alpha output must route through vrv_alpha.
+    //   Custom tail / fn-scope vrv_alpha NOT emitted when only frag_emissive is set → non-custom
+    //   and custom-without-frag_alpha paths stay byte-identical to the plain delegator.
+    frag_emissive_glsl: ?[]const u8 = null,
+    frag_emissive_wgsl: ?[]const u8 = null,
+    frag_alpha_glsl: ?[]const u8 = null,
+    frag_alpha_wgsl: ?[]const u8 = null,
 };
 
 pub fn pbrFragmentSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u8 {
@@ -1713,6 +1728,11 @@ pub fn pbrFragmentSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []
         \\}
         \\
     ;
+    const tail_close_custom =
+        \\  o_frag = vec4(color, vrv_alpha);
+        \\}
+        \\
+    ;
     comptime var src: []const u8 = head;
     if (flags & variant_instanced != 0) src = src ++ inst_in;
     if (flags & variant_normal_map != 0) src = src ++ nm_ins;
@@ -1727,6 +1747,8 @@ pub fn pbrFragmentSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []
     if (flags & variant_clipping != 0) src = src ++ clip_uniforms;
     src = src ++ main_open;
     if (flags & variant_instanced != 0) src = src ++ inst_tint;
+    if (hooks.frag_alpha_glsl != null) src = src ++ "  float vrv_alpha = base_color.a;\n";
+    if (hooks.frag_alpha_glsl) |s| src = src ++ "  {\n" ++ s ++ "\n  }\n";
     if (flags & variant_alpha_test != 0) src = src ++ alpha_test;
     if (flags & variant_clipping != 0) src = src ++ clip_discard;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
@@ -1741,11 +1763,12 @@ pub fn pbrFragmentSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []
     if (flags & variant_shadow != 0) src = src ++ area_lighting_shadow_2d;
     src = src ++ area_lighting_tail;
     src = src ++ combine_plain;
+    if (hooks.frag_emissive_glsl) |s| src = src ++ "  {\n  vec3 vrv_emissive = vec3(0.0);\n" ++ s ++ "\n  color += vrv_emissive;\n  }\n";
     if (flags & variant_emissive != 0) src = src ++ emissive;
     if (flags & variant_fog != 0) src = src ++ fog_mix;
     if (hooks.frag_final_glsl) |snippet| src = src ++ "  {\n  vec3 vrv_color = color;\n" ++ snippet ++ "\n  color = vrv_color;\n  }\n";
     if (flags & variant_linear_output == 0) src = src ++ tail_tonemap;
-    src = src ++ tail_close;
+    src = src ++ (if (hooks.frag_alpha_glsl != null) tail_close_custom else tail_close);
     return src;
 }
 
@@ -2973,6 +2996,11 @@ pub fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u
         \\}
         \\
     ;
+    const fs_tail_close_custom =
+        \\  return vec4<f32>(color, vrv_alpha);
+        \\}
+        \\
+    ;
 
     const nm = flags & variant_normal_map != 0;
     const em = flags & variant_emissive != 0;
@@ -3050,6 +3078,8 @@ pub fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u
     // custom × instanced and custom × double_sided (v1 exclusions) until a future slice adds
     // fs_open_ds_custom / fs_open_instanced_custom.
     src = src ++ (if (inst) fs_open_instanced else (if (ds) fs_open_ds else (if (hooks.frag_albedo_wgsl != null) fs_open_custom else fs_open)));
+    if (hooks.frag_alpha_wgsl != null) src = src ++ "  var vrv_alpha = base_color.a;\n";
+    if (hooks.frag_alpha_wgsl) |s| src = src ++ "  {\n" ++ s ++ "\n  }\n";
     if (flags & variant_alpha_test != 0) src = src ++ fs_alpha_test;
     if (clip) src = src ++ fs_clip_discard;
     src = src ++ (if (nm) (if (ds) fs_normal_nm_ds else fs_normal_nm) else (if (ds) fs_normal_plain_ds else fs_normal_plain));
@@ -3064,11 +3094,12 @@ pub fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u
     if (shadow) src = src ++ fs_area_lighting_shadow_2d;
     src = src ++ fs_area_lighting_tail;
     src = src ++ fs_combine_plain;
+    if (hooks.frag_emissive_wgsl) |s| src = src ++ "  {\n  var vrv_emissive = vec3<f32>(0.0);\n" ++ s ++ "\n  color = color + vrv_emissive;\n  }\n";
     if (em) src = src ++ fs_emissive;
     if (flags & variant_fog != 0) src = src ++ fs_fog_mix;
     if (hooks.frag_final_wgsl) |snippet| src = src ++ "  {\n  var vrv_color = color;\n" ++ snippet ++ "\n  color = vrv_color;\n  }\n";
     if (!lin) src = src ++ fs_tail_tonemap;
-    src = src ++ fs_tail_close;
+    src = src ++ (if (hooks.frag_alpha_wgsl != null) fs_tail_close_custom else fs_tail_close);
     return src;
 }
 
@@ -8548,4 +8579,131 @@ test "golden: SET_CUSTOM (tag 48) byte layout" {
             "00100000", // ptr=0x1000
         hex,
     );
+}
+
+// ── Custom-materials 3A: frag_emissive + frag_alpha fragment hooks ────────────
+
+test "frag_emissive + frag_alpha structural: WGSL + GLSL FS contain vrv_emissive, vrv_alpha, custom tail" {
+    const fixture = ShaderHooks{
+        .frag_emissive_wgsl = "vrv_emissive = vec3<f32>(0.1, 0.0, 0.0);",
+        .frag_emissive_glsl = "vrv_emissive = vec3(0.1, 0.0, 0.0);",
+        .frag_alpha_wgsl = "vrv_alpha = vrv_alpha * 0.5;",
+        .frag_alpha_glsl = "vrv_alpha = vrv_alpha * 0.5;",
+    };
+    const C = variant_pbr | variant_custom;
+    const wgsl = wgslPbrHooked(C, fixture);
+    const glsl = pbrFragmentSrcHooked(C, fixture);
+
+    // WGSL: fn-scope var vrv_alpha declared.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "var vrv_alpha = base_color.a;") != null);
+    // WGSL: frag_alpha snippet in block.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "vrv_alpha = vrv_alpha * 0.5;") != null);
+    // WGSL: custom tail selected.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "return vec4<f32>(color, vrv_alpha);") != null);
+    // WGSL: plain tail NOT present when custom tail selected.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "return vec4<f32>(color, base_color.a);") == null);
+    // WGSL: frag_emissive block with init + writeback.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "var vrv_emissive = vec3<f32>(0.0);") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "color = color + vrv_emissive;") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "vrv_emissive = vec3<f32>(0.1, 0.0, 0.0);") != null);
+
+    // GLSL: fn-scope float vrv_alpha declared.
+    try testing.expect(std.mem.indexOf(u8, glsl, "float vrv_alpha = base_color.a;") != null);
+    // GLSL: frag_alpha snippet in block.
+    try testing.expect(std.mem.indexOf(u8, glsl, "vrv_alpha = vrv_alpha * 0.5;") != null);
+    // GLSL: custom tail selected.
+    try testing.expect(std.mem.indexOf(u8, glsl, "o_frag = vec4(color, vrv_alpha);") != null);
+    // GLSL: plain tail NOT present when custom tail selected.
+    try testing.expect(std.mem.indexOf(u8, glsl, "o_frag = vec4(color, base_color.a);") == null);
+    // GLSL: frag_emissive block with init + writeback.
+    try testing.expect(std.mem.indexOf(u8, glsl, "vec3 vrv_emissive = vec3(0.0);") != null);
+    try testing.expect(std.mem.indexOf(u8, glsl, "color += vrv_emissive;") != null);
+    try testing.expect(std.mem.indexOf(u8, glsl, "vrv_emissive = vec3(0.1, 0.0, 0.0);") != null);
+}
+
+test "frag_alpha custom-tail gating: frag_emissive-only keeps plain tail, no vrv_alpha" {
+    // frag_emissive present, frag_alpha ABSENT → custom tail NOT selected, no vrv_alpha declared.
+    const emissive_only = ShaderHooks{
+        .frag_emissive_wgsl = "vrv_emissive = vec3<f32>(0.1, 0.0, 0.0);",
+        .frag_emissive_glsl = "vrv_emissive = vec3(0.1, 0.0, 0.0);",
+    };
+    const C = variant_pbr | variant_custom;
+    const wgsl = wgslPbrHooked(C, emissive_only);
+    const glsl = pbrFragmentSrcHooked(C, emissive_only);
+
+    // WGSL: plain tail present, custom tail absent.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "return vec4<f32>(color, base_color.a);") != null);
+    try testing.expect(std.mem.indexOf(u8, wgsl, "return vec4<f32>(color, vrv_alpha);") == null);
+    // WGSL: no fn-scope vrv_alpha declared.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "var vrv_alpha") == null);
+
+    // GLSL: plain tail present, custom tail absent.
+    try testing.expect(std.mem.indexOf(u8, glsl, "o_frag = vec4(color, base_color.a);") != null);
+    try testing.expect(std.mem.indexOf(u8, glsl, "o_frag = vec4(color, vrv_alpha);") == null);
+    // GLSL: no fn-scope vrv_alpha declared.
+    try testing.expect(std.mem.indexOf(u8, glsl, "float vrv_alpha") == null);
+
+    // frag_emissive IS present in both.
+    try testing.expect(std.mem.indexOf(u8, wgsl, "vrv_emissive") != null);
+    try testing.expect(std.mem.indexOf(u8, glsl, "vrv_emissive") != null);
+}
+
+test "frag_emissive + frag_alpha both-hook scope: preamble decls in separate blocks (C1 regression)" {
+    // Both hooks carry the same preamble identifier. Block-scoping prevents identifier collision.
+    const wgsl_em = "  let custom_u = custom.u_time;\n  vrv_emissive = vec3<f32>(custom_u, 0.0, 0.0);";
+    const wgsl_al = "  let custom_u = custom.u_time;\n  vrv_alpha = vrv_alpha * custom_u;";
+    const glsl_em = "  float custom_u = u_time;\n  vrv_emissive = vec3(custom_u, 0.0, 0.0);";
+    const glsl_al = "  float custom_u = u_time;\n  vrv_alpha = vrv_alpha * custom_u;";
+
+    const scope_fixture = ShaderHooks{
+        .frag_emissive_wgsl = wgsl_em,
+        .frag_alpha_wgsl = wgsl_al,
+        .frag_emissive_glsl = glsl_em,
+        .frag_alpha_glsl = glsl_al,
+    };
+    const C = variant_pbr | variant_custom;
+    const wgsl = wgslPbrHooked(C, scope_fixture);
+    const glsl = pbrFragmentSrcHooked(C, scope_fixture);
+
+    // WGSL: `let custom_u = custom.u_time;` appears exactly twice, with a `}` between.
+    const wgsl_first = std.mem.indexOf(u8, wgsl, "let custom_u = custom.u_time;").?;
+    const wgsl_second = std.mem.indexOfPos(u8, wgsl, wgsl_first + 1, "let custom_u = custom.u_time;").?;
+    const wgsl_brace = std.mem.indexOfPos(u8, wgsl, wgsl_first, "}").?;
+    try testing.expect(wgsl_brace < wgsl_second);
+    try testing.expect(std.mem.indexOfPos(u8, wgsl, wgsl_second + 1, "let custom_u = custom.u_time;") == null);
+
+    // GLSL: `float custom_u = u_time;` appears exactly twice, with a `}` between.
+    const glsl_first = std.mem.indexOf(u8, glsl, "float custom_u = u_time;").?;
+    const glsl_second = std.mem.indexOfPos(u8, glsl, glsl_first + 1, "float custom_u = u_time;").?;
+    const glsl_brace = std.mem.indexOfPos(u8, glsl, glsl_first, "}").?;
+    try testing.expect(glsl_brace < glsl_second);
+    try testing.expect(std.mem.indexOfPos(u8, glsl, glsl_second + 1, "float custom_u = u_time;") == null);
+}
+
+test "frag_emissive + frag_alpha byte-identity: variant_emissive + variant_alpha_test unchanged by null hooks" {
+    // Extended byte-identity guard for variant_emissive and variant_alpha_test paths.
+    // New null fields must emit zero bytes so non-hook paths stay byte-identical.
+    const F_em = variant_pbr | variant_emissive;
+    const F_at = variant_pbr | variant_alpha_test;
+    const F_em_at = variant_pbr | variant_emissive | variant_alpha_test;
+    // WGSL
+    try testing.expectEqual(fnv64(wgslPbr(F_em)), fnv64(wgslPbrHooked(F_em, .{})));
+    try testing.expectEqual(fnv64(wgslPbr(F_at)), fnv64(wgslPbrHooked(F_at, .{})));
+    try testing.expectEqual(fnv64(wgslPbr(F_em_at)), fnv64(wgslPbrHooked(F_em_at, .{})));
+    // GLSL FS
+    try testing.expectEqual(fnv64(pbrFragmentSrc(F_em)), fnv64(pbrFragmentSrcHooked(F_em, .{})));
+    try testing.expectEqual(fnv64(pbrFragmentSrc(F_at)), fnv64(pbrFragmentSrcHooked(F_at, .{})));
+    try testing.expectEqual(fnv64(pbrFragmentSrc(F_em_at)), fnv64(pbrFragmentSrcHooked(F_em_at, .{})));
+}
+
+test "golden: frag_emissive + frag_alpha hooks WGSL + GLSL FS hashes frozen (FNV-1a-64)" {
+    const fixture = ShaderHooks{
+        .frag_emissive_wgsl = "vrv_emissive = vec3<f32>(0.1, 0.0, 0.0);",
+        .frag_emissive_glsl = "vrv_emissive = vec3(0.1, 0.0, 0.0);",
+        .frag_alpha_wgsl = "vrv_alpha = vrv_alpha * 0.5;",
+        .frag_alpha_glsl = "vrv_alpha = vrv_alpha * 0.5;",
+    };
+    const C = variant_pbr | variant_custom;
+    try testing.expectEqual(@as(u64, 0x574cdf16867ebbdb), fnv64(wgslPbrHooked(C, fixture)));
+    try testing.expectEqual(@as(u64, 0x12cdea3ca731a5f6), fnv64(pbrFragmentSrcHooked(C, fixture)));
 }
