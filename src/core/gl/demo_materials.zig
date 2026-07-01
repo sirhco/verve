@@ -7,7 +7,9 @@ const gl = @import("gl.zig");
 
 /// Holographic scanline material. Blends the PBR albedo toward `tint`
 /// along the V axis (frag_albedo hook) and adds a time-animated scanline
-/// pulse in the final-color hook.
+/// pulse in the final-color hook. Vertex hooks apply a u_time sine wobble
+/// that displaces geometry along Y (vertex_displace) and recomputes the
+/// surface normal so lighting follows the displaced surface (vertex_normal).
 ///
 /// Uniform layout (std140 lane order):
 ///   params[0].xyz = tint  (vec3, vec4_index 0, lanes x/y/z; lane w = pad)
@@ -18,6 +20,14 @@ const gl = @import("gl.zig");
 /// (Multi-uniform materials must pad each Vec3/Vec4 to its 4-float slot — the
 /// chunk's data-glmat parser reads floats straight into params[] by lane.)
 pub const example_holo = gl.Material(.{
+    .vertex_displace = .{
+        .glsl = "vrv_pos.y += sin(vrv_pos.x * 3.0 + u_time * 2.0) * 0.08;",
+        .wgsl = "vrv_pos.y = vrv_pos.y + sin(vrv_pos.x * 3.0 + u_time * 2.0) * 0.08;",
+    },
+    .vertex_normal = .{
+        .glsl = "vrv_normal = normalize(vrv_normal - vec3(3.0 * 0.08 * cos(vrv_pos.x * 3.0 + u_time * 2.0), 0.0, 0.0));",
+        .wgsl = "vrv_normal = normalize(vrv_normal - vec3<f32>(3.0 * 0.08 * cos(vrv_pos.x * 3.0 + u_time * 2.0), 0.0, 0.0));",
+    },
     .frag_albedo = .{
         .glsl = "vrv_albedo = mix(vrv_albedo, tint, v_uv.y);",
         .wgsl = "vrv_albedo = mix(vrv_albedo, tint, in.uv.y);",
