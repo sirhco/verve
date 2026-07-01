@@ -5148,6 +5148,58 @@
   // path (tag 49, 3D) throughout the session. False until a backend initialises.
   let glBc7Supported = false;
 
+  // >>> parseKtx2 (KTX2/BC7 slice 3) — node cross-check extracts this exact block
+  // between the sentinels; keep it SELF-CONTAINED (no closure deps beyond
+  // DataView/Uint8Array). Mirrors src/core/gl/ktx2.zig byte layout EXACTLY (S1
+  // golden froze these offsets). Parses our minimal BC7 subset; returns
+  //   { w, h, format /*1=BC7_UNORM(vk145) 2=BC7_SRGB(vk146)*/,
+  //     levels: [{ off, len } ...] /*byte ranges into buf, LARGEST-FIRST*/ }
+  // or null on any mismatch (bad magic / unsupported vkFormat / supercompression /
+  // truncation) so the caller can fall back to the .png sibling.
+  function parseKtx2(buf) {
+    const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    // Identifier (12 bytes) — ktx2.zig off 0.
+    if (u8.length < 12) return null;
+    const ID = [
+      0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb, 0x0d, 0x0a, 0x1a, 0x0a,
+    ];
+    for (let i = 0; i < 12; i++) if (u8[i] !== ID[i]) return null;
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    // Need identifier(12) + header(36) + index(32) = 80 bytes minimum.
+    if (u8.length < 80) return null;
+    // Header — 9 × u32 LE from off 12 (ktx2.zig off_header).
+    const vkFormat = dv.getUint32(12, true); // @12 vkFormat
+    // @16 typeSize (ignored)
+    const w = dv.getUint32(20, true); //        @20 pixelWidth
+    const h = dv.getUint32(24, true); //        @24 pixelHeight
+    // @28 pixelDepth, @32 layerCount, @36 faceCount (ignored)
+    const levelCount = dv.getUint32(40, true); // @40 levelCount
+    const superScheme = dv.getUint32(44, true); // @44 supercompressionScheme
+    if (superScheme !== 0) return null; // we never emit supercompression
+    let format;
+    if (vkFormat === 145) format = 1; // VK_FORMAT_BC7_UNORM_BLOCK
+    else if (vkFormat === 146) format = 2; // VK_FORMAT_BC7_SRGB_BLOCK
+    else return null; // unsupported vkFormat → PNG fallback
+    // Index block @48..79 (dfd u32×2, kvd u32×2, sgd u64×2) — deterministic in
+    // our writer; skipped. srgb comes from vkFormat, not the DFD.
+    // Level index @80 (ktx2.zig off_level_idx): levelCount × 3×u64 LE.
+    const levelIdxEnd = 80 + levelCount * 24;
+    if (u8.length < levelIdxEnd) return null;
+    const levels = [];
+    let p = 80;
+    for (let i = 0; i < levelCount; i++) {
+      const off = Number(dv.getBigUint64(p, true)); // byteOffset (into buf)
+      p += 8;
+      const len = Number(dv.getBigUint64(p, true)); // byteLength
+      p += 8;
+      p += 8; // uncompressedByteLength (ignored)
+      if (off > u8.length || len > u8.length - off) return null; // bounds
+      levels.push({ off, len });
+    }
+    return { w, h, format, levels };
+  }
+  // <<< parseKtx2 <<<
+
   // Per-canvas frame callbacks driven by the master anim rAF (animTick).
   // Membership == "this canvas's loop is running": sinks delete themselves
   // on stop paths instead of skipping a self-reschedule. Shared tick means
@@ -10232,6 +10284,42 @@
                 new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
                 deliver(ptr, bytes.length >>> 0);
               };
+              // ── LAYER-1 tex-ready payload builders (KTX2/BC7 slice 3) ──────────
+              // Chunk 3E reads a format word at off 8, then either RGBA (fmt 0) at
+              // off 12 or a BC7 mip table (fmt 1/2). See s3-design-pins LAYER 1.
+              const buildRgbaPayload = (w, h, px) => {
+                const out = new Uint8Array(12 + px.length);
+                const dv = new DataView(out.buffer);
+                dv.setUint32(0, w >>> 0, true);
+                dv.setUint32(4, h >>> 0, true);
+                dv.setUint32(8, 0, true); // format 0 = RGBA8
+                out.set(px, 12);
+                return out;
+              };
+              // k = parseKtx2 output; src = Uint8Array over the whole .ktx2 blob.
+              // Emits [w][h][format][mip_count][ {off,len}×n ][blocks], blocks
+              // largest-first; table `off` relative to blocks_base = 16 + n*8.
+              const buildBc7Payload = (k, src) => {
+                const n = k.levels.length;
+                let total = 0;
+                for (const lv of k.levels) total += lv.len;
+                const blocksBase = 16 + n * 8;
+                const out = new Uint8Array(blocksBase + total);
+                const dv = new DataView(out.buffer);
+                dv.setUint32(0, k.w >>> 0, true);
+                dv.setUint32(4, k.h >>> 0, true);
+                dv.setUint32(8, k.format >>> 0, true);
+                dv.setUint32(12, n >>> 0, true);
+                let rel = 0;
+                for (let i = 0; i < n; i++) {
+                  const lv = k.levels[i];
+                  dv.setUint32(16 + i * 8, rel >>> 0, true);
+                  dv.setUint32(16 + i * 8 + 4, lv.len >>> 0, true);
+                  out.set(src.subarray(lv.off, lv.off + lv.len), blocksBase + rel);
+                  rel += lv.len;
+                }
+                return out;
+              };
               const isImageUrl = (u) => /\.(png|jpe?g|webp)$/i.test(u);
               const decodeImageMain = async (ab) => {
                 const bm = await createImageBitmap(new Blob([ab]));
@@ -10239,35 +10327,103 @@
                 const cx = c.getContext("2d");
                 cx.drawImage(bm, 0, 0);
                 const px = cx.getImageData(0, 0, bm.width, bm.height).data;
-                const out = new Uint8Array(8 + px.length);
-                const dv = new DataView(out.buffer);
-                dv.setUint32(0, bm.width, true);
-                dv.setUint32(4, bm.height, true);
-                out.set(px, 8);
+                const w = bm.width;
+                const h = bm.height;
                 bm.close();
-                return out;
+                return buildRgbaPayload(w, h, px);
               };
-              const mainThreadFetch = () => {
-                fetch(url)
-                  .then((r) => {
-                    if (!r.ok) throw new Error("HTTP " + r.status);
-                    return r.arrayBuffer();
-                  })
-                  .then((ab) =>
-                    isImageUrl(url) ? decodeImageMain(ab) : new Uint8Array(ab),
-                  )
-                  .then((bytes) => onBytes(bytes))
-                  .catch((err) => {
-                    console.error("verve.gl: asset fetch failed:", url, err);
-                    deliver(0, 0);
-                  });
+              // The asset worker still emits the legacy 8-byte [w][h][rgba] image
+              // payload; re-wrap it into the LAYER-1 12-byte [w][h][0][rgba] form
+              // without touching the worker (this task is verve.js-only).
+              const rewrapWorkerImage = (u8) => {
+                const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+                return buildRgbaPayload(
+                  dv.getUint32(0, true),
+                  dv.getUint32(4, true),
+                  u8.subarray(8),
+                );
               };
-              // Prefer the asset worker; fall back to a main-thread fetch on any
-              // worker failure (unavailable / CSP-blocked / crashed / fetch error).
-              assetWorkerLoad(url).then(
-                (ab) => onBytes(new Uint8Array(ab)),
-                () => mainThreadFetch(),
-              );
+              // PNG-fallback loader: BC7 unsupported OR KTX2 parse failed. Swaps a
+              // `.ktx2` request to its `.png` sibling and decodes → RGBA payload.
+              const loadPng = () => {
+                const pngUrl = /\.ktx2$/i.test(url)
+                  ? url.replace(/\.ktx2$/i, ".png")
+                  : url;
+                const mainThreadFetch = () => {
+                  fetch(pngUrl)
+                    .then((r) => {
+                      if (!r.ok) throw new Error("HTTP " + r.status);
+                      return r.arrayBuffer();
+                    })
+                    .then((ab) => decodeImageMain(ab))
+                    .then((bytes) => onBytes(bytes))
+                    .catch((err) => {
+                      console.error("verve.gl: asset fetch failed:", pngUrl, err);
+                      deliver(0, 0);
+                    });
+                };
+                assetWorkerLoad(pngUrl).then(
+                  (ab) => onBytes(rewrapWorkerImage(new Uint8Array(ab))),
+                  () => mainThreadFetch(),
+                );
+              };
+              // BC7 loader: fetch the .ktx2 raw, parse, emit the compressed
+              // LAYER-1 payload. Corrupt/unsupported container → .png fallback.
+              const loadBc7 = () => {
+                const handle = (ab) => {
+                  const k = parseKtx2(ab);
+                  if (!k) {
+                    loadPng();
+                    return;
+                  }
+                  onBytes(buildBc7Payload(k, new Uint8Array(ab)));
+                };
+                const mainThreadFetch = () => {
+                  fetch(url)
+                    .then((r) => {
+                      if (!r.ok) throw new Error("HTTP " + r.status);
+                      return r.arrayBuffer();
+                    })
+                    .then((ab) => handle(ab))
+                    .catch((err) => {
+                      console.error("verve.gl: asset fetch failed:", url, err);
+                      deliver(0, 0);
+                    });
+                };
+                // Worker fetches the .ktx2 with passthrough decode (no image
+                // decoder for that ext), handing back the raw container bytes.
+                assetWorkerLoad(url).then((ab) => handle(ab), () => mainThreadFetch());
+              };
+              // Raw-asset loader (meshes, .bin, ltc) — unchanged passthrough.
+              const loadRaw = () => {
+                const mainThreadFetch = () => {
+                  fetch(url)
+                    .then((r) => {
+                      if (!r.ok) throw new Error("HTTP " + r.status);
+                      return r.arrayBuffer();
+                    })
+                    .then((ab) => new Uint8Array(ab))
+                    .then((bytes) => onBytes(bytes))
+                    .catch((err) => {
+                      console.error("verve.gl: asset fetch failed:", url, err);
+                      deliver(0, 0);
+                    });
+                };
+                assetWorkerLoad(url).then(
+                  (ab) => onBytes(new Uint8Array(ab)),
+                  () => mainThreadFetch(),
+                );
+              };
+              // Host-transparent dispatch: the chunk always requests `.ktx2` for
+              // textures; JS returns BC7 when supported, else the RGBA sibling —
+              // the engine never learns which won (format word in the payload).
+              if (/\.ktx2$/i.test(url)) {
+                glBc7Supported ? loadBc7() : loadPng();
+              } else if (isImageUrl(url)) {
+                loadPng();
+              } else {
+                loadRaw();
+              }
             },
           },
         }).catch((err) => {
