@@ -76,7 +76,7 @@ pub const UniformSlot = struct {
 pub const MaterialDesc = struct {
     flags: u32, // command.variant_pbr | command.variant_custom
     wgsl: []const u8, // wgslPbrHooked(flags, hooks)
-    glsl_vs: []const u8, // command.pbrVertexSrc(flags)  (unchanged by custom in slice 1)
+    glsl_vs: []const u8, // pbrVertexSrcHooked(flags, hooks) — hooked when vertex opts present
     glsl_fs: []const u8, // pbrFragmentSrcHooked(flags, hooks)
     uniforms: []const UniformSlot, // declaration order
     param_vec4_count: u8, // K vec4s actually used (must be ≤ 4)
@@ -90,6 +90,8 @@ pub const MaterialDesc = struct {
 /// `opts` fields (all optional):
 /// - `.frag_albedo = .{ .glsl = "...", .wgsl = "..." }` — replaces albedo in PBR pipeline.
 /// - `.frag_final = .{ .glsl = "...", .wgsl = "..." }` — post-tonemap color hook.
+/// - `.vertex_displace = .{ .glsl = "...", .wgsl = "..." }` — writes `vrv_pos` (local-space position).
+/// - `.vertex_normal = .{ .glsl = "...", .wgsl = "..." }` — writes `vrv_normal` (local-space normal).
 /// - `.uniforms = .{ .name = Type, ... }` — uniform type markers; Type ∈ {f32, Vec2, Vec3, Vec4}.
 ///
 /// Packed into params[] vec4s (std140-simplified, declaration order).
@@ -100,6 +102,8 @@ pub fn Material(comptime opts: anytype) MaterialDesc {
     const has_uniforms = @hasField(@TypeOf(opts), "uniforms");
     const has_frag_albedo = @hasField(@TypeOf(opts), "frag_albedo");
     const has_frag_final = @hasField(@TypeOf(opts), "frag_final");
+    const has_vertex_displace = @hasField(@TypeOf(opts), "vertex_displace");
+    const has_vertex_normal = @hasField(@TypeOf(opts), "vertex_normal");
 
     // Validate dual-language requirement
     if (has_frag_albedo) {
@@ -109,6 +113,14 @@ pub fn Material(comptime opts: anytype) MaterialDesc {
     if (has_frag_final) {
         if (!@hasField(@TypeOf(opts.frag_final), "glsl") or !@hasField(@TypeOf(opts.frag_final), "wgsl"))
             @compileError("frag_final requires both .glsl and .wgsl");
+    }
+    if (has_vertex_displace) {
+        if (!@hasField(@TypeOf(opts.vertex_displace), "glsl") or !@hasField(@TypeOf(opts.vertex_displace), "wgsl"))
+            @compileError("vertex_displace requires both .glsl and .wgsl");
+    }
+    if (has_vertex_normal) {
+        if (!@hasField(@TypeOf(opts.vertex_normal), "glsl") or !@hasField(@TypeOf(opts.vertex_normal), "wgsl"))
+            @compileError("vertex_normal requires both .glsl and .wgsl");
     }
 
     const n_uniforms: usize = if (has_uniforms) std.meta.fields(@TypeOf(opts.uniforms)).len else 0;
@@ -213,13 +225,23 @@ pub fn Material(comptime opts: anytype) MaterialDesc {
         hooks.frag_final_wgsl = S.wgsl_preamble ++ opts.frag_final.wgsl;
         hooks.frag_final_glsl = S.glsl_preamble ++ opts.frag_final.glsl;
     }
+    // Vertex hooks — same preamble builder (works in VS scope: 2A added custom_uniforms to GLSL VS,
+    // WGSL custom is module-global). block-scoped splices prevent cross-hook redeclaration (C1 fix).
+    if (has_vertex_displace) {
+        hooks.vertex_displace_wgsl = S.wgsl_preamble ++ opts.vertex_displace.wgsl;
+        hooks.vertex_displace_glsl = S.glsl_preamble ++ opts.vertex_displace.glsl;
+    }
+    if (has_vertex_normal) {
+        hooks.vertex_normal_wgsl = S.wgsl_preamble ++ opts.vertex_normal.wgsl;
+        hooks.vertex_normal_glsl = S.glsl_preamble ++ opts.vertex_normal.glsl;
+    }
 
     const mat_wgsl = command.wgslPbrHooked(flags, hooks);
     const mat_glsl_fs = command.pbrFragmentSrcHooked(flags, hooks);
     return MaterialDesc{
         .flags = flags,
         .wgsl = mat_wgsl,
-        .glsl_vs = command.pbrVertexSrc(flags),
+        .glsl_vs = command.pbrVertexSrcHooked(flags, hooks),
         .glsl_fs = mat_glsl_fs,
         .uniforms = &S.slots,
         .param_vec4_count = S.param_vec4_count,
@@ -333,10 +355,92 @@ test "Material: frag_albedo present → var albedo; frag_final-only → let albe
     try std.testing.expect(std.mem.indexOf(u8, desc_final.wgsl, "var albedo") == null);
 }
 
-test "Material: glsl_vs unchanged from pbrVertexSrc" {
+test "Material: glsl_vs unchanged from pbrVertexSrc (frag-only, no vertex hooks)" {
     const desc = comptime Material(.{
         .frag_final = .{ .glsl = "vrv_color = vrv_color;", .wgsl = "vrv_color = vrv_color;" },
     });
     const expected_vs = comptime command.pbrVertexSrc(command.variant_pbr | command.variant_custom);
     try std.testing.expectEqualStrings(expected_vs, desc.glsl_vs);
 }
+
+test "Material: vertex_displace + vertex_normal + uniform → VS contains hooks + preamble" {
+    const desc = comptime Material(.{
+        .vertex_displace = .{
+            .glsl = "vrv_pos.y += sin(u_time) * amp;",
+            .wgsl = "vrv_pos.y = vrv_pos.y + sin(u_time) * amp;",
+        },
+        .vertex_normal = .{
+            .glsl = "vrv_normal = normalize(vrv_normal + vec3(0.0, amp, 0.0));",
+            .wgsl = "vrv_normal = normalize(vrv_normal + vec3<f32>(0.0, amp, 0.0));",
+        },
+        .uniforms = .{ .amp = f32 },
+    });
+
+    // GLSL VS contains both vertex snippets
+    try std.testing.expect(std.mem.indexOf(u8, desc.glsl_vs, "vrv_pos.y += sin(u_time) * amp;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc.glsl_vs, "vrv_normal = normalize(vrv_normal + vec3(0.0, amp, 0.0));") != null);
+    // GLSL VS contains the preamble alias for amp
+    try std.testing.expect(std.mem.indexOf(u8, desc.glsl_vs, "float amp = u_params[0].x;") != null);
+    // GLSL VS has the vrv_pos declaration (added by hooked VS when vertex hooks present)
+    try std.testing.expect(std.mem.indexOf(u8, desc.glsl_vs, "vrv_pos") != null);
+
+    // WGSL combined module contains both vertex snippets (in vs_main)
+    try std.testing.expect(std.mem.indexOf(u8, desc.wgsl, "vrv_pos.y = vrv_pos.y + sin(u_time) * amp;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc.wgsl, "vrv_normal = normalize(vrv_normal + vec3<f32>(0.0, amp, 0.0));") != null);
+    // WGSL contains vrv_pos
+    try std.testing.expect(std.mem.indexOf(u8, desc.wgsl, "vrv_pos") != null);
+    // WGSL contains u_time alias (from preamble prepended to each hook)
+    try std.testing.expect(std.mem.indexOf(u8, desc.wgsl, "let u_time = custom.u_time;") != null);
+}
+
+test "Material: vertex-only → FS is plain (no frag splice)" {
+    const desc = comptime Material(.{
+        .vertex_displace = .{
+            .glsl = "vrv_pos.y += 0.5;",
+            .wgsl = "vrv_pos.y = vrv_pos.y + 0.5;",
+        },
+    });
+    const plain_fs = comptime command.pbrFragmentSrc(command.variant_pbr | command.variant_custom);
+    try std.testing.expectEqualStrings(plain_fs, desc.glsl_fs);
+}
+
+test "Material: vertex+frag+uniform → WGSL brace-balanced + u_time count per-hook" {
+    const desc = comptime Material(.{
+        .vertex_displace = .{
+            .glsl = "vrv_pos.y += sin(u_time) * amp;",
+            .wgsl = "vrv_pos.y = vrv_pos.y + sin(u_time) * amp;",
+        },
+        .vertex_normal = .{
+            .glsl = "vrv_normal = normalize(vrv_normal);",
+            .wgsl = "vrv_normal = normalize(vrv_normal);",
+        },
+        .frag_final = .{
+            .glsl = "vrv_color = vrv_color * amp;",
+            .wgsl = "vrv_color = vrv_color * amp;",
+        },
+        .uniforms = .{ .amp = f32 },
+    });
+
+    // WGSL must be brace-balanced (block-scoped splices each add matched { })
+    var balance: i64 = 0;
+    for (desc.wgsl) |c| {
+        if (c == '{') balance += 1;
+        if (c == '}') balance -= 1;
+    }
+    try std.testing.expectEqual(@as(i64, 0), balance);
+
+    // let u_time = custom.u_time; appears exactly once per hook (3 hooks: vd, vn, ff)
+    const needle = "let u_time = custom.u_time;";
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOf(u8, desc.wgsl[i..], needle)) |pos| {
+        count += 1;
+        i += pos + needle.len;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+}
+
+// Test 4 — Dual-language guard: structural invariant, not runtime-testable.
+// Material(.{ .vertex_displace = .{ .glsl = "..." } })  — missing .wgsl —
+// triggers @compileError("vertex_displace requires both .glsl and .wgsl").
+// Likewise for .vertex_normal. Guard mirrors the frag-hook guards above it.
