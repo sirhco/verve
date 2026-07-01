@@ -1232,7 +1232,7 @@ test "gl.example_holo resolves with non-zero id and correct flags" {
     // Purely comptime — exercises the demo_materials re-export chain through gl.zig.
     try testing.expect(gl.example_holo.id != 0);
     try testing.expectEqual(
-        gl.command.variant_pbr | gl.command.variant_custom,
+        gl.command.variant_pbr | gl.command.variant_custom | gl.command.variant_custom_tex,
         gl.example_holo.flags,
     );
 }

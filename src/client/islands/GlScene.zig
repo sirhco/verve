@@ -72,6 +72,7 @@ const zoom_sens: f32 = 0.005; // distance per wheel deltaY unit
 const vmesh_ready_export = "glscene_vmesh_ready";
 const env_ready_export = "glscene_env_ready";
 const tex_ready_export = "glscene_tex_ready";
+const custom_tex_ready_export = "glscene_custom_tex_ready";
 const frame_export = "glscene_frame";
 
 // GPU resource handles (kept distinct from IBL handles 16/17/18).
@@ -336,6 +337,10 @@ const Inst = struct {
     tex_url_buf: [192]u8 = undefined, // scratch for the derived "<stem>.tex{N}.<ext>"
     tex_up: [max_tex]TexUpload = undefined, // decoded textures awaiting createTexture
     tex_up_n: u32 = 0,
+    // Custom material textures (slice 3E). Separate from mesh tex_loading to avoid
+    // conflicts. Handles 30+i; separate callback glscene_custom_tex_ready.
+    custom_tex_scan: u32 = 0, // next custom texture index to load
+    custom_tex_loading: i32 = -1, // custom texture index in-flight (-1 = none)
 
     // Refs resolved once in hydrate (scoped); frame/asset callbacks run unscoped.
     canvas_handle: ?i32 = null,
@@ -1618,6 +1623,47 @@ export fn glscene_tex_ready(ptr: u32, len: u32) void {
     if (inst.asset) |*a| loadNextExternalTex(inst, a);
 }
 
+/// Kick the next custom material texture load (gated on custom_on).
+/// Custom textures use handles 30+i to avoid collision with mesh handles (1..8).
+fn loadNextCustomTex(inst: *Inst) void {
+    if (!inst.custom_on) return;
+    const textures = gl.example_holo.textures;
+    while (inst.custom_tex_scan < textures.len) {
+        const i = inst.custom_tex_scan;
+        inst.custom_tex_scan = i + 1;
+        inst.custom_tex_loading = @intCast(i);
+        const url = textures[i].url;
+        if (url.len != 0)
+            gl_load(url.ptr, @intCast(url.len), custom_tex_ready_export.ptr, custom_tex_ready_export.len);
+        return;
+    }
+    inst.custom_tex_loading = -1;
+}
+
+/// Worker-decoded custom material texture arrived (glscene_custom_tex_ready callback).
+/// Queues upload with handle 30+i — avoids collision with mesh handles 1..8.
+/// Kicks the next custom texture load when done.
+export fn glscene_custom_tex_ready(ptr: u32, len: u32) void {
+    const inst = current orelse return;
+    if (inst.custom_tex_loading < 0) return;
+    const idx: u32 = @intCast(inst.custom_tex_loading);
+    inst.custom_tex_loading = -1;
+    if (ptr != 0 and len >= 8 and inst.tex_up_n < max_tex) {
+        const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
+        inst.tex_up[inst.tex_up_n] = .{
+            .handle = 30 + idx,
+            .w = std.mem.readInt(u32, bytes[0..4], .little),
+            .h = std.mem.readInt(u32, bytes[4..8], .little),
+            .ptr = ptr + 8,
+            .len = len - 8,
+            .srgb = false, // custom textures are linear (noise/mask)
+        };
+        inst.tex_up_n += 1;
+    }
+    // ptr==0 → load failed: leave binding 14's white fallback.
+    loadNextCustomTex(inst);
+}
+
 /// Drain queued external textures into createTexture commands (called each frame
 /// while assets are live). Recorded into the registry for context-restore replay.
 fn drainTexUploads(inst: *Inst, enc: *gl.Encoder) void {
@@ -2823,6 +2869,14 @@ fn drawSubmesh(
     enc.bindTexture(2, texHandle(sub.tex_normal));
     enc.bindTexture(3, texHandle(sub.tex_emissive));
     enc.bindTexture(4, texHandle(sub.tex_occlusion));
+    // Custom material textures (unit = slot.unit = 12+i, handle = 30+i). Gated on custom_on.
+    // drainTexUploads will have created handle 30+i before this draw; bridge falls back to
+    // the white default at unit 12 until the async load completes.
+    if (inst.custom_on) {
+        for (gl.example_holo.textures, 0..) |slot, i| {
+            enc.bindTexture(slot.unit, 30 + @as(u32, @intCast(i)));
+        }
+    }
     enc.drawPbr(
         vbuf,
         ibuf,
@@ -3003,6 +3057,9 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     // uploaded on later frames by drainTexUploads. Raw textures handled inline above.
     inst.tex_scan = 0;
     loadNextExternalTex(inst, a);
+    // Kick custom material texture loads (gated on custom_on; handle range 30+i).
+    inst.custom_tex_scan = 0;
+    loadNextCustomTex(inst);
 
     enc.createTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));
     inst.registry.recordTextureEx(irr_handle, .cube, .rgba16f, env.irr_size, env.irr_size, 1, @intCast(@intFromPtr(env.irradiance.ptr)), @intCast(env.irradiance.len));
