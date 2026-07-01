@@ -1664,7 +1664,7 @@ pub fn pbrFragmentSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []
     if (flags & variant_clipping != 0) src = src ++ clip_discard;
     src = src ++ (if (flags & variant_normal_map != 0) normal_nm else normal_plain);
     if (flags & variant_double_sided != 0) src = src ++ ds_flip;
-    if (hooks.frag_albedo_glsl) |snippet| src = src ++ "  vec3 vrv_albedo = albedo;\n" ++ snippet ++ "\n  albedo = vrv_albedo;\n";
+    if (hooks.frag_albedo_glsl) |snippet| src = src ++ "  {\n  vec3 vrv_albedo = albedo;\n" ++ snippet ++ "\n  albedo = vrv_albedo;\n  }\n";
     src = src ++ lighting_head;
     if (flags & variant_shadow != 0) src = src ++ lighting_shadow_csm;
     if (flags & variant_shadow_point != 0) src = src ++ lighting_shadow_point;
@@ -1676,7 +1676,7 @@ pub fn pbrFragmentSrcHooked(comptime flags: u32, comptime hooks: ShaderHooks) []
     src = src ++ combine_plain;
     if (flags & variant_emissive != 0) src = src ++ emissive;
     if (flags & variant_fog != 0) src = src ++ fog_mix;
-    if (hooks.frag_final_glsl) |snippet| src = src ++ "  vec3 vrv_color = color;\n" ++ snippet ++ "\n  color = vrv_color;\n";
+    if (hooks.frag_final_glsl) |snippet| src = src ++ "  {\n  vec3 vrv_color = color;\n" ++ snippet ++ "\n  color = vrv_color;\n  }\n";
     if (flags & variant_linear_output == 0) src = src ++ tail_tonemap;
     src = src ++ tail_close;
     return src;
@@ -2935,7 +2935,7 @@ pub fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u
     if (clip) src = src ++ fs_clip_discard;
     src = src ++ (if (nm) (if (ds) fs_normal_nm_ds else fs_normal_nm) else (if (ds) fs_normal_plain_ds else fs_normal_plain));
     if (ds) src = src ++ fs_ds_flip;
-    if (hooks.frag_albedo_wgsl) |snippet| src = src ++ "  var vrv_albedo = albedo;\n" ++ snippet ++ "\n  albedo = vrv_albedo;\n";
+    if (hooks.frag_albedo_wgsl) |snippet| src = src ++ "  {\n  var vrv_albedo = albedo;\n" ++ snippet ++ "\n  albedo = vrv_albedo;\n  }\n";
     src = src ++ fs_lighting_head;
     if (shadow) src = src ++ fs_lighting_shadow_csm;
     if (point_shadow) src = src ++ fs_lighting_shadow_point;
@@ -2947,7 +2947,7 @@ pub fn wgslPbrHooked(comptime flags: u32, comptime hooks: ShaderHooks) []const u
     src = src ++ fs_combine_plain;
     if (em) src = src ++ fs_emissive;
     if (flags & variant_fog != 0) src = src ++ fs_fog_mix;
-    if (hooks.frag_final_wgsl) |snippet| src = src ++ "  var vrv_color = color;\n" ++ snippet ++ "\n  color = vrv_color;\n";
+    if (hooks.frag_final_wgsl) |snippet| src = src ++ "  {\n  var vrv_color = color;\n" ++ snippet ++ "\n  color = vrv_color;\n  }\n";
     if (!lin) src = src ++ fs_tail_tonemap;
     src = src ++ fs_tail_close;
     return src;
@@ -8153,11 +8153,11 @@ test "variant_custom: GLSL FS contains custom uniforms; non-custom path clean" {
 //
 // Tests (a-e) for the comptime hook seam. Hashes bootstrapped from first green run.
 // Frozen: a hash change here = deliberate contract bump.
-// Lvalue convention (PIN — spec §2 output contract):
-//   frag_albedo GLSL: "  vec3 vrv_albedo = albedo;\n" ++ snippet ++ "\n  albedo = vrv_albedo;\n"
-//   frag_albedo WGSL: "  var vrv_albedo = albedo;\n"  ++ snippet ++ "\n  albedo = vrv_albedo;\n"
-//   frag_final  GLSL: "  vec3 vrv_color = color;\n"   ++ snippet ++ "\n  color = vrv_color;\n"
-//   frag_final  WGSL: "  var vrv_color = color;\n"    ++ snippet ++ "\n  color = vrv_color;\n"
+// Lvalue convention (PIN — spec §2 output contract, C1 fix: each hook block-scoped):
+//   frag_albedo GLSL: "  {\n  vec3 vrv_albedo = albedo;\n" ++ snippet ++ "\n  albedo = vrv_albedo;\n  }\n"
+//   frag_albedo WGSL: "  {\n  var vrv_albedo = albedo;\n"  ++ snippet ++ "\n  albedo = vrv_albedo;\n  }\n"
+//   frag_final  GLSL: "  {\n  vec3 vrv_color = color;\n"   ++ snippet ++ "\n  color = vrv_color;\n  }\n"
+//   frag_final  WGSL: "  {\n  var vrv_color = color;\n"    ++ snippet ++ "\n  color = vrv_color;\n  }\n"
 
 test "golden: fragment hooks WGSL + GLSL FS hashes frozen (FNV-1a-64)" {
     const fixture = ShaderHooks{
@@ -8167,10 +8167,10 @@ test "golden: fragment hooks WGSL + GLSL FS hashes frozen (FNV-1a-64)" {
         .frag_final_wgsl = "vrv_color = vrv_color + vec3<f32>(0.0, 0.05 * sin(custom.u_time), 0.0);",
     };
     const C = variant_pbr | variant_custom;
-    // (a) WGSL with fixture hooks.
-    try testing.expectEqual(@as(u64, 0x27631ea0d44e64de), fnv64(wgslPbrHooked(C, fixture)));
-    // (b) GLSL FS with fixture hooks.
-    try testing.expectEqual(@as(u64, 0x6c4b7cfdc5c25608), fnv64(pbrFragmentSrcHooked(C, fixture)));
+    // (a) WGSL with fixture hooks. Re-baselined for C1 fix: hook splices now block-scoped { }.
+    try testing.expectEqual(@as(u64, 0x21d990e60a6fd110), fnv64(wgslPbrHooked(C, fixture)));
+    // (b) GLSL FS with fixture hooks. Re-baselined for C1 fix: hook splices now block-scoped { }.
+    try testing.expectEqual(@as(u64, 0xc133a5477395f556), fnv64(pbrFragmentSrcHooked(C, fixture)));
 }
 
 test "fragment hooks structural: WGSL splice content and var albedo" {
@@ -8222,6 +8222,53 @@ test "fragment hooks byte-identity: empty hooks == plain delegator" {
     try testing.expectEqual(fnv64(pbrFragmentSrc(F1)), fnv64(pbrFragmentSrcHooked(F1, .{})));
     try testing.expectEqual(fnv64(pbrFragmentSrc(F2)), fnv64(pbrFragmentSrcHooked(F2, .{})));
     try testing.expectEqual(fnv64(pbrFragmentSrc(F3)), fnv64(pbrFragmentSrcHooked(F3, .{})));
+}
+
+// ── C1 regression: both-hook scope isolation ─────────────────────────────────────
+// Verifies that a material with BOTH frag_albedo AND frag_final does NOT produce
+// duplicate bare-name preamble declarations in the same shader scope. Without the
+// block-scope fix, `let u_time` (WGSL) / `vec3 tint` (GLSL) appeared twice in the
+// same function body → compile error on both backends.
+//
+// Snippets manually include the alias preamble lines that Material() would inject
+// (let u_time / let tint for WGSL; vec3 tint for GLSL), so both hook bodies carry
+// the same identifier declaration. With block-scoping each pair lands in its own { }
+// and never collides; without it the compiler would reject the shader.
+
+test "both-hook scope: preamble decls in separate blocks, not redeclared in same scope" {
+    // Simulate what Material(.{ .uniforms = .{ .tint = Vec3 } }) injects as preamble
+    // for a material with both frag_albedo and frag_final.
+    const wgsl_preamble = "  let u_time = custom.u_time;\n  let tint = custom.params[0].xyz;\n";
+    const glsl_preamble = "  vec3 tint = u_params[0].xyz;\n";
+
+    const both = ShaderHooks{
+        // Each snippet begins with the alias preamble — same identifiers in both hooks.
+        .frag_albedo_wgsl = wgsl_preamble ++ "vrv_albedo = mix(vrv_albedo, tint, in.uv.y);",
+        .frag_albedo_glsl = glsl_preamble ++ "vrv_albedo = mix(vrv_albedo, tint, v_uv.y);",
+        .frag_final_wgsl = wgsl_preamble ++ "vrv_color = vrv_color + tint * (0.5 + 0.5 * sin(u_time * 2.0 + in.world_pos.y * 4.0));",
+        .frag_final_glsl = glsl_preamble ++ "vrv_color = vrv_color + tint * (0.5 + 0.5 * sin(u_time * 2.0 + v_world_pos.y * 4.0));",
+    };
+    const C = variant_pbr | variant_custom;
+    const wgsl = wgslPbrHooked(C, both);
+    const glsl = pbrFragmentSrcHooked(C, both);
+
+    // WGSL: `let u_time = custom.u_time;` appears exactly twice (once per hook block).
+    // A closing `}` must appear between the two occurrences — proving the first hook's
+    // block closed before the second hook opened (no cross-hook scope collision).
+    const wgsl_first = std.mem.indexOf(u8, wgsl, "let u_time = custom.u_time;").?;
+    const wgsl_second = std.mem.indexOfPos(u8, wgsl, wgsl_first + 1, "let u_time = custom.u_time;").?;
+    const wgsl_brace = std.mem.indexOfPos(u8, wgsl, wgsl_first, "}").?;
+    try testing.expect(wgsl_brace < wgsl_second);
+    // No third occurrence (only 2 hooks).
+    try testing.expect(std.mem.indexOfPos(u8, wgsl, wgsl_second + 1, "let u_time = custom.u_time;") == null);
+
+    // GLSL: `vec3 tint = u_params[0].xyz;` appears exactly twice, with a `}` between.
+    const glsl_first = std.mem.indexOf(u8, glsl, "vec3 tint = u_params[0].xyz;").?;
+    const glsl_second = std.mem.indexOfPos(u8, glsl, glsl_first + 1, "vec3 tint = u_params[0].xyz;").?;
+    const glsl_brace = std.mem.indexOfPos(u8, glsl, glsl_first, "}").?;
+    try testing.expect(glsl_brace < glsl_second);
+    // No third occurrence.
+    try testing.expect(std.mem.indexOfPos(u8, glsl, glsl_second + 1, "vec3 tint = u_params[0].xyz;") == null);
 }
 
 // ── Custom-materials 1E1: set_custom wire tag (48) + Encoder.setCustom ──────────
