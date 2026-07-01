@@ -32,6 +32,11 @@ pub const fixture = @import("fixture.zig");
 // Lazy import — island chunks never reference it, so it stays out of the wasm.
 pub const ltc_data = @import("ltc_data.zig");
 pub const material = @import("material.zig");
+pub const demo_materials = @import("demo_materials.zig");
+/// Framework demo holographic custom material. Importable from app code
+/// and wasm chunks. Provides a comptime `MaterialDesc` with a non-zero `.id`
+/// (fnv32 of its assembled shader source) and `.flags == variant_pbr | variant_custom`.
+pub const example_holo = demo_materials.example_holo;
 
 pub const Scene = scene.Scene;
 pub const Encoder = command.Encoder;
@@ -68,4 +73,5 @@ test {
     _ = ibl;
     _ = fixture;
     _ = material;
+    _ = demo_materials;
 }

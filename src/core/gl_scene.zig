@@ -16,6 +16,7 @@ const Context = @import("context.zig").Context;
 const Node = @import("node.zig").Node;
 const island = @import("island.zig").island;
 const encodeProps = @import("props.zig").encodeProps;
+const gl = @import("gl/gl.zig");
 
 /// Frozen props contract decoded verbatim by the GlScene client chunk
 /// (positional mirror — fields are read in declaration order). `[3]f32`
@@ -181,6 +182,10 @@ pub const GlSceneBuilder = struct {
     clip_count: usize = 0,
     wire_on: bool = false,
     wire_color: [3]f32 = .{ 1, 1, 1 },
+    custom_on: bool = false,
+    custom_id: u32 = 0,
+    custom_params_buf: [16]f32 = [_]f32{0} ** 16,
+    custom_param_len: usize = 0,
     pick_names_buf: [max_picks][]const u8 = undefined,
     pick_ids_buf: [max_picks]u32 = undefined,
     pick_export_buf: [max_picks][]const u8 = undefined,
@@ -278,6 +283,26 @@ pub const GlSceneBuilder = struct {
         return self;
     }
 
+    /// Scene-global custom shader material. `params` = the packed initial uniform
+    /// values in std140 lane order from the material's packing table (up to
+    /// `param_vec4_count * 4` f32 values). Transported outside Props via
+    /// `data-glmat` ("id;f0,f1,…") so Props stays 14 fields. Mutually exclusive
+    /// with `.wireframe()` (wireframe is pure-replace; custom is a lit-variant) —
+    /// combining both returns a poison node from `build()`.
+    ///
+    /// v1 exclusions (builder does not structurally check these; the demo avoids
+    /// them): custom × instanced, custom × double_sided, custom × morph all
+    /// produce invalid shader variants per the material injection spec (1B).
+    pub fn material(self: *GlSceneBuilder, desc: gl.MaterialDesc, params: []const f32) *GlSceneBuilder {
+        self.custom_on = true;
+        self.custom_id = desc.id;
+        const n = @min(params.len, self.custom_params_buf.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) self.custom_params_buf[i] = params[i];
+        self.custom_param_len = n;
+        return self;
+    }
+
     /// Set clipping planes (up to `max_clip`; extra entries are dropped).
     /// Each plane's normal is normalized at `build()` time via `normalize3`.
     /// Transported outside Props via `data-glclip` so Props stays 14 fields.
@@ -355,6 +380,17 @@ pub const GlSceneBuilder = struct {
             poison.err = e;
             return poison;
         };
+
+        // Custom×wireframe: mutually exclusive. Wireframe is a pure-replace
+        // shader path; custom materials are a lit-variant injection. Combining
+        // both would produce an invalid shader permutation. Guard here (at
+        // build() time) so the error surfaces at the render call site like
+        // other build errors.
+        if (self.custom_on and self.wire_on) {
+            const poison = self.ctx.el("verve-island");
+            poison.err = error.CustomMaterialConflict;
+            return poison;
+        }
 
         // Fog travels OUTSIDE Props (see the Props note) as a comma-joined
         // `data-glfog` attribute the chunk reads via refGetAttr: mode,r,g,b,
@@ -542,6 +578,28 @@ pub const GlSceneBuilder = struct {
             },
         ) catch null;
         if (wire_attr) |wa| _ = canvas.attr("data-glwire", wa);
+
+        // Custom shader material travels OUTSIDE Props as `data-glmat`:
+        // "<id>;<f0>,<f1>,…" (the material's fnv32 id, semicolon, then the
+        // packed initial param floats as a comma-separated CSV). Only emitted
+        // when a custom material was set via `.material(...)`. When absent the
+        // chunk uses its standard PBR pipeline — non-custom SSR is byte-identical.
+        if (self.custom_on) {
+            // Build the float CSV into a stack buffer (16 floats × ~16 chars ≈ 256 B).
+            var pbuf: [256]u8 = undefined;
+            var ppos: usize = 0;
+            for (self.custom_params_buf[0..self.custom_param_len], 0..) |pv, pi| {
+                const sep: []const u8 = if (pi != 0) "," else "";
+                const pchunk = std.fmt.bufPrint(pbuf[ppos..], "{s}{d}", .{ sep, pv }) catch break;
+                ppos += pchunk.len;
+            }
+            const mat_attr = std.fmt.allocPrint(
+                self.ctx.allocator,
+                "{d};{s}",
+                .{ self.custom_id, pbuf[0..ppos] },
+            ) catch null;
+            if (mat_attr) |ma| _ = canvas.attr("data-glmat", ma);
+        }
 
         const inner_wrapper = self.ctx.div()
             .attr("style", "position:relative;display:block;width:100%;height:100%");
@@ -1126,4 +1184,55 @@ test "glScene no .wireframe call emits no data-glwire" {
     const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
     const html = try renderHtml(scene, arena.allocator());
     try testing.expect(std.mem.indexOf(u8, html, "data-glwire") == null);
+}
+
+// ── custom material tests (1D) ──────────────────────────────────────────────
+
+test "glScene .material emits data-glmat with id prefix and param CSV" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    var b = ctx.glScene(.{ .src = "s", .env = "e" });
+    _ = b.material(gl.example_holo, &.{ 0.2, 0.6, 1.0, 0.0 });
+    const scene = b.build();
+    const html = try renderHtml(scene, arena.allocator());
+    // Attribute value starts with "<example_holo.id>;"
+    var id_buf: [64]u8 = undefined;
+    const id_prefix = try std.fmt.bufPrint(&id_buf, "data-glmat=\"{d};", .{gl.example_holo.id});
+    try testing.expect(std.mem.indexOf(u8, html, id_prefix) != null);
+    // CSV portion contains the first param value 0.2
+    try testing.expect(std.mem.indexOf(u8, html, "0.2") != null);
+}
+
+test "glScene no .material call emits no data-glmat (SSR byte-identical)" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" }).build();
+    const html = try renderHtml(scene, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, html, "data-glmat") == null);
+}
+
+test "glScene .material + .wireframe returns poison (custom×wireframe guard)" {
+    island_mod.resetRenderVidSeq();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = Context.init(&arena);
+    const scene = ctx.glScene(.{ .src = "s", .env = "e" })
+        .material(gl.example_holo, &.{ 1, 0, 0 })
+        .wireframe(.{ .color = .{ 1, 1, 1 } })
+        .build();
+    // Guard fires in build(): returns a poison node with .err set, NOT a GlScene island.
+    try testing.expect(scene.err != null);
+}
+
+test "gl.example_holo resolves with non-zero id and correct flags" {
+    // Purely comptime — exercises the demo_materials re-export chain through gl.zig.
+    try testing.expect(gl.example_holo.id != 0);
+    try testing.expectEqual(
+        gl.command.variant_pbr | gl.command.variant_custom,
+        gl.example_holo.flags,
+    );
 }
