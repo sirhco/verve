@@ -36,6 +36,9 @@ pub const demo_materials = @import("demo_materials.zig");
 /// Pure-Zig BC7 mode-6 texture encoder (KTX2/BC7 compressed-texture pipeline).
 /// Build/comptime + native-test only; no runtime/wasm references.
 pub const bc7 = @import("bc7.zig");
+/// Pure-Zig BC1 (DXT1) + BC3 (DXT5) S3TC texture encoder (non-BC7 GPU reach).
+/// Build/comptime + native-test only; no runtime/wasm references.
+pub const bc1 = @import("bc1.zig");
 /// Minimal KTX2 container writer + reader wrapping BC7 mip levels.
 /// Build/comptime + native-test only; no runtime/wasm references.
 pub const ktx2 = @import("ktx2.zig");
@@ -85,6 +88,7 @@ test {
     _ = material;
     _ = demo_materials;
     _ = bc7;
+    _ = bc1;
     _ = ktx2;
     _ = tex_encode;
 }
