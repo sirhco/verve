@@ -1721,6 +1721,21 @@ export fn glscene_custom_tex_ready(ptr: u32, len: u32) void {
     loadNextCustomTex(inst);
 }
 
+/// Map a LAYER-1 format tag (u32) to the corresponding CompressedFormat enum value.
+/// Tags: 1=bc7_unorm, 2=bc7_srgb, 3=bc1_unorm, 4=bc1_srgb, 5=bc3_unorm, 6=bc3_srgb.
+/// Caller guarantees format >= 1 (RGBA path handled separately); unknown tags fall back to bc7_unorm.
+fn compressedFormatFromTag(format: u32) gl.command.CompressedFormat {
+    return switch (format) {
+        1 => .bc7_unorm,
+        2 => .bc7_srgb,
+        3 => .bc1_unorm,
+        4 => .bc1_srgb,
+        5 => .bc3_unorm,
+        6 => .bc3_srgb,
+        else => .bc7_unorm, // safe default; caller guarantees a known tag
+    };
+}
+
 /// Drain queued external textures into createTexture commands (called each frame
 /// while assets are live). Recorded into the registry for context-restore replay.
 fn drainTexUploads(inst: *Inst, enc: *gl.Encoder) void {
@@ -1736,7 +1751,7 @@ fn drainTexUploads(inst: *Inst, enc: *gl.Encoder) void {
                 inst.registry.recordTexture(u.handle, u.w, u.h, u.ptr, u.len);
             }
         } else {
-            const cf: gl.command.CompressedFormat = if (u.format == 2) .bc7_srgb else .bc7_unorm;
+            const cf = compressedFormatFromTag(u.format);
             enc.createCompressedTexture(u.handle, u.w, u.h, cf, u.mip_count, u.ptr, u.len);
             inst.registry.recordCompressedTexture(u.handle, u.w, u.h, cf, u.mip_count, u.ptr, u.len);
         }
@@ -3589,4 +3604,16 @@ test "customUboIndex: example_holo tint slot (vec4_index=0, lane=0, lanes=3)" {
     try std.testing.expectEqual(@as(usize, 4), customUboIndex(slot.vec4_index, slot.lane, 0));
     try std.testing.expectEqual(@as(usize, 5), customUboIndex(slot.vec4_index, slot.lane, 1));
     try std.testing.expectEqual(@as(usize, 6), customUboIndex(slot.vec4_index, slot.lane, 2));
+}
+
+test "compressedFormatFromTag: all six format tags map to correct CompressedFormat" {
+    try std.testing.expectEqual(gl.command.CompressedFormat.bc7_unorm, compressedFormatFromTag(1));
+    try std.testing.expectEqual(gl.command.CompressedFormat.bc7_srgb, compressedFormatFromTag(2));
+    try std.testing.expectEqual(gl.command.CompressedFormat.bc1_unorm, compressedFormatFromTag(3));
+    try std.testing.expectEqual(gl.command.CompressedFormat.bc1_srgb, compressedFormatFromTag(4));
+    try std.testing.expectEqual(gl.command.CompressedFormat.bc3_unorm, compressedFormatFromTag(5));
+    try std.testing.expectEqual(gl.command.CompressedFormat.bc3_srgb, compressedFormatFromTag(6));
+    // unknown tag falls back to bc7_unorm
+    try std.testing.expectEqual(gl.command.CompressedFormat.bc7_unorm, compressedFormatFromTag(0));
+    try std.testing.expectEqual(gl.command.CompressedFormat.bc7_unorm, compressedFormatFromTag(99));
 }
