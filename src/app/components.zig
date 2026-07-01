@@ -2544,6 +2544,34 @@ pub fn glSceneWireframe(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.gl custom shader material demo — /gl-material.
+/// A UV sphere (lodsphere.vmesh) rendered with the verve.gl.example_holo
+/// custom material: frag_albedo gradient toward a cyan tint + a u_time
+/// frag_final scanline pulse.  Lit via IBL env + directional light (mirrors
+/// glSceneMorph setup) so PBR lighting feeds frag_albedo and the animated
+/// frag_final pulse is visible.
+pub fn glSceneMaterial(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/lodsphere.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%230d0f17'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%2300aaff' text-anchor='middle'%3ECustom%20Material%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 2.5, .pitch = 0.3, .yaw = 0.5 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .material(verve.gl.example_holo, &.{ 0.2, 0.6, 1.0, 0.0 })
+        .autoRotate(0.3)
+        .build();
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl \u{2014} custom shader material"),
+        ctx.p().text("Comptime-baked custom material: frag_albedo gradient toward tint + " ++
+            "a u_time frag_final scanline pulse. (slice 1/3: fragment hooks + " ++
+            "Custom UBO + u_time.) Both WebGL2 and WebGPU backends."),
+        scene,
+        ctx.p().text("Enable with .material(verve.gl.example_holo, &.{ r, g, b, 0 }) on any GlScene. " ++
+            "Drag to orbit \u{00b7} wheel to zoom."),
+    });
+}
+
 /// verve.gl morph-targets demo — /gl-morph.
 /// A 5×5 subdivided plane with 3 morph targets (Bulge/Wave/Twist) and a
 /// baked LINEAR weight animation that cycles through the targets. The
