@@ -882,8 +882,20 @@ pub const Window = struct {
         // Pass nil config — defaults to the whole web view bounds at
         // the device's native pixel scale.
         const takeSnapshot = m.cast(*const fn (id, SEL, ?id, *SnapshotBlock) callconv(.c) void);
+        // [smoke-instr] boundary: the async snapshot is dispatched here; the
+        // nested run-loop pump below only returns once the completion block
+        // (snapshotBlockInvoke) sets `done`. On a headless/off-screen WKWebView
+        // the completion may never fire → the pump spins forever → hang.
+        std.log.info("verve.desktop[macos]: snapshot: takeSnapshotWithConfiguration invoked; pumping run loop", .{});
         takeSnapshot(self.webview, m.sel("takeSnapshotWithConfiguration:completionHandler:"), null, &block);
-        pumpUntilDone(&done);
+        // Bounded pump: a headless/off-screen WKWebView never fires the
+        // snapshot completion, so cap the wait and degrade to CaptureFailed
+        // (via the null-image check below) rather than hanging the app.
+        pumpUntilDoneTimeout(&done, 5.0);
+        // [smoke-instr] boundary: if this line is absent in CI output but the
+        // "invoked" line is present, the pump never returned (completion never
+        // fired) — confirming the headless-snapshot hang.
+        std.log.info("verve.desktop[macos]: snapshot: pump returned (image={s})", .{if (image != null) "present" else "null"});
 
         const ns_image = image orelse return opts_mod.SnapshotError.CaptureFailed;
         const release = m.cast(*const fn (id, SEL) callconv(.c) void);
@@ -1709,6 +1721,10 @@ fn snapshotBlockInvoke(block: *SnapshotBlock, image: id, err: ?id) callconv(.c) 
     if (@intFromPtr(image) != 0) {
         block.out_image.* = retain(image, m.sel("retain"));
     }
+    // [smoke-instr] boundary: the snapshot completion handler fired. If this is
+    // absent in CI (while "takeSnapshotWithConfiguration invoked" is present),
+    // WKWebView never called back on this runner → the pump hangs.
+    std.log.info("verve.desktop[macos]: snapshot: completion fired (image={s})", .{if (@intFromPtr(image) != 0) "present" else "null"});
     block.done.* = true;
 }
 
@@ -1747,6 +1763,31 @@ fn pumpUntilDone(done: *const bool) void {
     while (!done.*) {
         const rl = currentRunLoop(@as(id, @ptrCast(NSRunLoop)), m.sel("currentRunLoop"));
         const date = distantFuture(@as(id, @ptrCast(NSDate)), m.sel("distantFuture"));
+        _ = runMode(rl, m.sel("runMode:beforeDate:"), mode_str, date);
+    }
+}
+
+/// Bounded variant of `pumpUntilDone`: pump the run loop in short slices
+/// until `done` is set OR `timeout_s` elapses. The WKWebView snapshot
+/// completion handler does NOT fire on a headless / off-screen web view
+/// (e.g. a CI runner with no display) — without a bound the app would
+/// spin here forever and never terminate. On timeout the caller sees
+/// `done == false` (and a null image) and degrades gracefully.
+fn pumpUntilDoneTimeout(done: *const bool, timeout_s: f64) void {
+    const NSRunLoop = m.getClass("NSRunLoop");
+    const NSDate = m.getClass("NSDate");
+    const currentRunLoop = m.cast(*const fn (id, SEL) callconv(.c) id);
+    const dateSince = m.cast(*const fn (id, SEL, f64) callconv(.c) id);
+    const runMode = m.cast(*const fn (id, SEL, id, id) callconv(.c) bool);
+
+    const mode_str = nsString("kCFRunLoopDefaultMode");
+    const slice_s: f64 = 0.05;
+    var elapsed: f64 = 0;
+    while (!done.* and elapsed < timeout_s) : (elapsed += slice_s) {
+        const rl = currentRunLoop(@as(id, @ptrCast(NSRunLoop)), m.sel("currentRunLoop"));
+        // `runMode:beforeDate:` blocks until an input source fires or the
+        // date passes — a near-future date makes this a ~slice_s poll.
+        const date = dateSince(@as(id, @ptrCast(NSDate)), m.sel("dateWithTimeIntervalSinceNow:"), slice_s);
         _ = runMode(rl, m.sel("runMode:beforeDate:"), mode_str, date);
     }
 }
