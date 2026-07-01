@@ -1,13 +1,16 @@
-// KTX2 parser cross-check (verve.gl KTX2/BC7 slice 3, Task 3C).
+// KTX2 parser cross-check (verve.gl KTX2/BC7+S3TC slice 2, Task 2B).
 //
 // Extracts the frozen `parseKtx2` block from src/bridge/verve.js (between the
 // `>>> parseKtx2 ... >>>` / `<<< parseKtx2 <<<` sentinels) and runs it against a
-// real `demo.tex0.ktx2` produced by `zig build`. This is the native proxy for
+// real `demo.tex0.bc7.ktx2` produced by `zig build`. This is the native proxy for
 // the CDP gate: it catches any drift between the JS parser and the S1-frozen
 // ktx2.zig container layout NOW.
 //
-// Usage: node scripts/ktx2_parse_check.mjs [path/to/demo.tex0.ktx2]
-// (auto-discovers the newest demo.tex0.ktx2 under .zig-cache when omitted).
+// Also validates `demo.tex0.s3tc.ktx2` via raw KTX2 header reads (vkFormat at
+// offset 12), because parseKtx2 only knows BC7 until S3 extends it to BC1/BC3.
+//
+// Usage: node scripts/ktx2_parse_check.mjs [path/to/demo.tex0.bc7.ktx2]
+// (auto-discovers the newest demo.tex0.bc7.ktx2 under .zig-cache when omitted).
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -28,8 +31,8 @@ const fnSrc = verveSrc.slice(start, end).trim();
 // eslint-disable-next-line no-new-func
 const parseKtx2 = new Function(fnSrc + "\nreturn parseKtx2;")();
 
-// --- locate a real demo.tex0.ktx2 --------------------------------------------
-function findKtx2(dir) {
+// --- locate a real KTX2 file by name under a directory -----------------------
+function findKtx2(dir, name) {
   let best = null;
   let bestMtime = -1;
   const walk = (d) => {
@@ -42,7 +45,7 @@ function findKtx2(dir) {
     for (const e of entries) {
       const p = join(d, e.name);
       if (e.isDirectory()) walk(p);
-      else if (e.name === "demo.tex0.ktx2") {
+      else if (e.name === name) {
         const m = statSync(p).mtimeMs;
         if (m > bestMtime) {
           bestMtime = m;
@@ -55,9 +58,10 @@ function findKtx2(dir) {
   return best;
 }
 
-const file = process.argv[2] || findKtx2(join(root, ".zig-cache"));
+// --- BC7 validation via parseKtx2 --------------------------------------------
+const file = process.argv[2] || findKtx2(join(root, ".zig-cache"), "demo.tex0.bc7.ktx2");
 if (!file) {
-  console.error("FAIL: no demo.tex0.ktx2 found (run `zig build` first)");
+  console.error("FAIL: no demo.tex0.bc7.ktx2 found (run `zig build` first)");
   process.exit(1);
 }
 
@@ -83,6 +87,7 @@ console.log("sum(lens): ", sumLen);
 console.log("header:    ", headerBytes, "(file - blocks)");
 
 // Assertions per the task brief.
+let ok = true;
 const checks = [
   ["w === 256", k.w === 256],
   ["h === 256", k.h === 256],
@@ -106,9 +111,70 @@ const checks = [
   ],
 ];
 
-let ok = true;
 for (const [name, pass] of checks) {
   console.log(`${pass ? "PASS" : "FAIL"}: ${name}`);
   if (!pass) ok = false;
 }
+
+// --- S3TC validation via raw KTX2 header reads --------------------------------
+// parseKtx2 only recognises BC7 (vkFormat 145/146) until S3 extends it.
+// For BC1/BC3 files we read the raw header directly:
+//   KTX2 header layout (all little-endian):
+//     0x00 [12] identifier
+//     0x0C [4]  vkFormat
+//     0x10 [4]  typeSize
+//     0x14 [4]  pixelWidth
+//     0x18 [4]  pixelHeight
+//     0x28 [4]  levelCount
+//     0x50 [8]  level[0].byteOffset  (level index starts at 0x50)
+//     0x58 [8]  level[0].byteLength
+// BC1 (no alpha): vkFormat 131 (UNORM) or 132 (SRGB); block = 8 bytes → 256²: 32768 B
+// BC3 (alpha):    vkFormat 137 (UNORM) or 138 (SRGB); block = 16 bytes → 256²: 65536 B
+const ktx2Ident = Buffer.from([
+  0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb, 0x0d, 0x0a, 0x1a, 0x0a,
+]);
+
+function validateS3tcRaw(filePath, expectVkFormats, expectLevel0Len, label) {
+  const s3tcBuf = readFileSync(filePath);
+  const identOk = ktx2Ident.every((b, i) => s3tcBuf[i] === b);
+  const vkFormat = s3tcBuf.readUInt32LE(12);
+  const pixW = s3tcBuf.readUInt32LE(20);
+  const pixH = s3tcBuf.readUInt32LE(24);
+  // level[0].byteLength is the second u64 in the first level-index entry (at 0x50+8 = 0x58).
+  const level0Len = Number(s3tcBuf.readBigUInt64LE(0x58));
+
+  console.log(`\n${label} file:   `, filePath, `(${s3tcBuf.length} bytes)`);
+  console.log(`${label} vkFormat:`, vkFormat, `(expect ${expectVkFormats.join(" or ")})`);
+  console.log(`${label} w/h:     `, pixW, pixH);
+  console.log(`${label} level0:  `, level0Len, `(expect ${expectLevel0Len})`);
+
+  const s3tcChecks = [
+    [`${label} KTX2 identifier valid`, identOk],
+    [`${label} vkFormat is ${expectVkFormats.join("/")}`, expectVkFormats.includes(vkFormat)],
+    [`${label} w === 256`, pixW === 256],
+    [`${label} h === 256`, pixH === 256],
+    [`${label} level0 byteLength === ${expectLevel0Len}`, level0Len === expectLevel0Len],
+  ];
+  for (const [name, pass] of s3tcChecks) {
+    console.log(`${pass ? "PASS" : "FAIL"}: ${name}`);
+    if (!pass) ok = false;
+  }
+}
+
+// demo.tex0 is opaque base-color → BC1 sRGB (vkFormat 132); 256²: 64×64 blocks × 8B = 32768 B
+const demoS3tc = findKtx2(join(root, ".zig-cache"), "demo.tex0.s3tc.ktx2");
+if (demoS3tc) {
+  validateS3tcRaw(demoS3tc, [131, 132], 32768, "demo.s3tc");
+} else {
+  console.log("\nSKIP: demo.tex0.s3tc.ktx2 not found under .zig-cache (run `zig build` first)");
+}
+
+// cutout.tex0 has alpha → BC3 sRGB (vkFormat 138); 256²: 64×64 blocks × 16B = 65536 B
+const cutoutS3tc = findKtx2(join(root, ".zig-cache"), "cutout.tex0.s3tc.ktx2");
+if (cutoutS3tc) {
+  validateS3tcRaw(cutoutS3tc, [137, 138], 65536, "cutout.s3tc");
+} else {
+  console.log("\nSKIP: cutout.tex0.s3tc.ktx2 not found under .zig-cache (run `zig build` first)");
+}
+
 process.exit(ok ? 0 : 1);
