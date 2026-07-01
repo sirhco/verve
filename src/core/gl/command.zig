@@ -146,6 +146,11 @@ pub const Tag = enum(u16) {
     //   (overrides the pass's bound depth shader). Per-instance model matrix columns (loc 4-7) come
     //   from `instance_ptr`; `light_vp_ptr` is the light view-projection matrix. `instance_count`
     //   objects are rendered in a single draw call into the shadow atlas. 8 × u32 = 32 payload bytes.
+
+    // ── Custom shader materials ─────────────────────────────────────────────
+    set_custom = 48, // {ptr} — ptr -> 80-byte Custom UBO block (u_time f32 + 3×f32 pad + 4×vec4 params)
+    //   PTR-based scene-global command (one write per frame). The chunk (1E2) owns the 80-byte block
+    //   in Inst; the bridge (1F) reads 80 bytes at `ptr` and uploads to @group(0)@binding(5).
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -4262,6 +4267,19 @@ pub const Encoder = struct {
         self.putU32(ptr);
     }
 
+    /// Encode a set_custom command: ptr -> the 80-byte Custom UBO block, laid out to match `struct Custom`
+    /// (@group(0)@binding(5)) from 1A:
+    ///   [0]   u_time: f32
+    ///   [1..3] _pad0/_pad1/_pad2: f32 (u_time padded to a 16B boundary)
+    ///   [4..19] params: 4 × vec4<f32>  (16 f32)
+    /// = 20 f32 = 80 bytes. The chunk (1E2) owns this block in Inst and fills u_time + params each frame;
+    /// the bridge (1F) reads 80 bytes at `ptr` post-return and uploads it to binding 5. Scene-global, one
+    /// write per frame (no per-draw aliasing).
+    pub fn setCustom(self: *Encoder, ptr: u32) void {
+        self.header(.set_custom, 4);
+        self.putU32(ptr);
+    }
+
     /// Encode set_morph_weights: the active morph influence set (≤ morph_max_active).
     /// idx_ptr -> count u32 target indices; wt_ptr -> count f32 weights.
     pub fn setMorphWeights(self: *Encoder, count: u32, idx_ptr: u32, wt_ptr: u32) void {
@@ -8204,4 +8222,29 @@ test "fragment hooks byte-identity: empty hooks == plain delegator" {
     try testing.expectEqual(fnv64(pbrFragmentSrc(F1)), fnv64(pbrFragmentSrcHooked(F1, .{})));
     try testing.expectEqual(fnv64(pbrFragmentSrc(F2)), fnv64(pbrFragmentSrcHooked(F2, .{})));
     try testing.expectEqual(fnv64(pbrFragmentSrc(F3)), fnv64(pbrFragmentSrcHooked(F3, .{})));
+}
+
+// ── Custom-materials 1E1: set_custom wire tag (48) + Encoder.setCustom ──────────
+
+test "set_custom: tag value frozen at 48" {
+    try testing.expectEqual(@as(u16, 48), @intFromEnum(Tag.set_custom));
+}
+
+test "golden: SET_CUSTOM (tag 48) byte layout" {
+    var buf: [16]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.setCustom(0x1000);
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    // SET_CUSTOM: 4-byte length + 4-byte (tag+payload_size) + 4-byte payload = 12 bytes total.
+    // Length field = bytes after it = 2+2+4 = 8 = 0x08 → "08000000".
+    // tag=48=0x30 payload_size=4=0x04 ptr=0x1000
+    try testing.expectEqualStrings(
+        "08000000" ++ // length header: 8 record bytes follow
+            // tag=48=0x30  payload_size=4=0x04
+            "3000" ++ "0400" ++
+            "00100000", // ptr=0x1000
+        hex,
+    );
 }
