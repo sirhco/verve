@@ -19,6 +19,7 @@ const Tag = enum(u4) {
     texture,
     texture_ex,
     texture_srgb,
+    texture_compressed,
     shadow_map,
 };
 
@@ -59,6 +60,15 @@ const Record = union(Tag) {
         handle: u32,
         width: u32,
         height: u32,
+        ptr: u32,
+        byte_len: u32,
+    },
+    texture_compressed: struct {
+        handle: u32,
+        width: u32,
+        height: u32,
+        format: command.CompressedFormat,
+        mip_count: u32,
         ptr: u32,
         byte_len: u32,
     },
@@ -180,6 +190,33 @@ pub fn Registry(comptime cap: usize) type {
             self._count += 1;
         }
 
+        /// Record a `Encoder.createCompressedTexture` call (KTX2/BC7 slice 3).
+        pub fn recordCompressedTexture(
+            self: *Self,
+            handle: u32,
+            width: u32,
+            height: u32,
+            format: command.CompressedFormat,
+            mip_count: u32,
+            ptr: u32,
+            byte_len: u32,
+        ) void {
+            if (self._count >= cap) {
+                self._overflowed = true;
+                return;
+            }
+            self.records[self._count] = .{ .texture_compressed = .{
+                .handle = handle,
+                .width = width,
+                .height = height,
+                .format = format,
+                .mip_count = mip_count,
+                .ptr = ptr,
+                .byte_len = byte_len,
+            } };
+            self._count += 1;
+        }
+
         /// Record a `Encoder.createTextureEx` call.
         pub fn recordTextureEx(
             self: *Self,
@@ -229,6 +266,7 @@ pub fn Registry(comptime cap: usize) type {
                     .texture => |t| enc.createTexture(t.handle, t.width, t.height, t.ptr, t.byte_len),
                     .texture_ex => |x| enc.createTextureEx(x.handle, x.target, x.format, x.width, x.height, x.mip_count, x.ptr, x.byte_len),
                     .texture_srgb => |t| enc.createTextureSrgb(t.handle, t.width, t.height, t.ptr, t.byte_len),
+                    .texture_compressed => |t| enc.createCompressedTexture(t.handle, t.width, t.height, t.format, t.mip_count, t.ptr, t.byte_len),
                     .shadow_map => |sm| enc.createShadowMap(sm.handle, sm.size),
                 }
             }
@@ -259,7 +297,8 @@ test "replay matches direct encode — one of each resource type" {
     reg.recordTexture(3, 8, 8, 0x6000, 256);
     reg.recordTextureEx(4, .cube, .rgba16f, 128, 128, 6, 0x8000, 0x100000);
     reg.recordTextureSrgb(5, 16, 16, 0x9000, 1024); // P8 sRGB material texture
-    reg.recordShadowMap(6, 1024); // P9 slice 3 shadow map
+    reg.recordCompressedTexture(6, 256, 128, .bc7_srgb, 8, 0xa000, 0x8000); // KTX2/BC7 slice 3
+    reg.recordShadowMap(7, 1024); // P9 slice 3 shadow map
 
     var buf_a: [512]u8 = undefined;
     var enc_a = command.Encoder.init(&buf_a);
@@ -274,7 +313,8 @@ test "replay matches direct encode — one of each resource type" {
     enc_b.createTexture(3, 8, 8, 0x6000, 256);
     enc_b.createTextureEx(4, .cube, .rgba16f, 128, 128, 6, 0x8000, 0x100000);
     enc_b.createTextureSrgb(5, 16, 16, 0x9000, 1024);
-    enc_b.createShadowMap(6, 1024);
+    enc_b.createCompressedTexture(6, 256, 128, .bc7_srgb, 8, 0xa000, 0x8000);
+    enc_b.createShadowMap(7, 1024);
     const stream_b = enc_b.finish();
 
     try testing.expectEqualSlices(u8, stream_b, stream_a);
@@ -298,6 +338,26 @@ test "replay preserves record order" {
     const stream_b = enc_b.finish();
 
     try testing.expectEqualSlices(u8, stream_b, stream_a);
+}
+
+test "compressed texture record replays byte-identical (bc7_unorm and bc7_srgb)" {
+    var reg = Registry(4){};
+    reg.recordCompressedTexture(2, 512, 512, .bc7_unorm, 10, 0x1000, 0x40000);
+    reg.recordCompressedTexture(30, 64, 64, .bc7_srgb, 7, 0x8000, 0x2000);
+
+    var buf_a: [512]u8 = undefined;
+    var enc_a = command.Encoder.init(&buf_a);
+    reg.replay(&enc_a);
+    const stream_a = enc_a.finish();
+
+    var buf_b: [512]u8 = undefined;
+    var enc_b = command.Encoder.init(&buf_b);
+    enc_b.createCompressedTexture(2, 512, 512, .bc7_unorm, 10, 0x1000, 0x40000);
+    enc_b.createCompressedTexture(30, 64, 64, .bc7_srgb, 7, 0x8000, 0x2000);
+    const stream_b = enc_b.finish();
+
+    try testing.expectEqualSlices(u8, stream_b, stream_a);
+    try testing.expectEqual(@as(usize, 2), reg.count());
 }
 
 test "capacity overflow: count==cap, overflowed==true, replay emits cap entries" {

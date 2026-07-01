@@ -109,7 +109,7 @@ const max_submesh = 128; // per-instance pool cap (was 8); sizes Scene + all Ins
 const max_tex = 8; // material-texture cap (per mesh)
 
 // A worker-decoded external texture awaiting upload on the next frame.
-const TexUpload = struct { handle: u32, w: u32, h: u32, ptr: u32, len: u32, srgb: bool };
+const TexUpload = struct { handle: u32, w: u32, h: u32, ptr: u32, len: u32, srgb: bool, format: u32 = 0, mip_count: u32 = 0 };
 const max_picks = 4; // mirror of gl_scene.zig max_picks
 const max_name = 64; // per-name fixed storage
 const no_hover_hash: u32 = 0xFFFF_FFFF;
@@ -1573,11 +1573,16 @@ fn texExtName(fmt: gl.vmesh.Format) []const u8 {
     };
 }
 
-/// Derive "<stem>.tex{idx}.<ext>" from the instance's vmesh src into tex_url_buf.
+/// Derive "<stem>.tex{idx}.ktx2" from the instance's vmesh src into tex_url_buf.
+/// Always requests the `.ktx2` sibling: the host transparently returns pre-
+/// compressed BC7 when the browser supports it, else falls back to the authored
+/// `.png`/`.jpg`/`.webp` (`texExtName(fmt)`) and returns RGBA. `fmt` is retained
+/// for the caller's format bookkeeping but no longer selects the request URL.
 fn buildTexUrl(inst: *Inst, idx: u32, fmt: gl.vmesh.Format) []const u8 {
+    _ = fmt;
     const src = inst.src_buf[0..inst.src_len];
     const stem = if (std.mem.endsWith(u8, src, ".vmesh")) src[0 .. src.len - ".vmesh".len] else src;
-    return std.fmt.bufPrint(&inst.tex_url_buf, "{s}.tex{d}.{s}", .{ stem, idx, texExtName(fmt) }) catch "";
+    return std.fmt.bufPrint(&inst.tex_url_buf, "{s}.tex{d}.ktx2", .{ stem, idx }) catch "";
 }
 
 /// Kick the next external (non-raw) material texture load, scanning from tex_scan.
@@ -1599,28 +1604,72 @@ fn loadNextExternalTex(inst: *Inst, a: *const gl.vmesh.Reader) void {
     inst.tex_loading = -1;
 }
 
-/// Worker-decoded external texture arrived: bytes = [w:u32 LE][h:u32 LE][RGBA…] at
-/// `ptr`. Queue it for upload on the next frame, then kick the next one. (gl_load
-/// callbacks run outside a frame, so the createTexture is deferred to drainTexUploads.)
+/// Worker-decoded external texture arrived. LAYER-1 payload at `ptr`:
+/// `[w:u32][h:u32][format:u32]` then, for RGBA (format 0), `[rgba@12]`; for BC7
+/// (format 1/2), `[mip_count:u32@12][{off,len}×mip_count @16][blocks]`. Queue it
+/// for upload on the next frame, then kick the next one. (gl_load callbacks run
+/// outside a frame, so the createTexture is deferred to drainTexUploads.)
 export fn glscene_tex_ready(ptr: u32, len: u32) void {
     const inst = current orelse return;
     if (inst.tex_loading < 0) return;
     const idx: u32 = @intCast(inst.tex_loading);
     inst.tex_loading = -1;
-    if (ptr != 0 and len >= 8 and inst.tex_up_n < max_tex) {
+    if (ptr != 0 and len >= 12 and inst.tex_up_n < max_tex) {
         const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
-        inst.tex_up[inst.tex_up_n] = .{
-            .handle = idx + 1,
-            .w = std.mem.readInt(u32, bytes[0..4], .little),
-            .h = std.mem.readInt(u32, bytes[4..8], .little),
-            .ptr = ptr + 8,
-            .len = len - 8,
-            .srgb = if (inst.asset) |*a| a.texIsSrgb(idx) else false,
-        };
+        const format = std.mem.readInt(u32, bytes[8..12], .little);
+        inst.tex_up[inst.tex_up_n] = queueTexUpload(bytes, ptr, len, format, idx + 1, if (inst.asset) |*a| a.texIsSrgb(idx) else false);
         inst.tex_up_n += 1;
     }
     // ptr==0 → load/decode failed: leave the slot's default texture.
     if (inst.asset) |*a| loadNextExternalTex(inst, a);
+}
+
+/// Build a TexUpload from a LAYER-1 payload. RGBA (format 0): RGBA bytes start at
+/// ptr+12. BC7 (format 1/2): mip_count at off 12, level table + blocks start at
+/// ptr+16, and the format enum (not srgb) drives the wire encode. Callers must
+/// have verified `len >= 12`.
+fn queueTexUpload(bytes: []const u8, ptr: u32, len: u32, format: u32, handle: u32, rgba_srgb: bool) TexUpload {
+    const w = std.mem.readInt(u32, bytes[0..4], .little);
+    const h = std.mem.readInt(u32, bytes[4..8], .little);
+    if (format == 0) {
+        return .{
+            .handle = handle,
+            .w = w,
+            .h = h,
+            .ptr = ptr + 12,
+            .len = len - 12,
+            .srgb = rgba_srgb,
+            .format = 0,
+            .mip_count = 0,
+        };
+    }
+    // BC7: [mip_count@12][{off,len}×mip @16][blocks]. ptr+16 = level-table start.
+    const mip_count = if (len >= 16) std.mem.readInt(u32, bytes[12..16], .little) else 0;
+    return .{
+        .handle = handle,
+        .w = w,
+        .h = h,
+        .ptr = ptr + 16,
+        .len = if (len >= 16) len - 16 else 0,
+        .srgb = (format == 2), // informational; the format enum drives the wire
+        .format = format,
+        .mip_count = mip_count,
+    };
+}
+
+/// Swap an authored texture URL's trailing image extension to `.ktx2` (into
+/// tex_url_buf). Authors keep writing `.png`/`.jpg`/`.webp`; the chunk always
+/// requests the `.ktx2` sibling and the host transparently falls back. Unknown
+/// or extension-less URLs get `.ktx2` appended per the mesh convention.
+fn buildCustomTexUrl(inst: *Inst, url: []const u8) []const u8 {
+    var stem = url;
+    inline for (.{ ".png", ".jpg", ".jpeg", ".webp", ".ktx2" }) |ext| {
+        if (std.mem.endsWith(u8, url, ext)) {
+            stem = url[0 .. url.len - ext.len];
+            break;
+        }
+    }
+    return std.fmt.bufPrint(&inst.tex_url_buf, "{s}.ktx2", .{stem}) catch "";
 }
 
 /// Kick the next custom material texture load (gated on custom_on).
@@ -1632,7 +1681,7 @@ fn loadNextCustomTex(inst: *Inst) void {
         const i = inst.custom_tex_scan;
         inst.custom_tex_scan = i + 1;
         inst.custom_tex_loading = @intCast(i);
-        const url = textures[i].url;
+        const url = buildCustomTexUrl(inst, textures[i].url);
         if (url.len != 0)
             gl_load(url.ptr, @intCast(url.len), custom_tex_ready_export.ptr, custom_tex_ready_export.len);
         return;
@@ -1648,16 +1697,11 @@ export fn glscene_custom_tex_ready(ptr: u32, len: u32) void {
     if (inst.custom_tex_loading < 0) return;
     const idx: u32 = @intCast(inst.custom_tex_loading);
     inst.custom_tex_loading = -1;
-    if (ptr != 0 and len >= 8 and inst.tex_up_n < max_tex) {
+    if (ptr != 0 and len >= 12 and inst.tex_up_n < max_tex) {
         const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
-        inst.tex_up[inst.tex_up_n] = .{
-            .handle = 30 + idx,
-            .w = std.mem.readInt(u32, bytes[0..4], .little),
-            .h = std.mem.readInt(u32, bytes[4..8], .little),
-            .ptr = ptr + 8,
-            .len = len - 8,
-            .srgb = false, // custom textures are linear (noise/mask)
-        };
+        const format = std.mem.readInt(u32, bytes[8..12], .little);
+        // Custom textures are linear (noise/mask) → rgba_srgb=false for the RGBA path.
+        inst.tex_up[inst.tex_up_n] = queueTexUpload(bytes, ptr, len, format, 30 + idx, false);
         inst.tex_up_n += 1;
     }
     // ptr==0 → load failed: leave binding 14's white fallback.
@@ -1670,12 +1714,18 @@ fn drainTexUploads(inst: *Inst, enc: *gl.Encoder) void {
     var i: u32 = 0;
     while (i < inst.tex_up_n) : (i += 1) {
         const u = inst.tex_up[i];
-        if (u.srgb) {
-            enc.createTextureSrgb(u.handle, u.w, u.h, u.ptr, u.len);
-            inst.registry.recordTextureSrgb(u.handle, u.w, u.h, u.ptr, u.len);
+        if (u.format == 0) {
+            if (u.srgb) {
+                enc.createTextureSrgb(u.handle, u.w, u.h, u.ptr, u.len);
+                inst.registry.recordTextureSrgb(u.handle, u.w, u.h, u.ptr, u.len);
+            } else {
+                enc.createTexture(u.handle, u.w, u.h, u.ptr, u.len);
+                inst.registry.recordTexture(u.handle, u.w, u.h, u.ptr, u.len);
+            }
         } else {
-            enc.createTexture(u.handle, u.w, u.h, u.ptr, u.len);
-            inst.registry.recordTexture(u.handle, u.w, u.h, u.ptr, u.len);
+            const cf: gl.command.CompressedFormat = if (u.format == 2) .bc7_srgb else .bc7_unorm;
+            enc.createCompressedTexture(u.handle, u.w, u.h, cf, u.mip_count, u.ptr, u.len);
+            inst.registry.recordCompressedTexture(u.handle, u.w, u.h, cf, u.mip_count, u.ptr, u.len);
         }
     }
     inst.tex_up_n = 0;
