@@ -15,7 +15,7 @@ versions follow [Semantic Versioning](https://semver.org/).
   **Custom UBO** at `@group(0)@binding(5)` carries `u_time` (auto-advanced each frame) plus
   packed uniform params (`f32`, `gl.Vec2`, `gl.Vec3`, `gl.Vec4`, `std140` lanes); both
   WebGL2 and WebGPU backends. Scene binding via `GlSceneBuilder.material(desc, params)` →
-  `data-glmat` out-of-band attribute; a `set_custom` wire tag (47) uploads the Custom UBO
+  `data-glmat` out-of-band attribute; a `set_custom` wire tag (48) uploads the Custom UBO
   each frame. `verve.gl.Material(opts)` is the comptime material descriptor; the frozen
   shader is FNV-hashed like every PBR variant. New `/gl-material` demo. **Deferrals
   (slices 2–3):** `frag_emissive` / `frag_alpha` / `vertex_displace` / `vertex_normal`
