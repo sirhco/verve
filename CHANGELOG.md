@@ -4,6 +4,27 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.35.0] - 2026-07-01
+
+### Added
+
+- **gl — multi-format compressed textures: S3TC (BC1/BC3) encoder + container**
+  (slice 1 of 3). Pure-Zig, zero-dep, build-time only — no runtime yet (consumed in
+  later slices). First step toward giving GPUs that lack BC7/BPTC a *compressed* texture
+  (S3TC) instead of the uncompressed-PNG fallback. Build-time multi-format, not runtime
+  transcode.
+  - **`src/core/gl/bc1.zig`** — pure-Zig **BC1 (DXT1)** + **BC3 (DXT5)** block encoder:
+    `encodeBlockBc1` (4×4 RGBA → 8-byte BC1, RGB565 endpoints + 2-bit indices, always
+    4-color mode), `encodeBlockBc3` (→ 16-byte BC3: BC4 8-alpha sub-block + BC1 color),
+    `encodeImage(...,mode)` (box-filtered mip chain, largest-first, sub-4 mips padded to a
+    full block), plus test-only decoders as the PSNR oracle. Native goldens + PSNR
+    round-trip tests.
+  - **`src/core/gl/ktx2.zig`** — adds the S3TC vkFormats (BC1 131/132, BC3 137/138) and
+    changes `write` to take an explicit `VkFormat` (replacing the `srgb: bool`); the BC7
+    container bytes are unchanged (145/146). Round-trip tests for every format.
+  - Scope: **BC1 (opaque) + BC3 (alpha) only** this slice; ETC2/ASTC are future
+    sub-clusters; IBL cubemaps + HDR env remain excluded.
+
 ## [0.34.0] - 2026-07-01
 
 ### Added
