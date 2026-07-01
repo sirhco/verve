@@ -47,6 +47,26 @@ pub const Vec3 = struct {
     }
 };
 
+pub const Vec2 = struct {
+    x: f32,
+    y: f32,
+
+    pub fn init(x: f32, y: f32) Vec2 {
+        return .{ .x = x, .y = y };
+    }
+};
+
+pub const Vec4 = struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+
+    pub fn init(x: f32, y: f32, z: f32, w: f32) Vec4 {
+        return .{ .x = x, .y = y, .z = z, .w = w };
+    }
+};
+
 pub const Quat = struct {
     x: f32,
     y: f32,

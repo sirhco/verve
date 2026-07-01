@@ -31,6 +31,7 @@ pub const fixture = @import("fixture.zig");
 // (two [16384]f32 arrays); the native ltc gen tool imports this to pack ltc.bin.
 // Lazy import — island chunks never reference it, so it stays out of the wasm.
 pub const ltc_data = @import("ltc_data.zig");
+pub const material = @import("material.zig");
 
 pub const Scene = scene.Scene;
 pub const Encoder = command.Encoder;
@@ -38,6 +39,12 @@ pub const Registry = registry.Registry;
 pub const Orbit = orbit.Orbit;
 pub const OrbitInput = orbit.OrbitInput;
 pub const Ray = ray.Ray;
+pub const Material = material.Material;
+pub const MaterialDesc = material.MaterialDesc;
+pub const UniformSlot = material.UniformSlot;
+pub const Vec2 = math.Vec2;
+pub const Vec3 = math.Vec3;
+pub const Vec4 = math.Vec4;
 
 test {
     _ = math;
@@ -59,4 +66,5 @@ test {
     _ = hdr;
     _ = ibl;
     _ = fixture;
+    _ = material;
 }
