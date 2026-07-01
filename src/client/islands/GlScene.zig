@@ -89,6 +89,7 @@ const lut_handle: u32 = 18;
 const depth_shader: u32 = 5;
 const depth_at_shader: u32 = 10; // alpha-tested depth shader for MASK cutout shadows
 const inst_depth_shader: u32 = 91; // instanced depth shader for shadow casters (4B2b)
+const custom_shader: u32 = 92; // custom-material shader (fixed handle, NOT in shader_seen[91])
 const shadow_handle: u32 = 1;
 // Multi-caster 2D shadow atlas (was a single 1024² map). Now a 4096² atlas tiled
 // into 1024² cells; up to max_2d_casters (4) directional/spot casters share row 0.
@@ -309,6 +310,13 @@ const Inst = struct {
     wire_count: [max_submesh]u32 = [_]u32{0} ** max_submesh,
     wire_total: u32 = 0,
     wire_skipped: bool = false,
+
+    // Custom shader material (data-glmat). custom_on=false → all paths are no-ops.
+    // custom_ubo layout: [0]=u_time (seconds), [1..4)=pad, [4..20)=params (4×vec4, 80 bytes).
+    // custom_ubo is Inst-owned static storage — stable across the frame post-return (deferred decode).
+    custom_on: bool = false,
+    custom_handle: u32 = 0,
+    custom_ubo: [20]f32 = [_]f32{0} ** 20,
 
     // GPU-resource registry for context-restore replay (cap 80; morph adds 16 more
     // shader variants + 1 morph tex: 2 buf + 36 shader + depth + depth_at + shadow
@@ -969,6 +977,23 @@ fn emitWireframeShader(inst: *Inst, enc: *gl.Encoder) void {
     inst.registry.recordShader(wire_shader, variant_wire, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
 }
 
+// Emit the custom-material shader at a FIXED handle (custom_shader=92).
+// Mirror of emitWireframeShader: fixed handle, NOT tracked in shader_seen[91] (OOB trap).
+// Guarded on inst.custom_on in sendResources so non-custom scenes pay zero cost.
+// Registry headroom: base ~54 + wire + inst_depth + 1 custom = ~57 ≪ Registry(96).
+fn emitCustomShader(inst: *Inst, enc: *gl.Encoder) void {
+    const desc = gl.example_holo;
+    if (use_webgpu) {
+        enc.createShader(custom_shader, desc.flags, @intCast(@intFromPtr(desc.wgsl.ptr)), @intCast(desc.wgsl.len), 0, 0);
+        inst.registry.recordShader(custom_shader, desc.flags, @intCast(@intFromPtr(desc.wgsl.ptr)), @intCast(desc.wgsl.len), 0, 0);
+        return;
+    }
+    const vs = desc.glsl_vs;
+    const fs = desc.glsl_fs;
+    enc.createShader(custom_shader, desc.flags, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+    inst.registry.recordShader(custom_shader, desc.flags, @intCast(@intFromPtr(vs.ptr)), @intCast(vs.len), @intCast(@intFromPtr(fs.ptr)), @intCast(fs.len));
+}
+
 // ── hydrate ──────────────────────────────────────────────────────────────────
 
 // Parse a "mode,r,g,b,near,far,density" fog attribute into inst.fog_params.
@@ -1020,6 +1045,31 @@ fn parseWire(inst: *Inst, s: []const u8) void {
     }
     inst.wire_color = vals;
     inst.wire_on = true;
+}
+
+// Parse the `data-glmat` attribute: "<u32 id>;<f0>,<f1>,…" → resolve id to custom handle + fill params.
+// If id matches gl.example_holo.id: custom_on=true, custom_handle=custom_shader=92,
+// custom_ubo[4..20) filled with up to 16 CSV floats (params region). Rest stay zero.
+// If id does not match: no-op (custom_on stays false). Malformed input: no crash.
+// Slice-1 assumption: single fixed material. TODO: multi-material id→handle map.
+fn parseGlmat(inst: *Inst, s: []const u8) void {
+    // Split once on ';': left=id, right=CSV floats.
+    const sep = std.mem.indexOfScalar(u8, s, ';') orelse return;
+    const id_str = s[0..sep];
+    const csv = s[sep + 1 ..];
+    const id = std.fmt.parseInt(u32, id_str, 10) catch return;
+    // TODO: multi-material id→handle map (slice 2+).
+    if (id != gl.example_holo.id) return;
+    inst.custom_on = true;
+    inst.custom_handle = custom_shader;
+    // Fill params into custom_ubo[4..20) (up to 16 floats, rest remain zero).
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |tok| {
+        if (n >= 16) break;
+        inst.custom_ubo[4 + n] = std.fmt.parseFloat(f32, tok) catch 0.0;
+        n += 1;
+    }
 }
 
 // Parse the `data-glcam` attribute into inst camera fields.
@@ -1429,6 +1479,15 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         var wbuf: [64]u8 = undefined;
         const wa = verve.refGetAttr(ch, "data-glwire", &wbuf);
         if (wa.len != 0) parseWire(inst, wa);
+    }
+
+    // Custom material rides on the canvas `data-glmat` attribute (NOT Props).
+    // Format: "<u32 id>;<f0>,<f1>,…" — id resolves to a registered material; CSV fills params.
+    // Absent or non-matching id → custom_on stays false (all custom paths are no-ops).
+    if (inst.canvas_handle) |ch| {
+        var mbuf: [256]u8 = undefined;
+        const ma = verve.refGetAttr(ch, "data-glmat", &mbuf);
+        if (ma.len != 0) parseGlmat(inst, ma);
     }
 
     // Kick the asset fetches (geometry + prefiltered IBL).
@@ -2272,6 +2331,15 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             enc.bindLtcLut(0, 0);
         }
 
+        // Custom-material UBO — frame-global, emitted AFTER beginFrame (bridge resets
+        // frame-local state at begin_frame). u_time advances each frame from inst_time_ms
+        // (ms → seconds). params (custom_ubo[4..]) filled at hydrate, stable for page life.
+        // custom_ubo is Inst-owned static storage — NOT a stack local (deferred-decode trap).
+        if (inst.custom_on) {
+            inst.custom_ubo[0] = inst.inst_time_ms * 0.001;
+            enc.setCustom(@intCast(@intFromPtr(&inst.custom_ubo)));
+        }
+
         const pv = clipFix().mul(proj).mul(view);
         // World-space frustum planes for this frame's camera (P9 slice 2).
         const planes = gl.cull.frustumPlanes(pv);
@@ -2691,8 +2759,15 @@ fn drawSubmesh(
         (if (inst.morph_enabled) variant_morph else 0) |
         (if (clipActive(inst)) variant_clip else 0) |
         sbit;
-    if (v != last_variant.*) {
-        enc.setPipeline(shaderHandleFor(v), state);
+    // Custom-material pipeline substitution (slice 1): if custom_on, use the fixed handle
+    // instead of shaderHandleFor(v). Guard fires on every submesh (custom_on always true)
+    // to ensure setPipeline runs at least once even when v doesn't vary between submeshes.
+    // Slice-1 assumption: demo material flags = variant_pbr | variant_custom (no fog/shadow);
+    // demo scene has no fog/shadow so v matches. Custom × fog/shadow composition is a later slice.
+    // Non-custom path: custom_on=false → handle=shaderHandleFor(v), condition=original.
+    const handle = if (inst.custom_on) inst.custom_handle else shaderHandleFor(v);
+    if (v != last_variant.* or inst.custom_on) {
+        enc.setPipeline(handle, state);
         enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
         enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
         // Re-bind per-pipeline (WebGL2 uniforms are per-program; WebGPU re-stash).
@@ -2773,6 +2848,10 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
         }
         emitWireframeShader(inst, enc);
     }
+
+    // Custom-material shader — compiled ONLY when the scene uses it (custom_on=true).
+    // Fixed handle 92: NOT tracked in shader_seen[91] (OOB trap). Like wireframe/inst_depth.
+    if (inst.custom_on) emitCustomShader(inst, enc);
 
     // M7: detect morph presence from the vmesh and set inst.morph_enabled.
     const morph_target_count = a.morphTargetCount();
@@ -3267,4 +3346,59 @@ test "instanced-shadow handle table covers every emitted instanced+shadow combo"
     while (hi <= 90) : (hi += 1) {
         try std.testing.expect(seen[hi]);
     }
+}
+
+test "parseGlmat: matching id sets custom_on + handle + params" {
+    // Inst is very large (hundreds of KB); heap-allocate to avoid stack overflow.
+    const inst = try std.testing.allocator.create(Inst);
+    defer std.testing.allocator.destroy(inst);
+    inst.* = .{};
+    // Build the attribute string: "<example_holo.id>;0.2,0.6,1.0,0.0"
+    var buf: [128]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d};0.2,0.6,1.0,0.0", .{gl.example_holo.id}) catch unreachable;
+    parseGlmat(inst, s);
+    try std.testing.expect(inst.custom_on);
+    try std.testing.expectEqual(@as(u32, custom_shader), inst.custom_handle);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), inst.custom_ubo[4], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), inst.custom_ubo[5], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), inst.custom_ubo[6], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), inst.custom_ubo[7], 1e-5);
+    // Remaining params stay zero.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), inst.custom_ubo[8], 1e-5);
+    // u_time slot (index 0) untouched at parse time — filled per-frame.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), inst.custom_ubo[0], 1e-5);
+}
+
+test "parseGlmat: non-matching id leaves custom_on false" {
+    const inst = try std.testing.allocator.create(Inst);
+    defer std.testing.allocator.destroy(inst);
+    inst.* = .{};
+    // Use id=0 which can never match example_holo.id (which is non-zero by spec).
+    parseGlmat(inst, "0;0.2,0.6,1.0,0.0");
+    try std.testing.expect(!inst.custom_on);
+    try std.testing.expectEqual(@as(u32, 0), inst.custom_handle);
+}
+
+test "parseGlmat: malformed input (no ';') does not crash" {
+    const inst = try std.testing.allocator.create(Inst);
+    defer std.testing.allocator.destroy(inst);
+    inst.* = .{};
+    parseGlmat(inst, "notanumber");
+    try std.testing.expect(!inst.custom_on);
+}
+
+test "parseGlmat: malformed id (non-integer) does not crash" {
+    const inst = try std.testing.allocator.create(Inst);
+    defer std.testing.allocator.destroy(inst);
+    inst.* = .{};
+    parseGlmat(inst, "abc;0.2,0.6");
+    try std.testing.expect(!inst.custom_on);
+}
+
+test "parseGlmat: empty string does not crash" {
+    const inst = try std.testing.allocator.create(Inst);
+    defer std.testing.allocator.destroy(inst);
+    inst.* = .{};
+    parseGlmat(inst, "");
+    try std.testing.expect(!inst.custom_on);
 }
