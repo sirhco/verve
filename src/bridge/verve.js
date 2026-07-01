@@ -5507,6 +5507,10 @@
             sh.fog0 = gl.getUniformLocation(prog, "u_fog0");
             sh.fog1 = gl.getUniformLocation(prog, "u_fog1");
           }
+          if (variant & 0x800000) { // variant_custom: u_time + u_params[0] (base loc uploads all 4 vec4)
+            sh.uTime = gl.getUniformLocation(prog, "u_time");
+            sh.uParams = gl.getUniformLocation(prog, "u_params[0]");
+          }
           if (variant & 0x4000) { // variant_morph: morph-target sampler + weight uniforms
             // u_morph_tex is bound to a fixed unit (9); set it once at link time.
             const morphLoc = gl.getUniformLocation(prog, "u_morph_tex");
@@ -6782,6 +6786,14 @@
           gl2.drawElementsInstanced(gl2.TRIANGLES, count47, gl2.UNSIGNED_SHORT, byteOff47, instanceCount47);
           break;
         }
+        case 48: { // SET_CUSTOM (WebGL2) — u_time (c[0]) + u_params (c[4..20], 4×vec4) on the active program.
+          // Payload (4B): ptr → 80-byte Custom struct (u_time @0, 3 pad f32 @1..3, u_params[4] @4..19).
+          const ptr = dv.getUint32(off, true);
+          const c = new Float32Array(memory.buffer, ptr, 20); // 80B / 4 bytes per f32
+          if (st.active && st.active.uTime != null) gl.uniform1f(st.active.uTime, c[0]);
+          if (st.active && st.active.uParams != null) gl.uniform4fv(st.active.uParams, c.subarray(4, 20));
+          break;
+        }
 
         default:
           break; // unknown tag: size-skip = forward compatible
@@ -7974,6 +7986,14 @@
                 texture: { sampleType: "unfilterable-float", viewDimension: "2d" },
               });
             }
+            const hasCustom = (variant & 0x800000) !== 0; // variant_custom: Custom UBO @group(0) @binding(5)
+            if (hasCustom) {
+              bgl0Entries.push({
+                binding: 5,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, // VERTEX|FRAG so vertex hooks in slice 2 need no bridge change
+                buffer: { type: "uniform" },
+              });
+            }
             const bgl0 = device.createBindGroupLayout({ entries: bgl0Entries });
             // group(1): sampler@0 + per-slot textures. Binding numbers + types
             // EXACTLY match wgslPbr's @group(1) decls. base@1, mr@2 always;
@@ -8108,6 +8128,7 @@
               hasFog,
               hasMorph,
               hasPointShadow,
+              hasCustom,
             };
             break;
           }
@@ -8653,11 +8674,20 @@
                 bg0Entries.push({ binding: 4, resource: mte });
               }
             }
+            // binding 5: Custom UBO (80B, VERTEX|FRAGMENT). Created lazily; SET_CUSTOM
+            // (tag 48) also creates it on first call. Layout has binding 5 iff hasCustom —
+            // both layout (CREATE_SHADER) and bindGroup (here) gated on the same flag so
+            // WebGPU bind-group-layout validation never mismatch.
+            // NOTE: custom×instanced is excluded (v1) — NOT added to the instanced bgl0/bindGroup.
+            if (active.hasCustom) {
+              if (!st.customBuf) st.customBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+              bg0Entries.push({ binding: 5, resource: { buffer: st.customBuf } });
+            }
             // Multi-caster: the dead PointShadow uniform (old bg0 binding 5) is GONE.
             // Task 1 deleted the WGSL `struct PointShadow` + `@group(0) @binding(5)`;
             // the receiver now reads each point caster's lpos/far from the per-light
             // loop vars. Pushing a binding-5 entry here would be a bind-group-layout
-            // mismatch (WebGPU validation error), so it is removed entirely.
+            // mismatch (WebGPU validation error), so it is removed entirely (non-custom path).
             st.bg0 = device.createBindGroup({ layout: active.bgl0, entries: bg0Entries });
             st.bg0Layout = active.bgl0;
           }
@@ -9563,6 +9593,14 @@
           st.shadowPass.setIndexBuffer(ib47.buf, "uint16", byteOff47);
           st.shadowPass.setBindGroup(0, st.depthInstBG, [dbase47]);
           st.shadowPass.drawIndexed(count47, instanceCount47);
+          break;
+        }
+        case 48: { // SET_CUSTOM (WebGPU) — write the 80-byte Custom UBO at group(0) binding(5).
+          // Payload (4B): ptr → 80-byte Custom struct (u_time f32, 3 pad f32, u_params[4] vec4 = 80B).
+          // Lazy-creates st.customBuf on first call; SET_CUSTOM may arrive before the
+          // first draw (same pattern as SET_FOG / tag 28).
+          if (!st.customBuf) st.customBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          device.queue.writeBuffer(st.customBuf, 0, memory.buffer, dv.getUint32(off, true), 80);
           break;
         }
 
