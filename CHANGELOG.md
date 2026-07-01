@@ -4,6 +4,27 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.33.0] - 2026-07-01
+
+### Added
+
+- **gl — KTX2 / BC7 compressed textures: asset pipeline** (slice 2 of 3). The
+  build-time asset pipeline now emits and serves a `.ktx2` (BC7) sibling next to every
+  externalized material texture. Still **dormant** — nothing loads these at runtime yet
+  (that arrives in slice 3); this slice makes the compressed assets exist and be
+  reachable over `/gl/`.
+  - **`src/core/gl/tex_encode.zig`** — new `pngToKtx2(alloc, png_bytes, srgb) ![]u8`
+    helper composing `png.decode` → `bc7.encodeImage` → `ktx2.write` (unit-tested in the
+    core suite: vkFormat selection, round-trip, determinism).
+  - **`tools/gl_asset_gen.zig`** — `convertGlb` now writes `<stem>.tex{N}.ktx2` alongside
+    each externalized `<stem>.tex{N}.png`. The sRGB-vs-linear choice reuses the existing
+    `vmesh.Reader.texIsSrgb` role mapping verbatim (base-color + emissive → BC7 sRGB 146;
+    normal / metallic-roughness / occlusion → BC7 UNORM 145). IBL cubemaps + HDR env
+    (`.hdr` → `.venv`) are excluded.
+  - **`build.zig`** — serves each generated `.ktx2` under `/gl/` (copy-file + embedded
+    `gl_assets.zig` manifest, in lockstep with the `.png` siblings). Integration test
+    asserts `GET /gl/demo.tex0.ktx2` → 200 with a valid KTX2 identifier.
+
 ## [0.32.0] - 2026-07-01
 
 ### Added
