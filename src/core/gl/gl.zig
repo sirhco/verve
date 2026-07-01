@@ -42,6 +42,7 @@ pub const Ray = ray.Ray;
 pub const Material = material.Material;
 pub const MaterialDesc = material.MaterialDesc;
 pub const UniformSlot = material.UniformSlot;
+pub const UniformKind = material.UniformKind;
 pub const Vec2 = math.Vec2;
 pub const Vec3 = math.Vec3;
 pub const Vec4 = math.Vec4;

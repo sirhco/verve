@@ -12,7 +12,9 @@ const command = @import("command.zig");
 // ── helpers ────────────────────────────────────────────────────────────────────
 
 /// FNV-1a-32: stable, JS-computable name hash (glmat_set looks up by this in slice 3).
+/// Quota raised to handle full assembled shader sources (several KiB).
 fn fnv32(comptime s: []const u8) u32 {
+    @setEvalBranchQuota(1_000_000);
     comptime var h: u32 = 0x811c9dc5;
     inline for (s) |c| {
         h ^= @as(u32, c);
@@ -78,6 +80,7 @@ pub const MaterialDesc = struct {
     glsl_fs: []const u8, // pbrFragmentSrcHooked(flags, hooks)
     uniforms: []const UniformSlot, // declaration order
     param_vec4_count: u8, // K vec4s actually used (must be ≤ 4)
+    id: u32, // fnv32(wgsl ++ "|" ++ glsl_fs) — stable identity for data-glmat attribute
 };
 
 // ── builder ────────────────────────────────────────────────────────────────────
@@ -170,54 +173,7 @@ pub fn Material(comptime opts: anytype) MaterialDesc {
             break :blk s;
         };
 
-        const param_vec4_count: u8 = pvc: {
-            if (n_uniforms == 0) break :pvc 0;
-            var vi: u8 = 0;
-            var lc: u8 = 0;
-            for (std.meta.fields(@TypeOf(opts.uniforms))) |field| {
-                const T = @field(opts.uniforms, field.name);
-                const kind = uniformKindOf(T, field.name);
-                switch (kind) {
-                    .scalar => {
-                        lc += 1;
-                        if (lc == 4) {
-                            vi += 1;
-                            lc = 0;
-                        }
-                    },
-                    .vec2 => {
-                        if (lc == 1) {
-                            lc = 2;
-                        } else if (lc == 3) {
-                            vi += 1;
-                            lc = 0;
-                        }
-                        lc += 2;
-                        if (lc == 4) {
-                            vi += 1;
-                            lc = 0;
-                        }
-                    },
-                    .vec3 => {
-                        if (lc != 0) {
-                            vi += 1;
-                            lc = 0;
-                        }
-                        vi += 1;
-                        lc = 0;
-                    },
-                    .vec4 => {
-                        if (lc != 0) {
-                            vi += 1;
-                            lc = 0;
-                        }
-                        vi += 1;
-                        lc = 0;
-                    },
-                }
-            }
-            break :pvc vi + (if (lc > 0) @as(u8, 1) else 0);
-        };
+        const param_vec4_count: u8 = if (n_uniforms == 0) 0 else slots[n_uniforms - 1].vec4_index + 1;
 
         // WGSL alias preamble: "let u_time = custom.u_time;" then one line per uniform.
         // Unconditionally emitted for every hook present; unused-alias warnings are benign.
@@ -258,13 +214,16 @@ pub fn Material(comptime opts: anytype) MaterialDesc {
         hooks.frag_final_glsl = S.glsl_preamble ++ opts.frag_final.glsl;
     }
 
+    const mat_wgsl = command.wgslPbrHooked(flags, hooks);
+    const mat_glsl_fs = command.pbrFragmentSrcHooked(flags, hooks);
     return MaterialDesc{
         .flags = flags,
-        .wgsl = command.wgslPbrHooked(flags, hooks),
+        .wgsl = mat_wgsl,
         .glsl_vs = command.pbrVertexSrc(flags),
-        .glsl_fs = command.pbrFragmentSrcHooked(flags, hooks),
+        .glsl_fs = mat_glsl_fs,
         .uniforms = &S.slots,
         .param_vec4_count = S.param_vec4_count,
+        .id = fnv32(mat_wgsl ++ "|" ++ mat_glsl_fs),
     };
 }
 
@@ -293,6 +252,10 @@ test "Material: shape + assembly (Vec3 uniform, frag_final hook)" {
     try std.testing.expectEqual(@as(u8, 0), slot.lane);
     try std.testing.expectEqual(@as(u8, 3), slot.lanes);
     try std.testing.expectEqual(@as(u8, 1), desc.param_vec4_count);
+
+    // id: non-zero stable hash of assembled sources
+    try std.testing.expect(desc.id != 0);
+    try std.testing.expectEqual(comptime fnv32(desc.wgsl ++ "|" ++ desc.glsl_fs), desc.id);
 
     // WGSL assembled source contains the snippet and the aliases
     try std.testing.expect(std.mem.indexOf(u8, desc.wgsl, "vrv_color = vrv_color * tint;") != null);
