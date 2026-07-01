@@ -2561,6 +2561,14 @@ pub fn glSceneMaterial(ctx: *const verve.Context) !*verve.Node {
         .material(verve.gl.example_holo, &.{ 0.2, 0.6, 1.0, 0.0 })
         .autoRotate(0.3)
         .build();
+    // Tint controls — must live INSIDE the island subtree (scene IS the
+    // <verve-island> node) so the bridge resolves glmat_tint_* exports.
+    _ = scene.children(.{
+        ctx.div().class("gl-controls").children(.{
+            ctx.el("button").attr("z-on-click", "glmat_tint_red").text("Tint red"),
+            ctx.el("button").attr("z-on-click", "glmat_tint_cyan").text("Tint cyan"),
+        }),
+    });
     return ctx.main_().class("home gl-scene-page").children(.{
         ctx.h1("verve.gl \u{2014} custom shader material"),
         ctx.p().text("Comptime-baked custom material: frag_albedo gradient toward tint + " ++
@@ -2568,7 +2576,8 @@ pub fn glSceneMaterial(ctx: *const verve.Context) !*verve.Node {
             "Custom UBO + u_time.) Both WebGL2 and WebGPU backends."),
         scene,
         ctx.p().text("Enable with .material(verve.gl.example_holo, &.{ r, g, b, 0 }) on any GlScene. " ++
-            "Drag to orbit \u{00b7} wheel to zoom."),
+            "Drag to orbit \u{00b7} wheel to zoom. Buttons above live-update the tint " ++
+            "via glmat_set (slice 3/3: runtime uniform setter, no bridge change)."),
     });
 }
 

@@ -1072,6 +1072,43 @@ fn parseGlmat(inst: *Inst, s: []const u8) void {
     }
 }
 
+// ── /gl-material runtime uniform setter ───────────────────────────────────────
+
+/// Returns the custom_ubo index for lane `i` of the given uniform slot.
+/// Pure function — native-testable. Result is within [4,19] for any valid slot.
+fn customUboIndex(vec4_index: u8, lane: u8, i: usize) usize {
+    return 4 + @as(usize, vec4_index) * 4 + lane + i;
+}
+
+/// Live-update a custom-material uniform by fnv32 name-id. Writes `slot.lanes`
+/// values into inst.custom_ubo's params region; the per-frame setCustom
+/// re-uploads it next frame (no wire tag / bridge change needed).
+/// No-op if the scene has no custom material or the name-id is unknown.
+export fn glmat_set(name_id: u32, v0: f32, v1: f32, v2: f32, v3: f32) void {
+    const inst = current orelse return;
+    if (!inst.custom_on) return;
+    const vals = [4]f32{ v0, v1, v2, v3 };
+    for (gl.example_holo.uniforms) |slot| {
+        if (slot.name_id != name_id) continue;
+        var i: usize = 0;
+        while (i < slot.lanes) : (i += 1) {
+            inst.custom_ubo[customUboIndex(slot.vec4_index, slot.lane, i)] = vals[i];
+        }
+        return;
+    }
+}
+
+/// Zero-arg wrapper — z-on-click button: switch tint to red (1.0, 0.2, 0.2).
+export fn glmat_tint_red() void {
+    glmat_set(gl.example_holo.uniforms[0].name_id, 1.0, 0.2, 0.2, 0.0);
+}
+
+/// Zero-arg wrapper — z-on-click button: switch tint to cyan (0.2, 0.6, 1.0),
+/// matching the initial data-glmat tint so the pair toggles visibly and back.
+export fn glmat_tint_cyan() void {
+    glmat_set(gl.example_holo.uniforms[0].name_id, 0.2, 0.6, 1.0, 0.0);
+}
+
 // Parse the `data-glcam` attribute into inst camera fields.
 // Format: "mode,ortho_height,fov_deg,near,far" (5 fields).
 // Tolerant: needs ≥5 comma fields, else leaves defaults.
@@ -3401,4 +3438,23 @@ test "parseGlmat: empty string does not crash" {
     inst.* = .{};
     parseGlmat(inst, "");
     try std.testing.expect(!inst.custom_on);
+}
+
+test "customUboIndex: vec3 slot at vec4_index=0, lane=0 produces indices 4,5,6" {
+    try std.testing.expectEqual(@as(usize, 4), customUboIndex(0, 0, 0));
+    try std.testing.expectEqual(@as(usize, 5), customUboIndex(0, 0, 1));
+    try std.testing.expectEqual(@as(usize, 6), customUboIndex(0, 0, 2));
+}
+
+test "customUboIndex: last valid slot stays within custom_ubo bounds (max index 19)" {
+    // param_vec4_count ≤ 4; worst case: vec4_index=3, lane=3, i=0 → 4+12+3+0 = 19 < 20
+    try std.testing.expectEqual(@as(usize, 19), customUboIndex(3, 3, 0));
+}
+
+test "customUboIndex: example_holo tint slot (vec4_index=0, lane=0, lanes=3)" {
+    // Mirrors the actual example_holo uniform slot for tint (Vec3 → lanes 3).
+    const slot = gl.example_holo.uniforms[0];
+    try std.testing.expectEqual(@as(usize, 4), customUboIndex(slot.vec4_index, slot.lane, 0));
+    try std.testing.expectEqual(@as(usize, 5), customUboIndex(slot.vec4_index, slot.lane, 1));
+    try std.testing.expectEqual(@as(usize, 6), customUboIndex(slot.vec4_index, slot.lane, 2));
 }
