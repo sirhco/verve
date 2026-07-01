@@ -185,7 +185,14 @@ pub const TexTarget = enum(u32) { tex_2d = 0, cube = 1 };
 pub const TexFormat = enum(u32) { rgba8 = 0, rgba16f = 1 };
 /// Compressed texture format for `create_compressed_texture` (tag 49, KTX2/BC7 slice 3).
 /// Values match the s3 LAYER-2 wire contract. Format 0 (RGBA) never uses tag 49.
-pub const CompressedFormat = enum(u32) { bc7_unorm = 1, bc7_srgb = 2 };
+pub const CompressedFormat = enum(u32) {
+    bc7_unorm = 1,
+    bc7_srgb = 2,
+    bc1_unorm = 3,
+    bc1_srgb = 4,
+    bc3_unorm = 5,
+    bc3_srgb = 6,
+};
 
 /// CREATE_SHADER variant bits for the comptime PBR über-shader.
 pub const variant_pbr: u32 = 1 << 2; // stride-48 layout, Cook-Torrance + IBL + tonemap
@@ -8865,6 +8872,82 @@ test "golden: create_compressed_texture tag 49 bc7_unorm format word differs" {
         "24000000" ++ // length header: 36 record bytes
             // CREATE_COMPRESSED_TEXTURE handle=3 w=256 h=128 format=bc7_unorm(1) mips=8 ptr=0xa000 len=0x8000
             "3100" ++ "1c00" ++ "03000000" ++ "00010000" ++ "80000000" ++ "01000000" ++ "08000000" ++ "00a00000" ++ "00800000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "golden: create_compressed_texture tag 49 bc1_unorm format word" {
+    // Same fixed args as bc7 goldens; only format word: bc1_unorm=3 → 03000000
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createCompressedTexture(3, 256, 128, .bc1_unorm, 8, 0xa000, 0x8000);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "24000000" ++
+            // CREATE_COMPRESSED_TEXTURE handle=3 w=256 h=128 format=bc1_unorm(3) mips=8 ptr=0xa000 len=0x8000
+            "3100" ++ "1c00" ++ "03000000" ++ "00010000" ++ "80000000" ++ "03000000" ++ "08000000" ++ "00a00000" ++ "00800000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "golden: create_compressed_texture tag 49 bc1_srgb format word" {
+    // Same fixed args as bc7 goldens; only format word: bc1_srgb=4 → 04000000
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createCompressedTexture(3, 256, 128, .bc1_srgb, 8, 0xa000, 0x8000);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "24000000" ++
+            // CREATE_COMPRESSED_TEXTURE handle=3 w=256 h=128 format=bc1_srgb(4) mips=8 ptr=0xa000 len=0x8000
+            "3100" ++ "1c00" ++ "03000000" ++ "00010000" ++ "80000000" ++ "04000000" ++ "08000000" ++ "00a00000" ++ "00800000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "golden: create_compressed_texture tag 49 bc3_unorm format word" {
+    // Same fixed args as bc7 goldens; only format word: bc3_unorm=5 → 05000000
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createCompressedTexture(3, 256, 128, .bc3_unorm, 8, 0xa000, 0x8000);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "24000000" ++
+            // CREATE_COMPRESSED_TEXTURE handle=3 w=256 h=128 format=bc3_unorm(5) mips=8 ptr=0xa000 len=0x8000
+            "3100" ++ "1c00" ++ "03000000" ++ "00010000" ++ "80000000" ++ "05000000" ++ "08000000" ++ "00a00000" ++ "00800000" ++
+            // END_FRAME
+            "0600" ++ "0000",
+        hex,
+    );
+}
+
+test "golden: create_compressed_texture tag 49 bc3_srgb format word" {
+    // Same fixed args as bc7 goldens; only format word: bc3_srgb=6 → 06000000
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createCompressedTexture(3, 256, 128, .bc3_srgb, 8, 0xa000, 0x8000);
+    enc.endFrame();
+    const stream = enc.finish();
+    const hex = try hexAlloc(testing.allocator, stream);
+    defer testing.allocator.free(hex);
+    try testing.expectEqualStrings(
+        "24000000" ++
+            // CREATE_COMPRESSED_TEXTURE handle=3 w=256 h=128 format=bc3_srgb(6) mips=8 ptr=0xa000 len=0x8000
+            "3100" ++ "1c00" ++ "03000000" ++ "00010000" ++ "80000000" ++ "06000000" ++ "08000000" ++ "00a00000" ++ "00800000" ++
             // END_FRAME
             "0600" ++ "0000",
         hex,
