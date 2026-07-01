@@ -5156,12 +5156,16 @@
   const glSetActiveChunk = (exports) => {
     glActiveChunkExports = exports;
   };
-  // BC7 compressed-texture capability flag — set by whichever backend (WebGPU or
-  // WebGL2) initialises first, then readable by gl_load (:10183) and the upload
-  // path (tag 49, 3D) throughout the session. False until a backend initialises.
-  let glBc7Supported = false;
+  // Compressed-texture capability capset — set by whichever backend (WebGPU or
+  // WebGL2) initialises first, then readable by gl_load and the upload path (3D)
+  // throughout the session. Both false until a backend initialises.
+  //   bc7  — BC7/BPTC (EXT_texture_compression_bptc / texture-compression-bc)
+  //   s3tc — BC1/BC3/DXT (WEBGL_compressed_texture_s3tc / texture-compression-bc)
+  // WebGPU: texture-compression-bc enables BC1..BC7 → both true.
+  // WebGL2: independent extensions → set independently.
+  const glTexCaps = { bc7: false, s3tc: false };
   // 3F: Force-PNG toggle — parsed once at startup from the `?nobc7` query param.
-  // Flips ONLY the gl_load fetch decision (glBc7Supported && !glForceNoBc7); the
+  // Flips ONLY the gl_load fetch decision (glTexCaps.bc7 && !glForceNoBc7); the
   // upload path (tag 49) is unchanged so the test exercises the PNG decode path
   // without needing a non-BC7 GPU. Usage: open <demo>?nobc7.
   const glForceNoBc7 = typeof location !== "undefined" && /[?&]nobc7\b/.test(location.search);
@@ -9779,7 +9783,8 @@
       const device = await adapter.requestDevice(
         wantBc ? { requiredFeatures: ["texture-compression-bc"] } : undefined,
       );
-      glBc7Supported = wantBc;
+      glTexCaps.bc7 = wantBc;
+      glTexCaps.s3tc = wantBc; // texture-compression-bc enables BC1..BC7 (S3TC=BC1/3 included)
       // Surface WebGPU validation/out-of-memory errors that would otherwise be
       // swallowed (Chrome suppresses repeated warnings) → blank canvas, no error.
       device.addEventListener("uncapturederror", (e) => {
@@ -9897,11 +9902,14 @@
       // the chunk renders THIS instance's state. 0 for single-instance chunks.
       vid: vidOfEl(canvas),
     };
-    // Probe BC7/BPTC compressed-texture support (dormant until tag-49 upload in 3D).
-    // Cache the extension object on st so the upload path has the format enums;
-    // also set the module-scoped flag so gl_load (3C) can decide .ktx2 vs .png.
+    // Probe compressed-texture support (upload paths dormant until 3D).
+    // Cache extension objects on st so upload paths have format enum constants.
+    // BPTC and S3TC are INDEPENDENT WebGL2 extensions — probe separately.
     st.extTextureCompressionBptc = ctx.getExtension("EXT_texture_compression_bptc");
-    glBc7Supported = !!st.extTextureCompressionBptc;
+    st.extTextureCompressionS3tc = ctx.getExtension("WEBGL_compressed_texture_s3tc");
+    st.extTextureCompressionS3tcSrgb = ctx.getExtension("EXT_texture_compression_s3tc_srgb");
+    glTexCaps.bc7 = !!st.extTextureCompressionBptc;
+    glTexCaps.s3tc = !!st.extTextureCompressionS3tc;
     // Sink driven by the master anim rAF (animTick) — see glSinks. Same body
     // as the old self-rescheduling step(), except stop paths remove the sink
     // from glSinks instead of skipping a requestAnimationFrame(step) self-call.
@@ -10511,7 +10519,7 @@
               // else the RGBA sibling. Format word in the LAYER-1 payload tells
               // the chunk which path won (0=RGBA, 1/2=BC7).
               if (/\.ktx2$/i.test(url)) {
-                const useBc7 = glBc7Supported && !glForceNoBc7;
+                const useBc7 = glTexCaps.bc7 && !glForceNoBc7;
                 console.info(`verve.gl: texture ${url} → ${useBc7 ? "BC7" : "PNG fallback"}`);
                 useBc7 ? loadBc7() : loadPng();
               } else if (isImageUrl(url)) {
