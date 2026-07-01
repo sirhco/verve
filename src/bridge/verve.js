@@ -5703,6 +5703,39 @@
           st.textures[handle] = { tex, target: gl.TEXTURE_2D };
           break;
         }
+        case 49: { // CREATE_COMPRESSED_TEXTURE — BC7/BPTC, pre-supplied mips (no generateMipmap)
+          // Payload (7×u32, 28 bytes): handle|w|h|format|mip_count|ptr|byte_len
+          // format: 1=BC7_UNORM, 2=BC7_SRGB. ptr → level table in wasm memory.
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          const format = dv.getUint32(off + 12, true);
+          const mip_count = dv.getUint32(off + 16, true);
+          const ptr = dv.getUint32(off + 20, true);
+          // off + 24 = byte_len (informational)
+          const ext = st.extTextureCompressionBptc;
+          if (!ext) { console.error("verve.gl: BC7 upload but BPTC ext absent"); break; }
+          const glFmt = format === 2
+            ? ext.COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT
+            : ext.COMPRESSED_RGBA_BPTC_UNORM_EXT;
+          const dvm = new DataView(memory.buffer);
+          const blocks_base = ptr + mip_count * 8;
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          for (let i = 0; i < mip_count; i++) {
+            const off_i = dvm.getUint32(ptr + i * 8, true);
+            const len_i = dvm.getUint32(ptr + i * 8 + 4, true);
+            const wi = Math.max(1, w >> i);
+            const hi = Math.max(1, h >> i);
+            const data = new Uint8Array(memory.buffer, blocks_base + off_i, len_i);
+            gl.compressedTexImage2D(gl.TEXTURE_2D, i, glFmt, wi, hi, 0, data);
+          }
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER,
+            mip_count > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          st.textures[handle] = { tex, target: gl.TEXTURE_2D };
+          break;
+        }
         case 8: { // BIND_TEXTURE
           const slot = dv.getUint32(off, true);
           const entry = st.textures[dv.getUint32(off + 4, true)];
@@ -8306,6 +8339,42 @@
             { bytesPerRow: w * 4, rowsPerImage: h },
             [w, h],
           );
+          st.textures[handle] = { tex, view: tex.createView(), w, h };
+          break;
+        }
+        case 49: { // CREATE_COMPRESSED_TEXTURE — BC7/BPTC, pre-supplied mips
+          // Payload (7×u32, 28 bytes): handle|w|h|format|mip_count|ptr|byte_len
+          // format: 1=BC7_UNORM, 2=BC7_SRGB. ptr → level table in wasm memory.
+          const handle = dv.getUint32(off, true);
+          const w = dv.getUint32(off + 4, true);
+          const h = dv.getUint32(off + 8, true);
+          const format = dv.getUint32(off + 12, true);
+          const mip_count = dv.getUint32(off + 16, true);
+          const ptr = dv.getUint32(off + 20, true);
+          // off + 24 = byte_len (informational)
+          const gpuFmt = format === 2 ? "bc7-rgba-unorm-srgb" : "bc7-rgba-unorm";
+          const dvm = new DataView(memory.buffer);
+          const blocks_base = ptr + mip_count * 8;
+          const tex = device.createTexture({
+            size: [w, h],
+            format: gpuFmt,
+            mipLevelCount: mip_count,
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+            // NO RENDER_ATTACHMENT — compressed textures cannot be render targets
+          });
+          for (let i = 0; i < mip_count; i++) {
+            const off_i = dvm.getUint32(ptr + i * 8, true);
+            const len_i = dvm.getUint32(ptr + i * 8 + 4, true);
+            const wi = Math.max(1, w >> i);
+            const hi = Math.max(1, h >> i);
+            const data = new Uint8Array(memory.buffer, blocks_base + off_i, len_i);
+            device.queue.writeTexture(
+              { texture: tex, mipLevel: i },
+              data,
+              { bytesPerRow: Math.ceil(wi / 4) * 16, rowsPerImage: Math.ceil(hi / 4) },
+              [wi, hi],
+            );
+          }
           st.textures[handle] = { tex, view: tex.createView(), w, h };
           break;
         }
