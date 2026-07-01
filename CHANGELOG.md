@@ -4,6 +4,28 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.30.0] - 2026-06-30
+
+### Added
+
+- **gl — custom shader materials** (slice 2 of 3, vertex hooks): two vertex-stage
+  injection hooks added to `verve.gl.Material()`, both WebGL2 and WebGPU backends.
+  `vertex_displace` provides a `vrv_pos` lvalue (local-space `vec3` / `vec3f` initialized
+  from the position attribute) — write it to displace the vertex in local space before the
+  world and clip transforms are applied. `vertex_normal` provides a `vrv_normal` lvalue
+  (local-space `vec3` / `vec3f` initialized from the normal attribute) — write it to
+  recompute the normal, which the engine then transforms through the normal matrix
+  (inverse-transpose upper-3×3) into the shading normal and TBN bitangent for normal
+  mapping. Both hooks can read `v_uv`, custom uniforms, and `u_time`. `vertex_normal`
+  **composes** with normal mapping (not mutually exclusive in v1); the tangent is still
+  derived from the mesh tangent attribute, so a drastically custom normal can mildly desync
+  the tangent frame — accepted v1 caveat. Reuses the slice-1 Custom UBO, `u_time`,
+  `Material()` / `.material()` / `data-glmat` / `set_custom` wire tag (48) — no new wire
+  tag, UBO field, or bridge binding. `/gl-material` demo updated: `example_holo` now adds
+  a `u_time`-driven surface wobble (`vertex_displace`) with correct re-lighting
+  (`vertex_normal`). **Deferrals (slice 3):** `frag_emissive`, `frag_alpha`, custom
+  textures, live `glmat_set` setter.
+
 ## [0.29.0] - 2026-06-30
 
 ### Added
