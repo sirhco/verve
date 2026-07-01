@@ -1,4 +1,4 @@
-// KTX2 parser cross-check (verve.gl KTX2/BC7+S3TC slice 2, Task 2B).
+// KTX2 parser cross-check (verve.gl KTX2/BC7+S3TC slice 3, Task 3C).
 //
 // Extracts the frozen `parseKtx2` block from src/bridge/verve.js (between the
 // `>>> parseKtx2 ... >>>` / `<<< parseKtx2 <<<` sentinels) and runs it against a
@@ -6,8 +6,10 @@
 // the CDP gate: it catches any drift between the JS parser and the S1-frozen
 // ktx2.zig container layout NOW.
 //
-// Also validates `demo.tex0.s3tc.ktx2` via raw KTX2 header reads (vkFormat at
-// offset 12), because parseKtx2 only knows BC7 until S3 extends it to BC1/BC3.
+// Also validates S3TC files via:
+//   (a) raw KTX2 header reads (vkFormat, w/h, level0 byteLength) — structural gate
+//   (b) parseKtx2 result — asserts format tag 4 (BC1_SRGB) for demo and 6 (BC3_SRGB)
+//       for cutout, now that S3 extended parseKtx2 to know BC1/BC3 vkFormats.
 //
 // Usage: node scripts/ktx2_parse_check.mjs [path/to/demo.tex0.bc7.ktx2]
 // (auto-discovers the newest demo.tex0.bc7.ktx2 under .zig-cache when omitted).
@@ -116,9 +118,28 @@ for (const [name, pass] of checks) {
   if (!pass) ok = false;
 }
 
+// --- S3TC validation via parseKtx2 (3C) --------------------------------------
+// S3 extended parseKtx2 to know BC1/BC3 vkFormats; run it directly on the
+// .s3tc.ktx2 siblings and assert the expected format tags.
+function validateS3tcParsed(filePath, expectTag, label) {
+  const buf = readFileSync(filePath);
+  const kk = parseKtx2(buf);
+  console.log(`\n${label} parseKtx2: ${kk ? `format=${kk.format} w=${kk.w} h=${kk.h} mips=${kk.levels.length}` : "null"}`);
+  const parsed = [
+    [`${label} parseKtx2 not null`, kk !== null],
+    [`${label} format === ${expectTag}`, kk !== null && kk.format === expectTag],
+    [`${label} w === 256`, kk !== null && kk.w === 256],
+    [`${label} h === 256`, kk !== null && kk.h === 256],
+    [`${label} mip_count === 9`, kk !== null && kk.levels.length === 9],
+  ];
+  for (const [name, pass] of parsed) {
+    console.log(`${pass ? "PASS" : "FAIL"}: ${name}`);
+    if (!pass) ok = false;
+  }
+}
+
 // --- S3TC validation via raw KTX2 header reads --------------------------------
-// parseKtx2 only recognises BC7 (vkFormat 145/146) until S3 extends it.
-// For BC1/BC3 files we read the raw header directly:
+// Belt-and-suspenders structural gate (vkFormat, w/h, level0 byteLength).
 //   KTX2 header layout (all little-endian):
 //     0x00 [12] identifier
 //     0x0C [4]  vkFormat
@@ -165,6 +186,7 @@ function validateS3tcRaw(filePath, expectVkFormats, expectLevel0Len, label) {
 const demoS3tc = findKtx2(join(root, ".zig-cache"), "demo.tex0.s3tc.ktx2");
 if (demoS3tc) {
   validateS3tcRaw(demoS3tc, [131, 132], 32768, "demo.s3tc");
+  validateS3tcParsed(demoS3tc, 4, "demo.s3tc"); // 4 = BC1_RGB_SRGB (vk132)
 } else {
   console.log("\nSKIP: demo.tex0.s3tc.ktx2 not found under .zig-cache (run `zig build` first)");
 }
@@ -173,6 +195,7 @@ if (demoS3tc) {
 const cutoutS3tc = findKtx2(join(root, ".zig-cache"), "cutout.tex0.s3tc.ktx2");
 if (cutoutS3tc) {
   validateS3tcRaw(cutoutS3tc, [137, 138], 65536, "cutout.s3tc");
+  validateS3tcParsed(cutoutS3tc, 6, "cutout.s3tc"); // 6 = BC3_SRGB (vk138)
 } else {
   console.log("\nSKIP: cutout.tex0.s3tc.ktx2 not found under .zig-cache (run `zig build` first)");
 }

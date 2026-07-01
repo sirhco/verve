@@ -5164,17 +5164,32 @@
   // WebGPU: texture-compression-bc enables BC1..BC7 → both true.
   // WebGL2: independent extensions → set independently.
   const glTexCaps = { bc7: false, s3tc: false };
-  // 3F: Force-PNG toggle — parsed once at startup from the `?nobc7` query param.
-  // Flips ONLY the gl_load fetch decision (glTexCaps.bc7 && !glForceNoBc7); the
-  // upload path (tag 49) is unchanged so the test exercises the PNG decode path
-  // without needing a non-BC7 GPU. Usage: open <demo>?nobc7.
-  const glForceNoBc7 = typeof location !== "undefined" && /[?&]nobc7\b/.test(location.search);
+  // 3C: Format-force param — ?fmt=bc7|s3tc|png pins gl_load's format choice (overriding
+  // caps, for CDP / manual testing). ?nobc7 = legacy alias for ?fmt=png.
+  function parseForceFmt() {
+    if (typeof location === "undefined") return null;
+    const m = /[?&]fmt=(bc7|s3tc|png)\b/.exec(location.search);
+    if (m) return m[1];
+    if (/[?&]nobc7\b/.test(location.search)) return "png";
+    return null;
+  }
+  const glForceFmt = parseForceFmt(); // 'bc7' | 's3tc' | 'png' | null
+  // Choose the forced format for a .ktx2 request. Force honors a SUPPORTED format
+  // (or png); an unsupported forced format → console.warn + normal priority.
+  function chooseTexFmt() {
+    if (glForceFmt === "png") return "png";
+    if (glForceFmt === "bc7") return glTexCaps.bc7 ? "bc7" : (console.warn("verve.gl: ?fmt=bc7 unsupported, using priority"), null);
+    if (glForceFmt === "s3tc") return glTexCaps.s3tc ? "s3tc" : (console.warn("verve.gl: ?fmt=s3tc unsupported, using priority"), null);
+    return null; // no (usable) force → fall through to priority
+  }
 
   // >>> parseKtx2 (KTX2/BC7 slice 3) — node cross-check extracts this exact block
   // between the sentinels; keep it SELF-CONTAINED (no closure deps beyond
   // DataView/Uint8Array). Mirrors src/core/gl/ktx2.zig byte layout EXACTLY (S1
-  // golden froze these offsets). Parses our minimal BC7 subset; returns
-  //   { w, h, format /*1=BC7_UNORM(vk145) 2=BC7_SRGB(vk146)*/,
+  // golden froze these offsets). Parses BC7 and BC1/BC3 (S3TC) KTX2 containers; returns
+  //   { w, h, format /*1=BC7_UNORM(vk145) 2=BC7_SRGB(vk146)
+  //                    3=BC1_RGB_UNORM(vk131) 4=BC1_RGB_SRGB(vk132)
+  //                    5=BC3_UNORM(vk137)     6=BC3_SRGB(vk138)*/,
   //     levels: [{ off, len } ...] /*byte ranges into buf, LARGEST-FIRST*/ }
   // or null on any mismatch (bad magic / unsupported vkFormat / supercompression /
   // truncation) so the caller can fall back to the .png sibling.
@@ -5199,9 +5214,13 @@
     const superScheme = dv.getUint32(44, true); // @44 supercompressionScheme
     if (superScheme !== 0) return null; // we never emit supercompression
     let format;
-    if (vkFormat === 145) format = 1; // VK_FORMAT_BC7_UNORM_BLOCK
-    else if (vkFormat === 146) format = 2; // VK_FORMAT_BC7_SRGB_BLOCK
-    else return null; // unsupported vkFormat → PNG fallback
+    if (vkFormat === 145) format = 1;        // VK_FORMAT_BC7_UNORM_BLOCK
+    else if (vkFormat === 146) format = 2;   // VK_FORMAT_BC7_SRGB_BLOCK
+    else if (vkFormat === 131) format = 3;   // VK_FORMAT_BC1_RGB_UNORM_BLOCK
+    else if (vkFormat === 132) format = 4;   // VK_FORMAT_BC1_RGB_SRGB_BLOCK
+    else if (vkFormat === 137) format = 5;   // VK_FORMAT_BC3_UNORM_BLOCK
+    else if (vkFormat === 138) format = 6;   // VK_FORMAT_BC3_SRGB_BLOCK
+    else return null;                        // unknown vkFormat → PNG fallback
     // Index block @48..79 (dfd u32×2, kvd u32×2, sgd u64×2) — deterministic in
     // our writer; skipped. srgb comes from vkFormat, not the DFD.
     // Level index @80 (ktx2.zig off_level_idx): levelCount × 3×u64 LE.
@@ -10467,9 +10486,11 @@
                   () => mainThreadFetch(),
                 );
               };
-              // BC7 loader: fetch the .ktx2 raw, parse, emit the compressed
-              // LAYER-1 payload. Corrupt/unsupported container → .png fallback.
-              const loadBc7 = () => {
+              // Compressed-KTX2 loader (BC7 or S3TC): fetch the sibling .ktx2, parse,
+              // emit the LAYER-1 payload. parseKtx2 null (bad container) → .png fallback.
+              // Both bc7 (.bc7.ktx2) and s3tc (.s3tc.ktx2) use this path — the
+              // vkFormat→format tag in the KTX2 header tells the chunk which GPU format won.
+              const loadBc7 = (ktx2Url) => {
                 const handle = (ab) => {
                   const k = parseKtx2(ab);
                   if (!k) {
@@ -10479,20 +10500,20 @@
                   onBytes(buildBc7Payload(k, new Uint8Array(ab)));
                 };
                 const mainThreadFetch = () => {
-                  fetch(url)
+                  fetch(ktx2Url)
                     .then((r) => {
                       if (!r.ok) throw new Error("HTTP " + r.status);
                       return r.arrayBuffer();
                     })
                     .then((ab) => handle(ab))
                     .catch((err) => {
-                      console.error("verve.gl: asset fetch failed:", url, err);
+                      console.error("verve.gl: asset fetch failed:", ktx2Url, err);
                       deliver(0, 0);
                     });
                 };
                 // Worker fetches the .ktx2 with passthrough decode (no image
                 // decoder for that ext), handing back the raw container bytes.
-                assetWorkerLoad(url).then((ab) => handle(ab), () => mainThreadFetch());
+                assetWorkerLoad(ktx2Url).then((ab) => handle(ab), () => mainThreadFetch());
               };
               // Raw-asset loader (meshes, .bin, ltc) — unchanged passthrough.
               const loadRaw = () => {
@@ -10515,13 +10536,19 @@
                 );
               };
               // Host-transparent dispatch: the chunk always requests `.ktx2` for
-              // textures; JS returns BC7 when supported (and ?nobc7 is absent),
-              // else the RGBA sibling. Format word in the LAYER-1 payload tells
-              // the chunk which path won (0=RGBA, 1/2=BC7).
+              // textures; JS picks the best sibling by caps (bc7 → s3tc → png) with
+              // optional ?fmt= override. Format tag in LAYER-1 payload tells the chunk
+              // which GPU format won (0=RGBA, 1/2=BC7, 3-6=BC1/BC3).
               if (/\.ktx2$/i.test(url)) {
-                const useBc7 = glTexCaps.bc7 && !glForceNoBc7;
-                console.info(`verve.gl: texture ${url} → ${useBc7 ? "BC7" : "PNG fallback"}`);
-                useBc7 ? loadBc7() : loadPng();
+                let fmt = chooseTexFmt();
+                if (fmt === null) fmt = glTexCaps.bc7 ? "bc7" : glTexCaps.s3tc ? "s3tc" : "png";
+                console.info(`verve.gl: texture ${url} → ${fmt.toUpperCase()}`);
+                if (fmt === "png") {
+                  loadPng();
+                } else {
+                  const sibUrl = url.replace(/\.ktx2$/i, fmt === "bc7" ? ".bc7.ktx2" : ".s3tc.ktx2");
+                  loadBc7(sibUrl);
+                }
               } else if (isImageUrl(url)) {
                 loadPng();
               } else {
