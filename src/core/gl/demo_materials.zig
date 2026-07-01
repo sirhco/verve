@@ -10,9 +10,13 @@ const gl = @import("gl.zig");
 /// pulse in the final-color hook.
 ///
 /// Uniform layout (std140 lane order):
-///   params[0].xyz = tint  (vec3, vec4_index 0, lanes x/y/z)
+///   params[0].xyz = tint  (vec3, vec4_index 0, lanes x/y/z; lane w = pad)
 ///
-/// Pass initial tint to `GlSceneBuilder.material(gl.example_holo, &.{r, g, b})`.
+/// A Vec3 occupies a FULL vec4 slot (4 floats, lane 3 = padding) in std140.
+/// Pass the packed lanes, padding lane 3:
+///   `GlSceneBuilder.material(gl.example_holo, &.{ r, g, b, 0 })`.
+/// (Multi-uniform materials must pad each Vec3/Vec4 to its 4-float slot — the
+/// chunk's data-glmat parser reads floats straight into params[] by lane.)
 pub const example_holo = gl.Material(.{
     .frag_albedo = .{
         .glsl = "vrv_albedo = mix(vrv_albedo, tint, v_uv.y);",
