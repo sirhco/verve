@@ -19,7 +19,7 @@
 //!   DFD[4..7]   vendorId=0 | descriptorType=0      — u32 LE = 0x00000000
 //!   DFD[8..9]   versionNumber = 2 (u16 LE)
 //!   DFD[10..11] descriptorBlockSize = 24 (u16 LE)  — size of block from [4..27]
-//!   DFD[12]     colorModel = 134 (KHR_DF_MODEL_BC7)
+//!   DFD[12]     colorModel per format (BC1=128, BC3=130, BC7=134)
 //!   DFD[13]     colorPrimaries = 1 (KHR_DF_PRIMARIES_BT709)
 //!   DFD[14]     transferFunction = 2 (sRGB) or 1 (linear/UNORM)
 //!   DFD[15]     flags = 0
@@ -27,7 +27,7 @@
 //!   DFD[17]     texelBlockDimension1 = 3 (block height - 1 = 4 - 1)
 //!   DFD[18]     texelBlockDimension2 = 0
 //!   DFD[19]     texelBlockDimension3 = 0
-//!   DFD[20..27] bytesPlane = [16, 0, 0, 0, 0, 0, 0, 0]  — 16 bytes/BC7 block
+//!   DFD[20..27] bytesPlane = [blockBytes, 0, …]  — BC1=8, BC3/BC7=16 bytes/block
 //!
 //! Absolute byte offsets for a file with N mip levels (all u32/u64 LE):
 //!   0:             identifier (12 bytes)
@@ -63,6 +63,23 @@ fn isSrgb(vk: VkFormat) bool {
     return switch (vk) {
         .bc7_srgb, .bc1_rgb_srgb, .bc3_srgb => true,
         else => false,
+    };
+}
+
+/// KHR_DF_MODEL for the DFD colorModel byte (exhaustive — a new VkFormat is a compile error).
+fn dfdColorModel(vk: VkFormat) u8 {
+    return switch (vk) {
+        .bc1_rgb_unorm, .bc1_rgb_srgb => 128, // KHR_DF_MODEL_BC1A (BC1)
+        .bc3_unorm, .bc3_srgb => 130, // KHR_DF_MODEL_BC3
+        .bc7_unorm, .bc7_srgb => 134, // KHR_DF_MODEL_BC7
+    };
+}
+
+/// Bytes per 4×4 block for the DFD bytesPlane[0] byte (BC1 = 8, BC3/BC7 = 16).
+fn dfdBlockBytes(vk: VkFormat) u8 {
+    return switch (vk) {
+        .bc1_rgb_unorm, .bc1_rgb_srgb => 8,
+        .bc3_unorm, .bc3_srgb, .bc7_unorm, .bc7_srgb => 16,
     };
 }
 
@@ -160,8 +177,8 @@ pub fn write(alloc: Allocator, levels: []const []const u8, w: u32, h: u32, vk: V
     p += 2;
     std.mem.writeInt(u16, out[p..][0..2], 24, .little); // descriptorBlockSize (bytes [4..27])
     p += 2;
-    out[p] = 134;
-    p += 1; // colorModel = KHR_DF_MODEL_BC7
+    out[p] = dfdColorModel(vk);
+    p += 1; // colorModel per format (BC1=128, BC3=130, BC7=134)
     out[p] = 1;
     p += 1; // colorPrimaries = KHR_DF_PRIMARIES_BT709
     out[p] = transfer;
@@ -176,8 +193,8 @@ pub fn write(alloc: Allocator, levels: []const []const u8, w: u32, h: u32, vk: V
     p += 1; // texelBlockDimension2
     out[p] = 0;
     p += 1; // texelBlockDimension3
-    out[p] = 16;
-    p += 1; // bytesPlane[0] = 16 (bytes per BC7 4×4 block)
+    out[p] = dfdBlockBytes(vk);
+    p += 1; // bytesPlane[0] per format (BC1=8, BC3/BC7=16 bytes per 4×4 block)
     out[p] = 0;
     p += 1;
     out[p] = 0;
@@ -614,6 +631,29 @@ test "round-trip bc3_srgb" {
     for (chain, 0..) |expected, i| {
         const ref = info.levels[i];
         try testing.expectEqualSlices(u8, expected, blob[ref.offset .. ref.offset + ref.len]);
+    }
+}
+
+test "DFD colorModel + bytesPlane are per-format (BC1=128/8, BC3=130/16, BC7=134/16)" {
+    const alloc = testing.allocator;
+    // Single-level container → off_dfd = 80 + 1*24 = 104; colorModel @ +12 = 116; bytesPlane[0] @ +20 = 124.
+    const Case = struct { vk: VkFormat, model: u8, block: u8, bc1: bool };
+    const cases = [_]Case{
+        .{ .vk = .bc1_rgb_unorm, .model = 128, .block = 8, .bc1 = true },
+        .{ .vk = .bc1_rgb_srgb, .model = 128, .block = 8, .bc1 = true },
+        .{ .vk = .bc3_unorm, .model = 130, .block = 16, .bc1 = false },
+        .{ .vk = .bc3_srgb, .model = 130, .block = 16, .bc1 = false },
+        .{ .vk = .bc7_unorm, .model = 134, .block = 16, .bc1 = false },
+        .{ .vk = .bc7_srgb, .model = 134, .block = 16, .bc1 = false },
+    };
+    for (cases) |c| {
+        const chain = if (c.bc1) try fakeChainBC1(alloc, 4, 4, 1) else try fakeChain(alloc, 4, 4, 1);
+        defer freeChain(alloc, chain);
+        const blob = try write(alloc, chain, 4, 4, c.vk);
+        defer alloc.free(blob);
+        const off_dfd: usize = 80 + 1 * 24;
+        try testing.expectEqual(c.model, blob[off_dfd + 12]); // colorModel
+        try testing.expectEqual(c.block, blob[off_dfd + 20]); // bytesPlane[0]
     }
 }
 
