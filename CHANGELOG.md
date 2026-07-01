@@ -4,6 +4,33 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.31.0] - 2026-07-01
+
+### Added
+
+- **gl — custom shader materials complete** (slice 3 of 3, v0.29.0–v0.31.0 cluster
+  CLOSED): completes the full hook surface and adds custom textures + live setter.
+  - **`frag_emissive` hook** — runs after `frag_final`, before the emissive additive
+    pass; write `vrv_emissive` (vec3) to contribute additive glow; both GLSL + WGSL.
+  - **`frag_alpha` hook** — runs last in the fragment stage; write `vrv_alpha` (float
+    opacity) or `discard`; both GLSL + WGSL.
+  - **Custom textures** (`variant_custom_tex = 1<<24`): declare `.textures = .{ .name =
+    .{ .url = "..." } }` in the `gl.Material()` descriptor; the first texture is bound at
+    WGSL `@group(1)@binding(14)` / GLSL texture unit 12; sampled in snippets via the
+    framework-fixed name `custom_tex0` (WGSL: `textureSample(custom_tex0, samp, uv)`) /
+    `u_custom_tex0` (GLSL: `texture(u_custom_tex0, uv)`); the declared field name maps to
+    the URL + slot order only. Both WebGL2 and WebGPU backends; loaded via existing asset
+    pipeline.
+  - **Live setter `glmat_set`** — chunk export `glmat_set(name_id, v0..v3)` updates a
+    named uniform at runtime; the next frame's `set_custom` (tag 48) re-uploads
+    automatically (no new wire tag); demo controls wired via zero-arg wrapper exports +
+    `z-on-click`.
+  - `/gl-material` demo now exercises all four fragment hooks, both vertex hooks, the
+    custom noise texture, and live tint buttons.
+  - **v1 exclusions unchanged:** custom × instanced / wireframe / double-sided /
+    morph-skinning; per-submesh materials; runtime/data-driven source; whole-program
+    ShaderMaterial; app-authored materials (src/app).
+
 ## [0.30.0] - 2026-06-30
 
 ### Added
