@@ -12,11 +12,14 @@
 //!                    texels 1..15 = 4 bits each                 (63 bits)
 //!   effective 8-bit endpoint channel = (v7 << 1) | p
 //!
-//! Encoder PINs (v1): per-channel min/max bounding-box endpoints; the shared
-//! p-bit per endpoint chosen to minimise summed squared reconstruction error
-//! across its 4 channels; each texel gets the 4-bit index minimising squared
-//! error to the interpolated line; standard anchor fix (swap endpoints +
-//! invert indices when index[0] > 7).
+//! Encoder PINs (v1): principal-axis endpoint fit — 24-iteration power
+//! iteration on the block's RGBA covariance finds the dominant colour axis,
+//! and the endpoints are the min/max projections of the texels onto that axis
+//! (per-channel 7-bit + shared p-bit quantization); the shared p-bit per
+//! endpoint chosen to minimise summed squared reconstruction error across its
+//! 4 channels; each texel gets the 4-bit index minimising squared error to the
+//! interpolated line; standard anchor fix (swap endpoints + invert indices
+//! when index[0] > 7).
 
 const std = @import("std");
 const testing = std.testing;
