@@ -4,6 +4,33 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.34.0] - 2026-07-01
+
+### Added
+
+- **gl — KTX2 / BC7 compressed textures: runtime upload + observable indicator** (slice 3
+  of 3, completes the KTX2/BC7 cluster S1–S3). The full BC7 compressed-texture pipeline
+  is now live: the chunk (GlScene) detects browser BC7 support at startup, requests
+  `.ktx2` siblings for all material textures, parses the KTX2 container in JS, and uploads
+  BC7 blocks directly to the GPU via `COMPRESSED_RGBA_BPTC_UNORM_EXT` (WebGL2) or
+  `bc7-rgba-unorm`/`bc7-rgba-unorm-srgb` (WebGPU) — both backends. Non-BC7 GPUs and the
+  `?nobc7` query flag trigger the host-transparent PNG fallback; the chunk always gets a
+  valid RGBA or BC7 payload regardless of path.
+  - **`src/client/islands/GlScene.zig`** — `glscene_tex_format()` export surfaces the
+    format of the last loaded texture (0xFF=not yet, 0=RGBA/PNG, 1=BC7\_UNORM, 2=BC7\_SRGB)
+    so the per-frame JS HUD can show "BC7" or "PNG"; `tex_format_seen` / `tex_format_loaded`
+    fields on `Inst` track it; both `glscene_tex_ready` and `glscene_custom_tex_ready`
+    update them.
+  - **`src/bridge/verve.js`** — `glTexFmtHudUpdate` reads `[data-ref="gltex-hud"]` each
+    frame (guard: no-op when absent); `glForceNoBc7` flag parsed from `?nobc7` query param
+    flips only the `gl_load` fetch decision (`glBc7Supported && !glForceNoBc7`); a
+    `console.info` line logs `verve.gl: texture <url> → BC7` or `→ PNG fallback` for
+    each `.ktx2` request.
+  - **`src/app/components.zig`** — `/gl-material` page gains a `[data-ref="gltex-hud"]`
+    hint div that the bridge updates to "BC7" or "PNG" after the demo texture loads.
+  - **`docs/24-gl.md`** — "Compressed textures (KTX2 / BC7)" section added to Shipped;
+    `KTX2 / basis textures` removed from Remaining.
+
 ## [0.33.0] - 2026-07-01
 
 ### Added

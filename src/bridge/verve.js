@@ -618,6 +618,19 @@
     hudEl.textContent = `instances drawn ${d} / culled ${c} / ${d + c}`;
   };
 
+  // 3F: Write texture-format indicator into the [data-ref="gltex-hud"] element.
+  // glscene_tex_format() returns 0xFF when no texture has loaded yet, 0=RGBA
+  // (PNG-fallback path), 1=BC7_UNORM or 2=BC7_SRGB (both shown as "BC7").
+  // Guard: no-op when the function or element is absent (every demo except /gl-material).
+  const glTexFmtHudUpdate = (exports) => {
+    if (typeof exports.glscene_tex_format !== "function") return;
+    const hudEl = document.querySelector('[data-ref="gltex-hud"]');
+    if (!hudEl) return;
+    const fmt = exports.glscene_tex_format() >>> 0;
+    if (fmt === 0xFF) return; // not yet loaded — leave initial text
+    hudEl.textContent = fmt === 0 ? "PNG" : "BC7";
+  };
+
   const dispatchEventId = (e, attr, prevent) => {
     const node = e.target.closest(`[${attr}]`);
     if (!node) return false;
@@ -5147,6 +5160,11 @@
   // WebGL2) initialises first, then readable by gl_load (:10183) and the upload
   // path (tag 49, 3D) throughout the session. False until a backend initialises.
   let glBc7Supported = false;
+  // 3F: Force-PNG toggle — parsed once at startup from the `?nobc7` query param.
+  // Flips ONLY the gl_load fetch decision (glBc7Supported && !glForceNoBc7); the
+  // upload path (tag 49) is unchanged so the test exercises the PNG decode path
+  // without needing a non-BC7 GPU. Usage: open <demo>?nobc7.
+  const glForceNoBc7 = typeof location !== "undefined" && /[?&]nobc7\b/.test(location.search);
 
   // >>> parseKtx2 (KTX2/BC7 slice 3) — node cross-check extracts this exact block
   // between the sentinels; keep it SELF-CONTAINED (no closure deps beyond
@@ -9946,6 +9964,8 @@
         glLodHudUpdate(st.exports);
         // 3B: instanced cull HUD — only present on /gl-instanced-cull; no-op on all other demos.
         glInstCullHudUpdate(st.exports);
+        // 3F: texture-format HUD — only present on /gl-material; no-op on all other demos.
+        glTexFmtHudUpdate(st.exports);
       } catch (err) {
         // A corrupt stream/pointer must not kill the loop silently.
         console.error("verve.gl: interpreter fault, loop stopped:", err, err && err.stack);
@@ -10142,6 +10162,8 @@
         glLodHudUpdate(st.exports);
         // 3B: instanced cull HUD — only present on /gl-instanced-cull; no-op on all other demos.
         glInstCullHudUpdate(st.exports);
+        // 3F: texture-format HUD — only present on /gl-material; no-op on all other demos.
+        glTexFmtHudUpdate(st.exports);
       } catch (err) {
         console.error("verve.gl: WebGPU interpreter fault, loop stopped:", err);
         glSinks.delete(sink);
@@ -10484,10 +10506,13 @@
                 );
               };
               // Host-transparent dispatch: the chunk always requests `.ktx2` for
-              // textures; JS returns BC7 when supported, else the RGBA sibling —
-              // the engine never learns which won (format word in the payload).
+              // textures; JS returns BC7 when supported (and ?nobc7 is absent),
+              // else the RGBA sibling. Format word in the LAYER-1 payload tells
+              // the chunk which path won (0=RGBA, 1/2=BC7).
               if (/\.ktx2$/i.test(url)) {
-                glBc7Supported ? loadBc7() : loadPng();
+                const useBc7 = glBc7Supported && !glForceNoBc7;
+                console.info(`verve.gl: texture ${url} → ${useBc7 ? "BC7" : "PNG fallback"}`);
+                useBc7 ? loadBc7() : loadPng();
               } else if (isImageUrl(url)) {
                 loadPng();
               } else {

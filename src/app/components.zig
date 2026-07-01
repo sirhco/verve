@@ -2575,9 +2575,14 @@ pub fn glSceneMaterial(ctx: *const verve.Context) !*verve.Node {
             "a u_time frag_final scanline pulse. (slice 1/3: fragment hooks + " ++
             "Custom UBO + u_time.) Both WebGL2 and WebGPU backends."),
         scene,
+        // 3F: texture-format indicator — written each frame by glTexFmtHudUpdate via
+        // glscene_tex_format(); shows "BC7" when compressed upload is live, "PNG" on
+        // fallback (e.g. ?nobc7). Absent on other demos (guard is a no-op).
+        ctx.div().attr("data-ref", "gltex-hud").class("hint"),
         ctx.p().text("Enable with .material(verve.gl.example_holo, &.{ r, g, b, 0 }) on any GlScene. " ++
             "Drag to orbit \u{00b7} wheel to zoom. Buttons above live-update the tint " ++
-            "via glmat_set (slice 3/3: runtime uniform setter, no bridge change)."),
+            "via glmat_set (slice 3/3: runtime uniform setter, no bridge change). " ++
+            "Add ?nobc7 to force the PNG fallback path for testing."),
     });
 }
 

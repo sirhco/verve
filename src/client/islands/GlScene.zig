@@ -337,6 +337,13 @@ const Inst = struct {
     tex_url_buf: [192]u8 = undefined, // scratch for the derived "<stem>.tex{N}.<ext>"
     tex_up: [max_tex]TexUpload = undefined, // decoded textures awaiting createTexture
     tex_up_n: u32 = 0,
+    // 3F: format of the last completed external texture load.
+    // 0=RGBA (PNG-fallback), 1=BC7_UNORM, 2=BC7_SRGB. Updated by
+    // glscene_tex_ready and glscene_custom_tex_ready. tex_format_loaded becomes
+    // true on the first completed load; until then glscene_tex_format() returns
+    // 0xFF so the JS HUD knows to wait.
+    tex_format_seen: u32 = 0,
+    tex_format_loaded: bool = false,
     // Custom material textures (slice 3E). Separate from mesh tex_loading to avoid
     // conflicts. Handles 30+i; separate callback glscene_custom_tex_ready.
     custom_tex_scan: u32 = 0, // next custom texture index to load
@@ -1619,6 +1626,9 @@ export fn glscene_tex_ready(ptr: u32, len: u32) void {
         const format = std.mem.readInt(u32, bytes[8..12], .little);
         inst.tex_up[inst.tex_up_n] = queueTexUpload(bytes, ptr, len, format, idx + 1, if (inst.asset) |*a| a.texIsSrgb(idx) else false);
         inst.tex_up_n += 1;
+        // 3F: record format so glscene_tex_format() can surface BC7 vs PNG.
+        inst.tex_format_seen = format;
+        inst.tex_format_loaded = true;
     }
     // ptr==0 → load/decode failed: leave the slot's default texture.
     if (inst.asset) |*a| loadNextExternalTex(inst, a);
@@ -1703,6 +1713,9 @@ export fn glscene_custom_tex_ready(ptr: u32, len: u32) void {
         // Custom textures are linear (noise/mask) → rgba_srgb=false for the RGBA path.
         inst.tex_up[inst.tex_up_n] = queueTexUpload(bytes, ptr, len, format, 30 + idx, false);
         inst.tex_up_n += 1;
+        // 3F: record format so glscene_tex_format() can surface BC7 vs PNG.
+        inst.tex_format_seen = format;
+        inst.tex_format_loaded = true;
     }
     // ptr==0 → load failed: leave binding 14's white fallback.
     loadNextCustomTex(inst);
@@ -2804,6 +2817,18 @@ export fn glscene_lod_stats() u32 {
 export fn glscene_inst_cull_stats() u32 {
     const inst = current orelse return 0;
     return (inst.inst_drawn & 0xffff) | ((inst.inst_culled & 0xffff) << 16);
+}
+
+/// 3F: Format of the last completed external texture load.
+///   0xFF (255) — no external texture has completed loading yet (JS HUD: wait)
+///   0          — RGBA (PNG-fallback path; glBc7Supported was false or ?nobc7)
+///   1          — BC7_UNORM (VK_FORMAT_BC7_UNORM_BLOCK / BPTC_RGBA_UNORM)
+///   2          — BC7_SRGB  (VK_FORMAT_BC7_SRGB_BLOCK  / BPTC_SRGB_ALPHA_UNORM)
+/// Returns 0 when no instance is selected.
+export fn glscene_tex_format() u32 {
+    const inst = current orelse return 0;
+    if (!inst.tex_format_loaded) return 0xFF;
+    return inst.tex_format_seen;
 }
 
 // ── /gl-morph runtime controls ────────────────────────────────────────────────

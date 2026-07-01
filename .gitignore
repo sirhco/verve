@@ -4,6 +4,8 @@ zig-pkg/
 *.o
 *.obj
 *.dll
+# wasm build artifacts (e.g. island_GlDemo_test.wasm from zig build test)
+*.wasm
 # …except the vendored MS-redistributable WebView2 loader: the win-native
 # gate, both desktop templates, and the scaffold embed need it present in
 # a fresh clone (the build is offline — no NuGet fetch at build time).
