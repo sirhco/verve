@@ -4,6 +4,23 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.37.0] - 2026-07-01
+
+### Added
+
+- **gl — multi-format compressed textures: S3TC runtime complete** (slice 3 of 3 — closes the S3TC cluster S1–S3).
+  BC1 (opaque) and BC3 (alpha) S3TC textures are uploaded on both backends and selected
+  by capability on the runtime path. Completes the multi-format cluster begun in v0.35.0.
+  - **Runtime format indicator**: `[data-ref="gltex-hud"]` on `/gl-material` now shows
+    `PNG` / `BC7` / `S3TC BC1` / `S3TC BC3` matching the actual GPU format in use.
+    `console.info` line distinguishes `→ BC7 (.bc7.ktx2)` / `→ S3TC (.s3tc.ktx2)` /
+    `→ PNG fallback` for every textured page.
+  - **WebGPU defensive guard**: unknown `format` values in `case 49` now log
+    `console.error` and break instead of calling `createTexture({format: undefined})`.
+  - **Alias removal**: the temporary bare `.ktx2` aliases added in v0.36.0 are removed
+    (runtime now requests `.bc7.ktx2` / `.s3tc.ktx2` directly via `chooseTexFmt`).
+  - **`?fmt=bc7|s3tc|png`** force-flag for CDP / manual testing (unchanged; documented).
+
 ## [0.36.0] - 2026-07-01
 
 ### Added

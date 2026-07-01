@@ -620,15 +620,16 @@
 
   // 3F: Write texture-format indicator into the [data-ref="gltex-hud"] element.
   // glscene_tex_format() returns 0xFF when no texture has loaded yet, 0=RGBA
-  // (PNG-fallback path), 1=BC7_UNORM or 2=BC7_SRGB (both shown as "BC7").
-  // Guard: no-op when the function or element is absent (every demo except /gl-material).
+  // (PNG-fallback path), 1=BC7_UNORM or 2=BC7_SRGB (both shown as "BC7"),
+  // 3=BC1_UNORM or 4=BC1_SRGB (shown as "S3TC BC1"), 5=BC3_UNORM or 6=BC3_SRGB
+  // (shown as "S3TC BC3"). Guard: no-op when function or element is absent.
   const glTexFmtHudUpdate = (exports) => {
     if (typeof exports.glscene_tex_format !== "function") return;
     const hudEl = document.querySelector('[data-ref="gltex-hud"]');
     if (!hudEl) return;
     const fmt = exports.glscene_tex_format() >>> 0;
     if (fmt === 0xFF) return; // not yet loaded — leave initial text
-    hudEl.textContent = fmt === 0 ? "PNG" : "BC7";
+    hudEl.textContent = fmt === 0 ? "PNG" : fmt <= 2 ? "BC7" : fmt <= 4 ? "S3TC BC1" : "S3TC BC3";
   };
 
   const dispatchEventId = (e, attr, prevent) => {
@@ -8419,6 +8420,7 @@
             case 5: gpuFmt = "bc3-rgba-unorm";      blockBytes = 16; break;
             case 6: gpuFmt = "bc3-rgba-unorm-srgb"; blockBytes = 16; break;
           }
+          if (!gpuFmt) { console.error("verve.gl: compressed format " + format + " unknown"); break; }
           const dvm = new DataView(memory.buffer);
           const blocks_base = ptr + mip_count * 8;
           const tex = device.createTexture({
@@ -10567,7 +10569,7 @@
               if (/\.ktx2$/i.test(url)) {
                 let fmt = chooseTexFmt();
                 if (fmt === null) fmt = glTexCaps.bc7 ? "bc7" : glTexCaps.s3tc ? "s3tc" : "png";
-                console.info(`verve.gl: texture ${url} → ${fmt.toUpperCase()}`);
+                console.info(`verve.gl: texture ${url} → ${fmt === "bc7" ? "BC7 (.bc7.ktx2)" : fmt === "s3tc" ? "S3TC (.s3tc.ktx2)" : "PNG fallback"}`);
                 if (fmt === "png") {
                   loadPng();
                 } else {
