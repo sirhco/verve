@@ -5744,9 +5744,10 @@
           st.textures[handle] = { tex, target: gl.TEXTURE_2D };
           break;
         }
-        case 49: { // CREATE_COMPRESSED_TEXTURE — BC7/BPTC, pre-supplied mips (no generateMipmap)
+        case 49: { // CREATE_COMPRESSED_TEXTURE — BC7/BC1/BC3, pre-supplied mips (no generateMipmap)
           // Payload (7×u32, 28 bytes): handle|w|h|format|mip_count|ptr|byte_len
-          // format: 1=BC7_UNORM, 2=BC7_SRGB. ptr → level table in wasm memory.
+          // format: 1=BC7_UNORM, 2=BC7_SRGB, 3=BC1_UNORM, 4=BC1_SRGB, 5=BC3_UNORM, 6=BC3_SRGB.
+          // ptr → level table in wasm memory.
           const handle = dv.getUint32(off, true);
           const w = dv.getUint32(off + 4, true);
           const h = dv.getUint32(off + 8, true);
@@ -5754,11 +5755,26 @@
           const mip_count = dv.getUint32(off + 16, true);
           const ptr = dv.getUint32(off + 20, true);
           // off + 24 = byte_len (informational)
-          const ext = st.extTextureCompressionBptc;
-          if (!ext) { console.error("verve.gl: BC7 upload but BPTC ext absent"); break; }
-          const glFmt = format === 2
-            ? ext.COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT
-            : ext.COMPRESSED_RGBA_BPTC_UNORM_EXT;
+          let glFmt, texExt;
+          switch (format) {
+            case 1: texExt = st.extTextureCompressionBptc; glFmt = texExt && texExt.COMPRESSED_RGBA_BPTC_UNORM_EXT; break;
+            case 2: texExt = st.extTextureCompressionBptc; glFmt = texExt && texExt.COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT; break;
+            case 3: texExt = st.extTextureCompressionS3tc; glFmt = texExt && texExt.COMPRESSED_RGB_S3TC_DXT1_EXT; break;
+            case 4: {
+              const se = st.extTextureCompressionS3tcSrgb;
+              if (se) glFmt = se.COMPRESSED_SRGB_S3TC_DXT1_EXT;
+              else { const s = st.extTextureCompressionS3tc; glFmt = s && s.COMPRESSED_RGB_S3TC_DXT1_EXT; console.warn("verve.gl: no sRGB-S3TC ext; BC1 sRGB uploaded as linear DXT1 (gamma approx)"); }
+              break;
+            }
+            case 5: texExt = st.extTextureCompressionS3tc; glFmt = texExt && texExt.COMPRESSED_RGBA_S3TC_DXT5_EXT; break;
+            case 6: {
+              const se = st.extTextureCompressionS3tcSrgb;
+              if (se) glFmt = se.COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT;
+              else { const s = st.extTextureCompressionS3tc; glFmt = s && s.COMPRESSED_RGBA_S3TC_DXT5_EXT; console.warn("verve.gl: no sRGB-S3TC ext; BC3 sRGB uploaded as linear DXT5 (gamma approx)"); }
+              break;
+            }
+          }
+          if (!glFmt) { console.error("verve.gl: compressed format " + format + " unsupported ext"); break; }
           const dvm = new DataView(memory.buffer);
           const blocks_base = ptr + mip_count * 8;
           const tex = gl.createTexture();
@@ -8383,9 +8399,10 @@
           st.textures[handle] = { tex, view: tex.createView(), w, h };
           break;
         }
-        case 49: { // CREATE_COMPRESSED_TEXTURE — BC7/BPTC, pre-supplied mips
+        case 49: { // CREATE_COMPRESSED_TEXTURE — BC7/BC1/BC3, pre-supplied mips
           // Payload (7×u32, 28 bytes): handle|w|h|format|mip_count|ptr|byte_len
-          // format: 1=BC7_UNORM, 2=BC7_SRGB. ptr → level table in wasm memory.
+          // format: 1=BC7_UNORM, 2=BC7_SRGB, 3=BC1_UNORM, 4=BC1_SRGB, 5=BC3_UNORM, 6=BC3_SRGB.
+          // ptr → level table in wasm memory.
           const handle = dv.getUint32(off, true);
           const w = dv.getUint32(off + 4, true);
           const h = dv.getUint32(off + 8, true);
@@ -8393,7 +8410,15 @@
           const mip_count = dv.getUint32(off + 16, true);
           const ptr = dv.getUint32(off + 20, true);
           // off + 24 = byte_len (informational)
-          const gpuFmt = format === 2 ? "bc7-rgba-unorm-srgb" : "bc7-rgba-unorm";
+          let gpuFmt, blockBytes;
+          switch (format) {
+            case 1: gpuFmt = "bc7-rgba-unorm";      blockBytes = 16; break;
+            case 2: gpuFmt = "bc7-rgba-unorm-srgb"; blockBytes = 16; break;
+            case 3: gpuFmt = "bc1-rgba-unorm";      blockBytes = 8;  break;
+            case 4: gpuFmt = "bc1-rgba-unorm-srgb"; blockBytes = 8;  break;
+            case 5: gpuFmt = "bc3-rgba-unorm";      blockBytes = 16; break;
+            case 6: gpuFmt = "bc3-rgba-unorm-srgb"; blockBytes = 16; break;
+          }
           const dvm = new DataView(memory.buffer);
           const blocks_base = ptr + mip_count * 8;
           const tex = device.createTexture({
@@ -8412,7 +8437,7 @@
             device.queue.writeTexture(
               { texture: tex, mipLevel: i },
               data,
-              { bytesPerRow: Math.ceil(wi / 4) * 16, rowsPerImage: Math.ceil(hi / 4) },
+              { bytesPerRow: Math.ceil(wi / 4) * blockBytes, rowsPerImage: Math.ceil(hi / 4) },
               // block-aligned copy extent required for compressed formats (sub-4 mips pad to a full 4×4 block)
               [Math.ceil(wi / 4) * 4, Math.ceil(hi / 4) * 4],
             );
