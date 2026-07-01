@@ -882,8 +882,17 @@ pub const Window = struct {
         // Pass nil config — defaults to the whole web view bounds at
         // the device's native pixel scale.
         const takeSnapshot = m.cast(*const fn (id, SEL, ?id, *SnapshotBlock) callconv(.c) void);
+        // [smoke-instr] boundary: the async snapshot is dispatched here; the
+        // nested run-loop pump below only returns once the completion block
+        // (snapshotBlockInvoke) sets `done`. On a headless/off-screen WKWebView
+        // the completion may never fire → the pump spins forever → hang.
+        std.log.info("verve.desktop[macos]: snapshot: takeSnapshotWithConfiguration invoked; pumping run loop", .{});
         takeSnapshot(self.webview, m.sel("takeSnapshotWithConfiguration:completionHandler:"), null, &block);
         pumpUntilDone(&done);
+        // [smoke-instr] boundary: if this line is absent in CI output but the
+        // "invoked" line is present, the pump never returned (completion never
+        // fired) — confirming the headless-snapshot hang.
+        std.log.info("verve.desktop[macos]: snapshot: pump returned (image={s})", .{if (image != null) "present" else "null"});
 
         const ns_image = image orelse return opts_mod.SnapshotError.CaptureFailed;
         const release = m.cast(*const fn (id, SEL) callconv(.c) void);
@@ -1709,6 +1718,10 @@ fn snapshotBlockInvoke(block: *SnapshotBlock, image: id, err: ?id) callconv(.c) 
     if (@intFromPtr(image) != 0) {
         block.out_image.* = retain(image, m.sel("retain"));
     }
+    // [smoke-instr] boundary: the snapshot completion handler fired. If this is
+    // absent in CI (while "takeSnapshotWithConfiguration invoked" is present),
+    // WKWebView never called back on this runner → the pump hangs.
+    std.log.info("verve.desktop[macos]: snapshot: completion fired (image={s})", .{if (@intFromPtr(image) != 0) "present" else "null"});
     block.done.* = true;
 }
 

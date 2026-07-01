@@ -93,7 +93,8 @@ pub fn onDragDrop(c: ?*anyopaque, paths: []const []const u8) void {
     for (paths) |path| {
         std.log.info("[drag-drop] {s}", .{path});
         var buf: [4096]u8 = undefined;
-        const js = std.fmt.bufPrint(&buf,
+        const js = std.fmt.bufPrint(
+            &buf,
             "window.verve.handleDragDrop && window.verve.handleDragDrop(\"{s}\");",
             .{path},
         ) catch continue;
@@ -291,13 +292,7 @@ const Routes = struct {
         pub const Reply = struct { ok: bool };
         pub fn handle(c: *RouterCtx, _: std.mem.Allocator, args: Args) !Reply {
             const w = c.window;
-            if (std.mem.eql(u8, args.action, "minimize")) w.minimize()
-            else if (std.mem.eql(u8, args.action, "maximize")) w.maximize()
-            else if (std.mem.eql(u8, args.action, "restore")) w.restore()
-            else if (std.mem.eql(u8, args.action, "center")) w.center()
-            else if (std.mem.eql(u8, args.action, "fullscreen_on")) w.setFullscreen(true)
-            else if (std.mem.eql(u8, args.action, "fullscreen_off")) w.setFullscreen(false)
-            else return .{ .ok = false };
+            if (std.mem.eql(u8, args.action, "minimize")) w.minimize() else if (std.mem.eql(u8, args.action, "maximize")) w.maximize() else if (std.mem.eql(u8, args.action, "restore")) w.restore() else if (std.mem.eql(u8, args.action, "center")) w.center() else if (std.mem.eql(u8, args.action, "fullscreen_on")) w.setFullscreen(true) else if (std.mem.eql(u8, args.action, "fullscreen_off")) w.setFullscreen(false) else return .{ .ok = false };
             return .{ .ok = true };
         }
     };
@@ -380,9 +375,7 @@ const Routes = struct {
         pub const Reply = struct { ok: bool, status: []const u8 };
         pub fn handle(c: *RouterCtx, _: std.mem.Allocator, args: Args) !Reply {
             const kind: desktop.PrintDialogKind =
-                if (std.mem.eql(u8, args.kind, "system")) .system
-                else if (std.mem.eql(u8, args.kind, "browser")) .browser
-                else .default;
+                if (std.mem.eql(u8, args.kind, "system")) .system else if (std.mem.eql(u8, args.kind, "browser")) .browser else .default;
             c.window.printWithOptions(.{ .kind = kind }) catch |err| switch (err) {
                 error.Cancelled => return .{ .ok = false, .status = "cancelled" },
                 error.Unsupported => return .{ .ok = false, .status = "unsupported" },
@@ -417,6 +410,10 @@ const Routes = struct {
         pub const Args = struct { checksum: i64 = 0 };
         pub const Reply = struct { ok: bool };
         pub fn handle(c: *RouterCtx, alloc: std.mem.Allocator, args: Args) !Reply {
+            // [smoke-instr] boundary: the JS driver reached smoke_done → hydration
+            // + the click sequence ran. If this line is absent in CI output, the
+            // hang is upstream (driver/IPC), not in the snapshot path.
+            std.log.info("smoke_done: received (checksum={d})", .{args.checksum});
             const dir = c.smoke_dir orelse {
                 std.log.warn("smoke_done: no smoke_dir set; ignoring", .{});
                 return .{ .ok = false };
@@ -427,6 +424,11 @@ const Routes = struct {
             const cksum_path = try std.fs.path.join(alloc, &.{ dir, "checksum.txt" });
             defer alloc.free(cksum_path);
 
+            // [smoke-instr] boundary: about to enter the (async, run-loop-pumped)
+            // WKWebView snapshot. If "snapshot: completion fired" never follows,
+            // the completion handler didn't fire (headless/off-screen) → the pump
+            // spins → the app hangs here.
+            std.log.info("smoke_done: taking snapshot → '{s}'", .{png_path});
             c.window.takeSnapshotPng(png_path) catch |err| {
                 std.log.err("smoke_done: snapshot failed: {s}", .{@errorName(err)});
                 c.window.terminate();
