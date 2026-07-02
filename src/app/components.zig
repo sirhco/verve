@@ -4,30 +4,16 @@ const std = @import("std");
 const verve = @import("verve");
 const islands = @import("islands.zig");
 
-/// Visualization demo: an interactive force-directed graph (VizGraph island,
-/// nodes reveal on hydrate) plus static SSR charts — all from `verve.viz`.
-pub fn viz(ctx: *const verve.Context) !*verve.Node {
-    // --- Force graph as an island -------------------------------------------
-    const nodes = [_]verve.viz.GraphNode{
-        .{ .id = "core", .label = "core" },
-        .{ .id = "server", .label = "server" },
-        .{ .id = "client", .label = "client" },
-        .{ .id = "desktop", .label = "desktop" },
-        .{ .id = "viz", .label = "viz" },
-        .{ .id = "cli", .label = "cli" },
-    };
-    const edges = [_]verve.viz.GraphEdge{
-        .{ .from = "core", .to = "server" },
-        .{ .from = "core", .to = "client" },
-        .{ .from = "core", .to = "desktop" },
-        .{ .from = "core", .to = "viz" },
-        .{ .from = "viz", .to = "client" },
-        .{ .from = "server", .to = "cli" },
-    };
-    const g = verve.viz.Graph{ .nodes = &nodes, .edges = &edges, .layout = .force };
-    const gopts = verve.viz.GraphOpts{ .width = 640, .height = 420, .node_color = "#1f6feb", .edge_color = "#30363d", .label_color = "#f5f5f5" };
-
-    // Positions reused for SSR; node/edge/label arrays feed the island props.
+/// Build one VizGraphInteractive island (SSR graph + controls). Shared by
+/// viz() and vizMulti() so the island-wiring is not duplicated.
+fn vizGraphIsland(
+    ctx: *const verve.Context,
+    nodes: []const verve.viz.GraphNode,
+    edges: []const verve.viz.GraphEdge,
+    layout: verve.viz.Layout,
+    gopts: verve.viz.GraphOpts,
+) !*verve.Node {
+    const g = verve.viz.Graph{ .nodes = nodes, .edges = edges, .layout = layout };
     const positions = try verve.viz.graphPositions(ctx, g, gopts);
     const xs = try ctx.alloc().alloc(f64, positions.len);
     const ys = try ctx.alloc().alloc(f64, positions.len);
@@ -60,7 +46,7 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         .et = et.items,
         .labels = node_labels,
         .ids = node_ids,
-        .layout = @intFromEnum(g.layout),
+        .layout = @intFromEnum(layout),
         .margin = gopts.margin,
     });
     const graph_svg = verve.viz.renderGraphInteractive(ctx, g, gopts);
@@ -71,7 +57,31 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         ctx.el("button").attr("z-on-click", "viz_layout_cycle").attr("data-ref", "viz-layout-btn").text("⟳ force"),
     });
     const graph_inner = ctx.div().children(.{ controls, graph_svg });
-    const graph_island = verve.island(ctx, .{ .name = "VizGraphInteractive", .props = props }, graph_inner);
+    return verve.island(ctx, .{ .name = "VizGraphInteractive", .props = props }, graph_inner);
+}
+
+/// Visualization demo: an interactive force-directed graph (VizGraph island,
+/// nodes reveal on hydrate) plus static SSR charts — all from `verve.viz`.
+pub fn viz(ctx: *const verve.Context) !*verve.Node {
+    // --- Force graph as an island -------------------------------------------
+    const nodes = [_]verve.viz.GraphNode{
+        .{ .id = "core", .label = "core" },
+        .{ .id = "server", .label = "server" },
+        .{ .id = "client", .label = "client" },
+        .{ .id = "desktop", .label = "desktop" },
+        .{ .id = "viz", .label = "viz" },
+        .{ .id = "cli", .label = "cli" },
+    };
+    const edges = [_]verve.viz.GraphEdge{
+        .{ .from = "core", .to = "server" },
+        .{ .from = "core", .to = "client" },
+        .{ .from = "core", .to = "desktop" },
+        .{ .from = "core", .to = "viz" },
+        .{ .from = "viz", .to = "client" },
+        .{ .from = "server", .to = "cli" },
+    };
+    const gopts = verve.viz.GraphOpts{ .width = 640, .height = 420, .node_color = "#1f6feb", .edge_color = "#30363d", .label_color = "#f5f5f5" };
+    const graph_island = try vizGraphIsland(ctx, &nodes, &edges, .force, gopts);
 
     // --- Static charts ------------------------------------------------------
     const bars = [_]verve.viz.Datum{
@@ -228,6 +238,68 @@ pub fn viz(ctx: *const verve.Context) !*verve.Node {
         ctx.section().class("card viz-card").children(.{ ctx.h2("Chord diagram"), ctx.p().class("hint").text("Pairwise flows around a circle — arc span ∝ row sum, ribbons connect nonzero pairs."), verve.viz.chordChart(ctx, &chord_labels, &chord_matrix, .{ .width = 380, .height = 380, .label_color = "#f5f5f5" }) }),
         ctx.p().children(.{verve.link(ctx, "/", "← Home", .{})}),
     }).build();
+}
+
+/// Multi-instance viz demo: two independent VizGraphInteractive islands on one
+/// page, proving per-instance reactive dispatch (slice A3).
+pub fn vizMulti(ctx: *const verve.Context) !*verve.Node {
+    // --- Graph 1: Framework dependency graph (force layout, blue) -----------
+    const nodes1 = [_]verve.viz.GraphNode{
+        .{ .id = "core", .label = "core" },
+        .{ .id = "server", .label = "server" },
+        .{ .id = "client", .label = "client" },
+        .{ .id = "desktop", .label = "desktop" },
+        .{ .id = "viz", .label = "viz" },
+        .{ .id = "cli", .label = "cli" },
+    };
+    const edges1 = [_]verve.viz.GraphEdge{
+        .{ .from = "core", .to = "server" },
+        .{ .from = "core", .to = "client" },
+        .{ .from = "core", .to = "desktop" },
+        .{ .from = "core", .to = "viz" },
+        .{ .from = "viz", .to = "client" },
+        .{ .from = "server", .to = "cli" },
+    };
+    const gopts1 = verve.viz.GraphOpts{ .width = 560, .height = 380, .node_color = "#1f6feb", .edge_color = "#30363d", .label_color = "#f5f5f5" };
+    const island1 = try vizGraphIsland(ctx, &nodes1, &edges1, .force, gopts1);
+
+    // --- Graph 2: CI/CD pipeline (dag layout, amber) — distinct topology ----
+    const nodes2 = [_]verve.viz.GraphNode{
+        .{ .id = "source", .label = "source" },
+        .{ .id = "build", .label = "build" },
+        .{ .id = "test", .label = "test" },
+        .{ .id = "lint", .label = "lint" },
+        .{ .id = "package", .label = "package" },
+        .{ .id = "deploy", .label = "deploy" },
+        .{ .id = "monitor", .label = "monitor" },
+    };
+    const edges2 = [_]verve.viz.GraphEdge{
+        .{ .from = "source", .to = "build" },
+        .{ .from = "build", .to = "test" },
+        .{ .from = "build", .to = "lint" },
+        .{ .from = "test", .to = "package" },
+        .{ .from = "lint", .to = "package" },
+        .{ .from = "package", .to = "deploy" },
+        .{ .from = "deploy", .to = "monitor" },
+    };
+    const gopts2 = verve.viz.GraphOpts{ .width = 560, .height = 380, .node_color = "#d97706", .edge_color = "#44403c", .label_color = "#fef3c7" };
+    const island2 = try vizGraphIsland(ctx, &nodes2, &edges2, .dag, gopts2);
+
+    return ctx.main_().class("home").children(.{
+        ctx.h1("Multi-Instance Viz Demo"),
+        ctx.p().text("Two independent VizGraphInteractive islands — each has its own " ++
+            "reactive state. +/− node, ● live, and ⟳ layout controls on each " ++
+            "panel affect only that instance."),
+        ctx.section().class("card viz-card").children(.{
+            ctx.h2("Graph 1 — Framework (force)"),
+            island1,
+        }),
+        ctx.section().class("card viz-card").children(.{
+            ctx.h2("Graph 2 — CI/CD Pipeline (dag)"),
+            island2,
+        }),
+        ctx.p().children(.{ verve.link(ctx, "/viz", "← Viz", .{}), ctx.span().text(" | "), verve.link(ctx, "/", "Home", .{}) }),
+    });
 }
 
 /// verve.viz canvas render path demo — /viz-canvas. A ~1500-node procedural
