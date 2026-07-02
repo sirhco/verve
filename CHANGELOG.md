@@ -4,6 +4,29 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.40.0] - 2026-07-02
+
+### Added
+
+- **viz — routed-edge live re-route** (multi-instance interactivity cluster, slice C of 3 —
+  **completes the cluster**). The interactive node-link graph now renders curved/orthogonal
+  `<path>` edges (via `GraphOpts.edge_routing`) instead of only straight `<line>`, and those
+  edges **re-route live while a node is dragged** — the path `d` is rebuilt from the two live
+  endpoints every frame. The `/viz-multi` demo's second graph (a DAG) now uses `.orthogonal`
+  routing (Manhattan bends with rounded corners); its first graph stays straight.
+  - **`src/core/viz/edge_path.zig`** — added `pathDBuf`, a fixed-buffer (`std.Io.Writer.fixed`)
+    `d`-builder sharing `writePath` with the allocating `pathD`. It is safe to call from wasm
+    island chunks (no address-taken drain fn to collide with the chunk's shared function table),
+    unlike `pathD`.
+  - **`src/core/viz/graph.zig`** — `renderInteractive` and `edgeFragment` emit routed `<path>`
+    when `edge_routing != .straight`; straight stays byte-identical `<line>`.
+  - **`src/client/islands/VizGraphInteractive.zig`** — `updateEdge` recomputes the routed `d`
+    from live node positions on drag (via the chunk-safe `pathDBuf`); the chunk's edge-fragment
+    builder mirrors the SSR `<path>` contract. New `edge_routing` prop threads the mode through.
+
+  With slices A (v0.38.0, multiple interactive graphs per page) and B (v0.39.0, multi-parent-aware
+  collapse), this closes the viz multi-instance interactivity cluster.
+
 ## [0.39.0] - 2026-07-02
 
 ### Fixed
