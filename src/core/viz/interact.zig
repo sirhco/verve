@@ -51,14 +51,24 @@ pub fn tweenPos(start: Vec2, target: Vec2, t: f64) Vec2 {
 }
 
 /// Subtree collapse visibility: recompute `hidden` from the `collapsed` flags.
-/// For every collapsed node, BFS the *directed* out-edges (`ef[i]` → `et[i]`)
-/// and hide everything reached except the collapsed root itself — the root
-/// stays visible as the re-expand handle. Cycles terminate via the visited
-/// set; a nested collapsed node's subtree hides with it.
+/// A node is hidden iff it is reachable from a collapsed subtree
+/// (collapseReachable) AND not reachable from any visible root
+/// (visibleFromRoots). Collapsed roots always stay visible as re-expand
+/// handles.
 ///
-/// Known v1 limitation (pinned by test): a node with a second parent outside
-/// the collapsed subtree still hides — visibility is reachability from each
-/// collapsed root, not reachability from visible roots.
+/// collapseReachable (H): for each collapsed root, forward-BFS the directed
+/// out-edges (`ef[i]` → `et[i]`) and mark everything reached except the root
+/// itself. Cycles terminate via the visited set.
+///
+/// visibleFromRoots (V): forward-BFS from every in-degree-0 root. Each
+/// dequeued node is marked visible; out-edges are only expanded for
+/// non-collapsed nodes — a collapsed node is marked visible (it stays visible
+/// as the re-expand handle) but blocks descent through it. Graphs with no
+/// in-degree-0 roots (pure cycles) produce V=∅, so the only invariant keeping
+/// the collapsed root visible is H[root]=false (the BFS never marks its own
+/// root).
+///
+/// Final: `hidden[v] = H[v] and !V[v]`.
 pub fn collapseHidden(
     a: std.mem.Allocator,
     node_count: usize,
@@ -69,8 +79,13 @@ pub fn collapseHidden(
 ) !void {
     @memset(hidden[0..node_count], false);
     if (node_count == 0) return;
+
+    // --- Pass 1: compute H (collapseReachable) ---
+    const h = try a.alloc(bool, node_count);
+    @memset(h, false);
     const visited = try a.alloc(bool, node_count);
     const queue = try a.alloc(usize, node_count);
+
     for (0..node_count) |root| {
         if (!collapsed[root]) continue;
         @memset(visited, false);
@@ -86,13 +101,56 @@ pub fn collapseHidden(
                 if (f != cur or t >= node_count) continue;
                 if (visited[t]) continue;
                 visited[t] = true;
-                hidden[t] = true;
+                h[t] = true;
                 if (tail < node_count) {
                     queue[tail] = t;
                     tail += 1;
                 }
             }
         }
+    }
+
+    // --- Pass 2: compute V (visibleFromRoots) ---
+    const vv = try a.alloc(bool, node_count);
+    @memset(vv, false);
+
+    // Compute in-degrees from edge targets.
+    const indeg = try a.alloc(usize, node_count);
+    @memset(indeg, 0);
+    for (et) |t| {
+        if (t < node_count) indeg[t] += 1;
+    }
+
+    // BFS from all in-degree-0 roots; reuse queue/visited scratch.
+    @memset(visited, false);
+    var head: usize = 0;
+    var tail: usize = 0;
+    for (0..node_count) |i| {
+        if (indeg[i] == 0 and !visited[i]) {
+            visited[i] = true;
+            queue[tail] = i;
+            tail += 1;
+        }
+    }
+    while (head < tail) {
+        const cur = queue[head];
+        head += 1;
+        vv[cur] = true;
+        if (collapsed[cur]) continue; // visible but blocks descent
+        for (ef, et) |f, t| {
+            if (f != cur or t >= node_count) continue;
+            if (visited[t]) continue;
+            visited[t] = true;
+            if (tail < node_count) {
+                queue[tail] = t;
+                tail += 1;
+            }
+        }
+    }
+
+    // --- Combine: hidden[v] = H[v] and !V[v] ---
+    for (0..node_count) |i| {
+        hidden[i] = h[i] and !vv[i];
     }
 }
 
@@ -193,12 +251,47 @@ test "nested collapsed subtree hides with its collapsed ancestor" {
     );
 }
 
-test "v1 limitation: multi-parent node hides even with a visible parent" {
-    // 0 → 2 and 1 → 2; collapsing 0 hides 2 although parent 1 is visible.
+test "multi-parent node stays visible via a visible parent" {
+    // 0 → 2 and 1 → 2; collapsing 0 only — non-collapsed root 1 reaches 2,
+    // so 2 stays visible (H[2]=true but V[2]=true via root 1 → 2).
     try collapseCase(
         &.{ true, false, false },
         &.{ 0, 1 },
         &.{ 2, 2 },
+        &.{ false, false, false },
+    );
+}
+
+test "multi-parent node hides when ALL its parents subtrees are collapsed" {
+    // 0 → 2 and 1 → 2; both 0 and 1 collapsed → neither root expands → V[2]=false
+    // → 2 hides.
+    try collapseCase(
+        &.{ true, true, false },
+        &.{ 0, 1 },
+        &.{ 2, 2 },
         &.{ false, false, true },
+    );
+}
+
+test "diamond with one arm collapsed keeps the join visible via the other arm" {
+    // 0 → {1, 2} → 3; collapse 1 only. H[3]=true (via 1→3). V BFS from root 0:
+    // 0 not collapsed → expands → enqueues 1 (collapsed, stops) and 2 (not
+    // collapsed → enqueues 3). So V={0,1,2,3}. hidden[3]=true&&!true=false.
+    try collapseCase(
+        &.{ false, true, false, false },
+        &.{ 0, 0, 1, 2 },
+        &.{ 1, 2, 3, 3 },
+        &.{ false, false, false, false },
+    );
+}
+
+test "child of a collapsed node with no other parent hides" {
+    // 0 → 1, collapse 0. H[1]=true. V BFS from root 0: 0 IS collapsed → stop.
+    // V[1]=false → hidden[1]=true.
+    try collapseCase(
+        &.{ true, false },
+        &.{0},
+        &.{1},
+        &.{ false, true },
     );
 }
