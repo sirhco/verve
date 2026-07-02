@@ -9,9 +9,11 @@ const cbuf = verve.viz_core.canvas_buf;
 
 extern "verve_runtime" fn viz_canvas_draw(ref_handle: i32, ptr: [*]const u8, len: u32) void;
 
-// The graph is synthesized in the chunk (a deterministic ~1500-node jittered
-// grid) rather than delivered via props — the SSR→hydrate scratch buffer (8 KB)
-// can't carry a graph this size, and a perf demo needs no server-authored data.
+// The graph is now SERVER-AUTHORED: `hydrate` fetches `/viz/graph.bin` (canvas_buf
+// binary) via `verve.fetchBinaryToExport` into the 4 MB asset region (bypassing the
+// 8 KB props scratch, which can't carry a ~35 KB graph) and `vizcanvas_graph_ready`
+// parses it. `genGraph` below is the original in-chunk synthesizer, RETAINED for
+// reference / as a manual fallback; it is not called on the current fetch path.
 const GRAPH_N: u32 = 1500;
 const GRAPH_COLS: u32 = 50;
 

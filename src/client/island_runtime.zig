@@ -1670,8 +1670,9 @@ pub fn fetchToExport(api_name: []const u8, island: []const u8, export_name: []co
 /// Fetch a URL's raw bytes into the page-scoped asset region (4 MB bump
 /// allocator, NOT the 8 KB island_scratch) and deliver `(ptr, len)` into
 /// the WASM linear memory to the named chunk export. Bypasses the 8 KB cap.
-/// The bridge scopes `vid` via `verve_enter_island` + `vizcanvas_select`
-/// before calling the export, so `current` is set when the export runs.
+/// The bridge scopes `vid` via `verve_enter_island` + the island's `*_select`
+/// export (routed by the generic `glSelect`: glscene_select / viz_select /
+/// vizcanvas_select — whichever the chunk provides) before calling the export.
 pub fn fetchBinaryToExport(url: []const u8, island: []const u8, export_name: []const u8, vid: u32) void {
     var args_buf: [256]u8 = undefined;
     const args = std.fmt.bufPrint(
