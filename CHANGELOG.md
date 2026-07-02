@@ -4,6 +4,31 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.38.0] - 2026-07-02
+
+### Added
+
+- **viz — multiple interactive graphs per page** (multi-instance interactivity cluster,
+  slice A of 3). The `VizGraphInteractive` island is no longer single-instance: N copies
+  can now live on one page, each with fully independent state (positions, view/zoom/pan,
+  selection, collapse, layout, force sim, and live streaming). New `/viz-multi` demo renders
+  two distinct graphs (a force-directed dependency graph + a DAG pipeline) side by side.
+  - **`src/client/islands/VizGraphInteractive.zig`** — converted from ~38 module-static
+    `var`s to a per-instance `Inst` struct + a fixed slot pool (`MAX_INSTANCES = 2`,
+    `@sizeOf(Inst)` ≈ 47 KB), mirroring the `GlScene.zig` pattern: `findSlot` / `allocSlot`
+    + a `viz_select(vid)` / `viz_unmount(vid)` export the bridge calls before each dispatch.
+    Every export operates on the selected instance; single-instance `/viz` behavior is
+    unchanged. (Fixed a latent bug: the runtime node-id counter was module-shared across
+    would-be instances — now per-instance.)
+  - **`src/bridge/verve.js`** — the dispatch seams are now vid-routed: `glSelect` also
+    selects the viz chunk instance; `callIslandExport` selects before delivery; the JS raf
+    loop (`rafLoops`) and live-poll timers are keyed per-vid; and the SSE-push resync
+    (`verveFetchExport`) threads the requesting instance's vid so a live stream updates its
+    OWN graph. Island removal now reclaims the chunk-side slot via a generic `*_unmount`
+    export call.
+  - **`src/app/`** — shared `vizGraphIsland()` builder used by both `viz()` and the new
+    `vizMulti()`; `/viz-multi` route.
+
 ## [0.37.0] - 2026-07-01
 
 ### Added
