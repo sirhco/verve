@@ -122,7 +122,44 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     inst.hover = -1;
     inst.select = -1;
     inst.panning = false;
-    genGraph(inst);
+    // Fetch the server-authored graph binary into the 4 MB asset region (not
+    // the 8 KB scratch). The bridge delivers (ptr,len) to vizcanvas_graph_ready
+    // after the fetch completes; that export parses the canvas_buf layout and
+    // starts the RAF loop. The canvas stays blank until the fetch lands (~35KB
+    // is fast; no synthetic fallback — chosen for clarity).
+    verve.fetchBinaryToExport("/viz/graph.bin", "VizGraphCanvas", "vizcanvas_graph_ready", inst.vid);
+}
+
+/// Called by the bridge after fetchBinaryToExport delivers the graph binary.
+/// Parses the canvas_buf layout (48B header + node xs/ys + edge ef/et), populates
+/// inst.*, fits the camera, and starts the RAF loop.
+/// The bridge has already called vizcanvas_select(vid) so `current` == inst.
+export fn vizcanvas_graph_ready(ptr: u32, len: u32) void {
+    const inst = current orelse return;
+    if (len < cbuf.header_size) return;
+    const bytes: [*]const u8 = @ptrFromInt(ptr);
+    // Read node_count and edge_count from the header (LE, same as canvas_buf.pack).
+    const node_count = std.mem.readInt(u32, bytes[12..16], .little);
+    const edge_count = std.mem.readInt(u32, bytes[16..20], .little);
+    const n: u32 = @min(node_count, MAX_N);
+    const e: u32 = @min(edge_count, MAX_E);
+    inst.n = n;
+    inst.e = e;
+    // Node xs/ys immediately follow the 48-byte header.
+    var off: u32 = cbuf.header_size;
+    for (0..n) |i| {
+        inst.xs[i] = @bitCast(std.mem.readInt(u32, bytes[off..][0..4], .little));
+        inst.ys[i] = @bitCast(std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little));
+        off += 8;
+    }
+    // Edge section starts after ALL node_count entries (use the wire count, not
+    // clamped n, to seek to the right offset when the arrays are truncated).
+    off = cbuf.header_size + node_count * 8;
+    for (0..e) |i| {
+        inst.ef[i] = std.mem.readInt(u32, bytes[off..][0..4], .little);
+        inst.et[i] = std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little);
+        off += 8;
+    }
     fitCamera(inst);
     if (inst.canvas_handle != null) {
         var buf: [96]u8 = undefined;

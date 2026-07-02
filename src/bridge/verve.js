@@ -10356,6 +10356,55 @@
     return "{}";
   };
 
+  // Generic large-binary fetch transport (VF2). Fetches a URL into the 4 MB
+  // page-scoped asset region (same bump allocator as gl_load) and delivers
+  // (ptr,len) — pointers into shared WASM linear memory — directly to the
+  // named chunk export. Bypasses the 8 KB island_scratch cap.
+  // Args: { url, island, export, vid }
+  window.verveHost.verveFetchBinary = (argsJson) => {
+    let a = {};
+    try {
+      a = typeof argsJson === "string" ? JSON.parse(argsJson || "{}") : argsJson || {};
+    } catch {}
+    if (!a.url || !a.island || !a.export) return '{"err":"bad args"}';
+    const reqVid = (a.vid >>> 0) || 0;
+    // Capture exports synchronously (hydrate context) — by the time the fetch
+    // resolves the requesting instance's chunk is already loaded.
+    const exports = chunkExports[a.island];
+    if (!exports || typeof exports[a.export] !== "function") {
+      console.error("verve: verveFetchBinary export missing:", a.island, a.export);
+      return "{}";
+    }
+    fetch(a.url)
+      .then((r) => {
+        if (!r.ok) throw new Error(`verveFetchBinary HTTP ${r.status} for ${a.url}`);
+        return r.arrayBuffer();
+      })
+      .then((ab) => {
+        const bytes = new Uint8Array(ab);
+        const ptr =
+          typeof exp.verve_asset_alloc === "function"
+            ? exp.verve_asset_alloc(bytes.length >>> 0, 16)
+            : 0;
+        if (!ptr) {
+          console.error("verve: verveFetchBinary asset region full for", a.url);
+          return;
+        }
+        new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
+        if (reqVid && typeof exp.verve_enter_island === "function")
+          exp.verve_enter_island(reqVid);
+        glSelect(exports, reqVid);
+        try {
+          exports[a.export](ptr >>> 0, bytes.length >>> 0);
+        } finally {
+          if (reqVid && typeof exp.verve_exit_island === "function")
+            exp.verve_exit_island();
+        }
+      })
+      .catch((e) => console.error("verve: verveFetchBinary failed", a.url, e));
+    return "{}";
+  };
+
   const loadIslandChunk = async (el, instanceId) => {
     const name = el.getAttribute("data-name") || "";
     if (!name) return;

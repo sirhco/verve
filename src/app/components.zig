@@ -331,9 +331,9 @@ pub fn vizCanvas(ctx: *const verve.Context) !*verve.Node {
     const island = try vizCanvasIsland(ctx, "Large graph — canvas2d render path");
     return ctx.main_().class("home").children(.{
         ctx.h1("verve.viz — canvas render"),
-        ctx.p().text("A ~1500-node graph drawn to a single canvas2d (vs the SVG-DOM " ++
-            "path): one batched draw call per frame. Drag to pan, wheel to zoom, " ++
-            "hover/click a node to highlight."),
+        ctx.p().text("A ~1500-node server-authored graph fetched from /viz/graph.bin " ++
+            "and drawn to a single canvas2d (vs the SVG-DOM path): one batched draw " ++
+            "call per frame. Drag to pan, wheel to zoom, hover/click a node to highlight."),
         island,
     });
 }

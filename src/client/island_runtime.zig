@@ -1667,6 +1667,22 @@ pub fn fetchToExport(api_name: []const u8, island: []const u8, export_name: []co
     _ = host("verveFetchExport", args, &out);
 }
 
+/// Fetch a URL's raw bytes into the page-scoped asset region (4 MB bump
+/// allocator, NOT the 8 KB island_scratch) and deliver `(ptr, len)` into
+/// the WASM linear memory to the named chunk export. Bypasses the 8 KB cap.
+/// The bridge scopes `vid` via `verve_enter_island` + `vizcanvas_select`
+/// before calling the export, so `current` is set when the export runs.
+pub fn fetchBinaryToExport(url: []const u8, island: []const u8, export_name: []const u8, vid: u32) void {
+    var args_buf: [256]u8 = undefined;
+    const args = std.fmt.bufPrint(
+        &args_buf,
+        "{{\"url\":\"{s}\",\"island\":\"{s}\",\"export\":\"{s}\",\"vid\":{d}}}",
+        .{ url, island, export_name, vid },
+    ) catch return;
+    var out: [16]u8 = undefined;
+    _ = host("verveFetchBinary", args, &out);
+}
+
 /// Asynchronous host call. The JSON result fans back to the handler
 /// registered for `route` (via `registerResponseHandler`) — same path a
 /// server-fn reply takes. Use for host fns that return a Promise.
