@@ -324,7 +324,9 @@ pub fn edgeFragment(buf: []u8, opts: Opts, key: []const u8, ref: []const u8, p0:
     if (opts.edge_routing == .straight) {
         return std.fmt.bufPrint(buf, "<line data-vkey=\"{s}\" data-ref=\"{s}\" x1=\"{d}\" y1=\"{d}\" x2=\"{d}\" y2=\"{d}\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, ref, p0.x, p0.y, p1.x, p1.y, opts.edge_color });
     }
-    var dbuf: [256]u8 = undefined;
+    // 384 B: an orthogonal 2-point path is M + up to V/Q/H/Q/V (~7 numbers);
+    // even worst-case extreme f64 coords (~24 chars each) stay under this.
+    var dbuf: [384]u8 = undefined;
     const d = try edge_path.pathDBuf(&dbuf, &[_]Vec2{ p0, p1 }, opts.edge_routing, .{ .corner_radius = opts.edge_corner_radius });
     return std.fmt.bufPrint(buf, "<path data-vkey=\"{s}\" data-ref=\"{s}\" d=\"{s}\" fill=\"none\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, ref, d, opts.edge_color });
 }
