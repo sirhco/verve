@@ -267,3 +267,8 @@ test "vizAdvanceTick emits seq-ordered deltas that transform the snapshot" {
     const wrapped = Actions.vizGraph(.{});
     try std.testing.expectEqual(before_n, wrapped.nodes.len);
 }
+
+// Pull viz_data tests into the app test suite.
+test {
+    _ = @import("viz_data.zig");
+}

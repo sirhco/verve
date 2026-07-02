@@ -7,6 +7,7 @@ const Writer = std.Io.Writer;
 const verve = @import("verve");
 const assets = @import("assets");
 const gl_assets = @import("gl_assets");
+const viz_assets = @import("viz_assets");
 const public_assets = @import("public_assets");
 const app = @import("app");
 const router = @import("router.zig");
@@ -335,6 +336,15 @@ fn handleRequest(
     if (std.mem.startsWith(u8, path, GL_PREFIX)) {
         const name = path[GL_PREFIX.len..];
         if (gl_assets.lookupGlAsset(name)) |asset| {
+            try respondBuffered(gpa, request, .ok, "application/octet-stream", "public, max-age=300", meta.accept_gzip, asset.bytes);
+            return;
+        }
+    }
+
+    const VIZ_PREFIX = "/viz/";
+    if (std.mem.startsWith(u8, path, VIZ_PREFIX)) {
+        const name = path[VIZ_PREFIX.len..];
+        if (viz_assets.lookupVizAsset(name)) |asset| {
             try respondBuffered(gpa, request, .ok, "application/octet-stream", "public, max-age=300", meta.accept_gzip, asset.bytes);
             return;
         }

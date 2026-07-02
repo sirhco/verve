@@ -57,6 +57,33 @@ pub fn pack(buf: []u8, h: Header, xs: []const f32, ys: []const f32, ef: []const 
     return off;
 }
 
+/// Allocate and pack a graph into the canvas_buf byte layout with default
+/// camera and colour values. The canvas chunk's `fitCamera` recomputes the
+/// camera on load; hover/select start at -1 (none). Caller owns returned slice.
+pub fn packGraph(alloc: std.mem.Allocator, xs: []const f32, ys: []const f32, ef: []const u32, et: []const u32) ![]u8 {
+    std.debug.assert(xs.len == ys.len);
+    std.debug.assert(ef.len == et.len);
+    const n: u32 = @intCast(xs.len);
+    const e: u32 = @intCast(ef.len);
+    const buf = try alloc.alloc(u8, sizeFor(n, e));
+    const h = Header{
+        .cam_x = 0,
+        .cam_y = 0,
+        .scale = 1.0,
+        .node_count = n,
+        .edge_count = e,
+        .hover = -1,
+        .select = -1,
+        .node_r = 4.0,
+        .base_color = 0x1f6febff,
+        .hover_color = 0xffd166ff,
+        .select_color = 0xff5577ff,
+        .edge_color = 0x30363dff,
+    };
+    _ = pack(buf, h, xs, ys, ef, et);
+    return buf;
+}
+
 test "canvas_buf pack round-trip" {
     var buf: [header_size + 3 * 8 + 2 * 8]u8 = undefined;
     const xs = [_]f32{ 1, 2, 3 };
@@ -85,4 +112,29 @@ test "canvas_buf pack round-trip" {
     try std.testing.expectApproxEqAbs(@as(f32, 3), @as(f32, @bitCast(std.mem.readInt(u32, buf[header_size + 16 ..][0..4], .little))), 1e-6);
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, buf[header_size + 24 + 8 ..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, buf[header_size + 24 + 12 ..][0..4], .little));
+}
+
+test "canvas_buf packGraph allocates correct layout with defaults" {
+    const alloc = std.testing.allocator;
+    const xs = [_]f32{ 0, 22, 44 };
+    const ys = [_]f32{ 0, 0, 22 };
+    const ef = [_]u32{ 1, 2 };
+    const et = [_]u32{ 0, 1 };
+    const buf = try packGraph(alloc, &xs, &ys, &ef, &et);
+    defer alloc.free(buf);
+    // size matches sizeFor
+    try std.testing.expectEqual(sizeFor(3, 2), @as(u32, @intCast(buf.len)));
+    // node_count and edge_count written correctly
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, buf[12..16], .little));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, buf[16..20], .little));
+    // hover = -1, select = -1 (defaults)
+    try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, buf[20..24], .little));
+    try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, buf[24..28], .little));
+    // first node xs[0] = 0
+    const x0: f32 = @bitCast(std.mem.readInt(u32, buf[header_size..][0..4], .little));
+    try std.testing.expectApproxEqAbs(@as(f32, 0), x0, 1e-6);
+    // first edge ef[0]=1, et[0]=0
+    const edge_off = header_size + 3 * 8;
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, buf[edge_off..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[edge_off + 4 ..][0..4], .little));
 }
