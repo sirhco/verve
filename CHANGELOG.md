@@ -4,6 +4,26 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.39.0] - 2026-07-02
+
+### Fixed
+
+- **viz — multi-parent-aware subtree collapse** (multi-instance interactivity cluster,
+  slice B of 3). Collapsing a node's subtree no longer hides a node that is *also*
+  reachable from a non-collapsed parent. The visibility rule is now
+  `hidden = reachable-from-a-collapsed-subtree AND NOT reachable-from-a-visible-root`
+  (visible roots = in-degree-0 nodes; descent is blocked at collapsed nodes, which stay
+  visible as re-expand handles). Previously a node hid whenever *any* collapsed root
+  reached it, even with a visible parent (the documented v1 limitation). Example: with
+  `core→client` and `viz→client`, collapsing `viz` keeps `client` visible (still reached
+  via `core`); collapsing both `core` and `viz` hides it.
+  - **`src/core/viz/interact.zig`** — `collapseHidden` gains the `visibleFromRoots` BFS
+    pass and the combined rule; unit tests updated (the v1-limitation test is flipped) and
+    extended (both-parents-collapsed, one-arm-collapsed diamond, plain child).
+  - **`src/client/islands/VizGraphInteractive.zig`** — the chunk's `recomputeHidden`
+    mirror matches the new core algorithm (per-instance `visible`/`indeg` scratch);
+    composes with live streaming, node add/remove, and the slice-A multi-instance state.
+
 ## [0.38.0] - 2026-07-02
 
 ### Added
