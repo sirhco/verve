@@ -567,6 +567,8 @@
     glCurrentVid = vid >>> 0;
     if (vid && exports && typeof exports.glscene_select === "function")
       exports.glscene_select(vid >>> 0);
+    if (vid && exports && typeof exports.viz_select === "function")
+      exports.viz_select(vid >>> 0);
   };
   const vidOfEl = (el) => {
     const isl = el && el.closest && el.closest("verve-island");
@@ -4975,6 +4977,7 @@
     }
     if (vid && typeof exp.verve_enter_island === "function")
       exp.verve_enter_island(vid);
+    glSelect(chunkExports[islandName], vid);
     try {
       chunk[exportName](ptr, bytes.length);
     } finally {
@@ -4988,7 +4991,7 @@
   // `viz_toggle_live` falls back to this via `host("verveVizPoll")` when
   // EventSource is unavailable; we POST `vizGraph` on an interval and hand the
   // reply to the chunk's NAMED `viz_apply_snapshot` export.
-  let vizPollTimer = null;
+  const vizPollTimers = new Map(); // vid → intervalId
   window.verveHost.verveVizPoll = (argsJson) => {
     let a = {};
     try {
@@ -4996,9 +4999,10 @@
       // JSON string. Tolerate both — JSON.parse on an object throws.
       a = typeof argsJson === "string" ? JSON.parse(argsJson || "{}") : argsJson || {};
     } catch {}
-    if (vizPollTimer) {
-      clearInterval(vizPollTimer);
-      vizPollTimer = null;
+    const vid = (a.vid >>> 0) || 0;
+    if (vizPollTimers.has(vid)) {
+      clearInterval(vizPollTimers.get(vid));
+      vizPollTimers.delete(vid);
     }
     if (!a.on) return "{}";
     const interval = a.interval || 2000;
@@ -5014,9 +5018,9 @@
       } catch {
         return;
       }
-      callIslandExport("VizGraphInteractive", "viz_apply_snapshot", text);
+      callIslandExport("VizGraphInteractive", "viz_apply_snapshot", text, vid);
     };
-    vizPollTimer = setInterval(tick, interval);
+    vizPollTimers.set(vid, setInterval(tick, interval));
     tick();
     return "{}";
   };
@@ -5115,7 +5119,8 @@
       a = typeof argsJson === "string" ? JSON.parse(argsJson || "{}") : argsJson || {};
     } catch {}
     if (!a.island || !a.export) return '{"err":"bad args"}';
-    const key = `${a.island}|${a.export}`;
+    const vid = (a.vid >>> 0) || 0;
+    const key = `${a.island}|${a.export}|${vid}`;
     if (!a.on) {
       rafLoops.delete(key);
       return "{}";
@@ -5129,10 +5134,9 @@
         rafLoops.delete(key);
         return;
       }
-      const el = document.querySelector(`verve-island[data-name="${a.island}"]`);
-      const vid = el ? parseInt(el.getAttribute("data-vid"), 10) || 0 : 0;
       if (vid && typeof exp.verve_enter_island === "function")
         exp.verve_enter_island(vid);
+      glSelect(chunk, vid);
       let cont = 0;
       try {
         cont = chunk[a.export]();
