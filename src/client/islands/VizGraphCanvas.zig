@@ -141,6 +141,11 @@ export fn vizcanvas_graph_ready(ptr: u32, len: u32) void {
     // Read node_count and edge_count from the header (LE, same as canvas_buf.pack).
     const node_count = std.mem.readInt(u32, bytes[12..16], .little);
     const edge_count = std.mem.readInt(u32, bytes[16..20], .little);
+    // Reject a truncated/malformed payload: the body must hold every node + edge
+    // record the header claims, else the copy loops would read past the fetched
+    // bytes into adjacent asset-region memory. u64 math avoids u32 overflow.
+    const expected: u64 = @as(u64, cbuf.header_size) + @as(u64, node_count) * 8 + @as(u64, edge_count) * 8;
+    if (len < expected) return;
     const n: u32 = @min(node_count, MAX_N);
     const e: u32 = @min(edge_count, MAX_E);
     inst.n = n;
