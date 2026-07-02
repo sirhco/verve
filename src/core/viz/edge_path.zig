@@ -18,21 +18,36 @@ pub const PathOpts = struct {
     corner_radius: f64 = 8,
 };
 
-/// Build an SVG path `d` for the via-point chain `pts`. Caller owns the
-/// returned slice (typically the request arena / chunk arena).
-pub fn pathD(a: std.mem.Allocator, pts: []const Vec2, routing: Routing, opts: PathOpts) ![]const u8 {
-    if (pts.len < 2) return error.TooFewPoints;
-    var aw: std.Io.Writer.Allocating = .init(a);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-
+/// Write the path body (starting with `M`) into `w`. Used by both `pathD` and
+/// `pathDBuf` so the formatting logic lives in one place.
+fn writePath(w: *std.Io.Writer, pts: []const Vec2, routing: Routing, opts: PathOpts) !void {
     try w.print("M {d},{d}", .{ pts[0].x, pts[0].y });
     switch (routing) {
         .straight => for (pts[1..]) |p| try w.print(" L {d},{d}", .{ p.x, p.y }),
         .curved => try writeCurved(w, pts),
         .orthogonal => try writeOrthogonal(w, pts, opts.corner_radius),
     }
+}
+
+/// Build an SVG path `d` for the via-point chain `pts`. Caller owns the
+/// returned slice (typically the request arena / chunk arena).
+pub fn pathD(a: std.mem.Allocator, pts: []const Vec2, routing: Routing, opts: PathOpts) ![]const u8 {
+    if (pts.len < 2) return error.TooFewPoints;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    errdefer aw.deinit();
+    try writePath(&aw.writer, pts, routing, opts);
     return aw.toOwnedSlice();
+}
+
+/// Fixed-buffer variant of `pathD`. Uses `std.Io.Writer.fixed` (no
+/// address-taken drain fn) so it is safe to call from wasm island chunks
+/// where an Allocating writer's drain would collide in the function table.
+/// Returns the sub-slice of `buf` that was written.
+pub fn pathDBuf(buf: []u8, pts: []const Vec2, routing: Routing, opts: PathOpts) ![]const u8 {
+    if (pts.len < 2) return error.TooFewPoints;
+    var w: std.Io.Writer = .fixed(buf);
+    try writePath(&w, pts, routing, opts);
+    return w.buffered();
 }
 
 /// Uniform Catmull-Rom through every via-point, converted segment-wise to
@@ -165,4 +180,30 @@ test "output is deterministic" {
 test "fewer than two points is an error" {
     const one = [_]Vec2{.{ .x = 0, .y = 0 }};
     try testing.expectError(error.TooFewPoints, pathD(testing.allocator, &one, .straight, .{}));
+}
+
+test "pathDBuf produces the same d string as pathD" {
+    // 2-point orthogonal
+    const two = [_]Vec2{ .{ .x = 0, .y = 0 }, .{ .x = 50, .y = 100 } };
+    const two_d = try pathD(testing.allocator, &two, .orthogonal, .{});
+    defer testing.allocator.free(two_d);
+    var two_buf: [256]u8 = undefined;
+    const two_buf_d = try pathDBuf(&two_buf, &two, .orthogonal, .{});
+    try testing.expectEqualStrings(two_d, two_buf_d);
+
+    // 3-point curved
+    const three = [_]Vec2{ .{ .x = 0, .y = 0 }, .{ .x = 40, .y = 60 }, .{ .x = 10, .y = 120 } };
+    const three_d = try pathD(testing.allocator, &three, .curved, .{});
+    defer testing.allocator.free(three_d);
+    var three_buf: [512]u8 = undefined;
+    const three_buf_d = try pathDBuf(&three_buf, &three, .curved, .{});
+    try testing.expectEqualStrings(three_d, three_buf_d);
+
+    // 2-point straight
+    const str = [_]Vec2{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 20 } };
+    const str_d = try pathD(testing.allocator, &str, .straight, .{});
+    defer testing.allocator.free(str_d);
+    var str_buf: [64]u8 = undefined;
+    const str_buf_d = try pathDBuf(&str_buf, &str, .straight, .{});
+    try testing.expectEqualStrings(str_d, str_buf_d);
 }

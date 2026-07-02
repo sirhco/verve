@@ -120,6 +120,9 @@ pub const renderGraphInteractive = graph_mod.renderInteractive;
 pub const EdgeRouting = edge_path_mod.Routing;
 pub const EdgePathOpts = edge_path_mod.PathOpts;
 pub const edgePathD = edge_path_mod.pathD;
+/// Fixed-buffer `d`-builder for wasm island chunks (no Allocating writer,
+/// table-safe). C2 reaches this as `verve.viz_core.edgePathDBuf`.
+pub const edgePathDBuf = edge_path_mod.pathDBuf;
 
 // ---- live-streaming wire deltas ----
 /// Diff/serialize/apply for the `{"seq":N,"ops":[...]}` push-channel frames.

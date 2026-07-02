@@ -208,15 +208,27 @@ pub fn renderInteractive(ctx: *const Context, g: Graph, opts: Opts) *Node {
         const to = g.nodes[e[1]].id;
         const key = std.fmt.allocPrint(a, "{s}|{s}", .{ from, to }) catch return errNode(ctx);
         const ref = std.fmt.allocPrint(a, "viz-edge-{s}|{s}", .{ from, to }) catch return errNode(ctx);
-        _ = edges_g.children(.{ctx.el("line")
-            .attr("data-vkey", key)
-            .attr("data-ref", ref)
-            .attrFmt("x1", "{d}", .{positions[e[0]].x})
-            .attrFmt("y1", "{d}", .{positions[e[0]].y})
-            .attrFmt("x2", "{d}", .{positions[e[1]].x})
-            .attrFmt("y2", "{d}", .{positions[e[1]].y})
-            .attr("stroke", opts.edge_color)
-            .attr("stroke-width", "1.5")});
+        const edge_el = if (opts.edge_routing == .straight)
+            ctx.el("line")
+                .attr("data-vkey", key)
+                .attr("data-ref", ref)
+                .attrFmt("x1", "{d}", .{positions[e[0]].x})
+                .attrFmt("y1", "{d}", .{positions[e[0]].y})
+                .attrFmt("x2", "{d}", .{positions[e[1]].x})
+                .attrFmt("y2", "{d}", .{positions[e[1]].y})
+                .attr("stroke", opts.edge_color)
+                .attr("stroke-width", "1.5")
+        else blk: {
+            const d = edge_path.pathD(a, &[_]Vec2{ positions[e[0]], positions[e[1]] }, opts.edge_routing, .{ .corner_radius = opts.edge_corner_radius }) catch return errNode(ctx);
+            break :blk ctx.el("path")
+                .attr("data-vkey", key)
+                .attr("data-ref", ref)
+                .attr("d", d)
+                .attr("fill", "none")
+                .attr("stroke", opts.edge_color)
+                .attr("stroke-width", "1.5");
+        };
+        _ = edges_g.children(.{edge_el});
         if (edges_g.err != null) return edges_g;
     }
     _ = root.children(.{edges_g});
@@ -305,10 +317,16 @@ pub fn nodeFragment(buf: []u8, opts: Opts, id: []const u8, ref: []const u8, labe
     return std.fmt.bufPrint(buf, "<g data-vkey=\"{s}\" data-ref=\"{s}\" data-node=\"{s}\" class=\"viz-node\" transform=\"translate({d},{d})\" z-on-pointerdown=\"viz_pointerdown\" z-on-pointerover=\"viz_node_over\" z-on-pointerout=\"viz_node_out\" z-on-click=\"viz_node_click\"><circle cx=\"0\" cy=\"0\" r=\"{d}\" fill=\"{s}\"/><text x=\"0\" y=\"{d}\" text-anchor=\"middle\" font-size=\"{d}\" fill=\"{s}\">{s}</text></g>", .{ id, ref, id, pos.x, pos.y, opts.node_radius, opts.node_color, opts.node_radius + opts.label_size, opts.label_size, opts.label_color, label });
 }
 
-/// SVG-fragment string for one edge line, keyed by `key` (`from|to`) and ref'd
-/// by `ref`. See `nodeFragment`.
+/// SVG-fragment string for one edge, keyed by `key` (`from|to`) and ref'd
+/// by `ref`. See `nodeFragment`. Emits `<line>` for `.straight` routing or
+/// `<path>` (routed `d` via `edge_path.pathDBuf`) for any other routing.
 pub fn edgeFragment(buf: []u8, opts: Opts, key: []const u8, ref: []const u8, p0: Vec2, p1: Vec2) ![]const u8 {
-    return std.fmt.bufPrint(buf, "<line data-vkey=\"{s}\" data-ref=\"{s}\" x1=\"{d}\" y1=\"{d}\" x2=\"{d}\" y2=\"{d}\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, ref, p0.x, p0.y, p1.x, p1.y, opts.edge_color });
+    if (opts.edge_routing == .straight) {
+        return std.fmt.bufPrint(buf, "<line data-vkey=\"{s}\" data-ref=\"{s}\" x1=\"{d}\" y1=\"{d}\" x2=\"{d}\" y2=\"{d}\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, ref, p0.x, p0.y, p1.x, p1.y, opts.edge_color });
+    }
+    var dbuf: [256]u8 = undefined;
+    const d = try edge_path.pathDBuf(&dbuf, &[_]Vec2{ p0, p1 }, opts.edge_routing, .{ .corner_radius = opts.edge_corner_radius });
+    return std.fmt.bufPrint(buf, "<path data-vkey=\"{s}\" data-ref=\"{s}\" d=\"{s}\" fill=\"none\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, ref, d, opts.edge_color });
 }
 
 /// Map parallel edge id arrays to slot-index pairs against `ids`, writing valid
@@ -495,6 +513,42 @@ test "node/edge fragment builders emit keyed id-based markup" {
     try testing.expect(std.mem.indexOf(u8, es, "data-vkey=\"a|b\"") != null);
     try testing.expect(std.mem.indexOf(u8, es, "data-ref=\"viz-edge-a|b\"") != null);
     try testing.expect(std.mem.indexOf(u8, es, "x2=\"5\"") != null);
+}
+
+test "interactive orthogonal routing emits path edges" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [16384]u8 = undefined;
+    const nodes = [_]GraphNode{ .{ .id = "a", .label = "A" }, .{ .id = "b", .label = "B" } };
+    const edges = [_]GraphEdge{.{ .from = "a", .to = "b" }};
+    const ctx = Context.init(&arena);
+    const tree = try renderInteractive(&ctx, .{ .nodes = &nodes, .edges = &edges, .layout = .force }, .{ .width = 400, .height = 300, .force_iterations = 30, .edge_routing = .orthogonal }).build();
+    var w: std.Io.Writer = .fixed(&buf);
+    try Renderer.render(&w, tree);
+    const out = w.buffered();
+    // routed edge → <path with d attribute; no <line for edges
+    try testing.expect(std.mem.indexOf(u8, out, "<path") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "d=\"M ") != null);
+    // orthogonal uses V or H Manhattan commands
+    const has_v = std.mem.indexOf(u8, out, " V ") != null;
+    const has_h = std.mem.indexOf(u8, out, " H ") != null;
+    try testing.expect(has_v or has_h);
+    try testing.expect(std.mem.indexOf(u8, out, "<line") == null);
+}
+
+test "edgeFragment emits a routed path when edge_routing is orthogonal" {
+    var buf: [512]u8 = undefined;
+    const opts_straight = Opts{ .edge_color = "#888" };
+    const straight = try edgeFragment(&buf, opts_straight, "a|b", "viz-edge-a|b", .{ .x = 0, .y = 0 }, .{ .x = 50, .y = 100 });
+    try testing.expect(std.mem.startsWith(u8, straight, "<line"));
+
+    var pbuf: [512]u8 = undefined;
+    const opts_ortho = Opts{ .edge_color = "#888", .edge_routing = .orthogonal };
+    const routed = try edgeFragment(&pbuf, opts_ortho, "a|b", "viz-edge-a|b", .{ .x = 0, .y = 0 }, .{ .x = 50, .y = 100 });
+    try testing.expect(std.mem.startsWith(u8, routed, "<path"));
+    try testing.expect(std.mem.indexOf(u8, routed, "d=\"M ") != null);
+    try testing.expect(std.mem.indexOf(u8, routed, "data-vkey=\"a|b\"") != null);
+    try testing.expect(std.mem.indexOf(u8, routed, "data-ref=\"viz-edge-a|b\"") != null);
 }
 
 test "unknown edge endpoints are skipped, not fatal" {
