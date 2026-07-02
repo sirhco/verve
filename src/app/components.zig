@@ -48,6 +48,7 @@ fn vizGraphIsland(
         .ids = node_ids,
         .layout = @intFromEnum(layout),
         .margin = gopts.margin,
+        .edge_routing = @intFromEnum(gopts.edge_routing),
     });
     const graph_svg = verve.viz.renderGraphInteractive(ctx, g, gopts);
     const controls = ctx.div().class("viz-controls").children(.{
@@ -282,7 +283,7 @@ pub fn vizMulti(ctx: *const verve.Context) !*verve.Node {
         .{ .from = "package", .to = "deploy" },
         .{ .from = "deploy", .to = "monitor" },
     };
-    const gopts2 = verve.viz.GraphOpts{ .width = 560, .height = 380, .node_color = "#d97706", .edge_color = "#44403c", .label_color = "#fef3c7" };
+    const gopts2 = verve.viz.GraphOpts{ .width = 560, .height = 380, .node_color = "#d97706", .edge_color = "#44403c", .label_color = "#fef3c7", .edge_routing = .orthogonal };
     const island2 = try vizGraphIsland(ctx, &nodes2, &edges2, .dag, gopts2);
 
     return ctx.main_().class("home").children(.{

@@ -22,6 +22,7 @@ const Props = struct {
     ids: []const []const u8,
     layout: u32,
     margin: f64,
+    edge_routing: u32,
 };
 
 // ---- pure math (mirror of core/viz/interact.zig — unit-tested there) --------
@@ -110,6 +111,7 @@ const Inst = struct {
     // layout transitions
     layout_kind: u32 = LAYOUT_FORCE,
     margin_p: f64 = 40,
+    edge_routing: u32 = 0,
     txs: [MAX_N]f64 = undefined,
     tys: [MAX_N]f64 = undefined,
     anim_sx: [MAX_N]f64 = undefined,
@@ -404,11 +406,24 @@ fn setNodeXY(inst: *Inst, slot: usize) void {
 }
 fn updateEdge(inst: *Inst, e: usize) void {
     const h = resolveEdge(idOf(inst, inst.ef[e]), idOf(inst, inst.et[e])) orelse return;
-    var b: [24]u8 = undefined;
-    verve.setRefAttr(h, "x1", std.fmt.bufPrint(&b, "{d}", .{inst.gx[inst.ef[e]]}) catch return);
-    verve.setRefAttr(h, "y1", std.fmt.bufPrint(&b, "{d}", .{inst.gy[inst.ef[e]]}) catch return);
-    verve.setRefAttr(h, "x2", std.fmt.bufPrint(&b, "{d}", .{inst.gx[inst.et[e]]}) catch return);
-    verve.setRefAttr(h, "y2", std.fmt.bufPrint(&b, "{d}", .{inst.gy[inst.et[e]]}) catch return);
+    if (inst.edge_routing == 0) {
+        // Straight: update the <line> endpoints.
+        var b: [24]u8 = undefined;
+        verve.setRefAttr(h, "x1", std.fmt.bufPrint(&b, "{d}", .{inst.gx[inst.ef[e]]}) catch return);
+        verve.setRefAttr(h, "y1", std.fmt.bufPrint(&b, "{d}", .{inst.gy[inst.ef[e]]}) catch return);
+        verve.setRefAttr(h, "x2", std.fmt.bufPrint(&b, "{d}", .{inst.gx[inst.et[e]]}) catch return);
+        verve.setRefAttr(h, "y2", std.fmt.bufPrint(&b, "{d}", .{inst.gy[inst.et[e]]}) catch return);
+    } else {
+        // Routed: rebuild the path d from the 2 live endpoints.
+        var dbuf: [384]u8 = undefined;
+        const pts = [_]verve.viz_core.geom.Vec2{
+            .{ .x = inst.gx[inst.ef[e]], .y = inst.gy[inst.ef[e]] },
+            .{ .x = inst.gx[inst.et[e]], .y = inst.gy[inst.et[e]] },
+        };
+        const routing: verve.viz_core.edge_path.Routing = @enumFromInt(inst.edge_routing);
+        const d = verve.viz_core.edge_path.pathDBuf(dbuf[0..], pts[0..], routing, .{}) catch return;
+        verve.setRefAttr(h, "d", d);
+    }
 }
 
 fn hitSlot(inst: *Inst) ?usize {
@@ -562,8 +577,18 @@ fn nodeFragment(buf: []u8, id: []const u8, refn: []const u8, label: []const u8, 
     }
     return std.fmt.bufPrint(buf, "<g data-vkey=\"{s}\" data-ref=\"{s}\" data-node=\"{s}\" class=\"{s}\" transform=\"translate({d},{d})\" z-on-pointerdown=\"viz_pointerdown\" z-on-pointerover=\"viz_node_over\" z-on-pointerout=\"viz_node_out\" z-on-click=\"viz_node_click\" z-on-dblclick=\"viz_node_dblclick\"><circle cx=\"0\" cy=\"0\" r=\"{d}\" fill=\"{s}\"/><text x=\"0\" y=\"{d}\" text-anchor=\"middle\" font-size=\"{d}\" fill=\"{s}\">{s}</text></g>", .{ id, refn, id, klass, x, y, NODE_R, NODE_FILL, NODE_R + LABEL_SIZE, LABEL_SIZE, LABEL_FILL, label });
 }
-fn edgeFragment(buf: []u8, key: []const u8, refn: []const u8, x1: f64, y1: f64, x2: f64, y2: f64) ![]const u8 {
-    return std.fmt.bufPrint(buf, "<line data-vkey=\"{s}\" data-ref=\"{s}\" x1=\"{d}\" y1=\"{d}\" x2=\"{d}\" y2=\"{d}\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, refn, x1, y1, x2, y2, EDGE_STROKE });
+fn edgeFragment(buf: []u8, key: []const u8, refn: []const u8, x1: f64, y1: f64, x2: f64, y2: f64, edge_routing: u32) ![]const u8 {
+    if (edge_routing == 0) {
+        return std.fmt.bufPrint(buf, "<line data-vkey=\"{s}\" data-ref=\"{s}\" x1=\"{d}\" y1=\"{d}\" x2=\"{d}\" y2=\"{d}\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, refn, x1, y1, x2, y2, EDGE_STROKE });
+    }
+    var dbuf: [384]u8 = undefined;
+    const pts = [_]verve.viz_core.geom.Vec2{
+        .{ .x = x1, .y = y1 },
+        .{ .x = x2, .y = y2 },
+    };
+    const routing: verve.viz_core.edge_path.Routing = @enumFromInt(edge_routing);
+    const d = try verve.viz_core.edge_path.pathDBuf(dbuf[0..], pts[0..], routing, .{});
+    return std.fmt.bufPrint(buf, "<path data-vkey=\"{s}\" data-ref=\"{s}\" d=\"{s}\" fill=\"none\" stroke=\"{s}\" stroke-width=\"1.5\"/>", .{ key, refn, d, EDGE_STROKE });
 }
 
 /// Rebuild graph state + DOM from a desired graph (arena-owned id/label copies +
@@ -746,7 +771,7 @@ fn syncDom(inst: *Inst, a: std.mem.Allocator, old_nkeys: []const []const u8, old
         const sbuf = a.alloc(u8, 96) catch return;
         const sref = scopedRef(inst, sbuf, base) orelse return;
         const hbuf = a.alloc(u8, 320) catch return;
-        ehtml[ek] = edgeFragment(hbuf, key, sref, inst.gx[inst.ef[e]], inst.gy[inst.ef[e]], inst.gx[inst.et[e]], inst.gy[inst.et[e]]) catch return;
+        ehtml[ek] = edgeFragment(hbuf, key, sref, inst.gx[inst.ef[e]], inst.gy[inst.ef[e]], inst.gx[inst.et[e]], inst.gy[inst.et[e]], inst.edge_routing) catch return;
         ek += 1;
     }
     var epbuf: [48]u8 = undefined;
@@ -811,6 +836,7 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
 
     inst.layout_kind = p.layout;
     inst.margin_p = p.margin;
+    inst.edge_routing = p.edge_routing;
 
     if (ref("viz-svg")) |h| {
         const r = verve.refRect(h);

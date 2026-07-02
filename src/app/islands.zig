@@ -85,13 +85,15 @@ pub const AnimDemo = struct {
 /// graph; the client chunk wires interaction over the fixed element set. No new
 /// elements created. Source: `src/client/islands/VizGraphInteractive.zig`.
 pub const VizGraphInteractive = struct {
-    pub const props_schema: []const u8 = "{\"xs\":\"f64[]\",\"ys\":\"f64[]\",\"ef\":\"u32[]\",\"et\":\"u32[]\",\"labels\":\"string[]\",\"ids\":\"string[]\",\"layout\":\"u32\",\"margin\":\"f64\"}";
+    pub const props_schema: []const u8 = "{\"xs\":\"f64[]\",\"ys\":\"f64[]\",\"ef\":\"u32[]\",\"et\":\"u32[]\",\"labels\":\"string[]\",\"ids\":\"string[]\",\"layout\":\"u32\",\"margin\":\"f64\",\"edge_routing\":\"u32\"}";
 
     /// Positionally mirrored in the client chunk. `ef`/`et` are edge endpoint
     /// node indices; `labels` feeds tooltips. `layout` is
     /// `@intFromEnum(viz.Layout)` and `margin` the SSR `GraphOpts.margin` —
     /// together they let the chunk recompute deterministic layouts
     /// (tree/radial/dag) after runtime mutation with SSR-identical fitting.
+    /// `edge_routing` is `@intFromEnum(edge_path.Routing)`: 0=straight,
+    /// 1=curved, 2=orthogonal — drives live re-route on node drag in the chunk.
     pub const Props = struct {
         xs: []const f64,
         ys: []const f64,
@@ -101,6 +103,7 @@ pub const VizGraphInteractive = struct {
         ids: []const []const u8,
         layout: u32,
         margin: f64,
+        edge_routing: u32,
     };
 };
 
