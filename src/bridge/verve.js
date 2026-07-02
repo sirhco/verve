@@ -10349,7 +10349,7 @@
       body: "{}",
     })
       .then((r) => r.text())
-      .then((text) => callIslandExport(a.island, a.export, text))
+      .then((text) => callIslandExport(a.island, a.export, text, a.vid))
       .catch(() => {});
     return "{}";
   };
@@ -10726,6 +10726,13 @@
     const vid = parseInt(el.getAttribute("data-vid"), 10) || 0;
     if (vid && typeof exp.verve_unmount_island === "function") {
       exp.verve_unmount_island(vid);
+    }
+    // Reclaim the chunk-side per-instance slot (viz_unmount / glscene_unmount / …).
+    const name = el.getAttribute("data-name") || "";
+    const chunk = name && chunkExports[name];
+    if (vid && chunk) {
+      for (const k in chunk)
+        if (k.endsWith("_unmount") && typeof chunk[k] === "function") chunk[k](vid >>> 0);
     }
   };
 

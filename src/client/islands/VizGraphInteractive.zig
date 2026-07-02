@@ -873,7 +873,7 @@ export fn viz_node_dblclick() void {
 fn requestResync(inst: *Inst) void {
     if (inst.awaiting_resync) return;
     inst.awaiting_resync = true;
-    verve.fetchToExport("vizGraph", "VizGraphInteractive", "viz_apply_snapshot");
+    verve.fetchToExport("vizGraph", "VizGraphInteractive", "viz_apply_snapshot", inst.vid);
 }
 
 /// Mirror of core/viz/graph.zig mapSnapshotEdges (chunk can't import across the
