@@ -4,6 +4,26 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.41.0] - 2026-07-02
+
+### Added
+
+- **viz — multiple interactive CANVAS graphs per page.** The canvas2d graph island
+  (`VizGraphCanvas`, the batched-draw path for large graphs) is now multi-instance, so
+  several canvas graphs can share a page each with independent camera / hover / selection —
+  matching the SVG island's multi-instance support (v0.38.0). New `/viz-canvas-multi` demo
+  renders two canvas graphs side by side.
+  - **`src/client/islands/VizGraphCanvas.zig`** — converted from module-static singleton to a
+    per-instance `Inst` slot pool (`MAX_INSTANCES = 2`), mirroring `VizGraphInteractive` /
+    `GlScene`: `findSlot`/`allocSlot` + `vizcanvas_select(vid)`/`vizcanvas_unmount(vid)` the
+    bridge calls before each dispatch; every export operates on the selected instance. The
+    ~98 KB draw buffer stays module-shared (packed then drawn synchronously each frame, like
+    the gl command buffer) rather than duplicated per instance.
+  - **`src/bridge/verve.js`** — `glSelect` gained a guarded `vizcanvas_select` probe (beside
+    the gl and SVG-graph probes); the per-vid raf-loop + island scoping from v0.38.0 carry the
+    rest.
+  - **`src/app/`** — shared `vizCanvasIsland()` builder + `/viz-canvas-multi` route.
+
 ## [0.40.0] - 2026-07-02
 
 ### Added
