@@ -1657,7 +1657,7 @@ pub fn pushUnsubscribe(channel: []const u8, island: []const u8, vid: u32) void {
 /// `island`'s named export (same staging contract as `pushSubscribe`). The
 /// push path's resync hook.
 pub fn fetchToExport(api_name: []const u8, island: []const u8, export_name: []const u8, vid: u32) void {
-    var args_buf: [208]u8 = undefined;
+    var args_buf: [216]u8 = undefined;
     const args = std.fmt.bufPrint(
         &args_buf,
         "{{\"api\":\"{s}\",\"island\":\"{s}\",\"export\":\"{s}\",\"vid\":{d}}}",
