@@ -104,6 +104,8 @@ const Inst = struct {
     hidden: [MAX_N]bool = @splat(false),
     bfs_visited: [MAX_N]bool = undefined,
     bfs_queue: [MAX_N]usize = undefined,
+    visible: [MAX_N]bool = undefined,
+    indeg: [MAX_N]u32 = undefined,
 
     // layout transitions
     layout_kind: u32 = LAYOUT_FORCE,
@@ -185,9 +187,19 @@ export fn viz_unmount(root_id: u32) void {
 // ---- subtree collapse --------------------------------------------------------
 
 /// Mirror of core/viz/interact.zig `collapseHidden` (unit-tested there; chunks
-/// can't import across the module boundary): BFS each collapsed root's
-/// directed out-edges, hiding everything reached except the root itself.
+/// can't import across the module boundary). Algorithm: hidden[v] = H[v] and !V[v].
+///
+/// H (collapseReachable): per collapsed root, forward-BFS the directed out-edges
+/// (`ef[e]` → `et[e]`) and mark everything reached except the root itself.
+///
+/// V (visibleFromRoots): compute in-degree for each node (edge targets), then BFS
+/// from every in-degree-0 root. Dequeued node u is marked visible; out-edges
+/// expanded only for non-collapsed nodes — collapsed nodes are marked visible (as
+/// re-expand handles) but block descent.
+///
+/// Combine: inst.hidden[v] = inst.hidden[v] and !inst.visible[v].
 fn recomputeHidden(inst: *Inst) void {
+    // --- Pass 1 (H): collapseReachable ---
     @memset(inst.hidden[0..inst.n], false);
     for (0..inst.n) |root| {
         if (!inst.collapsed[root]) continue;
@@ -212,6 +224,48 @@ fn recomputeHidden(inst: *Inst) void {
                 }
             }
         }
+    }
+
+    // --- Pass 2 (V): visibleFromRoots ---
+    // Compute in-degrees from edge targets.
+    @memset(inst.indeg[0..inst.n], 0);
+    for (0..inst.edge_n) |e| {
+        const t = inst.et[e];
+        if (t < inst.n) inst.indeg[t] += 1;
+    }
+
+    // BFS from all in-degree-0 roots; reuse bfs_visited/bfs_queue (reset first).
+    @memset(inst.bfs_visited[0..inst.n], false);
+    @memset(inst.visible[0..inst.n], false);
+    var head: usize = 0;
+    var tail: usize = 0;
+    for (0..inst.n) |i| {
+        if (inst.indeg[i] == 0 and !inst.bfs_visited[i]) {
+            inst.bfs_visited[i] = true;
+            inst.bfs_queue[tail] = i;
+            tail += 1;
+        }
+    }
+    while (head < tail) {
+        const cur = inst.bfs_queue[head];
+        head += 1;
+        inst.visible[cur] = true;
+        if (inst.collapsed[cur]) continue; // visible but blocks descent
+        for (0..inst.edge_n) |e| {
+            if (inst.ef[e] != cur) continue;
+            const t = inst.et[e];
+            if (t >= inst.n or inst.bfs_visited[t]) continue;
+            inst.bfs_visited[t] = true;
+            if (tail < MAX_N) {
+                inst.bfs_queue[tail] = t;
+                tail += 1;
+            }
+        }
+    }
+
+    // --- Combine: hidden[v] = H[v] and !V[v] ---
+    for (0..inst.n) |v| {
+        inst.hidden[v] = inst.hidden[v] and !inst.visible[v];
     }
 }
 
