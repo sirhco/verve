@@ -303,10 +303,9 @@ pub fn vizMulti(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
-/// verve.viz canvas render path demo — /viz-canvas. A ~1500-node procedural
-/// graph (deterministic jittered grid, index-seeded — no RNG at SSR) drawn to a
-/// single canvas2d via the VizGraphCanvas island. Pan/zoom/hover/select.
-pub fn vizCanvas(ctx: *const verve.Context) !*verve.Node {
+/// Shared builder: one VizGraphCanvas island (canvas + card wrapper).
+/// Used by both vizCanvas() and vizCanvasMulti().
+fn vizCanvasIsland(ctx: *const verve.Context, heading: []const u8) !*verve.Node {
     const canvas = ctx.div().class("gl-wrap").children(.{
         ctx.el("canvas")
             .attr("data-ref", "vizcanvas-canvas")
@@ -319,16 +318,38 @@ pub fn vizCanvas(ctx: *const verve.Context) !*verve.Node {
             .attr("style", "width:100%;max-width:640px;aspect-ratio:32/21;display:block;background:#0d1117;border-radius:8px;touch-action:none;cursor:grab;"),
     });
     const inner = ctx.section().class("card").children(.{
-        ctx.h2("Large graph — canvas2d render path"),
+        ctx.h2(heading),
         canvas,
     });
-    const island = verve.island(ctx, .{ .name = "VizGraphCanvas" }, inner);
+    return verve.island(ctx, .{ .name = "VizGraphCanvas" }, inner);
+}
+
+/// verve.viz canvas render path demo — /viz-canvas. A ~1500-node procedural
+/// graph (deterministic jittered grid, index-seeded — no RNG at SSR) drawn to a
+/// single canvas2d via the VizGraphCanvas island. Pan/zoom/hover/select.
+pub fn vizCanvas(ctx: *const verve.Context) !*verve.Node {
+    const island = try vizCanvasIsland(ctx, "Large graph — canvas2d render path");
     return ctx.main_().class("home").children(.{
         ctx.h1("verve.viz — canvas render"),
         ctx.p().text("A ~1500-node graph drawn to a single canvas2d (vs the SVG-DOM " ++
             "path): one batched draw call per frame. Drag to pan, wheel to zoom, " ++
             "hover/click a node to highlight."),
         island,
+    });
+}
+
+/// Multi-instance canvas demo — /viz-canvas-multi. Two VizGraphCanvas islands
+/// on one page; each gets a distinct data-vid assigned by the framework.
+pub fn vizCanvasMulti(ctx: *const verve.Context) !*verve.Node {
+    const island1 = try vizCanvasIsland(ctx, "Canvas 1");
+    const island2 = try vizCanvasIsland(ctx, "Canvas 2");
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.viz — two canvas graphs"),
+        ctx.p().text("Two independent VizGraphCanvas islands on one page. " ++
+            "Each island gets its own data-vid; pan/zoom/select on one " ++
+            "does not affect the other."),
+        island1,
+        island2,
     });
 }
 

@@ -569,6 +569,8 @@
       exports.glscene_select(vid >>> 0);
     if (vid && exports && typeof exports.viz_select === "function")
       exports.viz_select(vid >>> 0);
+    if (vid && exports && typeof exports.vizcanvas_select === "function")
+      exports.vizcanvas_select(vid >>> 0);
   };
   const vidOfEl = (el) => {
     const isl = el && el.closest && el.closest("verve-island");

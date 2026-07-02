@@ -11,6 +11,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/counter", renderCounter),
     verve.Route.init("/viz", renderViz),
     verve.Route.init("/viz-canvas", renderVizCanvas),
+    verve.Route.init("/viz-canvas-multi", renderVizCanvasMulti),
     verve.Route.init("/viz-multi", renderVizMulti),
     verve.Route.init("/ws-demo", renderWsDemo),
     verve.Route.init("/anim", renderAnim),
@@ -81,6 +82,11 @@ fn renderViz(ctx: *verve.Context) !*verve.Node {
 
 fn renderVizCanvas(ctx: *verve.Context) !*verve.Node {
     const body = try components.vizCanvas(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderVizCanvasMulti(ctx: *verve.Context) !*verve.Node {
+    const body = try components.vizCanvasMulti(ctx);
     return components.page(ctx, body);
 }
 
