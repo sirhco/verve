@@ -287,6 +287,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = public_wf.getDirectory().path(b, "public_assets.zig"),
     });
 
+    const viz_assets_stub_mod = b.createModule(.{
+        .root_source_file = b.path("../../src/server/viz_assets_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const server_mod = b.createModule(.{
         .root_source_file = b.path("../../src/server/main.zig"),
         .target = target,
@@ -295,6 +301,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "verve", .module = verve_mod },
             .{ .name = "assets", .module = assets_mod },
             .{ .name = "gl_assets", .module = gl_assets_mod },
+            .{ .name = "viz_assets", .module = viz_assets_stub_mod },
             .{ .name = "app", .module = app_mod },
             .{ .name = "app_client", .module = app_client_mod },
             .{ .name = "client_manifest", .module = client_manifest_mod },
