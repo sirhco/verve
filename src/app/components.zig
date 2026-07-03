@@ -2333,6 +2333,67 @@ pub fn glSceneArea(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-probe: runtime reflection probe (slice 1, static capture-once). The scene
+/// is rendered into a cubemap from a probe position at the scene center on the
+/// first ready frame, box-filtered into a roughness mip chain, and bound as the
+/// specular IBL cube so the model reflects its ACTUAL surroundings (the captured
+/// scene) instead of the static studio environment map. Both WebGL2 and WebGPU.
+/// Reuses shadow.vmesh (cube + floor) and the page-global freeze control so a CDP
+/// run has a stable frame; `glscene_probe_state` reports capture progress.
+pub fn glSceneProbe(ctx: *const verve.Context) !*verve.Node {
+    // Saturated colored lights from distinct directions: on the forced-mirror
+    // material (see GlScene buildScene) these paint colored highlights that SWEEP
+    // across the surface as the camera orbits — the unmistakable "it's reflective"
+    // signal, and what the captured probe cubemap mirrors.
+    const lights = [_]verve.GlLight{
+        .{ .kind = .directional, .dir = .{ -0.5, -0.5, -0.5 }, .color = .{ 1.0, 0.55, 0.20 }, .intensity = 4.0, .casts_shadow = false }, // warm key
+        .{ .kind = .directional, .dir = .{ 0.6, -0.3, 0.4 }, .color = .{ 0.15, 0.8, 1.0 }, .intensity = 3.5, .casts_shadow = false }, // cyan rim
+        .{ .kind = .directional, .dir = .{ 0.1, 0.8, -0.6 }, .color = .{ 0.9, 0.2, 0.9 }, .intensity = 2.5, .casts_shadow = false }, // magenta fill
+    };
+
+    const island_node = ctx.glScene(.{
+        .src = "/gl/shadow.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='40' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EReflection Probe%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 12.0, .pitch = 0.28, .yaw = 0.6 })
+        .lights(&lights)
+        // Static reflection probe captured once from the scene center. The cube +
+        // floor around it are what the reflective surfaces mirror.
+        .probe(.{ 0, 1, 0 })
+        .autoRotate(0.15)
+        .build();
+
+    const controls = ctx.div().class("gl-controls").children(.{
+        ctx.el("button").attr("z-on-click", "glscene_freeze").text("Freeze"),
+        ctx.el("button").attr("z-on-click", "glscene_unfreeze").text("Unfreeze"),
+    });
+    _ = island_node.children(.{controls});
+
+    const scene_box = ctx.div().class("gl-wrap").children(.{
+        ctx.div()
+            .attr("style", "width:100%;max-width:640px;aspect-ratio:8/5;display:block;background:#121420;border-radius:8px;margin:0 auto")
+            .children(.{island_node}),
+    });
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — Reflection Probe"),
+        ctx.p().text("A runtime reflection probe renders the whole scene into a cubemap " ++
+            "from a fixed point in space, then binds that cubemap as the specular " ++
+            "environment for the model. Where a static environment map reflects a " ++
+            "pre-baked studio, the probe reflects the ACTUAL surrounding geometry — " ++
+            "the cube and floor here — so the reflection matches the scene. Slice 1 " ++
+            "captures once on load and box-filters the cubemap into a roughness mip " ++
+            "chain (sharper reflections on smooth surfaces, blurrier on rough ones). " ++
+            "Both WebGL2 and WebGPU backends."),
+        scene_box,
+        ctx.p().class("hint")
+            .text("Drag to orbit \u{00b7} wheel to zoom \u{00b7} Freeze pins the orbit. " ++
+            "The probe is captured a single time from the scene center; move the camera " ++
+            "to see the fixed reflection from different angles."),
+    });
+}
+
 /// /gl-cutout: alpha-test (MASK) cutout dissolve demo. The "Cutout" cube's
 /// base-color texture has a real alpha channel with HOLES; its material is
 /// alphaMode:MASK (cutoff 0.5), so the variant_alpha_test shader DISCARDS any

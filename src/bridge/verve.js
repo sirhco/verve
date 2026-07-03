@@ -5273,6 +5273,63 @@
     return p;
   };
 
+  // Build the GGX specular-prefilter program (reflection probes, slice 2). A
+  // VBO-less fullscreen triangle (gl_VertexID) covers each cube-face mip; the
+  // fragment shader reconstructs the world direction N for its (face, uv), then
+  // importance-samples the source cubemap with the GGX lobe for the target
+  // roughness (Karis N=V=R). Ports src/core/gl/ibl.zig prefilter/faceDir/
+  // importanceSampleGGX/radicalInverseVdC. Returns { prog, uniform locations }.
+  const glBuildProbePrefilter = (gl) => {
+    const vs = [
+      "#version 300 es",
+      "void main(){ vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2)); gl_Position=vec4(p*2.0-1.0,0.0,1.0); }",
+    ].join("\n");
+    const fs = [
+      "#version 300 es",
+      "precision highp float;",
+      "uniform samplerCube u_src; uniform float u_roughness; uniform float u_size; uniform int u_face;",
+      "out vec4 frag; const float PI=3.14159265359;",
+      "vec3 faceDir(int f, vec2 uv){",
+      "  if(f==0)return normalize(vec3(1.0,-uv.y,-uv.x));",
+      "  if(f==1)return normalize(vec3(-1.0,-uv.y,uv.x));",
+      "  if(f==2)return normalize(vec3(uv.x,1.0,uv.y));",
+      "  if(f==3)return normalize(vec3(uv.x,-1.0,-uv.y));",
+      "  if(f==4)return normalize(vec3(uv.x,-uv.y,1.0));",
+      "  return normalize(vec3(-uv.x,-uv.y,-1.0)); }",
+      "float radicalInverse(uint bits){",
+      "  bits=(bits<<16u)|(bits>>16u);",
+      "  bits=((bits&0x55555555u)<<1u)|((bits&0xAAAAAAAAu)>>1u);",
+      "  bits=((bits&0x33333333u)<<2u)|((bits&0xCCCCCCCCu)>>2u);",
+      "  bits=((bits&0x0F0F0F0Fu)<<4u)|((bits&0xF0F0F0F0u)>>4u);",
+      "  bits=((bits&0x00FF00FFu)<<8u)|((bits&0xFF00FF00u)>>8u);",
+      "  return float(bits)*2.3283064365386963e-10; }",
+      "vec3 importanceGGX(vec2 xi, vec3 n, float rough){",
+      "  float a=rough*rough; float phi=2.0*PI*xi.x;",
+      "  float ct=sqrt((1.0-xi.y)/(1.0+(a*a-1.0)*xi.y)); float st=sqrt(max(0.0,1.0-ct*ct));",
+      "  vec3 h=vec3(cos(phi)*st,sin(phi)*st,ct);",
+      "  vec3 up=abs(n.z)<0.999?vec3(0.0,0.0,1.0):vec3(1.0,0.0,0.0);",
+      "  vec3 t=normalize(cross(up,n)); vec3 b=cross(n,t);",
+      "  return normalize(t*h.x+b*h.y+n*h.z); }",
+      "void main(){",
+      "  vec2 uv=(gl_FragCoord.xy/u_size)*2.0-1.0; vec3 N=faceDir(u_face,uv); vec3 V=N;",
+      "  const uint NS=64u; vec3 acc=vec3(0.0); float wsum=0.0;",
+      "  for(uint i=0u;i<NS;i++){",
+      "    vec2 xi=vec2(float(i)/float(NS),radicalInverse(i));",
+      "    vec3 H=importanceGGX(xi,N,u_roughness); vec3 L=normalize(2.0*dot(V,H)*H-V);",
+      "    float ndl=dot(N,L); if(ndl>0.0){ acc+=textureLod(u_src,L,0.0).rgb*ndl; wsum+=ndl; } }",
+      "  vec3 col = wsum>0.0 ? acc/wsum : textureLod(u_src,N,0.0).rgb;",
+      "  frag=vec4(col,1.0); }",
+    ].join("\n");
+    const prog = glCompile(gl, vs, fs);
+    return {
+      prog,
+      src: gl.getUniformLocation(prog, "u_src"),
+      roughness: gl.getUniformLocation(prog, "u_roughness"),
+      size: gl.getUniformLocation(prog, "u_size"),
+      face: gl.getUniformLocation(prog, "u_face"),
+    };
+  };
+
   // Bind (or create+cache) the VAO for a given vbuf/ibuf pair, using the
   // active shader's variant to select the correct attribute layout.
   // variant & 1 (variant_vertex_color): loc0 vec3 s24 o0, loc1 vec3 s24 o12
@@ -6685,6 +6742,126 @@
           }
           if (st.active && st.active.pointAtlas != null)
             gl.uniform1i(st.active.pointAtlas, slot);
+          break;
+        }
+        case 50: { // CREATE_REFLECTION_PROBE — cube COLOR target (6 faces) + shared depth.
+          // Payload (16B): handle | size | format(0=rgba8,1=rgba16f) | mip_count.
+          // Unlike the point-shadow 2D atlas, this is a real TEXTURE_CUBE_MAP colour target;
+          // begin_probe_face attaches one face at a time. Registered in st.textures so
+          // bind_ibl (case 12) can bind it to the specular IBL unit unchanged.
+          const handle = dv.getUint32(off, true);
+          const size = dv.getUint32(off + 4, true);
+          const format = dv.getUint32(off + 8, true);
+          const mips = dv.getUint32(off + 12, true);
+          // rgba16f cube faces need EXT_color_buffer_float to be COLOR-renderable in
+          // WebGL2 (sampling alone doesn't require it). Enable it on demand; fall back
+          // to RGBA8 (LDR probe) if unavailable — mirrors create_render_target (case 22).
+          let f16 = format === 1;
+          if (f16 && !st.extColorBufferFloat) {
+            st.extColorBufferFloat = gl.getExtension("EXT_color_buffer_float");
+            if (!st.extColorBufferFloat) {
+              console.warn("verve.gl: EXT_color_buffer_float unavailable — reflection probe falling back to RGBA8");
+              f16 = false;
+            }
+          }
+          const internal = f16 ? gl.RGBA16F : gl.RGBA8;
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_CUBE_MAP, tex);
+          // Allocate the FULL mip chain (all 6 faces × all levels) immutably, so the
+          // GGX prefilter (case 53) can render into mips 1..n-1. texImage2D only
+          // defines the levels you call it for; the prefilter needs every level
+          // allocated up front — "attachment has zero size" otherwise.
+          gl.texStorage2D(gl.TEXTURE_CUBE_MAP, mips, internal, size, size);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAX_LEVEL, mips - 1);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER,
+            mips > 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+          gl.bindTexture(gl.TEXTURE_CUBE_MAP, null);
+          // Shared depth renderbuffer (size²), reused across all 6 faces.
+          const depth = gl.createRenderbuffer();
+          gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+          gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, size, size);
+          gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+          const fbo = gl.createFramebuffer();
+          st.probes[handle] = { fbo, tex, depth, size, mips };
+          st.textures[handle] = { tex, target: gl.TEXTURE_CUBE_MAP };
+          break;
+        }
+        case 51: { // BEGIN_PROBE_FACE — attach cube face as colour0 + depth; clear.
+          // Payload (28B): handle | face | clear_rgba(4×f32) | clear_flags.
+          const pr = st.probes[dv.getUint32(off, true)];
+          const face = dv.getUint32(off + 4, true);
+          const cr = dv.getFloat32(off + 8, true);
+          const cg = dv.getFloat32(off + 12, true);
+          const cb = dv.getFloat32(off + 16, true);
+          const ca = dv.getFloat32(off + 20, true);
+          const flags = dv.getUint32(off + 24, true);
+          if (!pr) break;
+          gl.bindFramebuffer(gl.FRAMEBUFFER, pr.fbo);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+            gl.TEXTURE_CUBE_MAP_POSITIVE_X + face, pr.tex, 0);
+          gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, pr.depth);
+          gl.viewport(0, 0, pr.size, pr.size);
+          gl.disable(gl.SCISSOR_TEST);
+          let mask = 0;
+          if (flags & 1) { gl.clearColor(cr, cg, cb, ca); mask |= gl.COLOR_BUFFER_BIT; }
+          if (flags & 2) { gl.depthMask(true); mask |= gl.DEPTH_BUFFER_BIT; }
+          if (mask) gl.clear(mask);
+          break;
+        }
+        case 52: { // END_PROBE_FACE — no-op on WebGL2 (single framebuffer, rebound per face).
+          break;
+        }
+        case 53: { // GENERATE_PROBE_MIPS — GGX importance-sample prefilter (slice 2).
+          // Payload (8B): handle | mip_count. Mip 0 stays the sharp capture (roughness
+          // 0 = mirror); mips 1..n-1 are convolved with the GGX lobe for roughness
+          // m/(n-1), sampling ONLY mip 0 (LOD 0, base=max level 0) so there is no
+          // read/write feedback loop (write target is mip m ≠ sampled mip 0).
+          const pr = st.probes[dv.getUint32(off, true)];
+          if (pr && pr.mips > 1) {
+            if (!st.probePrefilterProg) st.probePrefilterProg = glBuildProbePrefilter(gl);
+            const P = st.probePrefilterProg;
+            gl.useProgram(P.prog);
+            if (!st.emptyVao) st.emptyVao = gl.createVertexArray();
+            gl.bindVertexArray(st.emptyVao);
+            gl.disable(gl.DEPTH_TEST);
+            gl.disable(gl.CULL_FACE);
+            gl.disable(gl.BLEND);
+            gl.disable(gl.SCISSOR_TEST);
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_CUBE_MAP, pr.tex);
+            // Sample mip 0 ONLY during prefilter (avoids sampling the mip we write).
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_BASE_LEVEL, 0);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAX_LEVEL, 0);
+            gl.uniform1i(P.src, 0);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, pr.fbo);
+            gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, null);
+            for (let m = 1; m < pr.mips; m++) {
+              const msize = Math.max(1, pr.size >> m);
+              gl.uniform1f(P.roughness, m / (pr.mips - 1));
+              gl.uniform1f(P.size, msize);
+              for (let f = 0; f < 6; f++) {
+                gl.uniform1i(P.face, f);
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                  gl.TEXTURE_CUBE_MAP_POSITIVE_X + f, pr.tex, m);
+                gl.viewport(0, 0, msize, msize);
+                gl.drawArrays(gl.TRIANGLES, 0, 3);
+              }
+            }
+            // Restore full-chain sampling for the IBL specular reads.
+            gl.bindTexture(gl.TEXTURE_CUBE_MAP, pr.tex);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_BASE_LEVEL, 0);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAX_LEVEL, pr.mips - 1);
+            gl.bindTexture(gl.TEXTURE_CUBE_MAP, null);
+          }
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+          st.active = null; // capture used the PBR program against the probe FBO; force a rebind
           break;
         }
         case 42: { // DRAW_BILLBOARDS — N screen-facing quads via per-instance attribs.
@@ -9556,6 +9733,190 @@
           st.bg1Dirty = true; // trigger bg1 rebuild before next DRAW_PBR
           break;
         }
+        case 50: { // CREATE_REFLECTION_PROBE — cube color target (6 layers) + shared depth.
+          // Payload (16B): handle | size | format(0=rgba8,1=rgba16f) | mip_count.
+          // The cube is a 6-array-layer 2d texture: per-face 2d VIEWS are render
+          // attachments (case 51 / 53); a cube VIEW is the sampled IBL specular
+          // source (bind_ibl case 12, via st.textures[handle].view). RENDER_ATTACHMENT
+          // + mipLevelCount are REQUIRED at creation for per-layer/mip rendering.
+          const handle = dv.getUint32(off, true);
+          const size = dv.getUint32(off + 4, true);
+          const mips = dv.getUint32(off + 12, true);
+          // Slice-1 (LDR probe): the capture reuses the BASE PBR pipeline, whose color
+          // target format is baked at create_shader to st.format (the canvas format) —
+          // NOT the requested rgba16f. WebGPU render-pass/pipeline color formats must
+          // match EXACTLY, so the probe cube MUST use st.format (e.g. bgra8unorm), or
+          // set_pipeline throws "incompatible color attachments". Sampling a bgra8 cube
+          // as the IBL specular source is fine (texture_cube<f32>). An HDR probe needs
+          // the variant_linear_output (rgba16float) pipeline path — deferred to slice 2.
+          // (The wire `format` field at off+8 is honored on WebGL2, which is
+          // pipeline-format-agnostic; on WebGPU it is overridden here.)
+          const format = st.format;
+          const tex = device.createTexture({
+            size: [size, size, 6],
+            format,
+            mipLevelCount: mips,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+          });
+          const faceViews = [];
+          for (let f = 0; f < 6; f++) {
+            faceViews.push(tex.createView({
+              dimension: "2d", baseArrayLayer: f, arrayLayerCount: 1,
+              baseMipLevel: 0, mipLevelCount: 1,
+            }));
+          }
+          const cubeView = tex.createView({ dimension: "cube" });
+          const depthTex = device.createTexture({
+            size: [size, size],
+            format: "depth24plus",
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+          });
+          st.probes[handle] = {
+            tex, cubeView, faceViews, depthView: depthTex.createView(),
+            size, mips, format, depthTex,
+          };
+          // Register as a sampleable cube texture so bind_ibl binds it unchanged.
+          st.textures[handle] = { tex, view: cubeView, w: size, h: size, cube: true };
+          break;
+        }
+        case 51: { // BEGIN_PROBE_FACE — open a render pass into one cube face (mip 0).
+          // Payload (28B): handle | face | clear_rgba(4×f32) | clear_flags.
+          const pr = st.probes[dv.getUint32(off, true)];
+          const face = dv.getUint32(off + 4, true);
+          const cr = dv.getFloat32(off + 8, true);
+          const cg = dv.getFloat32(off + 12, true);
+          const cb = dv.getFloat32(off + 16, true);
+          const ca = dv.getFloat32(off + 20, true);
+          const flags = dv.getUint32(off + 24, true);
+          if (!pr) break;
+          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; st.prepassSlot = 0; }
+          if (st.pass) { st.pass.end(); st.pass = null; }
+          // Attachment view = single-layer 2d (NOT the cube sampling view).
+          st.pass = st.encoder.beginRenderPass({
+            colorAttachments: [{
+              view: pr.faceViews[face],
+              clearValue: { r: cr, g: cg, b: cb, a: ca },
+              loadOp: (flags & 1) ? "clear" : "load",
+              storeOp: "store",
+            }],
+            depthStencilAttachment: {
+              view: pr.depthView,
+              depthClearValue: 1.0,
+              depthLoadOp: (flags & 2) ? "clear" : "load",
+              depthStoreOp: "store",
+            },
+          });
+          st.curTargetFormat = pr.format; // PBR pipeline keys on this
+          st.curPassHasDepth = true;
+          st.active = null; // force pipeline re-bind for the capture draws
+          break;
+        }
+        case 52: { // END_PROBE_FACE — close the current face pass.
+          if (st.pass) { st.pass.end(); st.pass = null; }
+          break;
+        }
+        case 53: { // GENERATE_PROBE_MIPS — GGX importance-sample prefilter (slice 2).
+          // Payload (8B): handle | mip_count. Mip 0 stays the sharp capture (roughness
+          // 0 mirror). Mips 1..n-1 = GGX convolution for roughness m/(n-1), sampling
+          // the mip-0 cube VIEW only (no read/write subresource overlap; the write
+          // target mip m ≠ the sampled mip 0). Per-draw {roughness, face} rides a
+          // dynamic-offset uniform (queue.writeBuffer is last-write-wins across the
+          // single frame submit, so a shared buffer without offsets would collapse).
+          const pr = st.probes[dv.getUint32(off, true)];
+          if (!pr || pr.mips <= 1) { st.active = null; break; }
+          if (!st.encoder) { st.encoder = device.createCommandEncoder(); st.postSlot = 0; st.prepassSlot = 0; }
+          if (st.pass) { st.pass.end(); st.pass = null; }
+          if (!st.probePrefilterPipe || st.probePrefilterPipe.format !== pr.format) {
+            const wgsl = [
+              "struct U { roughness: f32, face: u32 }",
+              "@group(0) @binding(0) var<uniform> u: U;",
+              "@group(0) @binding(1) var src: texture_cube<f32>;",
+              "@group(0) @binding(2) var samp: sampler;",
+              "const PI: f32 = 3.14159265359;",
+              "struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }",
+              "@vertex fn vs(@builtin(vertex_index) vid: u32) -> VOut {",
+              "  var o: VOut; let x = f32((vid << 1u) & 2u); let y = f32(vid & 2u);",
+              "  o.uv = vec2f(x * 2.0 - 1.0, 1.0 - y * 2.0);",  // NDC-aligned: matches pos so top row = +uv.y
+              "  o.pos = vec4f(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0); return o; }",
+              "fn faceDir(f: u32, uv: vec2f) -> vec3f {",
+              "  if (f == 0u) { return normalize(vec3f(1.0, -uv.y, -uv.x)); }",
+              "  if (f == 1u) { return normalize(vec3f(-1.0, -uv.y, uv.x)); }",
+              "  if (f == 2u) { return normalize(vec3f(uv.x, 1.0, uv.y)); }",
+              "  if (f == 3u) { return normalize(vec3f(uv.x, -1.0, -uv.y)); }",
+              "  if (f == 4u) { return normalize(vec3f(uv.x, -uv.y, 1.0)); }",
+              "  return normalize(vec3f(-uv.x, -uv.y, -1.0)); }",
+              "fn radicalInverse(bits_in: u32) -> f32 {",
+              "  var bits = bits_in;",
+              "  bits = (bits << 16u) | (bits >> 16u);",
+              "  bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);",
+              "  bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);",
+              "  bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);",
+              "  bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);",
+              "  return f32(bits) * 2.3283064365386963e-10; }",
+              "fn importanceGGX(xi: vec2f, n: vec3f, rough: f32) -> vec3f {",
+              "  let a = rough * rough; let phi = 2.0 * PI * xi.x;",
+              "  let ct = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));",
+              "  let stt = sqrt(max(0.0, 1.0 - ct * ct));",
+              "  let h = vec3f(cos(phi) * stt, sin(phi) * stt, ct);",
+              "  var up = vec3f(0.0, 0.0, 1.0); if (abs(n.z) >= 0.999) { up = vec3f(1.0, 0.0, 0.0); }",
+              "  let t = normalize(cross(up, n)); let b = cross(n, t);",
+              "  return normalize(t * h.x + b * h.y + n * h.z); }",
+              "@fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {",
+              "  let N = faceDir(u.face, uv); let V = N;",
+              "  var acc = vec3f(0.0); var wsum = 0.0;",
+              "  for (var i: u32 = 0u; i < 64u; i = i + 1u) {",
+              "    let xi = vec2f(f32(i) / 64.0, radicalInverse(i));",
+              "    let H = importanceGGX(xi, N, u.roughness); let L = normalize(2.0 * dot(V, H) * H - V);",
+              "    let ndl = dot(N, L); if (ndl > 0.0) { acc = acc + textureSampleLevel(src, samp, L, 0.0).rgb * ndl; wsum = wsum + ndl; } }",
+              "  var col = textureSampleLevel(src, samp, N, 0.0).rgb; if (wsum > 0.0) { col = acc / wsum; }",
+              "  return vec4f(col, 1.0); }",
+            ].join("\n");
+            const module = device.createShaderModule({ code: wgsl });
+            const pipeline = device.createRenderPipeline({
+              layout: "auto",
+              vertex: { module, entryPoint: "vs" },
+              fragment: { module, entryPoint: "fs", targets: [{ format: pr.format }] },
+              primitive: { topology: "triangle-list" },
+            });
+            const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
+            // Dynamic-offset uniform: 256B stride × (max mips × 6 faces).
+            const ubuf = device.createBuffer({ size: 256 * 8 * 6, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            st.probePrefilterPipe = { pipeline, sampler, ubuf, format: pr.format };
+          }
+          const pp = st.probePrefilterPipe;
+          // Mip-0-only cube view — sampled while writing mips ≥ 1 (no subresource overlap).
+          const srcCube = pr.tex.createView({ dimension: "cube", baseMipLevel: 0, mipLevelCount: 1 });
+          let slot = 0;
+          for (let m = 1; m < pr.mips; m++) {
+            const rough = m / (pr.mips - 1);
+            for (let f = 0; f < 6; f++) {
+              const base = slot * 256; slot++;
+              device.queue.writeBuffer(pp.ubuf, base, new Float32Array([rough]));
+              device.queue.writeBuffer(pp.ubuf, base + 4, new Uint32Array([f]));
+              const dstView = pr.tex.createView({ dimension: "2d", baseArrayLayer: f, arrayLayerCount: 1, baseMipLevel: m, mipLevelCount: 1 });
+              // Static per-bind-group offset (256-aligned) — layout:"auto" has no
+              // dynamic-offset binding, so bake the slot offset into the bind group.
+              const bg = device.createBindGroup({
+                layout: pp.pipeline.getBindGroupLayout(0),
+                entries: [
+                  { binding: 0, resource: { buffer: pp.ubuf, offset: base, size: 8 } },
+                  { binding: 1, resource: srcCube },
+                  { binding: 2, resource: pp.sampler },
+                ],
+              });
+              const pass = st.encoder.beginRenderPass({
+                colorAttachments: [{ view: dstView, loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: "store" }],
+              });
+              pass.setPipeline(pp.pipeline);
+              pass.setBindGroup(0, bg);
+              pass.draw(3);
+              pass.end();
+            }
+          }
+          st.active = null; // capture used the PBR program; force rebind for the canvas pass
+          st.bg1Dirty = true; // the probe cube now has prefiltered mips to sample
+          break;
+        }
         case 42: { // DRAW_BILLBOARDS — N screen-facing quads via per-instance attribs.
           // Payload (24B / 6 u32): vbuf_instance | count | tex_handle | view_ptr | proj_ptr | flags.
           // Instance buffer (handle vbh) has stride-36 records; it was created as BufferKind.vertex
@@ -9921,6 +10282,8 @@
       shadowMaps: [], // P9 slice 3: { fbo, tex, size } per handle
       renderTargets: [], // post-processing: { fbo, colorTex, depthTex, w, h } per handle
       pointShadows: [], // T2: { fbo, tex, depth, w, h } per handle (RGBA8 atlas + depth RBO)
+      probes: [], // reflection probes: { fbo, tex, depth, size, mips } per handle (cube color target)
+      probePrefilterProg: null, // lazy — GGX specular-prefilter program (generate_probe_mips, slice 2)
       pointDepthProg: null, // lazy — compiled on first CREATE_POINT_SHADOW (case 31)
       vaos: new Map(),
       emptyVao: null, // lazy-created VAO for fullscreen-quad draw (case 25)
@@ -10128,6 +10491,8 @@
       pointDepthPipe: null, // lazy — pipeline + uniform buf for point-depth pass
       pointPass: null, // active render pass during begin/end_point_shadow_face
       pointAtlasView: null, // stashed by bind_point_shadow (tag 35) for bg1 binding 11
+      probes: [], // reflection probes: { tex, cubeView, faceViews[6], depthView, size, mips, format } by handle
+      probePrefilterPipe: null, // lazy — GGX specular-prefilter pipeline (generate_probe_mips, slice 2)
       renderTargets: [], // post: { tex, view, depthTex, depthView, w, h, format } by handle
       curTargetFormat: null, // color format of the active pass (post pipeline keying)
       curPassHasDepth: false, // true when the active render pass has a depth attachment

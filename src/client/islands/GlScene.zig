@@ -152,6 +152,13 @@ const max_morph_targets: u32 = 64;
 // IBL (16..18). No collision with shader handles (distinct namespace).
 const morph_tex_handle: u32 = 19;
 
+// Runtime reflection probe (slice 1). A cube COLOR target living in st.probes[]
+// AND registered in st.textures[] so bind_ibl can bind it as the specular cube.
+// Handle 20 is the next free texture handle (material 1-8, IBL 16-18, morph 19).
+const probe_handle: u32 = 20;
+const probe_size: u32 = 256; // per-face capture resolution
+const probe_mips: u32 = 8; // box-filtered roughness proxy levels
+
 // ── Props copies (decoded from SSR data-props; copied into the Inst before the
 //    chunk arena that held the decode result is reset) ─────────────────────────
 
@@ -318,6 +325,18 @@ const Inst = struct {
     custom_on: bool = false,
     custom_handle: u32 = 0,
     custom_ubo: [20]f32 = [_]f32{0} ** 20,
+
+    // Runtime reflection probe (slice 1, data-glprobe). Captured ONCE from
+    // probe_pos on the first ready frame, then bound as the specular IBL cube.
+    probe_enabled: bool = false,
+    probe_pos: [3]f32 = .{ 0, 0, 0 },
+    probe_cam: [3]f32 = .{ 0, 0, 0 }, // camera_pos pointer for capture draws (= probe_pos)
+    probe_sent: bool = false, // createReflectionProbe emitted (re-emit after restore)
+    probe_captured: bool = false,
+    // Per-face per-submesh MVP. Distinct slots so all 6 faces' draw records stay
+    // valid at deferred-decode time (the bridge walks cmd_buf AFTER the frame fn
+    // returns) — the aliasing trap. Inst-static, NOT frame stack (6×128×64B = 48KB).
+    probe_mvps: [6][max_submesh][16]f32 = undefined,
 
     // GPU-resource registry for context-restore replay (cap 80; morph adds 16 more
     // shader variants + 1 morph tex: 2 buf + 36 shader + depth + depth_at + shadow
@@ -1024,6 +1043,33 @@ fn parseFog(inst: *Inst, s: []const u8) void {
     inst.fog_enabled = true;
 }
 
+// Parse the `data-glprobe` attribute: "x,y,z" float CSV → probe_pos, probe_enabled.
+// Tolerant: fewer than 3 fields leaves the probe disabled.
+fn parseProbe(inst: *Inst, s: []const u8) void {
+    var vals: [3]f32 = .{ 0, 0, 0 };
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        if (n >= 3) break;
+        vals[n] = std.fmt.parseFloat(f32, tok) catch return;
+        n += 1;
+    }
+    if (n < 3) return;
+    inst.probe_pos = vals;
+    inst.probe_cam = vals;
+    inst.probe_enabled = true;
+}
+
+// IBL specular source for MAIN-scene draws: the captured probe cube once ready,
+// else the build-time env specular. Diffuse irradiance + BRDF LUT always come
+// from the env (slice 1 does not re-derive irradiance).
+fn iblSpec(inst: *const Inst) u32 {
+    return if (inst.probe_enabled and inst.probe_captured) probe_handle else spec_handle;
+}
+fn iblMips(inst: *const Inst, env: *const gl.venv.Reader) u32 {
+    return if (inst.probe_enabled and inst.probe_captured) probe_mips else env.spec_mip_count;
+}
+
 // Parse the `data-glclip` attribute into inst.clip_planes / clip_count.
 // Format: semicolon-separated plane records, each "nx,ny,nz,constant" (4 floats).
 // Tolerant: planes with fewer than 4 fields are skipped; max 4 planes.
@@ -1486,6 +1532,14 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
         if (fa.len != 0) parseFog(inst, fa);
     }
 
+    // Reflection probe rides on the canvas `data-glprobe` attribute (NOT Props).
+    // Format: "x,y,z" world position. Absent → no probe.
+    if (inst.canvas_handle) |ch| {
+        var pbbuf: [96]u8 = undefined;
+        const pba = verve.refGetAttr(ch, "data-glprobe", &pbbuf);
+        if (pba.len != 0) parseProbe(inst, pba);
+    }
+
     // Multi-light array rides on the canvas `data-gllights` attribute (NOT Props).
     // Format: semicolon-separated 15-field CSV records. When present, overrides
     // the Props default-directional written above.
@@ -1778,6 +1832,14 @@ fn buildScene(inst: *Inst, a: *const gl.vmesh.Reader) void {
             sub.metallic,      sub.roughness,     sub.occlusion_strength, sub.normal_scale,
             sub.emissive[0],   sub.emissive[1],   sub.emissive[2],        sub.alpha_cutoff,
         };
+        // Reflection-probe demo (slice 1): force a near-mirror material so the
+        // captured cubemap is actually VISIBLE as a reflection. Matte/dielectric
+        // surfaces show no specular IBL regardless of probe vs env. Slice 3 will
+        // gate this on a per-submesh `reflective` flag instead of scene-wide.
+        if (inst.probe_enabled) {
+            inst.mats[s][4] = 1.0; // metallic
+            inst.mats[s][5] = 0.10; // roughness → sharp mirror
+        }
         inst.submesh_aabb[s] = submeshLocalAabb(verts_f32, indices_u16, sub.index_byte_off / 2, sub.index_count);
     }
     // Model-local AABB: union of all per-submesh local AABBs for T6 per-instance cull (3A).
@@ -2171,6 +2233,11 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             if (inst.point_atlas_sent) {
                 enc.createPointShadow(point_atlas_handle, point_atlas_w, point_atlas_h);
             }
+            // Reflection probe cube died with the context; re-create + re-capture.
+            if (inst.probe_sent) {
+                enc.createReflectionProbe(probe_handle, probe_size, .rgba16f, probe_mips);
+                inst.probe_captured = false;
+            }
         }
 
         // Upload any external (compressed) textures that finished decoding since the
@@ -2472,6 +2539,14 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
             }
         } // end if (!inst.wire_on) — shadow depth passes
 
+        // Runtime reflection probe (slice 1): capture ONCE, before beginFrame (like
+        // the shadow passes — they share the encoder that beginFrame reuses). Renders
+        // the scene into the 6 cube faces from probe_pos, then box-mip prefilters.
+        if (inst.probe_enabled and inst.probe_sent and !inst.probe_captured) {
+            captureProbe(inst, a, &enc, env);
+            inst.probe_captured = true;
+        }
+
         enc.beginFrame(.{ 0.05, 0.06, 0.09, 1.0 }, width, height);
 
         // CSM frame-globals — MUST be emitted AFTER beginFrame: the bridge resets
@@ -2621,7 +2696,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     (if (clipActive(inst)) variant_clip else 0) |
                     (if (inst.n_2d_casters > 0) gl.command.variant_shadow else 0)), gl.command.state_depth_test | gl.command.state_cull_back);
                 enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
-                enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+                enc.bindIbl(irr_handle, iblSpec(inst), lut_handle, iblMips(inst, env));
                 // When variant_shadow is set (n_2d_casters > 0) the bridge feeds shadow_vp
                 // and binds the atlas via the pipeline's variant flag — these binds are live.
                 // When no casters (non-shadow handle), bindShadowResources sends count=0 which
@@ -2743,7 +2818,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     // Pass A: cull front → back faces drawn.
                     enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_front | gl.command.state_blend);
                     enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
-                    enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+                    enc.bindIbl(irr_handle, iblSpec(inst), lut_handle, iblMips(inst, env));
                     bindShadowResources(inst, &enc);
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
                     if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
@@ -2757,7 +2832,7 @@ export fn glscene_frame(dt_ms: f32, width: u32, height: u32) u32 {
                     // Pass B: cull back → front faces drawn.
                     enc.setPipeline(shaderHandleFor(v), gl.command.state_depth_test | gl.command.state_cull_back | gl.command.state_blend);
                     enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
-                    enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+                    enc.bindIbl(irr_handle, iblSpec(inst), lut_handle, iblMips(inst, env));
                     bindShadowResources(inst, &enc);
                     if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
                     if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
@@ -2844,6 +2919,18 @@ export fn glscene_tex_format() u32 {
     const inst = current orelse return 0;
     if (!inst.tex_format_loaded) return 0xFF;
     return inst.tex_format_seen;
+}
+
+/// Reflection-probe capture state (CDP verification, slice 1). Bit0 = probe
+/// enabled (data-glprobe present), bit1 = probe captured (6-face render + prefilter
+/// done). A CDP run polls this until bit1 sets to confirm the capture ran on the
+/// active backend, then samples the reflective surface. Returns 0 when no instance.
+export fn glscene_probe_state() u32 {
+    const inst = current orelse return 0;
+    var st: u32 = 0;
+    if (inst.probe_enabled) st |= 1;
+    if (inst.probe_captured) st |= 2;
+    return st;
 }
 
 // ── /gl-morph runtime controls ────────────────────────────────────────────────
@@ -2942,7 +3029,7 @@ fn drawSubmesh(
     if (v != last_variant.* or inst.custom_on) {
         enc.setPipeline(handle, state);
         enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
-        enc.bindIbl(irr_handle, spec_handle, lut_handle, env.spec_mip_count);
+        enc.bindIbl(irr_handle, iblSpec(inst), lut_handle, iblMips(inst, env));
         // Re-bind per-pipeline (WebGL2 uniforms are per-program; WebGPU re-stash).
         bindShadowResources(inst, enc);
         if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
@@ -2978,6 +3065,89 @@ fn drawSubmesh(
         @intCast(@intFromPtr(&inst.mats[s])),
         @intCast(@intFromPtr(&inst.camera_pos)),
     );
+}
+
+/// Capture the scene into the reflection-probe cube (slice 1, static/once).
+/// Renders every opaque submesh into all 6 faces from `probe_pos` with a 90° FOV,
+/// then box-mip prefilters into a roughness proxy. Reflections sample the env IBL
+/// during capture (spec_handle), NOT the probe itself.
+///
+/// Pointer discipline: the bridge decodes cmd_buf AFTER the frame fn returns, so
+/// every draw's MVP must live at a distinct, stable address until then. model/
+/// normal/material are camera-independent (shared across faces → one slot each);
+/// only the MVP differs per face → `probe_mvps[face][s]` (48KB Inst-static pool).
+fn captureProbe(inst: *Inst, a: *const gl.vmesh.Reader, enc: *gl.Encoder, env: *const gl.venv.Reader) void {
+    const probe = gl.math.Vec3.init(inst.probe_pos[0], inst.probe_pos[1], inst.probe_pos[2]);
+    const near: f32 = 0.05;
+    const far: f32 = inst.cam_far;
+    const s_count: u32 = if (a.submesh_count < max_submesh) a.submesh_count else max_submesh;
+
+    // Camera-independent model + normal matrices (identical for every face).
+    var s: u32 = 0;
+    while (s < s_count) : (s += 1) {
+        const world_s = inst.scene.world[s + 1];
+        inst.model_mats[s] = world_s.m;
+        inst.normal9s[s] = gl.math.normalMatrix(world_s);
+    }
+
+    var face: u8 = 0;
+    while (face < 6) : (face += 1) {
+        const fvp = clipFix().mul(gl.math.cubeFaceVp(probe, face, near, far));
+        s = 0;
+        while (s < s_count) : (s += 1) {
+            inst.probe_mvps[face][s] = fvp.mul(inst.scene.world[s + 1]).m;
+        }
+        enc.beginProbeFace(
+            probe_handle,
+            face,
+            // Lighter "sky" than the main clear so mirror surfaces read as reflecting
+            // an environment rather than pure black where no geometry is hit.
+            .{ 0.16, 0.20, 0.28, 1.0 },
+            gl.command.clear_flag_color | gl.command.clear_flag_depth,
+        );
+        // Per face: bind the base PBR pipeline once (re-emit per submesh only when the
+        // variant changes), sampling the env IBL + scene lights. Shadow receiver binds
+        // mirror drawSubmesh so the always-baked variant_shadow samplers stay valid.
+        var last_variant: u32 = 0xFFFF_FFFF;
+        s = 0;
+        while (s < s_count) : (s += 1) {
+            const sub = a.submesh(s);
+            const sbit: u32 = if (pointActive(inst)) gl.command.variant_shadow_point else 0;
+            const v = a.submeshVariant(s) |
+                (if (inst.fog_enabled) variant_fog else 0) |
+                (if (clipActive(inst)) variant_clip else 0) |
+                sbit;
+            const handle = shaderHandleFor(v);
+            if (v != last_variant) {
+                enc.setPipeline(handle, gl.command.state_depth_test | gl.command.state_cull_back);
+                enc.setLights(inst.light_count, @intCast(@intFromPtr(&inst.lights)));
+                enc.bindIbl(irr_handle, iblSpec(inst), lut_handle, iblMips(inst, env));
+                bindShadowResources(inst, enc);
+                if (inst.fog_enabled) enc.setFog(@intCast(@intFromPtr(&inst.fog_params)));
+                if (clipActive(inst)) enc.setClipPlanes(inst.clip_count, @intCast(@intFromPtr(&inst.clip_planes)));
+                last_variant = v;
+            }
+            enc.bindTexture(0, texHandle(sub.tex_base));
+            enc.bindTexture(1, texHandle(sub.tex_mr));
+            enc.bindTexture(2, texHandle(sub.tex_normal));
+            enc.bindTexture(3, texHandle(sub.tex_emissive));
+            enc.bindTexture(4, texHandle(sub.tex_occlusion));
+            enc.drawPbr(
+                vbuf,
+                ibuf,
+                sub.index_byte_off,
+                sub.index_count,
+                @intCast(@intFromPtr(&inst.probe_mvps[face][s])),
+                @intCast(@intFromPtr(&inst.model_mats[s])),
+                @intCast(@intFromPtr(&inst.normal9s[s])),
+                @intCast(@intFromPtr(&inst.mats[s])),
+                @intCast(@intFromPtr(&inst.probe_cam)),
+            );
+        }
+        enc.endProbeFace();
+    }
+    // Box-filtered mip chain → roughness proxy; restores the default framebuffer.
+    enc.generateProbeMips(probe_handle, probe_mips);
 }
 
 /// One-time GPU resource upload, mirrored into `inst.registry` for restore replay.
@@ -3128,6 +3298,15 @@ fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: 
     // flags the restore path to re-emit createPointShadow after registry.replay.
     enc.createPointShadow(point_atlas_handle, point_atlas_w, point_atlas_h);
     inst.point_atlas_sent = true;
+
+    // Runtime reflection probe (slice 1): allocate the cube color target now; the
+    // per-frame capture (captureProbe) fills + prefilters it on the first ready
+    // frame. Not registry-recorded (rendered content, not uploaded) — restore
+    // re-emits via probe_sent and re-captures (probe_captured reset).
+    if (inst.probe_enabled) {
+        enc.createReflectionProbe(probe_handle, probe_size, .rgba16f, probe_mips);
+        inst.probe_sent = true;
+    }
 
     var t: u32 = 0;
     while (t < a.tex_count) : (t += 1) {

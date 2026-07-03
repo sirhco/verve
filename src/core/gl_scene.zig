@@ -173,6 +173,9 @@ pub const GlSceneBuilder = struct {
     scrub_on: bool = false,
     fog_opts: FogOpts = .{},
     proj_opts: ProjectionOpts = .{},
+    /// Runtime reflection probe world position; null = no probe. Transported
+    /// OUTSIDE Props as `data-glprobe` ("x,y,z") so Props stays 14 fields.
+    probe_opts: ?[3]f32 = null,
     morph_weights_buf: []const f32 = &.{},
     lights_buf: [max_lights]Light = undefined,
     light_count: usize = 0,
@@ -217,6 +220,16 @@ pub const GlSceneBuilder = struct {
     /// Distance fog. `mode = .none` (default) disables fog entirely.
     pub fn fog(self: *GlSceneBuilder, f: FogOpts) *GlSceneBuilder {
         self.fog_opts = f;
+        return self;
+    }
+
+    /// Static reflection probe captured once from world position `pos`. The
+    /// scene is rendered into a cubemap from `pos` on the first ready frame,
+    /// box-filtered into a roughness mip chain, and bound as the specular IBL
+    /// source so the model reflects its surroundings. Transported as
+    /// `data-glprobe` on the canvas.
+    pub fn probe(self: *GlSceneBuilder, pos: [3]f32) *GlSceneBuilder {
+        self.probe_opts = pos;
         return self;
     }
 
@@ -438,6 +451,18 @@ pub const GlSceneBuilder = struct {
             },
         ) catch null;
         if (cam_attr) |ca| _ = canvas.attr("data-glcam", ca);
+
+        // Reflection probe position travels OUTSIDE Props as `data-glprobe`
+        // ("x,y,z"), read in the chunk via refGetAttr + parseProbe. Only emitted
+        // when a probe is configured.
+        if (self.probe_opts) |pp| {
+            const probe_attr = std.fmt.allocPrint(
+                self.ctx.allocator,
+                "{d},{d},{d}",
+                .{ pp[0], pp[1], pp[2] },
+            ) catch null;
+            if (probe_attr) |pa| _ = canvas.attr("data-glprobe", pa);
+        }
 
         // Morph weights travel OUTSIDE Props as a comma-joined `data-glmorph`
         // attribute ("w0,w1,…") the chunk reads via refGetAttr + parseMorph.

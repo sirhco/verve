@@ -158,6 +158,20 @@ pub const Tag = enum(u16) {
     //   `format` = CompressedFormat (1=BC7_UNORM, 2=BC7_SRGB). RGBA path (tag 7/15) is unaffected.
     //   `ptr` → level table start: mip_count×{u32 offset, u32 length} followed by the BC7 blocks.
     //   `byte_len` = mip_count*8 + total_block_bytes (table + all blocks; layer-1 `len - 16`).
+
+    // ── Runtime reflection probes (slice 1: static capture-once) ────────────
+    create_reflection_probe = 50, // {handle, size, format, mip_count} — real cube COLOR target
+    //   (6-face color attachment, unlike the point-shadow 2D atlas) + one shared depth buffer sized
+    //   size². `format` = TexFormat (0=rgba8, 1=rgba16f). `mip_count` levels are allocated so the box
+    //   mip chain (generate_probe_mips) can act as a roughness proxy for the IBL specular sampler.
+    begin_probe_face = 51, // {handle, face, clear_rgba(4 f32), clear_flags(bit0=color,bit1=depth)}
+    //   Bind cube face `face` (+X,-X,+Y,-Y,+Z,-Z order) as COLOR_ATTACHMENT0 + the shared depth,
+    //   set viewport to size², and clear per flags. Subsequent draw_pbr records render the scene from
+    //   the probe camera into this face. Mirrors begin_point_shadow_face (tag 32) but a real cube color target.
+    end_probe_face = 52, // {} — close the current face pass (WebGPU pass.end(); WebGL2 no-op).
+    generate_probe_mips = 53, // {handle, mip_count} — build a box-filtered mip chain over the cube
+    //   (mip N ≈ roughness level) and restore the default framebuffer/viewport. WebGL2 = one
+    //   generateMipmap(TEXTURE_CUBE_MAP); WebGPU = per-mip/per-face bilinear downsample passes.
 };
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
@@ -4882,6 +4896,43 @@ pub const Encoder = struct {
         self.putU32(param_count);
     }
 
+    // ── Runtime reflection probes (slice 1) ─────────────────────────────
+    /// Allocate a cube COLOR render target (6 face attachments + one shared depth),
+    /// with `mip_count` mip levels so `generateProbeMips` can build a roughness proxy.
+    /// `format` = rgba8 (LDR) or rgba16f (HDR). Reuse the resulting handle as the IBL
+    /// specular cube via `bindIbl(irr, handle, lut, mip_count)`.
+    pub fn createReflectionProbe(self: *Encoder, handle: u32, size: u32, format: TexFormat, mip_count: u32) void {
+        self.header(.create_reflection_probe, 16);
+        self.putU32(handle);
+        self.putU32(size);
+        self.putU32(@intFromEnum(format));
+        self.putU32(mip_count);
+    }
+
+    /// Begin rendering the scene into one cube face. `face` in 0..5 (+X,-X,+Y,-Y,+Z,-Z).
+    /// `clear` → rgba clear color; `clear_flags` (bit0=color, bit1=depth). Face view-projection
+    /// is applied by the draw records' mvp (compute via `math.cubeFaceVp(probe_pos, face, ..)`).
+    pub fn beginProbeFace(self: *Encoder, handle: u32, face: u32, clear: [4]f32, clear_flags: u32) void {
+        self.header(.begin_probe_face, 28);
+        self.putU32(handle);
+        self.putU32(face);
+        for (clear) |c| self.putF32(c);
+        self.putU32(clear_flags);
+    }
+
+    /// End the current probe face pass. WebGPU ends the render pass; WebGL2 is a no-op.
+    pub fn endProbeFace(self: *Encoder) void {
+        self.header(.end_probe_face, 0);
+    }
+
+    /// Finalize the probe: build the box-filtered mip chain (roughness proxy) and
+    /// restore the default framebuffer + canvas viewport.
+    pub fn generateProbeMips(self: *Encoder, handle: u32, mip_count: u32) void {
+        self.header(.generate_probe_mips, 8);
+        self.putU32(handle);
+        self.putU32(mip_count);
+    }
+
     pub fn endFrame(self: *Encoder) void {
         self.header(.end_frame, 0);
     }
@@ -7046,6 +7097,55 @@ test "bindPointShadow encodes tag 35 + 2 u32 payload (8 bytes)" {
     try testing.expectEqual(@as(u16, 8), std.mem.readInt(u16, s[6..8], .little)); // payload_size
     try testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, s[8..12], .little)); // slot
     try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[12..16], .little)); // handle
+}
+
+test "createReflectionProbe encodes tag 50 + 4 u32 payload (16 bytes)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.createReflectionProbe(7, 256, .rgba16f, 8);
+    const s = enc.finish();
+    // length header (4) + record header (4) + 4×u32 payload (16) = 20 record bytes
+    try testing.expectEqual(@as(u32, 20), std.mem.readInt(u32, s[0..4], .little)); // length
+    try testing.expectEqual(@as(u16, 50), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 16), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[8..12], .little)); // handle
+    try testing.expectEqual(@as(u32, 256), std.mem.readInt(u32, s[12..16], .little)); // size
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, s[16..20], .little)); // format=rgba16f
+    try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, s[20..24], .little)); // mip_count
+}
+
+test "beginProbeFace encodes tag 51 + 28-byte payload (handle,face,clear rgba,flags)" {
+    var buf: [64]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.beginProbeFace(7, 2, .{ 0, 0, 0, 1 }, clear_flag_color | clear_flag_depth);
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 51), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 28), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[8..12], .little)); // handle
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, s[12..16], .little)); // face (+Y)
+    try testing.expectEqual(@as(f32, 0), @as(f32, @bitCast(std.mem.readInt(u32, s[16..20], .little)))); // clear r
+    try testing.expectEqual(@as(f32, 1), @as(f32, @bitCast(std.mem.readInt(u32, s[28..32], .little)))); // clear a
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, s[32..36], .little)); // flags (color|depth)
+}
+
+test "endProbeFace encodes tag 52 + empty payload" {
+    var buf: [32]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.endProbeFace();
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 52), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+}
+
+test "generateProbeMips encodes tag 53 + 2 u32 payload (8 bytes)" {
+    var buf: [32]u8 = undefined;
+    var enc = Encoder.init(&buf);
+    enc.generateProbeMips(7, 8);
+    const s = enc.finish();
+    try testing.expectEqual(@as(u16, 53), std.mem.readInt(u16, s[4..6], .little)); // tag
+    try testing.expectEqual(@as(u16, 8), std.mem.readInt(u16, s[6..8], .little)); // payload_size
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, s[8..12], .little)); // handle
+    try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, s[12..16], .little)); // mip_count
 }
 
 test "golden: begin_shadow_pass (tag 17) 20-byte layout" {
