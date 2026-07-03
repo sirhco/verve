@@ -4,6 +4,37 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.44.0] - 2026-07-03
+
+### Added
+
+- **`verve.gl` runtime reflection probes.** A probe renders the surrounding scene into a
+  cubemap from a fixed world position, prefilters it into a roughness mip chain, and binds it
+  as the specular IBL source — so a reflective model mirrors its **actual** surroundings
+  instead of a static, pre-baked environment map. Both WebGL2 and WebGPU.
+  - **Static capture-once.** On the first ready frame the chunk drives a 6-face render loop
+    (mirroring the point-shadow cube pass) into a real cube colour target, then binds the
+    result via the existing `bind_ibl` path — **no PBR shader changes**, the über-shader's
+    existing `reflect(-V, N)` → `textureLod(u_prefiltered, …)` sampling is reused verbatim.
+  - **GGX prefilter.** Mip 0 stays the sharp capture (roughness 0 mirror); mips 1..n are
+    convolved with the GGX lobe for roughness `m/(n-1)` (Karis split-sum, ported from
+    `ibl.zig` into GLSL + WGSL fullscreen passes) — physically-based blur on rough surfaces,
+    sharp on smooth. Source is sampled at mip 0 only (no read/write feedback).
+  - Wire tags 50–53 (`create_reflection_probe` / `begin_probe_face` / `end_probe_face` /
+    `generate_probe_mips`) with byte-exact golden tests. API: `ctx.glScene(…).probe(pos)`,
+    transported out-of-band as `data-glprobe`. Demo: `/gl-probe`.
+  - **Backend gotcha handled:** WebGL2 RGBA16F cube attachments require
+    `EXT_color_buffer_float` (with RGBA8 fallback); the full mip chain is allocated up front
+    with `texStorage2D`. WebGPU renders each cube face as a single-layer 2D view and builds
+    the prefilter mips with per-mip passes (no `generateMipmap`).
+
+### Notes
+
+- Box-projected parallax correction (aligning reflections to a probe AABB rather than infinite
+  distance) was developed but **not shipped** — it could not be verified on the development
+  machine (no working headless WebGPU on macOS; `deno` validates WebGPU objects but cannot run
+  the DOM/island runtime). Deferred until a WebGPU-capable end-to-end test environment exists.
+
 ## [0.43.1] - 2026-07-03
 
 ### Fixed
