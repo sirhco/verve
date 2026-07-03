@@ -1,15 +1,15 @@
 # gl-viewer — standalone declarative 3D product viewer
 
-The smallest complete app built on **`verve.gl`**: a PBR + image-based-lit mesh
-declared in Zig and rendered in WebGL2, with orbit, pick, hover, and a
-scroll-scrub turntable — no scene graph JSON, no JS render loop, no Chromium.
-
-Two SSR routes share one scene declaration; only the interaction mode differs.
+A curated set of **`verve.gl`** demos: PBR + image-based-lit meshes declared
+in Zig and rendered in WebGL2 — no scene graph JSON, no JS render loop, no
+Chromium.
 
 ```sh
 cd examples/gl-viewer
 zig build run        # http://127.0.0.1:8080  (override with -- --port 9090)
 ```
+
+## Routes
 
 - **`/`** — scroll-scrub product viewer. `scrub(true)` makes the builder own a
   300vh scroll section + sticky viewport; scroll drives a full-rotation
@@ -17,6 +17,20 @@ zig build run        # http://127.0.0.1:8080  (override with -- --port 9090)
   pick.
 - **`/orbit`** — plain interactive orbit/pick. `scrub(false)` + `autoRotate(0.2)`:
   the model spins gently until you grab it.
+- **`/wireframe`** — wireframe overlay. The same `demo.vmesh` + `GlScene` with
+  `.wireframe(.{.color})` applied; demonstrates the wireframe mode without
+  changing the mesh.
+- **`/ortho`** — orthographic (parallel) projection. `demo.vmesh` rendered with
+  `.projection(.{.mode = .orthographic})`; depth cues disappear and parallel
+  lines stay parallel.
+- **`/clip`** — clipping planes. `shadow.vmesh` (a cube + floor) with
+  `.clipPlanes(&.{...})` — a diagonal plane cuts through the cube, revealing
+  the interior cross-section.
+- **`/shadow`** — directional depth-mapped shadow. `shadow.vmesh` lit by a
+  directional light with PCF shadow mapping; the cube casts a soft shadow onto
+  the floor plane.
+- **`/skin`** — skeletal skinning. `skinbar.vmesh` (a 3-joint bar mesh) driven
+  by the `GlSkin` island, which runs a keyframe animation loop.
 
 ## What it demonstrates
 
@@ -59,19 +73,21 @@ page** (the framework `build.zig` invariant). Each route here hosts exactly one
 
 ```
 build.zig                  mirrors the framework build; adds the gl_core chunk
-                           module + the gl asset pipeline + framework-chunk fallback
+                           module + the gl asset pipeline + framework-chunk fallback;
+                           gen_shadow_glb + gen_skin_glb fixture generators
 build.zig.zon              package manifest
 src/app/api.zig            re-exports routes/components/islands; empty Actions
-src/app/islands.zig        GlScene registry entry (typed Props mirror)
-src/app/components.zig     the two SSR pages + document shell
-src/app/routes.zig         "/" and "/orbit"
+src/app/islands.zig        GlScene + GlSkin registry entries
+src/app/components.zig     all seven SSR pages + document shell
+src/app/routes.zig         "/", "/orbit", "/wireframe", "/ortho", "/clip",
+                           "/shadow", "/skin"
 ```
 
 This example ships **no chunk source and no gl tools of its own**. The build
-resolves the island chunk example-local → framework
-(`../../src/client/islands/GlScene.zig`, used here verbatim) → `_default`, and
-runs the framework's `gen_demo_glb` / `gen_demo_hdr` / `gl_asset_gen` tools and
-`src/core/gl/gl.zig` directly by relative path.
+resolves island chunks example-local → framework → `_default`, and runs the
+framework's `gen_demo_glb` / `gen_shadow_glb` / `gen_skin_glb` /
+`gen_demo_hdr` / `gl_asset_gen` tools and `src/core/gl/gl.zig` directly by
+relative path.
 
 ## Guides
 

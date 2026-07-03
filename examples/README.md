@@ -1,6 +1,6 @@
 # Verve examples
 
-Fourteen self-contained sample apps. Each is a regular Zig project — a
+Fifteen self-contained sample apps. Each is a regular Zig project — a
 `build.zig`, a `build.zig.zon`, and a `src/app/` tree with the
 `Actions` / `routes` / `components` triple the framework expects.
 
@@ -37,9 +37,9 @@ generate a scaffolded variant.
 | [`keystrokes/`](keystrokes/README.md) | JS → wasm string passing via shared memory                            | ~440 B |
 | [`client-runtime/`](client-runtime/README.md) | All v0.1.30 primitives in one island — typed IPC, events-with-data, timers/storage/clipboard, forms/measurement, JS interop, chunk arena + drag-drop | ~3.6 KB |
 | [`islands-demo/`](islands-demo/README.md) | Island stack end-to-end — `encodeProps`/`decodeProps` typed props, `ctx.islandState`/`islandStateValue` resource-state, per-island lifecycle, chunk-side click handler, **two** independent Counter islands (shared component, independent state via per-vid namespacing) | ~3 KB |
-| [`viz-live/`](viz-live/README.md) | Live `verve.viz` graph over **SSE push** — `/push?channel=viz` broadcast hub, seq-ordered wire deltas (`diffGraphs`/`writeDeltaJson`), snapshot resync on gaps, plus the full interactive island (pointer-captured drag, dblclick collapse, layout-cycle tweens) reused from the framework | ~107 KB |
+| [`viz-live/`](viz-live/README.md) | `verve.viz` graph, three routes — **`/`**: live SSE deltas, seq-ordered wire diffs, snapshot resync, full interactive island (drag, dblclick collapse, layout-cycle tweens); **`/multi`**: two independent `VizGraphInteractive` islands, multi-parent-aware collapse + orthogonal edge routing; **`/canvas`**: `VizGraphCanvas` canvas2d path, 1 500-node server-authored graph + live binary streaming via `/viz/live-graph.bin` | ~107 KB |
 | [`anim-landing/`](anim-landing/README.md) | A `verve.anim` **landing page** — the whole plugin set composed like a real site: ScrollSmoother + parallax, SplitText hero, scroll-gated staggers, scrubbed MotionPath + MorphSVG, transform-pinned panel with points snap, zero-wasm Draggable with inertia + drop zones, and one FLIP gallery island (shuffle + enter/leave). Everything but the gallery is declarative SSR | ~10 KB |
-| [`gl-viewer/`](gl-viewer/README.md) | Standalone declarative **3D product viewer** — `ctx.glScene` builder, PBR + IBL `.venv` environment, orbit drag + wheel zoom, click pick + hover, scroll-scrub turntable (`verve.anim` ScrollTrigger fusion), poster swap on context loss. Reuses the framework `GlScene` chunk + asset pipeline; ships no custom client wasm | — |
+| [`gl-viewer/`](gl-viewer/README.md) | `verve.gl` curated demos, seven routes — **`/`**: scroll-scrub turntable, PBR + IBL, pick + hover; **`/orbit`**: plain auto-rotate orbit; **`/wireframe`**: wireframe overlay; **`/ortho`**: orthographic projection; **`/clip`**: diagonal clip plane (interior cross-section); **`/shadow`**: directional PCF shadow map; **`/skin`**: skeletal skinning (`GlSkin` island, 3-joint bar) | — |
 
 The wasm-driven examples each ship their own `src/client/main.zig`
 overriding the framework's default client. The framework's server,

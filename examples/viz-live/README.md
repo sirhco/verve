@@ -1,16 +1,31 @@
 # viz-live — live graph streaming over SSE push
 
-The smallest complete app that streams **server-pushed wire deltas** into an
-interactive `verve.viz` graph. One route, one island, one server function —
-plus the framework's `/push` broadcast hub doing the realtime work.
+A `verve.viz` graph demo covering three rendering modes: interactive SVG with
+live SSE deltas, multi-instance SVG with multi-parent-aware collapse and
+orthogonal edge routing, and a canvas2d render path with live binary streaming.
 
 ```sh
 zig build run        # http://127.0.0.1:8080
 ```
 
-Click **● live**. The server starts mutating its graph once per second and
-broadcasts the diff; the nodes appear and disappear on screen while zoom,
-pan, selection, and subtree collapse all survive every tick.
+## Routes
+
+- **`/`** — interactive SVG graph. Click **● live** to start the server's
+  once-per-second mutation cycle; wire deltas arrive over SSE and the graph
+  updates in place while zoom, pan, selection, and subtree collapse all survive
+  every tick. The initial graph (small dependency topology) is SSR-rendered so
+  it appears before any wasm loads.
+- **`/multi`** — two independent `VizGraphInteractive` islands on one page.
+  Graph 1 uses a multi-parent topology (both `server` and `viz` feed into
+  `client`): double-click `server` to collapse its subtree — `client` stays
+  visible because the `viz` parent remains open. Graph 2 uses
+  `edge_routing = .orthogonal`, routing edges as Manhattan runs with rounded
+  corners instead of straight lines.
+- **`/canvas`** — canvas2d render path (`VizGraphCanvas` island). On load it
+  fetches the server-authored graph from `/viz/graph.bin` (1 500 nodes,
+  2 949 edges), lays it out, and paints it to a `<canvas>`. Click **● live**
+  to stream live binary frames from `/viz/live-graph.bin` (a 256-node live
+  model); the canvas repaints each frame.
 
 ## What it demonstrates
 
@@ -40,10 +55,18 @@ pan, selection, and subtree collapse all survive every tick.
   seq-stamped snapshot from `/api/vizGraph` via `fetchToExport`. Kill and
   restart the server while live — EventSource reconnects (`Last-Event-ID`
   replays from the hub's 32-frame ring) and the graph recovers.
-- **SSR-first** — the page renders the full graph with JS off; the SSR tree
-  and the hydration props share one `graphPositions` call so the island's
+- **SSR-first** — the `/` page renders the full graph with JS off; the SSR
+  tree and the hydration props share one `graphPositions` call so the island's
   model lands exactly on the server-rendered pixels.
-- **The rest of the interactive island**, since it comes along for free:
+- **Multi-parent-aware collapse** (`/multi`) — the `VizGraphInteractive` chunk
+  tracks parent counts; collapsing a node hides its children only when all
+  parents are collapsed.
+- **Orthogonal edge routing** (`/multi`) — `edge_routing = .orthogonal`
+  switches the layout engine to route edges as axis-aligned segments.
+- **Canvas2d render path** (`/canvas`) — `VizGraphCanvas` fetches a binary
+  graph blob, lays it out server-side, and paints to `<canvas>` rather than
+  SVG; live frames stream as binary over the vizcanvas publisher.
+- **The rest of the interactive island**, since it comes along for free on `/`:
   pointer-captured pan/drag, hover tooltips, click select, double-click
   subtree collapse (`+N` badge), ⟳ layout cycling with tweens (the chunk
   recomputes tree/radial/dag layouts via the `viz_core` module), and local
@@ -55,15 +78,16 @@ pan, selection, and subtree collapse all survive every tick.
 build.zig                  mirrors the framework build; adds the viz_core
                            chunk module + framework-chunk source fallback
 src/app/api.zig            evolving graph model, vizAdvanceTick (publisher
-                           opt-in), Actions.vizGraph (seq-stamped snapshot)
-src/app/islands.zig        VizGraphInteractive registry entry (typed Props)
-src/app/components.zig     SSR page: island + controls + CSS
-src/app/routes.zig         "/"
+                           opt-in), vizCanvasAdvanceTick + packLiveGraph
+                           (vizcanvas publisher), Actions.vizGraph (snapshot)
+src/app/islands.zig        VizGraphInteractive + VizGraphCanvas registry entries
+src/app/components.zig     SSR pages: index, vizMulti, vizCanvas
+src/app/routes.zig         "/", "/multi", "/canvas"
+src/app/viz_live.zig       live graph model for the canvas binary stream
 ```
 
-No chunk source of its own: `build.zig` resolves the island chunk
-example-local → framework (`../../src/client/islands/VizGraphInteractive.zig`,
-used here) → `_default` stub.
+No chunk source of its own: `build.zig` resolves the island chunks
+example-local → framework → `_default` stub.
 
 ## Guides
 
