@@ -4,6 +4,26 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.43.1] - 2026-07-03
+
+### Fixed
+
+- **Examples unbroken + refreshed.** All 15 `examples/*` apps had drifted from the framework
+  build pattern and no longer compiled (accumulated across several releases): the server
+  `assets` module needed a `worker_js` embed, the `viz_assets` module import (added in
+  v0.42.0) had no example wiring, and the `gl_asset_gen` CLI moved to directory mode. Every
+  example now builds again. (Examples aren't in the main build/test gate, so this had
+  accumulated silently — the framework itself was unaffected.)
+
+### Added
+
+- **Example coverage for recent viz + gl features.** `examples/viz-live` now shows the
+  v0.38–v0.43 viz work — multiple interactive graphs per page, routed `<path>` edges,
+  multi-parent-aware collapse, and the canvas render path (server-authored graph fetched from
+  `/viz/graph.bin`, live streaming via `/viz/live-graph.bin`). `examples/gl-viewer` gained
+  curated gl demos: wireframe, orthographic camera, clipping planes, directional shadows, and
+  skeletal skinning. READMEs refreshed.
+
 ## [0.43.0] - 2026-07-03
 
 ### Added
