@@ -49,6 +49,11 @@ const Inst = struct {
     panning: bool = false,
     last_x: f64 = 0,
     last_y: f64 = 0,
+    // ── live streaming ───────────────────────────────────────────────────────
+    live: bool = false,
+    fit_next: bool = false,
+    last_seq: u64 = 0,
+    ticking: bool = false,
 };
 
 // ── slot machinery ───────────────────────────────────────────────────────────
@@ -124,6 +129,9 @@ export fn hydrate(props_ptr: u32, props_len: u32, root_id: u32) void {
     inst.hover = -1;
     inst.select = -1;
     inst.panning = false;
+    // First load must fit the camera (fit_next=true before the fetch so
+    // vizcanvas_graph_ready calls fitCamera on the initial graph).
+    inst.fit_next = true;
     // Fetch the server-authored graph binary into the 4 MB asset region (not
     // the 8 KB scratch). The bridge delivers (ptr,len) to vizcanvas_graph_ready
     // after the fetch completes; that export parses the canvas_buf layout and
@@ -167,8 +175,21 @@ export fn vizcanvas_graph_ready(ptr: u32, len: u32) void {
         inst.et[i] = std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little);
         off += 8;
     }
-    fitCamera(inst);
-    if (inst.canvas_handle != null) {
+    // Fit the camera only when requested (initial load and first live snapshot);
+    // subsequent live updates preserve pan/zoom so the view does not jump.
+    if (inst.fit_next) {
+        fitCamera(inst);
+        inst.fit_next = false;
+    }
+    // Reset hover/select on every graph_ready (node indices may shift between
+    // snapshots — stale indices would highlight the wrong node).
+    inst.hover = -1;
+    inst.select = -1;
+    // Start the RAF tick loop only if it is not already running. Repeated
+    // live refetches must not stack independent loops (each would draw
+    // independently and double-submit bridge calls every frame).
+    if (!inst.ticking and inst.canvas_handle != null) {
+        inst.ticking = true;
         var buf: [96]u8 = undefined;
         const args = std.fmt.bufPrint(&buf, "{{\"island\":\"VizGraphCanvas\",\"export\":\"vizcanvas_tick\",\"on\":1,\"vid\":{d}}}", .{inst.vid}) catch return;
         var out: [16]u8 = undefined;
@@ -201,6 +222,40 @@ fn genGraph(inst: *Inst) void {
             inst.e += 1;
         }
     }
+}
+
+// ── live streaming ───────────────────────────────────────────────────────────
+
+/// Toggle live streaming for this canvas island. ON: subscribe to the
+/// `vizcanvas` push channel so each server tick delivers a `vizcanvas_dirty`
+/// ping; set fit_next=true so the first live snapshot re-fits the view (the
+/// live graph is a different/smaller graph than the static 1500-node one);
+/// trigger an immediate refetch so the live graph appears without waiting a
+/// tick. OFF: unsubscribe. Mirrors `viz_toggle_live` in VizGraphInteractive.
+export fn vizcanvas_toggle_live() void {
+    const inst = current orelse return;
+    inst.live = !inst.live;
+    if (inst.live) {
+        _ = verve.pushSubscribe("vizcanvas", "VizGraphCanvas", "vizcanvas_dirty", inst.vid);
+        inst.fit_next = true;
+        // Immediate refetch: show the live graph without waiting for the first tick.
+        verve.fetchBinaryToExport("/viz/live-graph.bin", "VizGraphCanvas", "vizcanvas_graph_ready", inst.vid);
+    } else {
+        verve.pushUnsubscribe("vizcanvas", "VizGraphCanvas", inst.vid);
+    }
+    if (verve.queryRef(@as([]const u8, "vizcanvas-live-btn"))) |h| verve.setRefClass(h, "live-on", inst.live);
+}
+
+/// Ping handler — receives the small `{"seq":N}` frame pushed by the server
+/// each tick (delivered via callIslandExport → fits in island scratch). Triggers
+/// a refetch of the live graph binary. `fit_next` is intentionally NOT set here
+/// so the camera stays where the user left it between live updates.
+export fn vizcanvas_dirty(ptr: u32, len: u32) void {
+    _ = ptr;
+    _ = len;
+    const inst = current orelse return;
+    // fit_next stays false → preserve pan/zoom across live mutations.
+    verve.fetchBinaryToExport("/viz/live-graph.bin", "VizGraphCanvas", "vizcanvas_graph_ready", inst.vid);
 }
 
 /// Fit the camera so the graph's bounding box fills the view (with margin).

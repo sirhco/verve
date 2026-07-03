@@ -317,8 +317,12 @@ fn vizCanvasIsland(ctx: *const verve.Context, heading: []const u8) !*verve.Node 
             .attr("z-on-wheel", "vizcanvas_wheel")
             .attr("style", "width:100%;max-width:640px;aspect-ratio:32/21;display:block;background:#0d1117;border-radius:8px;touch-action:none;cursor:grab;"),
     });
+    const controls = ctx.div().class("viz-controls").children(.{
+        ctx.el("button").attr("z-on-click", "vizcanvas_toggle_live").attr("data-ref", "vizcanvas-live-btn").text("● live"),
+    });
     const inner = ctx.section().class("card").children(.{
         ctx.h2(heading),
+        controls,
         canvas,
     });
     return verve.island(ctx, .{ .name = "VizGraphCanvas" }, inner);
@@ -327,13 +331,16 @@ fn vizCanvasIsland(ctx: *const verve.Context, heading: []const u8) !*verve.Node 
 /// verve.viz canvas render path demo — /viz-canvas. A ~1500-node procedural
 /// graph (deterministic jittered grid, index-seeded — no RNG at SSR) drawn to a
 /// single canvas2d via the VizGraphCanvas island. Pan/zoom/hover/select.
+/// Click ● live to subscribe to the vizcanvas push channel and stream a live
+/// mutating 256-node graph from /viz/live-graph.bin.
 pub fn vizCanvas(ctx: *const verve.Context) !*verve.Node {
     const island = try vizCanvasIsland(ctx, "Large graph — canvas2d render path");
     return ctx.main_().class("home").children(.{
         ctx.h1("verve.viz — canvas render"),
         ctx.p().text("A ~1500-node server-authored graph fetched from /viz/graph.bin " ++
             "and drawn to a single canvas2d (vs the SVG-DOM path): one batched draw " ++
-            "call per frame. Drag to pan, wheel to zoom, hover/click a node to highlight."),
+            "call per frame. Drag to pan, wheel to zoom, hover/click a node to highlight. " ++
+            "Click ● live to subscribe to live streaming (256-node graph, updates each tick)."),
         island,
     });
 }
