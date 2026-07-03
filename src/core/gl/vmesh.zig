@@ -5,9 +5,9 @@
 //! preserve alignment relative to the buffer base, and
 //! `bvh.nodesFromBytes`/`triPermFromBytes` assert on the absolute pointer.
 //!
-//! Header layout (108 bytes, all integers little-endian u32):
+//! Header layout (116 bytes, all integers little-endian u32):
 //!   [0..4]   magic "VMSH"
-//!   [4..8]   version u32 = 16
+//!   [4..8]   version u32 = 17
 //!   [8..12]  vertex_count
 //!   [12..16] index_count
 //!   [16..20] submesh_count
@@ -34,6 +34,9 @@
 //!   [100..104] geo_codec u32 (GeoCodec; 0 = raw indices)  [v16+]
 //!   [104..108] index_comp_len u32 (compressed index blob byte length; 0 when
 //!              geo_codec == none — index section is index_count × 2 raw bytes)  [v16+]
+//!   [108..112] vertex_codec u32 (VertexCodec; 0 = raw f32 vertices)  [v17+]
+//!   [112..116] vertex_comp_len u32 (quantized vertex blob byte length; 0 when
+//!              vertex_codec == none — vertex section is vertex_count × stride raw)  [v17+]
 //!
 //! Morph section @ morph_off (16-aligned):
 //!   Deltas blob (texture-upload-ready, target-major then vertex-major):
@@ -82,18 +85,25 @@ const command = @import("command.zig");
 const geo_codec = @import("geo_codec.zig");
 
 pub const magic = "VMSH";
-pub const version: u32 = 16;
+pub const version: u32 = 17;
 
-/// Per-buffer geometry compression codec (v16+). `none` = raw bytes (every
-/// v13–v15 file, and uncompressed v16). `index_delta` = the index buffer is
-/// stored as a `geo_codec` delta+zigzag+varint blob of `index_comp_len` bytes
-/// at `index_off`, decoded to `index_count` u16 by `Reader.initAlloc`.
+/// Index-buffer compression codec (v16+). `none` = raw u16 (every v13–v15 file,
+/// and uncompressed v16+). `index_delta` = the index buffer is stored as a
+/// delta+zigzag+varint blob of `index_comp_len` bytes at `index_off`, decoded to
+/// `index_count` u16 by `Reader.initAlloc`.
 pub const GeoCodec = enum(u32) { none = 0, index_delta = 1 };
+
+/// Vertex-buffer compression codec (v17+). `none` = raw f32 stride-48/56 (every
+/// v13–v16 file, and uncompressed v17+). `quant` = the vertex buffer is stored
+/// as a lossy quantized blob (pos u16 over AABB, normal/tangent i8 snorm, uv u16
+/// over UV-AABB) of `vertex_comp_len` bytes at `vertex_off`, decoded back to the
+/// GPU-uploadable f32 section by `Reader.initAlloc`.
+pub const VertexCodec = enum(u32) { none = 0, quant = 1 };
 
 /// Compression options threaded into `pack` via `packCompressed`. Defaults keep
 /// the raw layout so existing `pack(...)` callers are byte-identical to v15
-/// (aside from the version bump + 8-byte header growth).
-pub const GeoOpts = struct { compress_indices: bool = false };
+/// (aside from the version bump + header growth).
+pub const GeoOpts = struct { compress_indices: bool = false, compress_vertices: bool = false };
 
 /// Returns the number of f16 values per (target, vertex) morph record.
 /// v13: 6 (pos3 + nrm3). v14+: 9 (pos3 + nrm3 + tan3).
@@ -103,14 +113,15 @@ pub fn morphRecordF16(ver: u32) u32 {
 
 pub const vertex_stride: u32 = 48; // pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40
 pub const skinned_vertex_stride: u32 = 56; // …48, then joints uint8x4 @48, weights unorm8x4 @52
-pub const header_size: u32 = 108;
+pub const header_size: u32 = 116;
 
 /// Returns the on-disk header size in bytes for the given vmesh version.
-/// v16+ added geo_codec + index_comp_len at [100..108] → 108-byte header.
+/// v17+ added vertex_codec + vertex_comp_len at [108..116] → 116-byte header.
+/// v16 added geo_codec + index_comp_len at [100..108] → 108-byte header.
 /// v15 added 3 LOD fields at [88..100] → 100-byte header.
 /// v13/v14 have an 88-byte header.
 pub fn headerSize(ver: u32) u32 {
-    return if (ver >= 16) 108 else if (ver >= 15) 100 else 88;
+    return if (ver >= 17) 116 else if (ver >= 16) 108 else if (ver >= 15) 100 else 88;
 }
 pub const submesh_size: u32 = 84;
 pub const tex_entry_size: u32 = 20;
@@ -265,7 +276,7 @@ pub fn packCompressed(
     morph: ?MorphData,
     lod: ?LodData,
 ) ![]u8 {
-    return packImpl(alloc, vertices, indices, submeshes, textures, bvh_nodes, tri_perm, names, skinned, joints, weights, skel, anim, instances, instance_count, morph, lod, .{ .compress_indices = true });
+    return packImpl(alloc, vertices, indices, submeshes, textures, bvh_nodes, tri_perm, names, skinned, joints, weights, skel, anim, instances, instance_count, morph, lod, .{ .compress_indices = true, .compress_vertices = true });
 }
 
 fn packImpl(
@@ -323,17 +334,25 @@ fn packImpl(
     const index_blob: ?[]u8 = if (geo.compress_indices) try geo_codec.encodeIndices(alloc, indices) else null;
     defer if (index_blob) |b| alloc.free(b);
 
+    // Optional vertex-buffer quantization (v17 vertex codec), encoded UP FRONT
+    // for the same reason: the section byte length flows through the sequential
+    // aligned-offset computation below with no post-hoc patching.
+    const vertex_codec_tag: VertexCodec = if (geo.compress_vertices) .quant else .none;
+    const vertex_blob: ?[]u8 = if (geo.compress_vertices) try geo_codec.encodeVertices(alloc, vertices, skinned, joints, weights) else null;
+    defer if (vertex_blob) |b| alloc.free(b);
+
     // Layout: header(108, v16) → submesh_table → tex_table → [align16] → vertices →
     //   [align4] → indices → [align4] → tex_blob → [align16] → bvh_nodes →
     //   tri_perm → [align4] → name_table → name_blob → [align16] → skeleton →
     //   [align16] → anim → [align16] → instances → [align16] → morph → [align16] → lod
-    // pack() always writes v16 (header_size == 108). The index section is either
-    // index_count×2 raw u16 or a `geo_codec` compressed blob (index_bytes).
+    // pack() always writes v17 (header_size == 116). The vertex section is either
+    // vertex_count×stride raw f32 or a `vertex_codec` quantized blob; the index
+    // section is either index_count×2 raw u16 or a `geo_codec` compressed blob.
     const submesh_table_off: u32 = header_size;
     const tex_table_off: u32 = submesh_table_off + submesh_count * submesh_size;
     const after_tex_table: u32 = tex_table_off + texture_count * tex_entry_size;
     const vertex_off: u32 = alignUp(after_tex_table, 16);
-    const vertex_bytes: u32 = vertex_count * stride;
+    const vertex_bytes: u32 = if (vertex_blob) |b| @intCast(b.len) else vertex_count * stride;
     const after_vertices: u32 = vertex_off + vertex_bytes;
     const index_off: u32 = alignUp(after_vertices, 4);
     const index_bytes: u32 = if (index_blob) |b| @intCast(b.len) else index_count * 2;
@@ -494,6 +513,9 @@ fn packImpl(
     // v16 geometry-compression header fields.
     std.mem.writeInt(u32, buf[100..104], @intFromEnum(geo_codec_tag), .little);
     std.mem.writeInt(u32, buf[104..108], if (index_blob) |b| @as(u32, @intCast(b.len)) else 0, .little);
+    // v17 vertex-compression header fields.
+    std.mem.writeInt(u32, buf[108..112], @intFromEnum(vertex_codec_tag), .little);
+    std.mem.writeInt(u32, buf[112..116], if (vertex_blob) |b| @as(u32, @intCast(b.len)) else 0, .little);
 
     // Write submesh table right after the header
     for (submeshes, 0..) |s, i| {
@@ -543,9 +565,12 @@ fn packImpl(
         tex_blob_cursor += data_len;
     }
 
-    // Write vertex data. Non-skinned: flat 48-byte stride blob. Skinned: per
-    // vertex write the 48 base bytes, then joints[v] (4 B) + weights[v] (4 B).
-    if (!skinned) {
+    // Write vertex data. Quantized blob when the vertex codec is active (already
+    // carries skin data); else raw. Non-skinned raw: flat 48-byte stride blob.
+    // Skinned raw: per vertex the 48 base bytes, then joints[v] + weights[v].
+    if (vertex_blob) |b| {
+        @memcpy(buf[vertex_off..][0..b.len], b);
+    } else if (!skinned) {
         const verts_bytes = std.mem.sliceAsBytes(vertices);
         @memcpy(buf[vertex_off..][0..verts_bytes.len], verts_bytes);
     } else {
@@ -770,15 +795,18 @@ pub const Reader = struct {
     lod_off_: u32, // v15+; 0 when absent
     lod_level_count_: u32, // v15+; 0 when absent
     lod_submesh_count_: u32, // v15+; 0 when absent
-    version_: u32, // file format version (13–16)
-    geo_codec_: GeoCodec = .none, // v16+; .none for v13–v15 and uncompressed v16
+    version_: u32, // file format version (13–17)
+    geo_codec_: GeoCodec = .none, // v16+; .none for v13–v15 and uncompressed v16+
     index_comp_len_: u32 = 0, // v16+; compressed index blob byte length (0 when raw)
+    vertex_codec_: VertexCodec = .none, // v17+; .none for v13–v16 and uncompressed v17+
+    vertex_comp_len_: u32 = 0, // v17+; quantized vertex blob byte length (0 when raw)
     bytes: []const u8,
-    // Owned decode buffer for a compressed index section (set only by initAlloc
-    // when geo_codec_ != .none). `indices` aliases this (as bytes) instead of
-    // `bytes`. Kept as []u16 so free matches the []u16 allocation alignment.
+    // Owned decode buffers for compressed sections (set only by initAlloc when the
+    // matching codec != .none). `indices`/`vertices` alias these (as bytes) instead
+    // of `bytes`. index buf kept as []u16 so free matches its allocation alignment.
     // Freed by deinit(). null for the zero-copy raw path.
     owned_index_buf: ?[]u16 = null,
+    owned_vertex_buf: ?[]u32 = null, // 4-aligned decoded f32 section (see geo_codec)
     alloc_: ?std.mem.Allocator = null,
 
     pub const Error = error{ BadMagic, BadVersion, Truncated, BadTexIndex, CompressedNeedsAlloc, Corrupt, OutOfMemory };
@@ -797,12 +825,14 @@ pub const Reader = struct {
         return parse(alloc, bytes);
     }
 
-    /// Free any owned decode buffer. Safe to call on a raw (init) Reader (no-op).
+    /// Free any owned decode buffers. Safe to call on a raw (init) Reader (no-op).
     pub fn deinit(self: *Reader) void {
-        if (self.owned_index_buf) |b| {
-            if (self.alloc_) |a| a.free(b);
-            self.owned_index_buf = null;
+        if (self.alloc_) |a| {
+            if (self.owned_index_buf) |b| a.free(b);
+            if (self.owned_vertex_buf) |b| a.free(b);
         }
+        self.owned_index_buf = null;
+        self.owned_vertex_buf = null;
     }
 
     fn parse(maybe_alloc: ?std.mem.Allocator, bytes: []const u8) Error!Reader {
@@ -852,7 +882,7 @@ pub const Reader = struct {
         const lod_level_count_h = if (ver >= 15 and blen >= 100) std.mem.readInt(u32, bytes[92..96], .little) else 0;
         const lod_submesh_count_h = if (ver >= 15 and blen >= 100) std.mem.readInt(u32, bytes[96..100], .little) else 0;
 
-        // v16 geometry-compression header fields (raw for v13–v15).
+        // v16 index-compression header fields (raw for v13–v15).
         const geo_codec_h = if (ver >= 16 and blen >= 108) std.mem.readInt(u32, bytes[100..104], .little) else 0;
         const index_comp_len_h = if (ver >= 16 and blen >= 108) std.mem.readInt(u32, bytes[104..108], .little) else 0;
         const geo_tag: GeoCodec = switch (geo_codec_h) {
@@ -860,13 +890,22 @@ pub const Reader = struct {
             1 => .index_delta,
             else => return error.Corrupt,
         };
+        // v17 vertex-compression header fields (raw for v13–v16).
+        const vertex_codec_h = if (ver >= 17 and blen >= 116) std.mem.readInt(u32, bytes[108..112], .little) else 0;
+        const vertex_comp_len_h = if (ver >= 17 and blen >= 116) std.mem.readInt(u32, bytes[112..116], .little) else 0;
+        const vertex_tag: VertexCodec = switch (vertex_codec_h) {
+            0 => .none,
+            1 => .quant,
+            else => return error.Corrupt,
+        };
 
         // Bounds-check vertex data (u64 to prevent u32 multiply wrap). Skinned
         // meshes use the wider stride-56 layout.
         const stride: u64 = if (skinned) @as(u64, skinned_vertex_stride) else @as(u64, vertex_stride);
-        const need_verts: u64 = @as(u64, vertex_count) * stride;
-        if (@as(u64, vertex_off) > blen or need_verts > blen - @as(u64, vertex_off)) return error.Truncated;
-        const vertex_bytes: usize = @intCast(need_verts);
+        // ON-DISK vertex section: raw = vertex_count×stride; quantized = vertex_comp_len.
+        // Decode (if quantized) happens at the very end, alongside indices.
+        const on_disk_verts: u64 = if (vertex_tag == .none) @as(u64, vertex_count) * stride else @as(u64, vertex_comp_len_h);
+        if (@as(u64, vertex_off) > blen or on_disk_verts > blen - @as(u64, vertex_off)) return error.Truncated;
 
         // Bounds-check the ON-DISK index section. Raw = index_count×2 u16 bytes;
         // compressed = index_comp_len codec bytes. Decode (if compressed) happens
@@ -1041,10 +1080,24 @@ pub const Reader = struct {
             if (@as(u64, lod_off_h) > blen or need_lod > blen - @as(u64, lod_off_h)) return error.Truncated;
         }
 
-        // Materialize the index slice LAST (all other validation passed). Raw =
-        // zero-copy alias into `bytes`. Compressed = decode into an owned heap
-        // buffer via `maybe_alloc` (required — `init` passes null → error).
+        // Materialize the vertex + index slices LAST (all other validation passed).
+        // Raw = zero-copy alias into `bytes`. Compressed = decode into an owned heap
+        // buffer via `maybe_alloc` (required — `init` passes null → error). On any
+        // decode error the errdefer frees whatever was already decoded (no leak).
         var owned_idx: ?[]u16 = null;
+        var owned_vtx: ?[]u32 = null;
+        errdefer if (maybe_alloc) |a| {
+            if (owned_idx) |b| a.free(b);
+            if (owned_vtx) |b| a.free(b);
+        };
+        const vertices_slice: []const u8 = if (vertex_tag == .none)
+            bytes[vertex_off..][0..@intCast(on_disk_verts)]
+        else blk: {
+            const a = maybe_alloc orelse return error.CompressedNeedsAlloc;
+            const decoded = try geo_codec.decodeVertices(a, bytes[vertex_off..][0..@intCast(on_disk_verts)], vertex_count, skinned);
+            owned_vtx = decoded;
+            break :blk std.mem.sliceAsBytes(decoded);
+        };
         const indices_slice: []const u8 = if (geo_tag == .none)
             bytes[index_off..][0..@intCast(on_disk_idx)]
         else blk: {
@@ -1057,11 +1110,14 @@ pub const Reader = struct {
         return Reader{
             .vertex_count = vertex_count,
             .index_count = index_count,
-            .vertices = bytes[vertex_off..][0..vertex_bytes],
+            .vertices = vertices_slice,
             .indices = indices_slice,
             .geo_codec_ = geo_tag,
             .index_comp_len_ = index_comp_len_h,
+            .vertex_codec_ = vertex_tag,
+            .vertex_comp_len_ = vertex_comp_len_h,
             .owned_index_buf = owned_idx,
+            .owned_vertex_buf = owned_vtx,
             .alloc_ = maybe_alloc,
             .submeshes = bytes[sub_table_off..][0..sub_table_bytes],
             .submesh_count = sub_count,
@@ -1507,7 +1563,7 @@ test "round-trip: one submesh (full PBR fields), one texture" {
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&idx), r.indices);
 }
 
-test "vmesh v16: compressed indices round-trip (packCompressed → initAlloc)" {
+test "vmesh v17: compressed index + quantized vertex round-trip (packCompressed → initAlloc)" {
     const a = testing.allocator;
     const verts = [_]f32{
         0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0,
@@ -1534,40 +1590,48 @@ test "vmesh v16: compressed indices round-trip (packCompressed → initAlloc)" {
     const bytes = try packCompressed(a, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null, null);
     defer a.free(bytes);
 
-    // Header: v16, geo_codec = index_delta, index_comp_len > 0.
-    try testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, bytes[4..8], .little));
+    // Header: v17, index codec (lossless) + vertex codec (quant) both active.
+    try testing.expectEqual(@as(u32, 17), std.mem.readInt(u32, bytes[4..8], .little));
     try testing.expectEqual(@as(u32, @intFromEnum(GeoCodec.index_delta)), std.mem.readInt(u32, bytes[100..104], .little));
     try testing.expect(std.mem.readInt(u32, bytes[104..108], .little) > 0);
+    try testing.expectEqual(@as(u32, @intFromEnum(VertexCodec.quant)), std.mem.readInt(u32, bytes[108..112], .little));
+    try testing.expect(std.mem.readInt(u32, bytes[112..116], .little) > 0);
 
-    // Raw init refuses a compressed file; initAlloc decodes it losslessly.
+    // Raw init refuses a compressed file; initAlloc decodes both sections.
     try testing.expectError(error.CompressedNeedsAlloc, Reader.init(bytes));
     var r = try Reader.initAlloc(a, bytes);
     defer r.deinit();
+    // Index buffer is LOSSLESS.
     try testing.expectEqual(@as(u32, idx.len), r.index_count);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&idx), r.indices);
-    // Vertices are untouched by index compression.
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&verts), r.vertices);
+    // Vertices are quantized (lossy) → dequantized within epsilon of the source.
+    try testing.expectEqual(@as(u32, 3), r.vertex_count);
+    const rv = std.mem.bytesAsSlice(f32, r.vertices);
+    for (0..verts.len) |k| try testing.expect(@abs(rv[k] - verts[k]) <= 1e-3);
 }
 
-test "vmesh v16: raw pack still zero-copy; initAlloc accepts raw (no leak)" {
+test "vmesh v17: raw pack still zero-copy; initAlloc accepts raw (no leak)" {
     const a = testing.allocator;
     const verts = [_]f32{0} ** 24;
     const idx = [_]u16{ 0, 1, 0 };
     const bytes = try pack(a, &verts, &idx, &.{}, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null, null);
     defer a.free(bytes);
-    // geo_codec none for an uncompressed v16 file.
-    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[100..104], .little));
-    // init works (raw), and .indices aliases the file buffer (zero-copy).
+    // Both codecs none for an uncompressed v17 file.
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[100..104], .little)); // geo_codec
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[108..112], .little)); // vertex_codec
+    // init works (raw); .indices AND .vertices alias the file buffer (zero-copy).
     const r0 = try Reader.init(bytes);
     try testing.expect(r0.indices.ptr == bytes.ptr + std.mem.readInt(u32, bytes[28..32], .little));
+    try testing.expect(r0.vertices.ptr == bytes.ptr + std.mem.readInt(u32, bytes[24..28], .little));
     // initAlloc on a raw file allocates nothing → deinit is a no-op.
     var r1 = try Reader.initAlloc(a, bytes);
     defer r1.deinit();
     try testing.expect(r1.owned_index_buf == null);
+    try testing.expect(r1.owned_vertex_buf == null);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&idx), r1.indices);
 }
 
-test "vmesh v16: index compression shrinks a large sequential buffer" {
+test "vmesh v17: index compression shrinks a large sequential buffer" {
     const a = testing.allocator;
     // Sequential triangle strip: deltas are ±1 → 1 varint byte each vs 2 raw.
     var idx: [3000]u16 = undefined;
@@ -2028,7 +2092,7 @@ test "(j) v5 skinned round-trip: stride 56, 2-joint skeleton" {
     defer testing.allocator.free(bytes);
 
     // Header: version 14, skinned flag set, joint_count == 2.
-    try testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, bytes[4..8], .little));
+    try testing.expectEqual(@as(u32, 17), std.mem.readInt(u32, bytes[4..8], .little));
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[56..60], .little));
     try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[64..68], .little));
     // skeleton_off 16-aligned.
@@ -2100,7 +2164,7 @@ test "vmesh v9: CUBICSPLINE round-trip — in/point/out tangents + LINEAR regres
     defer testing.allocator.free(bytes);
 
     // Version must be 14.
-    try testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, bytes[4..8], .little));
+    try testing.expectEqual(@as(u32, 17), std.mem.readInt(u32, bytes[4..8], .little));
 
     const r = try Reader.init(bytes);
     try testing.expect(r.animPresent());
@@ -2196,7 +2260,7 @@ test "vmesh v10: submesh alpha_mode round-trips" {
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null, null);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 16), version);
+    try testing.expectEqual(@as(u32, 17), version);
     try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 1), reader.submesh(0).alpha_mode);
 }
@@ -2210,7 +2274,7 @@ test "vmesh v10: submesh alpha_cutoff round-trips" {
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null, null);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 16), version);
+    try testing.expectEqual(@as(u32, 17), version);
     try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 2), reader.submesh(0).alpha_mode);
     try testing.expectEqual(@as(f32, 0.3), reader.submesh(0).alpha_cutoff);
@@ -2239,7 +2303,7 @@ test "vmesh v11: submesh double_sided round-trips" {
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null, null);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 16), version);
+    try testing.expectEqual(@as(u32, 17), version);
     try testing.expectEqual(@as(u32, 84), submesh_size);
     try testing.expectEqual(@as(u32, 1), reader.submesh(0).double_sided);
 }
@@ -2275,7 +2339,7 @@ test "vmesh v12: instances section round-trips" {
     const bytes = try pack(testing.allocator, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &insts, 2, null, null);
     defer testing.allocator.free(bytes);
     const reader = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 16), version);
+    try testing.expectEqual(@as(u32, 17), version);
     try testing.expectEqual(@as(u32, 2), reader.instanceCount());
     const blob = reader.instances();
     try testing.expectEqual(@as(usize, 2 * 80), blob.len);
@@ -2409,7 +2473,7 @@ test "vmesh v13 morph section round-trips; pre-morph mesh reads as zero morphs" 
     defer testing.allocator.free(bytes);
 
     var r = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 16), r.fileVersion());
+    try testing.expectEqual(@as(u32, 17), r.fileVersion());
     try testing.expectEqual(@as(u32, 2), r.morphTargetCount());
     try testing.expectEqual(@as(u32, 3), r.morphVertexCount());
     try testing.expectEqual(@as(usize, 2 * 3 * 9 * @sizeOf(f16)), r.morphDeltas().len);
@@ -2574,7 +2638,7 @@ test "vmesh v14 morph tangent round-trip" {
     defer testing.allocator.free(bytes);
 
     var r = try Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 16), r.fileVersion());
+    try testing.expectEqual(@as(u32, 17), r.fileVersion());
     // Each record is 9 f16 = 18 bytes; 1 target × 2 vertices = 2 records = 36 bytes.
     try testing.expectEqual(@as(usize, 1 * 2 * 9 * @sizeOf(f16)), r.morphDeltas().len);
 
@@ -2625,7 +2689,7 @@ test "vmesh v15 LOD round-trip: 3 levels across 3 submeshes" {
     );
     defer alloc.free(bytes);
     const r = try Reader.init(bytes);
-    try std.testing.expectEqual(@as(u32, 16), r.version_);
+    try std.testing.expectEqual(@as(u32, 17), r.version_);
     try std.testing.expectEqual(@as(u32, 3), r.lodLevelCount());
     try std.testing.expectEqual(@as(f32, 0), r.lodLevel(0).dist_min_sq);
     try std.testing.expectEqual(@as(f32, 100), r.lodLevel(1).dist_min_sq);

@@ -1,15 +1,16 @@
-//! Verve-native geometry compression codec for `.vmesh` index buffers.
+//! Verve-native geometry compression codec for `.vmesh` (index + vertex buffers).
 //!
-//! Lossless delta + zigzag + LEB128-varint encoding of a u16 index stream.
-//! Meshopt-*style* (delta of consecutive indices), but Verve owns both ends
-//! (build-time encode in `vmesh.compressGeometry`, runtime decode in
-//! `vmesh.Reader.initAlloc`) so it is NOT bit-compatible with upstream
-//! meshoptimizer and needs no interop guarantee. Cache-optimized meshes have
-//! small consecutive index deltas, which zigzag+varint pack into 1 byte each.
+//! Verve owns both ends (build-time encode in `vmesh.packCompressed`, runtime
+//! decode in `vmesh.Reader.initAlloc`), so the wire is NOT bit-compatible with
+//! upstream meshoptimizer / Draco and needs no interop guarantee.
 //!
-//! Lossless => a native round-trip golden is the definitive correctness gate;
-//! no GPU-output verification required (decoded bytes are byte-identical to the
-//! raw index buffer, so every downstream draw is unchanged).
+//! - **Indices** (`encode/decodeIndices`): LOSSLESS delta + zigzag + LEB128
+//!   varint of the u16 stream. Cache-optimized meshes have small consecutive
+//!   deltas → ~1 byte each. Decoded bytes are byte-identical → a native
+//!   round-trip golden is the definitive gate, no GPU verification needed.
+//! - **Vertices** (`encode/decodeVertices`): LOSSY quantization — pos u16 over
+//!   the mesh AABB, normal/tangent i8 snorm, uv u16 over the UV AABB (48 B → 17 B
+//!   base). Gate = a within-epsilon round-trip PLUS a browser visual check.
 
 const std = @import("std");
 
@@ -116,4 +117,217 @@ test "round-trip: u16 boundaries" {
 
 test "round-trip: descending" {
     try expectRoundTrip(&[_]u16{ 100, 90, 80, 0, 65535 });
+}
+
+// ── Vertex quantization codec (lossy) ────────────────────────────────────────
+//
+// The GPU-uploadable base vertex is 48 B of f32 (stride, layout):
+//   pos f32×3 @0, normal f32×3 @12, tangent f32×4 @24 (w = ±1 handedness),
+//   uv f32×2 @40.
+// Quantized to 17 B:
+//   pos u16×3 over the mesh AABB, normal i8×3 snorm, tangent i8×3 snorm (xyz)
+//   + tan_w i8 (±127 = handedness ±1), uv u16×2 over the UV AABB.
+// Skinned meshes append the raw joints u8×4 + weights u8×4 (NOT quantized) → 25 B.
+// Blob = [dequant header 40 B: pos_min f32×3, pos_ext f32×3, uv_min f32×2,
+//   uv_ext f32×2][vertex_count × (17 | 25) B]. decodeVertices reconstructs the
+// exact stride-48/56 f32(+u8) section that the raw pack path would have written.
+//
+// LOSSY (quantization rounding) → the native gate is a within-epsilon round-trip
+// plus a browser visual check, NOT a byte-exact golden.
+
+pub const vq_dequant_hdr: usize = 40; // 10 f32
+pub const vq_quant_base: usize = 17; // per-vertex quantized base bytes
+pub const vq_skin_extra: usize = 8; // joints u8×4 + weights u8×4 (raw)
+
+fn quantU16(v: f32, min: f32, ext: f32) u16 {
+    const t = (v - min) / ext; // ext already guarded != 0
+    const s = std.math.clamp(t, 0.0, 1.0) * 65535.0;
+    return @intFromFloat(@round(s));
+}
+
+fn dequantU16(q: u16, min: f32, ext: f32) f32 {
+    return min + (@as(f32, @floatFromInt(q)) / 65535.0) * ext;
+}
+
+fn snormI8(v: f32) i8 {
+    const s = std.math.clamp(v, -1.0, 1.0) * 127.0;
+    return @intFromFloat(@round(s));
+}
+
+fn snormF32(b: i8) f32 {
+    return @max(@as(f32, @floatFromInt(b)) / 127.0, -1.0);
+}
+
+/// Quantize a base-f32 vertex array (12 f32/vertex) + optional skin data into a
+/// compressed blob. Caller owns the result.
+pub fn encodeVertices(
+    alloc: std.mem.Allocator,
+    vertices: []const f32, // len % 12 == 0
+    skinned: bool,
+    joints: []const [4]u8,
+    weights: []const [4]u8,
+) ![]u8 {
+    const vc = vertices.len / 12;
+    // Position + UV AABB.
+    var pmin = [3]f32{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) };
+    var pmax = [3]f32{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) };
+    var umin = [2]f32{ std.math.inf(f32), std.math.inf(f32) };
+    var umax = [2]f32{ -std.math.inf(f32), -std.math.inf(f32) };
+    for (0..vc) |v| {
+        const f = vertices[v * 12 ..][0..12];
+        inline for (0..3) |k| {
+            pmin[k] = @min(pmin[k], f[k]);
+            pmax[k] = @max(pmax[k], f[k]);
+        }
+        inline for (0..2) |k| {
+            umin[k] = @min(umin[k], f[10 + k]);
+            umax[k] = @max(umax[k], f[10 + k]);
+        }
+    }
+    var pext: [3]f32 = undefined;
+    var uext: [2]f32 = undefined;
+    inline for (0..3) |k| pext[k] = if (pmax[k] > pmin[k]) pmax[k] - pmin[k] else 1.0;
+    inline for (0..2) |k| uext[k] = if (umax[k] > umin[k]) umax[k] - umin[k] else 1.0;
+    if (vc == 0) {
+        inline for (0..3) |k| {
+            pmin[k] = 0;
+            pext[k] = 1;
+        }
+        inline for (0..2) |k| {
+            umin[k] = 0;
+            uext[k] = 1;
+        }
+    }
+
+    const stride = vq_quant_base + if (skinned) vq_skin_extra else 0;
+    const out = try alloc.alloc(u8, vq_dequant_hdr + vc * stride);
+    errdefer alloc.free(out);
+    inline for (0..3) |k| std.mem.writeInt(u32, out[k * 4 ..][0..4], @bitCast(pmin[k]), .little);
+    inline for (0..3) |k| std.mem.writeInt(u32, out[12 + k * 4 ..][0..4], @bitCast(pext[k]), .little);
+    inline for (0..2) |k| std.mem.writeInt(u32, out[24 + k * 4 ..][0..4], @bitCast(umin[k]), .little);
+    inline for (0..2) |k| std.mem.writeInt(u32, out[32 + k * 4 ..][0..4], @bitCast(uext[k]), .little);
+
+    for (0..vc) |v| {
+        const f = vertices[v * 12 ..][0..12];
+        const o = vq_dequant_hdr + v * stride;
+        inline for (0..3) |k| std.mem.writeInt(u16, out[o + k * 2 ..][0..2], quantU16(f[k], pmin[k], pext[k]), .little);
+        inline for (0..3) |k| std.mem.writeInt(i8, out[o + 6 + k ..][0..1], snormI8(f[3 + k]), .little);
+        inline for (0..3) |k| std.mem.writeInt(i8, out[o + 9 + k ..][0..1], snormI8(f[6 + k]), .little);
+        std.mem.writeInt(i8, out[o + 12 ..][0..1], if (f[9] >= 0) @as(i8, 127) else @as(i8, -127), .little);
+        inline for (0..2) |k| std.mem.writeInt(u16, out[o + 13 + k * 2 ..][0..2], quantU16(f[10 + k], umin[k], uext[k]), .little);
+        if (skinned) {
+            @memcpy(out[o + 17 ..][0..4], &joints[v]);
+            @memcpy(out[o + 21 ..][0..4], &weights[v]);
+        }
+    }
+    return out;
+}
+
+/// Decode a quantized blob into the GPU-uploadable vertex section: stride-48 f32
+/// (non-skinned) or stride-56 f32+u8 (skinned), matching the raw pack layout.
+/// Returns `[]u32` (4-aligned) — downstream reads vertex positions as f32, so the
+/// buffer must be ≥4-aligned (the raw path aliases the 16-aligned file section).
+/// View the bytes with `std.mem.sliceAsBytes`. Caller owns + frees the []u32.
+pub fn decodeVertices(alloc: std.mem.Allocator, blob: []const u8, vertex_count: usize, skinned: bool) ![]u32 {
+    const qstride = vq_quant_base + if (skinned) vq_skin_extra else 0;
+    if (blob.len < vq_dequant_hdr or blob.len - vq_dequant_hdr < vertex_count * qstride) return error.Truncated;
+    var pmin: [3]f32 = undefined;
+    var pext: [3]f32 = undefined;
+    var umin: [2]f32 = undefined;
+    var uext: [2]f32 = undefined;
+    inline for (0..3) |k| pmin[k] = @bitCast(std.mem.readInt(u32, blob[k * 4 ..][0..4], .little));
+    inline for (0..3) |k| pext[k] = @bitCast(std.mem.readInt(u32, blob[12 + k * 4 ..][0..4], .little));
+    inline for (0..2) |k| umin[k] = @bitCast(std.mem.readInt(u32, blob[24 + k * 4 ..][0..4], .little));
+    inline for (0..2) |k| uext[k] = @bitCast(std.mem.readInt(u32, blob[32 + k * 4 ..][0..4], .little));
+
+    const ostride: usize = if (skinned) 56 else 48; // both divisible by 4
+    const words = try alloc.alloc(u32, vertex_count * ostride / 4);
+    errdefer alloc.free(words);
+    const out = std.mem.sliceAsBytes(words);
+    for (0..vertex_count) |v| {
+        const i = vq_dequant_hdr + v * qstride;
+        const o = v * ostride;
+        inline for (0..3) |k| {
+            const q = std.mem.readInt(u16, blob[i + k * 2 ..][0..2], .little);
+            std.mem.writeInt(u32, out[o + k * 4 ..][0..4], @bitCast(dequantU16(q, pmin[k], pext[k])), .little);
+        }
+        inline for (0..3) |k| std.mem.writeInt(u32, out[o + 12 + k * 4 ..][0..4], @bitCast(snormF32(@bitCast(blob[i + 6 + k]))), .little);
+        inline for (0..3) |k| std.mem.writeInt(u32, out[o + 24 + k * 4 ..][0..4], @bitCast(snormF32(@bitCast(blob[i + 9 + k]))), .little);
+        const wsign: i8 = @bitCast(blob[i + 12]);
+        std.mem.writeInt(u32, out[o + 36 ..][0..4], @bitCast(@as(f32, if (wsign >= 0) 1.0 else -1.0)), .little);
+        inline for (0..2) |k| {
+            const q = std.mem.readInt(u16, blob[i + 13 + k * 2 ..][0..2], .little);
+            std.mem.writeInt(u32, out[o + 40 + k * 4 ..][0..4], @bitCast(dequantU16(q, umin[k], uext[k])), .little);
+        }
+        if (skinned) {
+            @memcpy(out[o + 48 ..][0..4], blob[i + 17 ..][0..4]);
+            @memcpy(out[o + 52 ..][0..4], blob[i + 21 ..][0..4]);
+        }
+    }
+    return words;
+}
+
+fn expectVertRoundTrip(vertices: []const f32, skinned: bool, joints: []const [4]u8, weights: []const [4]u8) !void {
+    const a = std.testing.allocator;
+    const blob = try encodeVertices(a, vertices, skinned, joints, weights);
+    defer a.free(blob);
+    const vc = vertices.len / 12;
+    const words = try decodeVertices(a, blob, vc, skinned);
+    defer a.free(words);
+    const out = std.mem.sliceAsBytes(words);
+    const ostride: usize = if (skinned) 56 else 48;
+    // AABB extents drive position/uv tolerance (2 quantization steps).
+    var pmax = [3]f32{ 0, 0, 0 };
+    for (0..vc) |v| inline for (0..3) |k| {
+        pmax[k] = @max(pmax[k], @abs(vertices[v * 12 + k]));
+    };
+    for (0..vc) |v| {
+        const f = vertices[v * 12 ..][0..12];
+        const of = std.mem.bytesAsSlice(f32, out[v * ostride ..][0..48]);
+        inline for (0..3) |k| try std.testing.expect(@abs(of[k] - f[k]) <= (2.0 * pmax[k] + 1.0) / 65535.0 + 1e-5);
+        inline for (3..9) |k| try std.testing.expect(@abs(of[k] - f[k]) <= 2.0 / 127.0 + 1e-4); // normal + tangent xyz
+        try std.testing.expectEqual(f[9], of[9]); // tangent w = exact ±1
+        inline for (10..12) |k| try std.testing.expect(@abs(of[k] - f[k]) <= 2.0 / 65535.0 + 1e-4);
+        if (skinned) {
+            try std.testing.expectEqualSlices(u8, &joints[v], out[v * ostride + 48 ..][0..4]);
+            try std.testing.expectEqualSlices(u8, &weights[v], out[v * ostride + 52 ..][0..4]);
+        }
+    }
+}
+
+test "vertex codec: non-skinned round-trip within epsilon" {
+    const verts = [_]f32{
+        // pos            normal      tangent(w=1)    uv
+        0.0,  0.0,  0.0, 0, 0, 1, 1, 0, 0, 1,  0.0,  0.0,
+        1.5,  -2.0, 3.0, 1, 0, 0, 0, 1, 0, -1, 0.25, 0.75,
+        -4.0, 2.5,  0.5, 0, 1, 0, 0, 0, 1, 1,  1.0,  0.5,
+    };
+    try expectVertRoundTrip(&verts, false, &.{}, &.{});
+}
+
+test "vertex codec: skinned round-trip preserves joints/weights exactly" {
+    const verts = [_]f32{
+        0.0, 0.0, 0.0, 0, 0, 1, 1, 0, 0, 1, 0.0, 0.0,
+        2.0, 1.0, 0.0, 0, 1, 0, 1, 0, 0, 1, 1.0, 1.0,
+    };
+    const joints = [_][4]u8{ .{ 0, 1, 2, 3 }, .{ 4, 0, 0, 0 } };
+    const weights = [_][4]u8{ .{ 255, 0, 0, 0 }, .{ 128, 127, 0, 0 } };
+    try expectVertRoundTrip(&verts, true, &joints, &weights);
+}
+
+test "vertex codec: degenerate (zero-extent axis) does not divide by zero" {
+    // All verts share x=5 (flat plane) → pext[0] guarded to 1, decodes to 5.
+    const verts = [_]f32{
+        5.0, 0.0, 0.0, 0, 0, 1, 1, 0, 0, 1, 0.0, 0.0,
+        5.0, 1.0, 0.0, 0, 0, 1, 1, 0, 0, 1, 0.0, 0.0,
+    };
+    try expectVertRoundTrip(&verts, false, &.{}, &.{});
+}
+
+test "vertex codec: shrinks the vertex section" {
+    const verts = [_]f32{0} ** (12 * 100); // 100 verts × 48 B = 4800 raw
+    const blob = try encodeVertices(std.testing.allocator, &verts, false, &.{}, &.{});
+    defer std.testing.allocator.free(blob);
+    // 40 B header + 100 × 17 B = 1740 vs 4800 raw.
+    try std.testing.expect(blob.len < verts.len / 12 * 48);
 }
