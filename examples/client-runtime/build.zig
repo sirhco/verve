@@ -93,11 +93,13 @@ pub fn build(b: *std.Build) void {
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(wasm.getEmittedBin(), "client.wasm");
     _ = wf.addCopyFile(b.path("../../src/bridge/verve.js"), "verve.js");
+    _ = wf.addCopyFile(b.path("../../src/bridge/verve-worker.js"), "verve-worker.js");
 
     var assets_buf: std.ArrayList(u8) = .empty;
     assets_buf.appendSlice(b.allocator,
         \\pub const wasm: []const u8 = @embedFile("client.wasm");
         \\pub const js: []const u8 = @embedFile("verve.js");
+        \\pub const worker_js: []const u8 = @embedFile("verve-worker.js");
         \\
         \\pub const IslandChunk = struct { name: []const u8, bytes: []const u8 };
         \\
@@ -198,6 +200,9 @@ pub fn build(b: *std.Build) void {
     const gl_assets_stub_mod = b.createModule(.{
         .root_source_file = b.path("../../src/server/gl_assets_stub.zig"),
     });
+    const viz_assets_stub_mod = b.createModule(.{
+        .root_source_file = b.path("../../src/server/viz_assets_stub.zig"),
+    });
 
     const server_mod = b.createModule(.{
         .root_source_file = b.path("../../src/server/main.zig"),
@@ -207,6 +212,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "verve", .module = verve_mod },
             .{ .name = "assets", .module = assets_mod },
             .{ .name = "gl_assets", .module = gl_assets_stub_mod },
+            .{ .name = "viz_assets", .module = viz_assets_stub_mod },
             .{ .name = "app", .module = app_mod },
             .{ .name = "app_client", .module = app_client_mod },
             .{ .name = "client_manifest", .module = client_manifest_mod },
