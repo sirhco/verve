@@ -5398,12 +5398,100 @@
       .catch(() => { st.ltcLoading = false; }); // allow a later retry on failure
   };
 
+  // Shared PBR mesh vertex-attribute layout factory (WebGL2). One definition of
+  // the pos/normal/tangent/uv (+ skin) attributes over the mesh vertex buffer,
+  // covering BOTH the raw f32 layout (stride 48/56) AND the GPU-resident
+  // quantized layout (`q` — half pos/uv + snorm8 normal/tangent, stride 20/28).
+  // The GPU vertex fetch converts half→float and snorm8→[-1,1] for free, so the
+  // PBR shaders are byte-identical either way — only the fetch formats differ.
+  // Pass the attribute locations each draw path actually reads; null/undefined
+  // skips an attribute (e.g. depth/wireframe/OIT read position only). Locations
+  // follow the PBR VS: 0=pos, 1=normal, 2=tangent, 3=uv, 4=joints, 5=weights.
+  // The currently-bound ARRAY_BUFFER must be the mesh vertex buffer.
+  const setPbrMeshAttribs = (gl, q, skinned, locs) => {
+    const stride = q ? (skinned ? 28 : 20) : (skinned ? 56 : 48);
+    const { pos, normal, tangent, uv, joints, weights } = locs;
+    if (pos != null) {
+      gl.enableVertexAttribArray(pos);
+      if (q) gl.vertexAttribPointer(pos, 3, gl.HALF_FLOAT, false, stride, 0);
+      else gl.vertexAttribPointer(pos, 3, gl.FLOAT, false, stride, 0);
+    }
+    if (normal != null) {
+      gl.enableVertexAttribArray(normal);
+      if (q) gl.vertexAttribPointer(normal, 3, gl.BYTE, true, stride, 8);
+      else gl.vertexAttribPointer(normal, 3, gl.FLOAT, false, stride, 12);
+    }
+    if (tangent != null) {
+      gl.enableVertexAttribArray(tangent);
+      if (q) gl.vertexAttribPointer(tangent, 4, gl.BYTE, true, stride, 12);
+      else gl.vertexAttribPointer(tangent, 4, gl.FLOAT, false, stride, 24);
+    }
+    if (uv != null) {
+      gl.enableVertexAttribArray(uv);
+      if (q) gl.vertexAttribPointer(uv, 2, gl.HALF_FLOAT, false, stride, 16);
+      else gl.vertexAttribPointer(uv, 2, gl.FLOAT, false, stride, 40);
+    }
+    if (skinned && joints != null) {
+      gl.enableVertexAttribArray(joints);
+      gl.vertexAttribIPointer(joints, 4, gl.UNSIGNED_BYTE, stride, q ? 20 : 48);
+    }
+    if (skinned && weights != null) {
+      gl.enableVertexAttribArray(weights);
+      gl.vertexAttribPointer(weights, 4, gl.UNSIGNED_BYTE, true, stride, q ? 24 : 52);
+    }
+  };
+
+  // Shared PBR mesh vertex-buffer layout factory (WebGPU). The counterpart of
+  // setPbrMeshAttribs: one definition of the pos/normal/tangent/uv (+ skin)
+  // attributes over the mesh vertex buffer, for BOTH the raw f32 layout (stride
+  // 48/56, float32x*) AND the GPU-resident quantized layout (`q` — half pos/uv +
+  // snorm8 normal/tangent, stride 20/28). WebGPU has no float16x3, so position
+  // pads to float16x4 (the VS reads .xyz); normal likewise pads to snorm8x4. The
+  // vertex fetch converts to float for free, so the WGSL is byte-identical either
+  // way. `attrs` picks which shader locations a pipeline reads (pos-only for
+  // depth/oit/wireframe, pos+normal for prepass, etc.). Returns the array for a
+  // pipeline's `vertex.buffers[0]`.
+  const pbrVBLayout = (q, skinned, attrs) => {
+    const stride = q ? (skinned ? 28 : 20) : (skinned ? 56 : 48);
+    const a = [];
+    if (attrs.pos) a.push({ shaderLocation: 0, offset: 0, format: q ? "float16x4" : "float32x3" });
+    if (attrs.normal) a.push({ shaderLocation: 1, offset: q ? 8 : 12, format: q ? "snorm8x4" : "float32x3" });
+    if (attrs.tangent) a.push({ shaderLocation: 2, offset: q ? 12 : 24, format: q ? "snorm8x4" : "float32x4" });
+    if (attrs.uv) a.push({ shaderLocation: 3, offset: q ? 16 : 40, format: q ? "float16x2" : "float32x2" });
+    if (skinned && attrs.joints) a.push({ shaderLocation: 4, offset: q ? 20 : 48, format: "uint8x4" });
+    if (skinned && attrs.weights) a.push({ shaderLocation: 5, offset: q ? 24 : 52, format: "unorm8x4" });
+    return [{ arrayStride: stride, attributes: a }];
+  };
+
+  // Pick the render pipeline that matches the bound vertex buffer's layout. When
+  // `q` (the buffer is GPU-resident quantized) and the pipeline entry carries a
+  // quantized sibling set (`pipelineQ` + its blend variants), select from that;
+  // otherwise the raw set. Mirrors the blend-state selection in SET_PIPELINE
+  // (case 4) so a mesh draw can re-set the pipeline once its buffer is known.
+  const pipeForDraw = (entry, q, state) => {
+    const useQ = q && entry.pipelineQ;
+    const base = useQ ? entry.pipelineQ : entry.pipeline;
+    const blend = useQ ? entry.pipelineBlendQ : entry.pipelineBlend;
+    const front = useQ ? entry.pipelineBlendFrontQ : entry.pipelineBlendFront;
+    const back = useQ ? entry.pipelineBlendBackQ : entry.pipelineBlendBack;
+    let pipe = base;
+    if (state & 4) {
+      if (state & 8 && front) pipe = front;
+      else if (state & 2 && back) pipe = back;
+      else if (blend) pipe = blend;
+    }
+    return pipe;
+  };
+
   const bindVaoFor = (st, vh, ih) => {
     const gl = st.gl;
     const vb = st.buffers[vh];
     const ib = st.buffers[ih];
     if (!vb || !ib) return false; // defense-in-depth; callers also guard
     const variant = st.active ? st.active.variant : 1;
+    const q = vb.quantized === true; // GPU-resident quantized vertex layout
+    // The buffer handle `vh` is in the key and a handle's quantized-ness is
+    // fixed at creation, so raw + quantized meshes never share a VAO.
     const key = `${vh}:${ih}:${variant}`;
     let vao = st.vaos.get(key);
     if (!vao) {
@@ -5411,33 +5499,15 @@
       gl.bindVertexArray(vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
       if (variant & 64) {
-        // depth-only (shadow pass): PBR-layout buffer, position attrib only.
-        gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);
+        // depth-only (shadow pass): mesh-layout buffer, position attrib only.
+        setPbrMeshAttribs(gl, q, false, { pos: 0 });
       } else if (variant & 4) {
-        // PBR: pos f32x3 @0, normal f32x3 @12, tangent f32x4 @24, uv f32x2 @40.
-        // Skinned (variant & 0x80) widens the vertex to stride 56, appending
-        // joints (u8x4 @48) + weights (u8x4 @52); attribs 0-3 then re-stride to
-        // 56. Non-skinned keeps stride 48 / attribs 0-3 only. The VAO cache key
-        // already carries `variant`, so skinned + non-skinned uses of the same
-        // buffers get distinct VAOs (no attrib 4/5 leakage onto the 48 path).
-        const stride = (variant & 128) ? 56 : 48;
-        gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, stride, 0);
-        gl.enableVertexAttribArray(1);
-        gl.vertexAttribPointer(1, 3, gl.FLOAT, false, stride, 12);
-        gl.enableVertexAttribArray(2);
-        gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 24);
-        gl.enableVertexAttribArray(3);
-        gl.vertexAttribPointer(3, 2, gl.FLOAT, false, stride, 40);
-        if (variant & 128) {
-          // joints: uvec4 a_joints — integer attrib, NOT normalized
-          gl.enableVertexAttribArray(4);
-          gl.vertexAttribIPointer(4, 4, gl.UNSIGNED_BYTE, 56, 48);
-          // weights: vec4 a_weights — u8 normalized to [0,1]
-          gl.enableVertexAttribArray(5);
-          gl.vertexAttribPointer(5, 4, gl.UNSIGNED_BYTE, true, 56, 52);
-        }
+        // PBR: pos @0, normal, tangent, uv (+ joints/weights when skinned). The
+        // VAO cache key carries `variant`, so skinned + non-skinned uses of the
+        // same buffers get distinct VAOs (no attrib 4/5 leakage onto the base
+        // path).
+        const skinned = (variant & 128) !== 0;
+        setPbrMeshAttribs(gl, q, skinned, { pos: 0, normal: 1, tangent: 2, uv: 3, joints: 4, weights: 5 });
       } else if (variant & 2) {
         // lit/textured: pos f32x3 @0, normal f32x3 @12, uv f32x2 @24, stride 32
         gl.enableVertexAttribArray(0);
@@ -5563,7 +5633,10 @@
           const buf = gl.createBuffer();
           gl.bindBuffer(target, buf);
           gl.bufferData(target, new Uint8Array(memory.buffer, p, len), gl.STATIC_DRAW);
-          st.buffers[handle] = { buf, target };
+          // kind === 2 (BufferKind.vertex_gpu): GPU-resident quantized vertex
+          // layout (half pos/uv + snorm8 normal/tangent, stride 20/28). Draw
+          // paths that bind this buffer select the quantized attribute layout.
+          st.buffers[handle] = { buf, target, quantized: kind === 2 };
           break;
         }
         case 3: { // CREATE_SHADER — variant (word 1) selects layout + uniforms
@@ -6074,16 +6147,10 @@
           if (!iVao) {
             iVao = gl2.createVertexArray();
             gl2.bindVertexArray(iVao);
-            // Core mesh attribs 0-3: PBR layout stride 48 (non-skinned instanced only)
+            // Core mesh attribs 0-3: PBR layout (non-skinned instanced only),
+            // raw f32 or GPU-resident quantized per the buffer flag.
             gl2.bindBuffer(gl2.ARRAY_BUFFER, vb.buf);
-            gl2.enableVertexAttribArray(0);
-            gl2.vertexAttribPointer(0, 3, gl2.FLOAT, false, 48, 0);   // pos
-            gl2.enableVertexAttribArray(1);
-            gl2.vertexAttribPointer(1, 3, gl2.FLOAT, false, 48, 12);  // normal
-            gl2.enableVertexAttribArray(2);
-            gl2.vertexAttribPointer(2, 4, gl2.FLOAT, false, 48, 24);  // tangent
-            gl2.enableVertexAttribArray(3);
-            gl2.vertexAttribPointer(3, 2, gl2.FLOAT, false, 48, 40);  // uv
+            setPbrMeshAttribs(gl2, vb.quantized === true, false, { pos: 0, normal: 1, tangent: 2, uv: 3 });
             gl2.bindBuffer(gl2.ELEMENT_ARRAY_BUFFER, ib.buf);
             // Per-instance attribs from instanceBuf: mat4 columns at loc 4-7,
             // color rgba at loc 8. stride=80, divisor=1 for all.
@@ -6429,10 +6496,7 @@
             datVao = gl.createVertexArray();
             gl.bindVertexArray(datVao);
             gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
-            gl.enableVertexAttribArray(0);
-            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);
-            gl.enableVertexAttribArray(1);
-            gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 48, 40);
+            setPbrMeshAttribs(gl, vb.quantized === true, false, { pos: 0, uv: 1 });
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
             st.vaos.set(datKey, datVao);
           }
@@ -6463,10 +6527,7 @@
             ppVao = gl.createVertexArray();
             gl.bindVertexArray(ppVao);
             gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
-            gl.enableVertexAttribArray(0);
-            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);  // pos
-            gl.enableVertexAttribArray(1);
-            gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 48, 12); // normal
+            setPbrMeshAttribs(gl, vb.quantized === true, false, { pos: 0, normal: 1 });
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
             st.vaos.set(ppKey, ppVao);
           }
@@ -6503,8 +6564,7 @@
             oitVao = gl.createVertexArray();
             gl.bindVertexArray(oitVao);
             gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
-            gl.enableVertexAttribArray(0);
-            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0); // pos
+            setPbrMeshAttribs(gl, vb.quantized === true, false, { pos: 0 });
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
             st.vaos.set(oitKey, oitVao);
           }
@@ -7043,9 +7103,8 @@
             wfVao = gl.createVertexArray();
             gl.bindVertexArray(wfVao);
             gl.bindBuffer(gl.ARRAY_BUFFER, vb.buf);
-            // loc 0: pos vec3 f32 @0, stride 48 (only attrib read by the wireframe VS).
-            gl.enableVertexAttribArray(0);
-            gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 48, 0);
+            // loc 0: pos only (raw f32 stride 48 or GPU-resident half stride 20).
+            setPbrMeshAttribs(gl, vb.quantized === true, false, { pos: 0 });
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib.buf);
             st.vaos.set(wfKey, wfVao);
           }
@@ -7094,10 +7153,9 @@
           if (!diVao) {
             diVao = gl2.createVertexArray();
             gl2.bindVertexArray(diVao);
-            // Mesh position from vbuf: loc 0, vec3, stride 48.
+            // Mesh position from vbuf: loc 0 (raw f32 stride 48 or GPU half stride 20).
             gl2.bindBuffer(gl2.ARRAY_BUFFER, vb47.buf);
-            gl2.enableVertexAttribArray(0);
-            gl2.vertexAttribPointer(0, 3, gl2.FLOAT, false, 48, 0);
+            setPbrMeshAttribs(gl2, vb47.quantized === true, false, { pos: 0 });
             gl2.bindBuffer(gl2.ELEMENT_ARRAY_BUFFER, ib47.buf);
             // Per-instance model matrix cols from st.shadowInstanceBuf:
             // loc 4-7, vec4 each, stride 80, divisor 1 (advance per instance).
@@ -7679,7 +7737,9 @@
             : (GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
           const buf = device.createBuffer({ size: (len + 3) & ~3, usage });
           device.queue.writeBuffer(buf, 0, new Uint8Array(memory.buffer, p, len));
-          st.buffers[handle] = { buf, kind };
+          // kind === 2 (BufferKind.vertex_gpu): GPU-resident quantized layout; the
+          // draw path selects the pipeline built with the quantized vertex layout.
+          st.buffers[handle] = { buf, kind, quantized: kind === 2 };
           break;
         }
         case 3: { // CREATE_SHADER — one WGSL module in vs_ptr/vs_len.
@@ -7739,19 +7799,9 @@
               }],
             });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
-            const pipeline = device.createRenderPipeline({
+            const ppDesc = (q) => ({
               layout,
-              vertex: {
-                module,
-                entryPoint: "vs_main",
-                buffers: [{
-                  arrayStride: 48, // PBR layout: pos @0 (loc0), normal @12 (loc1)
-                  attributes: [
-                    { shaderLocation: 0, offset: 0, format: "float32x3" },
-                    { shaderLocation: 1, offset: 12, format: "float32x3" },
-                  ],
-                }],
-              },
+              vertex: { module, entryPoint: "vs_main", buffers: pbrVBLayout(q, false, { pos: 1, normal: 1 }) },
               // rgba16f G-buffer color target. Back-cull (cull-back) like the scene.
               fragment: { module, entryPoint: "fs_main", targets: [{ format: "rgba16float" }] },
               primitive: { topology: "triangle-list", cullMode: "back" },
@@ -7761,7 +7811,9 @@
                 depthCompare: "less",
               },
             });
-            st.pipelines[handle] = { pipeline, bgl0, kind: "prepass" };
+            const pipeline = device.createRenderPipeline(ppDesc(false));
+            const pipelineQ = device.createRenderPipeline(ppDesc(true));
+            st.pipelines[handle] = { pipeline, pipelineQ, bgl0, kind: "prepass" };
             break;
           }
           // variant_oit = 1 << 17 (0x20000) — Weighted-Blended OIT transparent
@@ -7782,16 +7834,9 @@
               }],
             });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
-            const pipeline = device.createRenderPipeline({
+            const oitDesc = (q) => ({
               layout,
-              vertex: {
-                module,
-                entryPoint: "vs_main",
-                buffers: [{
-                  arrayStride: 48, // PBR layout: pos @0 (loc0); normal/uv ignored.
-                  attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
-                }],
-              },
+              vertex: { module, entryPoint: "vs_main", buffers: pbrVBLayout(q, false, { pos: 1 }) },
               fragment: {
                 module,
                 entryPoint: "fs_main",
@@ -7820,7 +7865,9 @@
                 depthCompare: "less",
               },
             });
-            st.pipelines[handle] = { pipeline, bgl0, kind: "oit" };
+            const pipeline = device.createRenderPipeline(oitDesc(false));
+            const pipelineQ = device.createRenderPipeline(oitDesc(true));
+            st.pipelines[handle] = { pipeline, pipelineQ, bgl0, kind: "oit" };
             break;
           }
           if ((variant & 0x40000) !== 0) { // variant_billboard (1<<18) — per-instance screen-facing sprites.
@@ -8018,19 +8065,9 @@
               }],
             });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
-            const pipeline = device.createRenderPipeline({
+            const wfDesc = (q) => ({
               layout,
-              vertex: {
-                module,
-                entryPoint: "vs_main",
-                buffers: [{
-                  arrayStride: 48,
-                  stepMode: "vertex",
-                  attributes: [
-                    { shaderLocation: 0, offset: 0, format: "float32x3" }, // pos
-                  ],
-                }],
-              },
+              vertex: { module, entryPoint: "vs_main", buffers: pbrVBLayout(q, false, { pos: 1 }) },
               fragment: {
                 module,
                 entryPoint: "fs_main",
@@ -8043,7 +8080,9 @@
                 depthCompare: "less",
               },
             });
-            st.pipelines[handle] = { pipeline, bgl0, kind: "wireframe" };
+            const pipeline = device.createRenderPipeline(wfDesc(false));
+            const pipelineQ = device.createRenderPipeline(wfDesc(true));
+            st.pipelines[handle] = { pipeline, pipelineQ, bgl0, kind: "wireframe" };
             break;
           }
           // variant_pbr = 1 << 2 (command.zig). variant_normal_map = 1 << 3,
@@ -8069,16 +8108,19 @@
                 ],
               });
               const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
-              const pipeline = device.createRenderPipeline({
+              // depth-at reads pos + uv (loc 0/1). uv shaderLocation is 3 in the
+              // shared PBR layout, but wgslDepthAt declares it at @location(1); pass
+              // an explicit override so the factory emits shaderLocation 1 for uv.
+              const datDesc = (q) => ({
                 layout,
                 vertex: {
                   module,
                   entryPoint: "vs_main",
                   buffers: [{
-                    arrayStride: 48, // stride-48 layout: pos @0, uv @40
+                    arrayStride: q ? 20 : 48,
                     attributes: [
-                      { shaderLocation: 0, offset: 0, format: "float32x3" },
-                      { shaderLocation: 1, offset: 40, format: "float32x2" },
+                      { shaderLocation: 0, offset: 0, format: q ? "float16x4" : "float32x3" },
+                      { shaderLocation: 1, offset: q ? 16 : 40, format: q ? "float16x2" : "float32x2" },
                     ],
                   }],
                 },
@@ -8091,7 +8133,9 @@
                   depthCompare: "less",
                 },
               });
-              st.pipelines[handle] = { pipeline, bgl0, kind: "depthAt" };
+              const pipeline = device.createRenderPipeline(datDesc(false));
+              const pipelineQ = device.createRenderPipeline(datDesc(true));
+              st.pipelines[handle] = { pipeline, pipelineQ, bgl0, kind: "depthAt" };
               break;
             }
             if ((variant & 0x1000) !== 0) { // + variant_instanced → depth-instanced (two vertex buffers)
@@ -8105,28 +8149,19 @@
                 entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform", hasDynamicOffset: true } }],
               });
               const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
-              const pipeline = device.createRenderPipeline({
+              const diInstanceBuf = {
+                arrayStride: 80,
+                stepMode: "instance",
+                attributes: [
+                  { shaderLocation: 4, offset: 0, format: "float32x4" }, // inst_m0
+                  { shaderLocation: 5, offset: 16, format: "float32x4" }, // inst_m1
+                  { shaderLocation: 6, offset: 32, format: "float32x4" }, // inst_m2
+                  { shaderLocation: 7, offset: 48, format: "float32x4" }, // inst_m3
+                ],
+              };
+              const diDesc = (q) => ({
                 layout,
-                vertex: {
-                  module,
-                  entryPoint: "vs_main",
-                  buffers: [
-                    {
-                      arrayStride: 48,
-                      attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
-                    },
-                    {
-                      arrayStride: 80,
-                      stepMode: "instance",
-                      attributes: [
-                        { shaderLocation: 4, offset:  0, format: "float32x4" }, // inst_m0
-                        { shaderLocation: 5, offset: 16, format: "float32x4" }, // inst_m1
-                        { shaderLocation: 6, offset: 32, format: "float32x4" }, // inst_m2
-                        { shaderLocation: 7, offset: 48, format: "float32x4" }, // inst_m3
-                      ],
-                    },
-                  ],
-                },
+                vertex: { module, entryPoint: "vs_main", buffers: [...pbrVBLayout(q, false, { pos: 1 }), diInstanceBuf] },
                 primitive: { topology: "triangle-list", cullMode: "front" },
                 depthStencil: {
                   format: "depth32float",
@@ -8134,7 +8169,9 @@
                   depthCompare: "less",
                 },
               });
-              st.pipelines[handle] = { pipeline, bgl0, kind: "depth-instanced" };
+              const pipeline = device.createRenderPipeline(diDesc(false));
+              const pipelineQ = device.createRenderPipeline(diDesc(true));
+              st.pipelines[handle] = { pipeline, pipelineQ, bgl0, kind: "depth-instanced" };
               break;
             }
             // Depth-only pipeline (wgslDepth): position-only vertex, NO color
@@ -8144,16 +8181,9 @@
               entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform", hasDynamicOffset: true } }],
             });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
-            const pipeline = device.createRenderPipeline({
+            const depthDesc = (q) => ({
               layout,
-              vertex: {
-                module,
-                entryPoint: "vs_main",
-                buffers: [{
-                  arrayStride: 48, // stride-48 layout; only position (attr 0) is read
-                  attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
-                }],
-              },
+              vertex: { module, entryPoint: "vs_main", buffers: pbrVBLayout(q, false, { pos: 1 }) },
               primitive: { topology: "triangle-list", cullMode: "front" },
               depthStencil: {
                 format: "depth32float",
@@ -8161,7 +8191,9 @@
                 depthCompare: "less",
               },
             });
-            st.pipelines[handle] = { pipeline, bgl0, kind: "depth" };
+            const pipeline = device.createRenderPipeline(depthDesc(false));
+            const pipelineQ = device.createRenderPipeline(depthDesc(true));
+            st.pipelines[handle] = { pipeline, pipelineQ, bgl0, kind: "depth" };
             break;
           }
           // variant_instanced (1<<12 = 0x1000): PBR with slot-1 per-instance buffer.
@@ -8213,36 +8245,23 @@
             const bgl1 = device.createBindGroupLayout({ entries: g1 });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
             const pbrFragFormat = (variant & 0x200) ? "rgba16float" : st.format;
-            // Two vertex.buffers: slot 0 = mesh (stride 48, non-skinned attribs 0-3),
-            // slot 1 = per-instance (stride 80, stepMode "instance", attrs 4-8).
-            const instDesc = {
+            // Two vertex.buffers: slot 0 = mesh (raw stride 48 / quantized 20,
+            // non-skinned attribs 0-3), slot 1 = per-instance (stride 80, stepMode
+            // "instance", attrs 4-8). A quantized-mesh twin is built alongside.
+            const instMeshBuf80 = {
+              arrayStride: 80,
+              stepMode: "instance",
+              attributes: [
+                { shaderLocation: 4, offset: 0, format: "float32x4" }, // mat col 0
+                { shaderLocation: 5, offset: 16, format: "float32x4" }, // mat col 1
+                { shaderLocation: 6, offset: 32, format: "float32x4" }, // mat col 2
+                { shaderLocation: 7, offset: 48, format: "float32x4" }, // mat col 3
+                { shaderLocation: 8, offset: 64, format: "float32x4" }, // color rgba
+              ],
+            };
+            const instDescOf = (q) => ({
               layout,
-              vertex: {
-                module,
-                entryPoint: "vs_main",
-                buffers: [
-                  {
-                    arrayStride: 48,
-                    attributes: [
-                      { shaderLocation: 0, offset: 0,  format: "float32x3" }, // pos
-                      { shaderLocation: 1, offset: 12, format: "float32x3" }, // normal
-                      { shaderLocation: 2, offset: 24, format: "float32x4" }, // tangent
-                      { shaderLocation: 3, offset: 40, format: "float32x2" }, // uv
-                    ],
-                  },
-                  {
-                    arrayStride: 80,
-                    stepMode: "instance",
-                    attributes: [
-                      { shaderLocation: 4, offset: 0,  format: "float32x4" }, // mat col 0
-                      { shaderLocation: 5, offset: 16, format: "float32x4" }, // mat col 1
-                      { shaderLocation: 6, offset: 32, format: "float32x4" }, // mat col 2
-                      { shaderLocation: 7, offset: 48, format: "float32x4" }, // mat col 3
-                      { shaderLocation: 8, offset: 64, format: "float32x4" }, // color rgba
-                    ],
-                  },
-                ],
-              },
+              vertex: { module, entryPoint: "vs_main", buffers: [...pbrVBLayout(q, false, { pos: 1, normal: 1, tangent: 1, uv: 1 }), instMeshBuf80] },
               fragment: {
                 module,
                 entryPoint: "fs_main",
@@ -8254,10 +8273,12 @@
                 depthWriteEnabled: true,
                 depthCompare: "less",
               },
-            };
-            const pipeline = device.createRenderPipeline(instDesc);
+            });
+            const pipeline = device.createRenderPipeline(instDescOf(false));
+            const pipelineQ = device.createRenderPipeline(instDescOf(true));
             st.pipelines[handle] = {
               pipeline,
+              pipelineQ,
               bgl0,
               bgl1,
               kind: "pbr-instanced",
@@ -8369,31 +8390,16 @@
             // variant_linear_output (1<<9 = 0x200): scene renders into rgba16float
             // HDR target (post path). All other PBR variants render to canvas.
             const pbrFragFormat = (variant & 0x200) ? "rgba16float" : st.format;
+            // PBR vertex: pos@0, normal, tangent, uv (+ joints/weights when
+            // skinned). Raw f32 (stride 48/56) or GPU-resident quantized (half
+            // pos/uv + snorm8 normal/tangent, stride 20/28) — one factory, both
+            // layouts; the WGSL is byte-identical. A quantized sibling pipeline
+            // set is built alongside and selected at draw time per the bound
+            // buffer's `quantized` flag (see pipeForDraw).
+            const pbrAttrs = { pos: 1, normal: 1, tangent: 1, uv: 1, joints: 1, weights: 1 };
             const pbrDesc = {
               layout,
-              vertex: {
-                module,
-                entryPoint: "vs_main",
-                buffers: [{
-                  // PBR vertex: pos@0, normal@12, tangent@24, uv@40 (stride 48).
-                  // Skinned variants extend to stride 56 with joints@48
-                  // (uint8x4) + weights@52 (unorm8x4) at locations 4/5.
-                  arrayStride: skinned ? 56 : 48,
-                  attributes: skinned ? [
-                    { shaderLocation: 0, offset: 0, format: "float32x3" },
-                    { shaderLocation: 1, offset: 12, format: "float32x3" },
-                    { shaderLocation: 2, offset: 24, format: "float32x4" },
-                    { shaderLocation: 3, offset: 40, format: "float32x2" },
-                    { shaderLocation: 4, offset: 48, format: "uint8x4" },
-                    { shaderLocation: 5, offset: 52, format: "unorm8x4" },
-                  ] : [
-                    { shaderLocation: 0, offset: 0, format: "float32x3" },
-                    { shaderLocation: 1, offset: 12, format: "float32x3" },
-                    { shaderLocation: 2, offset: 24, format: "float32x4" },
-                    { shaderLocation: 3, offset: 40, format: "float32x2" },
-                  ],
-                }],
-              },
+              vertex: { module, entryPoint: "vs_main", buffers: pbrVBLayout(false, skinned, pbrAttrs) },
               fragment: {
                 module,
                 entryPoint: "fs_main",
@@ -8408,7 +8414,10 @@
                 depthCompare: "less",
               },
             };
+            // Quantized-layout twin of pbrDesc (same everything, quantized buffers).
+            const pbrDescQ = { ...pbrDesc, vertex: { module, entryPoint: "vs_main", buffers: pbrVBLayout(true, skinned, pbrAttrs) } };
             const pipeline = device.createRenderPipeline(pbrDesc);
+            const pipelineQ = device.createRenderPipeline(pbrDescQ);
             // Blend fragment target (shared across all blend pipeline variants).
             const blendFragTargets = [{
               format: pbrFragFormat,
@@ -8428,27 +8437,21 @@
             // Single-sided blend uses cull-back (same as pbrDesc opaque).
             // Double-sided blend needs TWO pipelines: cull-front (back faces) and
             // cull-back (front faces), selected by state_cull_front/state_cull_back.
-            const pipelineBlend = device.createRenderPipeline({
-              ...pbrDesc,
-              fragment: { module, entryPoint: "fs_main", targets: blendFragTargets },
-              depthStencil: blendDepthStencil,
-            });
-            // Double-sided blend cull pipelines (only created when doubleSided).
-            // pipelineBlendFront: state_cull_front (8) → draws back faces.
-            // pipelineBlendBack:  state_cull_back  (2) → draws front faces.
-            const pipelineBlendFront = doubleSided ? device.createRenderPipeline({
-              ...pbrDesc,
-              primitive: { topology: "triangle-list", cullMode: "front" },
-              fragment: { module, entryPoint: "fs_main", targets: blendFragTargets },
-              depthStencil: blendDepthStencil,
-            }) : null;
-            const pipelineBlendBack = doubleSided ? device.createRenderPipeline({
-              ...pbrDesc,
-              primitive: { topology: "triangle-list", cullMode: "back" },
-              fragment: { module, entryPoint: "fs_main", targets: blendFragTargets },
-              depthStencil: blendDepthStencil,
-            }) : null;
+            // Each blend pipeline gets a raw + quantized twin (…Q).
+            const mkBlend = (d, extra) => device.createRenderPipeline({ ...d, ...extra, fragment: { module, entryPoint: "fs_main", targets: blendFragTargets }, depthStencil: blendDepthStencil });
+            const pipelineBlend = mkBlend(pbrDesc, {});
+            const pipelineBlendQ = mkBlend(pbrDescQ, {});
+            const cullFront = { primitive: { topology: "triangle-list", cullMode: "front" } };
+            const cullBack = { primitive: { topology: "triangle-list", cullMode: "back" } };
+            const pipelineBlendFront = doubleSided ? mkBlend(pbrDesc, cullFront) : null;
+            const pipelineBlendFrontQ = doubleSided ? mkBlend(pbrDescQ, cullFront) : null;
+            const pipelineBlendBack = doubleSided ? mkBlend(pbrDesc, cullBack) : null;
+            const pipelineBlendBackQ = doubleSided ? mkBlend(pbrDescQ, cullBack) : null;
             st.pipelines[handle] = {
+              pipelineQ,
+              pipelineBlendQ,
+              pipelineBlendFrontQ,
+              pipelineBlendBackQ,
               pipeline,
               pipelineBlend,
               pipelineBlendFront,
@@ -8866,7 +8869,7 @@
           if (dslot >= MAX_DRAWS) break; // per-pass draw cap
           const dbase = dslot * DEPTH_STRIDE;
           device.queue.writeBuffer(st.depthUniform, dbase, new Float32Array(memory.buffer, mvpPtr, 16));
-          st.shadowPass.setPipeline(st.active.pipeline);
+          st.shadowPass.setPipeline(pipeForDraw(st.active, vb.quantized, 0));
           st.shadowPass.setVertexBuffer(0, vb.buf);
           st.shadowPass.setIndexBuffer(ib.buf, "uint16", byteOff);
           st.shadowPass.setBindGroup(0, st.depthBindGroup, [dbase]);
@@ -8905,7 +8908,7 @@
               { binding: 2, resource: st.defaults.sampler },
             ],
           });
-          st.shadowPass.setPipeline(datPipe.pipeline);
+          st.shadowPass.setPipeline(pipeForDraw(datPipe, vb.quantized, 0));
           st.shadowPass.setVertexBuffer(0, vb.buf);
           st.shadowPass.setIndexBuffer(ib.buf, "uint16", byteOff);
           st.shadowPass.setBindGroup(0, bg, [dbase]);
@@ -8930,7 +8933,7 @@
           const ubuf = gpuEnsurePrepassUniform(st, st.active);
           device.queue.writeBuffer(ubuf, pbase, new Float32Array(memory.buffer, mvpPtr, 16)); // mvp @0
           device.queue.writeBuffer(ubuf, pbase + 64, new Float32Array(memory.buffer, mvPtr, 16)); // mv @64
-          st.pass.setPipeline(st.active.pipeline);
+          st.pass.setPipeline(pipeForDraw(st.active, vb.quantized, 0));
           st.pass.setVertexBuffer(0, vb.buf);
           st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
           st.pass.setBindGroup(0, st.prepassBindGroup, [pbase]);
@@ -9121,7 +9124,7 @@
           }
           // Multi-caster: no per-draw PointShadow uniform write — the dead binding-5
           // buffer is gone (the receiver reads lpos/far from the per-light loop vars).
-          st.pass.setPipeline(active.pipeline);
+          st.pass.setPipeline(pipeForDraw(active, vb.quantized, 0));
           st.pass.setVertexBuffer(0, vb.buf);
           st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
           st.pass.setBindGroup(0, st.bg0, [base]);
@@ -9256,7 +9259,7 @@
             st.bg1Dirty = false;
           }
           // ── Draw: mesh at slot 0, instance data at slot 1. ──
-          st.pass.setPipeline(active.pipeline);
+          st.pass.setPipeline(pipeForDraw(active, vb.quantized, 0));
           st.pass.setVertexBuffer(0, vb.buf);
           st.pass.setVertexBuffer(1, st.instanceBuf);
           st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
@@ -9383,7 +9386,7 @@
           device.queue.writeBuffer(ubuf, obase, new Float32Array(memory.buffer, mvpPtr, 16)); // mvp @0
           device.queue.writeBuffer(ubuf, obase + 64, new Float32Array(memory.buffer, mvPtr, 16)); // mv @64
           device.queue.writeBuffer(ubuf, obase + 128, new Float32Array(memory.buffer, colorPtr, 4)); // color @128
-          st.pass.setPipeline(st.active.pipeline);
+          st.pass.setPipeline(pipeForDraw(st.active, vb.quantized, 0));
           st.pass.setVertexBuffer(0, vb.buf);
           st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
           st.pass.setBindGroup(0, st.oitBindGroup, [obase]);
@@ -9598,15 +9601,9 @@
             ].join("\n");
             const module = device.createShaderModule({ code: wgsl });
             const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
-            const pipeline = device.createRenderPipeline({
+            const pdDesc = (q) => ({
               layout,
-              vertex: {
-                module, entryPoint: "vs_main",
-                buffers: [{
-                  arrayStride: 48, // PBR stride: pos@0 only used here
-                  attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
-                }],
-              },
+              vertex: { module, entryPoint: "vs_main", buffers: pbrVBLayout(q, false, { pos: 1 }) },
               fragment: {
                 module, entryPoint: "fs_main",
                 targets: [{ format: "rgba8unorm" }],
@@ -9618,13 +9615,15 @@
                 depthCompare: "less",
               },
             });
+            const pipeline = device.createRenderPipeline(pdDesc(false));
+            const pipelineQ = device.createRenderPipeline(pdDesc(true));
             // Uniform buffer: POINT_DEPTH_STRIDE slots (one per draw_point_depth call).
             const POINT_DEPTH_STRIDE = 256;
             const pointDepthUniform = device.createBuffer({
               size: POINT_DEPTH_STRIDE * 384, // 6 faces × 64 submeshes
               usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             });
-            st.pointDepthPipe = { pipeline, bgl, pointDepthUniform,
+            st.pointDepthPipe = { pipeline, pipelineQ, bgl, pointDepthUniform,
               POINT_DEPTH_STRIDE, pointDepthSlot: 0,
               // Cached per-face data (written by begin_point_shadow_face).
               faceVp: null, lightPos: null, far: 0 };
@@ -9712,6 +9711,9 @@
               offset: 0, size: 144 } }],
           });
           st.pointPass.setBindGroup(0, bg, [base]);
+          // Per-draw pipeline: quantized sibling when the mesh buffer is GPU-resident
+          // (the face-level setPipeline in BEGIN_POINT_SHADOW_FACE assumes raw).
+          st.pointPass.setPipeline(vb.quantized && pd.pipelineQ ? pd.pipelineQ : pd.pipeline);
           st.pointPass.setVertexBuffer(0, vb.buf);
           st.pointPass.setIndexBuffer(ib.buf, "uint16", byteOff);
           st.pointPass.drawIndexed(count);
@@ -10095,7 +10097,7 @@
           }
           // ── Draw: vertex buffer slot 0, u16 edge index buffer, indexed draw. ──
           // Line-list topology is baked into the pipeline (not a runtime state).
-          st.pass.setPipeline(active.pipeline);
+          st.pass.setPipeline(pipeForDraw(active, vb.quantized, 0));
           st.pass.setVertexBuffer(0, vb.buf);
           st.pass.setIndexBuffer(ib.buf, "uint16", byteOff);
           st.pass.setBindGroup(0, st.wireframeBg0, [wbase]);
@@ -10158,7 +10160,7 @@
             st.depthInstBGLayout = pipe47.bgl0;
           }
           // ── Draw: mesh at slot 0, per-instance data at slot 1. ──
-          st.shadowPass.setPipeline(pipe47.pipeline);
+          st.shadowPass.setPipeline(pipeForDraw(pipe47, vb47.quantized, 0));
           st.shadowPass.setVertexBuffer(0, vb47.buf);
           st.shadowPass.setVertexBuffer(1, st.shadowInstanceBuf);
           st.shadowPass.setIndexBuffer(ib47.buf, "uint16", byteOff47);

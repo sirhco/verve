@@ -331,3 +331,218 @@ test "vertex codec: shrinks the vertex section" {
     // 40 B header + 100 × 17 B = 1740 vs 4800 raw.
     try std.testing.expect(blob.len < verts.len / 12 * 48);
 }
+
+// ── GPU-resident quantized vertex codec (slice 3, half-float + snorm8) ────────
+//
+// DISTINCT from the u16/AABB `encodeVertices` blob above (which decodes back to
+// full f32 host-side — a disk-only win). This encoding is uploaded to the GPU
+// VERBATIM and the fixed-function vertex-fetch hardware converts it to float for
+// free — NO vertex-shader dequant, NO UBO uniforms (so it dodges the PBR-UBO
+// offset-sync trap entirely). GPU stride 20 B (non-skinned) / 28 B (skinned) vs
+// 48/56 f32 → ~58% VRAM + upload-bandwidth win.
+//
+//   pos     float16x4 @0  (8 B; xyz + pad w=0, GPU reads as vec3 float)
+//   normal  snorm8x4  @8  (4 B; xyz + pad w=0, snorm8 ±127 → [-1,1])
+//   tangent snorm8x4  @12 (4 B; xyz + w = ±127 handedness → ±1)
+//   uv      float16x2 @16 (4 B)
+//   skinned: joints uint8x4 @20 (4 B) + weights unorm8x4 @24 (4 B) → stride 28
+//
+// Half precision (~2^-10 relative) suits normalized-scale meshes; worse than
+// u16-over-AABB for very large meshes → an acceptable medium quant. There is NO
+// on-disk dequant header (unlike `encodeVertices`): the GPU formats are
+// self-describing. Native gate = an f32→half→f32 round-trip within epsilon plus
+// a browser (WebGL2 CDP + WebGPU) visual check of the actual GPU vertex fetch.
+
+pub const vgpu_stride: usize = 20; // non-skinned GPU vertex stride
+pub const vgpu_skin_stride: usize = 28; // skinned GPU vertex stride
+
+/// Encode an f32 (IEEE-754 binary32) to a half (binary16). Round-to-nearest-even
+/// on the normal path; subnormal-half magnitudes are flushed to signed zero;
+/// overflow / ±inf → ±inf; NaN → a quiet NaN. Mesh attributes never hit the
+/// subnormal range meaningfully, so the flush is loss-free in practice.
+pub fn f32ToHalf(f: f32) u16 {
+    const x: u32 = @bitCast(f);
+    const sign: u16 = @intCast((x >> 16) & 0x8000);
+    const biased: u32 = (x >> 23) & 0xff;
+    const mant: u32 = x & 0x7fffff;
+    if (biased == 0xff) return sign | (if (mant != 0) @as(u16, 0x7e00) else 0x7c00); // NaN / Inf
+    const exp: i32 = @as(i32, @intCast(biased)) - 127 + 15;
+    if (exp >= 0x1f) return sign | 0x7c00; // overflow → Inf
+    if (exp <= 0) return sign; // subnormal-half or underflow → signed zero
+    // Normal: 5-bit exp + top 10 mantissa bits, round-to-nearest-even on the 13
+    // dropped bits. A rounding carry into the exponent propagates correctly (and
+    // an all-ones mantissa carrying to exp 0x1f yields Inf, the desired overflow).
+    var h: u16 = @intCast((@as(u32, @intCast(exp)) << 10) | (mant >> 13));
+    const dropped: u32 = mant & 0x1fff;
+    if (dropped > 0x1000 or (dropped == 0x1000 and (h & 1) == 1)) h +%= 1;
+    return sign | h;
+}
+
+/// Decode a half (binary16) back to f32. Inverse of `f32ToHalf` for the values
+/// it produces (subnormal halves are handled too, for completeness).
+pub fn halfToF32(h: u16) f32 {
+    const sign: u32 = @as(u32, h & 0x8000) << 16;
+    const exp: u32 = (h >> 10) & 0x1f;
+    const mant: u32 = h & 0x3ff;
+    if (exp == 0) {
+        if (mant == 0) return @bitCast(sign); // ±0
+        // Subnormal half → normalized f32: shift the leading 1 out of the mantissa.
+        var m = mant;
+        var e: u32 = 0;
+        while (m & 0x400 == 0) {
+            m <<= 1;
+            e += 1;
+        }
+        const fe: u32 = 127 - 15 - e + 1;
+        return @bitCast(sign | (fe << 23) | ((m & 0x3ff) << 13));
+    }
+    if (exp == 0x1f) return @bitCast(sign | 0x7f800000 | (mant << 13)); // Inf / NaN
+    const fe: u32 = @intCast(@as(i32, @intCast(exp)) - 15 + 127);
+    return @bitCast(sign | (fe << 23) | (mant << 13));
+}
+
+/// Encode a base-f32 vertex array (12 f32/vertex) + optional skin data into the
+/// GPU-ready half/snorm8 interleaved blob (stride 20 / 28). Uploaded verbatim;
+/// the GPU vertex fetch converts each attribute to float. Caller owns the result.
+pub fn encodeVerticesGpu(
+    alloc: std.mem.Allocator,
+    vertices: []const f32, // len % 12 == 0
+    skinned: bool,
+    joints: []const [4]u8,
+    weights: []const [4]u8,
+) ![]u8 {
+    const vc = vertices.len / 12;
+    const stride = if (skinned) vgpu_skin_stride else vgpu_stride;
+    const out = try alloc.alloc(u8, vc * stride);
+    errdefer alloc.free(out);
+    for (0..vc) |v| {
+        const f = vertices[v * 12 ..][0..12];
+        const o = v * stride;
+        inline for (0..3) |k| std.mem.writeInt(u16, out[o + k * 2 ..][0..2], f32ToHalf(f[k]), .little);
+        std.mem.writeInt(u16, out[o + 6 ..][0..2], 0, .little); // pos.w pad
+        inline for (0..3) |k| std.mem.writeInt(i8, out[o + 8 + k ..][0..1], snormI8(f[3 + k]), .little);
+        std.mem.writeInt(i8, out[o + 11 ..][0..1], 0, .little); // normal.w pad
+        inline for (0..3) |k| std.mem.writeInt(i8, out[o + 12 + k ..][0..1], snormI8(f[6 + k]), .little);
+        std.mem.writeInt(i8, out[o + 15 ..][0..1], if (f[9] >= 0) @as(i8, 127) else @as(i8, -127), .little);
+        inline for (0..2) |k| std.mem.writeInt(u16, out[o + 16 + k * 2 ..][0..2], f32ToHalf(f[10 + k]), .little);
+        if (skinned) {
+            @memcpy(out[o + 20 ..][0..4], &joints[v]);
+            @memcpy(out[o + 24 ..][0..4], &weights[v]);
+        }
+    }
+    return out;
+}
+
+/// Decode positions (only) from a GPU-quantized blob into an f32 xyz array,
+/// `vertex_count * 3` floats. The host-side pick/BVH raycast reads float
+/// positions the GPU-format vertex buffer no longer exposes to Zig, so the
+/// Reader keeps this alongside the upload blob. Caller owns the result.
+pub fn decodeGpuPositions(alloc: std.mem.Allocator, blob: []const u8, vertex_count: usize, skinned: bool) ![]f32 {
+    const stride = if (skinned) vgpu_skin_stride else vgpu_stride;
+    if (blob.len < vertex_count * stride) return error.Truncated;
+    const out = try alloc.alloc(f32, vertex_count * 3);
+    errdefer alloc.free(out);
+    for (0..vertex_count) |v| {
+        const o = v * stride;
+        inline for (0..3) |k| out[v * 3 + k] = halfToF32(std.mem.readInt(u16, blob[o + k * 2 ..][0..2], .little));
+    }
+    return out;
+}
+
+test "half round-trip: representative values within relative epsilon" {
+    const cases = [_]f32{ 0.0, 1.0, -1.0, 0.5, -0.25, 2.0, 100.0, -3.14159, 0.001, 65504.0 };
+    for (cases) |c| {
+        const back = halfToF32(f32ToHalf(c));
+        if (c == 0.0) {
+            try std.testing.expectEqual(@as(f32, 0.0), back);
+        } else {
+            try std.testing.expect(@abs(back - c) <= @abs(c) * (1.0 / 1024.0) + 1e-6);
+        }
+    }
+}
+
+test "half: signed zero, inf, overflow, NaN" {
+    try std.testing.expectEqual(@as(u16, 0x0000), f32ToHalf(0.0));
+    try std.testing.expectEqual(@as(u16, 0x8000), f32ToHalf(-0.0));
+    try std.testing.expectEqual(@as(u16, 0x7c00), f32ToHalf(std.math.inf(f32)));
+    try std.testing.expectEqual(@as(u16, 0xfc00), f32ToHalf(-std.math.inf(f32)));
+    try std.testing.expectEqual(@as(u16, 0x7c00), f32ToHalf(1.0e30)); // overflow → Inf
+    try std.testing.expect(std.math.isNan(halfToF32(f32ToHalf(std.math.nan(f32)))));
+    try std.testing.expect(std.math.isInf(halfToF32(0x7c00)));
+}
+
+fn expectGpuRoundTrip(vertices: []const f32, skinned: bool, joints: []const [4]u8, weights: []const [4]u8) !void {
+    const a = std.testing.allocator;
+    const blob = try encodeVerticesGpu(a, vertices, skinned, joints, weights);
+    defer a.free(blob);
+    const vc = vertices.len / 12;
+    const stride = if (skinned) vgpu_skin_stride else vgpu_stride;
+    try std.testing.expectEqual(vc * stride, blob.len);
+    // Decode every attribute the way the GPU vertex fetch would and compare.
+    for (0..vc) |v| {
+        const f = vertices[v * 12 ..][0..12];
+        const o = v * stride;
+        inline for (0..3) |k| { // pos: half
+            const got = halfToF32(std.mem.readInt(u16, blob[o + k * 2 ..][0..2], .little));
+            try std.testing.expect(@abs(got - f[k]) <= @abs(f[k]) * (1.0 / 1024.0) + 1e-4);
+        }
+        inline for (0..3) |k| { // normal: snorm8
+            const got = snormF32(@bitCast(blob[o + 8 + k]));
+            try std.testing.expect(@abs(got - f[3 + k]) <= 1.0 / 127.0 + 1e-4);
+        }
+        inline for (0..3) |k| { // tangent xyz: snorm8
+            const got = snormF32(@bitCast(blob[o + 12 + k]));
+            try std.testing.expect(@abs(got - f[6 + k]) <= 1.0 / 127.0 + 1e-4);
+        }
+        const tw: i8 = @bitCast(blob[o + 15]); // tangent w handedness → exact ±1
+        try std.testing.expectEqual(f[9] >= 0, tw >= 0);
+        inline for (0..2) |k| { // uv: half
+            const got = halfToF32(std.mem.readInt(u16, blob[o + 16 + k * 2 ..][0..2], .little));
+            try std.testing.expect(@abs(got - f[10 + k]) <= @abs(f[10 + k]) * (1.0 / 1024.0) + 1e-4);
+        }
+        if (skinned) {
+            try std.testing.expectEqualSlices(u8, &joints[v], blob[o + 20 ..][0..4]);
+            try std.testing.expectEqualSlices(u8, &weights[v], blob[o + 24 ..][0..4]);
+        }
+    }
+    // Position-only decode (pick path) matches the in-blob half positions.
+    const pos = try decodeGpuPositions(a, blob, vc, skinned);
+    defer a.free(pos);
+    try std.testing.expectEqual(vc * 3, pos.len);
+    for (0..vc) |v| inline for (0..3) |k| {
+        const f = vertices[v * 12 ..][0..12];
+        try std.testing.expect(@abs(pos[v * 3 + k] - f[k]) <= @abs(f[k]) * (1.0 / 1024.0) + 1e-4);
+    };
+}
+
+test "gpu vertex codec: non-skinned round-trip within epsilon" {
+    const verts = [_]f32{
+        0.0,  0.0,  0.0, 0, 0, 1, 1, 0, 0, 1,  0.0,  0.0,
+        1.5,  -2.0, 3.0, 1, 0, 0, 0, 1, 0, -1, 0.25, 0.75,
+        -4.0, 2.5,  0.5, 0, 1, 0, 0, 0, 1, 1,  1.0,  0.5,
+    };
+    try expectGpuRoundTrip(&verts, false, &.{}, &.{});
+}
+
+test "gpu vertex codec: skinned round-trip preserves joints/weights exactly" {
+    const verts = [_]f32{
+        0.0, 0.0, 0.0, 0, 0, 1, 1, 0, 0, 1, 0.0, 0.0,
+        2.0, 1.0, 0.0, 0, 1, 0, 1, 0, 0, 1, 1.0, 1.0,
+    };
+    const joints = [_][4]u8{ .{ 0, 1, 2, 3 }, .{ 4, 0, 0, 0 } };
+    const weights = [_][4]u8{ .{ 255, 0, 0, 0 }, .{ 128, 127, 0, 0 } };
+    try expectGpuRoundTrip(&verts, true, &joints, &weights);
+}
+
+test "gpu vertex codec: stride is 20 non-skinned / 28 skinned" {
+    const a = std.testing.allocator;
+    const verts = [_]f32{0} ** (12 * 10);
+    const b0 = try encodeVerticesGpu(a, &verts, false, &.{}, &.{});
+    defer a.free(b0);
+    try std.testing.expectEqual(@as(usize, 200), b0.len); // 10 × 20
+    const joints = [_][4]u8{.{ 0, 0, 0, 0 }} ** 10;
+    const weights = [_][4]u8{.{ 255, 0, 0, 0 }} ** 10;
+    const b1 = try encodeVerticesGpu(a, &verts, true, &joints, &weights);
+    defer a.free(b1);
+    try std.testing.expectEqual(@as(usize, 280), b1.len); // 10 × 28
+}

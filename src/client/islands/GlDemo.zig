@@ -355,7 +355,8 @@ export fn glmodel_frame(dt_ms: f32, width: u32, height: u32) u32 {
 
         if (!model_resources_sent) {
             model_resources_sent = true;
-            enc.createBuffer(model_vbuf, .vertex, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
+            const vkind: gl.command.BufferKind = if (a.vertexGpu()) .vertex_gpu else .vertex;
+            enc.createBuffer(model_vbuf, vkind, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
             enc.createBuffer(model_ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
             // Comptime PBR über-shader — VS/FS assembled at comptime for pbr_variant.
             const vs = gl.command.pbrVertexSrc(pbr_variant);

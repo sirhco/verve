@@ -497,7 +497,8 @@ export fn glskin_frame(dt_ms: f32, width: u32, height: u32) u32 {
     var enc = gl.Encoder.init(&cmd_buf);
     if (!resources_sent) {
         resources_sent = true;
-        enc.createBuffer(vbuf_handle, .vertex, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
+        const vkind: gl.command.BufferKind = if (a.vertexGpu()) .vertex_gpu else .vertex;
+        enc.createBuffer(vbuf_handle, vkind, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
         enc.createBuffer(ibuf_handle, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
 
         const variant = gl.command.variant_pbr | gl.command.variant_skinned;

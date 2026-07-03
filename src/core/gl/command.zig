@@ -176,7 +176,11 @@ pub const Tag = enum(u16) {
 
 pub const ResKind = enum(u32) { buffer = 0, texture = 1, shader = 2, shadow_map = 3, render_target = 4 };
 
-pub const BufferKind = enum(u32) { vertex = 0, index = 1 };
+// `vertex_gpu` binds like `vertex` (ARRAY_BUFFER) but flags the buffer as the
+// GPU-resident quantized layout (half pos/uv + snorm8 normal/tangent, stride
+// 20/28) so the bridge selects the quantized vertex-attribute layout for every
+// draw that binds it. See geo_codec.zig `encodeVerticesGpu` + vmesh `vertex_gpu`.
+pub const BufferKind = enum(u32) { vertex = 0, index = 1, vertex_gpu = 2 };
 
 /// SET_PIPELINE state bits.
 pub const state_depth_test: u32 = 1 << 0;

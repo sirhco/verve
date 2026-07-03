@@ -4,6 +4,32 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.47.0] - 2026-07-03
+
+### Added
+
+- **`verve.gl` GPU-resident quantized vertex attributes (`.vmesh` v17, VRAM win).** Extends the
+  v17 vertex codec so shipped meshes upload a **GPU-ready half/snorm8 blob** and the GPU stores
+  geometry quantized — a VRAM + upload-bandwidth win on top of the v16/v17 disk savings. GPU
+  vertex stride drops **48/56 B → 20/28 B (~58%)**, both backends.
+  - **half-float + snorm8, no shader/UBO change.** Position → `float16x4`, normal/tangent →
+    `snorm8x4` (tangent `w` = handedness), UV → `float16x2`; skinned joints/weights stay
+    `uint8x4`/`unorm8x4`. The fixed-function vertex fetch converts these to float for free, so
+    the PBR shaders and the PBR UBO are **byte-identical** — this deliberately avoids the
+    in-shader dequant + dequant-uniforms that a u16-over-AABB GPU layout would have required.
+  - **Buffer-flagged, not a shader variant.** New `BufferKind.vertex_gpu` + `VertexCodec.vertex_gpu`
+    (v17, header shape unchanged). `packCompressed` emits the GPU blob; `Reader` uploads it
+    verbatim (zero-copy alias) and keeps a decoded float **position-only** array for the host
+    pick/BVH raycast. The bridge selects the quantized vertex layout from the bound buffer's
+    flag, so shader handles and WGSL/GLSL codegen are untouched.
+  - **Refactor-first.** The per-backend vertex layout is extracted into one shared factory
+    (`setPbrMeshAttribs` for WebGL2, `pbrVBLayout` + `pipeForDraw` quantized-sibling pipelines
+    for WebGPU), so the raw and quantized layouts have a single definition across every draw
+    path (PBR, depth/shadow, prepass, OIT, wireframe, instanced).
+  - **Verified.** Native codec round-trip + Reader tests (**1188** total green); WebGL2 CDP
+    (`/gl`, `/gl-cull`, `/gl-skin` render undistorted, pick/BVH click clean, no gl errors); and
+    a WebGPU visual pass on both backends. Draco decode is the remaining follow-on.
+
 ## [0.46.0] - 2026-07-03
 
 ### Added

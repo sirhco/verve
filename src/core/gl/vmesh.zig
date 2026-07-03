@@ -94,16 +94,22 @@ pub const version: u32 = 17;
 pub const GeoCodec = enum(u32) { none = 0, index_delta = 1 };
 
 /// Vertex-buffer compression codec (v17+). `none` = raw f32 stride-48/56 (every
-/// v13–v16 file, and uncompressed v17+). `quant` = the vertex buffer is stored
-/// as a lossy quantized blob (pos u16 over AABB, normal/tangent i8 snorm, uv u16
-/// over UV-AABB) of `vertex_comp_len` bytes at `vertex_off`, decoded back to the
-/// GPU-uploadable f32 section by `Reader.initAlloc`.
-pub const VertexCodec = enum(u32) { none = 0, quant = 1 };
+/// v13–v16 file, and uncompressed v17+). `quant` = a lossy quantized blob (pos
+/// u16 over AABB, normal/tangent i8 snorm, uv u16 over UV-AABB) of
+/// `vertex_comp_len` bytes at `vertex_off`, decoded back to the GPU-uploadable
+/// f32 section host-side by `Reader.initAlloc` (a disk-only win). `vertex_gpu`
+/// (slice 3) = a GPU-ready half/snorm8 interleaved blob (stride 20/28) uploaded
+/// to the GPU VERBATIM — the vertex-fetch hardware converts it to float, so the
+/// Reader does NOT decode it (it aliases the blob for upload and keeps a decoded
+/// f32 position-only array for the host pick/BVH path). A VRAM + bandwidth win.
+pub const VertexCodec = enum(u32) { none = 0, quant = 1, vertex_gpu = 2 };
 
 /// Compression options threaded into `pack` via `packCompressed`. Defaults keep
 /// the raw layout so existing `pack(...)` callers are byte-identical to v15
-/// (aside from the version bump + header growth).
-pub const GeoOpts = struct { compress_indices: bool = false, compress_vertices: bool = false };
+/// (aside from the version bump + header growth). `gpu_vertices` (slice 3) takes
+/// precedence over `compress_vertices` — they select mutually exclusive vertex
+/// codecs (`vertex_gpu` vs `quant`), so setting both uses the GPU encoding.
+pub const GeoOpts = struct { compress_indices: bool = false, compress_vertices: bool = false, gpu_vertices: bool = false };
 
 /// Returns the number of f16 values per (target, vertex) morph record.
 /// v13: 6 (pos3 + nrm3). v14+: 9 (pos3 + nrm3 + tan3).
@@ -276,7 +282,7 @@ pub fn packCompressed(
     morph: ?MorphData,
     lod: ?LodData,
 ) ![]u8 {
-    return packImpl(alloc, vertices, indices, submeshes, textures, bvh_nodes, tri_perm, names, skinned, joints, weights, skel, anim, instances, instance_count, morph, lod, .{ .compress_indices = true, .compress_vertices = true });
+    return packImpl(alloc, vertices, indices, submeshes, textures, bvh_nodes, tri_perm, names, skinned, joints, weights, skel, anim, instances, instance_count, morph, lod, .{ .compress_indices = true, .gpu_vertices = true });
 }
 
 fn packImpl(
@@ -336,9 +342,16 @@ fn packImpl(
 
     // Optional vertex-buffer quantization (v17 vertex codec), encoded UP FRONT
     // for the same reason: the section byte length flows through the sequential
-    // aligned-offset computation below with no post-hoc patching.
-    const vertex_codec_tag: VertexCodec = if (geo.compress_vertices) .quant else .none;
-    const vertex_blob: ?[]u8 = if (geo.compress_vertices) try geo_codec.encodeVertices(alloc, vertices, skinned, joints, weights) else null;
+    // aligned-offset computation below with no post-hoc patching. `gpu_vertices`
+    // (GPU-resident half/snorm8, stride 20/28) takes precedence over the host-
+    // decoded `quant` blob — they are mutually exclusive vertex encodings.
+    const vertex_codec_tag: VertexCodec = if (geo.gpu_vertices) .vertex_gpu else if (geo.compress_vertices) .quant else .none;
+    const vertex_blob: ?[]u8 = if (geo.gpu_vertices)
+        try geo_codec.encodeVerticesGpu(alloc, vertices, skinned, joints, weights)
+    else if (geo.compress_vertices)
+        try geo_codec.encodeVertices(alloc, vertices, skinned, joints, weights)
+    else
+        null;
     defer if (vertex_blob) |b| alloc.free(b);
 
     // Layout: header(108, v16) → submesh_table → tex_table → [align16] → vertices →
@@ -800,6 +813,10 @@ pub const Reader = struct {
     index_comp_len_: u32 = 0, // v16+; compressed index blob byte length (0 when raw)
     vertex_codec_: VertexCodec = .none, // v17+; .none for v13–v16 and uncompressed v17+
     vertex_comp_len_: u32 = 0, // v17+; quantized vertex blob byte length (0 when raw)
+    // v17+ `vertex_gpu` codec: `vertices` aliases the GPU-ready half/snorm8 blob
+    // (stride 20/28) uploaded verbatim; it is NOT decoded to f32. The host pick/
+    // BVH path reads floats from `owned_pos_f32` instead (see positions()).
+    vertex_gpu_: bool = false,
     bytes: []const u8,
     // Owned decode buffers for compressed sections (set only by initAlloc when the
     // matching codec != .none). `indices`/`vertices` alias these (as bytes) instead
@@ -807,6 +824,7 @@ pub const Reader = struct {
     // Freed by deinit(). null for the zero-copy raw path.
     owned_index_buf: ?[]u16 = null,
     owned_vertex_buf: ?[]u32 = null, // 4-aligned decoded f32 section (see geo_codec)
+    owned_pos_f32: ?[]f32 = null, // vertex_gpu only: decoded xyz positions for pick/BVH
     alloc_: ?std.mem.Allocator = null,
 
     pub const Error = error{ BadMagic, BadVersion, Truncated, BadTexIndex, CompressedNeedsAlloc, Corrupt, OutOfMemory };
@@ -830,9 +848,11 @@ pub const Reader = struct {
         if (self.alloc_) |a| {
             if (self.owned_index_buf) |b| a.free(b);
             if (self.owned_vertex_buf) |b| a.free(b);
+            if (self.owned_pos_f32) |b| a.free(b);
         }
         self.owned_index_buf = null;
         self.owned_vertex_buf = null;
+        self.owned_pos_f32 = null;
     }
 
     fn parse(maybe_alloc: ?std.mem.Allocator, bytes: []const u8) Error!Reader {
@@ -896,6 +916,7 @@ pub const Reader = struct {
         const vertex_tag: VertexCodec = switch (vertex_codec_h) {
             0 => .none,
             1 => .quant,
+            2 => .vertex_gpu,
             else => return error.Corrupt,
         };
 
@@ -1086,17 +1107,32 @@ pub const Reader = struct {
         // decode error the errdefer frees whatever was already decoded (no leak).
         var owned_idx: ?[]u16 = null;
         var owned_vtx: ?[]u32 = null;
+        var owned_pos: ?[]f32 = null;
         errdefer if (maybe_alloc) |a| {
             if (owned_idx) |b| a.free(b);
             if (owned_vtx) |b| a.free(b);
+            if (owned_pos) |b| a.free(b);
         };
-        const vertices_slice: []const u8 = if (vertex_tag == .none)
-            bytes[vertex_off..][0..@intCast(on_disk_verts)]
-        else blk: {
-            const a = maybe_alloc orelse return error.CompressedNeedsAlloc;
-            const decoded = try geo_codec.decodeVertices(a, bytes[vertex_off..][0..@intCast(on_disk_verts)], vertex_count, skinned);
-            owned_vtx = decoded;
-            break :blk std.mem.sliceAsBytes(decoded);
+        const vertices_slice: []const u8 = switch (vertex_tag) {
+            // Raw f32 stride-48/56 → zero-copy alias into `bytes`.
+            .none => bytes[vertex_off..][0..@intCast(on_disk_verts)],
+            // Host-decoded quant (disk-only win) → decode to the full f32 section.
+            .quant => blk: {
+                const a = maybe_alloc orelse return error.CompressedNeedsAlloc;
+                const decoded = try geo_codec.decodeVertices(a, bytes[vertex_off..][0..@intCast(on_disk_verts)], vertex_count, skinned);
+                owned_vtx = decoded;
+                break :blk std.mem.sliceAsBytes(decoded);
+            },
+            // GPU-resident half/snorm8 (stride 20/28) → uploaded VERBATIM, so
+            // `vertices` aliases the blob zero-copy. Also decode positions-only
+            // for the host pick/BVH path (needs f32 the GPU-format buffer no
+            // longer exposes to Zig).
+            .vertex_gpu => blk: {
+                const a = maybe_alloc orelse return error.CompressedNeedsAlloc;
+                const gpu_blob = bytes[vertex_off..][0..@intCast(on_disk_verts)];
+                owned_pos = try geo_codec.decodeGpuPositions(a, gpu_blob, vertex_count, skinned);
+                break :blk gpu_blob;
+            },
         };
         const indices_slice: []const u8 = if (geo_tag == .none)
             bytes[index_off..][0..@intCast(on_disk_idx)]
@@ -1116,8 +1152,10 @@ pub const Reader = struct {
             .index_comp_len_ = index_comp_len_h,
             .vertex_codec_ = vertex_tag,
             .vertex_comp_len_ = vertex_comp_len_h,
+            .vertex_gpu_ = vertex_tag == .vertex_gpu,
             .owned_index_buf = owned_idx,
             .owned_vertex_buf = owned_vtx,
+            .owned_pos_f32 = owned_pos,
             .alloc_ = maybe_alloc,
             .submeshes = bytes[sub_table_off..][0..sub_table_bytes],
             .submesh_count = sub_count,
@@ -1147,9 +1185,35 @@ pub const Reader = struct {
         return std.mem.readInt(u32, self.bytes[4..8], .little);
     }
 
-    /// Vertex stride in bytes: 56 when skinned (joints+weights appended), else 48.
+    /// Vertex stride in bytes. GPU-resident (`vertex_gpu`) meshes are the compact
+    /// half/snorm8 layout (20 non-skinned / 28 skinned); every other codec is the
+    /// full f32 stride (48 / 56). This is the stride of the bytes in `vertices`.
     pub fn vertexStride(self: *const Reader) u32 {
+        if (self.vertex_gpu_) return if (self.skinned) @intCast(geo_codec.vgpu_skin_stride) else @intCast(geo_codec.vgpu_stride);
         return if (self.skinned) skinned_vertex_stride else vertex_stride;
+    }
+
+    /// True when `vertices` holds the GPU-resident half/snorm8 blob (uploaded
+    /// verbatim; the draw path must select the quantized vertex-attribute layout).
+    pub fn vertexGpu(self: *const Reader) bool {
+        return self.vertex_gpu_;
+    }
+
+    /// Host-readable float vertex positions for the pick/BVH raycast path, plus
+    /// their stride in f32 elements (via `positionStride`). For `vertex_gpu`
+    /// meshes this is the decoded xyz-only array (stride 3); for every other codec
+    /// it is a view over `vertices` (stride 12 = the 48-byte f32 vertex).
+    pub fn positions(self: *const Reader) []const f32 {
+        if (self.owned_pos_f32) |p| return p;
+        // Raw/quant path: `vertices` aliases the 16-aligned on-disk vertex section
+        // (or the 4-aligned decoded f32 buffer), so the f32 view is 4-aligned —
+        // the same assumption the existing pick path's `bytesAsF32` already makes.
+        return @alignCast(std.mem.bytesAsSlice(f32, self.vertices));
+    }
+
+    /// Stride, in f32 elements, of the array returned by `positions()`.
+    pub fn positionStride(self: *const Reader) u32 {
+        return if (self.vertex_gpu_) 3 else 12;
     }
 
     /// Number of skeleton joints (header [64..68]). 0 for non-skinned meshes.
@@ -1563,7 +1627,7 @@ test "round-trip: one submesh (full PBR fields), one texture" {
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&idx), r.indices);
 }
 
-test "vmesh v17: compressed index + quantized vertex round-trip (packCompressed → initAlloc)" {
+test "vmesh v17: compressed index + GPU-resident vertex round-trip (packCompressed → initAlloc)" {
     const a = testing.allocator;
     const verts = [_]f32{
         0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0,
@@ -1590,24 +1654,35 @@ test "vmesh v17: compressed index + quantized vertex round-trip (packCompressed 
     const bytes = try packCompressed(a, &verts, &idx, &subs, &.{}, &.{}, &.{}, &.{}, false, &.{}, &.{}, &.{}, null, &.{}, 0, null, null);
     defer a.free(bytes);
 
-    // Header: v17, index codec (lossless) + vertex codec (quant) both active.
+    // Header: v17, index codec (lossless) + vertex codec (GPU-resident) both active.
     try testing.expectEqual(@as(u32, 17), std.mem.readInt(u32, bytes[4..8], .little));
     try testing.expectEqual(@as(u32, @intFromEnum(GeoCodec.index_delta)), std.mem.readInt(u32, bytes[100..104], .little));
     try testing.expect(std.mem.readInt(u32, bytes[104..108], .little) > 0);
-    try testing.expectEqual(@as(u32, @intFromEnum(VertexCodec.quant)), std.mem.readInt(u32, bytes[108..112], .little));
+    try testing.expectEqual(@as(u32, @intFromEnum(VertexCodec.vertex_gpu)), std.mem.readInt(u32, bytes[108..112], .little));
     try testing.expect(std.mem.readInt(u32, bytes[112..116], .little) > 0);
 
-    // Raw init refuses a compressed file; initAlloc decodes both sections.
+    // Raw init refuses a compressed file; initAlloc aliases the GPU blob + decodes
+    // indices and the pick-path positions.
     try testing.expectError(error.CompressedNeedsAlloc, Reader.init(bytes));
     var r = try Reader.initAlloc(a, bytes);
     defer r.deinit();
     // Index buffer is LOSSLESS.
     try testing.expectEqual(@as(u32, idx.len), r.index_count);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&idx), r.indices);
-    // Vertices are quantized (lossy) → dequantized within epsilon of the source.
+    // Vertices are the GPU half/snorm8 blob (stride 20, uploaded verbatim), NOT
+    // decoded to f32. The comp-len equals the on-disk blob length.
     try testing.expectEqual(@as(u32, 3), r.vertex_count);
-    const rv = std.mem.bytesAsSlice(f32, r.vertices);
-    for (0..verts.len) |k| try testing.expect(@abs(rv[k] - verts[k]) <= 1e-3);
+    try testing.expect(r.vertexGpu());
+    try testing.expectEqual(@as(u32, 20), r.vertexStride());
+    try testing.expectEqual(@as(usize, 3 * 20), r.vertices.len);
+    try testing.expectEqual(std.mem.readInt(u32, bytes[112..116], .little), @as(u32, @intCast(r.vertices.len)));
+    // Pick-path positions decode (half) within epsilon of the source xyz (stride 3).
+    try testing.expectEqual(@as(u32, 3), r.positionStride());
+    const pos = r.positions();
+    try testing.expectEqual(@as(usize, 3 * 3), pos.len);
+    for (0..r.vertex_count) |v| inline for (0..3) |k| {
+        try testing.expect(@abs(pos[v * 3 + k] - verts[v * 12 + k]) <= 1e-2);
+    };
 }
 
 test "vmesh v17: raw pack still zero-copy; initAlloc accepts raw (no leak)" {

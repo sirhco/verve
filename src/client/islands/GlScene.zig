@@ -752,15 +752,17 @@ fn canvasRef(inst: *const Inst) ?i32 {
     return inst.canvas_handle;
 }
 
-/// Model-local AABB over a submesh's indexed vertex positions (stride 12 f32,
-/// pos xyz @0). An empty range yields an inverted (inf) box (never visible).
-fn submeshLocalAabb(verts: []const f32, indices: []const u16, first: u32, count: u32) gl.cull.Aabb {
+/// Model-local AABB over a submesh's indexed vertex positions. `vstride` is the
+/// f32 stride of `verts` (12 for the raw 48-byte vertex; 3 for the GPU-resident
+/// decoded position-only array — see `Reader.positions`/`positionStride`); pos
+/// xyz @0. An empty range yields an inverted (inf) box (never visible).
+fn submeshLocalAabb(verts: []const f32, vstride: u32, indices: []const u16, first: u32, count: u32) gl.cull.Aabb {
     const inf = std.math.inf(f32);
     var lo = gl.math.Vec3.init(inf, inf, inf);
     var hi = gl.math.Vec3.init(-inf, -inf, -inf);
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        const vi = @as(usize, indices[first + i]) * 12;
+        const vi = @as(usize, indices[first + i]) * vstride;
         const x = verts[vi];
         const y = verts[vi + 1];
         const z = verts[vi + 2];
@@ -1824,8 +1826,10 @@ fn buildScene(inst: *Inst, a: *const gl.vmesh.Reader) void {
     inst.scene = .{};
     _ = inst.scene.addNode(-1, "model");
     const n: u32 = @min(a.submesh_count, max_submesh);
-    // Vertices: vmesh stride 48 bytes = 12 f32; position xyz at offset 0.
-    const verts_f32 = bytesAsF32(a.vertices);
+    // Host-readable float positions (raw f32 stride 12, or GPU-resident decoded
+    // xyz stride 3) for CPU-side per-submesh AABBs. See Reader.positions.
+    const verts_f32 = a.positions();
+    const pstride = a.positionStride();
     const indices_u16 = bytesAsU16(a.indices);
     var s: u32 = 0;
     while (s < n) : (s += 1) {
@@ -1844,7 +1848,7 @@ fn buildScene(inst: *Inst, a: *const gl.vmesh.Reader) void {
             inst.mats[s][4] = 1.0; // metallic
             inst.mats[s][5] = 0.10; // roughness → sharp mirror
         }
-        inst.submesh_aabb[s] = submeshLocalAabb(verts_f32, indices_u16, sub.index_byte_off / 2, sub.index_count);
+        inst.submesh_aabb[s] = submeshLocalAabb(verts_f32, pstride, indices_u16, sub.index_byte_off / 2, sub.index_count);
     }
     // Model-local AABB: union of all per-submesh local AABBs for T6 per-instance cull (3A).
     // If n == 0, model_local_aabb is left undefined; the instanced branch already guards
@@ -1981,18 +1985,21 @@ fn raycastSubmesh(inst: *const Inst, a: *const gl.vmesh.Reader, aspect: f32, ndc
         gl.ray.rayFromCamera(inst.orbit.eye(), inst.orbit.target, up_vec, inst.cam_fov_y, aspect, ndc_x, ndc_y);
     const nodes = gl.bvh.nodesFromBytes(a.bvh_nodes);
     const tri_perm = gl.bvh.triPermFromBytes(a.tri_perm);
-    const verts_f32 = bytesAsF32(a.vertices);
+    // Host float positions: raw f32 (stride 12) or GPU-resident decoded xyz
+    // (stride 3, half-precision — fine for pick/BVH). See Reader.positions.
+    const verts_f32 = a.positions();
+    const pstride = a.positionStride();
     const indices_u16 = bytesAsU16(a.indices);
 
     const rot_identity = nodeXformIdentity(inst);
     if (!inst.scene_built or (inst.model_yaw == 0 and rot_identity)) {
-        const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, 12, indices_u16, r) orelse return null;
+        const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, pstride, indices_u16, r) orelse return null;
         return submeshOfTri(a, hit.tri_index);
     }
     if (rot_identity) {
         // Root-only: one walk with the ray in model (root) space.
         const tr = gl.ray.transformRay(r, gl.math.invert(inst.scene.world[0]));
-        const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, 12, indices_u16, tr) orelse return null;
+        const hit = gl.bvh.walk(nodes, tri_perm, verts_f32, pstride, indices_u16, tr) orelse return null;
         return submeshOfTri(a, hit.tri_index);
     }
     // Slow path: per-submesh inverse transform + range-walk over s's triangles.
@@ -2003,7 +2010,7 @@ fn raycastSubmesh(inst: *const Inst, a: *const gl.vmesh.Reader, aspect: f32, ndc
     while (s < n) : (s += 1) {
         const sub = a.submesh(s);
         const tr = gl.ray.transformRay(r, gl.math.invert(inst.scene.world[s + 1]));
-        const hit = gl.bvh.walkRange(nodes, tri_perm, verts_f32, 12, indices_u16, tr, sub.index_byte_off / 2, sub.index_count) orelse continue;
+        const hit = gl.bvh.walkRange(nodes, tri_perm, verts_f32, pstride, indices_u16, tr, sub.index_byte_off / 2, sub.index_count) orelse continue;
         if (hit.t < best_t) {
             best_t = hit.t;
             best_s = s;
@@ -3156,8 +3163,11 @@ fn captureProbe(inst: *Inst, a: *const gl.vmesh.Reader, enc: *gl.Encoder, env: *
 
 /// One-time GPU resource upload, mirrored into `inst.registry` for restore replay.
 fn sendResources(inst: *Inst, enc: *gl.Encoder, a: *const gl.vmesh.Reader, env: *const gl.venv.Reader) void {
-    enc.createBuffer(vbuf, .vertex, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
-    inst.registry.recordBuffer(vbuf, .vertex, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
+    // GPU-resident quantized meshes upload the half/snorm8 blob verbatim under
+    // BufferKind.vertex_gpu so every draw that binds it picks the quantized layout.
+    const vkind: gl.command.BufferKind = if (a.vertexGpu()) .vertex_gpu else .vertex;
+    enc.createBuffer(vbuf, vkind, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
+    inst.registry.recordBuffer(vbuf, vkind, @intCast(@intFromPtr(a.vertices.ptr)), @intCast(a.vertices.len));
     enc.createBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
     inst.registry.recordBuffer(ibuf, .index, @intCast(@intFromPtr(a.indices.ptr)), @intCast(a.indices.len));
 
