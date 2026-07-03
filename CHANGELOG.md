@@ -4,6 +4,28 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.45.0] - 2026-07-03
+
+### Added
+
+- **`verve.gl` geometry compression (`.vmesh` v16).** Shipped mesh assets now store the
+  **index buffer compressed** with a pure-Zig delta + zigzag + LEB128-varint codec
+  (`src/core/gl/geo_codec.zig`), halving the index-section byte size on the demo meshes
+  (≈50%: `lodsphere` 13248→6624 B, `cubegrid` 3528→1764 B, `windfarm` 1164→582 B).
+  - **Lossless.** Decode reconstructs the raw u16 indices byte-for-byte, so every downstream
+    draw, BVH pick, and shader is unchanged. A native round-trip golden is the definitive gate
+    (no GPU-output metric needed); browser-verified on WebGL2 across `/gl`, `/gl-cull`,
+    `/gl-skin` for the chunk decode path.
+  - **Build-time encode, host-side decode.** `gl_asset_gen.convertGlb` emits v16 via the new
+    `vmesh.packCompressed`; the wasm client chunk decodes transparently in
+    `vmesh.Reader.initAlloc` (into the page-persistent chunk arena) **before** the GPU upload,
+    so WebGL2 and WebGPU share one decode path — **no wire or shader change**.
+  - **Format.** v16 grows the header to 108 B (`geo_codec` @100 + `index_comp_len` @104);
+    `pack()`'s signature is frozen (raw path) and `packCompressed()` is additive, so every
+    existing caller is source-compatible. `Reader.init` still parses raw files zero-copy and
+    returns `error.CompressedNeedsAlloc` for a compressed one. Vertex-buffer compression is the
+    planned follow-on (reuses this infra).
+
 ## [0.44.0] - 2026-07-03
 
 ### Added
