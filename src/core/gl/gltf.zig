@@ -2867,7 +2867,7 @@ test "glTF morph TANGENT accessor (v14): nonzero tangent deltas survive parseGlb
     const bytes = try toVmesh(testing.allocator, glb);
     defer testing.allocator.free(bytes);
     var r = try vmesh.Reader.init(bytes);
-    try testing.expectEqual(@as(u32, 16), r.fileVersion());
+    try testing.expectEqual(@as(u32, 17), r.fileVersion());
     try testing.expectEqual(@as(u32, 1), r.morphTargetCount());
     // morphDeltas() must have 9-f16 stride (v14/v15).
     const vc = r.morphVertexCount();
