@@ -154,7 +154,7 @@ pub fn build(b: *std.Build) void {
         exe.import_memory = true;
         // Private per-chunk table supplied by the bridge (table isolation).
         exe.import_table = true;
-        exe.stack_size = 4 * 1024;
+        exe.stack_size = 64 * 1024;
 
         const out_name = b.fmt("island_{s}.wasm", .{name});
         _ = wf.addCopyFile(exe.getEmittedBin(), out_name);
@@ -220,10 +220,53 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("../../src/server/gl_assets_stub.zig"),
     });
 
-    const viz_assets_stub_mod = b.createModule(.{
-        .root_source_file = b.path("../../src/server/viz_assets_stub.zig"),
+    // Viz graph asset pipeline: build-time tool generates the deterministic
+    // ~1500-node jittered-grid graph and packs it as canvas_buf binary.
+    // Served at /viz/graph.bin; fetched by the VizGraphCanvas chunk.
+    const host_canvas_buf_mod = b.createModule(.{
+        .root_source_file = b.path("../../src/core/viz/canvas_buf.zig"),
         .target = target,
         .optimize = optimize,
+    });
+    const host_viz_data_mod = b.createModule(.{
+        .root_source_file = b.path("src/app/viz_data.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const viz_graph_gen_mod = b.createModule(.{
+        .root_source_file = b.path("../../tools/viz_graph_gen.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "canvas_buf", .module = host_canvas_buf_mod },
+            .{ .name = "viz_data", .module = host_viz_data_mod },
+        },
+    });
+    const viz_graph_gen_exe = b.addExecutable(.{
+        .name = "verve-viz-graph-gen",
+        .root_module = viz_graph_gen_mod,
+    });
+    const viz_graph_gen_run = b.addRunArtifact(viz_graph_gen_exe);
+    const graph_bin_path = viz_graph_gen_run.addOutputFileArg("graph.bin");
+    const wf_viz = b.addWriteFiles();
+    _ = wf_viz.addCopyFile(graph_bin_path, "graph.bin");
+    const viz_assets_src =
+        \\pub const VizAsset = struct { name: []const u8, bytes: []const u8 };
+        \\pub const viz_assets: []const VizAsset = &.{
+        \\    .{ .name = "graph.bin", .bytes = @embedFile("graph.bin") },
+        \\};
+        \\pub fn lookupVizAsset(name: []const u8) ?VizAsset {
+        \\    const std_mod = @import("std");
+        \\    for (viz_assets) |a| {
+        \\        if (std_mod.mem.eql(u8, a.name, name)) return a;
+        \\    }
+        \\    return null;
+        \\}
+        \\
+    ;
+    _ = wf_viz.add("viz_assets.zig", viz_assets_src);
+    const viz_assets_mod = b.createModule(.{
+        .root_source_file = wf_viz.getDirectory().path(b, "viz_assets.zig"),
     });
 
     const server_mod = b.createModule(.{
@@ -234,7 +277,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "verve", .module = verve_mod },
             .{ .name = "assets", .module = assets_mod },
             .{ .name = "gl_assets", .module = gl_assets_stub_mod },
-            .{ .name = "viz_assets", .module = viz_assets_stub_mod },
+            .{ .name = "viz_assets", .module = viz_assets_mod },
             .{ .name = "app", .module = app_mod },
             .{ .name = "app_client", .module = app_client_mod },
             .{ .name = "client_manifest", .module = client_manifest_mod },

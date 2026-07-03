@@ -115,3 +115,11 @@ pub const Actions = struct {
         return .{ .seq = seq, .nodes = tl_nodes[0..counts.n], .edges = tl_edges[0..counts.e] };
     }
 };
+
+// Live canvas graph — re-exported from viz_live.zig so the app module surface
+// presents `vizCanvasAdvanceTick` and `packLiveGraph` to main.zig. The
+// framework auto-activates the vizcanvas publisher + /viz/live-graph.bin route
+// when it detects @hasDecl(app, "vizCanvasAdvanceTick").
+const viz_live = @import("viz_live.zig");
+pub const vizCanvasAdvanceTick = viz_live.vizCanvasAdvanceTick;
+pub const packLiveGraph = viz_live.packLiveGraph;

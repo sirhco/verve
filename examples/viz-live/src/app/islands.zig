@@ -2,7 +2,7 @@
 //! struct { ... }` here and compiles the matching chunk — example-local
 //! `src/client/islands/<Name>.zig` first, then the framework's own
 //! implementation, then the `_default` stub. This example reuses the
-//! framework's `VizGraphInteractive` chunk verbatim.
+//! framework's `VizGraphInteractive` and `VizGraphCanvas` chunks verbatim.
 
 /// Interactive node-link graph: wheel-zoom, pointer-captured pan/drag, hover
 /// tooltip, click-select, dblclick subtree collapse, runtime add/remove with
@@ -26,4 +26,11 @@ pub const VizGraphInteractive = struct {
         margin: f64,
         edge_routing: u32,
     };
+};
+
+/// canvas2d render path (one batched draw call/frame) with pan/zoom/hover/select
+/// via hit-test. The graph is fetched from /viz/graph.bin at init; no props.
+/// Source: `../../src/client/islands/VizGraphCanvas.zig`.
+pub const VizGraphCanvas = struct {
+    pub const props_schema: []const u8 = "{}";
 };
