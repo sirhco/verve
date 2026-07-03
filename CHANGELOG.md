@@ -4,6 +4,28 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.42.0] - 2026-07-02
+
+### Added
+
+- **viz — server-authored large graphs for the canvas render path.** The canvas2d graph
+  island (`VizGraphCanvas`) now renders a graph authored on the **server** and delivered by
+  fetch, instead of synthesizing it in the chunk. This introduces a general large-binary
+  fetch transport for island chunks that bypasses the 8 KB per-island props scratch (which
+  silently caps every other inbound path), reusing the 4 MB asset region.
+  - **`src/core/viz/canvas_buf.zig`** — `packGraph` writes a node/edge graph into the existing
+    canvas_buf binary layout (48-byte header + `n×(x,y f32)` + `e×(from,to u32)`, index edges).
+  - **build/server** — a build-time tool (`tools/viz_graph_gen.zig`) packs an app-authored
+    ~1500-node graph (`src/app/viz_data.zig`) and serves it at **`/viz/graph.bin`** (embedded
+    asset, new `/viz/` route). `scripts/viz_graph_check.mjs` validates the served binary.
+  - **`verveFetchBinary` transport** (`src/client/island_runtime.zig` `fetchBinaryToExport` +
+    `src/bridge/verve.js`) — fetches a URL into the asset region and delivers `(ptr, len)` to a
+    named chunk export, vid-scoped, without touching the 8 KB scratch. Reusable by any island.
+  - **`src/client/islands/VizGraphCanvas.zig`** — `hydrate` fetches `/viz/graph.bin` and
+    `vizcanvas_graph_ready` parses it into the instance (bounds-checked), then fits the camera
+    and starts the render loop. Multi-instance safe (`/viz-canvas-multi`: each canvas fetches
+    independently). The old in-chunk `genGraph` synthesizer is retained for reference only.
+
 ## [0.41.0] - 2026-07-02
 
 ### Added
