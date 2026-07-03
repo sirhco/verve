@@ -268,7 +268,16 @@ test "vizAdvanceTick emits seq-ordered deltas that transform the snapshot" {
     try std.testing.expectEqual(before_n, wrapped.nodes.len);
 }
 
-// Pull viz_data tests into the app test suite.
+// Pull viz_data and viz_live tests into the app test suite.
 test {
     _ = @import("viz_data.zig");
+    _ = @import("viz_live.zig");
 }
+
+// ---------------------------------------------------------------------------
+// Live canvas graph — re-exported from viz_live.zig so the app module surface
+// presents `vizCanvasAdvanceTick` and `packLiveGraph` to main.zig.
+// ---------------------------------------------------------------------------
+const viz_live = @import("viz_live.zig");
+pub const vizCanvasAdvanceTick = viz_live.vizCanvasAdvanceTick;
+pub const packLiveGraph = viz_live.packLiveGraph;

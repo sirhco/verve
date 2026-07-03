@@ -114,6 +114,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Live canvas publisher (opt-in: only when the app declares
+    // `vizCanvasAdvanceTick`): ticks the mutable canvas-graph model once per
+    // second and broadcasts a small ping to the `vizcanvas` push channel,
+    // but only while someone is subscribed.
+    if (comptime app_has_viz_canvas_publisher) {
+        if (std.Thread.spawn(.{}, vizCanvasPublisherLoop, .{io})) |t| t.detach() else |err| {
+            log.err("vizcanvas publisher spawn: {s}", .{@errorName(err)});
+        }
+    }
+
     // Metrics publisher (opt-in: only when the app declares
     // `metricsAdvanceTick` — see `app_has_metrics_publisher`): ticks the
     // metrics model at ~2 Hz and publishes JSON frames to the `metrics` push
@@ -337,6 +347,18 @@ fn handleRequest(
         const name = path[GL_PREFIX.len..];
         if (gl_assets.lookupGlAsset(name)) |asset| {
             try respondBuffered(gpa, request, .ok, "application/octet-stream", "public, max-age=300", meta.accept_gzip, asset.bytes);
+            return;
+        }
+    }
+
+    // Dynamic live canvas snapshot — served fresh on every request so clients
+    // refetching after a "vizcanvas" push ping always get the latest model.
+    // Must be matched BEFORE the static /viz/ prefix handler below.
+    if (comptime app_has_viz_canvas_publisher) {
+        if (std.mem.eql(u8, path, "/viz/live-graph.bin")) {
+            const bytes = try app.packLiveGraph(gpa);
+            defer gpa.free(bytes);
+            try respondBuffered(gpa, request, .ok, "application/octet-stream", "no-store", meta.accept_gzip, bytes);
             return;
         }
     }
@@ -785,6 +807,28 @@ fn vizPublisherLoop(io: std.Io) void {
         if (push.subscriberCount("viz") == 0) continue;
         const frame = app.vizAdvanceTick(&buf) orelse continue;
         _ = push.publish("viz", frame);
+    }
+}
+
+/// Whether the app module opts into the live canvas publisher: a
+/// `pub fn vizCanvasAdvanceTick(buf: []u8) ?[]const u8` advancing the mutable
+/// canvas-graph model and returning a small JSON ping. Apps without it skip
+/// the thread.
+const app_has_viz_canvas_publisher = @hasDecl(app, "vizCanvasAdvanceTick");
+
+/// Once per second: advance the live canvas model unconditionally, then
+/// publish a small ping (`{"seq":N}`) to the `vizcanvas` push channel only
+/// while someone is subscribed. The model always advances so that
+/// GET /viz/live-graph.bin polling clients see fresh data even without an
+/// active SSE connection.
+fn vizCanvasPublisherLoop(io: std.Io) void {
+    if (comptime !app_has_viz_canvas_publisher) return;
+    var buf: [push.MSG_MAX]u8 = undefined;
+    while (true) {
+        std.Io.sleep(io, VIZ_PUBLISH_TICK, .awake) catch return;
+        const frame = app.vizCanvasAdvanceTick(&buf) orelse continue;
+        if (push.subscriberCount("vizcanvas") == 0) continue;
+        _ = push.publish("vizcanvas", frame);
     }
 }
 
