@@ -312,7 +312,10 @@ export fn glcube_frame(dt_ms: f32, width: u32, height: u32) u32 {
 export fn glmodel_ready(ptr: u32, len: u32) void {
     if (ptr == 0) return; // fetch failed; stay on clear-only frames
     const bytes = @as([*]const u8, @ptrFromInt(ptr))[0..len];
-    model_asset = gl.vmesh.Reader.init(bytes) catch null;
+    // v16 assets carry a compressed index section → decode via initAlloc into the
+    // page-persistent chunk arena (same lifetime as the fetched asset bytes).
+    if (model_asset) |*old| old.deinit();
+    model_asset = gl.vmesh.Reader.initAlloc(verve.chunkArena(), bytes) catch null;
 }
 
 export fn glmodel_env_ready(ptr: u32, len: u32) void {

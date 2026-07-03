@@ -1610,7 +1610,11 @@ export fn glscene_vmesh_ready(ptr: u32, len: u32) void {
     const inst = current orelse return;
     if (ptr == 0) return; // fetch failed → stay on clear-only frames
     const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
-    inst.asset = gl.vmesh.Reader.init(bytes) catch null;
+    // v16 assets carry a compressed index section → decode via initAlloc into the
+    // page-persistent chunk arena (same lifetime as the fetched asset bytes; the
+    // decoded indices must survive across frames for the pick/BVH raycast path).
+    if (inst.asset) |*old| old.deinit(); // bump arena → no-op free; future-proof re-hydrate
+    inst.asset = gl.vmesh.Reader.initAlloc(verve.chunkArena(), bytes) catch null;
     if (inst.asset) |*a| buildScene(inst, a);
     // With the Reader resolvable, build the scroll-scrubbed timeline once.
     if (inst.scrub_enabled and !inst.scrub_built) buildScrubTimeline(inst);

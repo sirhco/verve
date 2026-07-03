@@ -113,8 +113,8 @@ fn convertGlb(
     };
     defer bvh_result.deinit(alloc);
 
-    // Pack Model + BVH + names → v3 .vmesh bytes.
-    const vmesh_bytes = try gl.vmesh.pack(
+    // Pack Model + BVH + names → v16 .vmesh bytes with index compression.
+    const vmesh_bytes = try gl.vmesh.packCompressed(
         alloc,
         model.vertices,
         model.indices,
@@ -141,7 +141,9 @@ fn convertGlb(
 
     // Build a vmesh Reader over the just-packed bytes for the sRGB role lookup
     // (texIsSrgb returns true for base-color/emissive maps, false for linear maps).
-    const reader = try gl.vmesh.Reader.init(vmesh_bytes);
+    // initAlloc: the packed bytes now carry a compressed (v16) index section.
+    var reader = try gl.vmesh.Reader.initAlloc(alloc, vmesh_bytes);
+    defer reader.deinit();
 
     // Write each externalized (large) texture as three siblings:
     //   <stem>.tex{index}.{ext}       — original compressed bytes (unchanged)

@@ -164,7 +164,10 @@ export fn glskin_env_ready(ptr: u32, len: u32) void {
 export fn glskin_vmesh_ready(ptr: u32, len: u32) void {
     if (ptr == 0) return; // fetch failed → poster stays
     const bytes = @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
-    asset = gl.vmesh.Reader.init(bytes) catch null;
+    // v16 assets carry a compressed index section → decode via initAlloc into the
+    // page-persistent chunk arena (survives across frames for skin draws).
+    if (asset) |*old| old.deinit();
+    asset = gl.vmesh.Reader.initAlloc(verve.chunkArena(), bytes) catch null;
 }
 
 // ── bone palette ──────────────────────────────────────────────────────────────
