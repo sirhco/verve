@@ -4,6 +4,28 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.43.0] - 2026-07-03
+
+### Added
+
+- **viz — live/streaming updates for the canvas render path.** The canvas2d graph island
+  (`VizGraphCanvas`) can now stream a live, server-mutating graph, matching the SVG island's
+  live capability. A `● live` toggle subscribes the canvas to a push channel; the server
+  publishes a tiny `{"seq":N}` ping each tick and the canvas refetches the current graph over
+  the v0.42.0 binary transport — pan/zoom is preserved across updates.
+  - **`src/app/viz_live.zig`** — a mutable server-side canvas graph (mutex-guarded, animates
+    each tick) + `vizCanvasAdvanceTick` (publishes a small seq ping, not the graph) + a dynamic
+    `GET /viz/live-graph.bin` route that packs the current model as `canvas_buf` binary at
+    request time (distinct from the static `/viz/graph.bin`).
+  - **`src/server/main.zig`** — a `vizcanvas` push-channel publisher loop + the dynamic route.
+  - **`src/client/islands/VizGraphCanvas.zig`** — `vizcanvas_toggle_live` (subscribe/unsubscribe),
+    `vizcanvas_dirty` (ping → refetch via `fetchBinaryToExport`), and a preserve-view path
+    (`vizcanvas_graph_ready` refits only on the first load, keeps the camera on live mutations;
+    a `ticking` guard prevents stacked render loops).
+
+  The push ping is small (fits the 8 KB scratch); only the graph snapshot uses the large binary
+  fetch — so a full 1500-node graph never has to squeeze through the push frame.
+
 ## [0.42.0] - 2026-07-02
 
 ### Added
