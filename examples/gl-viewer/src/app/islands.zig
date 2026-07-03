@@ -34,3 +34,10 @@ pub const GlScene = struct {
         scrub: bool,
     };
 };
+
+/// WebGL2 GPU-skinned bar demo. SSR emits `<canvas data-ref="glskin-canvas">`.
+/// The chunk fetches skinbar.vmesh and drives variant_pbr | variant_skinned.
+/// Source: `src/client/islands/GlSkin.zig`.
+pub const GlSkin = struct {
+    pub const props_schema: []const u8 = "{}";
+};
