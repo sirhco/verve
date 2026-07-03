@@ -64,6 +64,7 @@ pub fn index(ctx: *const verve.Context) !*verve.Node {
         .ids = node_ids,
         .layout = @intFromEnum(g.layout),
         .margin = gopts.margin,
+        .edge_routing = @intFromEnum(gopts.edge_routing),
     });
 
     const graph_svg = verve.viz.renderGraphInteractive(ctx, g, gopts);

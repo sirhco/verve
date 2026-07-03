@@ -9,7 +9,7 @@
 /// layout-aware tweening, and live SSE wire-delta streaming with seq-gap
 /// resync. Source: `../../src/client/islands/VizGraphInteractive.zig`.
 pub const VizGraphInteractive = struct {
-    pub const props_schema: []const u8 = "{\"xs\":\"f64[]\",\"ys\":\"f64[]\",\"ef\":\"u32[]\",\"et\":\"u32[]\",\"labels\":\"string[]\",\"ids\":\"string[]\",\"layout\":\"u32\",\"margin\":\"f64\"}";
+    pub const props_schema: []const u8 = "{\"xs\":\"f64[]\",\"ys\":\"f64[]\",\"ef\":\"u32[]\",\"et\":\"u32[]\",\"labels\":\"string[]\",\"ids\":\"string[]\",\"layout\":\"u32\",\"margin\":\"f64\",\"edge_routing\":\"u32\"}";
 
     /// Positionally mirrored in the chunk. `ef`/`et` are edge endpoint node
     /// indices; `layout` is `@intFromEnum(viz.Layout)` and `margin` the SSR
@@ -24,5 +24,6 @@ pub const VizGraphInteractive = struct {
         ids: []const []const u8,
         layout: u32,
         margin: f64,
+        edge_routing: u32,
     };
 };
