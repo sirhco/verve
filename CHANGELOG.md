@@ -4,6 +4,26 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.46.0] - 2026-07-03
+
+### Added
+
+- **`verve.gl` vertex-buffer compression (`.vmesh` v17).** Extends the v16 index codec with
+  **lossy vertex quantization**: positions → u16 over the mesh AABB, normals + tangents → i8
+  snorm, UVs → u16 over the UV AABB (48 B → 17 B base; skinned meshes keep raw u8 joints/weights
+  → 25 B). Combined with v16 index compression, total `.vmesh` files shrink **~32–46%**
+  (lodsphere 116→79 KB, cubegrid 79→43 KB); the vertex section alone drops **~65%**.
+  - **Same host-side-decode pattern as v16, no chunk change.** `packCompressed` now quantizes
+    vertices too; `Reader.initAlloc` dequantizes back to the exact stride-48/56 f32 section
+    **before** GPU upload, into the page-persistent chunk arena (4-aligned for the f32 pick
+    path) — so both backends and every downstream draw/BVH-pick are unchanged.
+  - **Lossy → dual gate.** Native within-epsilon round-trip tests (positions within 2
+    quantization steps, normals/tangents within `2/127`, tangent `w` exact ±1) **plus** a
+    WebGL2 CDP visual pass (`/gl`, `/gl-cull`, `/gl-skin` render undistorted, no gl errors).
+  - **Format.** v17 header grows to 116 B (`vertex_codec` @108 + `vertex_comp_len` @112);
+    `pack()` stays raw/frozen. `Reader` reads v13–v17; a compressed file still needs
+    `initAlloc`. Draco decode is the remaining (large, zero-dep-gated) asset follow-on.
+
 ## [0.45.0] - 2026-07-03
 
 ### Added
