@@ -22,12 +22,15 @@ pub const QuantParams = struct {
     bits: u8,
 };
 
-/// `num_components` is fixed at 3 (position-only scope of this slice); the
-/// caller (`attributes.parseAttrHeader`) rejects any attribute with
-/// `num_components != 3` or `att_type != POSITION`, so the fixed `[3]f32` read is safe.
-pub fn parseQuantParams(buf: *DecoderBuffer) Error!QuantParams {
-    var min: [3]f32 = undefined;
-    for (&min) |*m| {
+/// Reads `num_components` `min_values_` floats (`AttributeQuantizationTransform::
+/// DecodeParameters` writes exactly `num_components` of them — 3 for POSITION,
+/// 2 for TEXCOORD). `min` is a fixed `[3]f32`; components beyond `num_components`
+/// stay zero (never read by `dequantize`, whose `comp` index is `< num_components`).
+/// `num_components` must be in `[1, 3]`.
+pub fn parseQuantParams(buf: *DecoderBuffer, num_components: usize) Error!QuantParams {
+    if (num_components == 0 or num_components > 3) return Error.UnsupportedDracoFeature;
+    var min: [3]f32 = .{ 0, 0, 0 };
+    for (min[0..num_components]) |*m| {
         const bits = try buf.readInt(u32);
         m.* = @bitCast(bits);
     }

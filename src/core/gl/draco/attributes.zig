@@ -45,9 +45,10 @@ const OctahedronToolBox = octahedron.OctahedronToolBox;
 pub const seq_encoder_quantization: u8 = 2;
 pub const seq_encoder_normals: u8 = 3;
 
-/// `GeometryAttribute::Type`: `POSITION == 0`, `NORMAL == 1`.
+/// `GeometryAttribute::Type`: `POSITION == 0`, `NORMAL == 1`, `TEX_COORD == 3`.
 const geom_attr_position: u8 = 0;
 const geom_attr_normal: u8 = 1;
+const geom_attr_texcoord: u8 = 3;
 
 /// `PredictionSchemeTransformType`: `NORMAL_OCTAHEDRON_CANONICALIZED == 3` — the
 /// only NORMAL transform this port accepts (`NORMAL_OCTAHEDRON == 2`, the older
@@ -127,22 +128,32 @@ const AttrSection = struct {
     header: DecodedAttrHeader,
     residuals: []i32,
     /// Descriptor of decoder 1 (the second attributes decoder) captured during
-    /// the phase-1/phase-2 walk, or null when only one decoder is present
-    /// (quad/cube/torus — position only). `decodeAttributes` inspects it to
-    /// decide whether a NORMAL value section (phase 3, decoder 1) follows the
-    /// POSITION section and should be decoded (C2b). Decoder 2+ (TEXCOORD) is
-    /// never captured — this port stops after NORMAL.
-    normal: ?NormalDecoderInfo,
+    /// the phase-1/phase-2 walk, or null when fewer than two decoders are
+    /// present (quad/cube/torus — position only). `decodeAttributes` inspects it
+    /// to decide whether a NORMAL value section (phase 3, decoder 1) follows the
+    /// POSITION section and should be decoded (C2b).
+    normal: ?DecoderInfo,
+    /// Descriptor of decoder 2 (TEXCOORD) captured during the walk, or null when
+    /// fewer than three decoders are present. `decodeAttributes` inspects it to
+    /// decide whether a TEXCOORD value section (phase 3, decoder 2) follows the
+    /// NORMAL section and should be decoded (C2c). Its `traversal_method` is
+    /// captured from phase 1 (each decoder carries its own).
+    texcoord: ?DecoderInfo,
 };
 
-/// Phase-2 descriptor of decoder 1 (its single attribute + sequential-encoder
-/// byte). `encoder_type == NORMALS (3)` + `att_type == NORMAL (1)` +
-/// `num_components == 3` marks a NORMAL decoder this port can reconstruct.
-const NormalDecoderInfo = struct {
+/// Phase-1/phase-2 descriptor of a non-POSITION decoder (its first attribute +
+/// sequential-encoder byte + its own traversal method). For decoder 1 (NORMAL),
+/// `encoder_type == NORMALS (3)` + `att_type == NORMAL (1)` + `num_components ==
+/// 3` marks a decoder this port can reconstruct via `decodeNormals`. For decoder
+/// 2 (TEXCOORD), `encoder_type == QUANTIZATION (2)` + `att_type == TEX_COORD (3)`
+/// + `num_components == 2` marks one this port reconstructs via the same
+/// parallelogram+WRAP+dequant path as POSITION (`decodeParallelogramAttr`).
+const DecoderInfo = struct {
     att_type: u8,
     num_components: u8,
     encoder_type: u8,
     num_attributes: u32,
+    traversal_method: u8,
 };
 
 /// Full attribute-section walk (see the module doc comment for the C++ chain),
@@ -176,6 +187,8 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
     // `att_data_id < 0` marks the position attribute (no per-attribute
     // connectivity); every valid combination reads the same 3 bytes.
     var traversal_method: u8 = 0;
+    var normal_traversal: u8 = 0;
+    var texcoord_traversal: u8 = 0;
     {
         var i: u8 = 0;
         while (i < num_attributes_decoders) : (i += 1) {
@@ -190,6 +203,10 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
                 // silently misdecode.
                 if (att_data_id != -1) return Error.UnsupportedDracoFeature;
                 traversal_method = tm;
+            } else if (i == 1) {
+                normal_traversal = tm;
+            } else if (i == 2) {
+                texcoord_traversal = tm;
             }
         }
     }
@@ -203,7 +220,8 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
     // num_components (u8), normalized (u8), unique_id (varint); the encoder-type
     // bytes are a *separate* trailing loop (matches the two C++ loops).
     var num_components: u8 = 0;
-    var normal_info: ?NormalDecoderInfo = null;
+    var normal_info: ?DecoderInfo = null;
+    var texcoord_info: ?DecoderInfo = null;
     {
         var i: u8 = 0;
         while (i < num_attributes_decoders) : (i += 1) {
@@ -227,11 +245,12 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
             } else {
                 // Non-POSITION decoder: walk its descriptor block. All
                 // descriptors first, then all encoder-type bytes (the two
-                // distinct C++ loops). Capture decoder 1's first-attribute
-                // descriptor + encoder byte so `decodeAttributes` can decide
-                // whether a NORMAL value section follows (C2b).
-                var att_type_1: u8 = 0;
-                var num_comp_1: u8 = 0;
+                // distinct C++ loops). Capture decoder 1's (NORMAL) and decoder
+                // 2's (TEXCOORD) first-attribute descriptor + encoder byte so
+                // `decodeAttributes` can decide whether their value sections
+                // follow (C2b / C2c). Decoders 3+ are walked but not captured.
+                var att_type_0: u8 = 0;
+                var num_comp_0: u8 = 0;
                 var j: u32 = 0;
                 while (j < num_attributes) : (j += 1) {
                     const at = try buf.readInt(u8); // att_type
@@ -239,23 +258,32 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
                     const ncomp = try buf.readInt(u8); // num_components
                     _ = try buf.readInt(u8); // normalized
                     _ = try buf.decodeVarint(u32); // unique_id
-                    if (i == 1 and j == 0) {
-                        att_type_1 = at;
-                        num_comp_1 = ncomp;
+                    if (j == 0) {
+                        att_type_0 = at;
+                        num_comp_0 = ncomp;
                     }
                 }
-                var enc_1: u8 = 0;
+                var enc_0: u8 = 0;
                 var k: u32 = 0;
                 while (k < num_attributes) : (k += 1) {
                     const et = try buf.readInt(u8); // sequential-encoder-type byte
-                    if (i == 1 and k == 0) enc_1 = et;
+                    if (k == 0) enc_0 = et;
                 }
                 if (i == 1) {
                     normal_info = .{
-                        .att_type = att_type_1,
-                        .num_components = num_comp_1,
-                        .encoder_type = enc_1,
+                        .att_type = att_type_0,
+                        .num_components = num_comp_0,
+                        .encoder_type = enc_0,
                         .num_attributes = num_attributes,
+                        .traversal_method = normal_traversal,
+                    };
+                } else if (i == 2) {
+                    texcoord_info = .{
+                        .att_type = att_type_0,
+                        .num_components = num_comp_0,
+                        .encoder_type = enc_0,
+                        .num_attributes = num_attributes,
+                        .traversal_method = texcoord_traversal,
                     };
                 }
             }
@@ -263,7 +291,36 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
     }
 
     // ── PHASE 3 — `DecodeAllAttributes`, decoder 0 (POSITION) only ──
+    // The value-section read is shared with decoder 2 (TEXCOORD, same
+    // parallelogram+WRAP+quant wire shape) via `readValueSection`.
+    const vs = try readValueSection(alloc, buf, conn, num_components, traversal_method);
 
+    return .{
+        .header = vs.header,
+        .residuals = vs.residuals,
+        .normal = normal_info,
+        .texcoord = texcoord_info,
+    };
+}
+
+/// One decoded parallelogram/WRAP/quantization value section (`header` +
+/// signed `residuals`, length `num_points * num_components`), shared by decoder
+/// 0 (POSITION, `num_components == 3`) and decoder 2 (TEXCOORD, `num_components
+/// == 2`). Owned by the passed allocator.
+const ValueSection = struct {
+    header: DecodedAttrHeader,
+    residuals: []i32,
+};
+
+/// Faithful port of the phase-3 value section for a QUANTIZATION sequential
+/// attribute decoded with a WRAP transform: prediction metadata + the entropy
+/// value blob + the WRAP clamp bounds + the quantization params. `buf` must be
+/// positioned at the section's first byte (`prediction_scheme_method`).
+/// `num_components` is the attribute's component count (3 POSITION / 2 TEXCOORD);
+/// `traversal_method` is that decoder's phase-1 traversal byte (threaded into
+/// the header for the prediction inverse). Never panics — malformed input maps
+/// to `draco.Error`.
+fn readValueSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity, num_components: u8, traversal_method: u8) Error!ValueSection {
     // `SequentialIntegerAttributeDecoder::DecodeValues`: prediction metadata.
     const scheme_method = try buf.readInt(i8);
     switch (scheme_method) {
@@ -276,9 +333,7 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
     const transform_type = try buf.readInt(i8);
     if (transform_type != transform_wrap) return Error.UnsupportedDracoFeature;
 
-    // `SequentialIntegerAttributeDecoder::DecodeIntegerValues`: the value blob
-    // itself. This port does not interpret the values (Tasks 2-4 own that) —
-    // it only needs to land `buf.pos` exactly where the real decoder would.
+    // `SequentialIntegerAttributeDecoder::DecodeIntegerValues`: the value blob.
     const num_values: usize = @as(usize, conn.num_points) * @as(usize, num_components);
     const residuals = try alloc.alloc(i32, num_values);
     errdefer alloc.free(residuals);
@@ -320,32 +375,64 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
     // go straight to the generic step.
     //
     // ★ NOT PORTED: no fixture in this repo exercises `scheme_method == 4`
-    // (quad/cube/torus.drc all pin `PARALLELOGRAM == 1` — see the golden test
-    // below), so the extra crease-edge decode has no real bitstream to verify
-    // byte-exactness against. Rejecting rather than guessing keeps this port's
-    // "never silently misdecode" posture; add the extra decode (mirroring
-    // `MeshPredictionSchemeConstrainedMultiParallelogramDecoder::DecodePredictionData`)
-    // once a fixture that actually encodes with this scheme exists.
+    // (quad/cube/torus.drc + cube_nrm_uv's UV all pin `PARALLELOGRAM == 1` — see
+    // the golden tests below), so the extra crease-edge decode has no real
+    // bitstream to verify byte-exactness against. Rejecting rather than guessing
+    // keeps this port's "never silently misdecode" posture; add the extra decode
+    // (mirroring `MeshPredictionSchemeConstrainedMultiParallelogramDecoder::
+    // DecodePredictionData`) once a fixture that actually encodes with it exists.
     if (scheme_method == prediction_constrained_multi_parallelogram) return Error.UnsupportedDracoFeature;
 
     // Generic path (`DIFFERENCE` / `PARALLELOGRAM` / `MULTI_PARALLELOGRAM`):
     // `PredictionSchemeDecoder::DecodePredictionData` ->
     // `PredictionSchemeWrapDecodingTransform::DecodeTransformData` — the WRAP
-    // clamp bounds, 2x `int32_t` (`DataTypeT` for a position attribute is
-    // always `int32_t` post-quantization). Consumed only to advance `buf`;
-    // Tasks 3-4 own re-deriving/using these for the actual unwrap.
+    // clamp bounds, 2x `int32_t` (`DataTypeT` post-quantization). Consumed only
+    // to advance `buf`; `inversePredict` re-derives/uses these for the unwrap.
     const wrap_min = try buf.readInt(i32);
     const wrap_max = try buf.readInt(i32);
     if (wrap_min > wrap_max) return Error.Corrupt;
 
-    // `SequentialQuantizationAttributeDecoder::DecodeQuantizedDataInfo`.
-    const quant = try attr_quant.parseQuantParams(buf);
+    // `SequentialQuantizationAttributeDecoder::DecodeQuantizedDataInfo` —
+    // `num_components` `min_values_` floats (3 POSITION / 2 TEXCOORD).
+    const quant = try attr_quant.parseQuantParams(buf, num_components);
 
     return .{
         .header = .{ .scheme_method = scheme_method, .transform_type = transform_type, .quant = quant, .num_components = num_components, .traversal_method = traversal_method, .wrap_min = wrap_min, .wrap_max = wrap_max },
         .residuals = residuals,
-        .normal = normal_info,
     };
+}
+
+/// End-to-end decode of one parallelogram+WRAP+quantization attribute value
+/// section into per-point `f32`s: `readValueSection` (prediction metadata +
+/// residual entropy stream + WRAP bounds + quant params) → `inversePredict`
+/// (parallelogram/difference inverse over `conn`'s corner table, per-point
+/// quantized ints) → `dequantize`. `buf` must be positioned at the section's
+/// first byte. Shared by POSITION (`num_components == 3`) and TEXCOORD
+/// (`num_components == 2`). Returns owned `[]f32` (`num_points * num_components`,
+/// decoded-vertex order). Never panics.
+fn decodeParallelogramAttr(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity, num_components: u8, traversal_method: u8) Error![]f32 {
+    const vs = try readValueSection(alloc, buf, conn, num_components, traversal_method);
+    defer alloc.free(vs.residuals);
+    return finishParallelogramAttr(alloc, vs.header, vs.residuals, num_components, conn);
+}
+
+/// Prediction inverse + dequantization shared by POSITION and TEXCOORD:
+/// `inversePredict` (per-point quantized ints) → `dequantize` per component.
+/// `num_components` selects the component stride for `dequantize`'s `min[comp]`.
+fn finishParallelogramAttr(alloc: std.mem.Allocator, header: DecodedAttrHeader, residuals: []const i32, num_components: u8, conn: *const Connectivity) Error![]f32 {
+    const nc: usize = num_components;
+    const q = try draco.inversePredict(alloc, header, residuals, num_components, conn);
+    defer alloc.free(q);
+    const values = try alloc.alloc(f32, q.len);
+    errdefer alloc.free(values);
+    for (q, 0..) |qi, i| {
+        // Post-WRAP quantized values are clamped into `[wrap_min, wrap_max]`,
+        // which for a quantized attribute is `[0, (1<<bits)-1]` — always
+        // non-negative. Guard rather than `@intCast`-panic on a corrupt stream.
+        if (qi < 0) return Error.Corrupt;
+        values[i] = attr_quant.dequantize(@intCast(qi), i % nc, header.quant);
+    }
+    return values;
 }
 
 /// Decode decoder 1's NORMAL value section (phase 3), positioned right after the
@@ -472,6 +559,10 @@ pub const PositionData = struct {
     /// order (lines up 1:1 with `values`), or null when the mesh carries no
     /// NORMAL attributes decoder (quad/cube/torus — `num_attribute_data == 0`).
     normals: ?[]f32 = null,
+    /// Decoded TEXCOORD (UV) values, `num_points * 2` `f32`s in per-point order
+    /// (lines up 1:1 with `values`), or null when the mesh carries no TEXCOORD
+    /// attributes decoder (fewer than three decoders — quad/cube/torus/cube_nrm).
+    texcoords: ?[]f32 = null,
 
     pub fn deinit(self: *PositionData) void {
         self.alloc.free(self.values);
@@ -480,39 +571,36 @@ pub const PositionData = struct {
             self.alloc.free(n);
             self.normals = null;
         }
+        if (self.texcoords) |t| {
+            self.alloc.free(t);
+            self.texcoords = null;
+        }
     }
 };
 
-/// End-to-end POSITION decode: header + residual entropy stream (`parseAttrSection`)
-/// → prediction inverse (`predict_mesh.inversePredict`, per-point quantized ints)
-/// → dequantization (`attr_quant.dequantize`). `buf` must be positioned right
-/// after `decodeConnectivity`. Returns owned `PositionData` (`values.len ==
-/// num_points * 3`, decoded-vertex order). Never panics on malformed input —
-/// bounds/consistency violations map to `draco.Error`.
+/// End-to-end decode of POSITION (decoder 0) + optional NORMAL (decoder 1) +
+/// optional TEXCOORD (decoder 2): header + residual entropy stream
+/// (`parseAttrSection`) → prediction inverse (`predict_mesh.inversePredict`) →
+/// dequantization. POSITION and TEXCOORD share `finishParallelogramAttr` /
+/// `decodeParallelogramAttr` (identical parallelogram+WRAP+quant wire shape,
+/// differing only in `num_components`); NORMAL uses `decodeNormals`. `buf` must
+/// be positioned right after `decodeConnectivity`. Returns owned `PositionData`
+/// (`values.len == num_points * 3`, decoded-vertex order). Never panics on
+/// malformed input — bounds/consistency violations map to `draco.Error`.
 pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity) Error!PositionData {
     const section = try parseAttrSection(alloc, buf, conn);
     defer alloc.free(section.residuals);
     const h = section.header;
-    const nc: usize = h.num_components;
 
-    const q = try draco.inversePredict(alloc, h, section.residuals, h.num_components, conn);
-    defer alloc.free(q);
-
-    const values = try alloc.alloc(f32, q.len);
+    // POSITION (decoder 0): shared prediction inverse + dequantization.
+    const values = try finishParallelogramAttr(alloc, h, section.residuals, h.num_components, conn);
     errdefer alloc.free(values);
-    for (q, 0..) |qi, i| {
-        // Post-WRAP quantized values are clamped into `[wrap_min, wrap_max]`,
-        // which for a quantized position is `[0, (1<<bits)-1]` — always
-        // non-negative. Guard rather than `@intCast`-panic on a corrupt stream.
-        if (qi < 0) return Error.Corrupt;
-        values[i] = attr_quant.dequantize(@intCast(qi), i % nc, h.quant);
-    }
 
     // Decoder 1 (NORMAL), if present and a supported NORMAL decoder. `buf` is
     // positioned exactly at decoder 1's phase-3 value section (right after the
-    // POSITION quant params `parseAttrSection` read). Decoder 2+ (TEXCOORD) is
-    // intentionally not decoded — this port stops after NORMAL.
+    // POSITION quant params `parseAttrSection` read).
     var normals: ?[]f32 = null;
+    errdefer if (normals) |n| alloc.free(n);
     if (section.normal) |ni| {
         if (ni.encoder_type == seq_encoder_normals) {
             // A NORMALS-encoded decoder we must reconstruct: reject anything
@@ -525,7 +613,25 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
         }
     }
 
-    return .{ .values = values, .alloc = alloc, .normals = normals };
+    // Decoder 2 (TEXCOORD), if present and a supported TEXCOORD decoder. `buf`
+    // is positioned exactly at decoder 2's phase-3 value section (right after
+    // the NORMAL section `decodeNormals` consumed). cube_nrm_uv's UV rides the
+    // shared POSITION connectivity (per-vertex, `is_connectivity_used == false`),
+    // so the parallelogram inverse runs over the same `conn` corner table.
+    var texcoords: ?[]f32 = null;
+    if (section.texcoord) |ti| {
+        if (ti.encoder_type == seq_encoder_quantization) {
+            // A QUANTIZATION-encoded TEXCOORD decoder we reconstruct via the
+            // same parallelogram+WRAP+dequant path as POSITION: reject anything
+            // outside the 2-component UV shape rather than silently misdecode.
+            if (ti.num_attributes != 1 or ti.att_type != geom_attr_texcoord or ti.num_components != 2) {
+                return Error.UnsupportedDracoFeature;
+            }
+            texcoords = try decodeParallelogramAttr(alloc, buf, conn, 2, ti.traversal_method);
+        }
+    }
+
+    return .{ .values = values, .alloc = alloc, .normals = normals, .texcoords = texcoords };
 }
 
 test "parseAttrHeader(quad.drc): QUANTIZATION, 3 components, WRAP transform" {
@@ -794,7 +900,7 @@ test "decodeAttributes(cube_nrm_uv.drc) → NORMAL byte-exact (stops before TEXC
     defer pos.deinit();
     try std.testing.expect(pos.normals != null);
     // Baked verbatim from cube_nrm_uv.golden.json's NORMAL (identical smooth-cube
-    // normals to cube_nrm — the trailing TEXCOORD decoder is not decoded).
+    // normals to cube_nrm).
     const want = [_]f32{
         -0.5762181282043457, 0.57621830701828,    0.5796077847480774,
         -0.5762181282043457, -0.57621830701828,   0.5796077847480774,
@@ -806,6 +912,28 @@ test "decodeAttributes(cube_nrm_uv.drc) → NORMAL byte-exact (stops before TEXC
         0.5762181878089905,  -0.5762181878089905, -0.5796077847480774,
     };
     try std.testing.expectEqualSlices(f32, &want, pos.normals.?);
+}
+
+test "decodeAttributes(cube_nrm_uv.drc) → TEXCOORD byte-exact (16 f32)" {
+    const a = std.testing.allocator;
+    const cube_nrm_uv_drc = @import("draco_fixtures").cube_nrm_uv_drc;
+    var buf = DecoderBuffer.init(cube_nrm_uv_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    var pos = try decodeAttributes(a, &buf, &conn);
+    defer pos.deinit();
+    try std.testing.expect(pos.texcoords != null);
+    // POSITION + NORMAL still decode (no regression).
+    try std.testing.expect(pos.normals != null);
+    // Baked verbatim from tests/fixtures/draco/cube_nrm_uv.golden.json's
+    // TEXCOORD_0 (`node -e "console.log(require('./tests/fixtures/draco/
+    // cube_nrm_uv.golden.json').TEXCOORD_0.join(', '))"`). 16 values (8 verts ×
+    // 2 components); byte-exact — decoder 2 (TEXCOORD) rides the shared POSITION
+    // connectivity and is reconstructed via the same parallelogram+WRAP+dequant
+    // path as POSITION with `num_components == 2`.
+    const want = [_]f32{ 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0 };
+    try std.testing.expectEqualSlices(f32, &want, pos.texcoords.?);
 }
 
 /// Absolute byte offset of `prediction_scheme_method` within `quad_drc`
@@ -862,6 +990,30 @@ test "reject unsupported prediction scheme" {
     // accepted set {DIFFERENCE=0, PARALLELOGRAM=1, MULTI_PARALLELOGRAM=2,
     // CONSTRAINED_MULTI_PARALLELOGRAM=4}.
     copy[SCHEME_OFF] = 5;
+    var buf = DecoderBuffer.init(copy);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    try std.testing.expectError(Error.UnsupportedDracoFeature, decodeAttributes(a, &buf, &conn));
+}
+
+/// Absolute byte offset of decoder 2's (TEXCOORD) `prediction_scheme_method`
+/// within `cube_nrm_uv_drc` (found by instrumenting `decodeAttributes` to print
+/// `buf.pos` right before the TEXCOORD `decodeParallelogramAttr` call, then
+/// running the TEXCOORD golden test → 151; `[151]=scheme(PARALLELOGRAM 1)`,
+/// `[152]=transform(WRAP 1)`, `[153]=compressed`).
+const TEXCOORD_SCHEME_OFF: usize = 151;
+
+test "reject unsupported TEXCOORD prediction scheme (patched → tex-coords-portable)" {
+    const a = std.testing.allocator;
+    const cube_nrm_uv_drc = @import("draco_fixtures").cube_nrm_uv_drc;
+    const copy = try a.dupe(u8, cube_nrm_uv_drc);
+    defer a.free(copy);
+    // Patch decoder 2's prediction_scheme_method from PARALLELOGRAM(1) to 5
+    // (TEX_COORDS_PORTABLE — outside this port's accepted set) → the TEXCOORD
+    // decode must reject via `readValueSection`, not silently misdecode. POSITION
+    // and NORMAL (decoders 0/1) decode fully before reaching this byte.
+    copy[TEXCOORD_SCHEME_OFF] = 5;
     var buf = DecoderBuffer.init(copy);
     _ = try draco.parseHeader(&buf);
     var conn = try draco.decodeConnectivity(a, &buf);
