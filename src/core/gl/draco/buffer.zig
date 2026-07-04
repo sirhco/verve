@@ -78,9 +78,10 @@ pub const BitDecoder = struct {
     }
 
     pub fn readBits(self: *BitDecoder, n: u6) u32 {
+        const nn = @min(n, 32);
         var out: u32 = 0;
         var i: u6 = 0;
-        while (i < n) : (i += 1) out |= @as(u32, self.readBit()) << @intCast(i);
+        while (i < nn) : (i += 1) out |= @as(u32, self.readBit()) << @intCast(i);
         return out;
     }
 };
@@ -135,4 +136,14 @@ test "BitDecoder spanning bytes" {
     var bd = try b.bitDecoder(2);
     try std.testing.expectEqual(@as(u32, 1), bd.readBits(8)); // 0x01
     try std.testing.expectEqual(@as(u32, 1), bd.readBits(8)); // 0x01
+}
+
+test "BitDecoder readBits n=32 full u32 + no panic when n>32" {
+    var b = DecoderBuffer.init(&[_]u8{ 0x78, 0x56, 0x34, 0x12, 0xAA });
+    var bd = try b.bitDecoder(5);
+    try std.testing.expectEqual(@as(u32, 0x12345678), bd.readBits(32)); // LSB-first over 4 bytes
+    // n>32 must not panic; clamped to 32 → reads the next 32 bits available (zero-padded past end)
+    var b2 = DecoderBuffer.init(&[_]u8{ 0x01, 0x00, 0x00, 0x00 });
+    var bd2 = try b2.bitDecoder(4);
+    try std.testing.expectEqual(@as(u32, 1), bd2.readBits(40));
 }
