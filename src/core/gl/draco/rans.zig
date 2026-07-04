@@ -120,6 +120,234 @@ pub const RAnsBitDecoder = struct {
     }
 };
 
+// ── multi-symbol rANS symbol decoder ─────────────────────────────────────────
+// Faithful port of Draco's multi-symbol rANS entropy decoder:
+//   * `DecodeSymbols` / `DecodeTaggedSymbols` / `DecodeRawSymbols`
+//     (`compression/entropy/symbol_decoding.cc`)
+//   * `RAnsSymbolDecoder<>` (`rans_symbol_decoder.h`) — reads `num_symbols`, the
+//     probability table (token bits + zero-run varints) and the rANS body.
+//   * `RAnsDecoder<>::{read_init, rans_read, rans_build_look_up_table}` plus the
+//     precision helpers (`ans.h`, `rans_symbol_coding.h`).
+// This is a DIFFERENT code path from the binary rABS above: multi-symbol rANS
+// with a runtime precision in [12,20] bits and `l_rans_base = precision * 4`
+// (the binary path used a fixed L_BASE = 4096).
+//
+// Scratch (probability table + the rANS look-up table, up to 2^20 u32 entries)
+// is allocated from an internal arena over `std.heap.page_allocator`. This
+// decoder is build-time only (native asset pipeline), so a heap is available and
+// the brief's fixed 4-arg public signature (no allocator) is preserved. All
+// malformed input is bounds-checked into `Error`, never a panic.
+
+const BitDecoder = @import("buffer.zig").BitDecoder;
+
+const SYMBOL_CODING_TAGGED: u8 = 0;
+const SYMBOL_CODING_RAW: u8 = 1;
+const K_MAX_RAW_ENCODING_BIT_LENGTH: u8 = 18;
+
+fn memGetLe32(m: []const u8) u32 {
+    return @as(u32, m[0]) | (@as(u32, m[1]) << 8) | (@as(u32, m[2]) << 16) | (@as(u32, m[3]) << 24);
+}
+
+/// `ComputeRAnsPrecisionFromUniqueSymbolsBitLength` (`rans_symbol_coding.h`):
+/// unclamped precision `(3 * bit_length) / 2` clamped to [12, 20].
+fn ransPrecisionBits(symbols_bit_length: u32) u5 {
+    const unclamped = (3 * symbols_bit_length) / 2;
+    const clamped: u32 = if (unclamped < 12) 12 else if (unclamped > 20) 20 else unclamped;
+    return @intCast(clamped);
+}
+
+const RansSym = struct { prob: u32 = 0, cum_prob: u32 = 0 };
+
+/// Port of `RAnsSymbolDecoder<>` + the `RAnsDecoder<>` it embeds. Precision is a
+/// runtime value here (the C++ template parameter), so the state constants
+/// (`precision`, `l_rans_base`) are stored per instance.
+const RansSymbolDecoder = struct {
+    precision: u32,
+    l_rans_base: u32,
+    num_symbols: u32 = 0,
+    prob_table: []RansSym = &.{},
+    lut: []u32 = &.{},
+    // Embedded AnsDecoder state.
+    buf: []const u8 = &.{},
+    buf_offset: usize = 0,
+    state: u32 = 0,
+
+    fn init(precision_bits: u5) RansSymbolDecoder {
+        const precision = @as(u32, 1) << precision_bits;
+        return .{ .precision = precision, .l_rans_base = precision *% 4 };
+    }
+
+    /// Port of `RAnsSymbolDecoder::Create`: decode `num_symbols`, the probability
+    /// table and build the look-up table. Leaves `num_symbols == 0` un-built (the
+    /// caller rejects that when `num_values > 0`, mirroring the C++).
+    fn create(self: *RansSymbolDecoder, a: std.mem.Allocator, src: *DecoderBuffer) Error!void {
+        self.num_symbols = try src.decodeVarint(u32);
+        // Sanity bound from Draco: the table needs at least num_symbols/64 bytes.
+        if (self.num_symbols / 64 > src.remaining()) return Error.Corrupt;
+        if (self.num_symbols == 0) return;
+        self.prob_table = try a.alloc(RansSym, self.num_symbols);
+        for (self.prob_table) |*e| e.* = .{};
+
+        var i: u32 = 0;
+        while (i < self.num_symbols) : (i += 1) {
+            const prob_data = try src.readInt(u8);
+            const token: u32 = prob_data & 3;
+            if (token == 3) {
+                // Run-length of zero-probability entries.
+                const offset: u32 = prob_data >> 2;
+                if (i + offset >= self.num_symbols) return Error.Corrupt;
+                var j: u32 = 0;
+                while (j < offset + 1) : (j += 1) self.prob_table[i + j].prob = 0;
+                i += offset;
+            } else {
+                const extra_bytes = token;
+                var prob: u32 = prob_data >> 2;
+                var b: u32 = 0;
+                while (b < extra_bytes) : (b += 1) {
+                    const eb = try src.readInt(u8);
+                    prob |= @as(u32, eb) << @intCast(8 * (b + 1) - 2);
+                }
+                self.prob_table[i].prob = prob;
+            }
+        }
+        try self.buildLookUpTable(a);
+    }
+
+    /// Port of `RAnsDecoder::rans_build_look_up_table`.
+    fn buildLookUpTable(self: *RansSymbolDecoder, a: std.mem.Allocator) Error!void {
+        self.lut = try a.alloc(u32, self.precision);
+        var cum_prob: u32 = 0;
+        var act_prob: u32 = 0;
+        var i: u32 = 0;
+        while (i < self.num_symbols) : (i += 1) {
+            self.prob_table[i].cum_prob = cum_prob;
+            cum_prob += self.prob_table[i].prob;
+            if (cum_prob > self.precision) return Error.Corrupt;
+            var j: u32 = act_prob;
+            while (j < cum_prob) : (j += 1) self.lut[j] = i;
+            act_prob = cum_prob;
+        }
+        if (cum_prob != self.precision) return Error.Corrupt;
+    }
+
+    /// Port of `RAnsSymbolDecoder::StartDecoding`: read the rANS body size, seed
+    /// the decoder from the body tail, advance `src` past it.
+    fn startDecoding(self: *RansSymbolDecoder, src: *DecoderBuffer) Error!void {
+        const bytes_encoded = try src.decodeVarint(u64);
+        if (bytes_encoded > src.remaining()) return Error.Truncated;
+        const region = try src.readBytes(@intCast(bytes_encoded));
+        try self.readInit(region);
+    }
+
+    /// Port of `RAnsDecoder::read_init` (includes the 4-byte `x == 3` state used
+    /// by higher-precision streams — absent from the binary `ans_read_init`).
+    fn readInit(self: *RansSymbolDecoder, region: []const u8) Error!void {
+        const offset = region.len;
+        if (offset < 1) return Error.Corrupt;
+        self.buf = region;
+        const x = region[offset - 1] >> 6;
+        if (x == 0) {
+            self.buf_offset = offset - 1;
+            self.state = region[offset - 1] & 0x3F;
+        } else if (x == 1) {
+            if (offset < 2) return Error.Corrupt;
+            self.buf_offset = offset - 2;
+            self.state = memGetLe16(region[offset - 2 ..]) & 0x3FFF;
+        } else if (x == 2) {
+            if (offset < 3) return Error.Corrupt;
+            self.buf_offset = offset - 3;
+            self.state = memGetLe24(region[offset - 3 ..]) & 0x3FFFFF;
+        } else { // x == 3
+            if (offset < 4) return Error.Corrupt;
+            self.buf_offset = offset - 4;
+            self.state = memGetLe32(region[offset - 4 ..]) & 0x3FFFFFFF;
+        }
+        self.state += self.l_rans_base;
+        if (self.state >= self.l_rans_base *% ANS_IO_BASE) return Error.Corrupt;
+    }
+
+    /// Port of `RAnsDecoder::rans_read` (== `DecodeSymbol`). Wrapping arithmetic
+    /// mirrors C unsigned semantics; on a valid stream no wrap occurs, and the
+    /// LUT/table indices are always in range (`rem < precision`, `sym <
+    /// num_symbols`), so this can neither fault nor read OOB.
+    fn decodeSymbol(self: *RansSymbolDecoder) u32 {
+        while (self.state < self.l_rans_base and self.buf_offset > 0) {
+            self.buf_offset -= 1;
+            self.state = self.state *% ANS_IO_BASE +% self.buf[self.buf_offset];
+        }
+        const quo = self.state / self.precision;
+        const rem = self.state % self.precision;
+        const sym = self.lut[rem];
+        const prob = self.prob_table[sym].prob;
+        const cum = self.prob_table[sym].cum_prob;
+        self.state = quo *% prob +% rem -% cum;
+        return sym;
+    }
+};
+
+/// Port of `DecodeSymbols` (`symbol_decoding.cc`). Decodes `num_values` unsigned
+/// symbols into `out` (`out.len` must be >= `num_values`). `num_components` is
+/// only used by the tagged scheme (one bit-length tag shared by a component
+/// tuple).
+pub fn decodeSymbols(buf: *DecoderBuffer, num_values: usize, num_components: u32, out: []u32) Error!void {
+    if (num_values == 0) return;
+    if (out.len < num_values) return Error.Corrupt;
+    var nc = num_components;
+    if (nc == 0) nc = 1;
+
+    const scheme = try buf.readInt(u8);
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    if (scheme == SYMBOL_CODING_TAGGED) {
+        try decodeTaggedSymbols(a, buf, num_values, nc, out);
+    } else if (scheme == SYMBOL_CODING_RAW) {
+        try decodeRawSymbols(a, buf, num_values, out);
+    } else {
+        return Error.Corrupt;
+    }
+}
+
+/// Port of `DecodeRawSymbols` + `DecodeRawSymbolsInternal`.
+fn decodeRawSymbols(a: std.mem.Allocator, buf: *DecoderBuffer, num_values: usize, out: []u32) Error!void {
+    const max_bit_length = try buf.readInt(u8);
+    if (max_bit_length < 1 or max_bit_length > K_MAX_RAW_ENCODING_BIT_LENGTH) return Error.Corrupt;
+    var dec = RansSymbolDecoder.init(ransPrecisionBits(max_bit_length));
+    try dec.create(a, buf);
+    if (dec.num_symbols == 0) return Error.Corrupt; // num_values > 0 here
+    try dec.startDecoding(buf);
+    for (0..num_values) |i| out[i] = dec.decodeSymbol();
+}
+
+/// Port of `DecodeTaggedSymbols`. A `SymbolDecoder<5>` recovers a per-tuple
+/// bit-length tag; the actual component values then follow as raw LSB-first bit
+/// fields in the remainder of the buffer.
+fn decodeTaggedSymbols(a: std.mem.Allocator, buf: *DecoderBuffer, num_values: usize, nc: u32, out: []u32) Error!void {
+    var tag = RansSymbolDecoder.init(ransPrecisionBits(5));
+    try tag.create(a, buf);
+    try tag.startDecoding(buf);
+    if (tag.num_symbols == 0) return Error.Corrupt; // num_values > 0 here
+
+    // `StartBitDecoding(false)` — a bit reader over the rest of the buffer.
+    var bd = BitDecoder{ .data = buf.data[buf.pos..] };
+    var value_id: usize = 0;
+    var i: usize = 0;
+    while (i < num_values) : (i += nc) {
+        const bit_length = tag.decodeSymbol();
+        if (bit_length > 32) return Error.Corrupt;
+        var j: u32 = 0;
+        while (j < nc) : (j += 1) {
+            if (value_id >= num_values) return Error.Corrupt;
+            out[value_id] = bd.readBits(@intCast(bit_length));
+            value_id += 1;
+        }
+    }
+    // `EndBitDecoding`: advance the parent past the consumed value bytes.
+    buf.pos += (bd.bit_pos + 7) / 8;
+}
+
 // ── round-trip tests (the gate) ──────────────────────────────────────────────
 const RAnsBitEncoder = @import("rans_test_encoder.zig").RAnsBitEncoder;
 
@@ -195,4 +423,33 @@ test "startDecoding rejects a truncated body" {
     var buf = DecoderBuffer.init(&[_]u8{ 128, 200, 1 });
     var dec: RAnsBitDecoder = undefined;
     try std.testing.expectError(Error.Truncated, dec.startDecoding(&buf));
+}
+
+// ── multi-symbol rANS round-trip (the gate) ──────────────────────────────────
+const SymbolEncoder = @import("rans_test_encoder.zig").SymbolEncoder;
+
+fn expectSymbolRoundTrip(vals: []const u32, num_components: u32) !void {
+    const a = std.testing.allocator;
+    const blob = try SymbolEncoder.encode(a, vals, num_components); // owned
+    defer a.free(blob);
+    var buf = DecoderBuffer.init(blob);
+    const out = try a.alloc(u32, vals.len);
+    defer a.free(out);
+    try decodeSymbols(&buf, vals.len, num_components, out);
+    try std.testing.expectEqualSlices(u32, vals, out);
+}
+
+test "symbols round-trip: uniform / skewed / single / large-values" {
+    try expectSymbolRoundTrip(&[_]u32{ 3, 3, 3, 3, 3 }, 1);
+    try expectSymbolRoundTrip(&[_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, 1);
+    try expectSymbolRoundTrip(&[_]u32{7}, 1);
+    try expectSymbolRoundTrip(&[_]u32{ 1000, 2, 999999, 0, 65535 }, 1);
+}
+
+test "symbols round-trip: multi-component" {
+    try expectSymbolRoundTrip(&[_]u32{ 10, 20, 30, 11, 21, 31 }, 3);
+}
+
+test "symbols empty" {
+    try expectSymbolRoundTrip(&[_]u32{}, 1);
 }

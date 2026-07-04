@@ -5,6 +5,7 @@ pub const Error = error{ BadMagic, Truncated, UnsupportedDracoVersion, Unsupport
 pub const DecoderBuffer = @import("buffer.zig").DecoderBuffer;
 
 pub const RAnsBitDecoder = @import("rans.zig").RAnsBitDecoder;
+pub const decodeSymbols = @import("rans.zig").decodeSymbols;
 
 pub const header = @import("header.zig");
 pub const GeometryType = header.GeometryType;
