@@ -133,9 +133,8 @@ pub const RAnsBitDecoder = struct {
 // (the binary path used a fixed L_BASE = 4096).
 //
 // Scratch (probability table + the rANS look-up table, up to 2^20 u32 entries)
-// is allocated from an internal arena over `std.heap.page_allocator`. This
-// decoder is build-time only (native asset pipeline), so a heap is available and
-// the brief's fixed 4-arg public signature (no allocator) is preserved. All
+// is allocated from an internal arena over the caller-supplied allocator, so
+// scratch allocations are leak-checked under `std.testing.allocator`. All
 // malformed input is bounds-checked into `Error`, never a panic.
 
 const BitDecoder = @import("buffer.zig").BitDecoder;
@@ -289,7 +288,7 @@ const RansSymbolDecoder = struct {
 /// symbols into `out` (`out.len` must be >= `num_values`). `num_components` is
 /// only used by the tagged scheme (one bit-length tag shared by a component
 /// tuple).
-pub fn decodeSymbols(buf: *DecoderBuffer, num_values: usize, num_components: u32, out: []u32) Error!void {
+pub fn decodeSymbols(alloc: std.mem.Allocator, buf: *DecoderBuffer, num_values: usize, num_components: u32, out: []u32) Error!void {
     if (num_values == 0) return;
     if (out.len < num_values) return Error.Corrupt;
     var nc = num_components;
@@ -297,7 +296,7 @@ pub fn decodeSymbols(buf: *DecoderBuffer, num_values: usize, num_components: u32
 
     const scheme = try buf.readInt(u8);
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
 
@@ -435,7 +434,7 @@ fn expectSymbolRoundTrip(vals: []const u32, num_components: u32) !void {
     var buf = DecoderBuffer.init(blob);
     const out = try a.alloc(u32, vals.len);
     defer a.free(out);
-    try decodeSymbols(&buf, vals.len, num_components, out);
+    try decodeSymbols(a, &buf, vals.len, num_components, out);
     try std.testing.expectEqualSlices(u32, vals, out);
 }
 
