@@ -207,12 +207,12 @@ const RIGHT_FACE_EDGE: u1 = 1;
 /// `MeshAttrCornerTable` per non-position attribute, describing that attribute's
 /// seam-split vertex partition. Caller owns everything and must call `deinit`.
 ///
-/// ★ Lifetime: each `MeshAttrCornerTable` in `attr_maps` *borrows* this
-/// connectivity's `corner_table` (its `corner_table_` pointer). Its
-/// self-contained per-corner data (`vertex(corner)`, `numVertices()`,
-/// `leftMostCorner()`) is fully materialised by `recomputeVertices` and is
-/// valid regardless. Consumers that need topology (`numFaces`/`numCorners`)
-/// must query `conn.corner_table` directly rather than through an `attr_map`.
+/// ★ Lifetime: `MeshAttrCornerTable` holds NO pointer into any `CornerTable` —
+/// every method that needs base-table topology takes it as a parameter
+/// (`addSeamEdge(c, ct)`, `recomputeVertices(ct)`). Its own materialised
+/// per-corner data (`vertex(corner)`, `numVertices()`, `leftMostCorner()`) is
+/// self-contained after `recomputeVertices`. Consumers that need topology
+/// (`numFaces`/`numCorners`) must query `conn.corner_table` directly.
 pub const Connectivity = struct {
     alloc: std.mem.Allocator,
     indices: []u32,
@@ -223,7 +223,7 @@ pub const Connectivity = struct {
     pub fn deinit(self: *Connectivity) void {
         self.alloc.free(self.indices);
         for (self.attr_maps) |*m| m.deinit();
-        self.alloc.free(self.attr_maps);
+        if (self.attr_maps.len > 0) self.alloc.free(self.attr_maps);
         self.corner_table.deinit();
     }
 };
@@ -572,13 +572,17 @@ pub fn decodeConnectivity(alloc: std.mem.Allocator, buf: *DecoderBuffer) Error!C
     // (impl.cc:474-508): a forward pass over every face decodes the per-attribute
     // seam bits (`DecodeAttributeConnectivitiesOnFace`, impl.cc:1132), then each
     // attribute builds a `MeshAttrCornerTable` from its recorded seam corners.
-    const attr_maps = try alloc.alloc(MeshAttrCornerTable, h.num_attribute_data);
-    var built_maps: usize = 0;
-    errdefer {
-        for (attr_maps[0..built_maps]) |*m| m.deinit();
-        alloc.free(attr_maps);
-    }
+    // Position-only streams (the common case) never allocate here — `attr_maps`
+    // stays the empty sentinel `&.{}`.
+    var attr_maps: []MeshAttrCornerTable = &.{};
     if (h.num_attribute_data > 0) {
+        attr_maps = try alloc.alloc(MeshAttrCornerTable, h.num_attribute_data);
+        var built_maps: usize = 0;
+        errdefer {
+            for (attr_maps[0..built_maps]) |*m| m.deinit();
+            alloc.free(attr_maps);
+        }
+
         // Per-attribute lists of corners that start an attribute seam.
         const seam_lists = try alloc.alloc(std.ArrayList(u32), h.num_attribute_data);
         for (seam_lists) |*s| s.* = std.ArrayList(u32).empty;
@@ -616,7 +620,7 @@ pub fn decodeConnectivity(alloc: std.mem.Allocator, buf: *DecoderBuffer) Error!C
         for (attr_maps, 0..) |*m, ai| {
             m.* = try MeshAttrCornerTable.init(alloc, &ct);
             built_maps += 1;
-            for (seam_lists[ai].items) |sc| m.addSeamEdge(sc);
+            for (seam_lists[ai].items) |sc| m.addSeamEdge(sc, &ct);
             try m.recomputeVertices(&ct);
         }
     }
