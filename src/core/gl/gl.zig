@@ -93,4 +93,5 @@ test {
     _ = bc1;
     _ = ktx2;
     _ = tex_encode;
+    _ = draco;
 }

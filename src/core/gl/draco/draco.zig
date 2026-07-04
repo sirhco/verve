@@ -3,3 +3,7 @@
 pub const Error = error{ BadMagic, Truncated, UnsupportedDracoVersion, UnsupportedGeometry, Corrupt, OutOfMemory };
 
 pub const DecoderBuffer = @import("buffer.zig").DecoderBuffer;
+
+test {
+    _ = @import("buffer.zig");
+}
