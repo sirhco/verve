@@ -62,6 +62,16 @@ pub const DecodedAttrHeader = struct {
     transform_type: i8,
     quant: QuantParams,
     num_components: u8,
+    /// `MeshTraversalMethod` byte (`DEPTH_FIRST == 0`, `PREDICTION_DEGREE == 1`).
+    /// The attribute-value decode order (and thus the prediction-scheme inverse
+    /// in `predict_mesh.zig`) depends on which traversal generated the sequence,
+    /// so Task 3 needs it verbatim.
+    traversal_method: u8,
+    /// WRAP-transform clamp bounds (`PredictionSchemeWrapDecodingTransform::
+    /// DecodeTransformData`). `predict_mesh.wrapInverse` unwraps the corrected
+    /// value into `[wrap_min, wrap_max]`.
+    wrap_min: i32,
+    wrap_max: i32,
 };
 
 /// Port of the header-parse chain documented in the module doc comment.
@@ -90,7 +100,7 @@ pub fn parseAttrHeader(buf: *DecoderBuffer, conn: *const Connectivity) Error!Dec
     // same 2 bytes here regardless of value.
     _ = try buf.readInt(i8); // att_data_id
     _ = try buf.readInt(u8); // decoder_type (MESH_VERTEX_ATTRIBUTE / MESH_CORNER_ATTRIBUTE)
-    _ = try buf.readInt(u8); // traversal_method_encoded
+    const traversal_method = try buf.readInt(u8); // MeshTraversalMethod (DEPTH_FIRST/PREDICTION_DEGREE)
 
     // `AttributesDecoder::DecodeAttributesDecoderData`. Only the first (and,
     // per this task's scope, only) attribute descriptor is kept.
@@ -176,7 +186,7 @@ pub fn parseAttrHeader(buf: *DecoderBuffer, conn: *const Connectivity) Error!Dec
     // `SequentialQuantizationAttributeDecoder::DecodeQuantizedDataInfo`.
     const quant = try attr_quant.parseQuantParams(buf);
 
-    return .{ .scheme_method = scheme_method, .transform_type = transform_type, .quant = quant, .num_components = num_components };
+    return .{ .scheme_method = scheme_method, .transform_type = transform_type, .quant = quant, .num_components = num_components, .traversal_method = traversal_method, .wrap_min = wrap_min, .wrap_max = wrap_max };
 }
 
 test "parseAttrHeader(quad.drc): QUANTIZATION, 3 components, WRAP transform" {

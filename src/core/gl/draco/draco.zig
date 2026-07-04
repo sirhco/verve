@@ -25,6 +25,7 @@ pub const QuantParams = @import("attr_quant.zig").QuantParams;
 pub const parseQuantParams = @import("attr_quant.zig").parseQuantParams;
 pub const DecodedAttrHeader = @import("attributes.zig").DecodedAttrHeader;
 pub const parseAttrHeader = @import("attributes.zig").parseAttrHeader;
+pub const inversePredict = @import("predict_mesh.zig").inversePredict;
 
 test {
     _ = @import("buffer.zig");
@@ -36,4 +37,5 @@ test {
     _ = @import("edgebreaker.zig");
     _ = @import("attributes.zig");
     _ = @import("attr_quant.zig");
+    _ = @import("predict_mesh.zig");
 }

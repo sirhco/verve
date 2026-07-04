@@ -113,6 +113,26 @@ pub const CornerTable = struct {
     pub fn swingRight(self: *const CornerTable, c: u32) u32 {
         return previousGuarded(self.oppositeGuarded(previousGuarded(c)));
     }
+
+    /// `CornerTable::GetLeftCorner` = Opposite(Previous(c)): the corner of the
+    /// adjacent face across the edge left of `c` (invalid at a boundary).
+    /// Used by the attribute-order depth-first traverser.
+    pub fn getLeftCorner(self: *const CornerTable, c: u32) u32 {
+        if (c == kInvalidCorner) return kInvalidCorner;
+        return self.oppositeGuarded(previous(c));
+    }
+    /// `CornerTable::GetRightCorner` = Opposite(Next(c)).
+    pub fn getRightCorner(self: *const CornerTable, c: u32) u32 {
+        if (c == kInvalidCorner) return kInvalidCorner;
+        return self.oppositeGuarded(next(c));
+    }
+    /// `CornerTable::IsOnBoundary`: a vertex is on a boundary when swinging left
+    /// from its left-most corner immediately falls off the mesh. Mirrors Draco:
+    /// `SwingLeft(LeftMostCorner(v)) == kInvalidCorner`.
+    pub fn isOnBoundary(self: *const CornerTable, v: u32) bool {
+        const c = self.leftMostCorner(v);
+        return self.swingLeft(c) == kInvalidCorner;
+    }
 };
 
 test "corner ring arithmetic: next/previous/face" {
@@ -157,6 +177,41 @@ test "addNewVertex grows the vertex map; leftMostCorner round-trips" {
     try std.testing.expectEqual(@as(u32, kInvalidCorner), ct.leftMostCorner(0));
     // SetLeftMostCorner on the invalid vertex is a no-op (must not index OOB).
     ct.setLeftMostCorner(kInvalidVertex, 1);
+}
+
+test "getLeftCorner/getRightCorner/isOnBoundary over a two-triangle fan" {
+    const a = std.testing.allocator;
+    // Two faces (0,1,2) and (3,4,5) glued along the edge opposite corner 0 and
+    // corner 4 (opposite(0)=4, opposite(4)=0). All other edges are open.
+    var ct = try CornerTable.initEmpty(a, 2, 4);
+    defer ct.deinit();
+    _ = try ct.addNewVertex();
+    _ = try ct.addNewVertex();
+    _ = try ct.addNewVertex();
+    _ = try ct.addNewVertex();
+    ct.setOpposite(0, 4);
+    ct.setOpposite(4, 0);
+    // GetRightCorner(0) = Opposite(Next(0)) = Opposite(1) = invalid (open edge).
+    try std.testing.expectEqual(kInvalidCorner, ct.getRightCorner(0));
+    // GetLeftCorner(0) = Opposite(Previous(0)) = Opposite(2) = invalid.
+    try std.testing.expectEqual(kInvalidCorner, ct.getLeftCorner(0));
+    // Across the shared edge: GetLeftCorner(1) = Opposite(Previous(1)=0) = 4.
+    try std.testing.expectEqual(@as(u32, 4), ct.getLeftCorner(1));
+    // GetRightCorner(2) = Opposite(Next(2)=0) = 4.
+    try std.testing.expectEqual(@as(u32, 4), ct.getRightCorner(2));
+    // Invalid input corner is passed through unchanged.
+    try std.testing.expectEqual(kInvalidCorner, ct.getLeftCorner(kInvalidCorner));
+    try std.testing.expectEqual(kInvalidCorner, ct.getRightCorner(kInvalidCorner));
+
+    // Boundary test: vertex 0 sits only on corner 0 (open on both sides) → on a
+    // boundary. Set its left-most corner and confirm SwingLeft falls off.
+    ct.setLeftMostCorner(0, 0);
+    try std.testing.expect(ct.isOnBoundary(0));
+    // Give vertex 1 a left-most corner whose SwingLeft crosses the shared edge
+    // and returns to a valid corner → not a boundary. SwingLeft(3) =
+    // Next(Opposite(Next(3)=4)=0) = Next(0) = 1 (valid) ⇒ interior.
+    ct.setLeftMostCorner(1, 3);
+    try std.testing.expect(!ct.isOnBoundary(1));
 }
 
 test "swingLeft/swingRight follow opposite ring; invalid at a boundary" {
