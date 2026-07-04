@@ -10,11 +10,27 @@ pub const Symbol = enum { c, s, l, r, e };
 /// num_attribute_data == 0 path.
 pub const TraversalDecoder = struct {
     symbols: draco.BitDecoder,
+    start_faces: draco.RAnsBitDecoder = .{},
 
     pub fn start(self: *TraversalDecoder, buf: *DecoderBuffer) Error!void {
         // StartBitDecoding(decode_size=true): varint byte size, then that region.
         const size = try buf.decodeVarint(u32);
         self.symbols = try buf.bitDecoder(size);
+    }
+
+    /// Port of `DecodeStartFaces` (v2.2 path): after the symbol bit region, the
+    /// start-face configuration bits are an rANS-binary stream. `buf` must be
+    /// positioned immediately after `start` (i.e. right after the symbols).
+    /// Advances `buf` past the rANS body, leaving it at the traversal end (no
+    /// attribute-seam streams exist for the num_attribute_data == 0 path).
+    pub fn startFaces(self: *TraversalDecoder, buf: *DecoderBuffer) Error!void {
+        try self.start_faces.startDecoding(buf);
+    }
+
+    /// Port of `DecodeStartFaceConfiguration` (v2.2): one rANS bit. `true` means
+    /// the start face is interior.
+    pub fn decodeStartFaceConfiguration(self: *TraversalDecoder) bool {
+        return self.start_faces.decodeNextBit() != 0;
     }
 
     pub fn decodeSymbol(self: *TraversalDecoder) Error!Symbol {

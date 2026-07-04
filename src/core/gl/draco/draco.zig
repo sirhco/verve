@@ -18,6 +18,9 @@ pub const CornerTable = @import("corner_table.zig").CornerTable;
 
 pub const TraversalDecoder = @import("traversal_standard.zig").TraversalDecoder;
 
+pub const decodeConnectivity = @import("edgebreaker.zig").decodeConnectivity;
+pub const Connectivity = @import("edgebreaker.zig").Connectivity;
+
 test {
     _ = @import("buffer.zig");
     _ = @import("header.zig");
