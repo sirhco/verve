@@ -20,24 +20,20 @@ pub const TraversalDecoder = struct {
         self.symbols = try buf.bitDecoder(size);
     }
 
-    /// Port of the attribute-connectivity part of `Start`/`DecodeAttributeSeams`
-    /// (`mesh_edgebreaker_traversal_decoder.h`): (1) the CLERS symbol region
-    /// (identical to `start`), THEN (2) `num_attribute_data` consecutive
+    /// Port of the attribute-connectivity loop of `Start`/`DecodeAttributeSeams`
+    /// (`mesh_edgebreaker_traversal_decoder.h`): `num_attribute_data` consecutive
     /// `RAnsBitDecoder`s, each seeded via `StartDecoding(&buffer_)` from wherever
     /// the previous one left `buf` — i.e. the attribute-connectivity rABS
-    /// streams are back to back in attribute order, immediately after the
-    /// symbol region. Decoders are owned via `alloc`; free with `deinitAttr`.
+    /// streams are back to back in attribute order. Decoders are owned via
+    /// `alloc`; free with `deinitAttr`.
     ///
-    /// NOTE: real Draco's full `Start()` also runs `DecodeStartFaces()` between
-    /// steps (1) and (2) (ported separately above as `startFaces`, already
-    /// exercised by the num_attribute_data == 0 path). This function only
-    /// covers the two phases in its own contract — a caller assembling the
-    /// complete v2.2 bitstream with attributes must sequence
-    /// `start` -> `startFaces` -> the attribute-decoder loop itself; it must
-    /// NOT call both `start`/`startFaces` and then `startWithAttributes` (which
-    /// would re-decode the symbol region).
-    pub fn startWithAttributes(self: *TraversalDecoder, buf: *DecoderBuffer, num_attribute_data: u32, alloc: std.mem.Allocator) Error!void {
-        try self.start(buf);
+    /// This function does NOT call `start` or `startFaces` itself — real
+    /// Draco's `Start()` sequences symbols -> `DecodeStartFaces()` ->
+    /// attribute seams, and `startFaces` is unconditional (it runs even when
+    /// `num_attribute_data == 0`). Callers must compose:
+    /// `start(buf); startFaces(buf); startAttributeSeams(buf, n, alloc);`
+    /// with `buf` positioned wherever the previous step left it.
+    pub fn startAttributeSeams(self: *TraversalDecoder, buf: *DecoderBuffer, num_attribute_data: u32, alloc: std.mem.Allocator) Error!void {
         const decoders = try alloc.alloc(draco.RAnsBitDecoder, num_attribute_data);
         errdefer alloc.free(decoders);
         for (decoders) |*d| d.* = .{};
@@ -54,7 +50,7 @@ pub const TraversalDecoder = struct {
     }
 
     /// Frees the attribute-connectivity decoders allocated by
-    /// `startWithAttributes`. Safe to call even if `startWithAttributes` was
+    /// `startAttributeSeams`. Safe to call even if `startAttributeSeams` was
     /// never called (no-op), and idempotent.
     pub fn deinitAttr(self: *TraversalDecoder) void {
         if (self.attr_alloc) |alloc| {
@@ -142,7 +138,13 @@ test "decodeSymbol reads C then S/L/R/E patterns" {
     for (want) |w| try std.testing.expectEqual(w, try td.decodeSymbol());
 }
 
-// ── startWithAttributes round-trip (the gate) ────────────────────────────────
+// ── startAttributeSeams round-trip (the gate) ────────────────────────────────
+// NOTE: this test builds a bare [symbols][attr0][attr1] stream with no
+// start-faces region, and calls `start` + `startAttributeSeams` directly
+// (skipping `startFaces`) — it validates the rABS seam-decoder plumbing in
+// isolation, not a real Draco bitstream layout. Task 4's real fixture
+// (`decodeConnectivity`, which composes `start` -> `startFaces` -> attribute
+// seams) is the layout gate for the true wire order.
 const RAnsBitEncoder = @import("rans_test_encoder.zig").RAnsBitEncoder;
 
 fn buildRabsStream(a: std.mem.Allocator, bits: []const u1) ![]u8 {
@@ -152,10 +154,10 @@ fn buildRabsStream(a: std.mem.Allocator, bits: []const u1) ![]u8 {
     return enc.finish(a); // owned bytes
 }
 
-test "startWithAttributes: symbol region then N attribute rABS seam streams, in order" {
+test "startAttributeSeams: symbol region then N attribute rABS seam streams, in order" {
     const a = std.testing.allocator;
 
-    // Draco layout: [CLERS symbol region][attr0 rABS stream][attr1 rABS stream].
+    // Isolated plumbing test: [CLERS symbol region][attr0 rABS stream][attr1 rABS stream].
     const want_syms = [_]Symbol{ .c, .s, .l, .r, .e, .c };
     const sym_stream = try buildSymbolStream(a, &want_syms);
     defer a.free(sym_stream);
@@ -175,7 +177,8 @@ test "startWithAttributes: symbol region then N attribute rABS seam streams, in 
 
     var buf = DecoderBuffer.init(stream);
     var td: TraversalDecoder = undefined;
-    try td.startWithAttributes(&buf, 2, a);
+    try td.start(&buf);
+    try td.startAttributeSeams(&buf, 2, a);
     defer td.deinitAttr();
 
     for (want_syms) |w| try std.testing.expectEqual(w, try td.decodeSymbol());
@@ -183,14 +186,15 @@ test "startWithAttributes: symbol region then N attribute rABS seam streams, in 
     for (attr1_bits) |b| try std.testing.expectEqual(b, td.decodeAttributeSeam(1));
 }
 
-test "startWithAttributes: num_attribute_data == 0 behaves like plain start" {
+test "startAttributeSeams: num_attribute_data == 0 behaves like plain start" {
     const a = std.testing.allocator;
     const want = [_]Symbol{ .c, .l, .c };
     const stream = try buildSymbolStream(a, &want);
     defer a.free(stream);
     var buf = DecoderBuffer.init(stream);
     var td: TraversalDecoder = undefined;
-    try td.startWithAttributes(&buf, 0, a);
+    try td.start(&buf);
+    try td.startAttributeSeams(&buf, 0, a);
     defer td.deinitAttr();
     for (want) |w| try std.testing.expectEqual(w, try td.decodeSymbol());
     // Out-of-range attribute seam lookups never panic.
