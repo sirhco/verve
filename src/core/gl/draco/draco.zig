@@ -15,6 +15,7 @@ pub const Header = header.Header;
 pub const parseHeader = header.parseHeader;
 
 pub const CornerTable = @import("corner_table.zig").CornerTable;
+pub const MeshAttrCornerTable = @import("mesh_attr_corner_table.zig").MeshAttrCornerTable;
 
 pub const TraversalDecoder = @import("traversal_standard.zig").TraversalDecoder;
 
@@ -35,6 +36,7 @@ test {
     _ = @import("rans.zig"); // pulls in rans_test_encoder.zig transitively
     _ = @import("fixture_test.zig");
     _ = @import("corner_table.zig");
+    _ = @import("mesh_attr_corner_table.zig");
     _ = @import("traversal_standard.zig");
     _ = @import("edgebreaker.zig");
     _ = @import("attributes.zig");
