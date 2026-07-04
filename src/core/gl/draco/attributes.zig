@@ -86,6 +86,41 @@ pub const DecodedAttrHeader = struct {
 /// encoder, a non-WRAP prediction transform, or a prediction-scheme method
 /// outside `{DIFFERENCE, PARALLELOGRAM, MULTI_PARALLELOGRAM, CONSTRAINED_MULTI_PARALLELOGRAM}`.
 pub fn parseAttrHeader(buf: *DecoderBuffer, conn: *const Connectivity) Error!DecodedAttrHeader {
+    const section = try parseAttrSection(conn.alloc, buf, conn);
+    conn.alloc.free(section.residuals);
+    return section.header;
+}
+
+/// Draco `ConvertSymbolToSignedInt` (`core/symbol_decoding.h`), the per-value
+/// portable/zigzag inverse `SequentialIntegerAttributeDecoder::DecodeIntegerValues`
+/// applies (`ConvertSymbolsToSignedInts`) after entropy-decoding the blob and
+/// before running the prediction inverse: `is = symbol >> 1; if (symbol & 1) is
+/// = -is - 1`. `symbol >> 1` always clears the top bit so the `@bitCast` is a
+/// non-negative `i32`; wrapping negation keeps `symbol == UINT32_MAX` (→ exactly
+/// `i32` min) from panicking.
+fn symbolToSignedInt(sym: u32) i32 {
+    const half: i32 = @bitCast(sym >> 1);
+    if (sym & 1 == 0) return half;
+    return -%half -% 1;
+}
+
+/// `parseAttrHeader`'s result plus the decoded, signed residual corrections. The
+/// two are produced in one pass because Draco interleaves them: the value blob
+/// is entropy-decoded in the *middle* of the attribute section — after the
+/// prediction metadata, before the WRAP clamp bounds and the quantization params
+/// (see `SequentialIntegerAttributeDecoder::DecodeIntegerValues`). `residuals`
+/// is owned by the allocator passed to `parseAttrSection`; its length is
+/// `num_points * num_components`, in data-entry (encoding) order.
+const AttrSection = struct {
+    header: DecodedAttrHeader,
+    residuals: []i32,
+};
+
+/// Full attribute-section walk (see the module doc comment for the C++ chain),
+/// capturing the signed residual corrections instead of discarding them.
+/// `parseAttrHeader` wraps this and frees `residuals`; `decodeAttributes`
+/// consumes them for the prediction inverse.
+fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity) Error!AttrSection {
     // `PointCloudDecoder::DecodePointAttributes`.
     const num_attributes_decoders = try buf.readInt(u8);
     if (num_attributes_decoders != 1) return Error.UnsupportedDracoFeature;
@@ -140,19 +175,34 @@ pub fn parseAttrHeader(buf: *DecoderBuffer, conn: *const Connectivity) Error!Dec
     // itself. This port does not interpret the values (Tasks 2-4 own that) —
     // it only needs to land `buf.pos` exactly where the real decoder would.
     const num_values: usize = @as(usize, conn.num_points) * @as(usize, num_components);
+    const residuals = try alloc.alloc(i32, num_values);
+    errdefer alloc.free(residuals);
     const compressed = try buf.readInt(u8);
     if (compressed > 0) {
-        // `DecodeSymbols(num_values, num_components, in_buffer, out)` — reuse
-        // Slice A's already-tested rANS/raw symbol decoder purely to advance
-        // `buf` past the entropy-coded blob; the decoded ints are discarded.
-        const scratch = try conn.alloc.alloc(u32, num_values);
-        defer conn.alloc.free(scratch);
-        try draco.decodeSymbols(conn.alloc, buf, num_values, num_components, scratch);
+        // `DecodeSymbols(num_values, num_components, in_buffer, out)` — Slice A's
+        // rANS/raw symbol decoder. The decoded unsigned symbols become the signed
+        // residual corrections via `ConvertSymbolsToSignedInts` (WRAP corrections
+        // are not positive-only, so the conversion always runs for this port).
+        const scratch = try alloc.alloc(u32, num_values);
+        defer alloc.free(scratch);
+        try draco.decodeSymbols(alloc, buf, num_values, num_components, scratch);
+        for (scratch, 0..) |s, i| residuals[i] = symbolToSignedInt(s);
     } else {
-        // Direct (uncompressed) path: `num_bytes` bytes per scalar value.
+        // Direct (uncompressed) path: `num_bytes` little-endian bytes per scalar
+        // value, each an unsigned symbol converted the same way. No committed
+        // fixture exercises this path, but it costs nothing to decode faithfully.
         const num_bytes = try buf.readInt(u8);
-        const total: usize = @as(usize, num_bytes) * num_values;
-        try buf.skip(total);
+        if (num_bytes == 0 or num_bytes > 4) return Error.UnsupportedDracoFeature;
+        var i: usize = 0;
+        while (i < num_values) : (i += 1) {
+            var sym: u32 = 0;
+            var b: usize = 0;
+            while (b < num_bytes) : (b += 1) {
+                const byte = try buf.readInt(u8);
+                sym |= @as(u32, byte) << @intCast(b * 8);
+            }
+            residuals[i] = symbolToSignedInt(sym);
+        }
     }
 
     // If `scheme_method` needed a prediction scheme (always true for the
@@ -186,7 +236,49 @@ pub fn parseAttrHeader(buf: *DecoderBuffer, conn: *const Connectivity) Error!Dec
     // `SequentialQuantizationAttributeDecoder::DecodeQuantizedDataInfo`.
     const quant = try attr_quant.parseQuantParams(buf);
 
-    return .{ .scheme_method = scheme_method, .transform_type = transform_type, .quant = quant, .num_components = num_components, .traversal_method = traversal_method, .wrap_min = wrap_min, .wrap_max = wrap_max };
+    return .{
+        .header = .{ .scheme_method = scheme_method, .transform_type = transform_type, .quant = quant, .num_components = num_components, .traversal_method = traversal_method, .wrap_min = wrap_min, .wrap_max = wrap_max },
+        .residuals = residuals,
+    };
+}
+
+/// Decoded POSITION values, `num_points * 3` `f32`s in per-point order (lines up
+/// 1:1 with `Connectivity.indices`). Caller must `deinit`.
+pub const PositionData = struct {
+    values: []f32,
+    alloc: std.mem.Allocator,
+
+    pub fn deinit(self: *PositionData) void {
+        self.alloc.free(self.values);
+        self.values = &.{};
+    }
+};
+
+/// End-to-end POSITION decode: header + residual entropy stream (`parseAttrSection`)
+/// → prediction inverse (`predict_mesh.inversePredict`, per-point quantized ints)
+/// → dequantization (`attr_quant.dequantize`). `buf` must be positioned right
+/// after `decodeConnectivity`. Returns owned `PositionData` (`values.len ==
+/// num_points * 3`, decoded-vertex order). Never panics on malformed input —
+/// bounds/consistency violations map to `draco.Error`.
+pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity) Error!PositionData {
+    const section = try parseAttrSection(alloc, buf, conn);
+    defer alloc.free(section.residuals);
+    const h = section.header;
+    const nc: usize = h.num_components;
+
+    const q = try draco.inversePredict(alloc, h, section.residuals, h.num_components, conn);
+    defer alloc.free(q);
+
+    const values = try alloc.alloc(f32, q.len);
+    errdefer alloc.free(values);
+    for (q, 0..) |qi, i| {
+        // Post-WRAP quantized values are clamped into `[wrap_min, wrap_max]`,
+        // which for a quantized position is `[0, (1<<bits)-1]` — always
+        // non-negative. Guard rather than `@intCast`-panic on a corrupt stream.
+        if (qi < 0) return Error.Corrupt;
+        values[i] = attr_quant.dequantize(@intCast(qi), i % nc, h.quant);
+    }
+    return .{ .values = values, .alloc = alloc };
 }
 
 test "parseAttrHeader(quad.drc): QUANTIZATION, 3 components, WRAP transform" {
@@ -202,7 +294,19 @@ test "parseAttrHeader(quad.drc): QUANTIZATION, 3 components, WRAP transform" {
     // scheme_method is one of {0,1,2,4}; assert it parsed into that set.
     try std.testing.expect(h.scheme_method == 0 or h.scheme_method == 1 or h.scheme_method == 2 or h.scheme_method == 4);
     try std.testing.expect(h.quant.bits > 0 and h.quant.bits <= 30);
-    std.debug.print("\n[C1] quad scheme_method={d} transform={d} bits={d} min={any} range={d}\n", .{ h.scheme_method, h.transform_type, h.quant.bits, h.quant.min, h.quant.range });
+}
+
+test "decodeAttributes(quad.drc) → POSITION [0,1,0, 0,0,0, 1,1,0, 1,0,0]" {
+    const a = std.testing.allocator;
+    const quad_drc = @import("draco_fixtures").quad_drc;
+    var buf = DecoderBuffer.init(quad_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    var pos = try decodeAttributes(a, &buf, &conn);
+    defer pos.deinit();
+    const want = [_]f32{ 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0 };
+    try std.testing.expectEqualSlices(f32, &want, pos.values);
 }
 
 test "parseAttrHeader rejects num_components != 3" {
