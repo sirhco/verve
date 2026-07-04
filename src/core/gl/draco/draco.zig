@@ -4,6 +4,13 @@ pub const Error = error{ BadMagic, Truncated, UnsupportedDracoVersion, Unsupport
 
 pub const DecoderBuffer = @import("buffer.zig").DecoderBuffer;
 
+pub const header = @import("header.zig");
+pub const GeometryType = header.GeometryType;
+pub const EncoderMethod = header.EncoderMethod;
+pub const Header = header.Header;
+pub const parseHeader = header.parseHeader;
+
 test {
     _ = @import("buffer.zig");
+    _ = @import("header.zig");
 }
