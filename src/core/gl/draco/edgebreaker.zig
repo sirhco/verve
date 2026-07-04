@@ -10,6 +10,7 @@ const kInvalidVertex = ct_mod.kInvalidVertex;
 const cNext = ct_mod.next;
 const cPrev = ct_mod.previous;
 const TraversalDecoder = @import("traversal_standard.zig").TraversalDecoder;
+const MeshAttrCornerTable = @import("mesh_attr_corner_table.zig").MeshAttrCornerTable;
 
 // Faithful port of Draco `mesh_edgebreaker_decoder.cc::InitializeDecoder` (the
 // traversal-type byte) plus `mesh_edgebreaker_decoder_impl.cc`'s
@@ -84,8 +85,10 @@ pub fn parseConnHeader(buf: *DecoderBuffer) Error!ConnHeader {
     const max_num_vertex_edges: u64 = if (v64 == 0) 0 else v64 * (v64 - 1) / 2;
     if (max_num_vertex_edges < min_num_face_edges) return Error.Corrupt;
 
+    // num_attribute_data > 0 is supported as of Slice C2a (attribute
+    // connectivity). VALENCE/PREDICTIVE traversal + non-2.2 streams remain
+    // rejected elsewhere (`beginConnectivity` / `parseHeader`).
     const num_attribute_data = try buf.readInt(u8);
-    if (num_attribute_data != 0) return Error.UnsupportedDracoFeature;
 
     const num_encoded_symbols = try buf.decodeVarint(u32);
     // Number of faces must be >= number of symbols (the initial face may not
@@ -199,16 +202,28 @@ pub fn decodeEvents(alloc: std.mem.Allocator, buf: *DecoderBuffer, hdr: ConnHead
 /// EdgeFaceName (mesh_edgebreaker_shared.h): RIGHT_FACE_EDGE == 1.
 const RIGHT_FACE_EDGE: u1 = 1;
 
-/// Decoded position-only connectivity. `indices` are Draco-native vertex ids,
-/// 3 per face. Caller owns everything and must call `deinit`.
+/// Decoded connectivity. `indices` are Draco-native position vertex ids, 3 per
+/// face. `attr_maps` (empty for the position-only path) holds one
+/// `MeshAttrCornerTable` per non-position attribute, describing that attribute's
+/// seam-split vertex partition. Caller owns everything and must call `deinit`.
+///
+/// ★ Lifetime: each `MeshAttrCornerTable` in `attr_maps` *borrows* this
+/// connectivity's `corner_table` (its `corner_table_` pointer). Its
+/// self-contained per-corner data (`vertex(corner)`, `numVertices()`,
+/// `leftMostCorner()`) is fully materialised by `recomputeVertices` and is
+/// valid regardless. Consumers that need topology (`numFaces`/`numCorners`)
+/// must query `conn.corner_table` directly rather than through an `attr_map`.
 pub const Connectivity = struct {
     alloc: std.mem.Allocator,
     indices: []u32,
     corner_table: CornerTable,
     num_points: u32,
+    attr_maps: []MeshAttrCornerTable = &.{},
 
     pub fn deinit(self: *Connectivity) void {
         self.alloc.free(self.indices);
+        for (self.attr_maps) |*m| m.deinit();
+        self.alloc.free(self.attr_maps);
         self.corner_table.deinit();
     }
 };
@@ -313,6 +328,12 @@ pub fn decodeConnectivity(alloc: std.mem.Allocator, buf: *DecoderBuffer) Error!C
     var td: TraversalDecoder = undefined;
     try td.start(buf); // CLERS symbol bit region
     try td.startFaces(buf); // start-face configuration rANS stream
+    // Attribute-connectivity seam rABS streams (num_attribute_data of them),
+    // back to back after the start-face stream. Matches Draco `Start()` =
+    // symbols → DecodeStartFaces (unconditional) → DecodeAttributeSeams. After
+    // this, `buf` sits at the multi-decoder attribute (value) section.
+    try td.startAttributeSeams(buf, h.num_attribute_data, alloc);
+    defer td.deinitAttr();
 
     // active_corner_stack: the LIFO of active edges (by opposite corner).
     var active_stack = std.ArrayList(u32).empty;
@@ -430,7 +451,12 @@ pub fn decodeConnectivity(alloc: std.mem.Allocator, buf: *DecoderBuffer) Error!C
                     if (corner_n == first_corner) return Error.Corrupt;
                 }
                 ct.makeVertexIsolated(vertex_n);
-                try invalid_vertices.append(alloc, vertex_n);
+                // `remove_invalid_vertices = attribute_data_.empty()`
+                // (impl.cc:558). Only record isolated vertices for later removal
+                // when there is no non-position attribute data — otherwise the
+                // vertex-remap is skipped so attribute corner tables can still
+                // reference every original position vertex.
+                if (h.num_attribute_data == 0) try invalid_vertices.append(alloc, vertex_n);
                 active_stack.items[active_stack.items.len - 1] = corner;
             },
             .e => {
@@ -500,8 +526,10 @@ pub fn decodeConnectivity(alloc: std.mem.Allocator, buf: *DecoderBuffer) Error!C
     if (num_faces != ct.numFaces()) return Error.Corrupt;
 
     // Remove vertices that were marked as isolated by split symbols so that all
-    // ids in <0, num_vertices) are valid. Safe here because attribute_data is
-    // empty (num_attribute_data == 0).
+    // ids in <0, num_vertices) are valid. `invalid_vertices` is only populated
+    // when `num_attribute_data == 0` (the `remove_invalid_vertices` branch,
+    // impl.cc:769), so for the attribute path this loop is a no-op and
+    // `num_vertices` stays at the full corner-table vertex count.
     var num_vertices = ct.numVertices();
     for (invalid_vertices.items) |invalid_vert| {
         if (num_vertices == 0) return Error.Corrupt;
@@ -539,7 +567,61 @@ pub fn decodeConnectivity(alloc: std.mem.Allocator, buf: *DecoderBuffer) Error!C
         }
     }
 
-    return .{ .alloc = alloc, .indices = indices, .corner_table = ct, .num_points = num_vertices };
+    // ── attribute connectivity (num_attribute_data > 0) ──────────────────────
+    // Port of `DecodeConnectivity()`'s post-traversal attribute section
+    // (impl.cc:474-508): a forward pass over every face decodes the per-attribute
+    // seam bits (`DecodeAttributeConnectivitiesOnFace`, impl.cc:1132), then each
+    // attribute builds a `MeshAttrCornerTable` from its recorded seam corners.
+    const attr_maps = try alloc.alloc(MeshAttrCornerTable, h.num_attribute_data);
+    var built_maps: usize = 0;
+    errdefer {
+        for (attr_maps[0..built_maps]) |*m| m.deinit();
+        alloc.free(attr_maps);
+    }
+    if (h.num_attribute_data > 0) {
+        // Per-attribute lists of corners that start an attribute seam.
+        const seam_lists = try alloc.alloc(std.ArrayList(u32), h.num_attribute_data);
+        for (seam_lists) |*s| s.* = std.ArrayList(u32).empty;
+        defer {
+            for (seam_lists) |*s| s.deinit(alloc);
+            alloc.free(seam_lists);
+        }
+
+        // `DecodeAttributeConnectivitiesOnFace(corner)` for corner = 0,3,6,…
+        // over every face (impl.cc:486). For each of the face's three corners:
+        //   • boundary edge (Opposite == invalid) → implicit seam, no bit read;
+        //   • opposite face already processed (opp_face < src_face) → skip;
+        //   • otherwise read one seam bit per attribute; if set, record the
+        //     corner as a seam corner for that attribute.
+        const num_corners = ct.numCorners();
+        var ci: u32 = 0;
+        while (ci < num_corners) : (ci += 3) {
+            const src_face = ci / 3;
+            const face_corners = [3]u32{ ci, cNext(ci), cPrev(ci) };
+            for (face_corners) |cc| {
+                const opp = ct.opposite(cc);
+                if (opp == kInvalidCorner) {
+                    for (seam_lists) |*s| try s.append(alloc, cc);
+                    continue;
+                }
+                if (opp / 3 < src_face) continue; // opposite face already processed
+                for (seam_lists, 0..) |*s, ai| {
+                    if (td.decodeAttributeSeam(ai) != 0) try s.append(alloc, cc);
+                }
+            }
+        }
+
+        // Build one MeshAttrCornerTable per attribute (impl.cc:497-508):
+        // InitEmpty → AddSeamEdge per recorded seam corner → RecomputeVertices.
+        for (attr_maps, 0..) |*m, ai| {
+            m.* = try MeshAttrCornerTable.init(alloc, &ct);
+            built_maps += 1;
+            for (seam_lists[ai].items) |sc| m.addSeamEdge(sc);
+            try m.recomputeVertices(&ct);
+        }
+    }
+
+    return .{ .alloc = alloc, .indices = indices, .corner_table = ct, .num_points = num_vertices, .attr_maps = attr_maps };
 }
 
 /// `MeshEdgebreakerDecoderImpl::SetOppositeCorners` — set both directions.
@@ -640,27 +722,6 @@ test "decodeConnectivity(cube.drc) → exact cube indices" {
     try std.testing.expectEqual(@as(u32, 8), conn.num_points);
 }
 
-/// Absolute byte offset of `num_attribute_data` in `quad.drc`: 11 bytes of
-/// file header + 1 traversal-type byte + 2 varint bytes
-/// (num_encoded_vertices=4, num_faces=2, each a single-byte varint) = 14.
-/// Pinned by `parse quad.drc connectivity header` above, which asserts
-/// `num_encoded_vertices == 4` and `num_faces == 2` decode from exactly those
-/// two single bytes.
-const ATTR_DATA_OFF: usize = 14;
-
-test "reject num_attribute_data > 0" {
-    // Patch a copy of quad.drc's num_attribute_data byte to 1.
-    const quad_drc = @import("draco_fixtures").quad_drc;
-    const a = std.testing.allocator;
-    const copy = try a.dupe(u8, quad_drc);
-    defer a.free(copy);
-    try std.testing.expectEqual(@as(u8, 0), copy[ATTR_DATA_OFF]);
-    copy[ATTR_DATA_OFF] = 1;
-    var buf = draco.DecoderBuffer.init(copy);
-    _ = try draco.parseHeader(&buf);
-    try std.testing.expectError(draco.Error.UnsupportedDracoFeature, decodeConnectivity(a, &buf));
-}
-
 // ── torus: genus-1, exercises the TOPOLOGY_S / topology-split path ─────────
 // quad.drc and cube.drc both decode with 0 topology splits (genus-0 meshes),
 // leaving the hardest part of the traversal loop (the `.s` symbol arm +
@@ -726,6 +787,24 @@ test "decodeConnectivity(torus.drc) → exact torus indices, exercises topology 
     };
     try std.testing.expectEqualSlices(u32, &want, conn.indices);
     try std.testing.expectEqual(@as(u32, 96), conn.num_points);
+}
+
+const cube_nrm_drc = @import("draco_fixtures").cube_nrm_drc;
+
+test "decodeConnectivity(cube_nrm.drc): num_attribute_data=1 accepted, indices byte-exact" {
+    const a = std.testing.allocator;
+    var buf = draco.DecoderBuffer.init(cube_nrm_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try decodeConnectivity(a, &buf); // must NOT reject
+    defer conn.deinit();
+    // cube indices are the same regardless of attributes (same topology):
+    const want = [_]u32{ 0, 1, 2, 2, 1, 3, 3, 1, 4, 1, 0, 4, 0, 5, 4, 4, 5, 6, 5, 0, 6, 0, 2, 6, 6, 2, 7, 2, 3, 7, 3, 4, 7, 6, 7, 4 };
+    try std.testing.expectEqualSlices(u32, &want, conn.indices);
+    try std.testing.expectEqual(@as(usize, 1), conn.attr_maps.len);
+    // Probe: print num_attributes_decoders + each att_data_id at buf.pos (attribute section start).
+    std.debug.print("\n[C2a] cube_nrm attr-section start pos={d}; next 8 bytes:", .{buf.pos});
+    for (cube_nrm_drc[buf.pos..][0..@min(8, cube_nrm_drc.len - buf.pos)]) |b| std.debug.print(" {x:0>2}", .{b});
+    std.debug.print("\n", .{});
 }
 
 test "decodeEvents rejects num_topology_splits > num_faces" {
