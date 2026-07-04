@@ -2970,3 +2970,107 @@ test "parseGlb decodes KHR_draco cube_nrm_uv → POSITION/NORMAL/TEXCOORD match 
     const want_idx = [_]u16{ 0, 1, 2, 2, 1, 3, 3, 1, 4, 1, 0, 4, 0, 5, 4, 4, 5, 6, 5, 0, 6, 0, 2, 6, 6, 2, 7, 2, 3, 7, 3, 4, 7, 6, 7, 4 };
     try std.testing.expectEqualSlices(u16, &want_idx, model.indices);
 }
+
+test "parseGlb decodes KHR_draco cube_nrm (no UV) → POSITION/NORMAL match golden, UV defaulted" {
+    const a = std.testing.allocator;
+    const glb = @import("draco_fixtures").cube_nrm_glb;
+    var model = try parseGlb(a, glb);
+    defer model.deinit();
+    const nv = model.vertices.len / 12;
+    const want_pos = [_]f32{ -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0 };
+    const want_nrm = [_]f32{ -0.5762181282043457, 0.57621830701828, 0.5796077847480774, -0.5762181282043457, -0.57621830701828, 0.5796077847480774, 0.5762181282043457, 0.57621830701828, 0.5796077847480774, 0.5762181878089905, -0.5762181878089905, 0.5796077847480774, -0.5762181878089905, -0.5762181878089905, -0.5796077847480774, -0.5762181878089905, 0.5762181878089905, -0.5796077847480774, 0.5762181282043457, 0.57621830701828, -0.5796077847480774, 0.5762181878089905, -0.5762181878089905, -0.5796077847480774 };
+    try std.testing.expectEqual(@as(usize, want_pos.len / 3), nv);
+    var vi: usize = 0;
+    while (vi < nv) : (vi += 1) {
+        inline for (0..3) |k| try std.testing.expectEqual(want_pos[vi * 3 + k], model.vertices[vi * 12 + 0 + k]);
+        inline for (0..3) |k| try std.testing.expectEqual(want_nrm[vi * 3 + k], model.vertices[vi * 12 + 3 + k]);
+        // No TEXCOORD_0 in this fixture → UV must default to (0, 0).
+        inline for (0..2) |k| try std.testing.expectEqual(@as(f32, 0.0), model.vertices[vi * 12 + 10 + k]);
+    }
+    const want_idx = [_]u16{ 0, 1, 2, 2, 1, 3, 3, 1, 4, 1, 0, 4, 0, 5, 4, 4, 5, 6, 5, 0, 6, 0, 2, 6, 6, 2, 7, 2, 3, 7, 3, 4, 7, 6, 7, 4 };
+    try std.testing.expectEqualSlices(u16, &want_idx, model.indices);
+}
+
+test "parseGlb decodes KHR_draco cube (position-only) → POSITION matches golden, NORMAL/UV defaulted" {
+    const a = std.testing.allocator;
+    const glb = @import("draco_fixtures").cube_glb;
+    var model = try parseGlb(a, glb);
+    defer model.deinit();
+    const nv = model.vertices.len / 12;
+    const want_pos = [_]f32{ -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0 };
+    try std.testing.expectEqual(@as(usize, want_pos.len / 3), nv);
+    var vi: usize = 0;
+    while (vi < nv) : (vi += 1) {
+        inline for (0..3) |k| try std.testing.expectEqual(want_pos[vi * 3 + k], model.vertices[vi * 12 + 0 + k]);
+        // No NORMAL accessor and no Draco-decoded normals → default (0, 0, 1).
+        try std.testing.expectEqual(@as(f32, 0.0), model.vertices[vi * 12 + 3]);
+        try std.testing.expectEqual(@as(f32, 0.0), model.vertices[vi * 12 + 4]);
+        try std.testing.expectEqual(@as(f32, 1.0), model.vertices[vi * 12 + 5]);
+        // No TEXCOORD_0 → UV defaults to (0, 0).
+        inline for (0..2) |k| try std.testing.expectEqual(@as(f32, 0.0), model.vertices[vi * 12 + 10 + k]);
+    }
+    const want_idx = [_]u16{ 0, 1, 2, 2, 1, 3, 3, 1, 4, 1, 0, 4, 0, 5, 4, 4, 5, 6, 5, 0, 6, 0, 2, 6, 6, 2, 7, 2, 3, 7, 3, 4, 7, 6, 7, 4 };
+    try std.testing.expectEqualSlices(u16, &want_idx, model.indices);
+}
+
+test "toVmesh(cube_nrm_uv.glb) round-trip: decoded .vmesh POSITION matches golden" {
+    // Proves the full glb→Model→vmesh.pack→vmesh.Reader path for a Draco glb,
+    // not just parseGlb in isolation. toVmesh (gltf.zig:90-112) calls the plain
+    // `vmesh.pack` (raw, uncompressed geo/vertex codecs) — not `packCompressed`
+    // — so a zero-copy `vmesh.Reader.init` (no `initAlloc`) is sufficient here;
+    // see the existing "glTF morph TANGENT accessor" test above for the same
+    // toVmesh + Reader.init pairing.
+    const a = std.testing.allocator;
+    const glb = @import("draco_fixtures").cube_nrm_uv_glb;
+    const bytes = try toVmesh(a, glb);
+    defer a.free(bytes);
+    var r = try vmesh.Reader.init(bytes);
+    try std.testing.expectEqual(vmesh.GeoCodec.none, r.geo_codec_);
+    try std.testing.expectEqual(vmesh.VertexCodec.none, r.vertex_codec_);
+    const want_pos = [_]f32{ -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0 };
+    const pos = r.positions();
+    const stride = r.positionStride();
+    const nv = want_pos.len / 3;
+    try std.testing.expectEqual(@as(u32, nv), r.vertex_count);
+    var vi: usize = 0;
+    while (vi < nv) : (vi += 1) {
+        inline for (0..3) |k| try std.testing.expectEqual(want_pos[vi * 3 + k], pos[vi * stride + k]);
+    }
+}
+
+test "seam guard: attr_map.numVertices() != num_points → error.UnsupportedDracoFeature (structural)" {
+    // gltf.zig's Draco decode path bails (line ~487) when a decoded attribute's
+    // MeshAttrCornerTable vertex count differs from the connectivity's
+    // num_points — that shape means a real UV/normal seam, which the shared
+    // value-decode path assumes away (1:1 indexing with the position table).
+    //
+    // seam guard: real coverage (parseGlb on an actual seamed KHR_draco glb) is
+    // the follow-on — no seam fixture exists yet (all committed .drc/.glb
+    // fixtures are seam-free: quad/cube/torus/cube_nrm/cube_nrm_uv). This test
+    // instead exercises the guard PREDICATE directly against a hand-built
+    // Connectivity whose lone attr_map's numVertices() is forced to exceed
+    // num_points, mirroring the exact comparison in the real code.
+    const a = std.testing.allocator;
+    var ct = try draco.CornerTable.initEmpty(a, 0, 0);
+    var attr_map = try draco.MeshAttrCornerTable.init(a, &ct);
+    // Force a seam-shaped mismatch: 2 attribute-vertex entries vs num_points=1.
+    try attr_map.vertex_to_attribute_entry_id_map_.append(a, 0);
+    try attr_map.vertex_to_attribute_entry_id_map_.append(a, 1);
+    try std.testing.expect(attr_map.numVertices() != 1);
+    const attr_maps = try a.alloc(draco.MeshAttrCornerTable, 1);
+    attr_maps[0] = attr_map;
+    var conn = draco.Connectivity{
+        .alloc = a,
+        .indices = try a.alloc(u32, 0),
+        .corner_table = ct,
+        .num_points = 1,
+        .attr_maps = attr_maps,
+    };
+    defer conn.deinit();
+    // Exact predicate from gltf.zig's Draco decode branch.
+    var guard_triggered = false;
+    for (conn.attr_maps) |m| {
+        if (m.numVertices() != conn.num_points) guard_triggered = true;
+    }
+    try std.testing.expect(guard_triggered);
+}

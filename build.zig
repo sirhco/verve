@@ -1335,9 +1335,10 @@ fn buildPublicAssets(b: *std.Build, dir_opt: ?[]const u8) *std.Build.Module {
 
 /// Walk `dir` for `<tag>.json` locale files at configure time and generate an
 /// `draco_fixtures` module: anchors the committed real-Draco-stream fixtures
-/// (`tests/fixtures/draco/{quad,cube,torus,cube_nrm,cube_nrm_uv}.drc`) so
-/// `src/core/gl/draco/fixture_test.zig` / `edgebreaker.zig` can `@embedFile`
-/// them. `@embedFile` paths may not escape a module's package root, and
+/// (`tests/fixtures/draco/{quad,cube,torus,cube_nrm,cube_nrm_uv}.drc` plus the
+/// `cube.glb`/`cube_nrm.glb`/`cube_nrm_uv.glb` KHR_draco glTF containers) so
+/// `src/core/gl/draco/fixture_test.zig` / `edgebreaker.zig` / `gltf.zig` can
+/// `@embedFile` them. `@embedFile` paths may not escape a module's package root, and
 /// `tests/` sits outside `src/`'s root — so, mirroring `buildI18nCatalog`
 /// below, copy the fixtures into a `WriteFiles` step and generate a tiny
 /// anchor source alongside them whose own package root is that generated
@@ -1349,6 +1350,8 @@ fn buildDracoFixtures(b: *std.Build) *std.Build.Module {
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/torus.drc"), "torus.drc");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm.drc"), "cube_nrm.drc");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm_uv.drc"), "cube_nrm_uv.drc");
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube.glb"), "cube.glb");
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm.glb"), "cube_nrm.glb");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm_uv.glb"), "cube_nrm_uv.glb");
     const gen = wf.add("draco_fixtures.zig",
         \\pub const quad_drc = @embedFile("quad.drc");
@@ -1356,6 +1359,8 @@ fn buildDracoFixtures(b: *std.Build) *std.Build.Module {
         \\pub const torus_drc = @embedFile("torus.drc");
         \\pub const cube_nrm_drc = @embedFile("cube_nrm.drc");
         \\pub const cube_nrm_uv_drc = @embedFile("cube_nrm_uv.drc");
+        \\pub const cube_glb = @embedFile("cube.glb");
+        \\pub const cube_nrm_glb = @embedFile("cube_nrm.glb");
         \\pub const cube_nrm_uv_glb = @embedFile("cube_nrm_uv.glb");
         \\
     );
