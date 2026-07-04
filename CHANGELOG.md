@@ -4,6 +4,13 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.48.0] - 2026-07-04
+
+### Added
+
+- **`verve.gl` Draco-compressed glTF ingest (`KHR_draco_mesh_compression`).** `gltf.zig`/`convertGlb` now decode Draco-compressed `.glb` meshes (pure-Zig, build-time, zero-dep) into the `.vmesh` pipeline: STANDARD edgebreaker connectivity + POSITION (parallelogram/WRAP) + NORMAL (octahedron) + TEXCOORD (parallelogram/WRAP), byte-exact vs the reference decoder (draco3dgltf). Tangents are generated (Draco carries none).
+- **Limitation:** shared-connectivity meshes only; meshes with attribute **seams** (`is_connectivity_used`) are rejected with a clear error (`UnsupportedDracoFeature`) rather than misdecoded — a documented follow-on. VALENCE/PREDICTIVE traversal, geometric-normal, tex-coords-portable, and multi-/constrained-multi-parallelogram schemes are likewise rejected.
+
 ## [0.47.0] - 2026-07-03
 
 ### Added
