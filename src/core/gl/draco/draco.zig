@@ -4,6 +4,8 @@ pub const Error = error{ BadMagic, Truncated, UnsupportedDracoVersion, Unsupport
 
 pub const DecoderBuffer = @import("buffer.zig").DecoderBuffer;
 
+pub const RAnsBitDecoder = @import("rans.zig").RAnsBitDecoder;
+
 pub const header = @import("header.zig");
 pub const GeometryType = header.GeometryType;
 pub const EncoderMethod = header.EncoderMethod;
@@ -13,4 +15,5 @@ pub const parseHeader = header.parseHeader;
 test {
     _ = @import("buffer.zig");
     _ = @import("header.zig");
+    _ = @import("rans.zig"); // pulls in rans_test_encoder.zig transitively
 }
