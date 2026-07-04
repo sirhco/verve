@@ -37,3 +37,20 @@ pub fn parseQuantParams(buf: *DecoderBuffer) Error!QuantParams {
     if (bits < 1 or bits > 30) return Error.UnsupportedDracoFeature; // IsQuantizationValid
     return .{ .min = min, .range = range, .bits = bits };
 }
+
+/// Dequantize a single component value per Draco `AttributeQuantizationTransform::DequantizeValues`.
+/// Formula: `max_q = (1 << bits) - 1; delta = range / max_q; value = min[comp] + q * delta`.
+/// Matches Draco's exact operation order for byte-exact f32 output.
+pub fn dequantize(q: u32, comp: usize, p: QuantParams) f32 {
+    const max_q: f32 = @floatFromInt((@as(u32, 1) << @intCast(p.bits)) - 1);
+    const delta: f32 = p.range / max_q;
+    return p.min[comp] + @as(f32, @floatFromInt(q)) * delta;
+}
+
+test "dequantize matches Draco formula min + q*(range/max)" {
+    const p = QuantParams{ .min = .{ -1.0, 0.0, 2.0 }, .range = 4.0, .bits = 8 };
+    // max quantized = (1<<8)-1 = 255; delta = 4/255.
+    try std.testing.expectEqual(@as(f32, -1.0), dequantize(0, 0, p));
+    try std.testing.expectEqual(@as(f32, 3.0), dequantize(255, 0, p)); // -1 + 255*(4/255) = 3
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 + 4.0 * (128.0 / 255.0)), dequantize(128, 2, p), 1e-6);
+}
