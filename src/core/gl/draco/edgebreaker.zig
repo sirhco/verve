@@ -805,10 +805,6 @@ test "decodeConnectivity(cube_nrm.drc): num_attribute_data=1 accepted, indices b
     const want = [_]u32{ 0, 1, 2, 2, 1, 3, 3, 1, 4, 1, 0, 4, 0, 5, 4, 4, 5, 6, 5, 0, 6, 0, 2, 6, 6, 2, 7, 2, 3, 7, 3, 4, 7, 6, 7, 4 };
     try std.testing.expectEqualSlices(u32, &want, conn.indices);
     try std.testing.expectEqual(@as(usize, 1), conn.attr_maps.len);
-    // Probe: print num_attributes_decoders + each att_data_id at buf.pos (attribute section start).
-    std.debug.print("\n[C2a] cube_nrm attr-section start pos={d}; next 8 bytes:", .{buf.pos});
-    for (cube_nrm_drc[buf.pos..][0..@min(8, cube_nrm_drc.len - buf.pos)]) |b| std.debug.print(" {x:0>2}", .{b});
-    std.debug.print("\n", .{});
 }
 
 test "decodeEvents rejects num_topology_splits > num_faces" {

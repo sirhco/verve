@@ -121,43 +121,100 @@ const AttrSection = struct {
 /// `parseAttrHeader` wraps this and frees `residuals`; `decodeAttributes`
 /// consumes them for the prediction inverse.
 fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity) Error!AttrSection {
-    // `PointCloudDecoder::DecodePointAttributes`.
+    // `PointCloudDecoder::DecodePointAttributes` is three *separate* passes over
+    // all N attributes decoders (confirmed from point_cloud_decoder.cc — the
+    // `CreateAttributesDecoder`, `DecodeAttributesDecoderData` and
+    // `DecodeAllAttributes` loops are distinct, each iterating every decoder):
+    //
+    //   PHASE 1  CreateAttributesDecoder × N        — att_data_id / decoder_type / traversal
+    //   PHASE 2  DecodeAttributesDecoderData × N    — per-decoder descriptors + seq-encoder byte
+    //   PHASE 3  DecodeAllAttributes (in order)     — the actual value blobs, decoder 0 first
+    //
+    // Task 4's probe established POSITION is *decoder 0* (att_data_id == -1), so
+    // its phase-3 values come first — but only *after* every decoder's phase-1
+    // and phase-2 headers. This port therefore walks phases 1 and 2 for ALL
+    // decoders (reading, not reconstructing, the NORMAL/UV descriptors — no
+    // value data lives in phase 2), then decodes only decoder 0 in phase 3 and
+    // stops. NORMAL/UV *value* reconstruction (octahedron / tex-coord-portable)
+    // is C2b/C2c and is never entered here.
     const num_attributes_decoders = try buf.readInt(u8);
-    if (num_attributes_decoders != 1) return Error.UnsupportedDracoFeature;
+    if (num_attributes_decoders == 0) return Error.UnsupportedDracoFeature;
 
-    // `MeshEdgebreakerDecoderImpl::CreateAttributesDecoder`. `att_data_id < 0`
-    // is the position-attribute case (no per-attribute connectivity data —
-    // Slice B already rejected `num_attribute_data != 0`, so this is the only
-    // case our connectivity port can ever hand back). `decoder_type` (vertex
-    // vs. corner attribute) and `traversal_method` (bitstream >= 1.2, always
-    // true for our 2.2-only port) are read but not further validated: neither
-    // is on this task's reject list, and every valid combination reads the
-    // same 2 bytes here regardless of value.
-    _ = try buf.readInt(i8); // att_data_id
-    _ = try buf.readInt(u8); // decoder_type (MESH_VERTEX_ATTRIBUTE / MESH_CORNER_ATTRIBUTE)
-    const traversal_method = try buf.readInt(u8); // MeshTraversalMethod (DEPTH_FIRST/PREDICTION_DEGREE)
+    // ── PHASE 1 — `MeshEdgebreakerDecoderImpl::CreateAttributesDecoder` × N ──
+    // Each decoder reads att_data_id (i8), decoder_type (u8: MESH_VERTEX_ATTRIBUTE
+    // / MESH_CORNER_ATTRIBUTE) and traversal_method (u8: DEPTH_FIRST /
+    // PREDICTION_DEGREE — bitstream >= 1.2, always true for our 2.2-only port).
+    // `att_data_id < 0` marks the position attribute (no per-attribute
+    // connectivity); every valid combination reads the same 3 bytes.
+    var traversal_method: u8 = 0;
+    {
+        var i: u8 = 0;
+        while (i < num_attributes_decoders) : (i += 1) {
+            const att_data_id = try buf.readInt(i8);
+            _ = try buf.readInt(u8); // decoder_type
+            const tm = try buf.readInt(u8); // traversal_method
+            if (i == 0) {
+                // Probe (Task 4) established POSITION leads (att_data_id == -1).
+                // If a future fixture violates that, POSITION is not decoder 0
+                // and reaching its values would require decoding the intervening
+                // NORMAL/UV value sections (C2b/C2c) — reject rather than
+                // silently misdecode.
+                if (att_data_id != -1) return Error.UnsupportedDracoFeature;
+                traversal_method = tm;
+            }
+        }
+    }
 
-    // `AttributesDecoder::DecodeAttributesDecoderData`. Only the first (and,
-    // per this task's scope, only) attribute descriptor is kept.
-    const num_attributes = try buf.decodeVarint(u32);
-    if (num_attributes != 1) return Error.UnsupportedDracoFeature;
+    // ── PHASE 2 — `AttributesDecoder::DecodeAttributesDecoderData` × N ──
+    // Decoder 0 (POSITION) is captured + validated; decoders 1+ (NORMAL/UV) are
+    // walked (descriptors + the per-attribute sequential-encoder byte that
+    // `SequentialAttributeDecodersController::DecodeAttributesDecoderData` adds)
+    // but never value-decoded — their value blobs live in phase 3, before which
+    // we stop. Per attribute the descriptor is att_type (u8), data_type (u8),
+    // num_components (u8), normalized (u8), unique_id (varint); the encoder-type
+    // bytes are a *separate* trailing loop (matches the two C++ loops).
+    var num_components: u8 = 0;
+    {
+        var i: u8 = 0;
+        while (i < num_attributes_decoders) : (i += 1) {
+            const num_attributes = try buf.decodeVarint(u32);
+            if (i == 0) {
+                // POSITION decoder: exactly one attribute, POSITION type, 3
+                // components, QUANTIZATION sequential encoder.
+                if (num_attributes != 1) return Error.UnsupportedDracoFeature;
+                const att_type = try buf.readInt(u8); // GeometryAttribute::Type
+                _ = try buf.readInt(u8); // data_type
+                num_components = try buf.readInt(u8);
+                _ = try buf.readInt(u8); // normalized
+                _ = try buf.decodeVarint(u32); // unique_id
+                // `att_type == 0` is POSITION (the only geometry attribute type
+                // this port accepts); `num_components == 3` is required by
+                // `attr_quant.parseQuantParams`.
+                if (att_type != 0) return Error.UnsupportedDracoFeature;
+                if (num_components != 3) return Error.UnsupportedDracoFeature;
+                const seq_encoder_type = try buf.readInt(u8);
+                if (seq_encoder_type != seq_encoder_quantization) return Error.UnsupportedDracoFeature;
+            } else {
+                // Non-POSITION decoder: walk its descriptor block without
+                // interpreting it. All descriptors first, then all encoder-type
+                // bytes (the two distinct C++ loops).
+                var j: u32 = 0;
+                while (j < num_attributes) : (j += 1) {
+                    _ = try buf.readInt(u8); // att_type
+                    _ = try buf.readInt(u8); // data_type
+                    _ = try buf.readInt(u8); // num_components
+                    _ = try buf.readInt(u8); // normalized
+                    _ = try buf.decodeVarint(u32); // unique_id
+                }
+                var k: u32 = 0;
+                while (k < num_attributes) : (k += 1) {
+                    _ = try buf.readInt(u8); // sequential-encoder-type byte
+                }
+            }
+        }
+    }
 
-    const att_type = try buf.readInt(u8); // att_type (GeometryAttribute::Type)
-    _ = try buf.readInt(u8); // data_type
-    const num_components = try buf.readInt(u8);
-    _ = try buf.readInt(u8); // normalized
-    _ = try buf.decodeVarint(u32); // unique_id
-
-    // Validate attribute type and component count before quantization parse.
-    // `att_type == 0` is POSITION (the only geometry attribute type this port
-    // accepts), and `num_components == 3` is required by `attr_quant.parseQuantParams`.
-    if (att_type != 0) return Error.UnsupportedDracoFeature;
-    if (num_components != 3) return Error.UnsupportedDracoFeature;
-
-    // `SequentialAttributeDecodersController::DecodeAttributesDecoderData`'s
-    // addition: one sequential-encoder-type byte per attribute.
-    const seq_encoder_type = try buf.readInt(u8);
-    if (seq_encoder_type != seq_encoder_quantization) return Error.UnsupportedDracoFeature;
+    // ── PHASE 3 — `DecodeAllAttributes`, decoder 0 (POSITION) only ──
 
     // `SequentialIntegerAttributeDecoder::DecodeValues`: prediction metadata.
     const scheme_method = try buf.readInt(i8);
@@ -480,6 +537,34 @@ test "decodeAttributes(torus.drc) → POSITION golden (real quantization)" {
         2.3384177684783936,    -1.3499176502227783,   9.1552734375e-05,     2.1607582569122314,    -1.2474089860916138,   -0.49498260021209717,
         2.4949824810028076,    0.0001647472381591797, -0.49498260021209717, 2.1607582569122314,    1.2474088668823242,    -0.49498260021209717,
     };
+    try std.testing.expectEqualSlices(f32, &want, pos.values);
+}
+
+test "decodeAttributes(cube_nrm.drc) → POSITION byte-exact (num_attribute_data=1)" {
+    const a = std.testing.allocator;
+    const cube_nrm_drc = @import("draco_fixtures").cube_nrm_drc;
+    var buf = DecoderBuffer.init(cube_nrm_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    var pos = try decodeAttributes(a, &buf, &conn);
+    defer pos.deinit();
+    // Baked verbatim from tests/fixtures/draco/cube_nrm.golden.json's POSITION.
+    const want = [_]f32{ -1, 1, 1, -1, -1, 1, 1, 1, 1, 1, -1, 1, -1, -1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1 };
+    try std.testing.expectEqualSlices(f32, &want, pos.values);
+}
+
+test "decodeAttributes(cube_nrm_uv.drc) → POSITION byte-exact (num_attribute_data=2)" {
+    const a = std.testing.allocator;
+    const cube_nrm_uv_drc = @import("draco_fixtures").cube_nrm_uv_drc;
+    var buf = DecoderBuffer.init(cube_nrm_uv_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    var pos = try decodeAttributes(a, &buf, &conn);
+    defer pos.deinit();
+    // Baked verbatim from tests/fixtures/draco/cube_nrm_uv.golden.json's POSITION.
+    const want = [_]f32{ -1, 1, 1, -1, -1, 1, 1, 1, 1, 1, -1, 1, -1, -1, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1 };
     try std.testing.expectEqualSlices(f32, &want, pos.values);
 }
 
