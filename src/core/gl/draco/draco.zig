@@ -21,6 +21,11 @@ pub const TraversalDecoder = @import("traversal_standard.zig").TraversalDecoder;
 pub const decodeConnectivity = @import("edgebreaker.zig").decodeConnectivity;
 pub const Connectivity = @import("edgebreaker.zig").Connectivity;
 
+pub const QuantParams = @import("attr_quant.zig").QuantParams;
+pub const parseQuantParams = @import("attr_quant.zig").parseQuantParams;
+pub const DecodedAttrHeader = @import("attributes.zig").DecodedAttrHeader;
+pub const parseAttrHeader = @import("attributes.zig").parseAttrHeader;
+
 test {
     _ = @import("buffer.zig");
     _ = @import("header.zig");
@@ -29,4 +34,6 @@ test {
     _ = @import("corner_table.zig");
     _ = @import("traversal_standard.zig");
     _ = @import("edgebreaker.zig");
+    _ = @import("attributes.zig");
+    _ = @import("attr_quant.zig");
 }
