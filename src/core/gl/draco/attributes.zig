@@ -385,6 +385,9 @@ fn decodeNormals(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Con
     const nc: usize = 2; // octahedral (s,t) — `GetNumValueComponents() == 2`
     const num_values: usize = num_points * nc;
 
+    // Guard: empty mesh → no normals to decode.
+    if (num_points == 0) return try alloc.alloc(f32, 0);
+
     // ── (2) DecodeIntegerValues: compressed flag + symbol blob (raw, NO zigzag) ──
     const corr = try alloc.alloc(i32, num_values);
     defer alloc.free(corr);
