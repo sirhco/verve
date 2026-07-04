@@ -23,8 +23,8 @@ pub const QuantParams = struct {
 };
 
 /// `num_components` is fixed at 3 (position-only scope of this slice); the
-/// caller (`attributes.parseAttrHeader`) has already validated
-/// `header.num_components == 3` before calling this.
+/// caller (`attributes.parseAttrHeader`) rejects any attribute with
+/// `num_components != 3` or `att_type != POSITION`, so the fixed `[3]f32` read is safe.
 pub fn parseQuantParams(buf: *DecoderBuffer) Error!QuantParams {
     var min: [3]f32 = undefined;
     for (&min) |*m| {

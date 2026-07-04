@@ -97,11 +97,17 @@ pub fn parseAttrHeader(buf: *DecoderBuffer, conn: *const Connectivity) Error!Dec
     const num_attributes = try buf.decodeVarint(u32);
     if (num_attributes != 1) return Error.UnsupportedDracoFeature;
 
-    _ = try buf.readInt(u8); // att_type (GeometryAttribute::Type)
+    const att_type = try buf.readInt(u8); // att_type (GeometryAttribute::Type)
     _ = try buf.readInt(u8); // data_type
     const num_components = try buf.readInt(u8);
     _ = try buf.readInt(u8); // normalized
     _ = try buf.decodeVarint(u32); // unique_id
+
+    // Validate attribute type and component count before quantization parse.
+    // `att_type == 0` is POSITION (the only geometry attribute type this port
+    // accepts), and `num_components == 3` is required by `attr_quant.parseQuantParams`.
+    if (att_type != 0) return Error.UnsupportedDracoFeature;
+    if (num_components != 3) return Error.UnsupportedDracoFeature;
 
     // `SequentialAttributeDecodersController::DecodeAttributesDecoderData`'s
     // addition: one sequential-encoder-type byte per attribute.
@@ -187,4 +193,96 @@ test "parseAttrHeader(quad.drc): QUANTIZATION, 3 components, WRAP transform" {
     try std.testing.expect(h.scheme_method == 0 or h.scheme_method == 1 or h.scheme_method == 2 or h.scheme_method == 4);
     try std.testing.expect(h.quant.bits > 0 and h.quant.bits <= 30);
     std.debug.print("\n[C1] quad scheme_method={d} transform={d} bits={d} min={any} range={d}\n", .{ h.scheme_method, h.transform_type, h.quant.bits, h.quant.min, h.quant.range });
+}
+
+test "parseAttrHeader rejects num_components != 3" {
+    const a = std.testing.allocator;
+    // Minimal header with num_components=2 (invalid): should reject before quant parse.
+    const minimal_buf_bytes = [_]u8{
+        1, // num_attributes_decoders
+        0xFF, // att_data_id (-1 as i8)
+        0, // decoder_type
+        0, // traversal_method_encoded
+        1, // num_attributes (varint)
+        0, // att_type (POSITION)
+        0, // data_type
+        2, // num_components (INVALID — not 3)
+        0, // normalized
+        0, // unique_id (varint)
+        2, // seq_encoder_type (QUANTIZATION)
+        0, // scheme_method
+        1, // transform_type (WRAP)
+    };
+
+    // Create a minimal connectivity to pass the conn parameter.
+    // parseAttrHeader rejects num_components before using conn.
+    const empty_indices = try a.alloc(u32, 0);
+    defer a.free(empty_indices);
+    const empty_opposite = try a.alloc(u32, 0);
+    defer a.free(empty_opposite);
+    const empty_corner_to_vertex = try a.alloc(u32, 0);
+    defer a.free(empty_corner_to_vertex);
+    const vertex_corners = std.ArrayList(u32).empty;
+
+    var conn = Connectivity{
+        .num_points = 0,
+        .alloc = a,
+        .indices = empty_indices,
+        .corner_table = .{
+            .alloc = a,
+            .opposite_corners = empty_opposite,
+            .corner_to_vertex = empty_corner_to_vertex,
+            .vertex_corners = vertex_corners,
+            .num_faces_ = 0,
+        },
+    };
+
+    var buf = DecoderBuffer.init(&minimal_buf_bytes);
+    const result = parseAttrHeader(&buf, &conn);
+    try std.testing.expectError(Error.UnsupportedDracoFeature, result);
+}
+
+test "parseAttrHeader rejects att_type != POSITION" {
+    const a = std.testing.allocator;
+    // Header with att_type=1 (not POSITION): should reject.
+    const minimal_buf_bytes = [_]u8{
+        1, // num_attributes_decoders
+        0xFF, // att_data_id (-1 as i8)
+        0, // decoder_type
+        0, // traversal_method_encoded
+        1, // num_attributes (varint)
+        1, // att_type (NOT POSITION — invalid)
+        0, // data_type
+        3, // num_components
+        0, // normalized
+        0, // unique_id (varint)
+        2, // seq_encoder_type (QUANTIZATION)
+        0, // scheme_method
+        1, // transform_type (WRAP)
+    };
+
+    const empty_indices = try a.alloc(u32, 0);
+    defer a.free(empty_indices);
+    const empty_opposite = try a.alloc(u32, 0);
+    defer a.free(empty_opposite);
+    const empty_corner_to_vertex = try a.alloc(u32, 0);
+    defer a.free(empty_corner_to_vertex);
+    const vertex_corners = std.ArrayList(u32).empty;
+
+    var conn = Connectivity{
+        .num_points = 0,
+        .alloc = a,
+        .indices = empty_indices,
+        .corner_table = .{
+            .alloc = a,
+            .opposite_corners = empty_opposite,
+            .corner_to_vertex = empty_corner_to_vertex,
+            .vertex_corners = vertex_corners,
+            .num_faces_ = 0,
+        },
+    };
+
+    var buf = DecoderBuffer.init(&minimal_buf_bytes);
+    const result = parseAttrHeader(&buf, &conn);
+    try std.testing.expectError(Error.UnsupportedDracoFeature, result);
 }
