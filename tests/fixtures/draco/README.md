@@ -31,6 +31,13 @@ tests can assert against an authoritative stream instead of a hand-rolled one.
   the decoder and the one `quad`/`cube` cannot reach. Slice B's golden test
   additionally asserts `num_encoded_split_symbols > 0` on this fixture to
   prove the split path actually ran, not just that the final indices match.
+- `cube_nrm.{glb,drc,golden.json}` — the same 8-vertex/12-triangle cube as
+  `cube`, plus a smooth per-vertex `NORMAL` (`N[i] = normalize(P[i])`).
+  Exercises multi-attribute decode: 2 Draco attributes (POSITION + NORMAL),
+  i.e. `num_attribute_data = 1`.
+- `cube_nrm_uv.{glb,drc,golden.json}` — `cube_nrm` plus a per-vertex
+  `TEXCOORD_0`. Exercises 3-attribute decode (POSITION + NORMAL +
+  TEXCOORD_0), i.e. `num_attribute_data = 2`.
 
 ## Source meshes
 
@@ -48,7 +55,13 @@ tests can assert against an authoritative stream instead of a hand-rolled one.
 segments, `R=2 r=0.7`; generated procedurally by `buildTorus` in the
 generator, not hand-listed here).
 
-All three are encoded with method `EDGEBREAKER` (Draco's
+`cube_nrm` / `cube_nrm_uv` — the same `cube` POSITION/indices, plus:
+
+- NORMAL: `N[i] = normalize(P[i])` per vertex (valid since the cube is
+  centered at the origin).
+- TEXCOORD_0 (`cube_nrm_uv` only): `[0,0, 1,0, 1,1, 0,1, 0,0, 1,0, 1,1, 0,1]`.
+
+All five are encoded with method `EDGEBREAKER` (Draco's
 connectivity-compression mode, as opposed to `SEQUENTIAL`). Draco reorders
 vertices during encoding, so the reference-decoded indices differ from the
 input — e.g. quad's input `[0,1,2, 0,2,3]` decodes to `[0,1,2,1,3,2]` (see
@@ -57,10 +70,13 @@ idea).
 
 ## Bitstream
 
-Draco bitstream version **2.2** for all three fixtures (`<name>.drc` bytes
+Draco bitstream version **2.2** for all five fixtures (`<name>.drc` bytes
 5-6 are `02 02`), method byte `01` = `EDGEBREAKER`, geometry-type byte `01` =
 `TRIANGULAR_MESH`. First bytes: `44 52 41 43 4f 02 02 01 01 ...` (`DRACO`,
-major=2, minor=2, encoder_method=1, encoder_type=1).
+major=2, minor=2, encoder_method=1, encoder_type=1). `cube_nrm.drc` /
+`cube_nrm_uv.drc` share the same header and traversal byte (offset 11 = `00`)
+as `quad`/`cube`/`torus`; their Draco attribute counts are 2 (POSITION +
+NORMAL) and 3 (+ TEXCOORD_0) respectively, i.e. `num_attribute_data` 1 and 2.
 
 ## Provenance
 

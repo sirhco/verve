@@ -14,18 +14,27 @@ const io = new WebIO().registerExtensions([KHRDracoMeshCompression]).registerDep
 });
 
 /// Build a glTF doc with one indexed triangle-mesh primitive from flat
-/// `positions`/`indices` arrays, EDGEBREAKER-compress it, write
-/// `<name>.{glb,drc,golden.json}` into `outDir`. The golden is produced by
-/// decoding the just-encoded glb back through the same reference
-/// (`draco3dgltf`) decoder — Draco reorders vertices during encoding, so the
-/// golden captures the *decoded* (post-reorder) indices/positions, not the
-/// input.
-async function genFixture(name, positions, indices) {
+/// `positions`/`indices` arrays (plus optional per-vertex `normals`/`uvs`),
+/// EDGEBREAKER-compress it, write `<name>.{glb,drc,golden.json}` into
+/// `outDir`. The golden is produced by decoding the just-encoded glb back
+/// through the same reference (`draco3dgltf`) decoder — Draco reorders
+/// vertices during encoding, so the golden captures the *decoded*
+/// (post-reorder) attributes, not the input.
+async function genFixture(name, positions, indices, extra = {}) {
+  const { normals, uvs } = extra;
   const doc = new Document();
   const buf = doc.createBuffer();
   const pos = doc.createAccessor().setType('VEC3').setArray(new Float32Array(positions)).setBuffer(buf);
   const idx = doc.createAccessor().setType('SCALAR').setArray(new Uint32Array(indices)).setBuffer(buf);
   const prim = doc.createPrimitive().setAttribute('POSITION', pos).setIndices(idx);
+  if (normals) {
+    const nrm = doc.createAccessor().setType('VEC3').setArray(new Float32Array(normals)).setBuffer(buf);
+    prim.setAttribute('NORMAL', nrm);
+  }
+  if (uvs) {
+    const uv = doc.createAccessor().setType('VEC2').setArray(new Float32Array(uvs)).setBuffer(buf);
+    prim.setAttribute('TEXCOORD_0', uv);
+  }
   doc.createScene().addChild(doc.createNode().setMesh(doc.createMesh().addPrimitive(prim)));
   doc.createExtension(KHRDracoMeshCompression).setRequired(true)
     .setEncoderOptions({ method: KHRDracoMeshCompression.EncoderMethod.EDGEBREAKER });
@@ -40,10 +49,13 @@ async function genFixture(name, positions, indices) {
   // Golden: decode via the reference lib.
   const doc2 = await io.readBinary(glb);
   const p2 = doc2.getRoot().listMeshes()[0].listPrimitives()[0];
-  writeFileSync(`${outDir}/${name}.golden.json`, JSON.stringify({
+  const golden = {
     indices: Array.from(p2.getIndices().getArray()),
     POSITION: Array.from(p2.getAttribute('POSITION').getArray()),
-  }, null, 2));
+  };
+  if (normals) golden.NORMAL = Array.from(p2.getAttribute('NORMAL').getArray());
+  if (uvs) golden.TEXCOORD_0 = Array.from(p2.getAttribute('TEXCOORD_0').getArray());
+  writeFileSync(`${outDir}/${name}.golden.json`, JSON.stringify(golden, null, 2));
   console.log(`wrote ${name}.glb / ${name}.drc / ${name}.golden.json`);
 }
 
@@ -86,3 +98,21 @@ function buildTorus(majorSegs, minorSegs, R, r) {
 }
 const { P: TORUS_P, I: TORUS_I } = buildTorus(12, 8, 2, 0.7);
 await genFixture('torus', TORUS_P, TORUS_I);
+
+// ── cube_nrm: same 8-vert/12-tri cube + smooth per-vertex NORMAL
+// (N[i] = normalize(P[i]), valid since the cube is centered at the origin) —
+// exercises multi-attribute decode (POSITION + NORMAL, num_attribute_data=1).
+function normalize3(v) {
+  const len = Math.hypot(v[0], v[1], v[2]);
+  return [v[0] / len, v[1] / len, v[2] / len];
+}
+const CUBE_N = [];
+for (let i = 0; i < CUBE_P.length; i += 3) {
+  CUBE_N.push(...normalize3(CUBE_P.slice(i, i + 3)));
+}
+await genFixture('cube_nrm', CUBE_P, CUBE_I, { normals: CUBE_N });
+
+// ── cube_nrm_uv: + TEXCOORD_0 — exercises 3-attribute decode
+// (POSITION + NORMAL + TEXCOORD_0, num_attribute_data=2).
+const CUBE_UV = [0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1];
+await genFixture('cube_nrm_uv', CUBE_P, CUBE_I, { normals: CUBE_N, uvs: CUBE_UV });

@@ -1335,7 +1335,7 @@ fn buildPublicAssets(b: *std.Build, dir_opt: ?[]const u8) *std.Build.Module {
 
 /// Walk `dir` for `<tag>.json` locale files at configure time and generate an
 /// `draco_fixtures` module: anchors the committed real-Draco-stream fixtures
-/// (`tests/fixtures/draco/{quad,cube,torus}.drc`) so
+/// (`tests/fixtures/draco/{quad,cube,torus,cube_nrm,cube_nrm_uv}.drc`) so
 /// `src/core/gl/draco/fixture_test.zig` / `edgebreaker.zig` can `@embedFile`
 /// them. `@embedFile` paths may not escape a module's package root, and
 /// `tests/` sits outside `src/`'s root — so, mirroring `buildI18nCatalog`
@@ -1347,10 +1347,14 @@ fn buildDracoFixtures(b: *std.Build) *std.Build.Module {
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/quad.drc"), "quad.drc");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube.drc"), "cube.drc");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/torus.drc"), "torus.drc");
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm.drc"), "cube_nrm.drc");
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm_uv.drc"), "cube_nrm_uv.drc");
     const gen = wf.add("draco_fixtures.zig",
         \\pub const quad_drc = @embedFile("quad.drc");
         \\pub const cube_drc = @embedFile("cube.drc");
         \\pub const torus_drc = @embedFile("torus.drc");
+        \\pub const cube_nrm_drc = @embedFile("cube_nrm.drc");
+        \\pub const cube_nrm_uv_drc = @embedFile("cube_nrm_uv.drc");
         \\
     );
     return b.createModule(.{ .root_source_file = gen });
