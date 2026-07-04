@@ -627,6 +627,107 @@ test "decodeEvents: synthetic stream with 2 topology splits" {
     try std.testing.expectEqual(@as(u1, 0), events.topology_splits[1].source_edge);
 }
 
+const cube_drc = @import("draco_fixtures").cube_drc;
+
+test "decodeConnectivity(cube.drc) → exact cube indices" {
+    const a = std.testing.allocator;
+    var buf = draco.DecoderBuffer.init(cube_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    const want = [_]u32{ 0, 1, 2, 2, 1, 3, 3, 1, 4, 1, 0, 4, 0, 5, 4, 4, 5, 6, 5, 0, 6, 0, 2, 6, 6, 2, 7, 2, 3, 7, 3, 4, 7, 6, 7, 4 };
+    try std.testing.expectEqualSlices(u32, &want, conn.indices);
+    try std.testing.expectEqual(@as(u32, 8), conn.num_points);
+}
+
+/// Absolute byte offset of `num_attribute_data` in `quad.drc`: 11 bytes of
+/// file header + 1 traversal-type byte + 2 varint bytes
+/// (num_encoded_vertices=4, num_faces=2, each a single-byte varint) = 14.
+/// Pinned by `parse quad.drc connectivity header` above, which asserts
+/// `num_encoded_vertices == 4` and `num_faces == 2` decode from exactly those
+/// two single bytes.
+const ATTR_DATA_OFF: usize = 14;
+
+test "reject num_attribute_data > 0" {
+    // Patch a copy of quad.drc's num_attribute_data byte to 1.
+    const quad_drc = @import("draco_fixtures").quad_drc;
+    const a = std.testing.allocator;
+    const copy = try a.dupe(u8, quad_drc);
+    defer a.free(copy);
+    try std.testing.expectEqual(@as(u8, 0), copy[ATTR_DATA_OFF]);
+    copy[ATTR_DATA_OFF] = 1;
+    var buf = draco.DecoderBuffer.init(copy);
+    _ = try draco.parseHeader(&buf);
+    try std.testing.expectError(draco.Error.UnsupportedDracoFeature, decodeConnectivity(a, &buf));
+}
+
+// ── torus: genus-1, exercises the TOPOLOGY_S / topology-split path ─────────
+// quad.drc and cube.drc both decode with 0 topology splits (genus-0 meshes),
+// leaving the hardest part of the traversal loop (the `.s` symbol arm +
+// `isTopologySplit` re-injection) completely unexercised by those goldens.
+// torus.drc (12x8 parametric torus, R=2 r=0.7 — see `tools/dev/draco_gen.mjs`)
+// is genus-1 and its real encoded stream carries 8 split symbols / 2
+// topology-split events (confirmed below), so this golden proves the split
+// path decodes byte-exact against the reference decoder.
+const torus_drc = @import("draco_fixtures").torus_drc;
+
+test "decodeConnectivity(torus.drc) → exact torus indices, exercises topology splits" {
+    const a = std.testing.allocator;
+
+    // First prove the fixture actually carries split symbols (else this
+    // fixture wouldn't be exercising anything new).
+    var hdr_buf = draco.DecoderBuffer.init(torus_drc);
+    _ = try draco.parseHeader(&hdr_buf);
+    _ = try beginConnectivity(&hdr_buf);
+    const h = try parseConnHeader(&hdr_buf);
+    try std.testing.expectEqual(@as(u32, 8), h.num_encoded_split_symbols);
+    try std.testing.expect(h.num_encoded_split_symbols > 0);
+    var events = try decodeEvents(a, &hdr_buf, h);
+    defer events.deinit();
+    try std.testing.expectEqual(@as(usize, 2), events.topology_splits.len);
+
+    var buf = draco.DecoderBuffer.init(torus_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    const want = [_]u32{
+        0,  1,  2,  3,  2,  5,  2,  1,  5,  5,  1,  6,  7,  6,  9,  6,  1,  9,
+        9,  1,  10, 1,  0,  10, 10, 0,  11, 12, 11, 14, 11, 0,  14, 14, 0,  15,
+        0,  2,  15, 15, 2,  16, 2,  3,  16, 16, 3,  17, 17, 3,  18, 18, 3,  19,
+        3,  5,  19, 19, 5,  20, 5,  6,  20, 20, 6,  21, 6,  7,  21, 21, 7,  22,
+        7,  23, 22, 22, 23, 24, 23, 25, 24, 24, 25, 26, 25, 27, 26, 26, 27, 28,
+        27, 17, 28, 17, 18, 28, 28, 18, 30, 30, 18, 31, 18, 19, 31, 31, 19, 32,
+        19, 20, 32, 32, 20, 33, 20, 21, 33, 33, 21, 34, 21, 22, 34, 34, 22, 35,
+        22, 24, 35, 35, 24, 36, 24, 26, 36, 36, 26, 37, 26, 28, 37, 28, 30, 37,
+        37, 30, 38, 39, 38, 41, 38, 30, 41, 30, 31, 41, 41, 31, 42, 31, 32, 42,
+        42, 32, 43, 32, 33, 43, 43, 33, 44, 33, 34, 44, 44, 34, 45, 34, 35, 45,
+        45, 35, 46, 35, 36, 46, 46, 36, 47, 36, 37, 47, 37, 38, 47, 47, 38, 48,
+        38, 39, 48, 48, 39, 49, 50, 49, 52, 49, 39, 52, 52, 39, 53, 39, 41, 53,
+        41, 42, 53, 53, 42, 54, 42, 43, 54, 54, 43, 55, 43, 44, 55, 55, 44, 56,
+        44, 45, 56, 56, 45, 57, 45, 46, 57, 57, 46, 58, 46, 47, 58, 47, 48, 58,
+        58, 48, 59, 48, 49, 59, 59, 49, 60, 49, 50, 60, 60, 50, 61, 12, 61, 64,
+        61, 50, 64, 64, 50, 65, 50, 52, 65, 65, 52, 66, 52, 53, 66, 53, 54, 66,
+        66, 54, 67, 54, 55, 67, 67, 55, 68, 55, 56, 68, 68, 56, 69, 56, 57, 69,
+        69, 57, 70, 57, 58, 70, 58, 59, 70, 70, 59, 71, 59, 60, 71, 71, 60, 72,
+        60, 61, 72, 72, 61, 73, 61, 12, 73, 12, 14, 73, 73, 14, 74, 14, 15, 74,
+        74, 15, 75, 15, 16, 75, 75, 16, 76, 16, 17, 76, 17, 27, 76, 76, 27, 77,
+        27, 25, 77, 77, 25, 78, 25, 23, 78, 78, 23, 79, 23, 7,  79, 7,  9,  79,
+        79, 9,  80, 9,  10, 80, 80, 10, 81, 10, 11, 81, 81, 11, 82, 11, 12, 82,
+        12, 64, 82, 82, 64, 83, 64, 65, 83, 83, 65, 84, 65, 66, 84, 66, 67, 84,
+        84, 67, 85, 67, 68, 85, 85, 68, 86, 68, 69, 86, 86, 69, 87, 69, 70, 87,
+        70, 71, 87, 87, 71, 88, 71, 72, 88, 88, 72, 89, 72, 73, 89, 73, 74, 89,
+        89, 74, 90, 74, 75, 90, 90, 75, 91, 75, 76, 91, 76, 77, 91, 91, 77, 92,
+        77, 78, 92, 92, 78, 93, 78, 79, 93, 79, 80, 93, 93, 80, 94, 80, 81, 94,
+        94, 81, 95, 81, 82, 95, 82, 83, 95, 95, 83, 62, 83, 84, 62, 84, 85, 62,
+        62, 85, 63, 85, 86, 63, 63, 86, 51, 86, 87, 51, 87, 88, 51, 51, 88, 40,
+        88, 89, 40, 89, 90, 40, 40, 90, 29, 90, 91, 29, 91, 92, 29, 29, 92, 13,
+        92, 93, 13, 93, 94, 13, 13, 94, 8,  94, 95, 8,  95, 62, 8,  62, 63, 8,
+        8,  63, 4,  63, 51, 4,  51, 40, 4,  40, 29, 4,  29, 13, 4,  8,  4,  13,
+    };
+    try std.testing.expectEqualSlices(u32, &want, conn.indices);
+    try std.testing.expectEqual(@as(u32, 96), conn.num_points);
+}
+
 test "decodeEvents rejects num_topology_splits > num_faces" {
     const a = std.testing.allocator;
     const bytes = [_]u8{1}; // num_topology_splits = 1

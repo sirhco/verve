@@ -18,25 +18,49 @@ tests can assert against an authoritative stream instead of a hand-rolled one.
   `draco3dgltf`. Consumed by Slices B/C to assert the from-scratch Zig
   decoder matches the reference decoder bit-for-bit (after accounting for
   Draco's internal vertex reordering).
+- `cube.{glb,drc,golden.json}` — same shape as the `quad.*` trio, but for an
+  8-vertex, 12-triangle cube. `quad` and `cube` are both genus-0 meshes, so
+  neither exercises the edgebreaker `TOPOLOGY_S` / topology-split path (0
+  split symbols in both streams).
+- `torus.{glb,drc,golden.json}` — a genus-1 mesh (parametric torus, 12 major
+  x 8 minor segments, `R=2 r=0.7`, 96 vertices / 192 triangles — see
+  `tools/dev/draco_gen.mjs`'s `buildTorus`). Its real encoded stream carries
+  8 split symbols across 2 topology-split events, so this is the fixture
+  that exercises the `.s` traversal-symbol arm and the
+  `isTopologySplit`/active-corner re-injection logic — the hardest part of
+  the decoder and the one `quad`/`cube` cannot reach. Slice B's golden test
+  additionally asserts `num_encoded_split_symbols > 0` on this fixture to
+  prove the split path actually ran, not just that the final indices match.
 
-## Source mesh
+## Source meshes
 
-A 4-vertex quad, 2 triangles:
+`quad` — a 4-vertex quad, 2 triangles:
 
 - POSITION: `[0,0,0, 1,0,0, 1,1,0, 0,1,0]` (4 × vec3)
 - indices: `[0,1,2, 0,2,3]` (2 triangles, CCW)
 
-Encoded with method `EDGEBREAKER` (Draco's connectivity-compression mode, as
-opposed to `SEQUENTIAL`). Draco reorders vertices during encoding, so the
-reference-decoded indices differ from the input: `[0,1,2,1,3,2]` (see
-`quad.golden.json`).
+`cube` — an 8-vertex cube, 12 triangles:
+
+- POSITION: `[-1,-1,-1, 1,-1,-1, 1,1,-1, -1,1,-1, -1,-1,1, 1,-1,1, 1,1,1, -1,1,1]`
+- indices: `[0,2,1, 0,3,2, 4,5,6, 4,6,7, 0,1,5, 0,5,4, 2,3,7, 2,7,6, 1,2,6, 1,6,5, 0,4,7, 0,7,3]`
+
+`torus` — a 96-vertex, 192-triangle parametric torus (12 major x 8 minor
+segments, `R=2 r=0.7`; generated procedurally by `buildTorus` in the
+generator, not hand-listed here).
+
+All three are encoded with method `EDGEBREAKER` (Draco's
+connectivity-compression mode, as opposed to `SEQUENTIAL`). Draco reorders
+vertices during encoding, so the reference-decoded indices differ from the
+input — e.g. quad's input `[0,1,2, 0,2,3]` decodes to `[0,1,2,1,3,2]` (see
+`quad.golden.json`; `cube.golden.json` / `torus.golden.json` are the same
+idea).
 
 ## Bitstream
 
-Draco bitstream version **2.2** (`quad.drc` bytes 5-6 are `02 02`), method
-byte `01` = `EDGEBREAKER`, geometry-type byte `01` = `TRIANGULAR_MESH`. First
-bytes: `44 52 41 43 4f 02 02 01 01 ...` (`DRACO`, major=2, minor=2,
-encoder_method=1, encoder_type=1).
+Draco bitstream version **2.2** for all three fixtures (`<name>.drc` bytes
+5-6 are `02 02`), method byte `01` = `EDGEBREAKER`, geometry-type byte `01` =
+`TRIANGULAR_MESH`. First bytes: `44 52 41 43 4f 02 02 01 01 ...` (`DRACO`,
+major=2, minor=2, encoder_method=1, encoder_type=1).
 
 ## Provenance
 
