@@ -45,6 +45,8 @@ pub const ktx2 = @import("ktx2.zig");
 /// PNG → BC7 → KTX2 pipeline helper used by gl_asset_gen to emit `.ktx2`
 /// siblings next to externalized textures. Build/test only; no runtime/wasm.
 pub const tex_encode = @import("tex_encode.zig");
+/// Pure-Zig Draco (KHR_draco_mesh_compression) decoder. Build/comptime only.
+pub const draco = @import("draco/draco.zig");
 /// Framework demo holographic custom material. Importable from app code
 /// and wasm chunks. Provides a comptime `MaterialDesc` with a non-zero `.id`
 /// (fnv32 of its assembled shader source) and `.flags == variant_pbr | variant_custom`.
