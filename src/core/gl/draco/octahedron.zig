@@ -95,8 +95,8 @@ pub const OctahedronToolBox = struct {
         us = us +% corner_point_s;
         ut = ut +% corner_point_t;
 
-        s.* = @bitCast(us);
-        t.* = @bitCast(ut);
+        s.* = @divTrunc(@as(i32, @bitCast(us)), 2);
+        t.* = @divTrunc(@as(i32, @bitCast(ut)), 2);
     }
 
     /// Port of `ModMax`. Wraps a value into `(-center_value, center_value]`
@@ -261,12 +261,12 @@ test "diamond ops: isInDiamond / invertDiamond / modMax on known values" {
     try std.testing.expect(box.isInDiamond(73, 0)); // 73 <= 127
     try std.testing.expect(!box.isInDiamond(100, 100)); // 200 > 127
 
-    // invertDiamond maps the outside point (100,100) back inside to (54,54)
+    // invertDiamond maps the outside point (100,100) back inside to (27,27)
     var s: i32 = 100;
     var t: i32 = 100;
     box.invertDiamond(&s, &t);
-    try std.testing.expectEqual(@as(i32, 54), s);
-    try std.testing.expectEqual(@as(i32, 54), t);
+    try std.testing.expectEqual(@as(i32, 27), s);
+    try std.testing.expectEqual(@as(i32, 27), t);
     try std.testing.expect(box.isInDiamond(s, t)); // now inside
 
     try std.testing.expectEqual(@as(i32, -55), box.modMax(200)); // 200 - 255
