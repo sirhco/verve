@@ -8,14 +8,16 @@ pub const Error = draco.Error;
 // `DecodeConnectivity()` header-counts section (~line 247) and
 // `DecodeHoleAndTopologySplitEvents` (~line 978).
 //
-// ★ Scope: this ports the bitstream-version >= 2.2 field layout ONLY (our
+// ★ Scope: this ports the bitstream-version 2.2 field layout ONLY (our
 // fixtures — draco3dgltf always emits 2.2). Draco's `DRACO_BACKWARDS_COMPATIBILITY_SUPPORTED`
 // branches read several fields differently (raw ints vs varints, an extra
 // `num_new_verts` field, an `encoded_connectivity_size`-prefixed sub-buffer
 // for hole/split events, 2-bit vs 1-bit split edges, and a hole-event count
 // that IS read for bitstream < 2.1) for older streams. None of that is
-// ported here — callers must only reach this once the stream is confirmed
-// >= 2.2 (checked by `draco.Header.bitstreamVersion()` upstream).
+// ported here. `header.zig`'s `parseHeader` rejects any bitstream version
+// other than 2.2 (`error.UnsupportedDracoVersion`), so this module only
+// ever runs on a confirmed-2.2 stream — there is no separate version check
+// in this file.
 //
 // Preamble: per `PointCloudDecoder::Decode` (point_cloud_decoder.cc), the
 // call order is DecodeHeader -> (DecodeMetadata if flag set) ->
@@ -145,6 +147,11 @@ pub fn decodeEvents(alloc: std.mem.Allocator, buf: *DecoderBuffer, hdr: ConnHead
         var last_source_symbol_id: u32 = 0;
         for (splits) |*ev| {
             const source_delta = try buf.decodeVarint(u32);
+            // Draco's C++ does a plain uint32 wraparound add here; we
+            // deliberately deviate and reject overflow as Corrupt instead —
+            // consistent with this port's never-panic/never-silent-misdecode
+            // posture (a wrapped id would otherwise silently point at the
+            // wrong symbol downstream).
             const source_symbol_id = std.math.add(u32, source_delta, last_source_symbol_id) catch return Error.Corrupt;
             const split_delta = try buf.decodeVarint(u32);
             if (split_delta > source_symbol_id) return Error.Corrupt;
@@ -163,7 +170,12 @@ pub fn decodeEvents(alloc: std.mem.Allocator, buf: *DecoderBuffer, hdr: ConnHead
         for (splits) |*ev| ev.source_edge = bd.readBit();
     }
 
-    const holes = try alloc.alloc(HoleEvent, 0);
+    // Never allocated for bitstream 2.2 (hole events are never decoded — see
+    // doc comment above) — use an empty sentinel rather than a real
+    // zero-length heap allocation. `Events.deinit` frees this via
+    // `alloc.free`, which is a documented no-op for a zero-length slice
+    // regardless of the slice's origin, so this stays safe.
+    const holes: []HoleEvent = &[_]HoleEvent{};
     return .{ .alloc = alloc, .topology_splits = splits, .holes = holes };
 }
 

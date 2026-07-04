@@ -7,8 +7,13 @@ pub const GeometryType = enum(u8) { point_cloud = 0, triangular_mesh = 1 };
 pub const EncoderMethod = enum(u8) { sequential = 0, edgebreaker = 1 };
 pub const metadata_flag: u16 = 0x8000;
 
-// Supported bitstream version range (inclusive). Bump when a fixture needs it.
-const min_version: u16 = 0x0200; // 2.0
+// Supported bitstream version range (inclusive). Only 2.2 (the version we
+// decode) is accepted — the edgebreaker connectivity code hard-codes the
+// >= 2.2 field layout with no per-call version check, so anything below 2.2
+// must be rejected here or it would silently misparse downstream. Bump
+// max_version only once a >2.2 fixture is ported; bump min_version only if
+// pre-2.2 field-layout support is added to edgebreaker.zig.
+const min_version: u16 = 0x0202; // 2.2
 const max_version: u16 = 0x0202; // 2.2 (draco3dgltf current)
 
 pub const Header = struct {
@@ -87,6 +92,15 @@ test "parseHeader rejects bad magic / non-mesh / bad version" {
         var b = DecoderBuffer.init(&old);
         try std.testing.expectError(Error.UnsupportedDracoVersion, parseHeader(&b));
     }
+}
+
+test "parseHeader rejects bitstream 2.1 (only 2.2 field layout is ported)" {
+    // v2.1 would misparse under the edgebreaker >= 2.2 field layout if
+    // accepted here, so parseHeader must narrow the accepted range to 2.2
+    // only. bytes: DRACO 02 01 01 01 00 00
+    const v21 = [_]u8{ 'D', 'R', 'A', 'C', 'O', 0x02, 0x01, 0x01, 0x01, 0x00, 0x00 };
+    var b = DecoderBuffer.init(&v21);
+    try std.testing.expectError(Error.UnsupportedDracoVersion, parseHeader(&b));
 }
 
 test "skipMetadata no-op when flag clear" {
