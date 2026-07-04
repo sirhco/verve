@@ -1349,12 +1349,14 @@ fn buildDracoFixtures(b: *std.Build) *std.Build.Module {
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/torus.drc"), "torus.drc");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm.drc"), "cube_nrm.drc");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm_uv.drc"), "cube_nrm_uv.drc");
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm_uv.glb"), "cube_nrm_uv.glb");
     const gen = wf.add("draco_fixtures.zig",
         \\pub const quad_drc = @embedFile("quad.drc");
         \\pub const cube_drc = @embedFile("cube.drc");
         \\pub const torus_drc = @embedFile("torus.drc");
         \\pub const cube_nrm_drc = @embedFile("cube_nrm.drc");
         \\pub const cube_nrm_uv_drc = @embedFile("cube_nrm_uv.drc");
+        \\pub const cube_nrm_uv_glb = @embedFile("cube_nrm_uv.glb");
         \\
     );
     return b.createModule(.{ .root_source_file = gen });

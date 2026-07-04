@@ -33,6 +33,7 @@ const vmesh = @import("vmesh.zig");
 const png = @import("png.zig");
 const tangent = @import("tangent.zig");
 const math = @import("math.zig");
+const draco = @import("draco/draco.zig");
 
 // ── public surface ─────────────────────────────────────────────────────────────
 
@@ -450,66 +451,137 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                 else => return error.Malformed,
             };
 
-            const pos_idx_val = attrs.get("POSITION") orelse return error.Malformed;
-            const pos_idx: usize = @intCast(jsonInt(pos_idx_val) orelse return error.Malformed);
+            // Attribute SOURCE: either a KHR_draco_mesh_compression stream (decode
+            // pos/nrm/uv + connectivity from the compressed .drc bufferView) or the
+            // raw glTF accessors. Both branches produce the same four slices, which
+            // then feed one shared interleave + tangent + submesh assembly below.
+            var pos_f32: []const f32 = undefined;
+            var nrm_f32: []const f32 = undefined;
+            var uv_f32: []const f32 = undefined;
+            var raw_indices: []const u16 = undefined;
+            var tan_accessor: ?[]const f32 = null; // set only on the raw path when TANGENT present
 
-            const nrm_idx_opt: ?usize = blk: {
-                if (attrs.get("NORMAL")) |v| {
-                    break :blk @intCast(jsonInt(v) orelse return error.Malformed);
+            const draco_ext: ?std.json.ObjectMap = blk: {
+                if (prim_obj.get("extensions")) |ev| {
+                    if (ev == .object) {
+                        if (ev.object.get("KHR_draco_mesh_compression")) |dv| {
+                            if (dv == .object) break :blk dv.object;
+                        }
+                    }
                 }
                 break :blk null;
             };
 
-            const tan_idx_opt: ?usize = blk: {
-                if (attrs.get("TANGENT")) |v| {
-                    break :blk @intCast(jsonInt(v) orelse return error.Malformed);
-                }
-                break :blk null;
-            };
+            if (draco_ext) |dext| {
+                // (1) locate the compressed .drc payload in the BIN chunk.
+                const drc_bv: usize = @intCast(jsonInt(dext.get("bufferView") orelse return error.Malformed) orelse return error.Malformed);
+                const drc = try getBufferViewSlice(buffer_views, drc_bv, bin);
+                // (2) decode connectivity.
+                var b = draco.DecoderBuffer.init(drc);
+                _ = try draco.parseHeader(&b);
+                var conn = try draco.decodeConnectivity(aa, &b);
+                defer conn.deinit();
+                // (3) seam guard: a split attribute corner table means real UV/normal
+                // seams; our value decode assumes attributes are indexed 1:1 with the
+                // position table, so bail rather than silently misdecode.
+                for (conn.attr_maps) |m| if (m.numVertices() != conn.num_points) return error.UnsupportedDracoFeature;
+                // (4) decode attribute values (semantically typed by the decoder;
+                // the extension's id-map is informational, so we ignore it).
+                var attr = try draco.decodeAttributes(aa, &b, &conn);
+                defer attr.deinit();
+                const np: usize = conn.num_points;
+                // (5) map decoder outputs → our slices. Own copies (dupe) so they
+                // survive the decode-temporary defers above; the shared path below
+                // allocates more into the same arena afterward.
+                pos_f32 = try aa.dupe(f32, attr.values);
+                nrm_f32 = if (attr.normals) |n| try aa.dupe(f32, n) else nblk: {
+                    const nn = try aa.alloc(f32, np * 3);
+                    var i: usize = 0;
+                    while (i < np) : (i += 1) {
+                        nn[i * 3 + 0] = 0;
+                        nn[i * 3 + 1] = 0;
+                        nn[i * 3 + 2] = 1;
+                    }
+                    break :nblk nn;
+                };
+                uv_f32 = if (attr.texcoords) |t| try aa.dupe(f32, t) else ublk: {
+                    const uu = try aa.alloc(f32, np * 2);
+                    @memset(uu, 0);
+                    break :ublk uu;
+                };
+                // narrow u32 connectivity → our u16 index pool (error on overflow).
+                const idx16 = try aa.alloc(u16, conn.indices.len);
+                for (conn.indices, 0..) |ii, k| idx16[k] = std.math.cast(u16, ii) orelse return error.Unsupported;
+                raw_indices = idx16;
+            } else {
+                // ── Raw glTF accessors (unchanged path) ────────────────────────
+                const pos_idx_val = attrs.get("POSITION") orelse return error.Malformed;
+                const pos_idx: usize = @intCast(jsonInt(pos_idx_val) orelse return error.Malformed);
 
-            const uv_idx_opt: ?usize = blk: {
-                if (attrs.get("TEXCOORD_0")) |v| {
-                    break :blk @intCast(jsonInt(v) orelse return error.Malformed);
-                }
-                break :blk null;
-            };
+                const nrm_idx_opt: ?usize = blk: {
+                    if (attrs.get("NORMAL")) |v| {
+                        break :blk @intCast(jsonInt(v) orelse return error.Malformed);
+                    }
+                    break :blk null;
+                };
 
-            // Read POSITION accessor → f32 slice
-            const pos_f32 = try readAccessorF32(accessors, buffer_views, bin, pos_idx, aa);
+                const tan_idx_opt: ?usize = blk: {
+                    if (attrs.get("TANGENT")) |v| {
+                        break :blk @intCast(jsonInt(v) orelse return error.Malformed);
+                    }
+                    break :blk null;
+                };
+
+                const uv_idx_opt: ?usize = blk: {
+                    if (attrs.get("TEXCOORD_0")) |v| {
+                        break :blk @intCast(jsonInt(v) orelse return error.Malformed);
+                    }
+                    break :blk null;
+                };
+
+                // Read POSITION accessor → f32 slice
+                pos_f32 = try readAccessorF32(accessors, buffer_views, bin, pos_idx, aa);
+                const vc = pos_f32.len / 3;
+
+                // Read NORMAL accessor if present (else default (0,0,1) below).
+                // We materialize a full normal slice so tangent.generate can consume it.
+                nrm_f32 = if (nrm_idx_opt) |ni|
+                    try readAccessorF32(accessors, buffer_views, bin, ni, aa)
+                else nblk: {
+                    const n = try aa.alloc(f32, vc * 3);
+                    var i: usize = 0;
+                    while (i < vc) : (i += 1) {
+                        n[i * 3 + 0] = 0;
+                        n[i * 3 + 1] = 0;
+                        n[i * 3 + 2] = 1;
+                    }
+                    break :nblk n;
+                };
+
+                // Read TEXCOORD_0 accessor if present (else (0,0)).
+                uv_f32 = if (uv_idx_opt) |ui|
+                    try readAccessorF32(accessors, buffer_views, bin, ui, aa)
+                else ublk: {
+                    const uv = try aa.alloc(f32, vc * 2);
+                    @memset(uv, 0);
+                    break :ublk uv;
+                };
+
+                // ── Indices ───────────────────────────────────────────────────
+                const idx_acc_val = prim_obj.get("indices") orelse return error.Malformed;
+                const idx_acc_idx: usize = @intCast(jsonInt(idx_acc_val) orelse return error.Malformed);
+                raw_indices = try readAccessorU16(accessors, buffer_views, bin, idx_acc_idx, aa);
+
+                // TANGENT VEC4 attribute if present (else generated below).
+                if (tan_idx_opt) |ti|
+                    tan_accessor = try readAccessorVec4F32(accessors, buffer_views, bin, ti, aa);
+            }
+
             const vert_count = pos_f32.len / 3;
 
-            // Read NORMAL accessor if present (else default (0,0,1) below).
-            // We materialize a full normal slice so tangent.generate can consume it.
-            const nrm_f32: []const f32 = if (nrm_idx_opt) |ni|
-                try readAccessorF32(accessors, buffer_views, bin, ni, aa)
-            else blk: {
-                const n = try aa.alloc(f32, vert_count * 3);
-                var i: usize = 0;
-                while (i < vert_count) : (i += 1) {
-                    n[i * 3 + 0] = 0;
-                    n[i * 3 + 1] = 0;
-                    n[i * 3 + 2] = 1;
-                }
-                break :blk n;
-            };
-
-            // Read TEXCOORD_0 accessor if present (else (0,0)).
-            const uv_f32: []const f32 = if (uv_idx_opt) |ui|
-                try readAccessorF32(accessors, buffer_views, bin, ui, aa)
-            else blk: {
-                const uv = try aa.alloc(f32, vert_count * 2);
-                @memset(uv, 0);
-                break :blk uv;
-            };
-
-            // ── Indices ───────────────────────────────────────────────────────
-            const idx_acc_val = prim_obj.get("indices") orelse return error.Malformed;
-            const idx_acc_idx: usize = @intCast(jsonInt(idx_acc_val) orelse return error.Malformed);
-            const raw_indices = try readAccessorU16(accessors, buffer_views, bin, idx_acc_idx, aa);
-
-            // ── Tangents: read VEC4 attribute, else generate ──────────────────
-            const tan_f32: []const f32 = if (tan_idx_opt) |ti|
-                try readAccessorVec4F32(accessors, buffer_views, bin, ti, aa)
+            // ── Tangents: use the raw VEC4 attribute if present, else generate ──
+            const tan_f32: []const f32 = if (tan_accessor) |t|
+                t
             else
                 tangent.generate(aa, pos_f32, nrm_f32, uv_f32, raw_indices) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -2876,4 +2948,25 @@ test "glTF morph TANGENT accessor (v14): nonzero tangent deltas survive parseGlb
     const d = r.morphDeltas();
     const tan_x: f16 = @bitCast(std.mem.readInt(u16, d[12..14], .little));
     try testing.expectApproxEqAbs(@as(f16, 0.75), tan_x, 0.01);
+}
+
+test "parseGlb decodes KHR_draco cube_nrm_uv → POSITION/NORMAL/TEXCOORD match golden" {
+    const a = std.testing.allocator;
+    const glb = @import("draco_fixtures").cube_nrm_uv_glb;
+    var model = try parseGlb(a, glb);
+    defer model.deinit();
+    // Model.vertices interleave 12 f32/vertex: pos@0..3, nrm@3..6, tan@6..10, uv@10..12.
+    const nv = model.vertices.len / 12;
+    const want_pos = [_]f32{ -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0 };
+    const want_nrm = [_]f32{ -0.5762181282043457, 0.57621830701828, 0.5796077847480774, -0.5762181282043457, -0.57621830701828, 0.5796077847480774, 0.5762181282043457, 0.57621830701828, 0.5796077847480774, 0.5762181878089905, -0.5762181878089905, 0.5796077847480774, -0.5762181878089905, -0.5762181878089905, -0.5796077847480774, -0.5762181878089905, 0.5762181878089905, -0.5796077847480774, 0.5762181282043457, 0.57621830701828, -0.5796077847480774, 0.5762181878089905, -0.5762181878089905, -0.5796077847480774 };
+    const want_uv = [_]f32{ 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0 };
+    try std.testing.expectEqual(@as(usize, want_pos.len / 3), nv);
+    var vi: usize = 0;
+    while (vi < nv) : (vi += 1) {
+        inline for (0..3) |k| try std.testing.expectEqual(want_pos[vi * 3 + k], model.vertices[vi * 12 + 0 + k]);
+        inline for (0..3) |k| try std.testing.expectEqual(want_nrm[vi * 3 + k], model.vertices[vi * 12 + 3 + k]);
+        inline for (0..2) |k| try std.testing.expectEqual(want_uv[vi * 2 + k], model.vertices[vi * 12 + 10 + k]);
+    }
+    const want_idx = [_]u16{ 0, 1, 2, 2, 1, 3, 3, 1, 4, 1, 0, 4, 0, 5, 4, 4, 5, 6, 5, 0, 6, 0, 2, 6, 6, 2, 7, 2, 3, 7, 3, 4, 7, 6, 7, 4 };
+    try std.testing.expectEqualSlices(u16, &want_idx, model.indices);
 }
