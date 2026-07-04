@@ -57,6 +57,32 @@ pub const DecoderBuffer = struct {
         const s: T = @bitCast(u >> 1);
         return s ^ -@as(T, @intCast(u & 1));
     }
+
+    pub fn bitDecoder(self: *DecoderBuffer, byte_len: usize) Error!BitDecoder {
+        const region = try self.readBytes(byte_len); // advances the parent
+        return BitDecoder{ .data = region };
+    }
+};
+
+/// LSB-first bit reader over a fixed byte range (Draco bit-decoding regions).
+pub const BitDecoder = struct {
+    data: []const u8,
+    bit_pos: usize = 0,
+
+    pub fn readBit(self: *BitDecoder) u1 {
+        const byte_i = self.bit_pos >> 3;
+        if (byte_i >= self.data.len) return 0; // Draco pads with zeros past the end
+        const shift: u3 = @intCast(self.bit_pos & 7);
+        self.bit_pos += 1;
+        return @intCast((self.data[byte_i] >> shift) & 1);
+    }
+
+    pub fn readBits(self: *BitDecoder, n: u6) u32 {
+        var out: u32 = 0;
+        var i: u6 = 0;
+        while (i < n) : (i += 1) out |= @as(u32, self.readBit()) << @intCast(i);
+        return out;
+    }
 };
 
 test "readInt little-endian + bounds" {
@@ -92,4 +118,21 @@ test "skip + remaining + truncated varint" {
     try b.skip(2);
     try std.testing.expectEqual(@as(usize, 1), b.remaining());
     try std.testing.expectError(Error.Truncated, b.decodeVarint(u32));
+}
+
+test "BitDecoder LSB-first extraction" {
+    // byte 0b1011_0010 = 0xB2. LSB-first: bit0=0,1,0,0,1,1,0,1
+    var b = DecoderBuffer.init(&[_]u8{ 0xB2, 0xFF });
+    var bd = try b.bitDecoder(1); // consume 1 byte for the bit region
+    try std.testing.expectEqual(@as(u1, 0), bd.readBit());
+    try std.testing.expectEqual(@as(u1, 1), bd.readBit());
+    try std.testing.expectEqual(@as(u32, 0b1100), bd.readBits(4)); // next 4 bits LSB-first = 0,0,1,1 -> 0b1100
+    try std.testing.expectEqual(@as(usize, 1), b.remaining()); // parent advanced past the 1 bit-region byte
+}
+
+test "BitDecoder spanning bytes" {
+    var b = DecoderBuffer.init(&[_]u8{ 0x01, 0x01 });
+    var bd = try b.bitDecoder(2);
+    try std.testing.expectEqual(@as(u32, 1), bd.readBits(8)); // 0x01
+    try std.testing.expectEqual(@as(u32, 1), bd.readBits(8)); // 0x01
 }
