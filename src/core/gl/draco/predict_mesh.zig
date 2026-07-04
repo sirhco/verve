@@ -444,6 +444,25 @@ pub fn inversePredict(
     return result;
 }
 
+/// Build the per-vertex → data-entry-index map produced by the DEPTH_FIRST
+/// attribute traversal (`MeshAttributeIndicesEncodingData::vertex_to_encoded_
+/// attribute_value_index_map`), the same map `inversePredict` uses internally to
+/// re-index values decoded in data-entry order into per-point (== per-vertex)
+/// order. Exposed so the NORMAL decoder (attributes.zig) can share the identical
+/// mapping: for a mesh with no attribute seams the position and normal
+/// attributes ride the same vertex sequence. Returns an owned `[]i32` of length
+/// `num_points` (`vertex_to_data[v]` == the data entry that decoded vertex `v`);
+/// caller frees. Never panics on malformed connectivity.
+pub fn buildVertexToData(alloc: std.mem.Allocator, conn: *const draco.Connectivity) Error![]i32 {
+    const ct = &conn.corner_table;
+    if (ct.numVertices() < conn.num_points) return Error.Corrupt;
+    const maps = try buildTraversalMaps(alloc, ct);
+    alloc.free(maps.data_to_corner);
+    errdefer alloc.free(maps.vertex_to_data);
+    if (maps.num_values != conn.num_points) return Error.Corrupt;
+    return maps.vertex_to_data;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ pub const parseQuantParams = @import("attr_quant.zig").parseQuantParams;
 pub const DecodedAttrHeader = @import("attributes.zig").DecodedAttrHeader;
 pub const parseAttrHeader = @import("attributes.zig").parseAttrHeader;
 pub const inversePredict = @import("predict_mesh.zig").inversePredict;
+pub const buildVertexToData = @import("predict_mesh.zig").buildVertexToData;
 pub const decodeAttributes = @import("attributes.zig").decodeAttributes;
 pub const PositionData = @import("attributes.zig").PositionData;
 

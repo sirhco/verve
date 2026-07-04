@@ -36,11 +36,23 @@ const attr_quant = @import("attr_quant.zig");
 pub const QuantParams = attr_quant.QuantParams;
 const edgebreaker = @import("edgebreaker.zig");
 const Connectivity = edgebreaker.Connectivity;
+const octahedron = @import("octahedron.zig");
+const OctahedronToolBox = octahedron.OctahedronToolBox;
 
 /// `SequentialAttributeEncoderType` (compression_shared.h): `QUANTIZATION == 2`
-/// is the only encoder this port accepts (`GENERIC=0`/`INTEGER=1`/`NORMALS=3`
-/// are rejected below).
+/// is the POSITION encoder; `NORMALS == 3` selects `SequentialNormalAttributeDecoder`
+/// (decoder 1). `GENERIC=0`/`INTEGER=1` are rejected.
 pub const seq_encoder_quantization: u8 = 2;
+pub const seq_encoder_normals: u8 = 3;
+
+/// `GeometryAttribute::Type`: `POSITION == 0`, `NORMAL == 1`.
+const geom_attr_position: u8 = 0;
+const geom_attr_normal: u8 = 1;
+
+/// `PredictionSchemeTransformType`: `NORMAL_OCTAHEDRON_CANONICALIZED == 3` — the
+/// only NORMAL transform this port accepts (`NORMAL_OCTAHEDRON == 2`, the older
+/// non-canonicalized variant, is rejected: no fixture exercises it).
+pub const transform_octahedron_canonicalized: i8 = 3;
 
 /// `PredictionSchemeMethod` (compression_shared.h). `NONE`/`UNDEFINED` and the
 /// normal/tex-coord-specific methods (3/5/6) are intentionally excluded from
@@ -114,6 +126,23 @@ fn symbolToSignedInt(sym: u32) i32 {
 const AttrSection = struct {
     header: DecodedAttrHeader,
     residuals: []i32,
+    /// Descriptor of decoder 1 (the second attributes decoder) captured during
+    /// the phase-1/phase-2 walk, or null when only one decoder is present
+    /// (quad/cube/torus — position only). `decodeAttributes` inspects it to
+    /// decide whether a NORMAL value section (phase 3, decoder 1) follows the
+    /// POSITION section and should be decoded (C2b). Decoder 2+ (TEXCOORD) is
+    /// never captured — this port stops after NORMAL.
+    normal: ?NormalDecoderInfo,
+};
+
+/// Phase-2 descriptor of decoder 1 (its single attribute + sequential-encoder
+/// byte). `encoder_type == NORMALS (3)` + `att_type == NORMAL (1)` +
+/// `num_components == 3` marks a NORMAL decoder this port can reconstruct.
+const NormalDecoderInfo = struct {
+    att_type: u8,
+    num_components: u8,
+    encoder_type: u8,
+    num_attributes: u32,
 };
 
 /// Full attribute-section walk (see the module doc comment for the C++ chain),
@@ -174,6 +203,7 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
     // num_components (u8), normalized (u8), unique_id (varint); the encoder-type
     // bytes are a *separate* trailing loop (matches the two C++ loops).
     var num_components: u8 = 0;
+    var normal_info: ?NormalDecoderInfo = null;
     {
         var i: u8 = 0;
         while (i < num_attributes_decoders) : (i += 1) {
@@ -195,20 +225,38 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
                 const seq_encoder_type = try buf.readInt(u8);
                 if (seq_encoder_type != seq_encoder_quantization) return Error.UnsupportedDracoFeature;
             } else {
-                // Non-POSITION decoder: walk its descriptor block without
-                // interpreting it. All descriptors first, then all encoder-type
-                // bytes (the two distinct C++ loops).
+                // Non-POSITION decoder: walk its descriptor block. All
+                // descriptors first, then all encoder-type bytes (the two
+                // distinct C++ loops). Capture decoder 1's first-attribute
+                // descriptor + encoder byte so `decodeAttributes` can decide
+                // whether a NORMAL value section follows (C2b).
+                var att_type_1: u8 = 0;
+                var num_comp_1: u8 = 0;
                 var j: u32 = 0;
                 while (j < num_attributes) : (j += 1) {
-                    _ = try buf.readInt(u8); // att_type
+                    const at = try buf.readInt(u8); // att_type
                     _ = try buf.readInt(u8); // data_type
-                    _ = try buf.readInt(u8); // num_components
+                    const ncomp = try buf.readInt(u8); // num_components
                     _ = try buf.readInt(u8); // normalized
                     _ = try buf.decodeVarint(u32); // unique_id
+                    if (i == 1 and j == 0) {
+                        att_type_1 = at;
+                        num_comp_1 = ncomp;
+                    }
                 }
+                var enc_1: u8 = 0;
                 var k: u32 = 0;
                 while (k < num_attributes) : (k += 1) {
-                    _ = try buf.readInt(u8); // sequential-encoder-type byte
+                    const et = try buf.readInt(u8); // sequential-encoder-type byte
+                    if (i == 1 and k == 0) enc_1 = et;
+                }
+                if (i == 1) {
+                    normal_info = .{
+                        .att_type = att_type_1,
+                        .num_components = num_comp_1,
+                        .encoder_type = enc_1,
+                        .num_attributes = num_attributes,
+                    };
                 }
             }
         }
@@ -296,7 +344,120 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
     return .{
         .header = .{ .scheme_method = scheme_method, .transform_type = transform_type, .quant = quant, .num_components = num_components, .traversal_method = traversal_method, .wrap_min = wrap_min, .wrap_max = wrap_max },
         .residuals = residuals,
+        .normal = normal_info,
     };
+}
+
+/// Decode decoder 1's NORMAL value section (phase 3), positioned right after the
+/// POSITION section. Faithful port of `SequentialNormalAttributeDecoder`
+/// (+ `SequentialIntegerAttributeDecoder::DecodeIntegerValues`):
+///
+///   1. `DecodeValues`: `prediction_scheme_method` (i8, must be DIFFERENCE) +
+///      `prediction_transform_type` (i8, must be NORMAL_OCTAHEDRON_CANONICALIZED).
+///   2. `DecodeIntegerValues`: `compressed` (u8) then the entropy blob of
+///      `num_points*2` symbols (2 octahedral components/normal). ★ The
+///      octahedron transform's `AreCorrectionsPositive()` is TRUE, so — unlike
+///      POSITION's WRAP transform — `ConvertSymbolsToSignedInts` is NOT applied:
+///      the raw decoded symbols ARE the corrections.
+///   3. `DecodePredictionData` → the canonicalized transform's
+///      `DecodeTransformData`: `max_quantized_value` (i32) + `center_value`
+///      (i32, unused — the box is rederived from `max_quantized_value`).
+///   4. `ComputeOriginalValues` (delta scheme + octahedron-canonicalized
+///      transform): running prefix where the first entry predicts from {0,0} and
+///      each subsequent entry predicts from the previous decoded (s,t); the
+///      per-entry combine is `octCanonicalizedOriginalValue(pred, corr)`.
+///   5. `DecodeDataNeededByPortableTransform` → `AttributeOctahedronTransform::
+///      DecodeParameters`: `quantization_bits` (u8), the box `StoreValues` uses.
+///   6. `StoreValues` (`InverseTransformAttribute`):
+///      `QuantizedOctahedralCoordsToUnitVector(s,t)` per entry → 3 f32s, then
+///      re-index data-entry order → per-point order (shared `vertex_to_data`
+///      map — position/normal ride the same vertex sequence, no attribute seams).
+///
+/// Returns owned `[]f32` (`num_points*3`, per-point order). Never panics.
+fn decodeNormals(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity) Error![]f32 {
+    // ── (1) DecodeValues: prediction metadata ──
+    const scheme_method = try buf.readInt(i8);
+    if (scheme_method != prediction_difference) return Error.UnsupportedDracoFeature;
+    const transform_type = try buf.readInt(i8);
+    if (transform_type != transform_octahedron_canonicalized) return Error.UnsupportedDracoFeature;
+
+    const num_points: usize = conn.num_points;
+    const nc: usize = 2; // octahedral (s,t) — `GetNumValueComponents() == 2`
+    const num_values: usize = num_points * nc;
+
+    // ── (2) DecodeIntegerValues: compressed flag + symbol blob (raw, NO zigzag) ──
+    const corr = try alloc.alloc(i32, num_values);
+    defer alloc.free(corr);
+    const compressed = try buf.readInt(u8);
+    if (compressed > 0) {
+        const scratch = try alloc.alloc(u32, num_values);
+        defer alloc.free(scratch);
+        try draco.decodeSymbols(alloc, buf, num_values, @intCast(nc), scratch);
+        for (scratch, 0..) |s, i| corr[i] = @bitCast(s); // AreCorrectionsPositive → keep as-is
+    } else {
+        const num_bytes = try buf.readInt(u8);
+        if (num_bytes == 0 or num_bytes > 4) return Error.UnsupportedDracoFeature;
+        var i: usize = 0;
+        while (i < num_values) : (i += 1) {
+            var sym: u32 = 0;
+            var b: usize = 0;
+            while (b < num_bytes) : (b += 1) {
+                const byte = try buf.readInt(u8);
+                sym |= @as(u32, byte) << @intCast(b * 8);
+            }
+            corr[i] = @bitCast(sym);
+        }
+    }
+
+    // ── (3) DecodePredictionData → DecodeTransformData: max_quantized + center ──
+    const max_quantized_value = try buf.readInt(i32);
+    _ = try buf.readInt(i32); // center_value — unused (rederived from max_quantized)
+    // `set_max_quantized_value`: value must be of the form 2^b-1 (odd, > 0).
+    if (max_quantized_value <= 0 or @rem(max_quantized_value, 2) == 0) return Error.Corrupt;
+    const mqv: u32 = @intCast(max_quantized_value);
+    // q = MostSignificantBit(max_quantized_value) + 1 == bit length == 32 - clz.
+    const q_transform: u8 = @intCast(32 - @as(u32, @clz(mqv)));
+    if (q_transform < 2 or q_transform > 30) return Error.UnsupportedDracoFeature;
+    const box_transform = OctahedronToolBox.init(q_transform);
+
+    // ── (4) ComputeOriginalValues: delta prefix + octahedron-canonicalized ──
+    const out_st = try alloc.alloc(i32, num_values);
+    defer alloc.free(out_st);
+    {
+        const o0 = octahedron.octCanonicalizedOriginalValue(.{ 0, 0 }, .{ corr[0], corr[1] }, &box_transform);
+        out_st[0] = o0[0];
+        out_st[1] = o0[1];
+        var e: usize = nc;
+        while (e < num_values) : (e += nc) {
+            const pred = [2]i32{ out_st[e - nc], out_st[e - nc + 1] };
+            const c = [2]i32{ corr[e], corr[e + 1] };
+            const o = octahedron.octCanonicalizedOriginalValue(pred, c, &box_transform);
+            out_st[e] = o[0];
+            out_st[e + 1] = o[1];
+        }
+    }
+
+    // ── (5) DecodeDataNeededByPortableTransform: quantization_bits (u8) ──
+    const quantization_bits = try buf.readInt(u8);
+    if (quantization_bits < 2 or quantization_bits > 30) return Error.UnsupportedDracoFeature;
+    const box_store = OctahedronToolBox.init(quantization_bits);
+
+    // ── (6) StoreValues: (s,t) → unit vector, re-indexed to per-point order ──
+    const vtd = try draco.buildVertexToData(alloc, conn);
+    defer alloc.free(vtd);
+    const normals = try alloc.alloc(f32, num_points * 3);
+    errdefer alloc.free(normals);
+    var v: usize = 0;
+    while (v < num_points) : (v += 1) {
+        const e = vtd[v];
+        if (e < 0 or @as(usize, @intCast(e)) >= num_points) return Error.Corrupt;
+        const eu: usize = @intCast(e);
+        const vec = box_store.quantizedOctahedralCoordsToUnitVector(out_st[eu * nc], out_st[eu * nc + 1]);
+        normals[v * 3 + 0] = vec[0];
+        normals[v * 3 + 1] = vec[1];
+        normals[v * 3 + 2] = vec[2];
+    }
+    return normals;
 }
 
 /// Decoded POSITION values, `num_points * 3` `f32`s in per-point order (lines up
@@ -304,10 +465,18 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
 pub const PositionData = struct {
     values: []f32,
     alloc: std.mem.Allocator,
+    /// Decoded NORMAL values, `num_points * 3` unit-vector `f32`s in per-point
+    /// order (lines up 1:1 with `values`), or null when the mesh carries no
+    /// NORMAL attributes decoder (quad/cube/torus — `num_attribute_data == 0`).
+    normals: ?[]f32 = null,
 
     pub fn deinit(self: *PositionData) void {
         self.alloc.free(self.values);
         self.values = &.{};
+        if (self.normals) |n| {
+            self.alloc.free(n);
+            self.normals = null;
+        }
     }
 };
 
@@ -335,7 +504,25 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
         if (qi < 0) return Error.Corrupt;
         values[i] = attr_quant.dequantize(@intCast(qi), i % nc, h.quant);
     }
-    return .{ .values = values, .alloc = alloc };
+
+    // Decoder 1 (NORMAL), if present and a supported NORMAL decoder. `buf` is
+    // positioned exactly at decoder 1's phase-3 value section (right after the
+    // POSITION quant params `parseAttrSection` read). Decoder 2+ (TEXCOORD) is
+    // intentionally not decoded — this port stops after NORMAL.
+    var normals: ?[]f32 = null;
+    if (section.normal) |ni| {
+        if (ni.encoder_type == seq_encoder_normals) {
+            // A NORMALS-encoded decoder we must reconstruct: reject anything
+            // outside the octahedral 3-component normal shape rather than
+            // silently misdecode.
+            if (ni.num_attributes != 1 or ni.att_type != geom_attr_normal or ni.num_components != 3) {
+                return Error.UnsupportedDracoFeature;
+            }
+            normals = try decodeNormals(alloc, buf, conn);
+        }
+    }
+
+    return .{ .values = values, .alloc = alloc, .normals = normals };
 }
 
 test "parseAttrHeader(quad.drc): QUANTIZATION, 3 components, WRAP transform" {
@@ -568,11 +755,100 @@ test "decodeAttributes(cube_nrm_uv.drc) → POSITION byte-exact (num_attribute_d
     try std.testing.expectEqualSlices(f32, &want, pos.values);
 }
 
+test "decodeAttributes(cube_nrm.drc) → NORMAL byte-exact (24 f32)" {
+    const a = std.testing.allocator;
+    const cube_nrm_drc = @import("draco_fixtures").cube_nrm_drc;
+    var buf = DecoderBuffer.init(cube_nrm_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    var pos = try decodeAttributes(a, &buf, &conn);
+    defer pos.deinit();
+    try std.testing.expect(pos.normals != null);
+    // Baked verbatim from tests/fixtures/draco/cube_nrm.golden.json's NORMAL
+    // (`node -e "console.log(require('./tests/fixtures/draco/cube_nrm.golden.json').NORMAL.join(', '))"`).
+    const want = [_]f32{
+        -0.5762181282043457, 0.57621830701828,    0.5796077847480774,
+        -0.5762181282043457, -0.57621830701828,   0.5796077847480774,
+        0.5762181282043457,  0.57621830701828,    0.5796077847480774,
+        0.5762181878089905,  -0.5762181878089905, 0.5796077847480774,
+        -0.5762181878089905, -0.5762181878089905, -0.5796077847480774,
+        -0.5762181878089905, 0.5762181878089905,  -0.5796077847480774,
+        0.5762181282043457,  0.57621830701828,    -0.5796077847480774,
+        0.5762181878089905,  -0.5762181878089905, -0.5796077847480774,
+    };
+    try std.testing.expectEqualSlices(f32, &want, pos.normals.?);
+}
+
+test "decodeAttributes(cube_nrm_uv.drc) → NORMAL byte-exact (stops before TEXCOORD)" {
+    const a = std.testing.allocator;
+    const cube_nrm_uv_drc = @import("draco_fixtures").cube_nrm_uv_drc;
+    var buf = DecoderBuffer.init(cube_nrm_uv_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    var pos = try decodeAttributes(a, &buf, &conn);
+    defer pos.deinit();
+    try std.testing.expect(pos.normals != null);
+    // Baked verbatim from cube_nrm_uv.golden.json's NORMAL (identical smooth-cube
+    // normals to cube_nrm — the trailing TEXCOORD decoder is not decoded).
+    const want = [_]f32{
+        -0.5762181282043457, 0.57621830701828,    0.5796077847480774,
+        -0.5762181282043457, -0.57621830701828,   0.5796077847480774,
+        0.5762181282043457,  0.57621830701828,    0.5796077847480774,
+        0.5762181878089905,  -0.5762181878089905, 0.5796077847480774,
+        -0.5762181878089905, -0.5762181878089905, -0.5796077847480774,
+        -0.5762181878089905, 0.5762181878089905,  -0.5796077847480774,
+        0.5762181282043457,  0.57621830701828,    -0.5796077847480774,
+        0.5762181878089905,  -0.5762181878089905, -0.5796077847480774,
+    };
+    try std.testing.expectEqualSlices(f32, &want, pos.normals.?);
+}
+
 /// Absolute byte offset of `prediction_scheme_method` within `quad_drc`
 /// (verified: instrumented `parseAttrSection` to print `buf.pos` right before
 /// the `readInt(i8)` for `scheme_method`, ran the existing quad golden tests —
 /// both landed on 34).
 const SCHEME_OFF: usize = 34;
+
+/// Absolute byte offset of decoder 1's (NORMAL) `prediction_scheme_method`
+/// within `cube_nrm_drc` (found by instrumenting `decodeNormals` to print
+/// `buf.pos` at entry, then running the cube_nrm NORMAL golden test → 94;
+/// `[94]=scheme(DIFFERENCE 0)`, `[95]=transform(OCTAHEDRON_CANONICALIZED 3)`,
+/// `[96]=compressed`). cube_nrm_uv's is 108 — this reject test uses cube_nrm.
+const NORMAL_SCHEME_OFF: usize = 94;
+
+test "reject unsupported NORMAL prediction scheme (patched → geometric normal)" {
+    const a = std.testing.allocator;
+    const cube_nrm_drc = @import("draco_fixtures").cube_nrm_drc;
+    const copy = try a.dupe(u8, cube_nrm_drc);
+    defer a.free(copy);
+    // Patch decoder 1's prediction_scheme_method from DIFFERENCE(0) to 6
+    // (a normal/geometric method outside this port's accepted DIFFERENCE-only
+    // set for NORMAL) → the NORMAL decode must reject, not silently misdecode.
+    copy[NORMAL_SCHEME_OFF] = 6;
+    var buf = DecoderBuffer.init(copy);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    try std.testing.expectError(Error.UnsupportedDracoFeature, decodeAttributes(a, &buf, &conn));
+}
+
+test "reject unsupported NORMAL prediction transform (patched → plain octahedron)" {
+    const a = std.testing.allocator;
+    const cube_nrm_drc = @import("draco_fixtures").cube_nrm_drc;
+    const copy = try a.dupe(u8, cube_nrm_drc);
+    defer a.free(copy);
+    // Patch decoder 1's prediction_transform_type from
+    // NORMAL_OCTAHEDRON_CANONICALIZED(3) to NORMAL_OCTAHEDRON(2), the older
+    // non-canonicalized variant this port does not implement → reject.
+    copy[NORMAL_SCHEME_OFF + 1] = 2;
+    var buf = DecoderBuffer.init(copy);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    try std.testing.expectError(Error.UnsupportedDracoFeature, decodeAttributes(a, &buf, &conn));
+}
 
 test "reject unsupported prediction scheme" {
     const a = std.testing.allocator;
