@@ -17,4 +17,5 @@ test {
     _ = @import("buffer.zig");
     _ = @import("header.zig");
     _ = @import("rans.zig"); // pulls in rans_test_encoder.zig transitively
+    _ = @import("fixture_test.zig");
 }

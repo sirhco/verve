@@ -1012,10 +1012,14 @@ pub fn build(b: *std.Build) void {
         });
         b.installArtifact(cli);
 
+        const draco_fixtures_mod = buildDracoFixtures(b);
         const test_mod = b.createModule(.{
             .root_source_file = b.path("src/verve.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "draco_fixtures", .module = draco_fixtures_mod },
+            },
         });
         const tests = b.addTest(.{ .root_module = test_mod });
         const run_tests = b.addRunArtifact(tests);
@@ -1330,6 +1334,20 @@ fn buildPublicAssets(b: *std.Build, dir_opt: ?[]const u8) *std.Build.Module {
 }
 
 /// Walk `dir` for `<tag>.json` locale files at configure time and generate an
+/// `draco_fixtures` module: anchors the committed real-Draco-stream fixture
+/// (`tests/fixtures/draco/quad.drc`) so `src/core/gl/draco/fixture_test.zig`
+/// can `@embedFile` it. `@embedFile` paths may not escape a module's package
+/// root, and `tests/` sits outside `src/`'s root — so, mirroring
+/// `buildI18nCatalog` below, copy the fixture into a `WriteFiles` step and
+/// generate a tiny anchor source alongside it whose own package root is that
+/// generated directory.
+fn buildDracoFixtures(b: *std.Build) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/quad.drc"), "quad.drc");
+    const gen = wf.add("draco_fixtures.zig", "pub const quad_drc = @embedFile(\"quad.drc\");\n");
+    return b.createModule(.{ .root_source_file = gen });
+}
+
 /// `i18n_catalog` module: per-locale `@embedFile` blobs + a `locales` manifest
 /// of `verve.I18nLocale`. Missing dir → empty manifest (graceful). `default`
 /// is the default locale tag (else the first tag alphabetically). Mirrors
