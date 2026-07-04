@@ -25,4 +25,5 @@ test {
     _ = @import("fixture_test.zig");
     _ = @import("corner_table.zig");
     _ = @import("traversal_standard.zig");
+    _ = @import("edgebreaker.zig");
 }
