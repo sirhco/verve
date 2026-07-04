@@ -42,4 +42,5 @@ test {
     _ = @import("attributes.zig");
     _ = @import("attr_quant.zig");
     _ = @import("predict_mesh.zig");
+    _ = @import("octahedron.zig");
 }
