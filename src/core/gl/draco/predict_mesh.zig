@@ -396,7 +396,21 @@ pub fn inversePredict(
     if (num_points == 0) return alloc.alloc(i32, 0);
 
     const ct = &conn.corner_table;
-    if (ct.numVertices() != num_points) return Error.Corrupt;
+    // `ct.numVertices()` is the corner table's *physical* `vertex_corners.items.len`,
+    // which only ever grows (`addNewVertex`, used for topology-split handling —
+    // see `edgebreaker.zig`'s "Remove vertices that were marked as isolated"
+    // step). That step logically shrinks the live vertex count back down to
+    // `num_points` by remapping every corner reference below `num_points` and
+    // marking the (now-unreferenced) tail slots isolated, but it does not
+    // truncate the backing array — so for genus>0 meshes that hit topology
+    // splits during traversal (e.g. a torus), `ct.numVertices()` (104 here)
+    // legitimately exceeds `num_points` (96): the extra slots are dead, never
+    // targeted by any corner, and `buildTraversalMaps` below only ever visits
+    // vertices reachable from a real face corner, so it never touches them.
+    // Reject only when the array is *too small* to hold `num_points` — that's
+    // the real corruption signal; equality was an over-strict leftover from
+    // the split-free (quad/cube) fixtures that never exercised this path.
+    if (ct.numVertices() < num_points) return Error.Corrupt;
 
     var maps = try buildTraversalMaps(alloc, ct);
     defer maps.deinit(alloc);
