@@ -2552,6 +2552,36 @@ pub fn glSceneCull(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// /gl-draco: a real Blender-exported Draco mesh. `tests/fixtures/draco/
+/// draco_test.glb` (KHR_draco_mesh_compression, 8352 verts / 4156 tris,
+/// topology-splits + NORMAL + TEXCOORD attributes) is decoded by the pure-Zig
+/// Draco decoder into `dracotest.vmesh` at build time and rendered here. Grey
+/// double-sided PBR under the studio environment; drag to orbit, wheel to zoom.
+pub fn glSceneDraco(ctx: *const verve.Context) !*verve.Node {
+    const scene = ctx.glScene(.{
+        .src = "/gl/dracotest.vmesh",
+        .env = "/gl/studio.venv",
+        .poster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='400' viewBox='0 0 640 400'%3E%3Crect width='640' height='400' rx='8' fill='%23121420'/%3E%3Ctext x='320' y='215' font-family='system-ui' font-size='48' font-weight='700' fill='%23f5f5f5' text-anchor='middle'%3EDraco (Blender)%3C/text%3E%3C/svg%3E",
+    })
+        .camera(.{ .distance = 4.0, .pitch = 0.25, .yaw = 0.5 })
+        .light(.{ .dir = .{ -0.4, -0.7, -0.6 }, .intensity = 3.0 })
+        .autoRotate(0.3)
+        .build();
+
+    return ctx.main_().class("home gl-scene-page").children(.{
+        ctx.h1("verve.gl — Draco (Blender export)"),
+        ctx.p().text("A real Blender-exported mesh compressed with " ++
+            "KHR_draco_mesh_compression (8352 vertices, 4156 triangles, with " ++
+            "topology-split symbols and NORMAL + TEXCOORD attributes). Verve's " ++
+            "pure-Zig, zero-dependency Draco decoder ingests the .glb at build " ++
+            "time — no draco3d, no runtime transcode — producing a .vmesh that " ++
+            "renders identically on WebGL2 and WebGPU."),
+        scene,
+        ctx.p().text("Drag to orbit · wheel to zoom. The grey double-sided PBR " ++
+            "surface is lit by the studio environment."),
+    });
+}
+
 /// /gl-instanced: 16×16 = 256 cubes drawn in a single instanced draw call.
 /// The vmesh carries EXT_mesh_gpu_instancing data (TRANSLATION/ROTATION/SCALE/
 /// _COLOR_0 per instance). Each instance has a NON-uniform scale (sx/sz thin,
