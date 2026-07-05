@@ -422,7 +422,7 @@ fn readValueSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, num_value_ver
     // `PredictionSchemeDecoder::DecodePredictionData` ->
     // `PredictionSchemeWrapDecodingTransform::DecodeTransformData` — the WRAP
     // clamp bounds, 2x `int32_t` (`DataTypeT` post-quantization). Consumed only
-    // to advance `buf`; `inversePredict` re-derives/uses these for the unwrap.
+    // to advance `buf`; `predictValues` re-derives/uses these for the unwrap.
     const wrap_min = try buf.readInt(i32);
     const wrap_max = try buf.readInt(i32);
     if (wrap_min > wrap_max) return Error.Corrupt;
