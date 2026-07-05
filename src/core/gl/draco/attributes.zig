@@ -166,6 +166,13 @@ const DecoderInfo = struct {
     /// the base position corner table; `MESH_CORNER_ATTRIBUTE (1)` → decode over
     /// the attribute's own seam-aware `MeshAttrCornerTable`.
     decoder_type: u8,
+    /// This decoder's ordinal index (the `i` in the phase-1/phase-2 loops).
+    /// Phase 3 (`DecodeAllAttributes`) iterates decoders in index order, so the
+    /// value sections appear in decoder-index order. `decodeAttributes` reads the
+    /// NORMAL section before the TEXCOORD section, which is only correct when the
+    /// NORMAL decoder's index is less than the TEXCOORD decoder's — this field
+    /// lets it reject the reverse order rather than silently misdecode.
+    decoder_index: u8,
 };
 
 /// Full attribute-section walk (see the module doc comment for the C++ chain),
@@ -287,6 +294,7 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
                     .num_attributes = num_attributes,
                     .traversal_method = dec_traversal[i],
                     .decoder_type = dec_decoder_type[i],
+                    .decoder_index = i,
                 };
                 if (att_type_0 == geom_attr_normal) {
                     if (normal_info == null) normal_info = info;
@@ -471,6 +479,10 @@ fn expandToPoints(alloc: std.mem.Allocator, conn: *const Connectivity, values: [
     var p: usize = 0;
     while (p < n) : (p += 1) {
         const corner = conn.point_to_corner[p];
+        // Corners are internally constructed and never exceed the table, but the
+        // vertex accessor indexes by corner — guard rather than let a corrupt
+        // `point_to_corner` entry run off the corner table (never-panic invariant).
+        if (corner >= conn.corner_table.numCorners()) return Error.Corrupt;
         const av = view.vertexPub(corner); // per-point attribute vertex
         const src: usize = @as(usize, av) * nc;
         if (src + nc > values.len) return Error.Corrupt;
@@ -642,6 +654,18 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
     const section = try parseAttrSection(alloc, buf, conn);
     defer alloc.free(section.residuals);
     const h = section.header;
+
+    // Phase 3 (`DecodeAllAttributes`) emits value sections in decoder-index
+    // order, but the NORMAL/TEXCOORD sections below are read in a fixed order
+    // (NORMAL first, then TEXCOORD). That fixed order is byte-correct only when
+    // the NORMAL decoder's index precedes the TEXCOORD decoder's. All committed
+    // fixtures satisfy this (POSITION, NORMAL, TEXCOORD), so this is unreachable
+    // today — but reject the reverse rather than silently misdecode.
+    if (section.normal) |ni| {
+        if (section.texcoord) |ti| {
+            if (ni.decoder_index > ti.decoder_index) return Error.UnsupportedDracoFeature;
+        }
+    }
 
     // POSITION (decoder 0): always a base attribute (no per-attribute seams on
     // the position itself). Decode per-base-vertex, then expand to per-point.
