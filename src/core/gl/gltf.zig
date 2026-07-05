@@ -3080,3 +3080,86 @@ test "toVmesh(seamcube.glb) round-trip: decoded .vmesh has 24 vertices, POSITION
         inline for (0..2) |k| try std.testing.expectEqual(want_uv[vi * 2 + k], verts[vi * stride + 10 + k]);
     }
 }
+
+fn fnv1a64(bytes: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (bytes) |b| {
+        h ^= b;
+        h = h *% 0x100000001b3;
+    }
+    return h;
+}
+
+/// Locate the KHR_draco_mesh_compression stream of meshes[0].primitives[0] in a
+/// GLB by minimally walking the container + JSON. Returns the raw .drc bytes.
+/// Used by the real-world decoder gate so the reference hashes can be compared
+/// against `draco.decodeAttributes`' *raw* output (point order, pre-transform) —
+/// exactly what `draco3dgltf` produces — rather than parseGlb's interleaved
+/// vertices, whose normals are renormalized (`normalize3`) after decode and so
+/// cannot be byte-exact against a raw-decode reference.
+fn dracoStreamOf(glb: []const u8, arena: *std.heap.ArenaAllocator) ![]const u8 {
+    const total_len = std.mem.readInt(u32, glb[8..12], .little);
+    var json_data: []const u8 = &.{};
+    var bin: []const u8 = &.{};
+    var off: usize = 12;
+    while (off + 8 <= total_len) {
+        const clen = std.mem.readInt(u32, glb[off..][0..4], .little);
+        const ctype = std.mem.readInt(u32, glb[off + 4 ..][0..4], .little);
+        const d = glb[off + 8 .. off + 8 + clen];
+        if (ctype == chunk_type_json) json_data = d else if (ctype == chunk_type_bin) bin = d;
+        off += 8 + clen;
+    }
+    const ja = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, ja, json_data, .{});
+    const root = parsed.value.object;
+    const bvs = root.get("bufferViews").?.array.items;
+    const mesh0 = root.get("meshes").?.array.items[0].object;
+    const prim0 = mesh0.get("primitives").?.array.items[0].object;
+    const dext = prim0.get("extensions").?.object.get("KHR_draco_mesh_compression").?.object;
+    const drc_bv: usize = @intCast(jsonInt(dext.get("bufferView").?).?);
+    return getBufferViewSlice(bvs, drc_bv, bin);
+}
+
+test "draco_test.glb: real Blender splits+attributes mesh byte-exact (FNV, raw decode)" {
+    const a = std.testing.allocator;
+    const glb = @import("draco_fixtures").draco_test_glb;
+
+    // (1) End-to-end pipeline smoke: parseGlb must produce a finite, in-range,
+    // correctly-sized mesh (counts / finiteness gate the full glb→Model path).
+    var model = try parseGlb(a, glb);
+    defer model.deinit();
+    const nv = model.vertices.len / 12;
+    try std.testing.expectEqual(@as(usize, 8352), nv);
+    try std.testing.expectEqual(@as(usize, 12468), model.indices.len);
+    for (model.vertices) |v| try std.testing.expect(std.math.isFinite(v));
+    for (model.indices) |ix| try std.testing.expect(ix < nv);
+
+    // (2) Byte-exact decoder gate: hash the RAW draco decode (point order,
+    // pre-transform) — the values the offline `draco3dgltf` reference hashes were
+    // computed from. parseGlb's interleaved normals are renormalized post-decode,
+    // so they are deliberately NOT the byte-exact target (POSITION/UV/indices are
+    // pass-through and DO match parseGlb; NORMAL only matches the raw decode).
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const drc = try dracoStreamOf(glb, &arena);
+    var b = draco.DecoderBuffer.init(drc);
+    _ = try draco.parseHeader(&b);
+    var conn = try draco.decodeConnectivity(a, &b);
+    defer conn.deinit();
+    var attr = try draco.decodeAttributes(a, &b, &conn);
+    defer attr.deinit();
+    try std.testing.expectEqual(@as(u32, 8352), conn.num_output_points);
+    try std.testing.expectEqual(@as(usize, 12468), conn.indices.len);
+    try std.testing.expect(attr.normals != null);
+    try std.testing.expect(attr.texcoords != null);
+    // Reference hashes: draco3dgltf decode of draco_test.glb (POSITION/NORMAL/UV
+    // f32 LE bytes in point order).
+    try std.testing.expectEqual(@as(u64, 0xb2f6d14b194af43d), fnv1a64(std.mem.sliceAsBytes(attr.values))); // POSITION
+    try std.testing.expectEqual(@as(u64, 0x38580763db61739e), fnv1a64(std.mem.sliceAsBytes(attr.normals.?))); // NORMAL
+    try std.testing.expectEqual(@as(u64, 0x9ea3e043f6a6d5ec), fnv1a64(std.mem.sliceAsBytes(attr.texcoords.?))); // TEXCOORD
+    // indices: narrow the decoded u32 connectivity to u16 (point order).
+    const idx16 = try a.alloc(u16, conn.indices.len);
+    defer a.free(idx16);
+    for (conn.indices, 0..) |ii, k| idx16[k] = @intCast(ii);
+    try std.testing.expectEqual(@as(u64, 0x496221c45f9b8f5e), fnv1a64(std.mem.sliceAsBytes(idx16))); // indices (u16)
+}
