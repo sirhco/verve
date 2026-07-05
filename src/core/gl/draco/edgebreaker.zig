@@ -219,11 +219,16 @@ pub const Connectivity = struct {
     corner_table: CornerTable,
     num_points: u32,
     attr_maps: []MeshAttrCornerTable = &.{},
+    num_output_points: u32 = 0,
+    corner_to_point: []u32 = &.{},
+    point_to_corner: []u32 = &.{},
 
     pub fn deinit(self: *Connectivity) void {
         self.alloc.free(self.indices);
         for (self.attr_maps) |*m| m.deinit();
         if (self.attr_maps.len > 0) self.alloc.free(self.attr_maps);
+        if (self.corner_to_point.len > 0) self.alloc.free(self.corner_to_point);
+        if (self.point_to_corner.len > 0) self.alloc.free(self.point_to_corner);
         self.corner_table.deinit();
     }
 };
@@ -555,25 +560,14 @@ pub fn decodeConnectivity(alloc: std.mem.Allocator, buf: *DecoderBuffer) Error!C
         num_vertices -= 1;
     }
 
-    // Position-only face extraction: point id == vertex id (AssignPointsToCorners).
-    const indices = try alloc.alloc(u32, ct.numFaces() * 3);
-    errdefer alloc.free(indices);
-    var fi: u32 = 0;
-    while (fi < ct.numFaces()) : (fi += 1) {
-        const start_corner = 3 * fi;
-        var c: u32 = 0;
-        while (c < 3) : (c += 1) {
-            indices[start_corner + c] = ct.vertex(start_corner + c);
-        }
-    }
-
     // ── attribute connectivity (num_attribute_data > 0) ──────────────────────
     // Port of `DecodeConnectivity()`'s post-traversal attribute section
     // (impl.cc:474-508): a forward pass over every face decodes the per-attribute
     // seam bits (`DecodeAttributeConnectivitiesOnFace`, impl.cc:1132), then each
     // attribute builds a `MeshAttrCornerTable` from its recorded seam corners.
     // Position-only streams (the common case) never allocate here — `attr_maps`
-    // stays the empty sentinel `&.{}`.
+    // stays the empty sentinel `&.{}`. This runs BEFORE point assignment because
+    // `AssignPointsToCorners` consumes the attribute corner tables.
     var attr_maps: []MeshAttrCornerTable = &.{};
     if (h.num_attribute_data > 0) {
         attr_maps = try alloc.alloc(MeshAttrCornerTable, h.num_attribute_data);
@@ -624,8 +618,118 @@ pub fn decodeConnectivity(alloc: std.mem.Allocator, buf: *DecoderBuffer) Error!C
             try m.recomputeVertices(&ct);
         }
     }
+    // The `if`-block errdefer above only covers a failure while building
+    // attr_maps. Once built, a later error in point assignment must still free
+    // them; register that here (deviation from brief — plugs a latent leak on
+    // the attribute path's Corrupt returns). Empty sentinel `&.{}` is a no-op.
+    errdefer {
+        for (attr_maps) |*m| m.deinit();
+        if (attr_maps.len > 0) alloc.free(attr_maps);
+    }
 
-    return .{ .alloc = alloc, .indices = indices, .corner_table = ct, .num_points = num_vertices, .attr_maps = attr_maps };
+    // AssignPointsToCorners — position-only: point id == vertex id.
+    const indices = try alloc.alloc(u32, ct.numFaces() * 3);
+    errdefer alloc.free(indices);
+    if (attr_maps.len == 0) {
+        var fi: u32 = 0;
+        while (fi < ct.numFaces()) : (fi += 1) {
+            const sc = 3 * fi;
+            indices[sc + 0] = ct.vertex(sc + 0);
+            indices[sc + 1] = ct.vertex(sc + 1);
+            indices[sc + 2] = ct.vertex(sc + 2);
+        }
+        return .{
+            .alloc = alloc,
+            .indices = indices,
+            .corner_table = ct,
+            .num_points = num_vertices,
+            .attr_maps = attr_maps,
+            .num_output_points = num_vertices,
+            .corner_to_point = &.{},
+            .point_to_corner = &.{},
+        };
+    }
+
+    // AssignPointsToCorners — attribute dedup (impl.cc:1188). Each corner starts
+    // as its own point; a CW pass per vertex merges corners that agree on every
+    // attribute vertex, and starts a new point at every attribute seam.
+    const num_corners = ct.numCorners();
+    const corner_to_point = try alloc.alloc(u32, num_corners);
+    errdefer alloc.free(corner_to_point);
+    @memset(corner_to_point, kInvalidCorner);
+    var point_to_corner = std.ArrayList(u32).empty;
+    errdefer point_to_corner.deinit(alloc);
+
+    const num_vert = ct.numVertices();
+    var vv: u32 = 0;
+    while (vv < num_vert) : (vv += 1) {
+        const lmc = ct.leftMostCorner(vv);
+        if (lmc == kInvalidCorner) continue; // isolated
+        var dedup_first = lmc;
+        if (!is_vert_hole[vv]) {
+            // Interior vertex: find the first attribute seam to start from.
+            seam_search: for (attr_maps) |*m| {
+                if (!m.isCornerOnSeam(lmc, &ct)) continue;
+                const vid = m.vertex(lmc);
+                var ac = ct.swingRight(lmc);
+                while (ac != lmc) {
+                    if (ac == kInvalidCorner) return Error.Corrupt;
+                    if (m.vertex(ac) != vid) {
+                        dedup_first = ac;
+                        break :seam_search;
+                    }
+                    ac = ct.swingRight(ac);
+                }
+            }
+        }
+        // CW dedup pass from dedup_first.
+        var c = dedup_first;
+        corner_to_point[c] = @intCast(point_to_corner.items.len);
+        try point_to_corner.append(alloc, c);
+        var prev_c = c;
+        c = ct.swingRight(c);
+        while (c != kInvalidCorner and c != dedup_first) {
+            var attribute_seam = false;
+            for (attr_maps) |*m| {
+                if (m.vertex(c) != m.vertex(prev_c)) {
+                    attribute_seam = true;
+                    break;
+                }
+            }
+            if (attribute_seam) {
+                corner_to_point[c] = @intCast(point_to_corner.items.len);
+                try point_to_corner.append(alloc, c);
+            } else {
+                corner_to_point[c] = corner_to_point[prev_c];
+            }
+            prev_c = c;
+            c = ct.swingRight(c);
+        }
+    }
+
+    // Faces reference point ids.
+    var fi: u32 = 0;
+    while (fi < ct.numFaces()) : (fi += 1) {
+        const sc = 3 * fi;
+        var k: u32 = 0;
+        while (k < 3) : (k += 1) {
+            const pid = corner_to_point[sc + k];
+            if (pid == kInvalidCorner) return Error.Corrupt; // every corner must be assigned
+            indices[sc + k] = pid;
+        }
+    }
+
+    const p2c = try point_to_corner.toOwnedSlice(alloc);
+    return .{
+        .alloc = alloc,
+        .indices = indices,
+        .corner_table = ct,
+        .num_points = num_vertices,
+        .attr_maps = attr_maps,
+        .num_output_points = @intCast(p2c.len),
+        .corner_to_point = corner_to_point,
+        .point_to_corner = p2c,
+    };
 }
 
 /// `MeshEdgebreakerDecoderImpl::SetOppositeCorners` — set both directions.
@@ -805,6 +909,54 @@ test "decodeConnectivity(cube_nrm.drc): num_attribute_data=1 accepted, indices b
     const want = [_]u32{ 0, 1, 2, 2, 1, 3, 3, 1, 4, 1, 0, 4, 0, 5, 4, 4, 5, 6, 5, 0, 6, 0, 2, 6, 6, 2, 7, 2, 3, 7, 3, 4, 7, 6, 7, 4 };
     try std.testing.expectEqualSlices(u32, &want, conn.indices);
     try std.testing.expectEqual(@as(usize, 1), conn.attr_maps.len);
+}
+
+const seamcube_drc = @import("draco_fixtures").seamcube_drc;
+
+test "decodeConnectivity(seamcube.drc): UV attr corner table splits (seam present)" {
+    const a = std.testing.allocator;
+    var buf = draco.DecoderBuffer.init(seamcube_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    // Base position vertices welded to 8; the single UV attribute corner table
+    // splits to 24 (a real seam: numVertices() > num_points).
+    try std.testing.expectEqual(@as(u32, 8), conn.num_points);
+    try std.testing.expectEqual(@as(usize, 1), conn.attr_maps.len);
+    try std.testing.expect(conn.attr_maps[0].numVertices() > conn.num_points);
+    try std.testing.expectEqual(@as(u32, 24), conn.attr_maps[0].numVertices());
+}
+
+const cube_nrm_uv_drc_pm = @import("draco_fixtures").cube_nrm_uv_drc;
+
+test "AssignPointsToCorners: seamcube → 24 output points, indices reference points" {
+    const a = std.testing.allocator;
+    var buf = draco.DecoderBuffer.init(seamcube_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    try std.testing.expectEqual(@as(u32, 24), conn.num_output_points);
+    try std.testing.expectEqual(@as(usize, 24), conn.point_to_corner.len);
+    try std.testing.expectEqual(conn.corner_table.numCorners(), @as(u32, @intCast(conn.corner_to_point.len)));
+    // Every index is a valid point id.
+    var mx: u32 = 0;
+    for (conn.indices) |ix| {
+        try std.testing.expect(ix < conn.num_output_points);
+        mx = @max(mx, ix);
+    }
+    try std.testing.expectEqual(@as(u32, 23), mx);
+}
+
+test "AssignPointsToCorners: cube_nrm_uv (no seam) → point id == vertex id (regression)" {
+    const a = std.testing.allocator;
+    var buf = draco.DecoderBuffer.init(cube_nrm_uv_drc_pm);
+    _ = try draco.parseHeader(&buf);
+    var conn = try decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    // No seams → dedup collapses to identity: N == num_points, indices unchanged.
+    try std.testing.expectEqual(conn.num_points, conn.num_output_points);
+    const want = [_]u32{ 0, 1, 2, 2, 1, 3, 3, 1, 4, 1, 0, 4, 0, 5, 4, 4, 5, 6, 5, 0, 6, 0, 2, 6, 6, 2, 7, 2, 3, 7, 3, 4, 7, 6, 7, 4 };
+    try std.testing.expectEqualSlices(u32, &want, conn.indices);
 }
 
 test "decodeEvents rejects num_topology_splits > num_faces" {

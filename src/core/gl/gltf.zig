@@ -481,15 +481,11 @@ fn parseGlbImpl(backing_alloc: std.mem.Allocator, bytes: []const u8) !Model {
                 _ = try draco.parseHeader(&b);
                 var conn = try draco.decodeConnectivity(aa, &b);
                 defer conn.deinit();
-                // (3) seam guard: a split attribute corner table means real UV/normal
-                // seams; our value decode assumes attributes are indexed 1:1 with the
-                // position table, so bail rather than silently misdecode.
-                for (conn.attr_maps) |m| if (m.numVertices() != conn.num_points) return error.UnsupportedDracoFeature;
                 // (4) decode attribute values (semantically typed by the decoder;
                 // the extension's id-map is informational, so we ignore it).
                 var attr = try draco.decodeAttributes(aa, &b, &conn);
                 defer attr.deinit();
-                const np: usize = conn.num_points;
+                const np: usize = conn.num_output_points;
                 // (5) map decoder outputs → our slices. Own copies (dupe) so they
                 // survive the decode-temporary defers above; the shared path below
                 // allocates more into the same arena afterward.
@@ -3038,39 +3034,49 @@ test "toVmesh(cube_nrm_uv.glb) round-trip: decoded .vmesh POSITION matches golde
     }
 }
 
-test "seam guard: attr_map.numVertices() != num_points → error.UnsupportedDracoFeature (structural)" {
-    // gltf.zig's Draco decode path bails (line ~487) when a decoded attribute's
-    // MeshAttrCornerTable vertex count differs from the connectivity's
-    // num_points — that shape means a real UV/normal seam, which the shared
-    // value-decode path assumes away (1:1 indexing with the position table).
-    //
-    // seam guard: real coverage (parseGlb on an actual seamed KHR_draco glb) is
-    // the follow-on — no seam fixture exists yet (all committed .drc/.glb
-    // fixtures are seam-free: quad/cube/torus/cube_nrm/cube_nrm_uv). This test
-    // instead exercises the guard PREDICATE directly against a hand-built
-    // Connectivity whose lone attr_map's numVertices() is forced to exceed
-    // num_points, mirroring the exact comparison in the real code.
+test "parseGlb decodes KHR_draco seamcube → 24-point POSITION/TEXCOORD match golden (UV seam)" {
     const a = std.testing.allocator;
-    var ct = try draco.CornerTable.initEmpty(a, 0, 0);
-    var attr_map = try draco.MeshAttrCornerTable.init(a, &ct);
-    // Force a seam-shaped mismatch: 2 attribute-vertex entries vs num_points=1.
-    try attr_map.vertex_to_attribute_entry_id_map_.append(a, 0);
-    try attr_map.vertex_to_attribute_entry_id_map_.append(a, 1);
-    try std.testing.expect(attr_map.numVertices() != 1);
-    const attr_maps = try a.alloc(draco.MeshAttrCornerTable, 1);
-    attr_maps[0] = attr_map;
-    var conn = draco.Connectivity{
-        .alloc = a,
-        .indices = try a.alloc(u32, 0),
-        .corner_table = ct,
-        .num_points = 1,
-        .attr_maps = attr_maps,
-    };
-    defer conn.deinit();
-    // Exact predicate from gltf.zig's Draco decode branch.
-    var guard_triggered = false;
-    for (conn.attr_maps) |m| {
-        if (m.numVertices() != conn.num_points) guard_triggered = true;
+    const glb = @import("draco_fixtures").seamcube_glb;
+    var model = try parseGlb(a, glb);
+    defer model.deinit();
+    // 24 points, 12 f32 per interleaved vertex (pos3@0 / nrm3@3 / tan4@6 / uv2@10).
+    try std.testing.expectEqual(@as(usize, 24 * 12), model.vertices.len);
+    const want_pos = [_]f32{ -1, 1, 1, -1, 1, 1, -1, 1, 1, -1, -1, 1, -1, -1, 1, -1, -1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, -1, 1, -1, -1 };
+    const want_uv = [_]f32{ 0.8333333134651184, 0.7501017451286316, 0.4999999701976776, 0.7501017451286316, 0.1666666567325592, 0.7501017451286316, 0.3333333134651184, 0, 0.8333333134651184, 0, 0.1666666567325592, 0, 0.4999999701976776, 0.4999999701976776, 0.6666666269302368, 0.4999999701976776, 0.1666666567325592, 0.4999999701976776, 0.1666666567325592, 0.2501017451286316, 0.6666666269302368, 0.2501017451286316, 0.3333333134651184, 0.2501017451286316, 0.8333333134651184, 0, 0.3333333134651184, 0, 0, 0, 0, 0.7501017451286316, 0.4999999701976776, 0.7501017451286316, 0.8333333134651184, 0.7501017451286316, 0.4999999701976776, 0.4999999701976776, 0, 0.4999999701976776, 0.6666666269302368, 0.4999999701976776, 0.6666666269302368, 0.2501017451286316, 0, 0.2501017451286316, 0.3333333134651184, 0.2501017451286316 };
+    var i: usize = 0;
+    while (i < 24) : (i += 1) {
+        try std.testing.expectEqual(want_pos[i * 3 + 0], model.vertices[i * 12 + 0]);
+        try std.testing.expectEqual(want_pos[i * 3 + 1], model.vertices[i * 12 + 1]);
+        try std.testing.expectEqual(want_pos[i * 3 + 2], model.vertices[i * 12 + 2]);
+        try std.testing.expectEqual(want_uv[i * 2 + 0], model.vertices[i * 12 + 10]);
+        try std.testing.expectEqual(want_uv[i * 2 + 1], model.vertices[i * 12 + 11]);
     }
-    try std.testing.expect(guard_triggered);
+    // Indices (narrowed to u16) equal the golden point indices.
+    const want_idx = [_]u16{ 2, 5, 8, 8, 5, 9, 11, 3, 13, 4, 0, 12, 0, 17, 12, 14, 15, 19, 16, 1, 18, 1, 6, 18, 20, 7, 21, 7, 10, 21, 11, 13, 23, 19, 22, 14 };
+    try std.testing.expectEqualSlices(u16, &want_idx, model.indices);
+}
+
+test "toVmesh(seamcube.glb) round-trip: decoded .vmesh has 24 vertices, POSITION/TEXCOORD match golden" {
+    // Full glb→Model→vmesh.pack→vmesh.Reader path for a seam-bearing Draco glb;
+    // mirrors the cube_nrm_uv round-trip above (plain vmesh.pack, zero-copy Reader).
+    const a = std.testing.allocator;
+    const glb = @import("draco_fixtures").seamcube_glb;
+    const bytes = try toVmesh(a, glb);
+    defer a.free(bytes);
+    var r = try vmesh.Reader.init(bytes);
+    try std.testing.expectEqual(vmesh.GeoCodec.none, r.geo_codec_);
+    try std.testing.expectEqual(vmesh.VertexCodec.none, r.vertex_codec_);
+    try std.testing.expectEqual(@as(u32, 24), r.vertex_count);
+    const want_pos = [_]f32{ -1, 1, 1, -1, 1, 1, -1, 1, 1, -1, -1, 1, -1, -1, 1, -1, -1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1, -1, 1, 1, -1, 1, -1, -1, 1, -1, -1, 1, -1, -1 };
+    const want_uv = [_]f32{ 0.8333333134651184, 0.7501017451286316, 0.4999999701976776, 0.7501017451286316, 0.1666666567325592, 0.7501017451286316, 0.3333333134651184, 0, 0.8333333134651184, 0, 0.1666666567325592, 0, 0.4999999701976776, 0.4999999701976776, 0.6666666269302368, 0.4999999701976776, 0.1666666567325592, 0.4999999701976776, 0.1666666567325592, 0.2501017451286316, 0.6666666269302368, 0.2501017451286316, 0.3333333134651184, 0.2501017451286316, 0.8333333134651184, 0, 0.3333333134651184, 0, 0, 0, 0, 0.7501017451286316, 0.4999999701976776, 0.7501017451286316, 0.8333333134651184, 0.7501017451286316, 0.4999999701976776, 0.4999999701976776, 0, 0.4999999701976776, 0.6666666269302368, 0.4999999701976776, 0.6666666269302368, 0.2501017451286316, 0, 0.2501017451286316, 0.3333333134651184, 0.2501017451286316 };
+    // Non-quant path: positions() is a stride-12 view over the interleaved f32
+    // vertex (pos@0..3, nrm@3..6, tan@6..10, uv@10..12), so UV rides the same view.
+    const verts = r.positions();
+    const stride = r.positionStride();
+    try std.testing.expectEqual(@as(u32, 12), stride);
+    var vi: usize = 0;
+    while (vi < 24) : (vi += 1) {
+        inline for (0..3) |k| try std.testing.expectEqual(want_pos[vi * 3 + k], verts[vi * stride + k]);
+        inline for (0..2) |k| try std.testing.expectEqual(want_uv[vi * 2 + k], verts[vi * stride + 10 + k]);
+    }
 }

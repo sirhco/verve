@@ -45,10 +45,56 @@ const corner_table = @import("corner_table.zig");
 
 pub const Error = draco.Error;
 const CornerTable = corner_table.CornerTable;
+const MeshAttrCornerTable = @import("mesh_attr_corner_table.zig").MeshAttrCornerTable;
 const kInvalidCorner = corner_table.kInvalidCorner;
 const kInvalidVertex = corner_table.kInvalidVertex;
 const next = corner_table.next;
 const previous = corner_table.previous;
+
+/// Uniform accessor over either the base position corner table (`attr == null`)
+/// or a seam-aware attribute corner table. All prediction/traversal indexing
+/// goes through this so the position and seamed-attribute paths share one code
+/// path. `attr == null` reproduces the base table's ops exactly (regression-safe).
+pub const TableView = struct {
+    ct: *const CornerTable,
+    attr: ?*const MeshAttrCornerTable,
+
+    fn numCorners(self: TableView) u32 {
+        return self.ct.numCorners();
+    }
+    fn numFaces(self: TableView) u32 {
+        return self.ct.numFaces();
+    }
+    fn numVertices(self: TableView) u32 {
+        return if (self.attr) |m| m.numVertices() else self.ct.numVertices();
+    }
+    fn vertex(self: TableView, c: u32) u32 {
+        return if (self.attr) |m| m.vertex(c) else self.ct.vertex(c);
+    }
+    /// Public accessor for `vertex` so `attributes.zig`'s `expandToPoints` can
+    /// resolve a point's representative corner → its (base or attr) vertex.
+    pub fn vertexPub(self: TableView, c: u32) u32 {
+        return self.vertex(c);
+    }
+    fn opposite(self: TableView, c: u32) u32 {
+        return if (self.attr) |m| m.opposite(c, self.ct) else self.ct.opposite(c);
+    }
+    fn leftMostCorner(self: TableView, v: u32) u32 {
+        return if (self.attr) |m| m.leftMostCorner(v) else self.ct.leftMostCorner(v);
+    }
+    fn swingRight(self: TableView, c: u32) u32 {
+        return if (self.attr) |m| m.swingRight(c, self.ct) else self.ct.swingRight(c);
+    }
+    fn getRightCorner(self: TableView, c: u32) u32 {
+        return if (self.attr) |m| m.getRightCorner(c, self.ct) else self.ct.getRightCorner(c);
+    }
+    fn getLeftCorner(self: TableView, c: u32) u32 {
+        return if (self.attr) |m| m.getLeftCorner(c, self.ct) else self.ct.getLeftCorner(c);
+    }
+    fn isOnBoundary(self: TableView, v: u32) bool {
+        return if (self.attr) |m| m.isOnBoundary(v, self.ct) else self.ct.isOnBoundary(v);
+    }
+};
 
 /// Sentinel used only for face bookkeeping inside the traversal (mirrors
 /// Draco's `kInvalidFaceIndex`, which `IsFaceVisited` treats as "visited").
@@ -120,7 +166,7 @@ const TraversalMaps = struct {
 /// order (`ProcessCorner(3*i)`). All corner/vertex indexing is bounds-guarded
 /// so a corrupt corner table yields `Error.Corrupt`, never a panic.
 const Traverser = struct {
-    ct: *const CornerTable,
+    view: TableView,
     alloc: std.mem.Allocator,
     is_face_visited: []bool,
     is_vertex_visited: []bool,
@@ -150,7 +196,7 @@ const Traverser = struct {
     }
     fn vertexOf(self: *const Traverser, corner: u32) Error!u32 {
         if (corner >= self.num_corners) return Error.Corrupt;
-        const v = self.ct.vertex(corner);
+        const v = self.view.vertex(corner);
         if (v == kInvalidVertex or v >= self.num_vertices) return Error.Corrupt;
         return v;
     }
@@ -188,11 +234,11 @@ const Traverser = struct {
                 self.is_face_visited[face_id] = true;
                 const vert_id = try self.vertexOf(corner_id);
                 if (!self.is_vertex_visited[vert_id]) {
-                    const on_boundary = self.ct.isOnBoundary(vert_id);
+                    const on_boundary = self.view.isOnBoundary(vert_id);
                     self.is_vertex_visited[vert_id] = true;
                     try self.onNewVertexVisited(vert_id, corner_id);
                     if (!on_boundary) {
-                        corner_id = self.ct.getRightCorner(corner_id);
+                        corner_id = self.view.getRightCorner(corner_id);
                         if (corner_id == kInvalidCorner) return Error.Corrupt;
                         face_id = corner_id / 3;
                         continue :inner;
@@ -200,8 +246,8 @@ const Traverser = struct {
                 }
                 // Vertex already visited or on a boundary — try to descend into a
                 // neighboring face.
-                const right_corner = self.ct.getRightCorner(corner_id);
-                const left_corner = self.ct.getLeftCorner(corner_id);
+                const right_corner = self.view.getRightCorner(corner_id);
+                const left_corner = self.view.getLeftCorner(corner_id);
                 const right_face = if (right_corner == kInvalidCorner) kInvalidFace else right_corner / 3;
                 const left_face = if (left_corner == kInvalidCorner) kInvalidFace else left_corner / 3;
                 if (self.faceVisitedByFace(right_face)) {
@@ -228,17 +274,17 @@ const Traverser = struct {
     }
 };
 
-fn buildTraversalMaps(alloc: std.mem.Allocator, ct: *const CornerTable) Error!TraversalMaps {
-    const num_faces = ct.numFaces();
-    const num_vertices = ct.numVertices();
-    const num_corners = ct.numCorners();
+fn buildTraversalMaps(alloc: std.mem.Allocator, view: TableView) Error!TraversalMaps {
+    const num_faces = view.numFaces();
+    const num_vertices = view.numVertices();
+    const num_corners = view.numCorners();
 
     const vertex_to_data = try alloc.alloc(i32, num_vertices);
     errdefer alloc.free(vertex_to_data);
     @memset(vertex_to_data, -1);
 
     var t = Traverser{
-        .ct = ct,
+        .view = view,
         .alloc = alloc,
         .is_face_visited = try alloc.alloc(bool, num_faces),
         .is_vertex_visited = try alloc.alloc(bool, num_vertices),
@@ -276,22 +322,22 @@ fn buildTraversalMaps(alloc: std.mem.Allocator, ct: *const CornerTable) Error!Tr
 fn computeParallelogramPrediction(
     p: usize,
     ci: u32,
-    ct: *const CornerTable,
+    view: TableView,
     vertex_to_data: []const i32,
     out: []const i32,
     nc: usize,
     pred: []i32,
 ) Error!bool {
-    if (ci >= ct.numCorners()) return Error.Corrupt;
-    const oci = ct.opposite(ci);
+    if (ci >= view.numCorners()) return Error.Corrupt;
+    const oci = view.opposite(ci);
     if (oci == kInvalidCorner) return false;
-    if (oci >= ct.numCorners()) return Error.Corrupt;
+    if (oci >= view.numCorners()) return Error.Corrupt;
 
     // GetParallelogramEntries(oci): opp = vertex(oci), next/prev around oci.
     const num_vertices: u32 = @intCast(vertex_to_data.len);
-    const v_opp = ct.vertex(oci);
-    const v_next = ct.vertex(next(oci));
-    const v_prev = ct.vertex(previous(oci));
+    const v_opp = view.vertex(oci);
+    const v_next = view.vertex(next(oci));
+    const v_prev = view.vertex(previous(oci));
     if (v_opp >= num_vertices or v_next >= num_vertices or v_prev >= num_vertices) return Error.Corrupt;
 
     const e_opp = vertex_to_data[v_opp];
@@ -331,7 +377,7 @@ fn computeParallelogram(
     residuals: []const i32,
     out: []i32,
     nc: usize,
-    ct: *const CornerTable,
+    view: TableView,
     maps: *const TraversalMaps,
     wt: WrapTransform,
     pred: []i32,
@@ -345,7 +391,7 @@ fn computeParallelogram(
     while (p < corner_map_size) : (p += 1) {
         const ci = maps.data_to_corner[p];
         const dst = p * nc;
-        if (try computeParallelogramPrediction(p, ci, ct, maps.vertex_to_data, out, nc, pred)) {
+        if (try computeParallelogramPrediction(p, ci, view, maps.vertex_to_data, out, nc, pred)) {
             c = 0;
             while (c < nc) : (c += 1) out[dst + c] = wt.originalValue(pred[c], residuals[dst + c]);
         } else {
@@ -381,6 +427,24 @@ pub fn inversePredict(
     num_components: u8,
     conn: *const draco.Connectivity,
 ) Error![]i32 {
+    return inversePredictView(alloc, header, residuals, num_components, .{ .ct = &conn.corner_table, .attr = null }, conn.num_points);
+}
+
+/// Generalized inverse over a `TableView`. `num_value_verts` is the attribute's
+/// vertex count (`view.numVertices()`): `conn.num_points` for the base table,
+/// `attr_map.numVertices()` for a seamed attribute. Returns owned `[]i32`
+/// (`num_value_verts * nc`) re-indexed into per-(attr-)vertex order.
+///
+/// `attr == null` reproduces `inversePredict`'s legacy base-table behavior
+/// byte-for-byte (the POSITION goldens are the regression gate).
+pub fn inversePredictView(
+    alloc: std.mem.Allocator,
+    header: attributes.DecodedAttrHeader,
+    residuals: []const i32,
+    num_components: u8,
+    view: TableView,
+    num_value_verts: usize,
+) Error![]i32 {
     const nc: usize = num_components;
     if (nc == 0) return Error.Corrupt;
     if (header.num_components != num_components) return Error.Corrupt;
@@ -391,28 +455,27 @@ pub fn inversePredict(
         else => return Error.UnsupportedDracoFeature,
     }
 
-    const num_points: usize = conn.num_points;
+    const num_points: usize = num_value_verts;
     if (residuals.len != num_points * nc) return Error.Corrupt;
     if (num_points == 0) return alloc.alloc(i32, 0);
 
-    const ct = &conn.corner_table;
-    // `ct.numVertices()` is the corner table's *physical* `vertex_corners.items.len`,
-    // which only ever grows (`addNewVertex`, used for topology-split handling —
-    // see `edgebreaker.zig`'s "Remove vertices that were marked as isolated"
-    // step). That step logically shrinks the live vertex count back down to
-    // `num_points` by remapping every corner reference below `num_points` and
+    // `view.numVertices()` is the corner table's *physical* vertex count, which
+    // only ever grows (`addNewVertex`, used for topology-split handling — see
+    // `edgebreaker.zig`'s "Remove vertices that were marked as isolated" step).
+    // That step logically shrinks the live vertex count back down to
+    // `num_value_verts` by remapping every corner reference below it and
     // marking the (now-unreferenced) tail slots isolated, but it does not
     // truncate the backing array — so for genus>0 meshes that hit topology
-    // splits during traversal (e.g. a torus), `ct.numVertices()` (104 here)
-    // legitimately exceeds `num_points` (96): the extra slots are dead, never
-    // targeted by any corner, and `buildTraversalMaps` below only ever visits
-    // vertices reachable from a real face corner, so it never touches them.
-    // Reject only when the array is *too small* to hold `num_points` — that's
-    // the real corruption signal; equality was an over-strict leftover from
-    // the split-free (quad/cube) fixtures that never exercised this path.
-    if (ct.numVertices() < num_points) return Error.Corrupt;
+    // splits during traversal (e.g. a torus), `view.numVertices()` (104 here)
+    // legitimately exceeds `num_value_verts` (96): the extra slots are dead,
+    // never targeted by any corner, and `buildTraversalMaps` below only ever
+    // visits vertices reachable from a real face corner, so it never touches
+    // them. Reject only when the array is *too small* to hold `num_value_verts`
+    // — that's the real corruption signal; equality was an over-strict leftover
+    // from the split-free (quad/cube) fixtures that never exercised this path.
+    if (view.numVertices() < num_points) return Error.Corrupt;
 
-    var maps = try buildTraversalMaps(alloc, ct);
+    var maps = try buildTraversalMaps(alloc, view);
     defer maps.deinit(alloc);
     // Every vertex must have been assigned exactly one data entry.
     if (maps.num_values != num_points or maps.data_to_corner.len != num_points) return Error.Corrupt;
@@ -427,10 +490,10 @@ pub fn inversePredict(
     } else {
         const pred = try alloc.alloc(i32, nc);
         defer alloc.free(pred);
-        try computeParallelogram(residuals, out_data, nc, ct, &maps, wt, pred);
+        try computeParallelogram(residuals, out_data, nc, view, &maps, wt, pred);
     }
 
-    // Re-index data-entry order -> per-point (== per-vertex) order.
+    // Re-index data-entry order -> per-(attr-)vertex order.
     const result = try alloc.alloc(i32, num_points * nc);
     errdefer alloc.free(result);
     var v: usize = 0;
@@ -454,12 +517,18 @@ pub fn inversePredict(
 /// `num_points` (`vertex_to_data[v]` == the data entry that decoded vertex `v`);
 /// caller frees. Never panics on malformed connectivity.
 pub fn buildVertexToData(alloc: std.mem.Allocator, conn: *const draco.Connectivity) Error![]i32 {
-    const ct = &conn.corner_table;
-    if (ct.numVertices() < conn.num_points) return Error.Corrupt;
-    const maps = try buildTraversalMaps(alloc, ct);
+    return buildVertexToDataView(alloc, .{ .ct = &conn.corner_table, .attr = null }, conn.num_points);
+}
+
+/// `buildVertexToData` generalized over a `TableView` — the seam-aware variant
+/// Task 4 uses for attributes that decode over their own `MeshAttrCornerTable`.
+/// `attr == null` reproduces the base-table map exactly.
+pub fn buildVertexToDataView(alloc: std.mem.Allocator, view: TableView, num_value_verts: usize) Error![]i32 {
+    if (view.numVertices() < num_value_verts) return Error.Corrupt;
+    const maps = try buildTraversalMaps(alloc, view);
     alloc.free(maps.data_to_corner);
     errdefer alloc.free(maps.vertex_to_data);
-    if (maps.num_values != conn.num_points) return Error.Corrupt;
+    if (maps.num_values != num_value_verts) return Error.Corrupt;
     return maps.vertex_to_data;
 }
 
@@ -524,7 +593,7 @@ test "traversal maps: single triangle → data-entry order v1,v2,v0" {
     const a = std.testing.allocator;
     var conn = try singleTriangle(a);
     defer conn.deinit();
-    var maps = try buildTraversalMaps(a, &conn.corner_table);
+    var maps = try buildTraversalMaps(a, .{ .ct = &conn.corner_table, .attr = null });
     defer maps.deinit(a);
     try std.testing.expectEqual(@as(usize, 3), maps.num_values);
     // vertex_to_data[v]: v0→2, v1→0, v2→1.
@@ -585,7 +654,7 @@ test "computeParallelogramPrediction: true branch = next + prev - opp" {
     //   e0(v0)=(10,100)  e1(v1)=(20,200)  e2(v2)=(30,300)
     const out_data = [_]i32{ 10, 100, 20, 200, 30, 300 };
     var pred = [_]i32{ 0, 0 };
-    const ok = try computeParallelogramPrediction(3, 4, &ct, &vertex_to_data, &out_data, 2, &pred);
+    const ok = try computeParallelogramPrediction(3, 4, .{ .ct = &ct, .attr = null }, &vertex_to_data, &out_data, 2, &pred);
     try std.testing.expect(ok);
     // pred = next(v1) + prev(v2) - opp(v0) = (20+30-10, 200+300-100) = (40, 400).
     try std.testing.expectEqual(@as(i32, 40), pred[0]);
@@ -593,7 +662,7 @@ test "computeParallelogramPrediction: true branch = next + prev - opp" {
 
     // Same corner but with a tip entry not yet decoded (>= p) → no prediction.
     const vtd_future = [_]i32{ 0, 5, 2, 3 }; // v1 mapped to 5 > p=3
-    try std.testing.expect(!try computeParallelogramPrediction(3, 4, &ct, &vtd_future, &out_data, 2, &pred));
+    try std.testing.expect(!try computeParallelogramPrediction(3, 4, .{ .ct = &ct, .attr = null }, &vtd_future, &out_data, 2, &pred));
 }
 
 test "inversePredict rejects unsupported scheme/transform/traversal" {
@@ -610,4 +679,36 @@ test "inversePredict rejects unsupported scheme/transform/traversal" {
     h = diffHeader(method_difference);
     h.traversal_method = 1; // PREDICTION_DEGREE
     try std.testing.expectError(Error.UnsupportedDracoFeature, inversePredict(a, h, &residuals, 1, &conn));
+}
+
+test "TableView(attr): traversal covers attr vertices, seam-aware opposite" {
+    const a = std.testing.allocator;
+    var ct = try CornerTable.initEmpty(a, 2, 4);
+    defer ct.deinit();
+    _ = try ct.addNewVertex();
+    _ = try ct.addNewVertex();
+    _ = try ct.addNewVertex();
+    _ = try ct.addNewVertex();
+    ct.mapCornerToVertex(0, 0);
+    ct.mapCornerToVertex(1, 1);
+    ct.mapCornerToVertex(2, 2);
+    ct.mapCornerToVertex(3, 0);
+    ct.mapCornerToVertex(4, 2);
+    ct.mapCornerToVertex(5, 3);
+    ct.setOpposite(1, 5);
+    ct.setOpposite(5, 1);
+    ct.setLeftMostCorner(0, 3);
+    ct.setLeftMostCorner(1, 1);
+    ct.setLeftMostCorner(2, 2);
+    ct.setLeftMostCorner(3, 5);
+    var m = try MeshAttrCornerTable.init(a, &ct);
+    defer m.deinit();
+    m.addSeamEdge(1, &ct);
+    try m.recomputeVertices(&ct);
+    // Seam-aware Opposite across the seam edge is invalid.
+    try std.testing.expectEqual(@as(u32, corner_table.kInvalidCorner), m.opposite(1, &ct));
+    const view = TableView{ .ct = &ct, .attr = &m };
+    var maps = try buildTraversalMaps(a, view);
+    defer maps.deinit(a);
+    try std.testing.expectEqual(@as(usize, 6), maps.num_values); // attr vertices, not 4
 }

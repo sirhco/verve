@@ -130,6 +130,49 @@ pub const MeshAttrCornerTable = struct {
         return self.vertex_to_left_most_corner_map_.items[v];
     }
 
+    // -- Public seam-aware ops (port of `mesh_attribute_corner_table.h` inlines).
+    // Each takes the base `ct` as a parameter — this struct stores no CornerTable
+    // pointer (lifetime rule). `attr == null` in `TableView` selects the base
+    // table's ops instead; these are the seam-aware variants.
+
+    pub fn opposite(self: *const MeshAttrCornerTable, c: u32, ct: *const draco.CornerTable) u32 {
+        return self.oppositeMod(ct, c);
+    }
+    pub fn swingRight(self: *const MeshAttrCornerTable, c: u32, ct: *const draco.CornerTable) u32 {
+        // Previous(Opposite(Previous(c)))
+        return prevG(self.oppositeMod(ct, prevG(c)));
+    }
+    pub fn swingLeft(self: *const MeshAttrCornerTable, c: u32, ct: *const draco.CornerTable) u32 {
+        return self.swingLeftMod(ct, c); // Next(Opposite(Next(c)))
+    }
+    pub fn getLeftCorner(self: *const MeshAttrCornerTable, c: u32, ct: *const draco.CornerTable) u32 {
+        return self.oppositeMod(ct, prevG(c));
+    }
+    pub fn getRightCorner(self: *const MeshAttrCornerTable, c: u32, ct: *const draco.CornerTable) u32 {
+        return self.oppositeMod(ct, nextG(c));
+    }
+    pub fn isOnBoundary(self: *const MeshAttrCornerTable, v: u32, ct: *const draco.CornerTable) bool {
+        const lmc = self.leftMostCorner(v);
+        if (lmc == kInvalidCorner) return true;
+        return self.swingLeftMod(ct, lmc) == kInvalidCorner;
+    }
+    pub fn numCorners(self: *const MeshAttrCornerTable, ct: *const draco.CornerTable) u32 {
+        _ = self;
+        return ct.numCorners();
+    }
+    pub fn numFaces(self: *const MeshAttrCornerTable, ct: *const draco.CornerTable) u32 {
+        _ = self;
+        return ct.numFaces();
+    }
+
+    /// `MeshAttributeCornerTable::IsCornerOnSeam`: true when the corner's base
+    /// position vertex lies on any attribute seam.
+    pub fn isCornerOnSeam(self: *const MeshAttrCornerTable, c: u32, ct: *const draco.CornerTable) bool {
+        const v = ct.vertex(c);
+        if (v == kInvalidVertex or v >= self.is_vertex_on_seam_.len) return false;
+        return self.is_vertex_on_seam_[v];
+    }
+
     /// `MeshAttributeCornerTable::RecomputeVertices(nullptr, nullptr)`: rebuild
     /// the attribute-vertex partition from the current seam edges. Identity
     /// vertex↔attribute-entry mapping (connectivity-only path).

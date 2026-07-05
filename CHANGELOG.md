@@ -4,6 +4,19 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.49.0] - 2026-07-04
+
+### Added
+
+- **`verve.gl` Draco per-attribute connectivity seams.** The Draco glTF decoder now handles
+  meshes where UV/normal attributes are split from the position connectivity (attribute
+  **seams**) — a faithful port of Draco's `AssignPointsToCorners` point model plus per-attribute
+  corner-table traversal/prediction. This removes the prior shared-connectivity-only limitation
+  (v0.48.0).
+- **Verified.** Seamed decode is byte-exact-golden-gated on a UV-seam fixture (`seamcube`).
+  NORMAL-seam is structurally supported by the same point model; a dedicated NORMAL-seam fixture
+  is a follow-on.
+
 ## [0.48.0] - 2026-07-04
 
 ### Added
