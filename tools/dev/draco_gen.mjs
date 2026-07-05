@@ -116,3 +116,26 @@ await genFixture('cube_nrm', CUBE_P, CUBE_I, { normals: CUBE_N });
 // (POSITION + NORMAL + TEXCOORD_0, num_attribute_data=2).
 const CUBE_UV = [0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1];
 await genFixture('cube_nrm_uv', CUBE_P, CUBE_I, { normals: CUBE_N, uvs: CUBE_UV });
+
+// ── seamcube: per-corner-expanded cube with per-face UVs → forces a UV
+// attribute connectivity seam. Draco welds the coincident positions back to
+// the 8 base cube vertices (its EDGEBREAKER connectivity is position-based),
+// while the per-face-distinct UVs split the UV corner table at every cube edge
+// → a MESH_CORNER_ATTRIBUTE with V_attr(24) > V_pos(8). Same topology as
+// `cube` (manifold/orientable), so it decodes cleanly. Identity indices.
+{
+  const P = [], UV = [], I = [];
+  for (let t = 0; t < CUBE_I.length; t += 3) {
+    const faceId = Math.floor(t / 6);            // 2 tris per quad face → 6 faces
+    for (let k = 0; k < 3; k++) {
+      const orig = CUBE_I[t + k];
+      P.push(CUBE_P[orig * 3], CUBE_P[orig * 3 + 1], CUBE_P[orig * 3 + 2]);
+      // Per-face-distinct UV block so every cube edge is a UV seam. Exact
+      // values are arbitrary (the golden captures whatever Draco emits); they
+      // only need to differ across faces at a shared position.
+      UV.push(faceId / 6, (orig % 4) / 4);
+      I.push(t + k);
+    }
+  }
+  await genFixture('seamcube', P, I, { uvs: UV });
+}

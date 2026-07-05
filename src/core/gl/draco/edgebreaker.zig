@@ -807,6 +807,22 @@ test "decodeConnectivity(cube_nrm.drc): num_attribute_data=1 accepted, indices b
     try std.testing.expectEqual(@as(usize, 1), conn.attr_maps.len);
 }
 
+const seamcube_drc = @import("draco_fixtures").seamcube_drc;
+
+test "decodeConnectivity(seamcube.drc): UV attr corner table splits (seam present)" {
+    const a = std.testing.allocator;
+    var buf = draco.DecoderBuffer.init(seamcube_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    // Base position vertices welded to 8; the single UV attribute corner table
+    // splits to 24 (a real seam: numVertices() > num_points).
+    try std.testing.expectEqual(@as(u32, 8), conn.num_points);
+    try std.testing.expectEqual(@as(usize, 1), conn.attr_maps.len);
+    try std.testing.expect(conn.attr_maps[0].numVertices() > conn.num_points);
+    try std.testing.expectEqual(@as(u32, 24), conn.attr_maps[0].numVertices());
+}
+
 test "decodeEvents rejects num_topology_splits > num_faces" {
     const a = std.testing.allocator;
     const bytes = [_]u8{1}; // num_topology_splits = 1

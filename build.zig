@@ -1353,6 +1353,8 @@ fn buildDracoFixtures(b: *std.Build) *std.Build.Module {
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube.glb"), "cube.glb");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm.glb"), "cube_nrm.glb");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm_uv.glb"), "cube_nrm_uv.glb");
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/seamcube.drc"), "seamcube.drc");
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/seamcube.glb"), "seamcube.glb");
     const gen = wf.add("draco_fixtures.zig",
         \\pub const quad_drc = @embedFile("quad.drc");
         \\pub const cube_drc = @embedFile("cube.drc");
@@ -1362,6 +1364,8 @@ fn buildDracoFixtures(b: *std.Build) *std.Build.Module {
         \\pub const cube_glb = @embedFile("cube.glb");
         \\pub const cube_nrm_glb = @embedFile("cube_nrm.glb");
         \\pub const cube_nrm_uv_glb = @embedFile("cube_nrm_uv.glb");
+        \\pub const seamcube_drc = @embedFile("seamcube.drc");
+        \\pub const seamcube_glb = @embedFile("seamcube.glb");
         \\
     );
     return b.createModule(.{ .root_source_file = gen });
