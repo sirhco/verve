@@ -29,6 +29,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/gl-post", renderGlPost),
     verve.Route.init("/gl-double", renderGlDouble),
     verve.Route.init("/gl-cull", renderGlCull),
+    verve.Route.init("/gl-draco", renderGlDraco),
     verve.Route.init("/gl-instanced", renderGlInstanced),
     verve.Route.init("/gl-instanced-multi", renderGlInstancedMulti),
     verve.Route.init("/gl-instanced-cull", renderGlInstancedCull),
@@ -173,6 +174,11 @@ fn renderGlDouble(ctx: *verve.Context) !*verve.Node {
 
 fn renderGlCull(ctx: *verve.Context) !*verve.Node {
     const body = try components.glSceneCull(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderGlDraco(ctx: *verve.Context) !*verve.Node {
+    const body = try components.glSceneDraco(ctx);
     return components.page(ctx, body);
 }
 

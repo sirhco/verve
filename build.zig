@@ -657,6 +657,25 @@ pub fn build(b: *std.Build) void {
     const gl_ltc_gen_run = b.addRunArtifact(gl_ltc_gen_exe);
     const ltc_bin_path = gl_ltc_gen_run.addOutputFileArg("ltc.bin");
 
+    // Draco demo asset: the committed real Blender KHR_draco glb → dracotest.vmesh
+    // (exercises the real parseGlb-Draco → Model → vmesh.pack pipeline at build
+    // time). Guarded like `tests_present` so a stripped `tests/` degrades to no
+    // asset (the /gl-draco route then just shows its poster).
+    const draco_demo_present = blk: {
+        const io_h = b.graph.io;
+        var probe = b.build_root.handle.openDir(io_h, "tests/fixtures/draco", .{}) catch break :blk false;
+        probe.close(io_h);
+        break :blk true;
+    };
+    var dracotest_vmesh: ?std.Build.LazyPath = null;
+    if (draco_demo_present) {
+        const gl_asset_gen_dracotest_run = b.addRunArtifact(gl_asset_gen_exe);
+        gl_asset_gen_dracotest_run.addFileArg(b.path("tests/fixtures/draco/draco_test.glb"));
+        const dracotest_dir = gl_asset_gen_dracotest_run.addOutputDirectoryArg("dracotest");
+        gl_asset_gen_dracotest_run.addArg("dracotest");
+        dracotest_vmesh = dracotest_dir.path(b, "dracotest.vmesh");
+    }
+
     // Embed the generated assets into a gl_assets.zig source that the server
     // imports. Pattern mirrors the island_chunks embedded table above.
     const wf_gl = b.addWriteFiles();
@@ -683,6 +702,7 @@ pub fn build(b: *std.Build) void {
     _ = wf_gl.addCopyFile(morph_dir.path(b, "morph.vmesh"), "morph.vmesh");
     _ = wf_gl.addCopyFile(morph16_dir.path(b, "morph16.vmesh"), "morph16.vmesh");
     _ = wf_gl.addCopyFile(lod_dir.path(b, "lodsphere.vmesh"), "lodsphere.vmesh");
+    if (dracotest_vmesh) |vp| _ = wf_gl.addCopyFile(vp, "dracotest.vmesh");
     _ = wf_gl.addCopyFile(studio_dir.path(b, "studio.venv"), "studio.venv");
     _ = wf_gl.addCopyFile(ltc_bin_path, "ltc.bin");
     const gl_assets_src =
