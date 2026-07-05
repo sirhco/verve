@@ -959,6 +959,25 @@ test "AssignPointsToCorners: cube_nrm_uv (no seam) → point id == vertex id (re
     try std.testing.expectEqualSlices(u32, &want, conn.indices);
 }
 
+const torus_nrm_uv_drc = @import("draco_fixtures").torus_nrm_uv_drc;
+
+test "seam/split fixture: torus_nrm_uv has splits AND attributes (phantom vertices)" {
+    const a = std.testing.allocator;
+    var hb = draco.DecoderBuffer.init(torus_nrm_uv_drc);
+    _ = try draco.parseHeader(&hb);
+    _ = try beginConnectivity(&hb);
+    const h = try parseConnHeader(&hb);
+    try std.testing.expect(h.num_encoded_split_symbols > 0); // topology splits present
+    try std.testing.expectEqual(@as(u8, 2), h.num_attribute_data); // NORMAL + UV
+    var b = draco.DecoderBuffer.init(torus_nrm_uv_drc);
+    _ = try draco.parseHeader(&b);
+    var conn = try decodeConnectivity(a, &b);
+    defer conn.deinit();
+    // Phantom split-vertices persist because attribute data suppresses removal:
+    try std.testing.expect(conn.num_points > conn.num_output_points);
+    try std.testing.expectEqual(@as(u32, 96), conn.num_output_points);
+}
+
 test "decodeEvents rejects num_topology_splits > num_faces" {
     const a = std.testing.allocator;
     const bytes = [_]u8{1}; // num_topology_splits = 1

@@ -316,8 +316,17 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
     // ── PHASE 3 — `DecodeAllAttributes`, decoder 0 (POSITION) only ──
     // The value-section read is shared with the TEXCOORD decoder (same
     // parallelogram+WRAP+quant wire shape) via `readValueSection`. POSITION is
-    // always a base attribute → `num_value_verts = conn.num_points`.
-    const vs = try readValueSection(alloc, buf, conn.num_points, num_components, traversal_method);
+    // always a base attribute, but the authoritative value count is the
+    // traversal's *reachable-vertex* count (`buildTraversalMaps(view).num_values`
+    // == Draco's `MeshTraversalSequencer` sequence length), NOT `conn.num_points`
+    // — for a splits+attributes mesh Draco leaves phantom split-vertices in
+    // `num_points` that the traversal never emits a value for. Reading with
+    // `conn.num_points` would over-read the residual blob and corrupt every later
+    // attribute section.
+    const pos_view = draco.TableView{ .ct = &conn.corner_table, .attr = null };
+    var pos_maps = try draco.buildTraversalMaps(alloc, pos_view);
+    defer pos_maps.deinit(alloc);
+    const vs = try readValueSection(alloc, buf, pos_maps.num_values, num_components, traversal_method);
 
     return .{
         .header = vs.header,
@@ -358,8 +367,11 @@ fn readValueSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, num_value_ver
     if (transform_type != transform_wrap) return Error.UnsupportedDracoFeature;
 
     // `SequentialIntegerAttributeDecoder::DecodeIntegerValues`: the value blob.
-    // `num_value_verts` is the attribute's vertex count — `conn.num_points` for a
-    // base/position attribute, `attr_map.numVertices()` for a seamed corner attr.
+    // `num_value_verts` is the traversal's reachable-vertex count for this
+    // attribute (`buildTraversalMaps(view).num_values`) — the base view's for
+    // POSITION/vertex-attrs, `attr_map.numVertices()` for a seamed corner attr.
+    // NOT `conn.num_points`, which for attribute meshes over-counts by the
+    // phantom split-vertices Draco leaves un-removed.
     const num_values: usize = num_value_verts * @as(usize, num_components);
     const residuals = try alloc.alloc(i32, num_values);
     errdefer alloc.free(residuals);
@@ -413,7 +425,7 @@ fn readValueSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, num_value_ver
     // `PredictionSchemeDecoder::DecodePredictionData` ->
     // `PredictionSchemeWrapDecodingTransform::DecodeTransformData` — the WRAP
     // clamp bounds, 2x `int32_t` (`DataTypeT` post-quantization). Consumed only
-    // to advance `buf`; `inversePredict` re-derives/uses these for the unwrap.
+    // to advance `buf`; `predictValues` re-derives/uses these for the unwrap.
     const wrap_min = try buf.readInt(i32);
     const wrap_max = try buf.readInt(i32);
     if (wrap_min > wrap_max) return Error.Corrupt;
@@ -428,71 +440,58 @@ fn readValueSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, num_value_ver
     };
 }
 
-/// End-to-end decode of one parallelogram+WRAP+quantization attribute value
-/// section into per-point `f32`s: `readValueSection` (prediction metadata +
-/// residual entropy stream + WRAP bounds + quant params) → `inversePredict`
-/// (parallelogram/difference inverse over `conn`'s corner table, per-point
-/// quantized ints) → `dequantize`. `buf` must be positioned at the section's
-/// first byte. Shared by POSITION (`num_components == 3`) and TEXCOORD
-/// (`num_components == 2`). Returns owned `[]f32` (`num_points * num_components`,
-/// decoded-vertex order). Never panics.
-fn decodeParallelogramAttr(alloc: std.mem.Allocator, buf: *DecoderBuffer, num_components: u8, traversal_method: u8, view: draco.TableView, num_value_verts: usize) Error![]f32 {
-    const vs = try readValueSection(alloc, buf, num_value_verts, num_components, traversal_method);
-    defer alloc.free(vs.residuals);
-    return finishParallelogramAttr(alloc, vs.header, vs.residuals, num_components, view, num_value_verts);
-}
-
-/// Prediction inverse + dequantization shared by POSITION and TEXCOORD:
-/// `inversePredictView` (per-(attr-)vertex quantized ints over `view`) →
-/// `dequantize` per component. `num_components` selects the component stride for
-/// `dequantize`'s `min[comp]`; `num_value_verts` is the attribute's vertex count
-/// (`view.numVertices()`). Returns owned `[]f32` (`num_value_verts * nc`) in
-/// per-(attr-)vertex order — the caller expands it to per-point order.
-fn finishParallelogramAttr(alloc: std.mem.Allocator, header: DecodedAttrHeader, residuals: []const i32, num_components: u8, view: draco.TableView, num_value_verts: usize) Error![]f32 {
+/// Decode a parallelogram+WRAP+quantization attribute to per-point `f32`s.
+/// Builds the traversal maps first (their `num_values` is the authoritative
+/// value count = reachable-vertex count, NOT `conn.num_points`), reads the value
+/// section with that count, predicts in data-entry order, dequantizes, and
+/// expands to `num_output_points`. Shared by TEXCOORD (nc=2), base or seamed
+/// `view`. `buf` must be positioned at the section's first byte. Returns owned
+/// `[]f32` (`num_output_points * nc`). Never panics.
+fn decodeParallelogramAttr(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity, num_components: u8, traversal_method: u8, view: draco.TableView) Error![]f32 {
     const nc: usize = num_components;
-    const q = try draco.inversePredictView(alloc, header, residuals, num_components, view, num_value_verts);
+    var maps = try draco.buildTraversalMaps(alloc, view);
+    defer maps.deinit(alloc);
+    const vs = try readValueSection(alloc, buf, maps.num_values, num_components, traversal_method);
+    defer alloc.free(vs.residuals);
+    const q = try draco.predictValues(alloc, vs.header, vs.residuals, num_components, view, &maps);
     defer alloc.free(q);
-    const values = try alloc.alloc(f32, q.len);
-    errdefer alloc.free(values);
+    const values_de = try alloc.alloc(f32, q.len);
+    defer alloc.free(values_de);
     for (q, 0..) |qi, i| {
         // Post-WRAP quantized values are clamped into `[wrap_min, wrap_max]`,
         // which for a quantized attribute is `[0, (1<<bits)-1]` — always
         // non-negative. Guard rather than `@intCast`-panic on a corrupt stream.
         if (qi < 0) return Error.Corrupt;
-        values[i] = attr_quant.dequantize(@intCast(qi), i % nc, header.quant);
+        values_de[i] = attr_quant.dequantize(@intCast(qi), i % nc, vs.header.quant);
     }
-    return values;
+    return expandToPoints(alloc, conn, values_de, nc, view, maps.vertex_to_data);
 }
 
-/// Expand per-(attr-)vertex `values` (nc components each) to per-point order.
-/// For each of `conn.num_output_points` points, resolve its representative
-/// corner (`conn.point_to_corner[p]`) → the attribute vertex on that corner
-/// (`view.vertexPub`) → its decoded value. Returns an owned `[]f32`
-/// (`num_output_points * nc`) that lines up 1:1 with `conn.indices`.
-///
-/// Fast path: when `conn.point_to_corner` is empty (position-only stream — no
-/// attribute dedup ran), per-point == per-vertex, so this is the identity dupe of
-/// `values`. For a 0-seam attribute mesh (cube_nrm/cube_nrm_uv) the map is
-/// non-empty but point id == vertex id, so the expansion is still an identity in
-/// value (regression-safe — the POSITION/NORMAL/TEXCOORD goldens are unchanged).
-/// Never panics — a corner/vertex out of range maps to `Error.Corrupt`.
-fn expandToPoints(alloc: std.mem.Allocator, conn: *const Connectivity, values: []const f32, nc: usize, view: draco.TableView) Error![]f32 {
-    if (conn.point_to_corner.len == 0) {
-        // Position-only / no attribute dedup: per-point == per-vertex.
-        return alloc.dupe(f32, values);
-    }
+/// Expand data-entry-order `values` to per-point order. For each of
+/// `conn.num_output_points` points, resolve its representative corner
+/// (`conn.point_to_corner[p]`) → the attribute vertex (`view.vertexPub`) →
+/// its data entry (`vertex_to_data[vertex]`) → the value. Mirrors Draco's
+/// `MeshTraversalSequencer::UpdatePointToAttributeIndexMapping`. Position-only
+/// streams (no attribute dedup) have an empty `point_to_corner`; there point id
+/// == vertex id, so the corner step is skipped. Returns owned `[]f32`
+/// (`num_output_points * nc`). Never panics — out-of-range maps to `Corrupt`.
+fn expandToPoints(alloc: std.mem.Allocator, conn: *const Connectivity, values: []const f32, nc: usize, view: draco.TableView, vertex_to_data: []const i32) Error![]f32 {
     const n = conn.num_output_points;
+    const has_points = conn.point_to_corner.len > 0;
     const out = try alloc.alloc(f32, @as(usize, n) * nc);
     errdefer alloc.free(out);
     var p: usize = 0;
     while (p < n) : (p += 1) {
-        const corner = conn.point_to_corner[p];
-        // Corners are internally constructed and never exceed the table, but the
-        // vertex accessor indexes by corner — guard rather than let a corrupt
-        // `point_to_corner` entry run off the corner table (never-panic invariant).
-        if (corner >= conn.corner_table.numCorners()) return Error.Corrupt;
-        const av = view.vertexPub(corner); // per-point attribute vertex
-        const src: usize = @as(usize, av) * nc;
+        const vtx: u32 = blk: {
+            if (!has_points) break :blk @intCast(p); // position-only: point == vertex
+            const corner = conn.point_to_corner[p];
+            if (corner >= conn.corner_table.numCorners()) return Error.Corrupt;
+            break :blk view.vertexPub(corner);
+        };
+        if (vtx >= vertex_to_data.len) return Error.Corrupt;
+        const de = vertex_to_data[vtx];
+        if (de < 0) return Error.Corrupt; // a live vertex must have a data entry
+        const src: usize = @as(usize, @intCast(de)) * nc;
         if (src + nc > values.len) return Error.Corrupt;
         var c: usize = 0;
         while (c < nc) : (c += 1) out[p * nc + c] = values[src + c];
@@ -521,23 +520,27 @@ fn expandToPoints(alloc: std.mem.Allocator, conn: *const Connectivity, values: [
 ///   5. `DecodeDataNeededByPortableTransform` → `AttributeOctahedronTransform::
 ///      DecodeParameters`: `quantization_bits` (u8), the box `StoreValues` uses.
 ///   6. `StoreValues` (`InverseTransformAttribute`):
-///      `QuantizedOctahedralCoordsToUnitVector(s,t)` per entry → 3 f32s, then
-///      re-index data-entry order → per-(attr-)vertex order (`buildVertexToDataView`
-///      over `view`). For a shared-connectivity normal (MESH_VERTEX_ATTRIBUTE)
-///      `view` is the base table and `num_value_verts == conn.num_points`; for a
-///      seamed normal it is `conn.attr_maps[att_data_id]` — the caller then
-///      expands per-attr-vertex → per-point (`expandToPoints`).
+///      `QuantizedOctahedralCoordsToUnitVector(s,t)` per entry → 3 f32s in
+///      data-entry order, then expand data-entry → per-point order via
+///      `MeshTraversalSequencer::UpdatePointToAttributeIndexMapping`
+///      (`expandToPoints` over `maps.vertex_to_data`). For a shared-connectivity
+///      normal (MESH_VERTEX_ATTRIBUTE) `view` is the base table; for a seamed
+///      normal it is `conn.attr_maps[att_data_id]`.
 ///
-/// Returns owned `[]f32` (`num_value_verts*3`, per-(attr-)vertex order). Never
-/// panics.
-fn decodeNormals(alloc: std.mem.Allocator, buf: *DecoderBuffer, view: draco.TableView, num_value_verts: usize) Error![]f32 {
+/// Returns owned per-POINT normals (`conn.num_output_points * 3`). Never panics.
+fn decodeNormals(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity, view: draco.TableView) Error![]f32 {
     // ── (1) DecodeValues: prediction metadata ──
     const scheme_method = try buf.readInt(i8);
     if (scheme_method != prediction_difference) return Error.UnsupportedDracoFeature;
     const transform_type = try buf.readInt(i8);
     if (transform_type != transform_octahedron_canonicalized) return Error.UnsupportedDracoFeature;
 
-    const num_points: usize = num_value_verts;
+    // The authoritative value count is the traversal's reachable-vertex count
+    // (Draco's sequence length), NOT `conn.num_points` — split-vertices left in
+    // `num_points` by a splits+attributes mesh never get a decoded normal.
+    var maps = try draco.buildTraversalMaps(alloc, view);
+    defer maps.deinit(alloc);
+    const num_points: usize = maps.num_values;
     const nc: usize = 2; // octahedral (s,t) — `GetNumValueComponents() == 2`
     const num_values: usize = num_points * nc;
 
@@ -601,22 +604,17 @@ fn decodeNormals(alloc: std.mem.Allocator, buf: *DecoderBuffer, view: draco.Tabl
     if (quantization_bits < 2 or quantization_bits > 30) return Error.UnsupportedDracoFeature;
     const box_store = OctahedronToolBox.init(quantization_bits);
 
-    // ── (6) StoreValues: (s,t) → unit vector, re-indexed to per-(attr-)vertex order ──
-    const vtd = try draco.buildVertexToDataView(alloc, view, num_value_verts);
-    defer alloc.free(vtd);
-    const normals = try alloc.alloc(f32, num_points * 3);
-    errdefer alloc.free(normals);
-    var v: usize = 0;
-    while (v < num_points) : (v += 1) {
-        const e = vtd[v];
-        if (e < 0 or @as(usize, @intCast(e)) >= num_points) return Error.Corrupt;
-        const eu: usize = @intCast(e);
-        const vec = box_store.quantizedOctahedralCoordsToUnitVector(out_st[eu * nc], out_st[eu * nc + 1]);
-        normals[v * 3 + 0] = vec[0];
-        normals[v * 3 + 1] = vec[1];
-        normals[v * 3 + 2] = vec[2];
+    // ── (6) StoreValues → data-entry-order f32, then expand to points ──
+    const store_de = try alloc.alloc(f32, num_points * 3);
+    defer alloc.free(store_de);
+    var e: usize = 0;
+    while (e < num_points) : (e += 1) {
+        const vec = box_store.quantizedOctahedralCoordsToUnitVector(out_st[e * nc], out_st[e * nc + 1]);
+        store_de[e * 3 + 0] = vec[0];
+        store_de[e * 3 + 1] = vec[1];
+        store_de[e * 3 + 2] = vec[2];
     }
-    return normals;
+    return expandToPoints(alloc, conn, store_de, 3, view, maps.vertex_to_data);
 }
 
 /// Decoded POSITION values, `num_output_points * 3` `f32`s in per-point order
@@ -651,12 +649,15 @@ pub const PositionData = struct {
 
 /// End-to-end decode of POSITION (decoder 0) + optional NORMAL (decoder 1) +
 /// optional TEXCOORD (decoder 2): header + residual entropy stream
-/// (`parseAttrSection`) → prediction inverse (`predict_mesh.inversePredict`) →
-/// dequantization. POSITION and TEXCOORD share `finishParallelogramAttr` /
-/// `decodeParallelogramAttr` (identical parallelogram+WRAP+quant wire shape,
-/// differing only in `num_components`); NORMAL uses `decodeNormals`. `buf` must
-/// be positioned right after `decodeConnectivity`. Returns owned `PositionData`
-/// (`values.len == num_points * 3`, decoded-vertex order). Never panics on
+/// (`parseAttrSection`) → data-entry-order prediction inverse
+/// (`predict_mesh.predictValues`) → dequantization → per-point expansion
+/// (`expandToPoints`). POSITION inlines the predict/dequant/expand; TEXCOORD
+/// shares `decodeParallelogramAttr` (identical parallelogram+WRAP+quant wire
+/// shape, differing only in `num_components`); NORMAL uses `decodeNormals`. All
+/// three resolve their value count from the traversal's reachable-vertex count
+/// (`buildTraversalMaps(view).num_values`), NOT `conn.num_points`. `buf` must be
+/// positioned right after `decodeConnectivity`. Returns owned `PositionData`
+/// (`values.len == num_output_points * 3`, per-point order). Never panics on
 /// malformed input — bounds/consistency violations map to `draco.Error`.
 pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity) Error!PositionData {
     const section = try parseAttrSection(alloc, buf, conn);
@@ -676,11 +677,22 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
     }
 
     // POSITION (decoder 0): always a base attribute (no per-attribute seams on
-    // the position itself). Decode per-base-vertex, then expand to per-point.
+    // the position itself). `parseAttrSection` already read the residual section
+    // using the base view's reachable-vertex count (Step 5), so build the same
+    // base-view maps here, predict in data-entry order, dequantize, and expand
+    // to per-point order.
     const pos_view = draco.TableView{ .ct = &conn.corner_table, .attr = null };
-    const pos_per_vtx = try finishParallelogramAttr(alloc, h, section.residuals, h.num_components, pos_view, conn.num_points);
-    defer alloc.free(pos_per_vtx);
-    const values = try expandToPoints(alloc, conn, pos_per_vtx, h.num_components, pos_view);
+    var pos_maps = try draco.buildTraversalMaps(alloc, pos_view);
+    defer pos_maps.deinit(alloc);
+    const pos_q = try draco.predictValues(alloc, h, section.residuals, h.num_components, pos_view, &pos_maps);
+    defer alloc.free(pos_q);
+    const pos_de = try alloc.alloc(f32, pos_q.len);
+    defer alloc.free(pos_de);
+    for (pos_q, 0..) |qi, i| {
+        if (qi < 0) return Error.Corrupt;
+        pos_de[i] = attr_quant.dequantize(@intCast(qi), i % @as(usize, h.num_components), h.quant);
+    }
+    const values = try expandToPoints(alloc, conn, pos_de, h.num_components, pos_view, pos_maps.vertex_to_data);
     errdefer alloc.free(values);
 
     // NORMAL decoder, if present and a supported NORMALS decoder. `buf` is
@@ -688,6 +700,7 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
     // quant params `parseAttrSection` read). A `MESH_CORNER_ATTRIBUTE` normal
     // decodes over its own seam-aware `attr_maps[att_data_id]`; a
     // `MESH_VERTEX_ATTRIBUTE` one (cube_nrm/cube_nrm_uv) over the base table.
+    // `decodeNormals` builds its own maps and expands to per-point internally.
     //
     // NOTE: no committed fixture carries a *seamed* NORMAL (seamcube has UV only,
     // num_attribute_data == 1). The corner-attr NORMAL branch below is therefore
@@ -703,20 +716,12 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
             if (ni.num_attributes != 1 or ni.att_type != geom_attr_normal or ni.num_components != 3) {
                 return Error.UnsupportedDracoFeature;
             }
-            if (ni.decoder_type == decoder_type_corner) {
-                const ai: usize = 0; // NORMAL is the first attribute-data decoder → att_data_id 0
-                if (ai >= conn.attr_maps.len) return Error.Corrupt;
-                const view = draco.TableView{ .ct = &conn.corner_table, .attr = &conn.attr_maps[ai] };
-                const nvv: usize = conn.attr_maps[ai].numVertices();
-                const per_vtx = try decodeNormals(alloc, buf, view, nvv);
-                defer alloc.free(per_vtx);
-                normals = try expandToPoints(alloc, conn, per_vtx, 3, view);
-            } else {
-                const view = draco.TableView{ .ct = &conn.corner_table, .attr = null };
-                const per_vtx = try decodeNormals(alloc, buf, view, conn.num_points);
-                defer alloc.free(per_vtx);
-                normals = try expandToPoints(alloc, conn, per_vtx, 3, view);
-            }
+            // Guard the corner-attr map index BEFORE addressing it (never-panic).
+            const nview = if (ni.decoder_type == decoder_type_corner) blk: {
+                if (conn.attr_maps.len == 0) return Error.Corrupt; // NORMAL is att_data_id 0
+                break :blk draco.TableView{ .ct = &conn.corner_table, .attr = &conn.attr_maps[0] };
+            } else draco.TableView{ .ct = &conn.corner_table, .attr = null };
+            normals = try decodeNormals(alloc, buf, conn, nview);
         }
     }
 
@@ -725,6 +730,7 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
     // section, if any). A `MESH_CORNER_ATTRIBUTE` UV (seamcube) decodes over its
     // own seam-aware `attr_maps[att_data_id]`; a `MESH_VERTEX_ATTRIBUTE` UV
     // (cube_nrm_uv, per-vertex) over the shared base corner table.
+    // `decodeParallelogramAttr` builds its own maps and expands internally.
     var texcoords: ?[]f32 = null;
     if (section.texcoord) |ti| {
         if (ti.encoder_type == seq_encoder_quantization) {
@@ -734,22 +740,14 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
             if (ti.num_attributes != 1 or ti.att_type != geom_attr_texcoord or ti.num_components != 2) {
                 return Error.UnsupportedDracoFeature;
             }
-            if (ti.decoder_type == decoder_type_corner) {
-                // att_data_id of the UV decoder: 1 when a NORMAL attr-data decoder
-                // precedes it (cube_nrm_uv), else 0 (seamcube).
-                const ai: usize = if (section.normal != null) 1 else 0;
+            // att_data_id of the UV decoder: 1 when a NORMAL attr-data decoder
+            // precedes it (cube_nrm_uv), else 0 (seamcube). Guard before addressing.
+            const ai: usize = if (section.normal != null) 1 else 0;
+            const tview = if (ti.decoder_type == decoder_type_corner) blk: {
                 if (ai >= conn.attr_maps.len) return Error.Corrupt;
-                const view = draco.TableView{ .ct = &conn.corner_table, .attr = &conn.attr_maps[ai] };
-                const nvv: usize = conn.attr_maps[ai].numVertices();
-                const per_vtx = try decodeParallelogramAttr(alloc, buf, 2, ti.traversal_method, view, nvv);
-                defer alloc.free(per_vtx);
-                texcoords = try expandToPoints(alloc, conn, per_vtx, 2, view);
-            } else {
-                const view = draco.TableView{ .ct = &conn.corner_table, .attr = null };
-                const per_vtx = try decodeParallelogramAttr(alloc, buf, 2, ti.traversal_method, view, conn.num_points);
-                defer alloc.free(per_vtx);
-                texcoords = try expandToPoints(alloc, conn, per_vtx, 2, view);
-            }
+                break :blk draco.TableView{ .ct = &conn.corner_table, .attr = &conn.attr_maps[ai] };
+            } else draco.TableView{ .ct = &conn.corner_table, .attr = null };
+            texcoords = try decodeParallelogramAttr(alloc, buf, conn, 2, ti.traversal_method, tview);
         }
     }
 
@@ -1187,4 +1185,36 @@ test "reject unsupported TEXCOORD prediction scheme (patched → tex-coords-port
     var conn = try draco.decodeConnectivity(a, &buf);
     defer conn.deinit();
     try std.testing.expectError(Error.UnsupportedDracoFeature, decodeAttributes(a, &buf, &conn));
+}
+
+test "decodeAttributes(torus_nrm_uv.drc): splits+attributes POSITION/NORMAL/TEXCOORD byte-exact" {
+    const a = std.testing.allocator;
+    const torus_nrm_uv_drc = @import("draco_fixtures").torus_nrm_uv_drc;
+    var buf = DecoderBuffer.init(torus_nrm_uv_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    var pos = try decodeAttributes(a, &buf, &conn);
+    defer pos.deinit();
+    // torus_nrm_uv is the splits+attributes gate: the mesh's connectivity leaves
+    // phantom split-vertices in `conn.num_points` that the attribute traversal
+    // never emits a value for, so the value count must be the traversal's
+    // reachable-vertex count (96), not `conn.num_points`. Baked verbatim from
+    // tests/fixtures/draco/torus_nrm_uv.golden.json (POSITION 288 / NORMAL 288 /
+    // TEXCOORD_0 192).
+    try std.testing.expectEqual(@as(usize, 96 * 3), pos.values.len);
+    const want_pos = [_]f32{
+        1.1257827281951904, -0.650155782699585, 0.000091552734375, 0.6501555442810059, -1.12578284740448, 0.000091552734375, 0.75266432762146, -1.3034425973892212, 0.49483615159988403, 0.0001647472381591797, -1.999908447265625, 0.6998534798622131, 0.0001647472381591797, -1.5051639080047607, 0.49483615159988403, 0.0001647472381591797, -1.3001465797424316, 0.000091552734375, 0.0001647472381591797, -1.5051639080047607, -0.49498260021209717, 0.75266432762146, -1.3034425973892212, -0.49498260021209717, 1.3034427165985107, -0.7526644468307495, -0.49498260021209717, 1.5051639080047607, 0.0001647472381591797, -0.49498260021209717, 1.3034427165985107, 0.75266432762146, -0.49498260021209717, 1.3001463413238525, 0.0001647472381591797, 0.000091552734375, 1.3034427165985107, -0.7526644468307495, 0.49483615159988403, 0.9998717308044434, -1.7319356203079224, 0.6998534798622131, 0.0001647472381591797, -2.4949827194213867, 0.49483615159988403, -1.2474089860916138, -2.1607580184936523, 0.49483615159988403, -0.9998718500137329, -1.7319356203079224, 0.6998534798622131, -0.7526644468307495, -1.3034425973892212, 0.49483615159988403, -0.650155782699585, -1.12578284740448, 0.000091552734375, -0.7526644468307495, -1.3034425973892212, -0.49498260021209717, 0.0001647472381591797, -1.999908447265625, -0.699999988079071, -0.9998718500137329, -1.7319356203079224, -0.699999988079071, 0.0001647472381591797, -2.4949827194213867, -0.49498260021209717, -1.2474089860916138, -2.1607580184936523, -0.49498260021209717, 0.0001647472381591797, -2.700000047683716, 0.000091552734375, -1.3499176502227783, -2.3384180068969727, 0.000091552734375, -2.3384180068969727, -1.3499176502227783, 0.000091552734375, -2.1607580184936523, -1.2474089860916138, 0.49483615159988403, -1.7319356203079224, -0.9998718500137329, 0.6998534798622131, -1.3034425973892212, -0.7526644468307495, 0.49483615159988403, -1.12578284740448, -0.650155782699585, 0.000091552734375, -1.3034425973892212, -0.7526644468307495, -0.49498260021209717, -1.7319356203079224, -0.9998718500137329, -0.699999988079071, -2.1607580184936523, -1.2474089860916138, -0.49498260021209717, -2.4949827194213867, 0.0001647472381591797, -0.49498260021209717, -2.1607580184936523, 1.2474088668823242, -0.49498260021209717, -2.700000047683716, 0.0001647472381591797, 0.000091552734375, -2.4949827194213867, 0.0001647472381591797, 0.49483615159988403, -1.999908447265625, 0.0001647472381591797, 0.6998534798622131, -1.5051639080047607, 0.0001647472381591797, 0.49483615159988403, -1.3001465797424316, 0.0001647472381591797, 0.000091552734375, -1.5051639080047607, 0.0001647472381591797, -0.49498260021209717, -1.999908447265625, 0.0001647472381591797, -0.699999988079071, -1.7319356203079224, 0.9998717308044434, -0.699999988079071, -0.9998718500137329, 1.7319352626800537, -0.699999988079071, 0.0001647472381591797, 1.999908208847046, -0.699999988079071, -1.2474089860916138, 2.1607582569122314, -0.49498260021209717, -2.3384180068969727, 1.3499176502227783, 0.000091552734375, -2.1607580184936523, 1.2474088668823242, 0.49483615159988403, -1.7319356203079224, 0.9998717308044434, 0.6998534798622131, -1.3034425973892212, 0.75266432762146, 0.49483615159988403, -1.12578284740448, 0.6501555442810059, 0.000091552734375, -1.3034425973892212, 0.75266432762146, -0.49498260021209717, -0.7526644468307495, 1.3034427165985107, -0.49498260021209717, 0.0001647472381591797, 1.5051639080047607, -0.49498260021209717, 0.75266432762146, 1.3034427165985107, -0.49498260021209717, 0.9998717308044434, 1.7319352626800537, -0.699999988079071, 0.0001647472381591797, 2.4949824810028076, -0.49498260021209717, -1.3499176502227783, 2.3384177684783936, 0.000091552734375, -1.2474089860916138, 2.1607582569122314, 0.49483615159988403, -0.9998718500137329, 1.7319352626800537, 0.6998534798622131, -0.7526644468307495, 1.3034427165985107, 0.49483615159988403, -0.650155782699585, 1.1257827281951904, 0.000091552734375, 0.0001647472381591797, 1.3001463413238525, 0.000091552734375, 0.6501555442810059, 1.1257827281951904, 0.000091552734375, 1.1257827281951904, 0.6501555442810059, 0.000091552734375, 1.5051639080047607, 0.0001647472381591797, 0.49483615159988403, 1.7319352626800537, -0.9998718500137329, 0.6998534798622131, 1.2474088668823242, -2.1607580184936523, 0.49483615159988403, 1.3499176502227783, -2.3384180068969727, 0.000091552734375, 1.2474088668823242, -2.1607580184936523, -0.49498260021209717, 0.9998717308044434, -1.7319356203079224, -0.699999988079071, 1.7319352626800537, -0.9998718500137329, -0.699999988079071, 1.999908208847046, 0.0001647472381591797, -0.699999988079071, 1.7319352626800537, 0.9998717308044434, -0.699999988079071, 1.2474088668823242, 2.1607582569122314, -0.49498260021209717, 0.0001647472381591797, 2.700000047683716, 0.000091552734375, 0.0001647472381591797, 2.4949824810028076, 0.49483615159988403, 0.0001647472381591797, 1.999908208847046, 0.6998534798622131, 0.0001647472381591797, 1.5051639080047607, 0.49483615159988403, 0.75266432762146, 1.3034427165985107, 0.49483615159988403, 1.3034427165985107, 0.75266432762146, 0.49483615159988403, 1.999908208847046, 0.0001647472381591797, 0.6998534798622131, 2.1607582569122314, -1.2474089860916138, 0.49483615159988403, 2.3384177684783936, -1.3499176502227783, 0.000091552734375, 2.1607582569122314, -1.2474089860916138, -0.49498260021209717, 2.4949824810028076, 0.0001647472381591797, -0.49498260021209717, 2.1607582569122314, 1.2474088668823242, -0.49498260021209717, 1.3499176502227783, 2.3384177684783936, 0.000091552734375, 1.2474088668823242, 2.1607582569122314, 0.49483615159988403, 0.9998717308044434, 1.7319352626800537, 0.6998534798622131, 1.7319352626800537, 0.9998717308044434, 0.6998534798622131, 2.4949824810028076, 0.0001647472381591797, 0.49483615159988403, 2.700000047683716, 0.0001647472381591797, 0.000091552734375, 2.3384177684783936, 1.3499176502227783, 0.000091552734375, 2.1607582569122314, 1.2474088668823242, 0.49483615159988403,
+    };
+    const want_nrm = [_]f32{
+        -0.866096556186676, 0.49987679719924927, 0, -0.49987679719924927, 0.866096556186676, 0, -0.3535968065261841, 0.6122466325759888, 0.7071939706802368, 0, 0, 1, 0, 0.708489179611206, 0.7057216167449951, 0, 1, 0, 0, 0.708489179611206, -0.7057216167449951, -0.3535968065261841, 0.6122466325759888, -0.7071939706802368, -0.6122464537620544, 0.3535969853401184, -0.7071939706802368, -0.7057216167449951, 0, -0.708489179611206, -0.6122466325759888, -0.3535970449447632, -0.7071939706802368, -1, 0, 0, -0.6122464537620544, 0.3535969853401184, 0.7071939706802368, 0, 0, 1, 0, -0.7057216167449951, 0.708489179611206, -0.35359689593315125, -0.6122466325759888, 0.707193911075592, 0, 0, 1, 0.3535970449447632, 0.6122466921806335, 0.707193911075592, 0.49987679719924927, 0.866096556186676, 0, 0.35359689593315125, 0.6122466325759888, -0.707193911075592, 0, 0, -1, 0, 0, -1, 0, -0.7057216167449951, -0.708489179611206, -0.35359689593315125, -0.6122466325759888, -0.707193911075592, 0, -1, 0, -0.49987679719924927, -0.866096556186676, 0, -0.866096556186676, -0.49987679719924927, 0, -0.6122466325759888, -0.3535970449447632, 0.7071939706802368, 0, 0, 1, 0.6122466921806335, 0.3535970449447632, 0.707193911075592, 0.866096556186676, 0.49987679719924927, 0, 0.6122466325759888, 0.3535970449447632, -0.7071939706802368, 0, 0, -1, -0.6122466325759888, -0.3535970449447632, -0.7071939706802368, -0.7057216167449951, 0, -0.708489179611206, -0.6122464537620544, 0.3535969853401184, -0.7071939706802368, -1, 0, 0, -0.7057216167449951, 0, 0.708489179611206, 0, 0, 1, 0.708489179611206, 0, 0.7057216167449951, 1, 0, 0, 0.708489179611206, 0, -0.7057216167449951, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, -0.3535968065261841, 0.6122466325759888, -0.7071939706802368, -0.866096556186676, 0.49987679719924927, 0, -0.6122464537620544, 0.3535969853401184, 0.7071939706802368, 0, 0, 1, 0.6122466921806335, -0.3535970449447632, 0.707193911075592, 0.866096556186676, -0.49987679719924927, 0, 0.6122466325759888, -0.3535970449447632, -0.7071939706802368, 0.35359689593315125, -0.6122466325759888, -0.707193911075592, 0, -0.7057216167449951, -0.708489179611206, -0.35359689593315125, -0.6122466325759888, -0.707193911075592, 0, 0, -1, 0, 0.708489179611206, -0.7057216167449951, -0.49987679719924927, 0.866096556186676, 0, -0.3535968065261841, 0.6122466325759888, 0.7071939706802368, 0, 0, 1, 0.3535970449447632, -0.6122466921806335, 0.707193911075592, 0.49987679719924927, -0.866096556186676, 0, 0, -1, 0, -0.49987679719924927, -0.866096556186676, 0, -0.866096556186676, -0.49987679719924927, 0, -0.7057216167449951, 0, 0.708489179611206, 0, 0, 1, 0.3535970449447632, -0.6122466921806335, 0.707193911075592, 0.49987679719924927, -0.866096556186676, 0, 0.35359689593315125, -0.6122466325759888, -0.707193911075592, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0.35359689593315125, 0.6122466325759888, -0.707193911075592, 0, 1, 0, 0, 0.708489179611206, 0.7057216167449951, 0, 0, 1, 0, -0.7057216167449951, 0.708489179611206, -0.35359689593315125, -0.6122466325759888, 0.707193911075592, -0.6122466325759888, -0.3535970449447632, 0.7071939706802368, 0, 0, 1, 0.6122466921806335, -0.3535970449447632, 0.707193911075592, 0.866096556186676, -0.49987679719924927, 0, 0.6122466325759888, -0.3535970449447632, -0.7071939706802368, 0.708489179611206, 0, -0.7057216167449951, 0.6122466325759888, 0.3535970449447632, -0.7071939706802368, 0.49987679719924927, 0.866096556186676, 0, 0.3535970449447632, 0.6122466921806335, 0.707193911075592, 0, 0, 1, 0, 0, 1, 0.708489179611206, 0, 0.7057216167449951, 1, 0, 0, 0.866096556186676, 0.49987679719924927, 0, 0.6122466921806335, 0.3535970449447632, 0.707193911075592,
+    };
+    const want_uv = [_]f32{
+        0.9166666865348816, 0.5000814199447632, 0.8333944082260132, 0.5000814199447632, 0.8333944082260132, 0.3749491572380066, 0.7498983144760132, 0.2500407099723816, 0.7498983144760132, 0.3749491572380066, 0.7498983144760132, 0.5000814199447632, 0.7498983144760132, 0.6249898672103882, 0.8333944082260132, 0.6249898672103882, 0.9166666865348816, 0.6249898672103882, 0, 0.6249898672103882, 0.083272285759449, 0.6249898672103882, 0, 0.5000814199447632, 0.9166666865348816, 0.3749491572380066, 0.8333944082260132, 0.2500407099723816, 0.7498983144760132, 0.1249084323644638, 0.6666259765625, 0.1249084323644638, 0.6666259765625, 0.2500407099723816, 0.6666259765625, 0.3749491572380066, 0.6666259765625, 0.5000814199447632, 0.6666259765625, 0.6249898672103882, 0.7498983144760132, 0.7498983144760132, 0.6666259765625, 0.7498983144760132, 0.7498983144760132, 0.8750305771827698, 0.6666259765625, 0.8750305771827698, 0.7498983144760132, 0, 0.6666259765625, 0, 0.5833536982536316, 0, 0.5833536982536316, 0.1249084323644638, 0.5833536982536316, 0.2500407099723816, 0.5833536982536316, 0.3749491572380066, 0.5833536982536316, 0.5000814199447632, 0.5833536982536316, 0.6249898672103882, 0.5833536982536316, 0.7498983144760132, 0.5833536982536316, 0.8750305771827698, 0.5000814199447632, 0.8750305771827698, 0.4165852963924408, 0.8750305771827698, 0.5000814199447632, 0, 0.5000814199447632, 0.1249084323644638, 0.5000814199447632, 0.2500407099723816, 0.5000814199447632, 0.3749491572380066, 0.5000814199447632, 0.5000814199447632, 0.5000814199447632, 0.6249898672103882, 0.5000814199447632, 0.7498983144760132, 0.4165852963924408, 0.7498983144760132, 0.33331298828125, 0.7498983144760132, 0.2500407099723816, 0.7498983144760132, 0.33331298828125, 0.8750305771827698, 0.4165852963924408, 0, 0.4165852963924408, 0.1249084323644638, 0.4165852963924408, 0.2500407099723816, 0.4165852963924408, 0.3749491572380066, 0.4165852963924408, 0.5000814199447632, 0.4165852963924408, 0.6249898672103882, 0.33331298828125, 0.6249898672103882, 0.2500407099723816, 0.6249898672103882, 0.16676843166351318, 0.6249898672103882, 0.16676843166351318, 0.7498983144760132, 0.2500407099723816, 0.8750305771827698, 0.33331298828125, 0, 0.33331298828125, 0.1249084323644638, 0.33331298828125, 0.2500407099723816, 0.33331298828125, 0.3749491572380066, 0.33331298828125, 0.5000814199447632, 0.2500407099723816, 0.5000814199447632, 0.16676843166351318, 0.5000814199447632, 0.083272285759449, 0.5000814199447632, 0, 0.3749491572380066, 0.9166666865348816, 0.2500407099723816, 0.8333944082260132, 0.1249084323644638, 0.8333944082260132, 0, 0.8333944082260132, 0.8750305771827698, 0.8333944082260132, 0.7498983144760132, 0.9166666865348816, 0.7498983144760132, 0, 0.7498983144760132, 0.083272285759449, 0.7498983144760132, 0.16676843166351318, 0.8750305771827698, 0.2500407099723816, 0, 0.2500407099723816, 0.1249084323644638, 0.2500407099723816, 0.2500407099723816, 0.2500407099723816, 0.3749491572380066, 0.16676843166351318, 0.3749491572380066, 0.083272285759449, 0.3749491572380066, 0, 0.2500407099723816, 0.9166666865348816, 0.1249084323644638, 0.9166666865348816, 0, 0.9166666865348816, 0.8750305771827698, 0, 0.8750305771827698, 0.083272285759449, 0.8750305771827698, 0.16676843166351318, 0, 0.16676843166351318, 0.1249084323644638, 0.16676843166351318, 0.2500407099723816, 0.083272285759449, 0.2500407099723816, 0, 0.1249084323644638, 0, 0, 0.083272285759449, 0, 0.083272285759449, 0.1249084323644638,
+    };
+    try std.testing.expectEqualSlices(f32, &want_pos, pos.values);
+    try std.testing.expect(pos.normals != null);
+    try std.testing.expectEqualSlices(f32, &want_nrm, pos.normals.?);
+    try std.testing.expect(pos.texcoords != null);
+    try std.testing.expectEqualSlices(f32, &want_uv, pos.texcoords.?);
 }

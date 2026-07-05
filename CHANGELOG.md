@@ -4,6 +4,19 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.49.1] - 2026-07-05
+
+### Fixed
+
+- **`verve.gl` Draco decoder: splits + attributes together.** The Draco decoder now decodes
+  meshes that carry BOTH topology-split symbols AND non-position attributes (the common
+  real-world Blender export case) — previously rejected with an internal error, because the
+  attribute value count was taken from `num_points` (which includes Draco's un-removed
+  phantom split-vertices) instead of the traversal's reachable-vertex count. Now adopts
+  Draco's data-entry value model.
+- **Verified.** Gated by a `torus_nrm_uv` byte-exact golden plus a real 8352-vertex Blender
+  mesh (`draco_test.glb`, FNV-checked).
+
 ## [0.49.0] - 2026-07-04
 
 ### Added

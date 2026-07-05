@@ -99,6 +99,25 @@ function buildTorus(majorSegs, minorSegs, R, r) {
 const { P: TORUS_P, I: TORUS_I } = buildTorus(12, 8, 2, 0.7);
 await genFixture('torus', TORUS_P, TORUS_I);
 
+// ── torus_nrm_uv: the torus (8 split symbols) + per-vertex NORMAL + UV →
+// the splits-AND-attributes condition (num_attribute_data=2) that leaves
+// phantom split-vertices (num_points=104 > num_output_points=96). Continuous
+// per-vertex UVs → NO attribute seams (isolates the value-count bug from the
+// seam path). Proper outward tube normals so the octahedron encode round-trips.
+{
+  const majorSegs = 12, minorSegs = 8;
+  const N = [], UV = [];
+  for (let i = 0; i < majorSegs; i++) {
+    const u = (i / majorSegs) * Math.PI * 2, cu = Math.cos(u), su = Math.sin(u);
+    for (let j = 0; j < minorSegs; j++) {
+      const v = (j / minorSegs) * Math.PI * 2, cv = Math.cos(v), sv = Math.sin(v);
+      N.push(cv * cu, cv * su, sv);              // unit outward tube normal
+      UV.push(i / majorSegs, j / minorSegs);     // continuous, no seam
+    }
+  }
+  await genFixture('torus_nrm_uv', TORUS_P, TORUS_I, { normals: N, uvs: UV });
+}
+
 // ── cube_nrm: same 8-vert/12-tri cube + smooth per-vertex NORMAL
 // (N[i] = normalize(P[i]), valid since the cube is centered at the origin) —
 // exercises multi-attribute decode (POSITION + NORMAL, num_attribute_data=1).

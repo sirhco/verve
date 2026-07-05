@@ -148,14 +148,14 @@ const WrapTransform = struct {
 
 /// The two maps the mesh prediction inverse needs, produced by the DEPTH_FIRST
 /// attribute traversal (Draco `MeshAttributeIndicesEncodingData`).
-const TraversalMaps = struct {
+pub const TraversalMaps = struct {
     /// data entry id -> corner processed when that entry was decoded.
     data_to_corner: []u32,
     /// vertex id -> data entry id (-1 until the vertex is visited).
     vertex_to_data: []i32,
     num_values: usize,
 
-    fn deinit(self: *TraversalMaps, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *TraversalMaps, alloc: std.mem.Allocator) void {
         alloc.free(self.data_to_corner);
         alloc.free(self.vertex_to_data);
     }
@@ -274,7 +274,7 @@ const Traverser = struct {
     }
 };
 
-fn buildTraversalMaps(alloc: std.mem.Allocator, view: TableView) Error!TraversalMaps {
+pub fn buildTraversalMaps(alloc: std.mem.Allocator, view: TableView) Error!TraversalMaps {
     const num_faces = view.numFaces();
     const num_vertices = view.numVertices();
     const num_corners = view.numCorners();
@@ -403,47 +403,19 @@ fn computeParallelogram(
     }
 }
 
-/// Invert the mesh prediction scheme + WRAP transform for a position attribute.
-///
-/// Final signature (Task 4 consumes this):
-///   `inversePredict(alloc, header, residuals, num_components, conn) Error![]i32`
-///
-/// - `header` — the `attributes.DecodedAttrHeader` produced by Task 1 (supplies
-///   `scheme_method`, `transform_type`, `traversal_method`, and the WRAP
-///   `wrap_min`/`wrap_max`).
-/// - `residuals` — the zigzag-decoded signed corrections in **data-entry order**;
-///   `residuals.len` must equal `num_points * num_components`.
-/// - Returns an **owned** `[]i32` of the same length, re-indexed into per-point
-///   (== per-vertex) order so it lines up with `conn.indices`. Caller frees.
-///
-/// Rejects (`Error.UnsupportedDracoFeature`) any scheme other than
-/// PARALLELOGRAM/DIFFERENCE, any transform other than WRAP, and the
-/// PREDICTION_DEGREE traversal (no fixture uses it). Never panics on malformed
-/// connectivity — bounds violations map to `Error.Corrupt`.
-pub fn inversePredict(
-    alloc: std.mem.Allocator,
-    header: attributes.DecodedAttrHeader,
-    residuals: []const i32,
-    num_components: u8,
-    conn: *const draco.Connectivity,
-) Error![]i32 {
-    return inversePredictView(alloc, header, residuals, num_components, .{ .ct = &conn.corner_table, .attr = null }, conn.num_points);
-}
-
-/// Generalized inverse over a `TableView`. `num_value_verts` is the attribute's
-/// vertex count (`view.numVertices()`): `conn.num_points` for the base table,
-/// `attr_map.numVertices()` for a seamed attribute. Returns owned `[]i32`
-/// (`num_value_verts * nc`) re-indexed into per-(attr-)vertex order.
-///
-/// `attr == null` reproduces `inversePredict`'s legacy base-table behavior
-/// byte-for-byte (the POSITION goldens are the regression gate).
-pub fn inversePredictView(
+/// Prediction inverse + WRAP transform over a `TableView`, returning values in
+/// **data-entry order** (`maps.num_values * nc`), NOT per-vertex order. The
+/// caller maps data entries to points via `maps.vertex_to_data` (Draco's
+/// `UpdatePointToAttributeIndexMapping`). `residuals.len` must equal
+/// `maps.num_values * nc`. Faithful to `MeshPredictionScheme*Decoder::
+/// ComputeOriginalValues` (the re-index is the sequencer's job, done separately).
+pub fn predictValues(
     alloc: std.mem.Allocator,
     header: attributes.DecodedAttrHeader,
     residuals: []const i32,
     num_components: u8,
     view: TableView,
-    num_value_verts: usize,
+    maps: *const TraversalMaps,
 ) Error![]i32 {
     const nc: usize = num_components;
     if (nc == 0) return Error.Corrupt;
@@ -454,82 +426,26 @@ pub fn inversePredictView(
         method_difference, method_parallelogram => {},
         else => return Error.UnsupportedDracoFeature,
     }
-
-    const num_points: usize = num_value_verts;
-    if (residuals.len != num_points * nc) return Error.Corrupt;
-    if (num_points == 0) return alloc.alloc(i32, 0);
-
-    // `view.numVertices()` is the corner table's *physical* vertex count, which
-    // only ever grows (`addNewVertex`, used for topology-split handling — see
-    // `edgebreaker.zig`'s "Remove vertices that were marked as isolated" step).
-    // That step logically shrinks the live vertex count back down to
-    // `num_value_verts` by remapping every corner reference below it and
-    // marking the (now-unreferenced) tail slots isolated, but it does not
-    // truncate the backing array — so for genus>0 meshes that hit topology
-    // splits during traversal (e.g. a torus), `view.numVertices()` (104 here)
-    // legitimately exceeds `num_value_verts` (96): the extra slots are dead,
-    // never targeted by any corner, and `buildTraversalMaps` below only ever
-    // visits vertices reachable from a real face corner, so it never touches
-    // them. Reject only when the array is *too small* to hold `num_value_verts`
-    // — that's the real corruption signal; equality was an over-strict leftover
-    // from the split-free (quad/cube) fixtures that never exercised this path.
-    if (view.numVertices() < num_points) return Error.Corrupt;
-
-    var maps = try buildTraversalMaps(alloc, view);
-    defer maps.deinit(alloc);
-    // Every vertex must have been assigned exactly one data entry.
-    if (maps.num_values != num_points or maps.data_to_corner.len != num_points) return Error.Corrupt;
+    // Defensive (TraversalMaps is public API now): the delta/parallelogram
+    // inverse indexes `out_data`/`residuals` by data-entry id up to
+    // `data_to_corner.len`, so a maps whose corner map disagrees with its
+    // `num_values` would run off `out_data` — reject rather than misindex.
+    if (maps.data_to_corner.len != maps.num_values) return Error.Corrupt;
+    const num_values: usize = maps.num_values;
+    if (residuals.len != num_values * nc) return Error.Corrupt;
+    if (num_values == 0) return alloc.alloc(i32, 0);
 
     const wt = try WrapTransform.init(header.wrap_min, header.wrap_max);
-
-    const out_data = try alloc.alloc(i32, num_points * nc);
-    defer alloc.free(out_data);
-
+    const out_data = try alloc.alloc(i32, num_values * nc);
+    errdefer alloc.free(out_data);
     if (header.scheme_method == method_difference) {
         computeDifference(residuals, out_data, nc, wt);
     } else {
         const pred = try alloc.alloc(i32, nc);
         defer alloc.free(pred);
-        try computeParallelogram(residuals, out_data, nc, view, &maps, wt, pred);
+        try computeParallelogram(residuals, out_data, nc, view, maps, wt, pred);
     }
-
-    // Re-index data-entry order -> per-(attr-)vertex order.
-    const result = try alloc.alloc(i32, num_points * nc);
-    errdefer alloc.free(result);
-    var v: usize = 0;
-    while (v < num_points) : (v += 1) {
-        const e = maps.vertex_to_data[v];
-        if (e < 0 or @as(usize, @intCast(e)) >= num_points) return Error.Corrupt;
-        const eu: usize = @intCast(e);
-        var c: usize = 0;
-        while (c < nc) : (c += 1) result[v * nc + c] = out_data[eu * nc + c];
-    }
-    return result;
-}
-
-/// Build the per-vertex → data-entry-index map produced by the DEPTH_FIRST
-/// attribute traversal (`MeshAttributeIndicesEncodingData::vertex_to_encoded_
-/// attribute_value_index_map`), the same map `inversePredict` uses internally to
-/// re-index values decoded in data-entry order into per-point (== per-vertex)
-/// order. Exposed so the NORMAL decoder (attributes.zig) can share the identical
-/// mapping: for a mesh with no attribute seams the position and normal
-/// attributes ride the same vertex sequence. Returns an owned `[]i32` of length
-/// `num_points` (`vertex_to_data[v]` == the data entry that decoded vertex `v`);
-/// caller frees. Never panics on malformed connectivity.
-pub fn buildVertexToData(alloc: std.mem.Allocator, conn: *const draco.Connectivity) Error![]i32 {
-    return buildVertexToDataView(alloc, .{ .ct = &conn.corner_table, .attr = null }, conn.num_points);
-}
-
-/// `buildVertexToData` generalized over a `TableView` — the seam-aware variant
-/// Task 4 uses for attributes that decode over their own `MeshAttrCornerTable`.
-/// `attr == null` reproduces the base-table map exactly.
-pub fn buildVertexToDataView(alloc: std.mem.Allocator, view: TableView, num_value_verts: usize) Error![]i32 {
-    if (view.numVertices() < num_value_verts) return Error.Corrupt;
-    const maps = try buildTraversalMaps(alloc, view);
-    alloc.free(maps.data_to_corner);
-    errdefer alloc.free(maps.vertex_to_data);
-    if (maps.num_values != num_value_verts) return Error.Corrupt;
-    return maps.vertex_to_data;
+    return out_data;
 }
 
 // ---------------------------------------------------------------------------
@@ -603,28 +519,48 @@ test "traversal maps: single triangle → data-entry order v1,v2,v0" {
     try std.testing.expectEqualSlices(u32, &[_]u32{ 1, 2, 0 }, maps.data_to_corner);
 }
 
-test "DIFFERENCE inverse: residuals [5,3,-2] → data-entry [5,8,6], per-point [6,5,8]" {
+test "DIFFERENCE predictValues: residuals [5,3,-2] → data-entry [5,8,6]" {
     const a = std.testing.allocator;
     var conn = try singleTriangle(a);
     defer conn.deinit();
-    // nc = 1. Data-entry prefix sums (no wrap): 5, 5+3=8, 8-2=6.
-    // Remap to per-vertex order via vertex_to_data=[2,0,1]:
-    //   v0=out[2]=6, v1=out[0]=5, v2=out[1]=8.
+    // nc = 1. Data-entry prefix sums (no wrap): 5, 5+3=8, 8-2=6. predictValues
+    // returns values in data-entry order (the sequencer's re-index to per-point
+    // order is now `attributes.expandToPoints`, exercised by the decode goldens).
+    const view = TableView{ .ct = &conn.corner_table, .attr = null };
+    var maps = try buildTraversalMaps(a, view);
+    defer maps.deinit(a);
     const residuals = [_]i32{ 5, 3, -2 };
-    const got = try inversePredict(a, diffHeader(method_difference), &residuals, 1, &conn);
+    const got = try predictValues(a, diffHeader(method_difference), &residuals, 1, view, &maps);
     defer a.free(got);
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 6, 5, 8 }, got);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 5, 8, 6 }, got);
+}
+
+test "predictValues: single triangle → data-entry order [5,8,6] (no re-index)" {
+    const a = std.testing.allocator;
+    var conn = try singleTriangle(a);
+    defer conn.deinit();
+    const view = TableView{ .ct = &conn.corner_table, .attr = null };
+    var maps = try buildTraversalMaps(a, view);
+    defer maps.deinit(a);
+    const residuals = [_]i32{ 5, 3, -2 };
+    const got = try predictValues(a, diffHeader(method_difference), &residuals, 1, view, &maps);
+    defer a.free(got);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 5, 8, 6 }, got);
 }
 
 test "PARALLELOGRAM on an open triangle degrades to the delta fallback" {
     const a = std.testing.allocator;
     var conn = try singleTriangle(a);
     defer conn.deinit();
-    // No interior edges → every parallelogram lookup fails → identical to DELTA.
+    // No interior edges → every parallelogram lookup fails → identical to DELTA,
+    // so data-entry order is the same prefix sum [5,8,6].
+    const view = TableView{ .ct = &conn.corner_table, .attr = null };
+    var maps = try buildTraversalMaps(a, view);
+    defer maps.deinit(a);
     const residuals = [_]i32{ 5, 3, -2 };
-    const got = try inversePredict(a, diffHeader(method_parallelogram), &residuals, 1, &conn);
+    const got = try predictValues(a, diffHeader(method_parallelogram), &residuals, 1, view, &maps);
     defer a.free(got);
-    try std.testing.expectEqualSlices(i32, &[_]i32{ 6, 5, 8 }, got);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 5, 8, 6 }, got);
 }
 
 test "computeParallelogramPrediction: true branch = next + prev - opp" {
@@ -665,20 +601,23 @@ test "computeParallelogramPrediction: true branch = next + prev - opp" {
     try std.testing.expect(!try computeParallelogramPrediction(3, 4, .{ .ct = &ct, .attr = null }, &vtd_future, &out_data, 2, &pred));
 }
 
-test "inversePredict rejects unsupported scheme/transform/traversal" {
+test "predictValues rejects unsupported scheme/transform/traversal" {
     const a = std.testing.allocator;
     var conn = try singleTriangle(a);
     defer conn.deinit();
+    const view = TableView{ .ct = &conn.corner_table, .attr = null };
+    var maps = try buildTraversalMaps(a, view);
+    defer maps.deinit(a);
     const residuals = [_]i32{ 0, 0, 0 };
     var h = diffHeader(method_difference);
     h.scheme_method = 2; // MULTI_PARALLELOGRAM
-    try std.testing.expectError(Error.UnsupportedDracoFeature, inversePredict(a, h, &residuals, 1, &conn));
+    try std.testing.expectError(Error.UnsupportedDracoFeature, predictValues(a, h, &residuals, 1, view, &maps));
     h = diffHeader(method_difference);
     h.transform_type = 0; // not WRAP
-    try std.testing.expectError(Error.UnsupportedDracoFeature, inversePredict(a, h, &residuals, 1, &conn));
+    try std.testing.expectError(Error.UnsupportedDracoFeature, predictValues(a, h, &residuals, 1, view, &maps));
     h = diffHeader(method_difference);
     h.traversal_method = 1; // PREDICTION_DEGREE
-    try std.testing.expectError(Error.UnsupportedDracoFeature, inversePredict(a, h, &residuals, 1, &conn));
+    try std.testing.expectError(Error.UnsupportedDracoFeature, predictValues(a, h, &residuals, 1, view, &maps));
 }
 
 test "TableView(attr): traversal covers attr vertices, seam-aware opposite" {
