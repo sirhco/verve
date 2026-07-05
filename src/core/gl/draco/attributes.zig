@@ -214,6 +214,14 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
         while (i < num_attributes_decoders) : (i += 1) {
             const att_data_id = try buf.readInt(i8);
             dec_decoder_type[i] = try buf.readInt(u8); // decoder_type
+            // `MeshEncoderElementType`: only MESH_VERTEX_ATTRIBUTE (0) and
+            // MESH_CORNER_ATTRIBUTE (1) exist. Draco's `CreateAttributesDecoder`
+            // rejects any other value; mirror that here so an unknown decoder
+            // type is a loud reject, not a silent fall-through to the vertex
+            // (base-table) decode path.
+            if (dec_decoder_type[i] != decoder_type_vertex and dec_decoder_type[i] != decoder_type_corner) {
+                return Error.UnsupportedDracoFeature;
+            }
             dec_traversal[i] = try buf.readInt(u8); // traversal_method
             if (i == 0) {
                 // Probe (Task 4) established POSITION leads (att_data_id == -1).
