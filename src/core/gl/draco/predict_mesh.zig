@@ -71,6 +71,11 @@ pub const TableView = struct {
     fn vertex(self: TableView, c: u32) u32 {
         return if (self.attr) |m| m.vertex(c) else self.ct.vertex(c);
     }
+    /// Public accessor for `vertex` so `attributes.zig`'s `expandToPoints` can
+    /// resolve a point's representative corner → its (base or attr) vertex.
+    pub fn vertexPub(self: TableView, c: u32) u32 {
+        return self.vertex(c);
+    }
     fn opposite(self: TableView, c: u32) u32 {
         return if (self.attr) |m| m.opposite(c, self.ct) else self.ct.opposite(c);
     }

@@ -66,6 +66,14 @@ pub const prediction_constrained_multi_parallelogram: i8 = 4;
 /// `PredictionSchemeTransformType` (compression_shared.h): `WRAP == 1`.
 pub const transform_wrap: i8 = 1;
 
+/// `MeshEncoderElementType` (the per-decoder `decoder_type` byte read in phase 1,
+/// right after `att_data_id`): `MESH_VERTEX_ATTRIBUTE == 0` (the attribute rides
+/// the shared position connectivity — decode over the base corner table),
+/// `MESH_CORNER_ATTRIBUTE == 1` (the attribute has its own seam-aware corner
+/// table — decode over `conn.attr_maps[att_data_id]`).
+pub const decoder_type_vertex: u8 = 0;
+pub const decoder_type_corner: u8 = 1;
+
 /// Result of the attribute-section header parse. Tasks 3-4 reuse this shape
 /// verbatim — `min`/`range`/`bits` (via `quant`) are exactly what the
 /// dequantization step needs; `scheme_method`/`transform_type` are exactly
@@ -127,16 +135,16 @@ fn symbolToSignedInt(sym: u32) i32 {
 const AttrSection = struct {
     header: DecodedAttrHeader,
     residuals: []i32,
-    /// Descriptor of decoder 1 (the second attributes decoder) captured during
-    /// the phase-1/phase-2 walk, or null when fewer than two decoders are
-    /// present (quad/cube/torus — position only). `decodeAttributes` inspects it
-    /// to decide whether a NORMAL value section (phase 3, decoder 1) follows the
-    /// POSITION section and should be decoded (C2b).
+    /// Descriptor of the NORMAL attributes decoder (the non-position decoder
+    /// whose first attribute has `att_type == NORMAL`), or null when the mesh
+    /// carries no NORMAL decoder. Captured by *attribute type*, not decoder
+    /// index: seamcube (POSITION + UV, 2 decoders) has decoder 1 == TEXCOORD, so
+    /// its `normal` stays null and its UV lands in `texcoord`. `decodeAttributes`
+    /// inspects it to decide whether/how to decode the NORMAL value section.
     normal: ?DecoderInfo,
-    /// Descriptor of decoder 2 (TEXCOORD) captured during the walk, or null when
-    /// fewer than three decoders are present. `decodeAttributes` inspects it to
-    /// decide whether a TEXCOORD value section (phase 3, decoder 2) follows the
-    /// NORMAL section and should be decoded (C2c). Its `traversal_method` is
+    /// Descriptor of the TEXCOORD attributes decoder (the non-position decoder
+    /// whose first attribute has `att_type == TEX_COORD`), or null when the mesh
+    /// carries no TEXCOORD decoder. Its `traversal_method`/`decoder_type` are
     /// captured from phase 1 (each decoder carries its own).
     texcoord: ?DecoderInfo,
 };
@@ -154,6 +162,10 @@ const DecoderInfo = struct {
     encoder_type: u8,
     num_attributes: u32,
     traversal_method: u8,
+    /// The phase-1 `decoder_type` byte: `MESH_VERTEX_ATTRIBUTE (0)` → decode over
+    /// the base position corner table; `MESH_CORNER_ATTRIBUTE (1)` → decode over
+    /// the attribute's own seam-aware `MeshAttrCornerTable`.
+    decoder_type: u8,
 };
 
 /// Full attribute-section walk (see the module doc comment for the C++ chain),
@@ -186,30 +198,27 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
     // PREDICTION_DEGREE — bitstream >= 1.2, always true for our 2.2-only port).
     // `att_data_id < 0` marks the position attribute (no per-attribute
     // connectivity); every valid combination reads the same 3 bytes.
-    var traversal_method: u8 = 0;
-    var normal_traversal: u8 = 0;
-    var texcoord_traversal: u8 = 0;
+    const dec_decoder_type = try alloc.alloc(u8, num_attributes_decoders);
+    defer alloc.free(dec_decoder_type);
+    const dec_traversal = try alloc.alloc(u8, num_attributes_decoders);
+    defer alloc.free(dec_traversal);
     {
         var i: u8 = 0;
         while (i < num_attributes_decoders) : (i += 1) {
             const att_data_id = try buf.readInt(i8);
-            _ = try buf.readInt(u8); // decoder_type
-            const tm = try buf.readInt(u8); // traversal_method
+            dec_decoder_type[i] = try buf.readInt(u8); // decoder_type
+            dec_traversal[i] = try buf.readInt(u8); // traversal_method
             if (i == 0) {
                 // Probe (Task 4) established POSITION leads (att_data_id == -1).
                 // If a future fixture violates that, POSITION is not decoder 0
                 // and reaching its values would require decoding the intervening
-                // NORMAL/UV value sections (C2b/C2c) — reject rather than
-                // silently misdecode.
+                // NORMAL/UV value sections first — reject rather than silently
+                // misdecode.
                 if (att_data_id != -1) return Error.UnsupportedDracoFeature;
-                traversal_method = tm;
-            } else if (i == 1) {
-                normal_traversal = tm;
-            } else if (i == 2) {
-                texcoord_traversal = tm;
             }
         }
     }
+    const traversal_method = dec_traversal[0]; // POSITION (decoder 0)
 
     // ── PHASE 2 — `AttributesDecoder::DecodeAttributesDecoderData` × N ──
     // Decoder 0 (POSITION) is captured + validated; decoders 1+ (NORMAL/UV) are
@@ -245,10 +254,12 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
             } else {
                 // Non-POSITION decoder: walk its descriptor block. All
                 // descriptors first, then all encoder-type bytes (the two
-                // distinct C++ loops). Capture decoder 1's (NORMAL) and decoder
-                // 2's (TEXCOORD) first-attribute descriptor + encoder byte so
-                // `decodeAttributes` can decide whether their value sections
-                // follow (C2b / C2c). Decoders 3+ are walked but not captured.
+                // distinct C++ loops). Classify by *attribute type* (not decoder
+                // index) so seamcube (POSITION + UV, 2 decoders) routes its
+                // decoder-1 UV into `texcoord_info` — leaving `normal_info` null —
+                // while cube_nrm_uv routes decoder 1 (NORMAL) → `normal_info` and
+                // decoder 2 (UV) → `texcoord_info`. Decoders whose first attribute
+                // is neither NORMAL nor TEX_COORD are walked but not captured.
                 var att_type_0: u8 = 0;
                 var num_comp_0: u8 = 0;
                 var j: u32 = 0;
@@ -269,31 +280,28 @@ fn parseAttrSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
                     const et = try buf.readInt(u8); // sequential-encoder-type byte
                     if (k == 0) enc_0 = et;
                 }
-                if (i == 1) {
-                    normal_info = .{
-                        .att_type = att_type_0,
-                        .num_components = num_comp_0,
-                        .encoder_type = enc_0,
-                        .num_attributes = num_attributes,
-                        .traversal_method = normal_traversal,
-                    };
-                } else if (i == 2) {
-                    texcoord_info = .{
-                        .att_type = att_type_0,
-                        .num_components = num_comp_0,
-                        .encoder_type = enc_0,
-                        .num_attributes = num_attributes,
-                        .traversal_method = texcoord_traversal,
-                    };
+                const info = DecoderInfo{
+                    .att_type = att_type_0,
+                    .num_components = num_comp_0,
+                    .encoder_type = enc_0,
+                    .num_attributes = num_attributes,
+                    .traversal_method = dec_traversal[i],
+                    .decoder_type = dec_decoder_type[i],
+                };
+                if (att_type_0 == geom_attr_normal) {
+                    if (normal_info == null) normal_info = info;
+                } else if (att_type_0 == geom_attr_texcoord) {
+                    if (texcoord_info == null) texcoord_info = info;
                 }
             }
         }
     }
 
     // ── PHASE 3 — `DecodeAllAttributes`, decoder 0 (POSITION) only ──
-    // The value-section read is shared with decoder 2 (TEXCOORD, same
-    // parallelogram+WRAP+quant wire shape) via `readValueSection`.
-    const vs = try readValueSection(alloc, buf, conn, num_components, traversal_method);
+    // The value-section read is shared with the TEXCOORD decoder (same
+    // parallelogram+WRAP+quant wire shape) via `readValueSection`. POSITION is
+    // always a base attribute → `num_value_verts = conn.num_points`.
+    const vs = try readValueSection(alloc, buf, conn.num_points, num_components, traversal_method);
 
     return .{
         .header = vs.header,
@@ -320,7 +328,7 @@ const ValueSection = struct {
 /// `traversal_method` is that decoder's phase-1 traversal byte (threaded into
 /// the header for the prediction inverse). Never panics — malformed input maps
 /// to `draco.Error`.
-fn readValueSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity, num_components: u8, traversal_method: u8) Error!ValueSection {
+fn readValueSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, num_value_verts: usize, num_components: u8, traversal_method: u8) Error!ValueSection {
     // `SequentialIntegerAttributeDecoder::DecodeValues`: prediction metadata.
     const scheme_method = try buf.readInt(i8);
     switch (scheme_method) {
@@ -334,7 +342,9 @@ fn readValueSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
     if (transform_type != transform_wrap) return Error.UnsupportedDracoFeature;
 
     // `SequentialIntegerAttributeDecoder::DecodeIntegerValues`: the value blob.
-    const num_values: usize = @as(usize, conn.num_points) * @as(usize, num_components);
+    // `num_value_verts` is the attribute's vertex count — `conn.num_points` for a
+    // base/position attribute, `attr_map.numVertices()` for a seamed corner attr.
+    const num_values: usize = num_value_verts * @as(usize, num_components);
     const residuals = try alloc.alloc(i32, num_values);
     errdefer alloc.free(residuals);
     const compressed = try buf.readInt(u8);
@@ -410,18 +420,21 @@ fn readValueSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const 
 /// first byte. Shared by POSITION (`num_components == 3`) and TEXCOORD
 /// (`num_components == 2`). Returns owned `[]f32` (`num_points * num_components`,
 /// decoded-vertex order). Never panics.
-fn decodeParallelogramAttr(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity, num_components: u8, traversal_method: u8) Error![]f32 {
-    const vs = try readValueSection(alloc, buf, conn, num_components, traversal_method);
+fn decodeParallelogramAttr(alloc: std.mem.Allocator, buf: *DecoderBuffer, num_components: u8, traversal_method: u8, view: draco.TableView, num_value_verts: usize) Error![]f32 {
+    const vs = try readValueSection(alloc, buf, num_value_verts, num_components, traversal_method);
     defer alloc.free(vs.residuals);
-    return finishParallelogramAttr(alloc, vs.header, vs.residuals, num_components, conn);
+    return finishParallelogramAttr(alloc, vs.header, vs.residuals, num_components, view, num_value_verts);
 }
 
 /// Prediction inverse + dequantization shared by POSITION and TEXCOORD:
-/// `inversePredict` (per-point quantized ints) → `dequantize` per component.
-/// `num_components` selects the component stride for `dequantize`'s `min[comp]`.
-fn finishParallelogramAttr(alloc: std.mem.Allocator, header: DecodedAttrHeader, residuals: []const i32, num_components: u8, conn: *const Connectivity) Error![]f32 {
+/// `inversePredictView` (per-(attr-)vertex quantized ints over `view`) →
+/// `dequantize` per component. `num_components` selects the component stride for
+/// `dequantize`'s `min[comp]`; `num_value_verts` is the attribute's vertex count
+/// (`view.numVertices()`). Returns owned `[]f32` (`num_value_verts * nc`) in
+/// per-(attr-)vertex order — the caller expands it to per-point order.
+fn finishParallelogramAttr(alloc: std.mem.Allocator, header: DecodedAttrHeader, residuals: []const i32, num_components: u8, view: draco.TableView, num_value_verts: usize) Error![]f32 {
     const nc: usize = num_components;
-    const q = try draco.inversePredict(alloc, header, residuals, num_components, conn);
+    const q = try draco.inversePredictView(alloc, header, residuals, num_components, view, num_value_verts);
     defer alloc.free(q);
     const values = try alloc.alloc(f32, q.len);
     errdefer alloc.free(values);
@@ -435,7 +448,39 @@ fn finishParallelogramAttr(alloc: std.mem.Allocator, header: DecodedAttrHeader, 
     return values;
 }
 
-/// Decode decoder 1's NORMAL value section (phase 3), positioned right after the
+/// Expand per-(attr-)vertex `values` (nc components each) to per-point order.
+/// For each of `conn.num_output_points` points, resolve its representative
+/// corner (`conn.point_to_corner[p]`) → the attribute vertex on that corner
+/// (`view.vertexPub`) → its decoded value. Returns an owned `[]f32`
+/// (`num_output_points * nc`) that lines up 1:1 with `conn.indices`.
+///
+/// Fast path: when `conn.point_to_corner` is empty (position-only stream — no
+/// attribute dedup ran), per-point == per-vertex, so this is the identity dupe of
+/// `values`. For a 0-seam attribute mesh (cube_nrm/cube_nrm_uv) the map is
+/// non-empty but point id == vertex id, so the expansion is still an identity in
+/// value (regression-safe — the POSITION/NORMAL/TEXCOORD goldens are unchanged).
+/// Never panics — a corner/vertex out of range maps to `Error.Corrupt`.
+fn expandToPoints(alloc: std.mem.Allocator, conn: *const Connectivity, values: []const f32, nc: usize, view: draco.TableView) Error![]f32 {
+    if (conn.point_to_corner.len == 0) {
+        // Position-only / no attribute dedup: per-point == per-vertex.
+        return alloc.dupe(f32, values);
+    }
+    const n = conn.num_output_points;
+    const out = try alloc.alloc(f32, @as(usize, n) * nc);
+    errdefer alloc.free(out);
+    var p: usize = 0;
+    while (p < n) : (p += 1) {
+        const corner = conn.point_to_corner[p];
+        const av = view.vertexPub(corner); // per-point attribute vertex
+        const src: usize = @as(usize, av) * nc;
+        if (src + nc > values.len) return Error.Corrupt;
+        var c: usize = 0;
+        while (c < nc) : (c += 1) out[p * nc + c] = values[src + c];
+    }
+    return out;
+}
+
+/// Decode the NORMAL value section (phase 3), positioned right after the
 /// POSITION section. Faithful port of `SequentialNormalAttributeDecoder`
 /// (+ `SequentialIntegerAttributeDecoder::DecodeIntegerValues`):
 ///
@@ -457,18 +502,22 @@ fn finishParallelogramAttr(alloc: std.mem.Allocator, header: DecodedAttrHeader, 
 ///      DecodeParameters`: `quantization_bits` (u8), the box `StoreValues` uses.
 ///   6. `StoreValues` (`InverseTransformAttribute`):
 ///      `QuantizedOctahedralCoordsToUnitVector(s,t)` per entry → 3 f32s, then
-///      re-index data-entry order → per-point order (shared `vertex_to_data`
-///      map — position/normal ride the same vertex sequence, no attribute seams).
+///      re-index data-entry order → per-(attr-)vertex order (`buildVertexToDataView`
+///      over `view`). For a shared-connectivity normal (MESH_VERTEX_ATTRIBUTE)
+///      `view` is the base table and `num_value_verts == conn.num_points`; for a
+///      seamed normal it is `conn.attr_maps[att_data_id]` — the caller then
+///      expands per-attr-vertex → per-point (`expandToPoints`).
 ///
-/// Returns owned `[]f32` (`num_points*3`, per-point order). Never panics.
-fn decodeNormals(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Connectivity) Error![]f32 {
+/// Returns owned `[]f32` (`num_value_verts*3`, per-(attr-)vertex order). Never
+/// panics.
+fn decodeNormals(alloc: std.mem.Allocator, buf: *DecoderBuffer, view: draco.TableView, num_value_verts: usize) Error![]f32 {
     // ── (1) DecodeValues: prediction metadata ──
     const scheme_method = try buf.readInt(i8);
     if (scheme_method != prediction_difference) return Error.UnsupportedDracoFeature;
     const transform_type = try buf.readInt(i8);
     if (transform_type != transform_octahedron_canonicalized) return Error.UnsupportedDracoFeature;
 
-    const num_points: usize = conn.num_points;
+    const num_points: usize = num_value_verts;
     const nc: usize = 2; // octahedral (s,t) — `GetNumValueComponents() == 2`
     const num_values: usize = num_points * nc;
 
@@ -532,8 +581,8 @@ fn decodeNormals(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Con
     if (quantization_bits < 2 or quantization_bits > 30) return Error.UnsupportedDracoFeature;
     const box_store = OctahedronToolBox.init(quantization_bits);
 
-    // ── (6) StoreValues: (s,t) → unit vector, re-indexed to per-point order ──
-    const vtd = try draco.buildVertexToData(alloc, conn);
+    // ── (6) StoreValues: (s,t) → unit vector, re-indexed to per-(attr-)vertex order ──
+    const vtd = try draco.buildVertexToDataView(alloc, view, num_value_verts);
     defer alloc.free(vtd);
     const normals = try alloc.alloc(f32, num_points * 3);
     errdefer alloc.free(normals);
@@ -550,18 +599,20 @@ fn decodeNormals(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *const Con
     return normals;
 }
 
-/// Decoded POSITION values, `num_points * 3` `f32`s in per-point order (lines up
-/// 1:1 with `Connectivity.indices`). Caller must `deinit`.
+/// Decoded POSITION values, `num_output_points * 3` `f32`s in per-point order
+/// (lines up 1:1 with `Connectivity.indices`). For a 0-seam mesh
+/// `num_output_points == num_points`, byte-identical to the pre-seam behavior.
+/// Caller must `deinit`.
 pub const PositionData = struct {
     values: []f32,
     alloc: std.mem.Allocator,
-    /// Decoded NORMAL values, `num_points * 3` unit-vector `f32`s in per-point
-    /// order (lines up 1:1 with `values`), or null when the mesh carries no
-    /// NORMAL attributes decoder (quad/cube/torus — `num_attribute_data == 0`).
+    /// Decoded NORMAL values, `num_output_points * 3` unit-vector `f32`s in
+    /// per-point order (lines up 1:1 with `values`), or null when the mesh
+    /// carries no NORMAL attributes decoder (quad/cube/torus/seamcube).
     normals: ?[]f32 = null,
-    /// Decoded TEXCOORD (UV) values, `num_points * 2` `f32`s in per-point order
-    /// (lines up 1:1 with `values`), or null when the mesh carries no TEXCOORD
-    /// attributes decoder (fewer than three decoders — quad/cube/torus/cube_nrm).
+    /// Decoded TEXCOORD (UV) values, `num_output_points * 2` `f32`s in per-point
+    /// order (lines up 1:1 with `values`), or null when the mesh carries no
+    /// TEXCOORD attributes decoder (quad/cube/torus/cube_nrm).
     texcoords: ?[]f32 = null,
 
     pub fn deinit(self: *PositionData) void {
@@ -592,13 +643,24 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
     defer alloc.free(section.residuals);
     const h = section.header;
 
-    // POSITION (decoder 0): shared prediction inverse + dequantization.
-    const values = try finishParallelogramAttr(alloc, h, section.residuals, h.num_components, conn);
+    // POSITION (decoder 0): always a base attribute (no per-attribute seams on
+    // the position itself). Decode per-base-vertex, then expand to per-point.
+    const pos_view = draco.TableView{ .ct = &conn.corner_table, .attr = null };
+    const pos_per_vtx = try finishParallelogramAttr(alloc, h, section.residuals, h.num_components, pos_view, conn.num_points);
+    defer alloc.free(pos_per_vtx);
+    const values = try expandToPoints(alloc, conn, pos_per_vtx, h.num_components, pos_view);
     errdefer alloc.free(values);
 
-    // Decoder 1 (NORMAL), if present and a supported NORMAL decoder. `buf` is
-    // positioned exactly at decoder 1's phase-3 value section (right after the
-    // POSITION quant params `parseAttrSection` read).
+    // NORMAL decoder, if present and a supported NORMALS decoder. `buf` is
+    // positioned exactly at its phase-3 value section (right after the POSITION
+    // quant params `parseAttrSection` read). A `MESH_CORNER_ATTRIBUTE` normal
+    // decodes over its own seam-aware `attr_maps[att_data_id]`; a
+    // `MESH_VERTEX_ATTRIBUTE` one (cube_nrm/cube_nrm_uv) over the base table.
+    //
+    // NOTE: no committed fixture carries a *seamed* NORMAL (seamcube has UV only,
+    // num_attribute_data == 1). The corner-attr NORMAL branch below is therefore
+    // structurally in place but golden-verified only for shared (per-vertex)
+    // normals; a NORMAL-seam fixture is a follow-on.
     var normals: ?[]f32 = null;
     errdefer if (normals) |n| alloc.free(n);
     if (section.normal) |ni| {
@@ -609,15 +671,28 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
             if (ni.num_attributes != 1 or ni.att_type != geom_attr_normal or ni.num_components != 3) {
                 return Error.UnsupportedDracoFeature;
             }
-            normals = try decodeNormals(alloc, buf, conn);
+            if (ni.decoder_type == decoder_type_corner) {
+                const ai: usize = 0; // NORMAL is the first attribute-data decoder → att_data_id 0
+                if (ai >= conn.attr_maps.len) return Error.Corrupt;
+                const view = draco.TableView{ .ct = &conn.corner_table, .attr = &conn.attr_maps[ai] };
+                const nvv: usize = conn.attr_maps[ai].numVertices();
+                const per_vtx = try decodeNormals(alloc, buf, view, nvv);
+                defer alloc.free(per_vtx);
+                normals = try expandToPoints(alloc, conn, per_vtx, 3, view);
+            } else {
+                const view = draco.TableView{ .ct = &conn.corner_table, .attr = null };
+                const per_vtx = try decodeNormals(alloc, buf, view, conn.num_points);
+                defer alloc.free(per_vtx);
+                normals = try expandToPoints(alloc, conn, per_vtx, 3, view);
+            }
         }
     }
 
-    // Decoder 2 (TEXCOORD), if present and a supported TEXCOORD decoder. `buf`
-    // is positioned exactly at decoder 2's phase-3 value section (right after
-    // the NORMAL section `decodeNormals` consumed). cube_nrm_uv's UV rides the
-    // shared POSITION connectivity (per-vertex, `is_connectivity_used == false`),
-    // so the parallelogram inverse runs over the same `conn` corner table.
+    // TEXCOORD decoder, if present and a supported TEXCOORD decoder. `buf` is
+    // positioned exactly at its phase-3 value section (right after the NORMAL
+    // section, if any). A `MESH_CORNER_ATTRIBUTE` UV (seamcube) decodes over its
+    // own seam-aware `attr_maps[att_data_id]`; a `MESH_VERTEX_ATTRIBUTE` UV
+    // (cube_nrm_uv, per-vertex) over the shared base corner table.
     var texcoords: ?[]f32 = null;
     if (section.texcoord) |ti| {
         if (ti.encoder_type == seq_encoder_quantization) {
@@ -627,7 +702,22 @@ pub fn decodeAttributes(alloc: std.mem.Allocator, buf: *DecoderBuffer, conn: *co
             if (ti.num_attributes != 1 or ti.att_type != geom_attr_texcoord or ti.num_components != 2) {
                 return Error.UnsupportedDracoFeature;
             }
-            texcoords = try decodeParallelogramAttr(alloc, buf, conn, 2, ti.traversal_method);
+            if (ti.decoder_type == decoder_type_corner) {
+                // att_data_id of the UV decoder: 1 when a NORMAL attr-data decoder
+                // precedes it (cube_nrm_uv), else 0 (seamcube).
+                const ai: usize = if (section.normal != null) 1 else 0;
+                if (ai >= conn.attr_maps.len) return Error.Corrupt;
+                const view = draco.TableView{ .ct = &conn.corner_table, .attr = &conn.attr_maps[ai] };
+                const nvv: usize = conn.attr_maps[ai].numVertices();
+                const per_vtx = try decodeParallelogramAttr(alloc, buf, 2, ti.traversal_method, view, nvv);
+                defer alloc.free(per_vtx);
+                texcoords = try expandToPoints(alloc, conn, per_vtx, 2, view);
+            } else {
+                const view = draco.TableView{ .ct = &conn.corner_table, .attr = null };
+                const per_vtx = try decodeParallelogramAttr(alloc, buf, 2, ti.traversal_method, view, conn.num_points);
+                defer alloc.free(per_vtx);
+                texcoords = try expandToPoints(alloc, conn, per_vtx, 2, view);
+            }
         }
     }
 
@@ -934,6 +1024,52 @@ test "decodeAttributes(cube_nrm_uv.drc) → TEXCOORD byte-exact (16 f32)" {
     // path as POSITION with `num_components == 2`.
     const want = [_]f32{ 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0 };
     try std.testing.expectEqualSlices(f32, &want, pos.texcoords.?);
+}
+
+test "decodeAttributes(seamcube.drc): 24-point POSITION + TEXCOORD byte-exact (UV seam)" {
+    const a = std.testing.allocator;
+    const seamcube_drc = @import("draco_fixtures").seamcube_drc;
+    var buf = DecoderBuffer.init(seamcube_drc);
+    _ = try draco.parseHeader(&buf);
+    var conn = try draco.decodeConnectivity(a, &buf);
+    defer conn.deinit();
+    var pos = try decodeAttributes(a, &buf, &conn);
+    defer pos.deinit();
+    // seamcube carries a UV seam: 8 position vertices expand to 24 output points
+    // (POSITION per-point == the position of the point's representative corner;
+    // TEXCOORD decodes over its own seam-aware attr corner table). seamcube has
+    // NO NORMAL attribute (num_attribute_data == 1, UV only), so the NORMAL-seam
+    // branch is exercised only structurally, not golden-verified here.
+    try std.testing.expectEqual(@as(usize, 24 * 3), pos.values.len);
+    try std.testing.expect(pos.normals == null);
+    try std.testing.expect(pos.texcoords != null);
+    try std.testing.expectEqual(@as(usize, 24 * 2), pos.texcoords.?.len);
+    // Baked verbatim from tests/fixtures/draco/seamcube.golden.json's POSITION /
+    // TEXCOORD_0 (`node -e "const g=require('./tests/fixtures/draco/
+    // seamcube.golden.json'); console.log(g.POSITION.join(', '));
+    // console.log(g.TEXCOORD_0.join(', '))"`).
+    const want_pos = [_]f32{
+        -1, 1,  1,  -1, 1,  1,  -1, 1,  1,  -1, -1, 1,  -1, -1, 1,  -1, -1, 1,
+        1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  -1, 1,  1,  -1, 1,  1,  -1, 1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1,  -1, -1, 1,  -1, -1, 1,  -1,
+        1,  1,  -1, 1,  1,  -1, 1,  1,  -1, 1,  -1, -1, 1,  -1, -1, 1,  -1, -1,
+    };
+    const want_uv = [_]f32{
+        0.8333333134651184, 0.7501017451286316, 0.4999999701976776, 0.7501017451286316,
+        0.1666666567325592, 0.7501017451286316, 0.3333333134651184, 0,
+        0.8333333134651184, 0,                  0.1666666567325592, 0,
+        0.4999999701976776, 0.4999999701976776, 0.6666666269302368, 0.4999999701976776,
+        0.1666666567325592, 0.4999999701976776, 0.1666666567325592, 0.2501017451286316,
+        0.6666666269302368, 0.2501017451286316, 0.3333333134651184, 0.2501017451286316,
+        0.8333333134651184, 0,                  0.3333333134651184, 0,
+        0,                  0,                  0,                  0.7501017451286316,
+        0.4999999701976776, 0.7501017451286316, 0.8333333134651184, 0.7501017451286316,
+        0.4999999701976776, 0.4999999701976776, 0,                  0.4999999701976776,
+        0.6666666269302368, 0.4999999701976776, 0.6666666269302368, 0.2501017451286316,
+        0,                  0.2501017451286316, 0.3333333134651184, 0.2501017451286316,
+    };
+    try std.testing.expectEqualSlices(f32, &want_pos, pos.values);
+    try std.testing.expectEqualSlices(f32, &want_uv, pos.texcoords.?);
 }
 
 /// Absolute byte offset of `prediction_scheme_method` within `quad_drc`
