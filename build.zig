@@ -1355,6 +1355,9 @@ fn buildDracoFixtures(b: *std.Build) *std.Build.Module {
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/cube_nrm_uv.glb"), "cube_nrm_uv.glb");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/seamcube.drc"), "seamcube.drc");
     _ = wf.addCopyFile(b.path("tests/fixtures/draco/seamcube.glb"), "seamcube.glb");
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/torus_nrm_uv.drc"), "torus_nrm_uv.drc");
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/torus_nrm_uv.glb"), "torus_nrm_uv.glb");
+    _ = wf.addCopyFile(b.path("tests/fixtures/draco/draco_test.glb"), "draco_test.glb");
     const gen = wf.add("draco_fixtures.zig",
         \\pub const quad_drc = @embedFile("quad.drc");
         \\pub const cube_drc = @embedFile("cube.drc");
@@ -1366,6 +1369,9 @@ fn buildDracoFixtures(b: *std.Build) *std.Build.Module {
         \\pub const cube_nrm_uv_glb = @embedFile("cube_nrm_uv.glb");
         \\pub const seamcube_drc = @embedFile("seamcube.drc");
         \\pub const seamcube_glb = @embedFile("seamcube.glb");
+        \\pub const torus_nrm_uv_drc = @embedFile("torus_nrm_uv.drc");
+        \\pub const torus_nrm_uv_glb = @embedFile("torus_nrm_uv.glb");
+        \\pub const draco_test_glb = @embedFile("draco_test.glb");
         \\
     );
     return b.createModule(.{ .root_source_file = gen });
