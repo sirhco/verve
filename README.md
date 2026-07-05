@@ -13,10 +13,10 @@
 
 </div>
 
-> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.18.x. Public
+> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.49.x. Public
 > APIs are not stable and **will** break between minor versions.
 > All three desktop backends (macOS, Windows, Linux GTK4) are validated
-> on real hardware (current as of v0.18.x). Known limitations: desktop auto-updater
+> on real hardware (current as of v0.49.x). Known limitations: desktop auto-updater
 > apply is macOS-only; full a11y provider not yet implemented; Linux
 > image clipboard returns `Unsupported`. Use for learning, experiments,
 > and personal projects. Not production-ready.
@@ -35,7 +35,7 @@ Targets **Zig 0.16.0**. Full documentation lives at **[verveframework.dev](https
 ```sh
 # Web app — HTTP server + wasm hydration
 zig build                           # native server + wasm client + per-island chunks
-zig build test --summary all        # 984 tests across core + server + client + desktop + integration
+zig build test --summary all        # 1,265 tests across core + server + client + desktop + integration
 zig build docs                      # zig-out/docs/api/index.html — Zig autodoc for the public verve module
 ./zig-out/bin/verve-server          # open http://127.0.0.1:8080
 
@@ -164,16 +164,20 @@ GSAP-class animation engine, pure Zig + one hand-written JS interpreter — no G
 
 ### 3D engine (`verve.gl`)
 Native 3D, pure Zig + two hand-written interpreters (**WebGL2 and WebGPU**) — no three.js. The whole engine (scene graph, transforms, draw ordering, lighting, asset parsing) runs in wasm and emits a flat binary command stream into linear memory; each backend walks the same bytes with zero-copy typed-array views. Backend chosen at runtime (WebGPU when `navigator.gpu` is present, WebGL2 otherwise). Wire contract frozen by byte-exact golden tests (the anim `serialize.zig` pattern). Guide: [`docs/24-gl.md`](docs/24-gl.md). Demos: `/gl`, `/gl-scene`, and the per-feature `/gl-*` routes (`zig build run`).
-- **Engine core** — column-major f32 math, struct-of-arrays scene graph with pre-order dirty propagation, one API-neutral command stream driving both backends, per-submesh shader-variant selection, frustum culling (camera + shadow-light), BVH picking, orbit controls, and declarative `ctx.glScene` scenes.
-- **Materials** — PBR metallic-roughness + image-based lighting (IBL), emissive, double-sided, and alpha **BLEND** / **MASK** (alpha-test cutout, with hole-accurate cast shadows) modes.
+- **Engine core** — column-major f32 math, struct-of-arrays scene graph with pre-order dirty propagation, one API-neutral command stream driving both backends, per-submesh shader-variant selection, frustum culling (camera + shadow-light), BVH picking, orbit controls, **orthographic or perspective projection**, and declarative `ctx.glScene` scenes.
+- **GPU instancing** — one draw covers thousands of instances with per-instance transforms, non-uniform-scale-correct normals, multi-submesh support, **per-instance frustum culling**, and instanced shadow casting. Demos: `/gl-instanced`, `/gl-instanced-cull`, `/gl-instanced-multi`, `/gl-instanced-shadow`.
+- **Primitives beyond triangle meshes** — **points & sprites** (screen-space billboards), **fat lines** (`Line2` / `LineSegments2`, wide 3D segments), and **forward decals** (`DecalGeometry`, project a texture onto surfaces). Demos: `/gl-points`, `/gl-lines`, `/gl-decals`.
+- **Materials** — PBR metallic-roughness + image-based lighting (IBL), emissive, double-sided, and alpha **BLEND** / **MASK** (alpha-test cutout, with hole-accurate cast shadows) modes; **wireframe** rendering; and **user clipping planes** (`GlSceneBuilder.clipPlanes`). Demos: `/gl-material`, `/gl-wireframe`, `/gl-clip`.
+- **Custom shader materials** — comptime-baked injection hooks (5 fragment + vertex stages), a Custom UBO, custom textures, and a live `glmat_set` setter, both backends — author bespoke shading without forking the über-shader. Demo: `/gl-material`.
 - **Lighting** — directional / spot / point lights with simultaneous multi-light **shadow casters** (tiled 2D + cube atlases), **cascaded shadow maps** for directional light, and **rect area lights** via Linearly Transformed Cosines with soft area shadows.
 - **Skeletal skinning** — GPU skinning with keyframe animation, multiple clips + switching, cross-fade and weighted blending, ping-pong / loop / once modes, scrub, and all glTF interpolation modes (step / linear / cubicspline). Demos: `/gl-skin`.
 - **Morph targets** — GPU blend shapes with POSITION + NORMAL + **TANGENT** deltas (correct normal-mapped morphing), up to **32 simultaneous active influences**, cubic-Hermite weight easing, and a **combined skinned + morph** variant (morph deltas applied to local space, then the skin matrix — glTF order). Demos: `/gl-morph`, `/gl-morph16`, `/gl-skin-morph`.
 - **Level of detail (LOD)** — a single `.vmesh` packs multiple LOD levels with squared-distance thresholds; the runtime selects the active level per object by camera distance and narrows every draw pass (opaque, transparent, shadow) to it. Demo: `/gl-lod`.
 - **Image quality** — bloom + FXAA, a depth + view-space-normal prepass (G-buffer), **SSAO**, **screen-space reflections (SSR)**, **depth of field**, **weighted-blended OIT** (order-independent transparency), selectable tone-mappers (ACES / AgX / Reinhard / Reinhard-extended / Uncharted2 / linear), and vignette. Demos: `/gl-ssao`, `/gl-ssr`, `/gl-dof`, `/gl-oit`, `/gl-tonemap`, `/gl-post`.
 - **Reflection probes** — a probe renders the scene into a cubemap from a fixed position, **GGX-prefilters** it into a roughness mip chain, and binds it as the specular IBL source, so a reflective model mirrors its **actual surroundings** rather than a static environment map. Static capture-once; both backends. `ctx.glScene(…).probe(pos)`. Demo: `/gl-probe`.
-- **Asset pipeline** — build-time `.glb` → packed `.vmesh` (`tools/gl_asset_gen`): zero runtime parsing, fetch → linear memory → GPU upload. Pure-Zig PNG decoder, glb parser, and vmesh reader, all hardened against hostile input (errors, never panics). `verve.anim` fusion drives scroll-scrubbed 3D. Demo: [`examples/gl-viewer/`](examples/gl-viewer/README.md).
-- **Geometry compression (`.vmesh` v16/v17)** — index buffers compress losslessly (delta+zigzag+varint, ~50%) and vertex buffers via quantization (pos u16 / normal+tangent i8 / uv u16, ~65%), decoded host-side before upload so both backends stay unchanged. Total assets shrink **~32–46%** (lodsphere 116→79 KB). Pure-Zig codec; native round-trip + WebGL2 visual gate.
+- **Compressed textures** — build-time-encoded (no runtime transcode) **KTX2 / BC7** (mode-6, ~4:1 VRAM) with host-transparent PNG fallback, plus **S3TC** (BC1 opaque / BC3 alpha) siblings for GPUs without BPTC. Runtime picks the best supported format per device caps; both backends. Pure-Zig BC1/BC3/BC7 encoders.
+- **Asset pipeline** — build-time `.glb` → packed `.vmesh` (`tools/gl_asset_gen`): zero runtime parsing, fetch → linear memory → GPU upload. Pure-Zig PNG decoder, glb parser, and vmesh reader, all hardened against hostile input (errors, never panics). **Draco-compressed glTF** (`KHR_draco_mesh_compression`) is decoded at build time (pure-Zig, zero-dep) into the same pipeline. `verve.anim` fusion drives scroll-scrubbed 3D. Demos: `/gl-draco`, [`examples/gl-viewer/`](examples/gl-viewer/README.md).
+- **Geometry compression (`.vmesh` v16/v17)** — index buffers compress losslessly (delta+zigzag+varint, ~50%) and vertex buffers via quantization (pos u16 / normal+tangent i8 / uv u16, ~65%), decoded host-side before upload; **GPU-resident quantized attributes** (half pos/uv + snorm8 normal/tangent) additionally cut VRAM ~58% by uploading the packed form directly. Total assets shrink **~32–46%** (lodsphere 116→79 KB). Pure-Zig codec; native round-trip + WebGL2 visual gate.
 
 ### Markdown & syntax highlighting
 Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed at SSR time into the `Node` tree; no client wasm, no JavaScript. Guide: [`docs/21-markdown-and-highlighting.md`](docs/21-markdown-and-highlighting.md). Demo: [`examples/markdown/`](examples/markdown/README.md).
@@ -216,7 +220,7 @@ tour and platform support matrix.
 
 > Pre-1.0 — release artifacts are published for each tag, but
 > behavior is experimental. All three desktop backends (macOS,
-> Windows, Linux GTK4) are validated on real hardware (current as of v0.18.x).
+> Windows, Linux GTK4) are validated on real hardware (current as of v0.49.x).
 
 Tagged releases publish `verve-server` + `verve-cli` tarballs for
 five targets:
@@ -228,7 +232,7 @@ five targets:
 - `x86_64-windows`
 
 ```sh
-VERSION=0.18.1
+VERSION=0.49.1
 SUFFIX=x86_64-linux        # or aarch64-linux / x86_64-macos / aarch64-macos / x86_64-windows
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz" -o verve.tgz
 curl -fsSL "https://github.com/sirhco/verve/releases/download/v${VERSION}/verve-${VERSION}-${SUFFIX}.tar.gz.sha256" -o verve.tgz.sha256
@@ -249,7 +253,7 @@ of any existing Zig project.
 ### Add the dependency
 
 ```sh
-zig fetch --save git+https://github.com/sirhco/verve#v0.18.1
+zig fetch --save git+https://github.com/sirhco/verve#v0.49.1
 ```
 
 This writes the `verve` entry into your `build.zig.zon` with the
@@ -309,7 +313,7 @@ every typed binding from the rendered HTML.
 release instead of a path dep:
 
 ```sh
-verve-cli new ~/my-app --release v0.18.1 \
+verve-cli new ~/my-app --release v0.49.1 \
                        --release-hash <multihash-from-zig-fetch>
 ```
 
@@ -344,8 +348,12 @@ Then open:
 - <http://127.0.0.1:8080/gl-scene> — declarative `ctx.glScene` 3D scene
 - <http://127.0.0.1:8080/gl-skin>, `/gl-skin-morph`, `/gl-morph` — skinning, combined skinned+morph, and morph-target demos
 - <http://127.0.0.1:8080/gl-lod> — distance-based level-of-detail (LOD) mesh selection
+- <http://127.0.0.1:8080/gl-instanced>, `/gl-instanced-cull`, `/gl-instanced-shadow` — GPU instancing (per-instance transforms, culling, shadows)
+- <http://127.0.0.1:8080/gl-material>, `/gl-wireframe`, `/gl-clip` — custom shader materials, wireframe, user clipping planes
+- <http://127.0.0.1:8080/gl-points>, `/gl-lines`, `/gl-decals` — points & sprites, fat lines, projected decals
 - <http://127.0.0.1:8080/gl-ssr>, `/gl-ssao`, `/gl-dof`, `/gl-oit`, `/gl-tonemap` — image-quality demos (SSR, SSAO, depth of field, order-independent transparency, tone-mappers)
 - <http://127.0.0.1:8080/gl-probe> — runtime reflection probe (GGX-prefiltered cubemap capture)
+- <http://127.0.0.1:8080/gl-draco> — Draco-compressed glTF (`KHR_draco_mesh_compression`) ingest
 
 Or run the **showcase** for a tour of every feature:
 
