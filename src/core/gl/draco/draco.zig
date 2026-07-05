@@ -31,6 +31,9 @@ pub const TableView = @import("predict_mesh.zig").TableView;
 pub const inversePredictView = @import("predict_mesh.zig").inversePredictView;
 pub const buildVertexToData = @import("predict_mesh.zig").buildVertexToData;
 pub const buildVertexToDataView = @import("predict_mesh.zig").buildVertexToDataView;
+pub const TraversalMaps = @import("predict_mesh.zig").TraversalMaps;
+pub const buildTraversalMaps = @import("predict_mesh.zig").buildTraversalMaps;
+pub const predictValues = @import("predict_mesh.zig").predictValues;
 pub const decodeAttributes = @import("attributes.zig").decodeAttributes;
 pub const PositionData = @import("attributes.zig").PositionData;
 
