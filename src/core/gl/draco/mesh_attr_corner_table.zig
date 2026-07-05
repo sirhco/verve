@@ -130,6 +130,14 @@ pub const MeshAttrCornerTable = struct {
         return self.vertex_to_left_most_corner_map_.items[v];
     }
 
+    /// `MeshAttributeCornerTable::IsCornerOnSeam`: true when the corner's base
+    /// position vertex lies on any attribute seam.
+    pub fn isCornerOnSeam(self: *const MeshAttrCornerTable, c: u32, ct: *const draco.CornerTable) bool {
+        const v = ct.vertex(c);
+        if (v == kInvalidVertex or v >= self.is_vertex_on_seam_.len) return false;
+        return self.is_vertex_on_seam_[v];
+    }
+
     /// `MeshAttributeCornerTable::RecomputeVertices(nullptr, nullptr)`: rebuild
     /// the attribute-vertex partition from the current seam edges. Identity
     /// vertex↔attribute-entry mapping (connectivity-only path).
