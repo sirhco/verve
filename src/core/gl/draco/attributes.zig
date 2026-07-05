@@ -367,8 +367,11 @@ fn readValueSection(alloc: std.mem.Allocator, buf: *DecoderBuffer, num_value_ver
     if (transform_type != transform_wrap) return Error.UnsupportedDracoFeature;
 
     // `SequentialIntegerAttributeDecoder::DecodeIntegerValues`: the value blob.
-    // `num_value_verts` is the attribute's vertex count — `conn.num_points` for a
-    // base/position attribute, `attr_map.numVertices()` for a seamed corner attr.
+    // `num_value_verts` is the traversal's reachable-vertex count for this
+    // attribute (`buildTraversalMaps(view).num_values`) — the base view's for
+    // POSITION/vertex-attrs, `attr_map.numVertices()` for a seamed corner attr.
+    // NOT `conn.num_points`, which for attribute meshes over-counts by the
+    // phantom split-vertices Draco leaves un-removed.
     const num_values: usize = num_value_verts * @as(usize, num_components);
     const residuals = try alloc.alloc(i32, num_values);
     errdefer alloc.free(residuals);
