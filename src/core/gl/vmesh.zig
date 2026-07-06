@@ -878,21 +878,8 @@ pub const Reader = struct {
         const index_count = std.mem.readInt(u32, bytes[12..16], .little);
         const sub_count = std.mem.readInt(u32, bytes[16..20], .little);
         const tex_count = std.mem.readInt(u32, bytes[20..24], .little);
-        // NOTE: `var` + `_ = &x` below (not `const`) is deliberate — it forces
-        // these two section offsets onto a stack slot so every later use reloads
-        // the correct value. Zig 0.16.0's self-hosted x86_64 backend (the Debug
-        // default on x86_64-linux) otherwise keeps them in a register that the
-        // version-gated readInt blocks further down (v16/v17) clobber, so the
-        // bounds checks + data slicing read a STALE offset → spurious
-        // error.Truncated. Same backend-bug class as the `blen` capture above;
-        // raw v13–v15 files skip those blocks (offsets stay fresh) which is why
-        // only compressed (v16/v17) assets — cubegrid/windfarm/dracotest —
-        // tripped it, and only on ubuntu CI (aarch64-macOS / Windows / all
-        // release builds take the correct LLVM path). See the `blen` note above.
-        var vertex_off = std.mem.readInt(u32, bytes[24..28], .little);
-        var index_off = std.mem.readInt(u32, bytes[28..32], .little);
-        _ = &vertex_off;
-        _ = &index_off;
+        const vertex_off = std.mem.readInt(u32, bytes[24..28], .little);
+        const index_off = std.mem.readInt(u32, bytes[28..32], .little);
         const tex_table_off = std.mem.readInt(u32, bytes[32..36], .little);
         const tex_data_off = std.mem.readInt(u32, bytes[36..40], .little);
         const bvh_off = std.mem.readInt(u32, bytes[40..44], .little);
@@ -939,6 +926,15 @@ pub const Reader = struct {
         // ON-DISK vertex section: raw = vertex_count×stride; quantized = vertex_comp_len.
         // Decode (if quantized) happens at the very end, alongside indices.
         const on_disk_verts: u64 = if (vertex_tag == .none) @as(u64, vertex_count) * stride else @as(u64, vertex_comp_len_h);
+        // TEMP DIAGNOSTIC (remove before merge): dump the vertex-bounds operands on
+        // native builds so the ubuntu x86_64 CI log reveals which value is wrong.
+        // Comptime-gated off for wasm (freestanding) so std.debug.print isn't linked.
+        if (comptime @import("builtin").target.os.tag != .freestanding) {
+            std.debug.print("VMESH-DBG ver={d} blen={d} liveLen={d} vertex_off={d} vertex_count={d} stride={d} vertex_tag={s} vertex_comp_len_h={d} on_disk_verts={d} cond1={} sub={d}\n", .{
+                ver,                  blen,              bytes.len,     vertex_off,                  vertex_count,                                                         stride,
+                @tagName(vertex_tag), vertex_comp_len_h, on_disk_verts, @as(u64, vertex_off) > blen, if (blen >= @as(u64, vertex_off)) blen - @as(u64, vertex_off) else 0,
+            });
+        }
         if (@as(u64, vertex_off) > blen or on_disk_verts > blen - @as(u64, vertex_off)) return error.Truncated;
 
         // Bounds-check the ON-DISK index section. Raw = index_count×2 u16 bytes;
