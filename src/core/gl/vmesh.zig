@@ -902,23 +902,32 @@ pub const Reader = struct {
         const lod_level_count_h = if (ver >= 15 and blen >= 100) std.mem.readInt(u32, bytes[92..96], .little) else 0;
         const lod_submesh_count_h = if (ver >= 15 and blen >= 100) std.mem.readInt(u32, bytes[96..100], .little) else 0;
 
-        // v16 index-compression header fields (raw for v13–v15).
+        // v16/v17 compression codec headers. ORDER IS LOAD-BEARING: each codec
+        // `switch` MUST run immediately after its codec read and BEFORE the next
+        // std.mem.readInt. Zig 0.16.0's self-hosted x86_64 backend (the Debug
+        // default on x86_64-linux) otherwise lets the following readInt clobber
+        // the register still holding the just-read codec word, so the switch sees
+        // a stale 0 and mis-tags a compressed section as `.none`. That recomputes
+        // on_disk_verts from the (much larger) raw vertex_count×stride and trips a
+        // spurious error.Truncated on large assets (dracotest/cubegrid/windfarm).
+        // Only ubuntu CI hit it — aarch64-macOS / Windows / all release builds
+        // take the correct LLVM path; same backend-bug class as the `blen`
+        // capture at the top of this fn.
         const geo_codec_h = if (ver >= 16 and blen >= 108) std.mem.readInt(u32, bytes[100..104], .little) else 0;
-        const index_comp_len_h = if (ver >= 16 and blen >= 108) std.mem.readInt(u32, bytes[104..108], .little) else 0;
         const geo_tag: GeoCodec = switch (geo_codec_h) {
             0 => .none,
             1 => .index_delta,
             else => return error.Corrupt,
         };
-        // v17 vertex-compression header fields (raw for v13–v16).
+        const index_comp_len_h = if (ver >= 16 and blen >= 108) std.mem.readInt(u32, bytes[104..108], .little) else 0;
         const vertex_codec_h = if (ver >= 17 and blen >= 116) std.mem.readInt(u32, bytes[108..112], .little) else 0;
-        const vertex_comp_len_h = if (ver >= 17 and blen >= 116) std.mem.readInt(u32, bytes[112..116], .little) else 0;
         const vertex_tag: VertexCodec = switch (vertex_codec_h) {
             0 => .none,
             1 => .quant,
             2 => .vertex_gpu,
             else => return error.Corrupt,
         };
+        const vertex_comp_len_h = if (ver >= 17 and blen >= 116) std.mem.readInt(u32, bytes[112..116], .little) else 0;
 
         // Bounds-check vertex data (u64 to prevent u32 multiply wrap). Skinned
         // meshes use the wider stride-56 layout.
@@ -926,15 +935,6 @@ pub const Reader = struct {
         // ON-DISK vertex section: raw = vertex_count×stride; quantized = vertex_comp_len.
         // Decode (if quantized) happens at the very end, alongside indices.
         const on_disk_verts: u64 = if (vertex_tag == .none) @as(u64, vertex_count) * stride else @as(u64, vertex_comp_len_h);
-        // TEMP DIAGNOSTIC (remove before merge): dump the vertex-bounds operands on
-        // native builds so the ubuntu x86_64 CI log reveals which value is wrong.
-        // Comptime-gated off for wasm (freestanding) so std.debug.print isn't linked.
-        if (comptime @import("builtin").target.os.tag != .freestanding) {
-            std.debug.print("VMESH-DBG ver={d} blen={d} liveLen={d} vertex_off={d} vertex_count={d} stride={d} vertex_tag={s} vertex_comp_len_h={d} on_disk_verts={d} cond1={} sub={d}\n", .{
-                ver,                  blen,              bytes.len,     vertex_off,                  vertex_count,                                                         stride,
-                @tagName(vertex_tag), vertex_comp_len_h, on_disk_verts, @as(u64, vertex_off) > blen, if (blen >= @as(u64, vertex_off)) blen - @as(u64, vertex_off) else 0,
-            });
-        }
         if (@as(u64, vertex_off) > blen or on_disk_verts > blen - @as(u64, vertex_off)) return error.Truncated;
 
         // Bounds-check the ON-DISK index section. Raw = index_count×2 u16 bytes;
