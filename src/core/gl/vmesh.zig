@@ -878,8 +878,21 @@ pub const Reader = struct {
         const index_count = std.mem.readInt(u32, bytes[12..16], .little);
         const sub_count = std.mem.readInt(u32, bytes[16..20], .little);
         const tex_count = std.mem.readInt(u32, bytes[20..24], .little);
-        const vertex_off = std.mem.readInt(u32, bytes[24..28], .little);
-        const index_off = std.mem.readInt(u32, bytes[28..32], .little);
+        // NOTE: `var` + `_ = &x` below (not `const`) is deliberate — it forces
+        // these two section offsets onto a stack slot so every later use reloads
+        // the correct value. Zig 0.16.0's self-hosted x86_64 backend (the Debug
+        // default on x86_64-linux) otherwise keeps them in a register that the
+        // version-gated readInt blocks further down (v16/v17) clobber, so the
+        // bounds checks + data slicing read a STALE offset → spurious
+        // error.Truncated. Same backend-bug class as the `blen` capture above;
+        // raw v13–v15 files skip those blocks (offsets stay fresh) which is why
+        // only compressed (v16/v17) assets — cubegrid/windfarm/dracotest —
+        // tripped it, and only on ubuntu CI (aarch64-macOS / Windows / all
+        // release builds take the correct LLVM path). See the `blen` note above.
+        var vertex_off = std.mem.readInt(u32, bytes[24..28], .little);
+        var index_off = std.mem.readInt(u32, bytes[28..32], .little);
+        _ = &vertex_off;
+        _ = &index_off;
         const tex_table_off = std.mem.readInt(u32, bytes[32..36], .little);
         const tex_data_off = std.mem.readInt(u32, bytes[36..40], .little);
         const bvh_off = std.mem.readInt(u32, bytes[40..44], .little);
