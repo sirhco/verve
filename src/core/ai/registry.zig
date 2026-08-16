@@ -96,11 +96,16 @@ pub fn Registry(comptime Actions: type, comptime decls: []const tool.ToolDecl) t
                         // like, and it must not be audited identically to a
                         // routine first-time prompt.
                         const outcome: audit.Outcome = if (confirm_token != null) .claim_rejected else .needs_confirmation;
-                        const fresh = policy.issueToken(name, args_json) orelse {
-                            // Fail-closed: refuse rather than evict some
-                            // other pending approval to make room.
+                        const fresh = policy.issueToken(name, args_json) catch |err| {
+                            // Fail-closed either way: refuse rather than
+                            // evict some other pending approval to make
+                            // room, and refuse rather than mint a token from
+                            // an unseeded (predictable) generator.
                             audit.record(name, decl.risk, .denied, args_json.len);
-                            return .{ .err = "too many pending confirmations" };
+                            return .{ .err = switch (err) {
+                                error.Unseeded => "confirmation token store is not initialized",
+                                error.TableFull => "too many pending confirmations",
+                            } };
                         };
                         audit.record(name, decl.risk, outcome, args_json.len);
                         return .{ .needs_confirmation = fresh };
@@ -210,6 +215,15 @@ const test_decls: []const tool.ToolDecl = &.{
 
 const R = Registry(TestActions, test_decls);
 
+/// Seed `policy`'s token key deterministically for tests that exercise the
+/// confirmation path. Test files run independently of each other, so this
+/// can't assume `policy.zig`'s own tests have already seeded it.
+fn seedPolicyKey() void {
+    var k: [policy.KEY_LEN]u8 = undefined;
+    for (&k, 0..) |*b, i| b.* = @intCast(i);
+    policy.setKey(k);
+}
+
 test "registry: tools_json golden" {
     try std.testing.expectEqualStrings(
         \\[{"name":"addTodo","description":"Append a todo item.","input_schema":{"type":"object","properties":{"text":{"type":"string","description":"Item text."}},"required":["text"],"additionalProperties":false}},{"name":"getCount","description":"Read the counter.","input_schema":{"type":"object","properties":{},"required":[],"additionalProperties":false}}]
@@ -265,6 +279,7 @@ test "dispatch: hallucinated argument name is an error, not a default" {
 
 test "dispatch: dangerous tool needs a token, then runs once" {
     policy.resetTokens();
+    seedPolicyKey();
     const DangerActions = struct {
         pub var ran: u32 = 0;
         pub var nuked: u32 = 0;
@@ -333,6 +348,7 @@ test "dispatch: oversized results are truncated into a still-valid JSON value" {
 
 test "dispatch: an approved confirmation leaves no live token behind" {
     policy.resetTokens();
+    seedPolicyKey();
     const DangerActions = struct {
         pub var ran: u32 = 0;
         pub fn wipe(_: struct {}) void {
@@ -358,14 +374,15 @@ test "dispatch: an approved confirmation leaves no live token behind" {
     // its full capacity available, not `token_cap - 1`.
     var i: usize = 0;
     while (i < policy.token_cap) : (i += 1) {
-        try std.testing.expect(policy.issueToken("filler", "{}") != null);
+        _ = try policy.issueToken("filler", "{}");
     }
-    try std.testing.expect(policy.issueToken("filler", "{}") == null);
+    try std.testing.expectError(policy.IssueError.TableFull, policy.issueToken("filler", "{}"));
     policy.resetTokens();
 }
 
 test "dispatch: a full confirmation table is refused, not silently evicted" {
     policy.resetTokens();
+    seedPolicyKey();
     const DangerActions = struct {
         pub fn wipe(_: struct {}) void {}
     };
@@ -378,7 +395,7 @@ test "dispatch: a full confirmation table is refused, not silently evicted" {
 
     var i: usize = 0;
     while (i < policy.token_cap) : (i += 1) {
-        try std.testing.expect(policy.issueToken("other", "{}") != null);
+        _ = try policy.issueToken("other", "{}");
     }
     const out = DR.invoke(arena.allocator(), "wipe", "{}", p, null);
     try std.testing.expect(out == .err);
@@ -388,6 +405,7 @@ test "dispatch: a full confirmation table is refused, not silently evicted" {
 
 test "dispatch: a rejected confirmation token is audited distinctly from a first-time ask" {
     policy.resetTokens();
+    seedPolicyKey();
     audit.reset();
     const DangerActions = struct {
         pub fn wipe(_: struct {}) void {}

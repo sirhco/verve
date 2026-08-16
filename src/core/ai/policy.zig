@@ -79,45 +79,80 @@ fn bindingOf(name: []const u8, args_json: []const u8) u64 {
     return h.final();
 }
 
-// `core/` has no `std.Io` handle to reach OS randomness — csrf.zig's
-// `io.random(...)` isn't reachable this deep in a comptime dispatch call
-// (and this module only ever links into host targets, never the
-// wasm32-freestanding client, so address-space layout is a real per-process
-// property here, not a wasm illusion). `std.crypto.random` does not exist in
-// this Zig version either (verified against the compiler, not assumed).
+// ---- Token secret -------------------------------------------------------
 //
-// So: seed a SplitMix64 generator once, from the runtime address of this
-// module's own static state (randomized per-process by ASLR on every real
-// deployment target this policy runs on) folded with an issuance counter.
-// This is not a substitute for an HMAC-signed capability token — it exists
-// to turn "guess the next small integer" into "guess an unexported
-// address-space offset", which is the specific weakness this fixes: a
-// sequential `token_seq` counted up from 1 was trivially enumerable.
-var prng_state: u64 = 0;
-var prng_seeded: bool = false;
+// `needs_confirmation` hands a token to the caller *by design* — that's how
+// a host shows a human what to approve. So the value can't be a PRNG output:
+// anyone who legitimately triggers one confirmation would see a value they
+// could invert or extrapolate from, and a generator whose internal state is
+// recoverable from a single output is worse than the sequential counter it
+// would replace, not better. Values must be unguessable *even to someone who
+// has already seen other tokens* — that needs a real keyed secret, not
+// process-local entropy mixed on the dispatch path.
+//
+// Mirrors `src/core/csrf.zig`'s shape exactly, for the same reason it does:
+// entropy has to enter where an `Io` genuinely exists — at process startup —
+// not down here on the comptime dispatch path, which `core/` keeps free of
+// OS handles (this module also never compiles into the wasm32-freestanding
+// client — verified only `src/verve.zig` imports `core/ai/*` — but the
+// startup-only entry point is the right shape regardless of that).
+pub const KEY_LEN: usize = 32;
+var key: [KEY_LEN]u8 = undefined;
+var key_initialized: bool = false;
 var issued_count: u64 = 0;
 
+/// Test/host seam for a deterministic key. Same role as `csrf.setKey`.
+pub fn setKey(new_key: [KEY_LEN]u8) void {
+    key = new_key;
+    key_initialized = true;
+}
+
+/// Draw a fresh key from real OS-backed randomness via `io.random`.
+/// Idempotent — a second call is a no-op, same as `csrf.initFromEnvOrRandom`.
+/// Call once at server/desktop-host startup, next to the CSRF key init.
+pub fn initRandom(io: std.Io) void {
+    if (key_initialized) return;
+    io.random(&key);
+    key_initialized = true;
+}
+
+pub const IssueError = error{
+    /// No key has been seeded yet — the host hasn't called `initRandom` (or
+    /// a test hasn't called `setKey`). Deliberately *not* an assert: island
+    /// chunks compile `ReleaseSmall` with asserts stripped, so an assert
+    /// here would silently vanish exactly where it matters. A dangerous
+    /// tool being unconfirmable until the host wires the key is the safe
+    /// failure — never fall back to a weaker, unseeded generator.
+    Unseeded,
+    /// The pending-confirmation table is at capacity.
+    TableFull,
+};
+
+/// HMAC-SHA256(key, counter), truncated to a u64. A keyed PRF: unlike a bare
+/// PRNG, no output — however many an attacker collects — leaks anything
+/// about `key` or predicts the next one. `issued_count` only needs to be
+/// unique per call, never secret; the security lives entirely in `key`.
 fn nextTokenValue() u64 {
-    if (!prng_seeded) {
-        prng_state = @intFromPtr(&tokens) ^ (@intFromPtr(&prng_state) *% 0x2545F4914F6CDD1D) ^ issued_count;
-        prng_seeded = true;
+    var t: u64 = 0;
+    while (t == 0) {
+        issued_count +%= 1;
+        var counter_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &counter_bytes, issued_count, .little);
+        var mac: [32]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &counter_bytes, &key);
+        t = std.mem.readInt(u64, mac[0..8], .little);
     }
-    // SplitMix64 step: fast, well-distributed, avalanches so consecutive
-    // issuances don't differ by a guessable delta.
-    prng_state +%= 0x9E3779B97F4A7C15;
-    var z = prng_state;
-    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
-    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
-    z = z ^ (z >> 31);
-    return z;
+    return t;
 }
 
 /// Mint a fresh confirmation token bound to the exact `(name, args_json)`
-/// call, in an empty slot. Returns `null` — refusing to issue — if the table
-/// is already full: fail-closed, so an attacker who keeps dangerous calls
-/// pending can only ever hit "too many pending confirmations," never
-/// silently evict someone else's pending approval.
-pub fn issueToken(name: []const u8, args_json: []const u8) ?u64 {
+/// call, in an empty slot. Fails closed on either of two conditions, never
+/// silently degrading: `IssueError.Unseeded` if no key has been set yet, or
+/// `IssueError.TableFull` if every slot is already occupied — an attacker
+/// who keeps dangerous calls pending can only ever hit "too many pending
+/// confirmations," never silently evict someone else's pending approval.
+pub fn issueToken(name: []const u8, args_json: []const u8) IssueError!u64 {
+    if (!key_initialized) return IssueError.Unseeded;
     lock();
     defer mu.unlock();
     var free_idx: ?usize = null;
@@ -127,10 +162,8 @@ pub fn issueToken(name: []const u8, args_json: []const u8) ?u64 {
             break;
         }
     }
-    const idx = free_idx orelse return null;
-    issued_count +%= 1;
-    var t: u64 = 0;
-    while (t == 0) t = nextTokenValue();
+    const idx = free_idx orelse return IssueError.TableFull;
+    const t = nextTokenValue();
     tokens[idx] = .{ .in_use = true, .token = t, .binding = bindingOf(name, args_json) };
     return t;
 }
@@ -169,6 +202,16 @@ pub fn resetTokens() void {
 
 // ---- tests ------------------------------------------------------------
 
+/// Seed a fixed, reproducible key via the public `setKey` seam — same
+/// pattern as every `csrf.zig` test, factored out since many tests here
+/// need it. Never used outside tests; production seeding goes through
+/// `initRandom`.
+fn seedTestKey() void {
+    var k: [KEY_LEN]u8 = undefined;
+    for (&k, 0..) |*b, i| b.* = @intCast(i);
+    setKey(k);
+}
+
 test "policy: safe and mutating tools pass at the default threshold" {
     const p: Policy = .{};
     try std.testing.expect(check(p, .{ .fn_name = "a", .description = "", .risk = .safe }, "0123456789") == .allow);
@@ -197,7 +240,8 @@ test "policy: oversized arguments are denied" {
 
 test "policy: a confirmation token is single-use" {
     resetTokens();
-    const token = issueToken("wipe", "{}").?;
+    seedTestKey();
+    const token = try issueToken("wipe", "{}");
     try std.testing.expect(claimToken(token, "wipe", "{}"));
     try std.testing.expect(!claimToken(token, "wipe", "{}"));
     try std.testing.expect(!claimToken(token +% 1, "wipe", "{}"));
@@ -205,7 +249,8 @@ test "policy: a confirmation token is single-use" {
 
 test "policy: a token issued for one tool does not authorise another" {
     resetTokens();
-    const token = issueToken("wipe", "{}").?;
+    seedTestKey();
+    const token = try issueToken("wipe", "{}");
 
     // A different tool name, same token value and same argument bytes: must
     // not claim.
@@ -217,7 +262,8 @@ test "policy: a token issued for one tool does not authorise another" {
 
 test "policy: a token issued for one argument payload does not authorise another" {
     resetTokens();
-    const token = issueToken("wipe", "{\"id\":5}").?;
+    seedTestKey();
+    const token = try issueToken("wipe", "{\"id\":5}");
 
     // Same tool, different argument bytes: must not claim.
     try std.testing.expect(!claimToken(token, "wipe", "{\"id\":999}"));
@@ -228,7 +274,8 @@ test "policy: a token issued for one argument payload does not authorise another
 
 test "policy: a failed claim does not consume the token" {
     resetTokens();
-    const token = issueToken("wipe", "{}").?;
+    seedTestKey();
+    const token = try issueToken("wipe", "{}");
 
     // A pile of wrong attempts: wrong name, wrong args, wrong token value.
     try std.testing.expect(!claimToken(token, "other", "{}"));
@@ -243,7 +290,8 @@ test "policy: a failed claim does not consume the token" {
 
 test "policy: an approved claim does not leave a second live token behind" {
     resetTokens();
-    const token = issueToken("wipe", "{}").?;
+    seedTestKey();
+    const token = try issueToken("wipe", "{}");
     try std.testing.expect(claimToken(token, "wipe", "{}"));
 
     // If claiming had also left a fresh, unclaimed token sitting in the
@@ -252,24 +300,36 @@ test "policy: an approved claim does not leave a second live token behind" {
     // table has its full capacity available, not `token_cap - 1`.
     var i: usize = 0;
     while (i < token_cap) : (i += 1) {
-        try std.testing.expect(issueToken("filler", "{}") != null);
+        _ = try issueToken("filler", "{}");
     }
-    try std.testing.expect(issueToken("filler", "{}") == null);
+    try std.testing.expectError(IssueError.TableFull, issueToken("filler", "{}"));
     resetTokens();
 }
 
 test "policy: a full table refuses to issue rather than evicting a pending approval" {
     resetTokens();
+    seedTestKey();
     var first_token: ?u64 = null;
     var i: usize = 0;
     while (i < token_cap) : (i += 1) {
-        const t = issueToken("wipe", "{}").?;
+        const t = try issueToken("wipe", "{}");
         if (i == 0) first_token = t;
     }
     // Table is now full; a further issuance must be refused, not silently
     // evict the oldest pending approval.
-    try std.testing.expect(issueToken("wipe", "{}") == null);
+    try std.testing.expectError(IssueError.TableFull, issueToken("wipe", "{}"));
     // The very first token issued must still be live and claimable.
     try std.testing.expect(claimToken(first_token.?, "wipe", "{}"));
     resetTokens();
+}
+
+test "policy: an unseeded token store refuses to issue rather than falling back to a weaker generator" {
+    resetTokens();
+    // Simulate the host never having called `initRandom` — save and restore
+    // the real flag so this doesn't leak an unseeded state to other tests.
+    const was_initialized = key_initialized;
+    key_initialized = false;
+    defer key_initialized = was_initialized;
+
+    try std.testing.expectError(IssueError.Unseeded, issueToken("wipe", "{}"));
 }

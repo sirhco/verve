@@ -11,6 +11,11 @@ pub const Registry = @import("registry.zig").Registry;
 pub const Policy = @import("policy.zig").Policy;
 pub const ToolOutcome = @import("registry.zig").ToolOutcome;
 pub const audit = @import("audit.zig");
+/// Exposes `policy.initRandom(io)` — call once at host startup (server or
+/// desktop) to seed the confirmation-token key, next to the CSRF key init.
+/// Without it, dangerous tools stay unconfirmable (`IssueError.Unseeded`)
+/// rather than falling back to a predictable token source.
+pub const policy = @import("policy.zig");
 
 test {
     _ = @import("tool.zig");

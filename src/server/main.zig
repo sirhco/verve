@@ -102,6 +102,11 @@ pub fn main(init: std.process.Init) !void {
     // back to fresh randomness otherwise.
     const csrf_env = init.environ_map.get("VERVE_CSRF_KEY");
     verve.csrf.initFromEnvOrRandom(csrf_env, io);
+
+    // Initialize the ai-tool confirmation-token key from the same real
+    // entropy source. Unseeded, `verve.ai`'s dangerous-tool path fails
+    // closed (IssueError.Unseeded) rather than minting a predictable token.
+    verve.ai.policy.initRandom(io);
     printStartupBanner(cli);
 
     // Live-graph publisher (opt-in: only when the app declares
