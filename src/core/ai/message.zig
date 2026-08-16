@@ -84,11 +84,13 @@ pub const Usage = struct {
     output_tokens: u32 = 0,
 };
 
-/// The parsed shape of a `POST /v1/messages` response — field-for-field the
-/// same shape `provider.Response` carries. Kept as its own type here (rather
-/// than importing `provider.zig`) so the codec has no dependency on the
-/// provider abstraction; nothing stops a future provider implementation from
-/// constructing a `provider.Response` by copying these three fields.
+/// The parsed shape of a `POST /v1/messages` response. Defined here (not in
+/// `provider.zig`) because this is the natural home — it's the wire shape
+/// this file parses — and `provider.zig` imports this file already, so it
+/// aliases `Response`/`Usage` (`pub const Response = message.Response;`)
+/// rather than redeclaring them: that keeps `provider.Response` the literal
+/// same type as this one, so `parseResponse`'s return value can be handed
+/// directly anywhere a `provider.Response` is expected, no field copy.
 pub const Response = struct {
     stop_reason: StopReason,
     blocks: []const Block,

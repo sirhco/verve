@@ -148,7 +148,7 @@ test "agent: tool_use turn executes the tool and continues" {
     try std.testing.expectEqual(@as(u8, 2), outcome.steps);
     try std.testing.expectEqual(message.StopReason.end_turn, outcome.stopped);
 
-    // convo: [user(hello), assistant(tool_use), user(tool_result), assistant(text)]
+    // convo: [user(what's the count?), assistant(tool_use), user(tool_result), assistant(text)]
     try std.testing.expectEqual(@as(usize, 4), convo.items.len);
     const results_msg = convo.items[2];
     try std.testing.expectEqual(message.Role.user, results_msg.role);

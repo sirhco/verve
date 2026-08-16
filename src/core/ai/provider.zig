@@ -5,7 +5,15 @@
 const std = @import("std");
 const message = @import("message.zig");
 
-pub const Usage = struct { input_tokens: u32 = 0, output_tokens: u32 = 0 };
+/// `message.zig` owns these definitions — they're the parsed wire shape, and
+/// `message.parseResponse` already returns them. Aliasing (not redefining)
+/// keeps `provider.Response`/`provider.Usage` the literal same type as
+/// `message.Response`/`message.Usage`, so a future provider implementation
+/// (`anthropic.zig`) can hand `parseResponse`'s return value straight back
+/// as its `complete`'s return value — no field-by-field copy between two
+/// structurally identical but nominally distinct structs.
+pub const Usage = message.Usage;
+pub const Response = message.Response;
 
 pub const Capabilities = struct {
     /// True when the provider accepts a tool list and returns `tool_use`
@@ -22,12 +30,6 @@ pub const Request = struct {
     /// Anthropic-format tool array, or "[]" for none.
     tools_json: []const u8 = "[]",
     max_tokens: u32 = 4096,
-};
-
-pub const Response = struct {
-    stop_reason: message.StopReason,
-    blocks: []const message.Block,
-    usage: Usage = .{},
 };
 
 pub const Provider = struct {
