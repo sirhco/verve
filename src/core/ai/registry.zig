@@ -149,17 +149,41 @@ pub fn Registry(comptime Actions: type, comptime decls: []const tool.ToolDecl) t
     };
 }
 
-/// Shrink an oversized JSON result into something shorter that still parses.
-/// A raw byte slice of a JSON value can leave a string unterminated and can
-/// split a multi-byte UTF-8 sequence — handing the model something it was
-/// told was well-formed JSON and isn't. Wraps a UTF-8-safe prefix of the
-/// original encoding in a small object instead.
+/// The wrapper with an empty `partial` — both the minimal fallback (below)
+/// and the yardstick used to budget how much of `json` can actually fit.
+const empty_wrapper = "{\"truncated\":true,\"partial\":\"\"}";
+
+/// Shrink an oversized JSON result into something shorter that still parses
+/// *and fits in `max_bytes`* — `Policy.max_tool_result_bytes` is documented
+/// as a cap, so the output has to actually respect it, not just be smaller
+/// than the untruncated original. A raw byte slice of a JSON value can leave
+/// a string unterminated and can split a multi-byte UTF-8 sequence — handing
+/// the model something it was told was well-formed JSON and isn't. Wraps a
+/// UTF-8-safe prefix of the original encoding in a small object instead.
 fn truncateResult(arena: std.mem.Allocator, json: []const u8, max_bytes: usize) []const u8 {
-    const cut = utf8SafeCut(json, max_bytes);
+    // Reserve the wrapper's own fixed characters before budgeting the
+    // prefix, so the *un-escaped* prefix plus wrapper is sized to fit.
+    const prefix_budget = max_bytes -| empty_wrapper.len;
+    const cut = utf8SafeCut(json, prefix_budget);
+
     var aw: Writer.Allocating = .init(arena);
     std.json.Stringify.value(.{ .truncated = true, .partial = json[0..cut] }, .{}, &aw.writer) catch
-        return "{\"truncated\":true,\"partial\":\"\"}";
-    return aw.written();
+        return empty_wrapper;
+    const out = aw.written();
+
+    // Escaping (quotes, backslashes, control bytes re-escaped inside
+    // `partial`) can still grow the result past `max_bytes` even after
+    // budgeting the wrapper's fixed characters out — a prefix that was
+    // itself JSON-quote-dense can approach 2x its raw length once
+    // re-escaped. Fall back to something smaller rather than exceed the
+    // cap this field exists to enforce.
+    if (out.len <= max_bytes) return out;
+    if (max_bytes >= empty_wrapper.len) return empty_wrapper;
+    if (max_bytes >= 4) return "null";
+    // Nothing valid and non-empty fits in under 4 bytes; `max_bytes` this
+    // small is a degenerate policy value (the default is 16KiB) rather than
+    // a case worth a bigger fallback ladder for.
+    return "0";
 }
 
 /// The largest prefix of `json` no longer than `max_bytes` that is still
@@ -323,10 +347,13 @@ test "dispatch: dangerous tool needs a token, then runs once" {
     try std.testing.expectEqual(@as(u32, 1), DangerActions.ran);
 }
 
-test "dispatch: oversized results are truncated into a still-valid JSON value" {
+test "dispatch: oversized results are truncated into a still-valid JSON value that fits the budget" {
     const BigActions = struct {
         pub fn big(_: struct {}) []const u8 {
-            return "0123456789";
+            // Long enough that a 60-byte cap still leaves room to see the
+            // wrapper object shape (rather than falling all the way back to
+            // the empty-partial / `null` tiers below).
+            return "0123456789" ** 10;
         }
     };
     const BR = Registry(BigActions, &.{
@@ -334,16 +361,45 @@ test "dispatch: oversized results are truncated into a still-valid JSON value" {
     });
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const out = BR.invoke(arena.allocator(), "big", "{}", .{ .max_tool_result_bytes = 4 }, null);
+    const out = BR.invoke(arena.allocator(), "big", "{}", .{ .max_tool_result_bytes = 60 }, null);
     try std.testing.expect(out == .ok);
 
+    // `max_tool_result_bytes` is documented as a cap — the output must
+    // actually respect it, not just be shorter than the untruncated value.
+    try std.testing.expect(out.ok.len <= 60);
+
     // The model must be handed something it can actually parse, not a raw
-    // byte-sliced fragment (a naive slice of `"0123456789"` to 4 bytes would
-    // be the unterminated `"01`).
+    // byte-sliced fragment (a naive slice would be an unterminated string).
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), out.ok, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
     try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+}
+
+test "dispatch: a truncated result fits its budget even when re-escaping would expand it" {
+    const QuoteActions = struct {
+        pub fn quotes(_: struct {}) []const u8 {
+            // All double-quotes: worst case for escaping expansion. Each is
+            // already escaped once by the initial JSON encoding (`"` → `\"`)
+            // and would be escaped *again* if a raw prefix were stuffed
+            // unescaped into a wrapper string — exactly the failure mode
+            // `max_tool_result_bytes` has to survive.
+            return "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"";
+        }
+    };
+    const QR = Registry(QuoteActions, &.{
+        .{ .fn_name = "quotes", .description = "Quotes.", .risk = .safe },
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const out = QR.invoke(arena.allocator(), "quotes", "{}", .{ .max_tool_result_bytes = 40 }, null);
+    try std.testing.expect(out == .ok);
+    try std.testing.expect(out.ok.len <= 40);
+
+    // Whatever shape the fallback ladder landed on — full wrapper, empty
+    // wrapper, or a bare `null` — it must still be valid JSON.
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), out.ok, .{});
+    defer parsed.deinit();
 }
 
 test "dispatch: an approved confirmation leaves no live token behind" {
@@ -370,11 +426,14 @@ test "dispatch: an approved confirmation leaves no live token behind" {
 
     // The approved claim must not have left a second, still-live token
     // bound to this call sitting in the table (the leftover-authorization
-    // bug this fixes) — fill every remaining slot and confirm the table has
-    // its full capacity available, not `token_cap - 1`.
+    // bug this fixes) — fill every remaining slot with distinct calls and
+    // confirm the table has its full capacity available, not
+    // `token_cap - 1`.
     var i: usize = 0;
     while (i < policy.token_cap) : (i += 1) {
-        _ = try policy.issueToken("filler", "{}");
+        var buf: [24]u8 = undefined;
+        const args = std.fmt.bufPrint(&buf, "{{\"n\":{d}}}", .{i}) catch unreachable;
+        _ = try policy.issueToken("filler", args);
     }
     try std.testing.expectError(policy.IssueError.TableFull, policy.issueToken("filler", "{}"));
     policy.resetTokens();
@@ -395,7 +454,9 @@ test "dispatch: a full confirmation table is refused, not silently evicted" {
 
     var i: usize = 0;
     while (i < policy.token_cap) : (i += 1) {
-        _ = try policy.issueToken("other", "{}");
+        var buf: [24]u8 = undefined;
+        const args = std.fmt.bufPrint(&buf, "{{\"n\":{d}}}", .{i}) catch unreachable;
+        _ = try policy.issueToken("other", args);
     }
     const out = DR.invoke(arena.allocator(), "wipe", "{}", p, null);
     try std.testing.expect(out == .err);

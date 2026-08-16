@@ -55,14 +55,18 @@ pub fn check(p: Policy, decl: tool.ToolDecl, args_json: []const u8) Decision {
 // slot meant a 17th pending dangerous call silently evicted an unrelated,
 // still-pending human approval (and, in the worst case, a call's own
 // eventual claim could be evicted by 16 *other* calls issued in between).
-// A full table now refuses to issue instead — fail-closed, and the pending
-// set is explicitly capped rather than silently rotated.
+// A full table refuses to issue instead — fail-closed — *unless* the
+// occupant is old enough to be presumed abandoned; see `findIssuableSlot`.
 pub const token_cap = 16;
 
 const Slot = struct {
     in_use: bool = false,
     token: u64 = 0,
     binding: u64 = 0,
+    /// Logical-clock value (`clock`, not wall time) when this slot was
+    /// minted. Used only to find "the oldest occupied slot" for reclaiming
+    /// abandoned confirmations — see `stale_after`.
+    generation: u64 = 0,
 };
 
 var tokens: [token_cap]Slot = @splat(.{});
@@ -70,13 +74,6 @@ var mu: std.atomic.Mutex = .unlocked;
 
 fn lock() void {
     while (!mu.tryLock()) std.atomic.spinLoopHint();
-}
-
-fn bindingOf(name: []const u8, args_json: []const u8) u64 {
-    var h = std.hash.Wyhash.init(0);
-    h.update(name);
-    h.update(args_json);
-    return h.final();
 }
 
 // ---- Token secret -------------------------------------------------------
@@ -124,9 +121,24 @@ pub const IssueError = error{
     /// tool being unconfirmable until the host wires the key is the safe
     /// failure — never fall back to a weaker, unseeded generator.
     Unseeded,
-    /// The pending-confirmation table is at capacity.
+    /// The pending-confirmation table is at capacity, and no occupied slot
+    /// is old enough to be presumed abandoned — see `findIssuableSlot`.
     TableFull,
 };
+
+/// HMAC-SHA256(key, name ++ args_json), truncated to a u64. Keyed (unlike
+/// the Wyhash this replaces) because this is the check that stops an
+/// approval for one call being spent on another: an unkeyed hash under a
+/// publicly known seed is guessable by anyone who can compute it, which
+/// defeats the point once `key` exists anyway to key something else.
+fn bindingOf(name: []const u8, args_json: []const u8) u64 {
+    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&key);
+    hmac.update(name);
+    hmac.update(args_json);
+    var mac: [32]u8 = undefined;
+    hmac.final(&mac);
+    return std.mem.readInt(u64, mac[0..8], .little);
+}
 
 /// HMAC-SHA256(key, counter), truncated to a u64. A keyed PRF: unlike a bare
 /// PRNG, no output — however many an attacker collects — leaks anything
@@ -145,26 +157,89 @@ fn nextTokenValue() u64 {
     return t;
 }
 
-/// Mint a fresh confirmation token bound to the exact `(name, args_json)`
-/// call, in an empty slot. Fails closed on either of two conditions, never
-/// silently degrading: `IssueError.Unseeded` if no key has been set yet, or
-/// `IssueError.TableFull` if every slot is already occupied — an attacker
-/// who keeps dangerous calls pending can only ever hit "too many pending
-/// confirmations," never silently evict someone else's pending approval.
-pub fn issueToken(name: []const u8, args_json: []const u8) IssueError!u64 {
-    if (!key_initialized) return IssueError.Unseeded;
-    lock();
-    defer mu.unlock();
-    var free_idx: ?usize = null;
+// ---- Reclaiming abandoned slots -----------------------------------------
+//
+// A slot is only ever freed by a *successful* claim (or a test's
+// `resetTokens`). Left at that, every un-approved ask — a human who
+// declines, one who never answers, a replayed or foreign token — leaks a
+// slot permanently: after `token_cap` of them, over the whole process
+// lifetime, every later dangerous call hits `TableFull` until restart. That
+// fails closed, not open, so it isn't a bypass, but it permanently kills
+// the mechanism this module exists to provide, which is its own kind of
+// failure.
+//
+// The fix has two parts. First, `issueToken` dedupes: a repeated ask for
+// the exact same `(name, args_json)` returns the slot's existing token
+// instead of minting a second one, which is the common case (a model
+// retrying one call) and costs nothing extra. Second, for asks that are
+// genuinely abandoned — different calls that pile up over time — the
+// oldest occupied slot becomes reclaimable once enough *other* activity has
+// happened since it was minted. `core/` has no `Io` handle on this path (see
+// the token-secret note above), so there is no wall clock to measure real
+// elapsed time; `clock` is a logical tick, incremented once per
+// `issueToken` call regardless of outcome (so that a table stuck at
+// capacity keeps advancing even while every attempt fails — otherwise
+// nothing would ever count as "old enough," and the table would stay wedged
+// forever, right back where this started). That means an attacker who can
+// also drive new asks can advance this clock arbitrarily fast: this bounds
+// the worst case (the table cannot stay wedged past `stale_after` further
+// asks) rather than proving a slot has truly sat idle for any real amount
+// of time. A wall-clock TTL would be the stronger mechanism if this code
+// ever gains access to one.
+var clock: u64 = 0;
+
+/// Generation-distance beyond which an unclaimed slot may be reclaimed.
+/// `token_cap * 4`: generous headroom so a burst of unrelated activity
+/// doesn't threaten a confirmation a human might still be about to act on.
+const stale_after: u64 = token_cap * 4;
+
+/// A free slot if one exists; otherwise the single oldest occupied slot, if
+/// it's old enough (`stale_after` ticks of `clock`) to be presumed
+/// abandoned. Returns null only when every slot is occupied and none is
+/// stale — the fail-closed case, preserved for slots that are plausibly
+/// still live.
+fn findIssuableSlot() ?usize {
     for (&tokens, 0..) |*slot, i| {
-        if (!slot.in_use) {
-            free_idx = i;
-            break;
+        if (!slot.in_use) return i;
+    }
+    var oldest_idx: usize = 0;
+    var oldest_gen: u64 = std.math.maxInt(u64);
+    for (&tokens, 0..) |*slot, i| {
+        if (slot.generation < oldest_gen) {
+            oldest_gen = slot.generation;
+            oldest_idx = i;
         }
     }
-    const idx = free_idx orelse return IssueError.TableFull;
+    if (clock -% oldest_gen >= stale_after) return oldest_idx;
+    return null;
+}
+
+/// Mint (or, for a repeated identical ask, return the existing) confirmation
+/// token for the exact `(name, args_json)` call. Fails closed on either of
+/// two conditions, never silently degrading: `IssueError.Unseeded` if no key
+/// has been set yet, or `IssueError.TableFull` if every slot is occupied and
+/// none is stale — an attacker who keeps dangerous calls pending can only
+/// ever hit "too many pending confirmations," never silently evict someone
+/// else's pending approval before it's had a fair chance to be acted on.
+pub fn issueToken(name: []const u8, args_json: []const u8) IssueError!u64 {
+    if (!key_initialized) return IssueError.Unseeded;
+    const binding = bindingOf(name, args_json);
+
+    lock();
+    defer mu.unlock();
+    clock +%= 1;
+
+    // A repeated ask for the exact same call returns its existing token
+    // instead of minting a second one and leaking a slot — this is also
+    // what keeps a human's in-progress approval alive instead of
+    // invalidating it just because the model (or a retry) asked again.
+    for (&tokens) |*slot| {
+        if (slot.in_use and slot.binding == binding) return slot.token;
+    }
+
+    const idx = findIssuableSlot() orelse return IssueError.TableFull;
     const t = nextTokenValue();
-    tokens[idx] = .{ .in_use = true, .token = t, .binding = bindingOf(name, args_json) };
+    tokens[idx] = .{ .in_use = true, .token = t, .binding = binding, .generation = clock };
     return t;
 }
 
@@ -192,12 +267,19 @@ pub fn claimToken(token: u64, name: []const u8, args_json: []const u8) bool {
     return false;
 }
 
-/// Test-only: clear the token table so tests don't interfere.
+/// Test-only: clear the token table (and its logical clock) so tests don't
+/// interfere with each other. Deliberately does not touch `key` — production
+/// code has no path back to "unseeded" once initialized. A host must never
+/// call this: besides discarding every pending confirmation outright, it
+/// also rewinds `issued_count`, which would replay the identical HMAC
+/// counter sequence against the still-live key. Harmless for a throwaway
+/// test process; not something a long-running server should ever do.
 pub fn resetTokens() void {
     lock();
     defer mu.unlock();
     tokens = @splat(.{});
     issued_count = 0;
+    clock = 0;
 }
 
 // ---- tests ------------------------------------------------------------
@@ -210,6 +292,13 @@ fn seedTestKey() void {
     var k: [KEY_LEN]u8 = undefined;
     for (&k, 0..) |*b, i| b.* = @intCast(i);
     setKey(k);
+}
+
+/// Distinct argument JSON per call, for tests that need to fill several
+/// slots with genuinely different bindings (dedupe would otherwise collapse
+/// repeated identical args onto a single slot).
+fn fmtArgs(buf: []u8, n: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "{{\"n\":{d}}}", .{n}) catch unreachable;
 }
 
 test "policy: safe and mutating tools pass at the default threshold" {
@@ -296,11 +385,13 @@ test "policy: an approved claim does not leave a second live token behind" {
 
     // If claiming had also left a fresh, unclaimed token sitting in the
     // table (the leftover-authorization bug this fixes), the table would
-    // already have an occupied slot here. Fill every slot and confirm the
-    // table has its full capacity available, not `token_cap - 1`.
+    // already have an occupied slot here. Fill every slot with distinct
+    // calls and confirm the table has its full capacity available, not
+    // `token_cap - 1`.
     var i: usize = 0;
     while (i < token_cap) : (i += 1) {
-        _ = try issueToken("filler", "{}");
+        var buf: [24]u8 = undefined;
+        _ = try issueToken("filler", fmtArgs(&buf, i));
     }
     try std.testing.expectError(IssueError.TableFull, issueToken("filler", "{}"));
     resetTokens();
@@ -312,14 +403,15 @@ test "policy: a full table refuses to issue rather than evicting a pending appro
     var first_token: ?u64 = null;
     var i: usize = 0;
     while (i < token_cap) : (i += 1) {
-        const t = try issueToken("wipe", "{}");
+        var buf: [24]u8 = undefined;
+        const t = try issueToken("wipe", fmtArgs(&buf, i));
         if (i == 0) first_token = t;
     }
-    // Table is now full; a further issuance must be refused, not silently
-    // evict the oldest pending approval.
-    try std.testing.expectError(IssueError.TableFull, issueToken("wipe", "{}"));
+    // Table is now full of distinct, recent slots; a further issuance must
+    // be refused, not silently evict the oldest pending approval.
+    try std.testing.expectError(IssueError.TableFull, issueToken("wipe", "{\"n\":999}"));
     // The very first token issued must still be live and claimable.
-    try std.testing.expect(claimToken(first_token.?, "wipe", "{}"));
+    try std.testing.expect(claimToken(first_token.?, "wipe", "{\"n\":0}"));
     resetTokens();
 }
 
@@ -332,4 +424,58 @@ test "policy: an unseeded token store refuses to issue rather than falling back 
     defer key_initialized = was_initialized;
 
     try std.testing.expectError(IssueError.Unseeded, issueToken("wipe", "{}"));
+}
+
+test "policy: a repeated ask for the same call returns the existing token, not a second slot" {
+    resetTokens();
+    seedTestKey();
+    const first = try issueToken("wipe", "{}");
+    const second = try issueToken("wipe", "{}");
+    try std.testing.expectEqual(first, second);
+
+    // Only one slot should have been consumed by the two asks above — fill
+    // the rest of the table with distinct calls and confirm we get exactly
+    // `token_cap - 1` more successful issuances, not `token_cap - 2` (which
+    // would mean the repeated ask had consumed a second slot).
+    var i: usize = 0;
+    while (i < token_cap - 1) : (i += 1) {
+        var buf: [24]u8 = undefined;
+        _ = try issueToken("filler", fmtArgs(&buf, i));
+    }
+    try std.testing.expectError(IssueError.TableFull, issueToken("last", "{}"));
+    resetTokens();
+}
+
+test "policy: abandoned asks do not permanently brick the confirmation table" {
+    resetTokens();
+    seedTestKey();
+
+    // Fill every slot with a distinct, never-claimed ask — simulates 16
+    // declined or ignored confirmations piling up over the process
+    // lifetime.
+    var i: usize = 0;
+    while (i < token_cap) : (i += 1) {
+        var buf: [24]u8 = undefined;
+        _ = try issueToken("wipe", fmtArgs(&buf, i));
+    }
+
+    // Immediately after, the table is genuinely full of "recent" slots —
+    // still refuses. This is the fail-closed guarantee from the previous
+    // fix, unchanged: a burst of activity can't instantly evict something
+    // that might still be live.
+    try std.testing.expectError(IssueError.TableFull, issueToken("wipe", "{\"n\":999}"));
+
+    // Enough further distinct asks pass for the oldest slot to be presumed
+    // abandoned; issuance must eventually recover, not stay wedged forever.
+    var reclaimed = false;
+    var j: usize = 0;
+    while (j < stale_after) : (j += 1) {
+        var buf: [24]u8 = undefined;
+        if (issueToken("nuke", fmtArgs(&buf, j))) |_| {
+            reclaimed = true;
+            break;
+        } else |_| {}
+    }
+    try std.testing.expect(reclaimed);
+    resetTokens();
 }
