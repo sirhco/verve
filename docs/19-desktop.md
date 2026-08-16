@@ -102,6 +102,20 @@ reference. Headline list:
   `verve.registerEvent(&fn)`) are wired in the bridge JS delegate
 - **Typed IPC** — `desktop.Router(Ctx, Routes)` with `Args`/`Reply`
   types per route; JS callers `await window.verve.request({type, ...})`
+- **AI tools** — `verve.ai.RouteRegistry` exposes a chosen subset of
+  those same typed IPC routes to a language model, running through
+  the identical allowlist → size → risk → confirmation gate and audit
+  trail as the HTTP path (one gate, not two). `desktop.ai_cli.Client`
+  is a second provider that shells out to the Claude Code CLI — it is
+  **delegation, not tool-calling**: Claude Code runs its own tools in
+  its own sandbox, so it reports `native_tools = false` and refuses a
+  non-empty tool list rather than silently dropping it. Confirmation
+  tokens are seeded at startup via `verve.ai.policy.initRandom(io)`
+  (already wired in both scaffold `main.zig` files) — without it the
+  token store stays unseeded and `.dangerous` tools are permanently
+  unconfirmable, failing closed. See [25 — AI tools](25-ai.md).
+  Note: no desktop demo route ships yet; the shared-gate property is
+  covered by unit tests rather than a running desktop example.
 - **Cookies** — per-window `CookieStore` with `set`/`get`/`delete`/`clear`,
   real implementations on all three backends (sync wrappers around
   platform-native async cookie managers)

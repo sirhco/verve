@@ -37,8 +37,58 @@ Fresh session? Do these four in order before writing code:
 
 Authoritative state of the desktop scaffold subsystem and the remaining
 work needed to call it "fully functional." Written 2026-05-22, last
-updated 2026-05-28. Fresh sessions should be able to pick up without
+updated 2026-08-16. Fresh sessions should be able to pick up without
 prior context.
+
+## Done in the 2026-08-16 session — `verve.ai` desktop surface (v0.50.0)
+
+Landed on `main` as part of the `verve.ai` subsystem (merge `6e7ea4b`),
+not as desktop-workstream work. Three things touch the desktop tree:
+
+- **`src/desktop/ai_cli.zig`** — a `verve.ai` `Provider` that shells out
+  to the Claude Code CLI via `desktop.process.runCapture`. It is
+  **delegation, not tool-calling**: Claude Code runs its own tools in
+  its own sandbox and never touches this framework's registry, so it
+  reports `native_tools = false` and returns
+  `error.ProviderLacksToolSupport` on a non-empty tool list rather than
+  silently dropping it. The CLI envelope is verified against the real
+  binary (`claude -p '…' --output-format=json` returns `result` and
+  `is_error` among ~21 keys; parsed via a dynamic `std.json.Value`, so
+  the rest are ignored).
+- **`verve.ai.RouteRegistry`** — exposes typed `ipc_router` routes to a
+  model through the *same* allowlist → size → risk → confirmation gate
+  and audit trail as HTTP actions. Verified as one shared
+  `gate`/`finish` pair, not two parallel implementations.
+- **`verve.ai.policy.initRandom(io)`** wired into both templates'
+  `main.zig`. Confirmation tokens derive from a process-wide key seeded
+  once at startup (mirroring `csrf.zig`); without this call the token
+  store stays unseeded and every `.dangerous` tool is permanently
+  unconfirmable. Fails closed, so it is a capability gap rather than a
+  hole — but it is silent, so don't remove the call.
+
+**Two constraint notes for future desktop sessions:**
+
+1. This work **did modify `src/verve.zig`** (adding the `ai` export and
+   the shared `action_invoke` module), which item 4 of the checklist
+   above forbids. That constraint governs *desktop-workstream* changes;
+   this was framework work on `main` that happens to reach into
+   `src/desktop/`. The constraint still stands for desktop work.
+2. It also fixed a latent bug in `src/desktop/process.zig`, which was
+   written against a removed `std.process.Child` API (`.run`,
+   `.Exited`). It had **zero callers repo-wide**, so Zig's lazy analysis
+   never type-checked the bodies and the suite stayed green. Worth
+   remembering: a public API with no exercising caller is not verified
+   by a passing build.
+
+**Not done — carried as outstanding work.** The `verve.ai` spec called
+for an `ai_chat` IPC route in `templates/desktop/src/handlers.zig`
+driving `RouteRegistry` over `ipc_router`. It was never built, so the
+"one gate, two surfaces" property is proven by unit test rather than by
+a running desktop demo, and `desktop.ai_cli.Client.complete` has never
+been invoked outside its unit tests. Building that route is the natural
+next desktop bundle — see
+`docs/superpowers/handoffs/2026-08-16-verve-ai-next-session.md` and
+[25 — AI tools](25-ai.md).
 
 ## Done in the 2026-06-07 session — Windows native host: first REAL-HARDWARE boot
 

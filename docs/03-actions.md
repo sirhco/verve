@@ -285,8 +285,50 @@ The walk happens via `inline for (comptime std.meta.declarations(app.Actions))`
 in `src/server/main.zig`. Adding a `pub fn` to `Actions` automatically
 registers it — no other config required.
 
+## Exposing actions to a language model
+
+The same comptime walk that registers `/api/<fn>` can also describe an action
+to a language model. `verve.ai` reflects over an action's argument struct to
+generate its JSON Schema, so a model can call it as a tool with typed
+arguments — no second declaration, no hand-written schema to drift.
+
+It is **default-deny**: an action is reachable by a model only if you name it
+in an explicit allowlist, and each entry carries a risk tier that decides
+whether the call runs, is refused, or requires a human to confirm it first.
+
+```zig
+// src/app/ai.zig
+pub const tools: []const verve.ai.ToolDecl = &.{
+    .{
+        .fn_name = "getCount",
+        .description = "Read the current value of the shared counter.",
+        .risk = .safe,
+    },
+    .{
+        .fn_name = "addTodo",
+        .description = "Append an item to the shared todo list.",
+        .risk = .mutating,
+        .arg_docs = &.{.{ .field = "text", .description = "Item text, max 200 characters." }},
+    },
+};
+```
+
+A typo'd `fn_name`, an `arg_docs.field` that no longer exists, or an argument
+type that cannot be represented in JSON Schema is a **build failure**, not a
+runtime surprise.
+
+Note that model-supplied arguments are parsed *strictly* — an unknown field is
+an error the model can see and retry against, rather than a silently defaulted
+real parameter and a wrong action executed. That is deliberately different from
+the lenient parsing the HTTP path uses for its own callers.
+
+See [25 — AI tools](25-ai.md) for the risk tiers, the policy gate, the
+confirmation round-trip, and the security model.
+
 ## Next
 
 - [04 — Routing](04-routing.md) — page route table + path params.
 - [05 — Reactivity](05-reactivity.md) — wiring actions to signals + effects.
 - [13 — Security](13-security.md) — CSRF + CSP + Origin pinning.
+- [25 — AI tools](25-ai.md) — exposing a chosen subset of these actions to a
+  language model as callable tools.
