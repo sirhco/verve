@@ -72,7 +72,7 @@ pub const Client = struct {
         const self: *Client = @ptrCast(@alignCast(ptr));
         const api_key = try resolveApiKey(self.api_key);
 
-        const body = try buildRequestBody(arena, req);
+        const body = try buildRequestBody(arena, self.resolveRequest(req));
         const url = try std.fmt.allocPrint(arena, "{s}/v1/messages", .{self.base_url});
 
         const headers = [_]std.http.Header{
@@ -91,13 +91,16 @@ pub const Client = struct {
             .io = self.io,
         });
 
-        if (res.truncated) return error.ResponseTruncated;
-
-        if (res.status < 200 or res.status >= 300) {
-            // Status only — the body can echo request content (including
-            // tool arguments an app might consider sensitive) back verbatim.
-            std.log.scoped(.verve_ai).err("anthropic: http {d}", .{res.status});
-            return error.AnthropicHttpError;
+        switch (classifyHttpResult(res)) {
+            .http_error => {
+                // Status only — the body can echo request content
+                // (including tool arguments an app might consider
+                // sensitive) back verbatim.
+                std.log.scoped(.verve_ai).err("anthropic: http {d}", .{res.status});
+                return error.AnthropicHttpError;
+            },
+            .truncated => return error.ResponseTruncated,
+            .ok => {},
         }
 
         // `message.Response`/`message.Usage` are the literal same types as
@@ -105,7 +108,37 @@ pub const Client = struct {
         // handed straight back, no field copy.
         return message.parseResponse(arena, res.body);
     }
+
+    /// Apply this client's configured defaults to whichever `Request` fields
+    /// the caller left unset. Split out from `complete()` so the defaulting
+    /// itself is unit-testable without a network call — see the
+    /// "Client defaults" tests below.
+    fn resolveRequest(self: Client, req: provider_mod.Request) ResolvedRequest {
+        return .{
+            .model = req.model orelse self.model,
+            .system = req.system,
+            .messages = req.messages,
+            .tools_json = req.tools_json,
+            .max_tokens = req.max_tokens orelse self.max_tokens,
+        };
+    }
 };
+
+const HttpOutcome = enum { ok, http_error, truncated };
+
+/// Status is checked before truncation: a non-2xx response with an
+/// oversized body (a proxy or WAF error page, say) classifies as
+/// `.http_error` — the more actionable signal — not masked by `.truncated`.
+/// A pure classification with no logging side effect, split out from
+/// `complete()` specifically so this ordering is unit-testable: Zig's test
+/// runner fails any test that triggers a `std.log.err` call, so the actual
+/// logging has to live in `complete()`, one level up from what's tested
+/// here.
+fn classifyHttpResult(res: fetch_mod.FetchResponse) HttpOutcome {
+    if (res.status < 200 or res.status >= 300) return .http_error;
+    if (res.truncated) return .truncated;
+    return .ok;
+}
 
 /// An explicit key wins; otherwise the value the host captured into
 /// `process_environ_map` via `initEnviron` (typically `ANTHROPIC_API_KEY`
@@ -120,12 +153,29 @@ fn resolveApiKey(explicit: ?[]const u8) ![]const u8 {
     return error.MissingApiKey;
 }
 
+/// The fields `buildRequestBody` actually encodes, after `Client` defaults
+/// have already been applied to whatever `provider.Request` left unset
+/// (see `Client.resolveRequest`). Deliberately distinct from
+/// `provider.Request` — `model`/`max_tokens` are optional there precisely
+/// so a caller can omit them, which means something has to have already
+/// picked a concrete value by the time this function runs; it never guesses
+/// a fallback itself. `max_tokens` keeps its own default here (matching
+/// `Client.max_tokens`'s) only for callers exercising this function
+/// directly, as the golden tests below do, with no `Client` in the loop.
+const ResolvedRequest = struct {
+    model: []const u8,
+    system: []const u8 = "",
+    messages: []const message.Message,
+    tools_json: []const u8 = "[]",
+    max_tokens: u32 = 4096,
+};
+
 /// Build the `POST /v1/messages` request body. Exposed (not `fn`-private)
 /// so the golden test can assert the exact bytes with no network involved.
 ///
 /// Deliberately omits `temperature`, `top_p`, `top_k`, and
 /// `thinking.budget_tokens` — see the module doc comment.
-pub fn buildRequestBody(arena: std.mem.Allocator, req: provider_mod.Request) ![]const u8 {
+pub fn buildRequestBody(arena: std.mem.Allocator, req: ResolvedRequest) ![]const u8 {
     const messages_json = try message.encodeMessages(arena, req.messages);
 
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -193,6 +243,51 @@ test "anthropic: refusal is surfaced, not treated as content" {
     );
     try std.testing.expectEqual(message.StopReason.refusal, res.stop_reason);
     try std.testing.expectEqual(@as(usize, 0), res.blocks.len);
+}
+
+test "anthropic: an unspecified model/max_tokens falls back to Client defaults on the wire" {
+    // The whole point of Client.model/max_tokens: a Request that doesn't
+    // set them must still produce claude-opus-5 (the required default
+    // model) and Client.max_tokens on the wire, not an empty/zero field.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var client: Client = .{}; // model="claude-opus-5", max_tokens=4096 (defaults)
+    const req: provider_mod.Request = .{ .messages = &.{} }; // model/max_tokens omitted
+    const body = try buildRequestBody(arena.allocator(), client.resolveRequest(req));
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"claude-opus-5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":4096") != null);
+}
+
+test "anthropic: an explicit Request model/max_tokens overrides Client defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var client: Client = .{ .model = "claude-haiku-x", .max_tokens = 999 };
+    const req: provider_mod.Request = .{ .model = "claude-opus-5", .max_tokens = 1024, .messages = &.{} };
+    const body = try buildRequestBody(arena.allocator(), client.resolveRequest(req));
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"claude-opus-5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":1024") != null);
+}
+
+test "anthropic: non-2xx status wins over a truncated body" {
+    // A proxy/WAF error page can be both non-2xx and oversized; the status
+    // is the more actionable signal and must not be masked by truncation.
+    const res: fetch_mod.FetchResponse = .{
+        .status = 502,
+        .body = "",
+        .truncated = true,
+        .arena = std.testing.allocator,
+    };
+    try std.testing.expectEqual(HttpOutcome.http_error, classifyHttpResult(res));
+}
+
+test "anthropic: a truncated 2xx body classifies as truncated" {
+    const res: fetch_mod.FetchResponse = .{
+        .status = 200,
+        .body = "",
+        .truncated = true,
+        .arena = std.testing.allocator,
+    };
+    try std.testing.expectEqual(HttpOutcome.truncated, classifyHttpResult(res));
 }
 
 test "anthropic: capabilities report native_tools" {

@@ -24,12 +24,18 @@ pub const Capabilities = struct {
 };
 
 pub const Request = struct {
-    model: []const u8,
+    /// `null` lets the `Provider` fall back to its own configured default
+    /// (e.g. `anthropic.Client.model`) instead of every call site having to
+    /// restate it — a restated "default" that every caller repeats isn't
+    /// actually a default. Set this explicitly to override it per call.
+    model: ?[]const u8 = null,
     system: []const u8 = "",
     messages: []const message.Message,
     /// Anthropic-format tool array, or "[]" for none.
     tools_json: []const u8 = "[]",
-    max_tokens: u32 = 4096,
+    /// `null` lets the `Provider` fall back to its own configured default
+    /// (e.g. `anthropic.Client.max_tokens`). See `model`.
+    max_tokens: ?u32 = null,
 };
 
 pub const Provider = struct {
