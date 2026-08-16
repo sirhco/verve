@@ -252,6 +252,9 @@ pub const serializeEncodeToBytes = @import("core/serialize.zig").encodeToBytes;
 // Allocator management — used by DI context internals
 pub const setDiTablesAllocator = @import("core/context_di.zig").setOwnerTablesAllocator;
 
+// Shared action invoker — used by the HTTP api_handler and the AI tool registry.
+pub const ai_action_invoke = @import("core/action_invoke.zig");
+
 test {
     _ = node_mod;
     _ = signal_mod;
@@ -295,4 +298,5 @@ test {
     _ = @import("core/anim/anim.zig");
     _ = @import("core/gl/gl.zig");
     _ = @import("core/ai/ai.zig");
+    _ = @import("core/action_invoke.zig");
 }
