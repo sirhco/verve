@@ -122,6 +122,25 @@ fn invoke(
         };
     }
 
+    if (is_form) {
+        // A form post redirects on completion regardless of what the action
+        // returned — the return value is never observed, so it must never
+        // be serialized either (a value-encode failure has no business
+        // 500-ing a request whose response doesn't depend on the value).
+        action_invoke.call(func, args) catch |err| switch (err) {
+            error.ActionFailed => {
+                try request.respond("internal error", .{ .status = .internal_server_error });
+                return;
+            },
+            error.BadArgs => {
+                try request.respond("bad json", .{ .status = .bad_request });
+                return;
+            },
+        };
+        try respondRedirect(request, redirect_target);
+        return;
+    }
+
     const result = action_invoke.callAndSerialize(func, arg_arena.allocator(), args) catch |err| switch (err) {
         error.ActionFailed => {
             try request.respond("internal error", .{ .status = .internal_server_error });
@@ -132,11 +151,6 @@ fn invoke(
             return;
         },
     };
-
-    if (is_form) {
-        try respondRedirect(request, redirect_target);
-        return;
-    }
     switch (result) {
         .ok => try respondOk(request, rid),
         .value_json => |json| try respondValueJson(gpa, request, rid, json),

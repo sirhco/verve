@@ -95,6 +95,36 @@ fn encode(arena: std.mem.Allocator, value: anytype) Error![]const u8 {
     return aw.written();
 }
 
+/// Call `func` for its side effects, discarding any return value.
+///
+/// For dispatch paths where the action's return value is never observed —
+/// an HTTP form post redirects on completion regardless of what the action
+/// returned. Unlike `callAndSerialize`, this never encodes: a value-encode
+/// failure must not be reachable on a path whose caller was never going to
+/// look at the value anyway, and there is no point paying for an encode
+/// nobody reads.
+pub fn call(
+    comptime func: anytype,
+    args: ArgsOf(func),
+) Error!void {
+    const fn_info = @typeInfo(@TypeOf(func)).@"fn";
+    const Ret = fn_info.return_type.?;
+    const ret_info = @typeInfo(Ret);
+    const returns_error = ret_info == .error_union;
+    const Payload = if (returns_error) ret_info.error_union.payload else Ret;
+    const returns_value = Payload != void;
+
+    if (returns_error and returns_value) {
+        _ = func(args) catch return Error.ActionFailed;
+    } else if (returns_error and !returns_value) {
+        func(args) catch return Error.ActionFailed;
+    } else if (!returns_error and returns_value) {
+        _ = func(args);
+    } else {
+        func(args);
+    }
+}
+
 // ---- tests ------------------------------------------------------------
 
 const T = struct {
@@ -114,6 +144,25 @@ const T = struct {
     }
     pub fn alwaysFails(_: struct {}) !void {
         return error.Nope;
+    }
+    pub fn returnsPoison(_: struct {}) Poison {
+        return .{};
+    }
+};
+
+/// A value whose JSON encoding is instrumented rather than actually poisoned
+/// — std.json can serialize almost any ordinary Zig type, so there is no
+/// portable way to make `Stringify.value` fail at runtime for a test. This
+/// hooks the custom-encoder path instead: `stringified` flips true iff the
+/// serializer actually visited this value, which is what `call()` must never
+/// cause and `callAndSerialize()` always does.
+const Poison = struct {
+    var stringified = false;
+
+    pub fn jsonStringify(self: Poison, jws: anytype) !void {
+        _ = self;
+        stringified = true;
+        try jws.write(0);
     }
 };
 
@@ -175,4 +224,29 @@ test "invoke: malformed JSON is BadArgs under both modes" {
     const a = arena.allocator();
     try std.testing.expectError(Error.BadArgs, parseJsonArgs(ArgsOf(T.takesText), a, "{oops", true));
     try std.testing.expectError(Error.BadArgs, parseJsonArgs(ArgsOf(T.takesText), a, "{oops", false));
+}
+
+test "invoke: call() runs a void action for its side effect" {
+    const args: ArgsOf(T.takesText) = .{ .text = "form" };
+    try call(T.takesText, args);
+    try std.testing.expectEqualStrings("form", T.last_text[0..T.last_len]);
+}
+
+test "invoke: call() maps action error to ActionFailed" {
+    try std.testing.expectError(Error.ActionFailed, call(T.alwaysFails, .{}));
+}
+
+test "invoke: call() discards a value return without serializing it — callAndSerialize does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    Poison.stringified = false;
+    try call(T.returnsPoison, .{});
+    try std.testing.expect(!Poison.stringified);
+
+    // Positive control on the same action: proves `stringified` is a
+    // faithful witness of "the serializer ran" and not just dead code.
+    const res = try callAndSerialize(T.returnsPoison, arena.allocator(), .{});
+    try std.testing.expect(Poison.stringified);
+    try std.testing.expectEqualStrings("0", res.value_json);
 }
