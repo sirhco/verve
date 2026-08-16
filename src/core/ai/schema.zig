@@ -83,6 +83,10 @@ fn typeSchema(comptime T: type, comptime desc: ?[]const u8, comptime path: []con
     }
 }
 
+/// Public alias so callers outside this file (the registry, for tool
+/// descriptions) can reuse the same escaping without duplicating it.
+pub const escapeJson = escape;
+
 /// Minimal JSON string escaping for comptime literals. Descriptions are
 /// author-written source text, so only the structural characters can appear.
 fn escape(comptime s: []const u8) []const u8 {

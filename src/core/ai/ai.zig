@@ -7,8 +7,10 @@ pub const Risk = @import("tool.zig").Risk;
 pub const ArgDoc = @import("tool.zig").ArgDoc;
 pub const ToolDecl = @import("tool.zig").ToolDecl;
 pub const jsonSchema = @import("schema.zig").jsonSchema;
+pub const Registry = @import("registry.zig").Registry;
 
 test {
     _ = @import("tool.zig");
     _ = @import("schema.zig");
+    _ = @import("registry.zig");
 }
