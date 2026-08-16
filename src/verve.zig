@@ -205,6 +205,9 @@ pub const gl = @import("core/gl/gl.zig");
 pub const GlLight = @import("core/gl_scene.zig").Light;
 pub const GlLightKind = @import("core/gl_scene.zig").LightKind;
 
+/// Agentic tools — expose typed app functions to a language model.
+pub const ai = @import("core/ai/ai.zig");
+
 // Codec
 pub const encode = serialize_mod.encode;
 
@@ -291,4 +294,5 @@ test {
     _ = @import("core/viz/viz.zig");
     _ = @import("core/anim/anim.zig");
     _ = @import("core/gl/gl.zig");
+    _ = @import("core/ai/ai.zig");
 }
