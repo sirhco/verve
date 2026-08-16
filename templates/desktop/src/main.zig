@@ -3,12 +3,22 @@
 //! the window, and run the platform event loop.
 
 const std = @import("std");
+const verve = @import("verve");
 const desktop = @import("desktop");
 const public_assets = @import("public_assets");
 const handlers = @import("handlers.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
+
+    // Seed the confirmation-token key once at startup — same seam the
+    // server uses next to its CSRF init (`src/server/main.zig`). Without
+    // this, a `desktop.ai_cli`/`verve.ai` tool declared `.dangerous` stays
+    // permanently unconfirmable (fails closed, not a security hole, but a
+    // silent capability gap): `policy.issueToken` refuses with
+    // `IssueError.Unseeded` until a real key is in place. Idempotent, so
+    // it's safe this early even before the allocator/window exist.
+    verve.ai.policy.initRandom(io);
 
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();

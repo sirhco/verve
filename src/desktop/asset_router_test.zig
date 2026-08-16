@@ -27,6 +27,7 @@ comptime {
     _ = @import("fswatch.zig");
     _ = @import("hotkeys.zig");
     _ = @import("process.zig");
+    _ = @import("ai_cli.zig");
     // Native-host (Windows) cookie field marshalling — pure Zig, no extern
     // host fns, so its tests run on every host alongside the rest.
     _ = @import("win_native/cookie_codec.zig");

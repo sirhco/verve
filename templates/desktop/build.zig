@@ -85,12 +85,19 @@ pub fn build(b: *std.Build) void {
     });
 
     // The desktop platform layer is shipped inside this project tree
-    // (vendored at scaffold time). It depends only on Zig stdlib and
-    // the OS's native window/webview headers.
+    // (vendored at scaffold time). Its window/webview/IPC pieces depend
+    // only on Zig stdlib and the OS's native headers; `ai_cli.zig` (the
+    // Claude Code CLI `Provider`) is the one piece that needs the
+    // `verve.ai` vocabulary (`Provider`/`Request`/`Response`/...) — a
+    // module rooted here can't reach `core/ai` by relative import (it's
+    // outside this module's root subtree), so `verve` is wired in by name.
     const desktop_mod = b.createModule(.{
         .root_source_file = b.path("src/desktop/window.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "verve", .module = verve_mod },
+        },
     });
 
     const exe_mod = b.createModule(.{
@@ -192,8 +199,7 @@ pub fn build(b: *std.Build) void {
             b.getInstallStep().dependOn(&install_loader.step);
         },
         .linux => {
-            const use_gtk4 = b.option(bool, "gtk4",
-                "Use GTK4 + WebKitGTK 6.0 instead of GTK3 + WebKitGTK 4.1") orelse false;
+            const use_gtk4 = b.option(bool, "gtk4", "Use GTK4 + WebKitGTK 6.0 instead of GTK3 + WebKitGTK 4.1") orelse false;
             if (use_gtk4) {
                 desktop_mod.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
                 desktop_mod.linkSystemLibrary("webkitgtk-6.0", .{ .use_pkg_config = .force });

@@ -43,6 +43,7 @@ pub const network = @import("network.zig");
 pub const fswatch = @import("fswatch.zig");
 pub const hotkeys = @import("hotkeys.zig");
 pub const process = @import("process.zig");
+pub const ai_cli = @import("ai_cli.zig");
 
 pub const Router = ipc_router.Router;
 

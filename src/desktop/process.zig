@@ -46,15 +46,22 @@ pub fn runCapture(
     io: std.Io,
     argv: []const []const u8,
 ) Error!Result {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .io = io,
+    // Note: this was previously written against an older `std.process.Child`
+    // shape (`Child.run(.{ .allocator, .io, .argv, .max_output_bytes })`,
+    // `Term.Exited`) that no longer exists in this toolchain — dead code
+    // (nothing called `runCapture` or `spawnDetached` from a test, so the
+    // mismatch never got type-checked) until `ai_cli.zig` became the first
+    // real caller. Current API: a free `std.process.run(gpa, io, options)`
+    // returning `RunResult{ term: Child.Term, stdout, stderr }`, with
+    // `Child.Term` tags lowercase (`.exited`, not `.Exited`).
+    const result = std.process.run(allocator, io, .{
         .argv = argv,
-        .max_output_bytes = 1024 * 1024,
+        .stdout_limit = std.Io.Limit.limited(1024 * 1024),
+        .stderr_limit = std.Io.Limit.limited(1024 * 1024),
     }) catch return error.SpawnFailed;
     return .{
         .code = switch (result.term) {
-            .Exited => |c| c,
+            .exited => |c| c,
             else => 1,
         },
         .stdout = result.stdout,
@@ -73,12 +80,16 @@ pub fn spawnDetached(
     io: std.Io,
     argv: []const []const u8,
 ) Error!void {
-    var child = std.process.Child.init(argv, allocator);
-    child.io = io;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return error.SpawnFailed;
+    // `allocator` is unused by the current `std.process.spawn` (it takes no
+    // allocator at all) — kept as a parameter for API stability; see the
+    // note in `runCapture` about this file predating that API.
+    _ = allocator;
+    _ = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.SpawnFailed;
     // Intentionally drop the handle. POSIX would prefer a double-fork
     // for true daemonization; the stdlib doesn't expose that surface
     // yet, so v1 ships the simpler path.

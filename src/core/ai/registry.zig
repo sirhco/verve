@@ -24,6 +24,122 @@ pub const ToolOutcome = union(enum) {
     needs_confirmation: u64,
 };
 
+/// Locate `name` in a comptime decl list. The one lookup rule both
+/// `Registry.find`/`invoke` and `RouteRegistry.find`/`invoke` share — see
+/// `gate`.
+fn findDecl(comptime decls: []const tool.ToolDecl, name: []const u8) ?tool.ToolDecl {
+    inline for (decls) |d| {
+        if (std.mem.eql(u8, d.fn_name, name)) return d;
+    }
+    return null;
+}
+
+/// Result of `gate`: either the call is cleared to run (carrying the decl
+/// its risk/execution needs), or it already has its final `ToolOutcome` —
+/// denied, refused, or awaiting confirmation — with no execution to follow.
+const Gated = union(enum) {
+    proceed: tool.ToolDecl,
+    outcome: ToolOutcome,
+};
+
+/// The security gate, shared verbatim by `Registry.invoke` (HTTP actions /
+/// model tool calls) and `RouteRegistry.invoke` (desktop IPC routes) — the
+/// two dispatch surfaces this subsystem promises feed *one* gate rather than
+/// two copies that can drift apart. This is the only place `policy.check`,
+/// `policy.claimToken`, and `policy.issueToken` are called, and the only
+/// place that calls `audit.record` for a call that doesn't reach execution.
+///
+/// Order matters: allowlist, then size, then risk, then confirmation. Nothing
+/// runs until every check has passed, and every path — including the
+/// refusals — is audited.
+fn gate(
+    comptime decls: []const tool.ToolDecl,
+    name: []const u8,
+    args_json: []const u8,
+    p: policy.Policy,
+    confirm_token: ?u64,
+) Gated {
+    const decl = findDecl(decls, name) orelse {
+        audit.record(name, .safe, .denied, args_json.len);
+        return .{ .outcome = .{ .err = "unknown tool" } };
+    };
+
+    switch (policy.check(p, decl, args_json)) {
+        .deny => |reason| {
+            audit.record(name, decl.risk, .denied, args_json.len);
+            return .{ .outcome = .{ .err = reason } };
+        },
+        .needs_confirmation => {
+            // A token only redeems the exact (name, args) it was
+            // issued for — see policy.claimToken. Minting happens
+            // here, not in `check`, and only when the caller doesn't
+            // already hold a valid token: otherwise an approved call
+            // would leave a second, unclaimed token behind in the
+            // table for no one to ever reap.
+            const approved = if (confirm_token) |t| policy.claimToken(t, name, args_json) else false;
+            if (!approved) {
+                // Distinguish "never asked" from "asked with a token
+                // that didn't match" — the latter is what a model
+                // spending one tool's approval on another looks
+                // like, and it must not be audited identically to a
+                // routine first-time prompt.
+                const outcome: audit.Outcome = if (confirm_token != null) .claim_rejected else .needs_confirmation;
+                const fresh = policy.issueToken(name, args_json) catch |err| {
+                    // Fail-closed either way: refuse rather than
+                    // evict some other pending approval to make
+                    // room, and refuse rather than mint a token from
+                    // an unseeded (predictable) generator.
+                    audit.record(name, decl.risk, .denied, args_json.len);
+                    return .{ .outcome = .{ .err = switch (err) {
+                        error.Unseeded => "confirmation token store is not initialized",
+                        error.TableFull => "too many pending confirmations",
+                    } } };
+                };
+                audit.record(name, decl.risk, outcome, args_json.len);
+                return .{ .outcome = .{ .needs_confirmation = fresh } };
+            }
+            // Approved: fall through to execute. Nothing is minted
+            // on this path, so the token just claimed is the only
+            // authorization this call ever held.
+        },
+        .allow => {},
+    }
+    return .{ .proceed = decl };
+}
+
+/// Post-execution half of the shared pipeline: audit the outcome, then
+/// encode/truncate the result. `result` folds together both ways a call can
+/// fail to produce a value — bad arguments (`action_invoke.Error.BadArgs`)
+/// and a failed action/handler (`action_invoke.Error.ActionFailed`) — into
+/// the same two messages `Registry.invoke` always returned, now shared with
+/// `RouteRegistry.invoke` too.
+fn finish(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    decl: tool.ToolDecl,
+    p: policy.Policy,
+    args_bytes: usize,
+    result: action_invoke.Error!action_invoke.InvokeResult,
+) ToolOutcome {
+    const res = result catch |err| {
+        audit.record(name, decl.risk, .failed, args_bytes);
+        return .{ .err = switch (err) {
+            action_invoke.Error.BadArgs => "invalid arguments for tool",
+            action_invoke.Error.ActionFailed => "tool execution failed",
+        } };
+    };
+    audit.record(name, decl.risk, .allowed, args_bytes);
+    const json = switch (res) {
+        .ok => "null",
+        .value_json => |v| v,
+    };
+    const capped = if (json.len > p.max_tool_result_bytes)
+        truncateResult(arena, json, p.max_tool_result_bytes)
+    else
+        json;
+    return .{ .ok = capped };
+}
+
 /// Build the tool table for `Actions` restricted to `decls`.
 ///
 /// Every entry is validated at comptime: the function must exist, take exactly
@@ -53,17 +169,12 @@ pub fn Registry(comptime Actions: type, comptime decls: []const tool.ToolDecl) t
         /// anything not on the allowlist — including real functions on
         /// `Actions` that were simply never declared.
         pub fn find(name: []const u8) ?tool.ToolDecl {
-            inline for (decls) |d| {
-                if (std.mem.eql(u8, d.fn_name, name)) return d;
-            }
-            return null;
+            return findDecl(decls, name);
         }
 
-        /// Execute a model-chosen tool call.
-        ///
-        /// Order matters: allowlist, then size, then risk, then confirmation,
-        /// then execution. Nothing runs until every gate has passed, and every
-        /// path — including the refusals — is audited.
+        /// Execute a model-chosen tool call. See `gate` for the security
+        /// pipeline (allowlist → size → risk → confirmation → audit), shared
+        /// with `RouteRegistry.invoke`.
         pub fn invoke(
             arena: std.mem.Allocator,
             name: []const u8,
@@ -71,77 +182,92 @@ pub fn Registry(comptime Actions: type, comptime decls: []const tool.ToolDecl) t
             p: policy.Policy,
             confirm_token: ?u64,
         ) ToolOutcome {
-            const decl = find(name) orelse {
-                audit.record(name, .safe, .denied, args_json.len);
-                return .{ .err = "unknown tool" };
+            const decl = switch (gate(decls, name, args_json, p, confirm_token)) {
+                .outcome => |o| return o,
+                .proceed => |d| d,
             };
-
-            switch (policy.check(p, decl, args_json)) {
-                .deny => |reason| {
-                    audit.record(name, decl.risk, .denied, args_json.len);
-                    return .{ .err = reason };
-                },
-                .needs_confirmation => {
-                    // A token only redeems the exact (name, args) it was
-                    // issued for — see policy.claimToken. Minting happens
-                    // here, not in `check`, and only when the caller doesn't
-                    // already hold a valid token: otherwise an approved call
-                    // would leave a second, unclaimed token behind in the
-                    // table for no one to ever reap.
-                    const approved = if (confirm_token) |t| policy.claimToken(t, name, args_json) else false;
-                    if (!approved) {
-                        // Distinguish "never asked" from "asked with a token
-                        // that didn't match" — the latter is what a model
-                        // spending one tool's approval on another looks
-                        // like, and it must not be audited identically to a
-                        // routine first-time prompt.
-                        const outcome: audit.Outcome = if (confirm_token != null) .claim_rejected else .needs_confirmation;
-                        const fresh = policy.issueToken(name, args_json) catch |err| {
-                            // Fail-closed either way: refuse rather than
-                            // evict some other pending approval to make
-                            // room, and refuse rather than mint a token from
-                            // an unseeded (predictable) generator.
-                            audit.record(name, decl.risk, .denied, args_json.len);
-                            return .{ .err = switch (err) {
-                                error.Unseeded => "confirmation token store is not initialized",
-                                error.TableFull => "too many pending confirmations",
-                            } };
-                        };
-                        audit.record(name, decl.risk, outcome, args_json.len);
-                        return .{ .needs_confirmation = fresh };
-                    }
-                    // Approved: fall through to execute. Nothing is minted
-                    // on this path, so the token just claimed is the only
-                    // authorization this call ever held.
-                },
-                .allow => {},
-            }
 
             inline for (decls) |d| {
                 if (std.mem.eql(u8, d.fn_name, name)) {
                     const func = @field(Actions, d.fn_name);
-                    const ArgsT = action_invoke.ArgsOf(func);
-                    // Strict parsing: an unknown key from a model means a
-                    // hallucinated field, and a silently defaulted real one
-                    // would run the wrong action with no error anywhere.
-                    const args = action_invoke.parseJsonArgs(ArgsT, arena, args_json, true) catch {
-                        audit.record(name, d.risk, .failed, args_json.len);
-                        return .{ .err = "invalid arguments for tool" };
-                    };
-                    const res = action_invoke.callAndSerialize(func, arena, args) catch {
-                        audit.record(name, d.risk, .failed, args_json.len);
-                        return .{ .err = "tool execution failed" };
-                    };
-                    audit.record(name, d.risk, .allowed, args_json.len);
-                    const json = switch (res) {
-                        .ok => "null",
-                        .value_json => |v| v,
-                    };
-                    const capped = if (json.len > p.max_tool_result_bytes)
-                        truncateResult(arena, json, p.max_tool_result_bytes)
-                    else
-                        json;
-                    return .{ .ok = capped };
+                    return finish(arena, name, decl, p, args_json.len, invokeAction(func, arena, args_json));
+                }
+            }
+            unreachable;
+        }
+    };
+}
+
+/// Parse + call one `Actions` function. Merges `action_invoke.parseJsonArgs`
+/// and `action_invoke.callAndSerialize` into the single `Error!InvokeResult`
+/// shape `finish` expects — the same shape `action_invoke.invokeRouteJson`
+/// already returns for the desktop-route side, so `finish` doesn't need to
+/// know which kind of callable it just ran.
+fn invokeAction(
+    comptime func: anytype,
+    arena: std.mem.Allocator,
+    args_json: []const u8,
+) action_invoke.Error!action_invoke.InvokeResult {
+    const ArgsT = action_invoke.ArgsOf(func);
+    // Strict parsing: an unknown key from a model means a hallucinated
+    // field, and a silently defaulted real one would run the wrong action
+    // with no error anywhere.
+    const args = try action_invoke.parseJsonArgs(ArgsT, arena, args_json, true);
+    return action_invoke.callAndSerialize(func, arena, args);
+}
+
+/// Build the dispatch table for desktop IPC routes restricted to `decls` —
+/// the sibling of `Registry` for the route shape (`Args`/`Reply`/
+/// `handle(ctx, alloc, args)`, see `action_invoke.invokeRouteJson`) that
+/// `src/desktop/ipc_router.zig` routes use. Dispatch itself can't be the
+/// literally same function as `Registry.invoke` (a route takes a `*Ctx` and
+/// returns `!Reply`, not a bare struct-arg function), but the
+/// security-relevant half — allowlist, policy, confirmation, audit — is:
+/// both `Registry.invoke` and `RouteRegistry.invoke` call `gate` and
+/// `finish` and nothing else touches `policy`/`audit` on the way to a
+/// result. That sharing is the point — a dangerous desktop IPC route gets
+/// exactly the same confirmation-token and audit guarantees a dangerous HTTP
+/// action does, from one implementation.
+pub fn RouteRegistry(comptime Routes: type, comptime Ctx: type, comptime decls: []const tool.ToolDecl) type {
+    comptime validateRoutes(Routes, decls);
+
+    return struct {
+        pub const routes = Routes;
+        pub const route_decls = decls;
+
+        /// Look up a declared route by name. Returns null for anything not
+        /// on the allowlist — including real routes on `Routes` that were
+        /// simply never declared here.
+        pub fn find(name: []const u8) ?tool.ToolDecl {
+            return findDecl(decls, name);
+        }
+
+        /// Execute a desktop-IPC-triggered route call through the same gate
+        /// `Registry.invoke` uses — see `gate` and the module doc comment.
+        pub fn invoke(
+            ctx: *Ctx,
+            arena: std.mem.Allocator,
+            name: []const u8,
+            args_json: []const u8,
+            p: policy.Policy,
+            confirm_token: ?u64,
+        ) ToolOutcome {
+            const decl = switch (gate(decls, name, args_json, p, confirm_token)) {
+                .outcome => |o| return o,
+                .proceed => |d| d,
+            };
+
+            inline for (decls) |d| {
+                if (std.mem.eql(u8, d.fn_name, name)) {
+                    const Route = @field(Routes, d.fn_name);
+                    return finish(
+                        arena,
+                        name,
+                        decl,
+                        p,
+                        args_json.len,
+                        action_invoke.invokeRouteJson(Route, ctx, arena, args_json, true),
+                    );
                 }
             }
             unreachable;
@@ -230,6 +356,34 @@ fn validate(comptime Actions: type, comptime decls: []const tool.ToolDecl) void 
                 }
                 if (!found) {
                     @compileError("ai tool '" ++ d.fn_name ++ "' has no argument named '" ++ doc.field ++ "'");
+                }
+            }
+        }
+    }
+}
+
+/// `validate`'s equivalent for the route shape: the route must exist on
+/// `Routes` and declare an `Args` struct, and every `arg_docs.field` must
+/// name a real field on it. Same failure mode as `validate` — a typo is a
+/// compile error, never a runtime surprise.
+fn validateRoutes(comptime Routes: type, comptime decls: []const tool.ToolDecl) void {
+    comptime {
+        for (decls) |d| {
+            if (!@hasDecl(Routes, d.fn_name)) {
+                @compileError("ai route '" ++ d.fn_name ++ "' is not declared on " ++ @typeName(Routes));
+            }
+            const Route = @field(Routes, d.fn_name);
+            if (!@hasDecl(Route, "Args")) {
+                @compileError("ai route '" ++ d.fn_name ++ "' has no Args type");
+            }
+            const fields = @typeInfo(Route.Args).@"struct".fields;
+            for (d.arg_docs) |doc| {
+                var found = false;
+                for (fields) |f| {
+                    if (std.mem.eql(u8, f.name, doc.field)) found = true;
+                }
+                if (!found) {
+                    @compileError("ai route '" ++ d.fn_name ++ "' has no argument named '" ++ doc.field ++ "'");
                 }
             }
         }
@@ -571,6 +725,112 @@ test "dispatch: a rejected confirmation token is audited distinctly from a first
     try std.testing.expectEqual(@as(usize, 2), got.len);
     try std.testing.expectEqual(audit.Outcome.needs_confirmation, got[0].outcome);
     try std.testing.expectEqual(audit.Outcome.claim_rejected, got[1].outcome);
+
+    policy.resetTokens();
+    audit.reset();
+}
+
+// ---- RouteRegistry tests -----------------------------------------------
+//
+// Desktop IPC routes have a different declaration shape than HTTP/model
+// actions (`Args`/`Reply`/`handle(ctx, alloc, args)` — see
+// `src/desktop/ipc_router.zig`), so `RouteRegistry` is a distinct comptime
+// type from `Registry`. What these tests pin is that it is gated by the
+// *same* `policy`/`audit` machinery, not a second copy of it.
+
+const RouteCtx = struct { pings: u32 = 0 };
+
+const TestRoutes = struct {
+    pub const ping = struct {
+        pub const Args = struct {};
+        pub const Reply = struct { ok: bool };
+        pub fn handle(ctx: *RouteCtx, _: std.mem.Allocator, _: Args) !Reply {
+            ctx.pings += 1;
+            return .{ .ok = true };
+        }
+    };
+};
+
+const route_test_decls: []const tool.ToolDecl = &.{
+    .{ .fn_name = "ping", .description = "Ping the desktop host.", .risk = .safe },
+};
+
+const RR2 = RouteRegistry(TestRoutes, RouteCtx, route_test_decls);
+
+test "route dispatch: a declared route executes and is audited" {
+    audit.reset();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: RouteCtx = .{};
+
+    const out = RR2.invoke(&ctx, arena.allocator(), "ping", "{}", .{}, null);
+    try std.testing.expectEqualStrings("{\"ok\":true}", out.ok);
+    try std.testing.expectEqual(@as(u32, 1), ctx.pings);
+    try std.testing.expectEqual(@as(usize, 1), audit.total());
+
+    var buf: [1]audit.Record = undefined;
+    const got = audit.recent(&buf);
+    try std.testing.expectEqualStrings("ping", got[0].name());
+    try std.testing.expectEqual(audit.Outcome.allowed, got[0].outcome);
+}
+
+test "route dispatch: an undeclared route is refused without executing" {
+    audit.reset();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: RouteCtx = .{};
+
+    // `nuke` exists nowhere on TestRoutes at all — same "unknown tool"
+    // refusal path as an undeclared HTTP action.
+    const out = RR2.invoke(&ctx, arena.allocator(), "nuke", "{}", .{}, null);
+    try std.testing.expect(out == .err);
+    try std.testing.expectEqualStrings("unknown tool", out.err);
+    try std.testing.expectEqual(@as(u32, 0), ctx.pings);
+}
+
+test "route dispatch: a dangerous route shares the exact confirmation-token gate as an HTTP action" {
+    // Proves the sharing, not just the shape: a token minted for an HTTP
+    // action's dangerous call must not authorise a desktop route (and vice
+    // versa isn't reachable — a route's own token is what's tested here),
+    // and RouteRegistry.invoke drives the identical policy.issueToken /
+    // policy.claimToken / audit.record calls Registry.invoke does.
+    policy.resetTokens();
+    seedPolicyKey();
+    audit.reset();
+
+    const DangerRoutes = struct {
+        pub const wipe = struct {
+            pub var ran: u32 = 0;
+            pub const Args = struct {};
+            pub const Reply = struct {};
+            pub fn handle(_: *RouteCtx, _: std.mem.Allocator, _: Args) !Reply {
+                ran += 1;
+                return .{};
+            }
+        };
+    };
+    const DRR = RouteRegistry(DangerRoutes, RouteCtx, &.{
+        .{ .fn_name = "wipe", .description = "Delete everything.", .risk = .dangerous },
+    });
+    const p: policy.Policy = .{ .allow_risk = .dangerous };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: RouteCtx = .{};
+
+    const first = DRR.invoke(&ctx, arena.allocator(), "wipe", "{}", p, null);
+    try std.testing.expect(first == .needs_confirmation);
+    try std.testing.expectEqual(@as(u32, 0), DangerRoutes.wipe.ran);
+
+    const token = first.needs_confirmation;
+    const approved = DRR.invoke(&ctx, arena.allocator(), "wipe", "{}", p, token);
+    try std.testing.expect(approved == .ok);
+    try std.testing.expectEqual(@as(u32, 1), DangerRoutes.wipe.ran);
+
+    // Replaying the same token must not run it again — the same single-use
+    // guarantee `policy.claimToken` gives every dangerous HTTP action.
+    const third = DRR.invoke(&ctx, arena.allocator(), "wipe", "{}", p, token);
+    try std.testing.expect(third == .needs_confirmation);
+    try std.testing.expectEqual(@as(u32, 1), DangerRoutes.wipe.ran);
 
     policy.resetTokens();
     audit.reset();

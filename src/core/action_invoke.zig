@@ -95,6 +95,25 @@ fn encode(arena: std.mem.Allocator, value: anytype) Error![]const u8 {
     return aw.written();
 }
 
+/// Invoke a desktop IPC route struct (`Args` / `Reply` / `handle`).
+///
+/// Mirrors `parseJsonArgs` + `callAndSerialize` for the other declaration
+/// shape, so both dispatch surfaces share one strictness rule and one error
+/// vocabulary. `strict` carries the same meaning as elsewhere: true for
+/// model-supplied arguments.
+pub fn invokeRouteJson(
+    comptime Route: type,
+    ctx: anytype,
+    arena: std.mem.Allocator,
+    json_args: []const u8,
+    strict: bool,
+) Error!InvokeResult {
+    const args = try parseJsonArgs(Route.Args, arena, json_args, strict);
+    const reply = Route.handle(ctx, arena, args) catch return Error.ActionFailed;
+    if (@TypeOf(reply) == void) return .ok;
+    return .{ .value_json = try encode(arena, reply) };
+}
+
 /// Call `func` for its side effects, discarding any return value.
 ///
 /// For dispatch paths where the action's return value is never observed —
@@ -249,4 +268,42 @@ test "invoke: call() discards a value return without serializing it — callAndS
     const res = try callAndSerialize(T.returnsPoison, arena.allocator(), .{});
     try std.testing.expect(Poison.stringified);
     try std.testing.expectEqualStrings("0", res.value_json);
+}
+
+test "invoke: desktop route shape" {
+    const Ctx = struct { calls: u32 = 0 };
+    const Route = struct {
+        pub const Args = struct { name: []const u8 };
+        pub const Reply = struct { greeting: []const u8 };
+        pub fn handle(ctx: *Ctx, alloc: std.mem.Allocator, args: Args) !Reply {
+            ctx.calls += 1;
+            return .{ .greeting = try std.fmt.allocPrint(alloc, "hi {s}", .{args.name}) };
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: Ctx = .{};
+
+    const res = try invokeRouteJson(Route, &ctx, arena.allocator(), "{\"name\":\"ana\"}", true);
+    try std.testing.expectEqualStrings("{\"greeting\":\"hi ana\"}", res.value_json);
+    try std.testing.expectEqual(@as(u32, 1), ctx.calls);
+}
+
+test "invoke: desktop route rejects hallucinated argument names" {
+    const Ctx = struct {};
+    const Route = struct {
+        pub const Args = struct { name: []const u8 };
+        pub const Reply = struct {};
+        pub fn handle(_: *Ctx, _: std.mem.Allocator, _: Args) !Reply {
+            return .{};
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: Ctx = .{};
+    try std.testing.expectError(
+        Error.BadArgs,
+        invokeRouteJson(Route, &ctx, arena.allocator(), "{\"nme\":\"ana\"}", true),
+    );
 }

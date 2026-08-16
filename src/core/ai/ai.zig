@@ -8,6 +8,7 @@ pub const ArgDoc = @import("tool.zig").ArgDoc;
 pub const ToolDecl = @import("tool.zig").ToolDecl;
 pub const jsonSchema = @import("schema.zig").jsonSchema;
 pub const Registry = @import("registry.zig").Registry;
+pub const RouteRegistry = @import("registry.zig").RouteRegistry;
 pub const Policy = @import("policy.zig").Policy;
 pub const ToolOutcome = @import("registry.zig").ToolOutcome;
 pub const audit = @import("audit.zig");
@@ -22,6 +23,14 @@ pub const Provider = @import("provider.zig").Provider;
 pub const MockProvider = @import("mock_provider.zig").MockProvider;
 pub const anthropic = @import("anthropic.zig");
 pub const run = @import("agent.zig").run;
+
+/// Whole-module re-exports (not just the cherry-picked aliases above) for
+/// implementations that live outside `core/` and therefore can't reach these
+/// files by relative import — `src/desktop/ai_cli.zig` is the reason this
+/// pair exists: it needs `provider.Request`/`Capabilities` and
+/// `message.Response`/`StopReason`/`Block`, not just `Provider`/`Message`.
+pub const message = @import("message.zig");
+pub const provider = @import("provider.zig");
 
 test {
     _ = @import("tool.zig");
