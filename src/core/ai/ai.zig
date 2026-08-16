@@ -17,10 +17,19 @@ pub const audit = @import("audit.zig");
 /// rather than falling back to a predictable token source.
 pub const policy = @import("policy.zig");
 
+pub const Message = @import("message.zig").Message;
+pub const Provider = @import("provider.zig").Provider;
+pub const MockProvider = @import("mock_provider.zig").MockProvider;
+pub const run = @import("agent.zig").run;
+
 test {
     _ = @import("tool.zig");
     _ = @import("schema.zig");
     _ = @import("registry.zig");
     _ = @import("policy.zig");
     _ = @import("audit.zig");
+    _ = @import("message.zig");
+    _ = @import("provider.zig");
+    _ = @import("mock_provider.zig");
+    _ = @import("agent.zig");
 }
