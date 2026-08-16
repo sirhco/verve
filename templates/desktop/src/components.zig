@@ -140,6 +140,27 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
                 }),
             }),
             ctx.section().class("card").children(.{
+                ctx.h2("Delegate to Claude Code"),
+                ctx.p().text("Hands the whole task to the Claude Code CLI (claude -p --output-format=json) as a subprocess through desktop.ai_cli. Delegation, not tool-calling: Claude Code runs its own tools in its own sandbox and never sees this app's registry. Needs the claude binary on PATH; without it the result reads CliSpawnFailed."),
+                ctx.p().text("The run takes tens of seconds and IPC handlers execute on the thread that owns the webview, so the route returns immediately and the page polls for the answer."),
+                ctx.div().class("row").children(.{
+                    ctx.input().id("ai-prompt").type_("text").value("Reply with the single word ok."),
+                    ctx.button("Send").id("ai-send"),
+                }),
+                ctx.div().id("ai-result").class("result-panel").text(""),
+            }),
+            ctx.section().class("card").children(.{
+                ctx.h2("AI tool gate over IPC"),
+                ctx.p().text("Runs an IPC route as an AI tool through verve.ai.RouteRegistry — the same gate a model-issued HTTP tool call passes: allowlist, argument size, risk tier, human confirmation, and an audit line for every outcome including the refusals."),
+                ctx.p().text("system_info and notify are on this app's allowlist in handlers.zig. smoke_done is a real route that is not, so it is refused. Watch stderr for the audit lines."),
+                ctx.div().class("row").children(.{
+                    ctx.button("system_info (allowed)").id("ai-tool-allowed"),
+                    ctx.button("notify (allowed)").id("ai-tool-notify"),
+                    ctx.button("smoke_done (not allowlisted)").id("ai-tool-denied"),
+                }),
+                ctx.div().id("ai-tool-result").class("result-panel").text(""),
+            }),
+            ctx.section().class("card").children(.{
                 ctx.h2("Log"),
                 ctx.pre().id("log").text("bridge ready"),
             }),
@@ -300,4 +321,64 @@ const inline_js =
     \\document.getElementById('print-system').addEventListener('click', () => {
     \\  call('print_page', { kind: 'system' });
     \\});
+    \\
+    \\document.getElementById('ai-send').addEventListener('click', async () => {
+    \\  const out = document.getElementById('ai-result');
+    \\  out.textContent = 'starting…';
+    \\  out.className = 'result-panel loading';
+    \\  try {
+    \\    const started = await window.verve.request({
+    \\      type: 'ai_delegate',
+    \\      prompt: document.getElementById('ai-prompt').value,
+    \\    });
+    \\    if (!started.started) {
+    \\      out.textContent = '✗ ' + started.status;
+    \\      out.className = 'result-panel error';
+    \\      return;
+    \\    }
+    \\    out.textContent = 'running claude -p … (tens of seconds)';
+    \\    // The worker cannot push its answer here: evaluating script in a
+    \\    // webview is main-thread-only on every backend. ai_delegate_poll
+    \\    // runs on the UI thread like any other IPC route, so we poll it.
+    \\    const poll = async () => {
+    \\      try {
+    \\        const r = await window.verve.request({ type: 'ai_delegate_poll' });
+    \\        if (r.state !== 'done') { setTimeout(poll, 500); return; }
+    \\        out.className = 'result-panel ' + (r.ok ? 'ok' : 'error');
+    \\        out.textContent = (r.ok ? '' : '✗ ') + (r.text || '(empty response)');
+    \\      } catch (err) {
+    \\        out.textContent = '✗ ' + err.message;
+    \\        out.className = 'result-panel error';
+    \\      }
+    \\    };
+    \\    setTimeout(poll, 500);
+    \\  } catch (err) {
+    \\    out.textContent = '✗ ' + err.message;
+    \\    out.className = 'result-panel error';
+    \\  }
+    \\});
+    \\
+    \\async function aiTool(name, argsJson) {
+    \\  const out = document.getElementById('ai-tool-result');
+    \\  out.textContent = 'invoking ' + name + '…';
+    \\  out.className = 'result-panel loading';
+    \\  try {
+    \\    const r = await window.verve.request({
+    \\      type: 'ai_tool_call', name: name, args_json: argsJson,
+    \\    });
+    \\    out.className = 'result-panel ' + (r.outcome === 'ok' ? 'ok' : 'error');
+    \\    out.innerHTML =
+    \\      '<dl class="kv">' +
+    \\      '<dt>Tool</dt><dd>' + name + '</dd>' +
+    \\      '<dt>Outcome</dt><dd>' + r.outcome + '</dd>' +
+    \\      '<dt>Result</dt><dd>' + (r.outcome === 'ok' ? r.value_json : r.err) + '</dd>' +
+    \\      '</dl>';
+    \\  } catch (err) {
+    \\    out.textContent = '✗ ' + err.message;
+    \\    out.className = 'result-panel error';
+    \\  }
+    \\}
+    \\document.getElementById('ai-tool-allowed').addEventListener('click', () => aiTool('system_info', '{}'));
+    \\document.getElementById('ai-tool-notify').addEventListener('click', () => aiTool('notify', '{"title":"Verve","body":"Fired through the AI tool gate."}'));
+    \\document.getElementById('ai-tool-denied').addEventListener('click', () => aiTool('smoke_done', '{"checksum":0}'));
 ;

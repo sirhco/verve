@@ -4,6 +4,51 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.51.0] - 2026-08-16
+
+### Added
+
+- **Desktop AI demo — closes the `verve.ai` spec's S5 deviation.** `0.50.0` shipped
+  `RouteRegistry` and `desktop.ai_cli` with no caller: the "one gate, two surfaces"
+  property was proven by unit test, and `ai_cli.Client.complete` had never been
+  invoked outside its own tests. `templates/desktop/src/handlers.zig` now ships three
+  routes and two demo cards that exercise both, verified by running the scaffolded
+  app on macOS.
+  - **`ai_tool_call`** runs an allowlisted IPC route as a model tool through
+    `verve.ai.RouteRegistry` — `RouteRegistry`'s first non-test caller. The allowlist
+    is `ai_tool_decls` in that file, the desktop counterpart of `src/app/ai.zig` and
+    the same comptime-validated boundary: `system_info` (`.safe`) and `notify`
+    (`.mutating`) are declared, and `smoke_done` — a real route that is not —
+    returns `unknown tool` and audits as denied, showing that reachability over
+    plain IPC grants nothing at the gate. Nothing is declared `.dangerous`: that
+    tier requires a human confirmation round-trip and the template ships no
+    approval UI, so the `needs_confirmation` arm remains unit-tested only.
+  - **`ai_delegate` / `ai_delegate_poll`** hand a whole task to the Claude Code CLI
+    via `desktop.ai_cli`. Delegation, not tool-calling — the allowlist above is not
+    involved. A missing `claude` on `PATH` surfaces as `CliSpawnFailed` in the card
+    rather than a crash.
+  - Split into a start route and a poll route because **a worker thread cannot
+    deliver a result with `evalJs`**: evaluating script in a webview is
+    main-thread-only on all three backends and the platform layer exposes no
+    main-thread marshal (`desktop.fswatch` documents the same gap). A `claude -p`
+    run takes tens of seconds and IPC handlers execute on the thread that owns the
+    webview, so blocking there would freeze the window. The start route spawns a
+    detached worker and returns; the worker parks its result behind a
+    `std.atomic.Mutex`; the page polls the second route, which — being an ordinary
+    IPC route — already replies from the right thread. A `Window.postToMain`
+    primitive would remove the poll and is recorded as future work in
+    `docs/11-desktop-roadmap.md`.
+- **Docs.** `docs/25-ai.md` gains a desktop-demo section; `docs/19-desktop.md` and
+  `docs/11-desktop-roadmap.md` drop their "no desktop demo ships yet" notes; the
+  desktop template README documents both routes and the threading constraint behind
+  the poll.
+
+### Changed
+
+- `templates/desktop/tests/golden/checksum.txt` regenerated (`1789` → `2778`) for
+  the two added demo cards. The smoke driver's click sequence is unchanged, so the
+  new cards contribute only static text and the value stays platform-stable.
+
 ## [0.50.0] - 2026-08-16
 
 ### Added

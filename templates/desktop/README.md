@@ -199,6 +199,58 @@ window.verve.send({ type: "log", message: "hi" });   // no reply
 window.evalJs("window.verve._dispatch({ type: 'event', ... })");
 ```
 
+## AI routes
+
+Two demo cards in the scaffold cover the two different things
+`verve.ai` does on the desktop. Both live in `src/handlers.zig`.
+
+### Tool gate over IPC — `ai_tool_call`
+
+`verve.ai.RouteRegistry(Routes, RouterCtx, ai_tool_decls)` exposes a
+chosen subset of your existing IPC routes to a language model, through
+the same gate an HTTP tool call passes: allowlist, argument size, risk
+tier, human confirmation — with every outcome audited, refusals
+included.
+
+`ai_tool_decls` in `src/handlers.zig` is the entire boundary, and it is
+validated at comptime: a typo'd `fn_name` or a stale `arg_docs.field` is
+a build failure.
+
+```zig
+const ai_tool_decls: []const verve.ai.ToolDecl = &.{
+    .{ .fn_name = "system_info", .description = "…", .risk = .safe },
+};
+```
+
+A route that isn't declared there has no schema, no reachable name, and
+no dispatch path. The demo card proves it: `smoke_done` is a real route,
+and asking for it by name returns `unknown tool` and audits as denied.
+**The JS shim is not a trust boundary — this list is.**
+
+Nothing is declared `.dangerous`, because that tier demands a human
+confirmation round-trip and this template ships no approval UI. Flip a
+`risk` and rebuild to exercise the `needs_confirmation` arm.
+
+### Delegation — `ai_delegate` / `ai_delegate_poll`
+
+Hands a whole task to the Claude Code CLI (`claude -p …
+--output-format=json`) as a subprocess via `desktop.ai_cli`. Needs
+`claude` on `PATH`; without it the card reads `CliSpawnFailed`.
+
+This is **delegation, not tool-calling** — Claude Code runs its own
+tools in its own sandbox and never sees the allowlist above.
+
+It's two routes rather than one because **a worker thread cannot call
+`evalJs`.** Evaluating script in a webview is main-thread-only on all
+three backends, and the platform layer has no main-thread marshal. A
+`claude -p` run takes tens of seconds and IPC handlers execute on the
+thread that owns the webview, so `ai_delegate` spawns a worker and
+returns immediately, the worker parks its result behind a mutex, and the
+page polls `ai_delegate_poll` — an ordinary IPC route, so its reply goes
+out on the right thread.
+
+Copy that shape for any slow work you drive from a handler.
+
 ## Window API reference
 
 ```zig

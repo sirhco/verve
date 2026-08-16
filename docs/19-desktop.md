@@ -113,9 +113,11 @@ reference. Headline list:
   tokens are seeded at startup via `verve.ai.policy.initRandom(io)`
   (already wired in both scaffold `main.zig` files) — without it the
   token store stays unseeded and `.dangerous` tools are permanently
-  unconfirmable, failing closed. See [25 — AI tools](25-ai.md).
-  Note: no desktop demo route ships yet; the shared-gate property is
-  covered by unit tests rather than a running desktop example.
+  unconfirmable, failing closed. The scaffold demos both: `ai_tool_call`
+  runs an allowlisted route through the gate (and shows a real-but-
+  undeclared route being refused), while `ai_delegate` /
+  `ai_delegate_poll` hand a whole task to the CLI. See
+  [25 — AI tools](25-ai.md).
 - **Cookies** — per-window `CookieStore` with `set`/`get`/`delete`/`clear`,
   real implementations on all three backends (sync wrappers around
   platform-native async cookie managers)

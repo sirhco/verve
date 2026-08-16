@@ -80,13 +80,47 @@ not as desktop-workstream work. Three things touch the desktop tree:
    remembering: a public API with no exercising caller is not verified
    by a passing build.
 
-**Not done — carried as outstanding work.** The `verve.ai` spec called
-for an `ai_chat` IPC route in `templates/desktop/src/handlers.zig`
-driving `RouteRegistry` over `ipc_router`. It was never built, so the
-"one gate, two surfaces" property is proven by unit test rather than by
-a running desktop demo, and `desktop.ai_cli.Client.complete` has never
-been invoked outside its unit tests. Building that route is the natural
-next desktop bundle — see
+**Closed in the 2026-08-16 follow-up session.** The `verve.ai` spec's
+missing desktop half — an IPC route driving `RouteRegistry` over
+`ipc_router` — now ships in `templates/desktop/src/handlers.zig` as three
+routes and two demo cards:
+
+- **`ai_tool_call`** runs an allowlisted IPC route as an AI tool through
+  `verve.ai.RouteRegistry`. `RouteRegistry` had no non-test caller before
+  this; "one gate, two surfaces" is now demonstrated, not just unit-tested.
+  The card exercises both arms — `system_info` (`.safe`) and `notify`
+  (`.mutating`) are on the allowlist and run; `smoke_done` is a real route
+  that is *not* declared, so it comes back `unknown tool` and is audited as
+  denied. Verified on macOS:
+
+  ```
+  info(verve_ai): tool system_info risk=safe     outcome=allowed args=2B
+  info(verve_ai): tool smoke_done  risk=safe     outcome=denied  args=14B
+  info(verve_ai): tool notify      risk=mutating outcome=allowed args=58B
+  ```
+
+- **`ai_delegate` / `ai_delegate_poll`** hand a whole task to the Claude
+  Code CLI via `desktop.ai_cli`. This is the first invocation of
+  `Client.complete` outside its unit tests — a real `claude -p` subprocess
+  ran and returned. Delegation, not tool-calling: the allowlist above is
+  untouched by it.
+
+The one design note worth carrying forward: **a worker thread cannot
+deliver its result with `evalJs`.** Evaluating script in a webview is
+main-thread-only on all three backends, and the platform layer exposes no
+main-thread marshal (`desktop.fswatch`'s module doc says as much and leaves
+marshalling to the app). So `ai_delegate` returns immediately, parks the
+result behind a `std.atomic.Mutex`, and the page polls `ai_delegate_poll` —
+which, being an ordinary IPC route, already runs on the thread that owns the
+webview. A `Window.postToMain` primitive would remove the poll and is the
+obvious future bundle; it needs `dispatch_async` / `g_idle_add` /
+`PostMessage`-plus-wndProc in three backends, which is why it wasn't done
+here.
+
+Still open from the same spec: a `.dangerous` tool has no approval UI, so
+the confirmation round-trip remains exercised only by unit test — the
+template deliberately declares nothing `.dangerous` rather than ship a tool
+it cannot confirm. See
 `docs/superpowers/handoffs/2026-08-16-verve-ai-next-session.md` and
 [25 — AI tools](25-ai.md).
 

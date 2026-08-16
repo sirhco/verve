@@ -12,6 +12,10 @@
 
 const std = @import("std");
 const desktop = @import("desktop");
+// `verve.ai` supplies the tool-declaration vocabulary and the shared
+// security gate the `ai_tool_call` route runs through, plus the
+// `Message`/`Block` types `ai_delegate`'s worker builds a request from.
+const verve = @import("verve");
 
 const RouterCtx = struct {
     window: *desktop.Window,
@@ -106,6 +110,152 @@ pub fn attach(window: *desktop.Window, assets: []const desktop.AssetEntry, smoke
     ctx = .{ .window = window, .assets = assets, .smoke_dir = smoke_dir, .io = io, .environ = environ };
     return &ctx;
 }
+
+// ---- AI delegation (`ai_delegate` / `ai_delegate_poll`) -------------------
+
+/// Allocator for state that outlives a single IPC dispatch — the delegation
+/// worker's prompt and its result. The dispatcher hands each handler an arena
+/// that is freed as soon as that handler's reply is encoded, so neither can
+/// live there. Same allocator the tray / deep-link callbacks in this file
+/// already use for their off-dispatch scratch.
+const ai_alloc = std.heap.page_allocator;
+
+/// Single-slot state for the background `claude -p` run.
+///
+/// Why the answer is *polled* rather than pushed with `evalJs`: evaluating
+/// script in a webview is main-thread-only on all three backends
+/// (`evaluateJavaScript:` on WKWebView, `webkit_web_view_evaluate_javascript`
+/// on the GTK main loop, `ExecuteScript` on the WebView2 UI thread), and the
+/// platform layer exposes no main-thread marshal — `desktop.fswatch`'s module
+/// doc says as much and leaves marshalling to the app. IPC dispatch already
+/// runs on the thread that owns the webview, so parking the result here and
+/// letting the page poll for it keeps every webview call on the right thread,
+/// identically on macOS, Windows, and Linux.
+///
+/// Deliberately one slot: a second delegation while one is in flight is
+/// refused, not queued. A queue would need a lifetime story for cancelled
+/// work that a template demo shouldn't be teaching.
+const AiDelegate = struct {
+    const State = enum { idle, running, done };
+
+    /// `std.atomic.Mutex` (there is no `std.Thread.Mutex` in Zig 0.16) has no
+    /// blocking `lock` — only `tryLock` — so callers spin, exactly as
+    /// `src/server/push.zig` does for its channel registry. Sound here
+    /// because every critical section below is a handful of field
+    /// assignments with no allocation and no syscall inside it.
+    mutex: std.atomic.Mutex = .unlocked,
+    state: State = .idle,
+    /// Meaningful only in `.done`. Owned by `ai_alloc`, freed when the next
+    /// result replaces it. Length zero means "nothing owned" — so the
+    /// zero-length literals below are never passed to `free`.
+    text: []const u8 = "",
+    ok: bool = false,
+};
+
+/// File-level rather than a `RouterCtx` field: the worker thread outlives the
+/// dispatch that spawned it, and `attach` assigns `ctx` as a whole struct, so
+/// state reachable from another thread should not sit inside it.
+var ai_state: AiDelegate = .{};
+
+/// Spin until `ai_state.mutex` is held. See the note on the field.
+fn aiLock() void {
+    while (!ai_state.mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+/// Publish a finished delegation result and wake the poll route.
+///
+/// `text` is always arena- or stack-owned by the caller, and the poll route
+/// reads it on a later turn of the event loop, so it has to be copied into
+/// `ai_alloc` first — before taking the lock, so no allocation happens inside
+/// the critical section. A failed copy degrades to an empty, not-ok result
+/// rather than reporting success with no text.
+fn aiPublish(ok: bool, text: []const u8) void {
+    const owned = ai_alloc.dupe(u8, text) catch "";
+
+    aiLock();
+    defer ai_state.mutex.unlock();
+    if (ai_state.text.len > 0) ai_alloc.free(ai_state.text);
+    ai_state.text = owned;
+    ai_state.ok = ok and owned.len == text.len;
+    ai_state.state = .done;
+}
+
+/// Return the slot to `.idle` after a start that never produced a worker.
+fn aiReset() void {
+    aiLock();
+    defer ai_state.mutex.unlock();
+    ai_state.state = .idle;
+}
+
+/// Body of the `ai_delegate` worker thread. Owns `prompt` and frees it.
+fn aiDelegateWorker(io: std.Io, prompt: []const u8) void {
+    defer ai_alloc.free(prompt);
+
+    var arena = std.heap.ArenaAllocator.init(ai_alloc);
+    defer arena.deinit();
+
+    var client: desktop.ai_cli.Client = .{ .io = io };
+    const blocks = [_]verve.ai.message.Block{.{ .text = prompt }};
+    const messages = [_]verve.ai.message.Message{.{ .role = .user, .blocks = &blocks }};
+
+    const res = client.provider().complete(arena.allocator(), .{
+        .system = "You are answering inside a Verve desktop demo. Reply in at most three sentences.",
+        // Delegation, not tool-calling: `ai_cli` reports
+        // `native_tools == false` and refuses a non-empty tool list outright
+        // rather than silently dropping it. The tool-calling surface is
+        // `ai_tool_call` below.
+        .tools_json = "[]",
+        .messages = &messages,
+    }) catch |err| {
+        // A missing `claude` on PATH lands here as `error.CliSpawnFailed`.
+        aiPublish(false, @errorName(err));
+        return;
+    };
+
+    for (res.blocks) |b| switch (b) {
+        .text => |t| {
+            aiPublish(true, t);
+            return;
+        },
+        else => {},
+    };
+    aiPublish(false, "response carried no text block");
+}
+
+// ---- AI tool gate over IPC (`ai_tool_call`) -------------------------------
+
+/// This app's AI tool allowlist for its *IPC* surface — the desktop sibling
+/// of `src/app/ai.zig` in the web scaffold. A route not named here has no
+/// generated schema, no name a caller can reach through the gate, and no
+/// dispatch path. The list is validated at comptime, so a typo'd `fn_name` or
+/// a stale `arg_docs.field` is a build failure.
+///
+/// Nothing here is `.dangerous` on purpose: `.dangerous` tools require a
+/// human confirmation round-trip, and this template ships no approval UI to
+/// perform one. Shipping a dangerous tool without the UI to confirm it would
+/// be worse than shipping neither.
+const ai_tool_decls: []const verve.ai.ToolDecl = &.{
+    .{
+        .fn_name = "system_info",
+        .description = "Read OS version, locale, CPU count, installed RAM, and uptime.",
+        .risk = .safe,
+    },
+    .{
+        .fn_name = "notify",
+        .description = "Show a native desktop notification.",
+        .risk = .mutating,
+        .arg_docs = &.{
+            .{ .field = "title", .description = "Notification title line." },
+            .{ .field = "body", .description = "Notification body text." },
+        },
+    },
+};
+
+/// The desktop-IPC sibling of `verve.ai.Registry`. Both call the same `gate`
+/// and the same `audit`, which is the whole point: a tool call arriving over
+/// IPC gets exactly the guarantees one arriving over HTTP gets, from one
+/// implementation rather than two that can drift.
+const AiTools = verve.ai.RouteRegistry(Routes, RouterCtx, ai_tool_decls);
 
 /// Comptime route table. Each public decl is a route; the router
 /// matches incoming `type` against the decl name.
@@ -399,6 +549,124 @@ const Routes = struct {
                 .scheme = "verve",
             });
             return .{ .ok = true };
+        }
+    };
+
+    /// Hand a whole task to the Claude Code CLI (`claude -p ...
+    /// --output-format=json`) as a subprocess, via `desktop.ai_cli`.
+    /// Delegation, not tool-calling — Claude Code runs its own tools in its
+    /// own sandbox and never sees this app's registry. `ai_tool_call` below
+    /// is the surface that does.
+    ///
+    /// Returns as soon as the worker is spawned. A `claude -p` run takes tens
+    /// of seconds and this handler runs on the thread that owns the webview,
+    /// so waiting here would freeze the window. Poll `ai_delegate_poll` for
+    /// the answer; see `AiDelegate` for why it's a poll and not a push.
+    pub const ai_delegate = struct {
+        pub const Args = struct { prompt: []const u8 = "" };
+        pub const Reply = struct { started: bool, status: []const u8 };
+        pub fn handle(c: *RouterCtx, _: std.mem.Allocator, args: Args) !Reply {
+            const trimmed = std.mem.trim(u8, args.prompt, " \t\r\n");
+            if (trimmed.len == 0) return .{ .started = false, .status = "empty prompt" };
+
+            {
+                aiLock();
+                defer ai_state.mutex.unlock();
+                if (ai_state.state == .running) return .{ .started = false, .status = "already running" };
+                ai_state.state = .running;
+            }
+
+            // Handed to the worker, which owns and frees it — this handler's
+            // arena dies as soon as the reply below is encoded.
+            const owned = ai_alloc.dupe(u8, trimmed) catch {
+                aiReset();
+                return .{ .started = false, .status = "out of memory" };
+            };
+
+            const worker = std.Thread.spawn(.{}, aiDelegateWorker, .{ c.io, owned }) catch {
+                ai_alloc.free(owned);
+                aiReset();
+                return .{ .started = false, .status = "spawn failed" };
+            };
+            // Detached — nothing joins this thread. It touches only
+            // `ai_state` (mutex-guarded) and its own allocations, so a run
+            // still in flight at shutdown loses its result rather than
+            // corrupting anything.
+            worker.detach();
+            return .{ .started = true, .status = "running" };
+        }
+    };
+
+    /// Poll for the `ai_delegate` worker's result.
+    pub const ai_delegate_poll = struct {
+        pub const Args = struct {};
+        pub const Reply = struct {
+            /// "idle" | "running" | "done"
+            state: []const u8,
+            ok: bool = false,
+            text: []const u8 = "",
+        };
+        pub fn handle(_: *RouterCtx, alloc: std.mem.Allocator, _: Args) !Reply {
+            aiLock();
+            defer ai_state.mutex.unlock();
+            return switch (ai_state.state) {
+                .idle => .{ .state = "idle" },
+                .running => .{ .state = "running" },
+                // Copied onto the dispatch arena rather than handed out by
+                // reference: the reply is JSON-encoded after this function
+                // returns, and a later run frees `ai_state.text`.
+                //
+                // The copy has to happen *inside* the critical section, not
+                // after it. Snapshotting the slice and duping once the lock
+                // is released reads freed memory if a second delegation
+                // publishes in the gap. Allocating under a spinlock is the
+                // lesser evil: the only contender is the worker, which holds
+                // the lock for a few stores.
+                .done => .{
+                    .state = "done",
+                    .ok = ai_state.ok,
+                    .text = try alloc.dupe(u8, ai_state.text),
+                },
+            };
+        }
+    };
+
+    /// Run an allowlisted IPC route as an AI *tool*, through the same
+    /// security gate a model-issued HTTP tool call passes: allowlist →
+    /// argument size → risk tier → human confirmation, with every outcome
+    /// — refusals included — audited to stderr.
+    ///
+    /// Both arms are the demo. `system_info` is on `ai_tool_decls` and runs.
+    /// `smoke_done` is a real route on `Routes` that is *not* declared there,
+    /// so it comes back "unknown tool" and is audited as denied — the gate
+    /// does not care that a caller could reach that route directly over plain
+    /// IPC. The JS shim is not a trust boundary; the allowlist is.
+    pub const ai_tool_call = struct {
+        pub const Args = struct {
+            name: []const u8 = "",
+            /// A JSON object of arguments, exactly as a model would supply
+            /// it. Parsed strictly — an argument name the caller invented is
+            /// rejected, not ignored.
+            args_json: []const u8 = "{}",
+        };
+        pub const Reply = struct {
+            /// "ok" | "denied" | "needs_confirmation"
+            outcome: []const u8,
+            value_json: []const u8 = "",
+            err: []const u8 = "",
+        };
+        pub fn handle(c: *RouterCtx, alloc: std.mem.Allocator, args: Args) !Reply {
+            return switch (AiTools.invoke(c, alloc, args.name, args.args_json, .{}, null)) {
+                .ok => |v| .{ .outcome = "ok", .value_json = v },
+                .err => |e| .{ .outcome = "denied", .err = e },
+                // Unreachable while `ai_tool_decls` declares nothing
+                // `.dangerous` — see the note there. Flip a decl's `risk` and
+                // rebuild to exercise it.
+                .needs_confirmation => .{
+                    .outcome = "needs_confirmation",
+                    .err = "a human must approve this call",
+                },
+            };
         }
     };
 
