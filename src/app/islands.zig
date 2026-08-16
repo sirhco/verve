@@ -318,3 +318,12 @@ pub const GlLines = struct {
 pub const GlDecals = struct {
     pub const props_schema: []const u8 = "{}";
 };
+
+/// AI tool-calling chat demo (/ai-chat, Task 8). No props: a multi-turn
+/// transcript would exceed the 8KB island-props scratch
+/// (`src/client/runtime_exports.zig`'s `island_scratch`), so the transcript
+/// is fetched entirely through the `aiChat` server action instead of being
+/// passed at SSR time. Source: `src/client/islands/AiChat.zig`.
+pub const AiChat = struct {
+    pub const props_schema: []const u8 = "{}";
+};

@@ -1322,3 +1322,52 @@ test "/gl/demo.tex0.s3tc.ktx2 serves a valid KTX2 asset" {
     try std.testing.expect(resp.body.len >= 12);
     try std.testing.expectEqualSlices(u8, &ktx2_id, resp.body[0..12]);
 }
+
+test "/api/aiChat runs the mock provider with no API key and no network (VERVE_AI_MOCK=1)" {
+    const gpa = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = undefined;
+    threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const port = TEST_PORT + 26;
+    var port_buf: [8]u8 = undefined;
+    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+
+    // Copy the test runner's real environment and add VERVE_AI_MOCK=1 so
+    // Actions.aiChat (src/app/api.zig) selects the scripted MockProvider
+    // instead of a live Anthropic call — see src/app/ai.zig's
+    // initEnviron/mockEnabled and src/server/main.zig's startup wiring.
+    // This is the whole point of the switch: no ANTHROPIC_API_KEY needs to
+    // be set anywhere and no request ever leaves this machine.
+    var env_map = try std.process.Environ.createMap(std.testing.environ, gpa);
+    defer env_map.deinit();
+    try env_map.put("VERVE_AI_MOCK", "1");
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ build_options.server_exe, "--port", port_str, "--csrf=disable" },
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .environ_map = &env_map,
+    });
+    defer child.kill(io);
+
+    try waitForReady(io, port);
+
+    var resp = try requestWithBody(
+        io,
+        gpa,
+        port,
+        "POST",
+        "/api/aiChat",
+        "application/json",
+        "{\"prompt\":\"what's the count?\"}",
+    );
+    defer resp.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    // The mock script's final scripted turn, verbatim — proves the tool-use
+    // step (getCount) ran and the loop reached a text-ending turn, all with
+    // no live provider involved.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "The counter is available via getCount.") != null);
+}

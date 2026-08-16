@@ -4,6 +4,50 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.50.0] - 2026-08-16
+
+### Added
+
+- **`verve.ai` — expose an app's typed functions to a language model as tools.** New
+  subsystem, pure Zig, zero third-party deps: a comptime JSON Schema generator over
+  `Actions`-shaped function args; a comptime tool registry (`Registry`/`RouteRegistry`)
+  restricted to an explicit, default-deny `[]const ToolDecl` allowlist — a function is
+  callable by a model only if it's named there, checked at compile time (unknown
+  `fn_name`, stale `arg_docs.field`, or an unrepresentable arg type is a build failure,
+  never a runtime surprise); a `Risk` tier per tool (`safe` / `mutating` — the default —
+  / `dangerous`) enforced by a shared policy gate (allowlist → size → risk →
+  confirmation), with a single-use, `(tool, args)`-bound confirmation token for
+  `dangerous` calls that never reaches the model; an audit trail for every dispatch
+  outcome; a `Message`/`Provider` conversation layer plus a bounded tool-use agent loop
+  (`verve.ai.run`); a live Anthropic Messages API provider
+  (`verve.ai.anthropic.Client`); a scripted `MockProvider` for deterministic
+  tests/CI; and, on the desktop target, a Claude Code CLI provider
+  (`desktop.ai_cli.Client`, delegation-only — refuses rather than silently dropping a
+  tool list) plus `RouteRegistry` wiring for typed IPC routes, sharing the exact same
+  gate/audit pipeline as the HTTP path.
+- **`/ai-chat` demo.** A tool-calling chat UI over a 4-function app allowlist
+  (`getCount`/`appName` `.safe`, `addTodo`/`removeTodo` `.mutating`, nothing
+  `.dangerous`). `Actions.aiChat` runs one non-streaming agent turn per request,
+  selecting a scripted `MockProvider` over the live Anthropic client when
+  `VERVE_AI_MOCK` is set in the captured process environment — the mechanism
+  `tests/integration.zig` uses to exercise `POST /api/aiChat` with no API key and no
+  network. The transcript is never passed as island props (the 8 KB props cap);
+  `src/client/islands/AiChat.zig` fetches it entirely through the server action.
+- **Docs.** `docs/25-ai.md` — allowlist declaration, `Risk` tiers, the policy gate,
+  the confirmation round-trip, provider selection, and a security-model section
+  stating plainly that the comptime allowlist is the whole boundary, that the
+  desktop JS shim is not a trust boundary, and that judging a function safe to
+  expose is the app author's call, never the framework's.
+- **Verified.** `zig build test --summary all`: 112/112 steps, 1353/1353 tests
+  (up from 1350 at the previous release) — the two new `src/app/ai.zig` tests plus
+  the new `/api/aiChat` mock-mode integration test, all newly green. Manually
+  exercised `/ai-chat` end to end against `VERVE_AI_MOCK=1` (tool call → summary,
+  audited) and against a real server with no API key configured (a clean 500, no
+  key or internal error detail in the body or logs, server stays up); confirmed a
+  tool marked `.dangerous` with this demo's default policy is denied outright
+  (`allow_risk` defaults to `.mutating` — a `.dangerous` declaration with no policy
+  opt-in is refused, not silently left "pending confirmation").
+
 ## [0.49.1] - 2026-07-05
 
 ### Fixed

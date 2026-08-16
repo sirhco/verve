@@ -114,6 +114,12 @@ pub fn main(init: std.process.Init) !void {
     // here at the true process entry point (mirrors `std.testing.environ`,
     // which the Zig test runner populates the same way).
     verve.ai.anthropic.initEnviron(init.environ_map);
+
+    // Same capture, for the app's own `VERVE_AI_MOCK` switch (see
+    // src/app/ai.zig's initEnviron/mockEnabled) — the /ai-chat demo action
+    // needs to know at request time whether to run the scripted
+    // MockProvider instead of a live Anthropic call.
+    app.ai.initEnviron(init.environ_map);
     printStartupBanner(cli);
 
     // Live-graph publisher (opt-in: only when the app declares
