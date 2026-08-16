@@ -99,13 +99,24 @@ var key_initialized: bool = false;
 var issued_count: u64 = 0;
 
 /// Test/host seam for a deterministic key. Same role as `csrf.setKey`.
+///
+/// Unlike `initRandom`, this is *not* idempotent: it overwrites whatever key
+/// is already in place. Because `key` also derives every slot's `binding`
+/// (see `bindingOf`), rekeying silently invalidates every token currently in
+/// the table — each outstanding `binding` was computed under the old key, so
+/// no pending approval can ever be claimed again and each slot sits until
+/// reclaimed as stale. That fails closed, and calling this mid-flight is a
+/// host/test decision rather than something production code does, but it is
+/// not a no-op on existing state: seed once, at startup, before any tool
+/// call.
 pub fn setKey(new_key: [KEY_LEN]u8) void {
     key = new_key;
     key_initialized = true;
 }
 
 /// Draw a fresh key from real OS-backed randomness via `io.random`.
-/// Idempotent — a second call is a no-op, same as `csrf.initFromEnvOrRandom`.
+/// Idempotent — a second call is a no-op, same as `csrf.initFromEnvOrRandom`,
+/// so unlike `setKey` it can never invalidate pending confirmations.
 /// Call once at server/desktop-host startup, next to the CSRF key init.
 pub fn initRandom(io: std.Io) void {
     if (key_initialized) return;
@@ -189,8 +200,18 @@ fn nextTokenValue() u64 {
 var clock: u64 = 0;
 
 /// Generation-distance beyond which an unclaimed slot may be reclaimed.
-/// `token_cap * 4`: generous headroom so a burst of unrelated activity
-/// doesn't threaten a confirmation a human might still be about to act on.
+/// `token_cap * 4`: headroom so a *short* burst of unrelated activity doesn't
+/// threaten a confirmation a human might still be about to act on. That's the
+/// whole guarantee — it holds for the first `stale_after` ticks after a slot
+/// is minted, and no longer. Once the table has been full that long, every
+/// further ask reclaims the oldest slot, so the scheme degrades to plain LRU
+/// eviction rather than staying fail-closed: a slot minted 64+ ticks ago is
+/// evictable however recently a human looked at it. `clock` counts asks, not
+/// time (see the block comment above), and it ticks in `issueToken` before
+/// the dedupe early-return, so even a repeated ask that consumes no slot
+/// still ages every occupant. Accepted: the alternative is a table that
+/// wedges permanently, and the exposure is denial-of-service on pending
+/// confirmations, never an unapproved execution.
 const stale_after: u64 = token_cap * 4;
 
 /// A free slot if one exists; otherwise the single oldest occupied slot, if

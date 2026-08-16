@@ -161,28 +161,49 @@ const empty_wrapper = "{\"truncated\":true,\"partial\":\"\"}";
 /// the model something it was told was well-formed JSON and isn't. Wraps a
 /// UTF-8-safe prefix of the original encoding in a small object instead.
 fn truncateResult(arena: std.mem.Allocator, json: []const u8, max_bytes: usize) []const u8 {
-    // Reserve the wrapper's own fixed characters before budgeting the
-    // prefix, so the *un-escaped* prefix plus wrapper is sized to fit.
-    const prefix_budget = max_bytes -| empty_wrapper.len;
-    const cut = utf8SafeCut(json, prefix_budget);
+    // The quantity that has to fit is the *escaped* length of the prefix, and
+    // that isn't known until the wrapper has been stringified — `json` is
+    // itself a JSON encoding, so a string result always opens with a `"` and
+    // any object or array result carries quoted keys, each of which grows on
+    // re-escape. Budgeting once against the un-escaped prefix therefore
+    // overflows for essentially every realistic payload. So: measure, and
+    // retry smaller. The first attempt reserves only the wrapper's own fixed
+    // characters — the best case, and exactly right for escape-free content
+    // like a numeric array. Each miss then shrinks the cut by its own
+    // measured overshoot, which is guaranteed to fit on the next attempt (see
+    // below), or halves it when the overshoot is as large as the cut itself.
+    // Either way the budget strictly decreases, so the loop terminates; in
+    // practice it runs once or twice.
+    var budget = max_bytes -| empty_wrapper.len;
+    while (budget > 0) {
+        const cut = utf8SafeCut(json, budget);
+        if (cut == 0) break;
 
-    var aw: Writer.Allocating = .init(arena);
-    std.json.Stringify.value(.{ .truncated = true, .partial = json[0..cut] }, .{}, &aw.writer) catch
-        return empty_wrapper;
-    const out = aw.written();
+        var aw: Writer.Allocating = .init(arena);
+        std.json.Stringify.value(.{ .truncated = true, .partial = json[0..cut] }, .{}, &aw.writer) catch
+            break;
+        const out = aw.written();
+        if (out.len <= max_bytes) return out;
 
-    // Escaping (quotes, backslashes, control bytes re-escaped inside
-    // `partial`) can still grow the result past `max_bytes` even after
-    // budgeting the wrapper's fixed characters out — a prefix that was
-    // itself JSON-quote-dense can approach 2x its raw length once
-    // re-escaped. Fall back to something smaller rather than exceed the
-    // cap this field exists to enforce.
-    if (out.len <= max_bytes) return out;
+        // Every prefix byte contributes at least one byte to the escaped
+        // output, so dropping `over` more prefix bytes drops at least `over`
+        // output bytes — cutting to `cut - over` therefore lands at or under
+        // the cap. When `over` is as big as the cut itself, subtracting it
+        // would leave nothing; halve instead, which still converges on a
+        // usable prefix for content that escapes to 2x or more.
+        const over = out.len - max_bytes;
+        budget = if (over < cut) cut - over else cut / 2;
+    }
+
+    // Floor, reached only for caps too small to hold the wrapper around any
+    // non-empty prefix at all. `max_bytes` this small is a degenerate policy
+    // value (the default is 16KiB) rather than a case worth a bigger ladder.
     if (max_bytes >= empty_wrapper.len) return empty_wrapper;
     if (max_bytes >= 4) return "null";
-    // Nothing valid and non-empty fits in under 4 bytes; `max_bytes` this
-    // small is a degenerate policy value (the default is 16KiB) rather than
-    // a case worth a bigger fallback ladder for.
+    // `"0"` is the shortest valid JSON value there is: one byte. A cap below
+    // that is unsatisfiable rather than merely tight — no valid JSON value is
+    // the empty string — so this one case deliberately returns a byte over
+    // budget instead of returning something the model cannot parse.
     return "0";
 }
 
@@ -350,9 +371,11 @@ test "dispatch: dangerous tool needs a token, then runs once" {
 test "dispatch: oversized results are truncated into a still-valid JSON value that fits the budget" {
     const BigActions = struct {
         pub fn big(_: struct {}) []const u8 {
-            // Long enough that a 60-byte cap still leaves room to see the
-            // wrapper object shape (rather than falling all the way back to
-            // the empty-partial / `null` tiers below).
+            // 100 characters, so the 102-byte JSON encoding is well over the
+            // 60-byte cap below and truncation definitely runs. The encoding
+            // opens with a `"` — an escape-expanding byte — which is what
+            // makes this the case a one-shot, un-escaped byte budget gets
+            // wrong (it overflows, then collapses to an empty partial).
             return "0123456789" ** 10;
         }
     };
@@ -374,6 +397,15 @@ test "dispatch: oversized results are truncated into a still-valid JSON value th
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
     try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+
+    // The whole point of the wrapper is to hand the model a usable prefix of
+    // the real result. A cap this far above the 31-byte wrapper must yield a
+    // substantial `partial`, not an empty one — an empty partial here means
+    // the budget arithmetic overflowed and the fallback ladder ate the
+    // content, which is exactly the regression this pins.
+    const partial = parsed.value.object.get("partial").?.string;
+    try std.testing.expect(partial.len >= 20);
+    try std.testing.expect(std.mem.startsWith(u8, partial, "\"0123456789"));
 }
 
 test "dispatch: a truncated result fits its budget even when re-escaping would expand it" {
@@ -396,10 +428,53 @@ test "dispatch: a truncated result fits its budget even when re-escaping would e
     try std.testing.expect(out == .ok);
     try std.testing.expect(out.ok.len <= 40);
 
-    // Whatever shape the fallback ladder landed on — full wrapper, empty
-    // wrapper, or a bare `null` — it must still be valid JSON.
+    // A cap this tight against content that escapes to ~2x may legitimately
+    // land on a short partial or, for a smaller cap, on one of the floor
+    // tiers — that tradeoff is the point of this test, so the shape is not
+    // pinned here (the non-empty property is pinned by the two tests either
+    // side of this one). What must hold regardless: it fits, and it parses.
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), out.ok, .{});
     defer parsed.deinit();
+}
+
+test "dispatch: a realistic oversized object result keeps most of its budget as content" {
+    const RowActions = struct {
+        const Row = struct { id: u32, name: []const u8, note: []const u8 };
+        pub fn rows(_: struct {}) []const Row {
+            // The shape a real tool returns: an array of records. Its JSON
+            // encoding is ~1.2KB and is dense with quoted keys and quoted
+            // string values, so nearly every byte of any prefix re-escapes
+            // to two — the case a single un-escaped byte budget silently
+            // turned into an empty partial.
+            const table = [_]Row{.{
+                .id = 1,
+                .name = "widget-alpha",
+                .note = "a reasonably wordy note field, as tool results tend to have",
+            }} ** 12;
+            return &table;
+        }
+    };
+    const RR = Registry(RowActions, &.{
+        .{ .fn_name = "rows", .description = "Rows.", .risk = .safe },
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const out = RR.invoke(arena.allocator(), "rows", "{}", .{ .max_tool_result_bytes = 512 }, null);
+    try std.testing.expect(out == .ok);
+    try std.testing.expect(out.ok.len <= 512);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), out.ok, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+
+    // A truncated reply that spends its whole budget on the wrapper is
+    // useless to the model. At a 512-byte cap the content must dominate:
+    // most of the budget is real prefix, and it starts where the original
+    // encoding starts.
+    const partial = parsed.value.object.get("partial").?.string;
+    try std.testing.expect(partial.len >= 400);
+    try std.testing.expect(std.mem.startsWith(u8, partial, "[{\"id\":1,\"name\":\"widget-alpha\""));
 }
 
 test "dispatch: an approved confirmation leaves no live token behind" {
