@@ -5,7 +5,7 @@
 const std = @import("std");
 const tool = @import("tool.zig");
 
-pub const Outcome = enum { allowed, denied, needs_confirmation, failed };
+pub const Outcome = enum { allowed, denied, needs_confirmation, claim_rejected, failed };
 
 pub const Record = struct {
     name_buf: [64]u8 = undefined,
@@ -33,14 +33,23 @@ pub fn record(name: []const u8, risk: tool.Risk, outcome: Outcome, args_bytes: u
     defer mu.unlock();
     const slot = &ring[count % cap];
     const n = @min(name.len, slot.name_buf.len);
-    @memcpy(slot.name_buf[0..n], name[0..n]);
+    // `name` is attacker-controlled on the unknown-tool path (whatever a
+    // model sent, unbounded). Capping to `name_buf` already bounds it; also
+    // replacing non-printable bytes here means the *only* representation of
+    // it that ever reaches storage or the log has no embedded newlines to
+    // forge extra log lines with, and no control bytes to bloat the log.
+    for (name[0..n], 0..) |c, i| {
+        slot.name_buf[i] = if (std.ascii.isPrint(c)) c else '?';
+    }
     slot.name_len = n;
     slot.risk = risk;
     slot.outcome = outcome;
     slot.args_bytes = args_bytes;
     count += 1;
+    // Log the sanitized, length-capped copy — never the raw `name` — so a
+    // single refusal can't write unbounded or forged content to the host log.
     std.log.scoped(.verve_ai).info("tool {s} risk={s} outcome={s} args={d}B", .{
-        name, @tagName(risk), @tagName(outcome), args_bytes,
+        slot.name(), @tagName(risk), @tagName(outcome), args_bytes,
     });
 }
 
@@ -88,4 +97,18 @@ test "audit: ring wraps without growing" {
     try std.testing.expectEqual(cap + 5, total());
     var buf: [cap]Record = undefined;
     try std.testing.expectEqual(cap, recent(&buf).len);
+}
+
+test "audit: non-printable bytes in the tool name are sanitized, not just capped" {
+    // A model-supplied name (the unknown-tool path passes `name` through
+    // unmodified) could carry embedded newlines to forge extra log lines,
+    // or other control bytes. Neither storage nor the log line should ever
+    // see the raw bytes — std.log output itself isn't capturable from a
+    // unit test, but this pins that the value fed into it (the same
+    // sanitized buffer `record` logs from) is already safe.
+    reset();
+    record("evil\nname\x07", .safe, .denied, 0);
+    var buf: [1]Record = undefined;
+    const got = recent(&buf);
+    try std.testing.expectEqualStrings("evil?name?", got[0].name());
 }

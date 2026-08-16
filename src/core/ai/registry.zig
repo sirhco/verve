@@ -9,9 +9,14 @@ const schema = @import("schema.zig");
 const action_invoke = @import("../action_invoke.zig");
 const policy = @import("policy.zig");
 const audit = @import("audit.zig");
+const Writer = std.Io.Writer;
 
 pub const ToolOutcome = union(enum) {
     /// JSON encoding of the tool's return value (`"null"` for void actions).
+    /// If the encoding is longer than the policy's `max_tool_result_bytes`,
+    /// this is instead `{"truncated":true,"partial":"..."}` — always a value
+    /// that parses, never a byte-sliced fragment of the original (see
+    /// `truncateResult`).
     ok: []const u8,
     /// Human- and model-readable reason the call did not run.
     err: []const u8,
@@ -76,14 +81,33 @@ pub fn Registry(comptime Actions: type, comptime decls: []const tool.ToolDecl) t
                     audit.record(name, decl.risk, .denied, args_json.len);
                     return .{ .err = reason };
                 },
-                .needs_confirmation => |fresh| {
+                .needs_confirmation => {
                     // A token only redeems the exact (name, args) it was
-                    // issued for — see policy.claimToken.
+                    // issued for — see policy.claimToken. Minting happens
+                    // here, not in `check`, and only when the caller doesn't
+                    // already hold a valid token: otherwise an approved call
+                    // would leave a second, unclaimed token behind in the
+                    // table for no one to ever reap.
                     const approved = if (confirm_token) |t| policy.claimToken(t, name, args_json) else false;
                     if (!approved) {
-                        audit.record(name, decl.risk, .needs_confirmation, args_json.len);
+                        // Distinguish "never asked" from "asked with a token
+                        // that didn't match" — the latter is what a model
+                        // spending one tool's approval on another looks
+                        // like, and it must not be audited identically to a
+                        // routine first-time prompt.
+                        const outcome: audit.Outcome = if (confirm_token != null) .claim_rejected else .needs_confirmation;
+                        const fresh = policy.issueToken(name, args_json) orelse {
+                            // Fail-closed: refuse rather than evict some
+                            // other pending approval to make room.
+                            audit.record(name, decl.risk, .denied, args_json.len);
+                            return .{ .err = "too many pending confirmations" };
+                        };
+                        audit.record(name, decl.risk, outcome, args_json.len);
                         return .{ .needs_confirmation = fresh };
                     }
+                    // Approved: fall through to execute. Nothing is minted
+                    // on this path, so the token just claimed is the only
+                    // authorization this call ever held.
                 },
                 .allow => {},
             }
@@ -109,7 +133,7 @@ pub fn Registry(comptime Actions: type, comptime decls: []const tool.ToolDecl) t
                         .value_json => |v| v,
                     };
                     const capped = if (json.len > p.max_tool_result_bytes)
-                        json[0..p.max_tool_result_bytes]
+                        truncateResult(arena, json, p.max_tool_result_bytes)
                     else
                         json;
                     return .{ .ok = capped };
@@ -118,6 +142,27 @@ pub fn Registry(comptime Actions: type, comptime decls: []const tool.ToolDecl) t
             unreachable;
         }
     };
+}
+
+/// Shrink an oversized JSON result into something shorter that still parses.
+/// A raw byte slice of a JSON value can leave a string unterminated and can
+/// split a multi-byte UTF-8 sequence — handing the model something it was
+/// told was well-formed JSON and isn't. Wraps a UTF-8-safe prefix of the
+/// original encoding in a small object instead.
+fn truncateResult(arena: std.mem.Allocator, json: []const u8, max_bytes: usize) []const u8 {
+    const cut = utf8SafeCut(json, max_bytes);
+    var aw: Writer.Allocating = .init(arena);
+    std.json.Stringify.value(.{ .truncated = true, .partial = json[0..cut] }, .{}, &aw.writer) catch
+        return "{\"truncated\":true,\"partial\":\"\"}";
+    return aw.written();
+}
+
+/// The largest prefix of `json` no longer than `max_bytes` that is still
+/// valid UTF-8 — so truncation never cuts a multi-byte codepoint in half.
+fn utf8SafeCut(json: []const u8, max_bytes: usize) usize {
+    var cut = @min(json.len, max_bytes);
+    while (cut > 0 and !std.unicode.utf8ValidateSlice(json[0..cut])) cut -= 1;
+    return cut;
 }
 
 fn validate(comptime Actions: type, comptime decls: []const tool.ToolDecl) void {
@@ -263,7 +308,7 @@ test "dispatch: dangerous tool needs a token, then runs once" {
     try std.testing.expectEqual(@as(u32, 1), DangerActions.ran);
 }
 
-test "dispatch: oversized results are truncated" {
+test "dispatch: oversized results are truncated into a still-valid JSON value" {
     const BigActions = struct {
         pub fn big(_: struct {}) []const u8 {
             return "0123456789";
@@ -275,5 +320,104 @@ test "dispatch: oversized results are truncated" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const out = BR.invoke(arena.allocator(), "big", "{}", .{ .max_tool_result_bytes = 4 }, null);
-    try std.testing.expectEqual(@as(usize, 4), out.ok.len);
+    try std.testing.expect(out == .ok);
+
+    // The model must be handed something it can actually parse, not a raw
+    // byte-sliced fragment (a naive slice of `"0123456789"` to 4 bytes would
+    // be the unterminated `"01`).
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), out.ok, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+}
+
+test "dispatch: an approved confirmation leaves no live token behind" {
+    policy.resetTokens();
+    const DangerActions = struct {
+        pub var ran: u32 = 0;
+        pub fn wipe(_: struct {}) void {
+            ran += 1;
+        }
+    };
+    const DR = Registry(DangerActions, &.{
+        .{ .fn_name = "wipe", .description = "Delete everything.", .risk = .dangerous },
+    });
+    const p: policy.Policy = .{ .allow_risk = .dangerous };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const first = DR.invoke(arena.allocator(), "wipe", "{}", p, null);
+    const token = first.needs_confirmation;
+    const approved = DR.invoke(arena.allocator(), "wipe", "{}", p, token);
+    try std.testing.expect(approved == .ok);
+    try std.testing.expectEqual(@as(u32, 1), DangerActions.ran);
+
+    // The approved claim must not have left a second, still-live token
+    // bound to this call sitting in the table (the leftover-authorization
+    // bug this fixes) — fill every remaining slot and confirm the table has
+    // its full capacity available, not `token_cap - 1`.
+    var i: usize = 0;
+    while (i < policy.token_cap) : (i += 1) {
+        try std.testing.expect(policy.issueToken("filler", "{}") != null);
+    }
+    try std.testing.expect(policy.issueToken("filler", "{}") == null);
+    policy.resetTokens();
+}
+
+test "dispatch: a full confirmation table is refused, not silently evicted" {
+    policy.resetTokens();
+    const DangerActions = struct {
+        pub fn wipe(_: struct {}) void {}
+    };
+    const DR = Registry(DangerActions, &.{
+        .{ .fn_name = "wipe", .description = "Delete everything.", .risk = .dangerous },
+    });
+    const p: policy.Policy = .{ .allow_risk = .dangerous };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var i: usize = 0;
+    while (i < policy.token_cap) : (i += 1) {
+        try std.testing.expect(policy.issueToken("other", "{}") != null);
+    }
+    const out = DR.invoke(arena.allocator(), "wipe", "{}", p, null);
+    try std.testing.expect(out == .err);
+    try std.testing.expectEqualStrings("too many pending confirmations", out.err);
+    policy.resetTokens();
+}
+
+test "dispatch: a rejected confirmation token is audited distinctly from a first-time ask" {
+    policy.resetTokens();
+    audit.reset();
+    const DangerActions = struct {
+        pub fn wipe(_: struct {}) void {}
+        pub fn nuke(_: struct {}) void {}
+    };
+    const DR = Registry(DangerActions, &.{
+        .{ .fn_name = "wipe", .description = "Delete everything.", .risk = .dangerous },
+        .{ .fn_name = "nuke", .description = "Delete everything else.", .risk = .dangerous },
+    });
+    const p: policy.Policy = .{ .allow_risk = .dangerous };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A routine first-time ask.
+    const first = DR.invoke(arena.allocator(), "wipe", "{}", p, null);
+    try std.testing.expect(first == .needs_confirmation);
+    const token = first.needs_confirmation;
+
+    // The same token, redeemed against a different tool — this is the
+    // attack the (tool, args) binding exists to stop, and it must not read
+    // the same in the audit trail as the routine ask above.
+    const wrong = DR.invoke(arena.allocator(), "nuke", "{}", p, token);
+    try std.testing.expect(wrong == .needs_confirmation);
+
+    var buf: [4]audit.Record = undefined;
+    const got = audit.recent(&buf);
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    try std.testing.expectEqual(audit.Outcome.needs_confirmation, got[0].outcome);
+    try std.testing.expectEqual(audit.Outcome.claim_rejected, got[1].outcome);
+
+    policy.resetTokens();
+    audit.reset();
 }
