@@ -30,14 +30,14 @@ fn jsonSchemaPath(comptime T: type, comptime docs: []const tool.ArgDoc, comptime
         for (fields) |f| {
             if (props.len != 0) props = props ++ ",";
             const field_path = if (path.len == 0) f.name else path ++ "." ++ f.name;
-            props = props ++ "\"" ++ f.name ++ "\":" ++ typeSchema(f.type, docFor(docs, f.name), field_path);
+            props = props ++ "\"" ++ escape(f.name) ++ "\":" ++ typeSchema(f.type, docFor(docs, f.name), field_path);
 
             // Optionals and defaulted fields are legitimately omittable; every
             // other field must be supplied or the call is malformed.
             const omittable = f.default_value_ptr != null or @typeInfo(f.type) == .optional;
             if (!omittable) {
                 if (required.len != 0) required = required ++ ",";
-                required = required ++ "\"" ++ f.name ++ "\"";
+                required = required ++ "\"" ++ escape(f.name) ++ "\"";
             }
         }
         return "{\"type\":\"object\",\"properties\":{" ++ props ++
@@ -68,7 +68,7 @@ fn typeSchema(comptime T: type, comptime desc: ?[]const u8, comptime path: []con
                 var vals: []const u8 = "";
                 for (e.fields) |ef| {
                     if (vals.len != 0) vals = vals ++ ",";
-                    vals = vals ++ "\"" ++ ef.name ++ "\"";
+                    vals = vals ++ "\"" ++ escape(ef.name) ++ "\"";
                 }
                 break :blk "{\"type\":\"string\",\"enum\":[" ++ vals ++ "]" ++ tail ++ "}";
             },
@@ -147,6 +147,19 @@ test "schema: arg_docs attach descriptions" {
     });
     try std.testing.expectEqualStrings(
         \\{"type":"object","properties":{"text":{"type":"string","description":"Item text."}},"required":["text"],"additionalProperties":false}
+    , got);
+}
+
+test "schema: field names and enum values are JSON-escaped, not interpolated raw" {
+    // Comptime and author-controlled, so this is theoretical for a normal
+    // app — but the escaper already exists for descriptions, and a struct
+    // field or enum tag declared via `@"..."` syntax can contain a quote or
+    // backslash that would otherwise produce structurally invalid JSON.
+    const Weird = enum { @"a\"b", plain };
+    const Args = struct { @"say\"hi\"": []const u8, mode: Weird };
+    const got = comptime jsonSchema(Args, &.{});
+    try std.testing.expectEqualStrings(
+        \\{"type":"object","properties":{"say\"hi\"":{"type":"string"},"mode":{"type":"string","enum":["a\"b","plain"]}},"required":["say\"hi\"","mode"],"additionalProperties":false}
     , got);
 }
 

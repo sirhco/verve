@@ -7,8 +7,13 @@
 //! (see `policy.claimToken`) — this loop must never let that value reach the
 //! provider. It doesn't: the `tool_result` built for that case below is a
 //! fixed, token-free string. The token itself has no path out of this
-//! function; only the caller of `run` (a host route, Tasks 7/8) ever sees it,
-//! via a side channel this loop doesn't touch.
+//! function at all: `Outcome` (below) carries only `{ text, steps, stopped }`,
+//! so a caller of `run` cannot learn that a confirmation is pending, which
+//! `(tool, args)` it is for, or what token would redeem it. A host that wants
+//! the approval flow must bypass this loop and call `Reg.invoke` directly —
+//! see `docs/25-ai.md`'s "The confirmation round-trip" section. Widening
+//! `Outcome` to surface a pending confirmation is a known gap, deliberately
+//! deferred.
 
 const std = @import("std");
 const message = @import("message.zig");
@@ -29,9 +34,12 @@ pub const Outcome = struct {
 /// effect scheduler is threadlocal).
 ///
 /// `confirm_token` is always `null` on the call into `Reg.invoke` below —
-/// this loop never holds one to spend. Host-driven confirmation (obtaining a
-/// token from a human and redeeming it) is Tasks 7 and 8's job, layered on
-/// top of a fresh call into the registry, not on top of this loop.
+/// this loop never holds one to spend. `verve.ai.run` does not surface a
+/// pending confirmation to its caller (see the module doc comment above):
+/// a `.needs_confirmation` outcome is reported to the model as a fixed
+/// refusal string and otherwise dropped. A host that wants the
+/// human-approval flow has to call `Reg.invoke` directly, outside this
+/// loop, with a real `confirm_token` once it has one.
 pub fn run(
     arena: std.mem.Allocator,
     prov: provider.Provider,
@@ -85,6 +93,18 @@ pub fn run(
             };
             try results.append(arena, .{ .tool_result = rb });
         }
+
+        // A response can report `stop_reason == .tool_use` while carrying no
+        // `tool_use` blocks at all (empty or malformed turn) — `results`
+        // would then be empty, and appending
+        // `{"role":"user","content":[]}` to the conversation is not just
+        // pointless, it's a guaranteed 400 from the Messages API on the next
+        // round trip (an empty `content` array is invalid). Stop here with a
+        // clear outcome instead.
+        if (results.items.len == 0) {
+            return .{ .text = last_text, .steps = step, .stopped = res.stop_reason };
+        }
+
         try convo.append(arena, .{ .role = .user, .blocks = try results.toOwnedSlice(arena) });
     }
     return .{ .text = last_text, .steps = step, .stopped = .tool_use };
@@ -179,6 +199,34 @@ test "agent: unknown tool feeds an is_error result back rather than aborting" {
     const results_msg = convo.items[2];
     try std.testing.expect(results_msg.blocks[0].tool_result.is_error);
     try std.testing.expectEqualStrings("unknown tool", results_msg.blocks[0].tool_result.content);
+}
+
+test "agent: tool_use stop_reason with no tool_use blocks stops instead of round-tripping empty content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A malformed/empty turn: stop_reason claims tool_use but no tool_use
+    // block is actually present. Without a guard, `results` stays empty and
+    // the loop would append `{"role":"user","content":[]}` to the
+    // conversation and call `complete` again — the Messages API rejects an
+    // empty `content` array with a 400. The mock only scripts one turn, so
+    // if the loop tried to continue past it, this test would fail with
+    // `error.MockExhausted` instead of returning cleanly.
+    var mock: @import("mock_provider.zig").MockProvider = .{ .turns = &.{
+        .{ .stop_reason = .tool_use, .blocks = &.{.{ .text = "thinking..." }} },
+    } };
+
+    var convo: std.ArrayList(message.Message) = .empty;
+    try convo.append(a, userTurn("do something"));
+
+    const outcome = try run(a, mock.provider(), R, .{}, &convo, "sys", "model-x");
+    try std.testing.expectEqual(@as(u8, 1), outcome.steps);
+    try std.testing.expectEqual(message.StopReason.tool_use, outcome.stopped);
+    try std.testing.expectEqualStrings("thinking...", outcome.text);
+
+    // No tool_result message was appended — just the assistant's turn.
+    try std.testing.expectEqual(@as(usize, 2), convo.items.len);
 }
 
 /// A provider that always returns a `tool_use` turn — used to pin

@@ -1,6 +1,12 @@
 //! Fixed-size ring of recent tool invocations. Every attempt is recorded —
-//! allowed, denied, confirmed, or failed — so a host can show what a model
-//! actually did, not just what it said it did.
+//! `.allowed`, `.denied`, `.needs_confirmation`, `.claim_rejected`, or
+//! `.failed` (see `Outcome` below; a confirmed-and-executed call records
+//! `.allowed`, same as any other successful run — there is no separate
+//! "confirmed" outcome) — so a host can show what a model actually did, not
+//! just what it said it did. The ring holds only the most recent `cap` (64)
+//! entries: a flood of calls evicts older ones, so this is a recency window
+//! for display, not a durable audit log a host can rely on to retain
+//! everything.
 
 const std = @import("std");
 const tool = @import("tool.zig");

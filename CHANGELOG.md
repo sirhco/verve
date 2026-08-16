@@ -37,13 +37,46 @@ versions follow [Semantic Versioning](https://semver.org/).
   the confirmation round-trip, provider selection, and a security-model section
   stating plainly that the comptime allowlist is the whole boundary, that the
   desktop JS shim is not a trust boundary, and that judging a function safe to
-  expose is the app author's call, never the framework's.
-- **Verified.** `zig build test --summary all`: 112/112 steps, 1353/1353 tests
-  (up from 1350 at the previous release) — the two new `src/app/ai.zig` tests plus
-  the new `/api/aiChat` mock-mode integration test, all newly green. Manually
-  exercised `/ai-chat` end to end against `VERVE_AI_MOCK=1` (tool call → summary,
-  audited) and against a real server with no API key configured (a clean 500, no
-  key or internal error detail in the body or logs, server stays up); confirmed a
+  expose is the app author's call, never the framework's. Also records two known
+  deviations from the `verve.ai` spec this branch shipped against: integer
+  schemas omit `minimum`/`maximum` (deferred — would churn every golden test for
+  a model-accuracy, not safety, gain), and the desktop IPC demo (spec S5's
+  `ai_chat` route in `templates/desktop/src/handlers.zig`) was not built, so the
+  one-gate-two-surfaces property is proven by unit test rather than a running
+  desktop demo.
+
+### Fixed
+
+- **`ctx.fetch` never compiled.** `src/core/fetch.zig` built `std.http.Client`
+  with no `.io`, which has no default in Zig 0.16 — a live compile error on any
+  real call path, invisible until now because no test and no production call
+  site ever invoked `fetch()`. `FetchOptions` gains `io: ?std.Io`, threaded
+  through automatically by `ctx.fetch` or defaulted to a process-lifetime
+  singleton when the caller has none of its own.
+- **`FetchResponse.json()` no longer parses a truncated body.** A response cut
+  short by `FetchOptions.max_body` now returns `error.ResponseTruncated` instead
+  of attempting to parse the partial bytes into a value that could look
+  legitimate while actually being incomplete. Callers that want the truncated
+  bytes anyway can still read `.body` directly.
+- **`src/desktop/process.zig` was written against an outdated
+  `std.process.Child` API** (`Child.run(...)`, `Term.Exited`) that no longer
+  exists in this toolchain. It had zero callers repo-wide, so Zig's lazy
+  analysis never type-checked it and the mismatch shipped invisibly — until
+  this branch's `ai_cli.zig` (the desktop CLI provider) became the first real
+  caller. Ported to the current API: `std.process.run(gpa, io, options)`
+  returning `RunResult{ term, stdout, stderr }`, with lowercase `Child.Term`
+  tags (`.exited`, not `.Exited`).
+- **Verified.** `zig build test --summary all`: 112/112 steps, 1354/1354 tests
+  (up from **1265** at the previous release, 0.49.1 — 1350 was an intra-branch
+  count taken mid-way through this branch's work, not a release baseline). The
+  two new `src/app/ai.zig` tests, the new `/api/aiChat` mock-mode integration
+  test, an `agent.zig` regression test for an empty tool-results turn, and a
+  `schema.zig` test pinning that field names/enum values are JSON-escaped, are
+  all newly green; one test that asserted a struct field against the value it
+  had just set (exercising no code) was deleted. Manually exercised `/ai-chat`
+  end to end against `VERVE_AI_MOCK=1` (tool call → summary, audited) and
+  against a real server with no API key configured (a clean 500, no key or
+  internal error detail in the body or logs, server stays up); confirmed a
   tool marked `.dangerous` with this demo's default policy is denied outright
   (`allow_risk` defaults to `.mutating` — a `.dangerous` declaration with no policy
   opt-in is refused, not silently left "pending confirmation").

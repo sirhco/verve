@@ -77,9 +77,12 @@ pub fn fetch(arena: std.mem.Allocator, url: []const u8, opts: FetchOptions) !Fet
     if (is_wasm) return error.UnsupportedOnClient;
 
     if (opts.timeout_ns != null) {
+        // Log the fact only, never the URL: query strings carry credentials
+        // (API keys, signed URLs) often enough that logging them
+        // unconditionally is a habit worth not forming.
         std.log.scoped(.verve_fetch).warn(
-            "fetch({s}): timeout_ns is set but not enforced — a hung upstream will block indefinitely",
-            .{url},
+            "fetch: timeout_ns is set but not enforced — a hung upstream will block indefinitely",
+            .{},
         );
     }
 
@@ -130,16 +133,6 @@ pub fn fetch(arena: std.mem.Allocator, url: []const u8, opts: FetchOptions) !Fet
 // decode helper directly.
 
 const testing = std.testing;
-
-test "fetch: options carry io and an enforced timeout" {
-    const opts: FetchOptions = .{ .timeout_ns = 5 * std.time.ns_per_s };
-    try std.testing.expect(opts.timeout_ns != null);
-    // max_body must be raisable well past the 1 MB default: LLM responses
-    // with long tool arguments routinely exceed it, and the truncation is
-    // silent apart from the flag.
-    const big: FetchOptions = .{ .max_body = 8 * 1024 * 1024 };
-    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), big.max_body);
-}
 
 test "fetch: truncated response.json() errors instead of parsing garbage" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
