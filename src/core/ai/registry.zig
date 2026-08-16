@@ -71,13 +71,15 @@ pub fn Registry(comptime Actions: type, comptime decls: []const tool.ToolDecl) t
                 return .{ .err = "unknown tool" };
             };
 
-            switch (policy.check(p, decl, args_json.len)) {
+            switch (policy.check(p, decl, args_json)) {
                 .deny => |reason| {
                     audit.record(name, decl.risk, .denied, args_json.len);
                     return .{ .err = reason };
                 },
                 .needs_confirmation => |fresh| {
-                    const approved = if (confirm_token) |t| policy.claimToken(t) else false;
+                    // A token only redeems the exact (name, args) it was
+                    // issued for — see policy.claimToken.
+                    const approved = if (confirm_token) |t| policy.claimToken(t, name, args_json) else false;
                     if (!approved) {
                         audit.record(name, decl.risk, .needs_confirmation, args_json.len);
                         return .{ .needs_confirmation = fresh };
@@ -220,12 +222,17 @@ test "dispatch: dangerous tool needs a token, then runs once" {
     policy.resetTokens();
     const DangerActions = struct {
         pub var ran: u32 = 0;
+        pub var nuked: u32 = 0;
         pub fn wipe(_: struct {}) void {
             ran += 1;
+        }
+        pub fn nuke(_: struct {}) void {
+            nuked += 1;
         }
     };
     const DR = Registry(DangerActions, &.{
         .{ .fn_name = "wipe", .description = "Delete everything.", .risk = .dangerous },
+        .{ .fn_name = "nuke", .description = "Delete everything else.", .risk = .dangerous },
     });
     const p: policy.Policy = .{ .allow_risk = .dangerous };
 
@@ -237,6 +244,15 @@ test "dispatch: dangerous tool needs a token, then runs once" {
     try std.testing.expectEqual(@as(u32, 0), DangerActions.ran);
 
     const token = first.needs_confirmation;
+
+    // A token issued for "wipe" must not authorise a different dangerous
+    // tool, even one also awaiting confirmation.
+    const wrong_tool = DR.invoke(arena.allocator(), "nuke", "{}", p, token);
+    try std.testing.expect(wrong_tool == .needs_confirmation);
+    try std.testing.expectEqual(@as(u32, 0), DangerActions.nuked);
+
+    // That mismatched attempt must not have spent the token — "wipe" with
+    // the arguments it was actually issued for still runs.
     const second = DR.invoke(arena.allocator(), "wipe", "{}", p, token);
     try std.testing.expect(second == .ok);
     try std.testing.expectEqual(@as(u32, 1), DangerActions.ran);
