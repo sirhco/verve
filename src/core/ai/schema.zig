@@ -11,6 +11,15 @@ const tool = @import("tool.zig");
 /// offending field — a tool schema that silently omitted a parameter would
 /// hand the model a lie.
 pub fn jsonSchema(comptime T: type, comptime docs: []const tool.ArgDoc) []const u8 {
+    return jsonSchemaPath(T, docs, "");
+}
+
+// Path-carrying implementation behind the public `jsonSchema`. `path` is a
+// dotted/bracketed breadcrumb ("nested.inner", "tags[]") built up as the
+// walk descends into nested structs and slice item types, so a
+// `@compileError` deep in the recursion can still name the field that
+// caused it rather than just the leaf Zig type.
+fn jsonSchemaPath(comptime T: type, comptime docs: []const tool.ArgDoc, comptime path: []const u8) []const u8 {
     comptime {
         const info = @typeInfo(T);
         if (info != .@"struct") @compileError("tool argument must be a struct, got " ++ @typeName(T));
@@ -20,7 +29,8 @@ pub fn jsonSchema(comptime T: type, comptime docs: []const tool.ArgDoc) []const 
         var required: []const u8 = "";
         for (fields) |f| {
             if (props.len != 0) props = props ++ ",";
-            props = props ++ "\"" ++ f.name ++ "\":" ++ typeSchema(f.type, docFor(docs, f.name));
+            const field_path = if (path.len == 0) f.name else path ++ "." ++ f.name;
+            props = props ++ "\"" ++ f.name ++ "\":" ++ typeSchema(f.type, docFor(docs, f.name), field_path);
 
             // Optionals and defaulted fields are legitimately omittable; every
             // other field must be supplied or the call is malformed.
@@ -44,7 +54,7 @@ fn docFor(comptime docs: []const tool.ArgDoc, comptime name: []const u8) ?[]cons
     }
 }
 
-fn typeSchema(comptime T: type, comptime desc: ?[]const u8) []const u8 {
+fn typeSchema(comptime T: type, comptime desc: ?[]const u8, comptime path: []const u8) []const u8 {
     comptime {
         const tail = if (desc) |d| ",\"description\":\"" ++ escape(d) ++ "\"" else "";
         return switch (@typeInfo(T)) {
@@ -53,7 +63,7 @@ fn typeSchema(comptime T: type, comptime desc: ?[]const u8) []const u8 {
             .float => "{\"type\":\"number\"" ++ tail ++ "}",
             // An optional is the same shape as its child; omittability is
             // expressed by leaving the field out of `required`, not here.
-            .optional => |o| typeSchema(o.child, desc),
+            .optional => |o| typeSchema(o.child, desc, path),
             .@"enum" => |e| blk: {
                 var vals: []const u8 = "";
                 for (e.fields) |ef| {
@@ -63,12 +73,12 @@ fn typeSchema(comptime T: type, comptime desc: ?[]const u8) []const u8 {
                 break :blk "{\"type\":\"string\",\"enum\":[" ++ vals ++ "]" ++ tail ++ "}";
             },
             .pointer => |p| blk: {
-                if (p.size != .slice) @compileError("unsupported pointer type in tool schema: " ++ @typeName(T));
+                if (p.size != .slice) @compileError("unsupported type for field '" ++ path ++ "': " ++ @typeName(T));
                 if (p.child == u8) break :blk "{\"type\":\"string\"" ++ tail ++ "}";
-                break :blk "{\"type\":\"array\",\"items\":" ++ typeSchema(p.child, null) ++ tail ++ "}";
+                break :blk "{\"type\":\"array\",\"items\":" ++ typeSchema(p.child, null, path ++ "[]") ++ tail ++ "}";
             },
-            .@"struct" => jsonSchema(T, &.{}),
-            else => @compileError("unsupported type in tool schema: " ++ @typeName(T)),
+            .@"struct" => jsonSchemaPath(T, &.{}, path),
+            else => @compileError("unsupported type for field '" ++ path ++ "': " ++ @typeName(T)),
         };
     }
 }
