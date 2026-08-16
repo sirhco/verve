@@ -384,6 +384,34 @@ pub fn wsDemo(ctx: *const verve.Context) !*verve.Node {
     });
 }
 
+/// verve.ai demo (/ai-chat, Task 8) — a chat UI over the app's comptime tool
+/// allowlist (`app.ai.tools`). The transcript lives entirely client-side,
+/// rebuilt each turn from the `aiChat` server action's reply; see
+/// `src/client/islands/AiChat.zig`.
+pub fn aiChatPage(ctx: *const verve.Context) !*verve.Node {
+    const card = ctx.section().class("card").children(.{
+        ctx.h2("Tool-calling chat"),
+        ctx.p().text("Ask about the counter or the todo list. The model can call " ++
+            "getCount, appName, addTodo, and removeTodo — nothing else is on the allowlist."),
+        ctx.el("div")
+            .attr("data-ref", "aichat-transcript")
+            .attr("style", "min-height:200px;margin:10px 0;background:#0d1117;color:#d5d5d5;padding:10px;" ++
+            "border-radius:6px;white-space:pre-wrap;overflow-y:auto;"),
+        ctx.el("input")
+            .attr("data-ref", "aichat-input")
+            .attr("placeholder", "ask the assistant…")
+            .attr("style", "width:70%;padding:6px;margin-right:6px;"),
+        ctx.el("button").attr("z-on-click", "aichat_send").text("Send"),
+    });
+    const island = verve.island(ctx, .{ .name = "AiChat" }, card);
+    return ctx.main_().class("home").children(.{
+        ctx.h1("verve.ai — tool-calling chat"),
+        ctx.p().text("A server-side agent loop over a comptime, default-deny tool " ++
+            "allowlist. See docs/25-ai.md for the security model."),
+        island,
+    });
+}
+
 pub fn counter(ctx: *const verve.Context, initial: i32) !*verve.Node {
     return ctx.div().class("counter-card").children(.{
         ctx.h1("Verve Counter"),

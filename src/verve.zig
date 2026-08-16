@@ -205,6 +205,9 @@ pub const gl = @import("core/gl/gl.zig");
 pub const GlLight = @import("core/gl_scene.zig").Light;
 pub const GlLightKind = @import("core/gl_scene.zig").LightKind;
 
+/// Agentic tools — expose typed app functions to a language model.
+pub const ai = @import("core/ai/ai.zig");
+
 // Codec
 pub const encode = serialize_mod.encode;
 
@@ -249,6 +252,9 @@ pub const serializeEncodeToBytes = @import("core/serialize.zig").encodeToBytes;
 // Allocator management — used by DI context internals
 pub const setDiTablesAllocator = @import("core/context_di.zig").setOwnerTablesAllocator;
 
+// Shared action invoker — used by the HTTP api_handler and the AI tool registry.
+pub const ai_action_invoke = @import("core/action_invoke.zig");
+
 test {
     _ = node_mod;
     _ = signal_mod;
@@ -291,4 +297,6 @@ test {
     _ = @import("core/viz/viz.zig");
     _ = @import("core/anim/anim.zig");
     _ = @import("core/gl/gl.zig");
+    _ = @import("core/ai/ai.zig");
+    _ = @import("core/action_invoke.zig");
 }

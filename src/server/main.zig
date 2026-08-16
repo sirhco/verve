@@ -102,6 +102,24 @@ pub fn main(init: std.process.Init) !void {
     // back to fresh randomness otherwise.
     const csrf_env = init.environ_map.get("VERVE_CSRF_KEY");
     verve.csrf.initFromEnvOrRandom(csrf_env, io);
+
+    // Initialize the ai-tool confirmation-token key from the same real
+    // entropy source. Unseeded, `verve.ai`'s dangerous-tool path fails
+    // closed (IssueError.Unseeded) rather than minting a predictable token.
+    verve.ai.policy.initRandom(io);
+
+    // Hand the real process environment to the Anthropic provider so its
+    // `ANTHROPIC_API_KEY` fallback can find it. Zig 0.16 has no ambient
+    // getenv — `init.environ_map` is the one live capture of it, made once
+    // here at the true process entry point (mirrors `std.testing.environ`,
+    // which the Zig test runner populates the same way).
+    verve.ai.anthropic.initEnviron(init.environ_map);
+
+    // Same capture, for the app's own `VERVE_AI_MOCK` switch (see
+    // src/app/ai.zig's initEnviron/mockEnabled) — the /ai-chat demo action
+    // needs to know at request time whether to run the scripted
+    // MockProvider instead of a live Anthropic call.
+    app.ai.initEnviron(init.environ_map);
     printStartupBanner(cli);
 
     // Live-graph publisher (opt-in: only when the app declares

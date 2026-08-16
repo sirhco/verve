@@ -58,6 +58,7 @@ pub const routes: []const verve.Route = &.{
     verve.Route.init("/gl-wireframe", renderGlWireframe),
     verve.Route.init("/gl-material", renderGlMaterial),
     verve.Route.init("/push-multi", renderPushMulti),
+    verve.Route.init("/ai-chat", renderAiChat),
     verve.Route.init("/todos", renderTodos),
     verve.Route.init("/work/:slug", renderWorkDetail),
     verve.Route.layout("/app", renderAppShell, &.{
@@ -319,6 +320,11 @@ fn renderGlMaterial(ctx: *verve.Context) !*verve.Node {
 
 fn renderPushMulti(ctx: *verve.Context) !*verve.Node {
     const body = try components.pushMulti(ctx);
+    return components.page(ctx, body);
+}
+
+fn renderAiChat(ctx: *verve.Context) !*verve.Node {
+    const body = try components.aiChatPage(ctx);
     return components.page(ctx, body);
 }
 

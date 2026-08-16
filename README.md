@@ -13,10 +13,10 @@
 
 </div>
 
-> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.49.x. Public
+> ⚠️ **Pre-1.0 — work in progress.** Verve is at v0.50.x. Public
 > APIs are not stable and **will** break between minor versions.
 > All three desktop backends (macOS, Windows, Linux GTK4) are validated
-> on real hardware (current as of v0.49.x). Known limitations: desktop auto-updater
+> on real hardware (current as of v0.50.x). Known limitations: desktop auto-updater
 > apply is macOS-only; full a11y provider not yet implemented; Linux
 > image clipboard returns `Unsupported`. Use for learning, experiments,
 > and personal projects. Not production-ready.
@@ -35,7 +35,7 @@ Targets **Zig 0.16.0**. Full documentation lives at **[verveframework.dev](https
 ```sh
 # Web app — HTTP server + wasm hydration
 zig build                           # native server + wasm client + per-island chunks
-zig build test --summary all        # 1,265 tests across core + server + client + desktop + integration
+zig build test --summary all        # 1,353 tests across core + server + client + desktop + integration
 zig build docs                      # zig-out/docs/api/index.html — Zig autodoc for the public verve module
 ./zig-out/bin/verve-server          # open http://127.0.0.1:8080
 
@@ -179,6 +179,35 @@ Native 3D, pure Zig + two hand-written interpreters (**WebGL2 and WebGPU**) — 
 - **Asset pipeline** — build-time `.glb` → packed `.vmesh` (`tools/gl_asset_gen`): zero runtime parsing, fetch → linear memory → GPU upload. Pure-Zig PNG decoder, glb parser, and vmesh reader, all hardened against hostile input (errors, never panics). **Draco-compressed glTF** (`KHR_draco_mesh_compression`) is decoded at build time (pure-Zig, zero-dep) into the same pipeline. `verve.anim` fusion drives scroll-scrubbed 3D. Demos: `/gl-draco`, [`examples/gl-viewer/`](examples/gl-viewer/README.md).
 - **Geometry compression (`.vmesh` v16/v17)** — index buffers compress losslessly (delta+zigzag+varint, ~50%) and vertex buffers via quantization (pos u16 / normal+tangent i8 / uv u16, ~65%), decoded host-side before upload; **GPU-resident quantized attributes** (half pos/uv + snorm8 normal/tangent) additionally cut VRAM ~58% by uploading the packed form directly. Total assets shrink **~32–46%** (lodsphere 116→79 KB). Pure-Zig codec; native round-trip + WebGL2 visual gate.
 
+### AI tools (`verve.ai`)
+Expose an app's own typed functions to a language model as callable tools, then run a
+bounded tool-use loop against them — pure Zig, zero third-party deps, reusing the same
+`Actions` namespace `POST /api/<fn>` already dispatches through. Guide:
+[`docs/25-ai.md`](docs/25-ai.md). Demo: `/ai-chat`.
+- **Comptime, default-deny allowlist** — a function is callable by a model only if it's
+  named in an explicit `[]const verve.ai.ToolDecl`; a typo'd `fn_name`, a stale
+  `arg_docs.field`, or an unrepresentable argument type is a build failure
+  (`@compileError`), never a runtime surprise. JSON Schema generated from the function's
+  own struct argument type at comptime — zero runtime cost.
+- **`Risk` tiers** (`safe` / `mutating` — the default — / `dangerous`) enforced by a
+  shared policy gate (allowlist → size → risk → confirmation) that both HTTP actions
+  (`Registry`) and desktop IPC routes (`RouteRegistry`) dispatch through identically —
+  one gate, not two copies that can drift.
+- **Confirmation round-trip for dangerous calls** — a single-use, `(tool, args)`-bound
+  token that never reaches the model (minted for a human-facing approval UI only); a
+  token issued for one tool cannot authorize another, and a mismatched claim is audited
+  distinctly from a routine first-time ask.
+- **Audited dispatch** — every call outcome (allowed / denied / needs-confirmation /
+  failed) is recorded, without ever logging raw argument content.
+- **Pluggable providers** — a live Anthropic Messages API client
+  (`verve.ai.anthropic.Client`), a scripted `MockProvider` for deterministic tests/CI
+  (no API key, no network), and on desktop a Claude Code CLI provider that delegates to
+  its own sandboxed tools and refuses outright rather than silently dropping a
+  declared tool list.
+- **`/ai-chat` demo** — a tool-calling chat UI over a 4-function allowlist; the
+  transcript is fetched entirely through the server action (never passed as island
+  props, which are capped at 8 KB).
+
 ### Markdown & syntax highlighting
 Pure-Zig, server-side — replaces third-party `marked` / `highlight.js`. Parsed at SSR time into the `Node` tree; no client wasm, no JavaScript. Guide: [`docs/21-markdown-and-highlighting.md`](docs/21-markdown-and-highlighting.md). Demo: [`examples/markdown/`](examples/markdown/README.md).
 - **`ctx.markdown(src)`** — GFM: CommonMark core + tables, task lists, strikethrough, autolinks, reference links. Returns a real `Node` subtree, so text is escaped by the one renderer escaper.
@@ -220,7 +249,7 @@ tour and platform support matrix.
 
 > Pre-1.0 — release artifacts are published for each tag, but
 > behavior is experimental. All three desktop backends (macOS,
-> Windows, Linux GTK4) are validated on real hardware (current as of v0.49.x).
+> Windows, Linux GTK4) are validated on real hardware (current as of v0.50.x).
 
 Tagged releases publish `verve-server` + `verve-cli` tarballs for
 five targets:

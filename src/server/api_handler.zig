@@ -10,6 +10,7 @@ const Writer = std.Io.Writer;
 const app = @import("app");
 const verve = @import("verve");
 const http = std.http;
+const action_invoke = @import("verve").ai_action_invoke;
 
 pub const RequestMeta = verve.RequestMeta;
 
@@ -91,20 +92,7 @@ fn invoke(
     redirect_target: []const u8,
     rid: ?u32,
 ) !void {
-    const fn_info = @typeInfo(@TypeOf(func)).@"fn";
-    if (fn_info.params.len != 1) {
-        @compileError("Action functions must take exactly one struct argument");
-    }
-    const ArgsStruct = fn_info.params[0].type.?;
-    if (@typeInfo(ArgsStruct) != .@"struct") {
-        @compileError("Action argument must be a struct");
-    }
-
-    const Ret = fn_info.return_type.?;
-    const ret_info = @typeInfo(Ret);
-    const returns_error = ret_info == .error_union;
-    const Payload = if (returns_error) ret_info.error_union.payload else Ret;
-    const returns_value = Payload != void;
+    const ArgsStruct = action_invoke.ArgsOf(func);
 
     var arg_arena = std.heap.ArenaAllocator.init(gpa);
     defer arg_arena.deinit();
@@ -123,40 +111,49 @@ fn invoke(
         // func(args) runs — leaving string fields dangling (UAF: any string arg
         // with a JSON escape gets a heap-allocated unescaped copy). Leaky parse
         // ties every allocation to the longer-lived arg_arena instead.
-        args = std.json.parseFromSliceLeaky(ArgsStruct, arg_arena.allocator(), body, .{
-            .ignore_unknown_fields = true,
-        }) catch {
+        //
+        // ignore_unknown_fields = true: the HTTP path's historical tolerance for
+        // extra keys. The AI tool path (action_invoke's other caller) parses
+        // strict instead — an unknown key there means a hallucinated field name,
+        // which should surface as a retryable error, not get silently dropped.
+        args = action_invoke.parseJsonArgs(ArgsStruct, arg_arena.allocator(), body, false) catch {
             try request.respond("bad json", .{ .status = .bad_request });
             return;
         };
     }
 
-    if (returns_error and returns_value) {
-        const value = func(args) catch {
+    if (is_form) {
+        // A form post redirects on completion regardless of what the action
+        // returned — the return value is never observed, so it must never
+        // be serialized either (a value-encode failure has no business
+        // 500-ing a request whose response doesn't depend on the value).
+        action_invoke.call(func, args) catch |err| switch (err) {
+            error.ActionFailed => {
+                try request.respond("internal error", .{ .status = .internal_server_error });
+                return;
+            },
+            error.BadArgs => {
+                try request.respond("bad json", .{ .status = .bad_request });
+                return;
+            },
+        };
+        try respondRedirect(request, redirect_target);
+        return;
+    }
+
+    const result = action_invoke.callAndSerialize(func, arg_arena.allocator(), args) catch |err| switch (err) {
+        error.ActionFailed => {
             try request.respond("internal error", .{ .status = .internal_server_error });
             return;
-        };
-        if (is_form) {
-            try respondRedirect(request, redirect_target);
-        } else {
-            try respondValue(gpa, request, rid, value);
-        }
-    } else if (returns_error and !returns_value) {
-        func(args) catch {
-            try request.respond("internal error", .{ .status = .internal_server_error });
+        },
+        error.BadArgs => {
+            try request.respond("bad json", .{ .status = .bad_request });
             return;
-        };
-        if (is_form) try respondRedirect(request, redirect_target) else try respondOk(request, rid);
-    } else if (!returns_error and returns_value) {
-        const value = func(args);
-        if (is_form) {
-            try respondRedirect(request, redirect_target);
-        } else {
-            try respondValue(gpa, request, rid, value);
-        }
-    } else {
-        func(args);
-        if (is_form) try respondRedirect(request, redirect_target) else try respondOk(request, rid);
+        },
+    };
+    switch (result) {
+        .ok => try respondOk(request, rid),
+        .value_json => |json| try respondValueJson(gpa, request, rid, json),
     }
 }
 
@@ -291,18 +288,13 @@ fn respondOk(request: *http.Server.Request, rid: ?u32) !void {
     });
 }
 
-fn respondValue(
+fn respondValueJson(
     gpa: std.mem.Allocator,
     request: *http.Server.Request,
     rid: ?u32,
-    value: anytype,
+    value_json: []const u8,
 ) !void {
-    // Serialize the value first, then wrap with optional rid prefix.
-    var val_aw: Writer.Allocating = .init(gpa);
-    defer val_aw.deinit();
-    try std.json.Stringify.value(value, .{}, &val_aw.writer);
-    const value_json = val_aw.written();
-
+    // Wrap the already-encoded value with the optional rid prefix.
     var wrap_aw: Writer.Allocating = .init(gpa);
     defer wrap_aw.deinit();
     const wrap_w = &wrap_aw.writer;

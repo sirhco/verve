@@ -1,0 +1,837 @@
+//! Comptime tool table: (namespace of actions) x (explicit allowlist).
+//!
+//! The allowlist is the security boundary. A function absent from `decls` has
+//! no schema, no name the model can reach, and no dispatch path.
+
+const std = @import("std");
+const tool = @import("tool.zig");
+const schema = @import("schema.zig");
+const action_invoke = @import("../action_invoke.zig");
+const policy = @import("policy.zig");
+const audit = @import("audit.zig");
+const Writer = std.Io.Writer;
+
+pub const ToolOutcome = union(enum) {
+    /// JSON encoding of the tool's return value (`"null"` for void actions).
+    /// If the encoding is longer than the policy's `max_tool_result_bytes`,
+    /// this is instead `{"truncated":true,"partial":"..."}` — always a value
+    /// that parses, never a byte-sliced fragment of the original (see
+    /// `truncateResult`).
+    ok: []const u8,
+    /// Human- and model-readable reason the call did not run.
+    err: []const u8,
+    /// A human must approve; echo this token back to execute.
+    needs_confirmation: u64,
+};
+
+/// Locate `name` in a comptime decl list. The one lookup rule both
+/// `Registry.find`/`invoke` and `RouteRegistry.find`/`invoke` share — see
+/// `gate`.
+fn findDecl(comptime decls: []const tool.ToolDecl, name: []const u8) ?tool.ToolDecl {
+    inline for (decls) |d| {
+        if (std.mem.eql(u8, d.fn_name, name)) return d;
+    }
+    return null;
+}
+
+/// Result of `gate`: either the call is cleared to run (carrying the decl
+/// its risk/execution needs), or it already has its final `ToolOutcome` —
+/// denied, refused, or awaiting confirmation — with no execution to follow.
+const Gated = union(enum) {
+    proceed: tool.ToolDecl,
+    outcome: ToolOutcome,
+};
+
+/// The security gate, shared verbatim by `Registry.invoke` (HTTP actions /
+/// model tool calls) and `RouteRegistry.invoke` (desktop IPC routes) — the
+/// two dispatch surfaces this subsystem promises feed *one* gate rather than
+/// two copies that can drift apart. This is the only place `policy.check`,
+/// `policy.claimToken`, and `policy.issueToken` are called, and the only
+/// place that calls `audit.record` for a call that doesn't reach execution.
+///
+/// Order matters: allowlist, then size, then risk, then confirmation. Nothing
+/// runs until every check has passed, and every path — including the
+/// refusals — is audited.
+fn gate(
+    comptime decls: []const tool.ToolDecl,
+    name: []const u8,
+    args_json: []const u8,
+    p: policy.Policy,
+    confirm_token: ?u64,
+) Gated {
+    const decl = findDecl(decls, name) orelse {
+        audit.record(name, .safe, .denied, args_json.len);
+        return .{ .outcome = .{ .err = "unknown tool" } };
+    };
+
+    switch (policy.check(p, decl, args_json)) {
+        .deny => |reason| {
+            audit.record(name, decl.risk, .denied, args_json.len);
+            return .{ .outcome = .{ .err = reason } };
+        },
+        .needs_confirmation => {
+            // A token only redeems the exact (name, args) it was
+            // issued for — see policy.claimToken. Minting happens
+            // here, not in `check`, and only when the caller doesn't
+            // already hold a valid token: otherwise an approved call
+            // would leave a second, unclaimed token behind in the
+            // table for no one to ever reap.
+            const approved = if (confirm_token) |t| policy.claimToken(t, name, args_json) else false;
+            if (!approved) {
+                // Distinguish "never asked" from "asked with a token
+                // that didn't match" — the latter is what a model
+                // spending one tool's approval on another looks
+                // like, and it must not be audited identically to a
+                // routine first-time prompt.
+                const outcome: audit.Outcome = if (confirm_token != null) .claim_rejected else .needs_confirmation;
+                const fresh = policy.issueToken(name, args_json) catch |err| {
+                    // Fail-closed either way: refuse rather than
+                    // evict some other pending approval to make
+                    // room, and refuse rather than mint a token from
+                    // an unseeded (predictable) generator.
+                    audit.record(name, decl.risk, .denied, args_json.len);
+                    return .{ .outcome = .{ .err = switch (err) {
+                        error.Unseeded => "confirmation token store is not initialized",
+                        error.TableFull => "too many pending confirmations",
+                    } } };
+                };
+                audit.record(name, decl.risk, outcome, args_json.len);
+                return .{ .outcome = .{ .needs_confirmation = fresh } };
+            }
+            // Approved: fall through to execute. Nothing is minted
+            // on this path, so the token just claimed is the only
+            // authorization this call ever held.
+        },
+        .allow => {},
+    }
+    return .{ .proceed = decl };
+}
+
+/// Post-execution half of the shared pipeline: audit the outcome, then
+/// encode/truncate the result. `result` folds together both ways a call can
+/// fail to produce a value — bad arguments (`action_invoke.Error.BadArgs`)
+/// and a failed action/handler (`action_invoke.Error.ActionFailed`) — into
+/// the same two messages `Registry.invoke` always returned, now shared with
+/// `RouteRegistry.invoke` too.
+fn finish(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    decl: tool.ToolDecl,
+    p: policy.Policy,
+    args_bytes: usize,
+    result: action_invoke.Error!action_invoke.InvokeResult,
+) ToolOutcome {
+    const res = result catch |err| {
+        audit.record(name, decl.risk, .failed, args_bytes);
+        return .{ .err = switch (err) {
+            action_invoke.Error.BadArgs => "invalid arguments for tool",
+            action_invoke.Error.ActionFailed => "tool execution failed",
+        } };
+    };
+    audit.record(name, decl.risk, .allowed, args_bytes);
+    const json = switch (res) {
+        .ok => "null",
+        .value_json => |v| v,
+    };
+    const capped = if (json.len > p.max_tool_result_bytes)
+        truncateResult(arena, json, p.max_tool_result_bytes)
+    else
+        json;
+    return .{ .ok = capped };
+}
+
+/// Build the tool table for `Actions` restricted to `decls`.
+///
+/// Every entry is validated at comptime: the function must exist, take exactly
+/// one struct argument, and every `arg_docs.field` must name a real field. A
+/// typo is a build failure, never a runtime surprise.
+pub fn Registry(comptime Actions: type, comptime decls: []const tool.ToolDecl) type {
+    comptime validate(Actions, decls);
+
+    return struct {
+        pub const actions = Actions;
+        pub const tool_decls = decls;
+
+        /// Anthropic-format tool array, built at comptime. Zero runtime cost.
+        pub const tools_json: []const u8 = blk: {
+            var out: []const u8 = "[";
+            for (decls, 0..) |d, i| {
+                if (i != 0) out = out ++ ",";
+                const ArgsT = action_invoke.ArgsOf(@field(Actions, d.fn_name));
+                out = out ++ "{\"name\":\"" ++ d.fn_name ++
+                    "\",\"description\":\"" ++ schema.escapeJson(d.description) ++
+                    "\",\"input_schema\":" ++ schema.jsonSchema(ArgsT, d.arg_docs) ++ "}";
+            }
+            break :blk out ++ "]";
+        };
+
+        /// Look up a declared tool by the name the model used. Returns null for
+        /// anything not on the allowlist — including real functions on
+        /// `Actions` that were simply never declared.
+        pub fn find(name: []const u8) ?tool.ToolDecl {
+            return findDecl(decls, name);
+        }
+
+        /// Execute a model-chosen tool call. See `gate` for the security
+        /// pipeline (allowlist → size → risk → confirmation → audit), shared
+        /// with `RouteRegistry.invoke`.
+        pub fn invoke(
+            arena: std.mem.Allocator,
+            name: []const u8,
+            args_json: []const u8,
+            p: policy.Policy,
+            confirm_token: ?u64,
+        ) ToolOutcome {
+            const decl = switch (gate(decls, name, args_json, p, confirm_token)) {
+                .outcome => |o| return o,
+                .proceed => |d| d,
+            };
+
+            inline for (decls) |d| {
+                if (std.mem.eql(u8, d.fn_name, name)) {
+                    const func = @field(Actions, d.fn_name);
+                    return finish(arena, name, decl, p, args_json.len, invokeAction(func, arena, args_json));
+                }
+            }
+            unreachable;
+        }
+    };
+}
+
+/// Parse + call one `Actions` function. Merges `action_invoke.parseJsonArgs`
+/// and `action_invoke.callAndSerialize` into the single `Error!InvokeResult`
+/// shape `finish` expects — the same shape `action_invoke.invokeRouteJson`
+/// already returns for the desktop-route side, so `finish` doesn't need to
+/// know which kind of callable it just ran.
+fn invokeAction(
+    comptime func: anytype,
+    arena: std.mem.Allocator,
+    args_json: []const u8,
+) action_invoke.Error!action_invoke.InvokeResult {
+    const ArgsT = action_invoke.ArgsOf(func);
+    // Strict parsing: an unknown key from a model means a hallucinated
+    // field, and a silently defaulted real one would run the wrong action
+    // with no error anywhere.
+    const args = try action_invoke.parseJsonArgs(ArgsT, arena, args_json, true);
+    return action_invoke.callAndSerialize(func, arena, args);
+}
+
+/// Build the dispatch table for desktop IPC routes restricted to `decls` —
+/// the sibling of `Registry` for the route shape (`Args`/`Reply`/
+/// `handle(ctx, alloc, args)`, see `action_invoke.invokeRouteJson`) that
+/// `src/desktop/ipc_router.zig` routes use. Dispatch itself can't be the
+/// literally same function as `Registry.invoke` (a route takes a `*Ctx` and
+/// returns `!Reply`, not a bare struct-arg function), but the
+/// security-relevant half — allowlist, policy, confirmation, audit — is:
+/// both `Registry.invoke` and `RouteRegistry.invoke` call `gate` and
+/// `finish` and nothing else touches `policy`/`audit` on the way to a
+/// result. That sharing is the point — a dangerous desktop IPC route gets
+/// exactly the same confirmation-token and audit guarantees a dangerous HTTP
+/// action does, from one implementation.
+pub fn RouteRegistry(comptime Routes: type, comptime Ctx: type, comptime decls: []const tool.ToolDecl) type {
+    comptime validateRoutes(Routes, decls);
+
+    return struct {
+        pub const routes = Routes;
+        pub const route_decls = decls;
+
+        /// Look up a declared route by name. Returns null for anything not
+        /// on the allowlist — including real routes on `Routes` that were
+        /// simply never declared here.
+        pub fn find(name: []const u8) ?tool.ToolDecl {
+            return findDecl(decls, name);
+        }
+
+        /// Execute a desktop-IPC-triggered route call through the same gate
+        /// `Registry.invoke` uses — see `gate` and the module doc comment.
+        pub fn invoke(
+            ctx: *Ctx,
+            arena: std.mem.Allocator,
+            name: []const u8,
+            args_json: []const u8,
+            p: policy.Policy,
+            confirm_token: ?u64,
+        ) ToolOutcome {
+            const decl = switch (gate(decls, name, args_json, p, confirm_token)) {
+                .outcome => |o| return o,
+                .proceed => |d| d,
+            };
+
+            inline for (decls) |d| {
+                if (std.mem.eql(u8, d.fn_name, name)) {
+                    const Route = @field(Routes, d.fn_name);
+                    return finish(
+                        arena,
+                        name,
+                        decl,
+                        p,
+                        args_json.len,
+                        action_invoke.invokeRouteJson(Route, ctx, arena, args_json, true),
+                    );
+                }
+            }
+            unreachable;
+        }
+    };
+}
+
+/// The wrapper with an empty `partial` — both the minimal fallback (below)
+/// and the yardstick used to budget how much of `json` can actually fit.
+const empty_wrapper = "{\"truncated\":true,\"partial\":\"\"}";
+
+/// Shrink an oversized JSON result into something shorter that still parses
+/// *and fits in `max_bytes`* — `Policy.max_tool_result_bytes` is documented
+/// as a cap, so the output has to actually respect it, not just be smaller
+/// than the untruncated original. A raw byte slice of a JSON value can leave
+/// a string unterminated and can split a multi-byte UTF-8 sequence — handing
+/// the model something it was told was well-formed JSON and isn't. Wraps a
+/// UTF-8-safe prefix of the original encoding in a small object instead.
+fn truncateResult(arena: std.mem.Allocator, json: []const u8, max_bytes: usize) []const u8 {
+    // The quantity that has to fit is the *escaped* length of the prefix, and
+    // that isn't known until the wrapper has been stringified — `json` is
+    // itself a JSON encoding, so a string result always opens with a `"` and
+    // any object or array result carries quoted keys, each of which grows on
+    // re-escape. Budgeting once against the un-escaped prefix therefore
+    // overflows for essentially every realistic payload. So: measure, and
+    // retry smaller. The first attempt reserves only the wrapper's own fixed
+    // characters — the best case, and exactly right for escape-free content
+    // like a numeric array. Each miss then shrinks the cut by its own
+    // measured overshoot, which is guaranteed to fit on the next attempt (see
+    // below), or halves it when the overshoot is as large as the cut itself.
+    // Either way the budget strictly decreases, so the loop terminates; in
+    // practice it runs once or twice.
+    var budget = max_bytes -| empty_wrapper.len;
+    while (budget > 0) {
+        const cut = utf8SafeCut(json, budget);
+        if (cut == 0) break;
+
+        var aw: Writer.Allocating = .init(arena);
+        std.json.Stringify.value(.{ .truncated = true, .partial = json[0..cut] }, .{}, &aw.writer) catch
+            break;
+        const out = aw.written();
+        if (out.len <= max_bytes) return out;
+
+        // Every prefix byte contributes at least one byte to the escaped
+        // output, so dropping `over` more prefix bytes drops at least `over`
+        // output bytes — cutting to `cut - over` therefore lands at or under
+        // the cap. When `over` is as big as the cut itself, subtracting it
+        // would leave nothing; halve instead, which still converges on a
+        // usable prefix for content that escapes to 2x or more.
+        const over = out.len - max_bytes;
+        budget = if (over < cut) cut - over else cut / 2;
+    }
+
+    // Floor, reached only for caps too small to hold the wrapper around any
+    // non-empty prefix at all. `max_bytes` this small is a degenerate policy
+    // value (the default is 16KiB) rather than a case worth a bigger ladder.
+    if (max_bytes >= empty_wrapper.len) return empty_wrapper;
+    if (max_bytes >= 4) return "null";
+    // `"0"` is the shortest valid JSON value there is: one byte. A cap below
+    // that is unsatisfiable rather than merely tight — no valid JSON value is
+    // the empty string — so this one case deliberately returns a byte over
+    // budget instead of returning something the model cannot parse.
+    return "0";
+}
+
+/// The largest prefix of `json` no longer than `max_bytes` that is still
+/// valid UTF-8 — so truncation never cuts a multi-byte codepoint in half.
+fn utf8SafeCut(json: []const u8, max_bytes: usize) usize {
+    var cut = @min(json.len, max_bytes);
+    while (cut > 0 and !std.unicode.utf8ValidateSlice(json[0..cut])) cut -= 1;
+    return cut;
+}
+
+fn validate(comptime Actions: type, comptime decls: []const tool.ToolDecl) void {
+    comptime {
+        for (decls) |d| {
+            if (!@hasDecl(Actions, d.fn_name)) {
+                @compileError("ai tool '" ++ d.fn_name ++ "' is not declared on " ++ @typeName(Actions));
+            }
+            const ArgsT = action_invoke.ArgsOf(@field(Actions, d.fn_name));
+            const fields = @typeInfo(ArgsT).@"struct".fields;
+            for (d.arg_docs) |doc| {
+                var found = false;
+                for (fields) |f| {
+                    if (std.mem.eql(u8, f.name, doc.field)) found = true;
+                }
+                if (!found) {
+                    @compileError("ai tool '" ++ d.fn_name ++ "' has no argument named '" ++ doc.field ++ "'");
+                }
+            }
+        }
+    }
+}
+
+/// `validate`'s equivalent for the route shape: the route must exist on
+/// `Routes` and declare an `Args` struct, and every `arg_docs.field` must
+/// name a real field on it. Same failure mode as `validate` — a typo is a
+/// compile error, never a runtime surprise.
+fn validateRoutes(comptime Routes: type, comptime decls: []const tool.ToolDecl) void {
+    comptime {
+        for (decls) |d| {
+            if (!@hasDecl(Routes, d.fn_name)) {
+                @compileError("ai route '" ++ d.fn_name ++ "' is not declared on " ++ @typeName(Routes));
+            }
+            const Route = @field(Routes, d.fn_name);
+            if (!@hasDecl(Route, "Args")) {
+                @compileError("ai route '" ++ d.fn_name ++ "' has no Args type");
+            }
+            const fields = @typeInfo(Route.Args).@"struct".fields;
+            for (d.arg_docs) |doc| {
+                var found = false;
+                for (fields) |f| {
+                    if (std.mem.eql(u8, f.name, doc.field)) found = true;
+                }
+                if (!found) {
+                    @compileError("ai route '" ++ d.fn_name ++ "' has no argument named '" ++ doc.field ++ "'");
+                }
+            }
+        }
+    }
+}
+
+// ---- tests ------------------------------------------------------------
+
+const TestActions = struct {
+    pub fn addTodo(args: struct { text: []const u8 }) !void {
+        _ = args;
+    }
+    pub fn getCount(_: struct {}) !i32 {
+        return 7;
+    }
+    pub fn secretWipe(_: struct {}) void {}
+};
+
+const test_decls: []const tool.ToolDecl = &.{
+    .{
+        .fn_name = "addTodo",
+        .description = "Append a todo item.",
+        .risk = .mutating,
+        .arg_docs = &.{.{ .field = "text", .description = "Item text." }},
+    },
+    .{ .fn_name = "getCount", .description = "Read the counter.", .risk = .safe },
+};
+
+const R = Registry(TestActions, test_decls);
+
+/// Seed `policy`'s token key deterministically for tests that exercise the
+/// confirmation path. Test files run independently of each other, so this
+/// can't assume `policy.zig`'s own tests have already seeded it.
+fn seedPolicyKey() void {
+    var k: [policy.KEY_LEN]u8 = undefined;
+    for (&k, 0..) |*b, i| b.* = @intCast(i);
+    policy.setKey(k);
+}
+
+test "registry: tools_json golden" {
+    try std.testing.expectEqualStrings(
+        \\[{"name":"addTodo","description":"Append a todo item.","input_schema":{"type":"object","properties":{"text":{"type":"string","description":"Item text."}},"required":["text"],"additionalProperties":false}},{"name":"getCount","description":"Read the counter.","input_schema":{"type":"object","properties":{},"required":[],"additionalProperties":false}}]
+    , R.tools_json);
+}
+
+test "registry: find returns declared tools" {
+    const d = R.find("addTodo").?;
+    try std.testing.expectEqual(tool.Risk.mutating, d.risk);
+    try std.testing.expectEqual(tool.Risk.safe, R.find("getCount").?.risk);
+}
+
+test "registry: undeclared action is not findable" {
+    // `secretWipe` exists on TestActions but is absent from the allowlist.
+    // Default-deny means it must be invisible here.
+    try std.testing.expect(R.find("secretWipe") == null);
+    try std.testing.expect(R.find("nope") == null);
+}
+
+test "registry: empty allowlist yields an empty array" {
+    const Empty = Registry(TestActions, &.{});
+    try std.testing.expectEqualStrings("[]", Empty.tools_json);
+}
+
+test "dispatch: allowed tool executes and returns JSON" {
+    policy.resetTokens();
+    audit.reset();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const out = R.invoke(arena.allocator(), "getCount", "{}", .{}, null);
+    try std.testing.expectEqualStrings("7", out.ok);
+    try std.testing.expectEqual(@as(usize, 1), audit.total());
+}
+
+test "dispatch: undeclared tool is refused without executing" {
+    audit.reset();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const out = R.invoke(arena.allocator(), "secretWipe", "{}", .{}, null);
+    try std.testing.expect(out == .err);
+    try std.testing.expectEqualStrings("unknown tool", out.err);
+}
+
+test "dispatch: hallucinated argument name is an error, not a default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const out = R.invoke(arena.allocator(), "addTodo", "{\"txt\":\"x\"}", .{}, null);
+    try std.testing.expect(out == .err);
+}
+
+test "dispatch: dangerous tool needs a token, then runs once" {
+    policy.resetTokens();
+    seedPolicyKey();
+    const DangerActions = struct {
+        pub var ran: u32 = 0;
+        pub var nuked: u32 = 0;
+        pub fn wipe(_: struct {}) void {
+            ran += 1;
+        }
+        pub fn nuke(_: struct {}) void {
+            nuked += 1;
+        }
+    };
+    const DR = Registry(DangerActions, &.{
+        .{ .fn_name = "wipe", .description = "Delete everything.", .risk = .dangerous },
+        .{ .fn_name = "nuke", .description = "Delete everything else.", .risk = .dangerous },
+    });
+    const p: policy.Policy = .{ .allow_risk = .dangerous };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const first = DR.invoke(arena.allocator(), "wipe", "{}", p, null);
+    try std.testing.expect(first == .needs_confirmation);
+    try std.testing.expectEqual(@as(u32, 0), DangerActions.ran);
+
+    const token = first.needs_confirmation;
+
+    // A token issued for "wipe" must not authorise a different dangerous
+    // tool, even one also awaiting confirmation.
+    const wrong_tool = DR.invoke(arena.allocator(), "nuke", "{}", p, token);
+    try std.testing.expect(wrong_tool == .needs_confirmation);
+    try std.testing.expectEqual(@as(u32, 0), DangerActions.nuked);
+
+    // That mismatched attempt must not have spent the token — "wipe" with
+    // the arguments it was actually issued for still runs.
+    const second = DR.invoke(arena.allocator(), "wipe", "{}", p, token);
+    try std.testing.expect(second == .ok);
+    try std.testing.expectEqual(@as(u32, 1), DangerActions.ran);
+
+    // Replaying the same token must not run it again.
+    const third = DR.invoke(arena.allocator(), "wipe", "{}", p, token);
+    try std.testing.expect(third == .needs_confirmation);
+    try std.testing.expectEqual(@as(u32, 1), DangerActions.ran);
+}
+
+test "dispatch: oversized results are truncated into a still-valid JSON value that fits the budget" {
+    const BigActions = struct {
+        pub fn big(_: struct {}) []const u8 {
+            // 100 characters, so the 102-byte JSON encoding is well over the
+            // 60-byte cap below and truncation definitely runs. The encoding
+            // opens with a `"` — an escape-expanding byte — which is what
+            // makes this the case a one-shot, un-escaped byte budget gets
+            // wrong (it overflows, then collapses to an empty partial).
+            return "0123456789" ** 10;
+        }
+    };
+    const BR = Registry(BigActions, &.{
+        .{ .fn_name = "big", .description = "Big.", .risk = .safe },
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const out = BR.invoke(arena.allocator(), "big", "{}", .{ .max_tool_result_bytes = 60 }, null);
+    try std.testing.expect(out == .ok);
+
+    // `max_tool_result_bytes` is documented as a cap — the output must
+    // actually respect it, not just be shorter than the untruncated value.
+    try std.testing.expect(out.ok.len <= 60);
+
+    // The model must be handed something it can actually parse, not a raw
+    // byte-sliced fragment (a naive slice would be an unterminated string).
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), out.ok, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+
+    // The whole point of the wrapper is to hand the model a usable prefix of
+    // the real result. A cap this far above the 31-byte wrapper must yield a
+    // substantial `partial`, not an empty one — an empty partial here means
+    // the budget arithmetic overflowed and the fallback ladder ate the
+    // content, which is exactly the regression this pins.
+    const partial = parsed.value.object.get("partial").?.string;
+    try std.testing.expect(partial.len >= 20);
+    try std.testing.expect(std.mem.startsWith(u8, partial, "\"0123456789"));
+}
+
+test "dispatch: a truncated result fits its budget even when re-escaping would expand it" {
+    const QuoteActions = struct {
+        pub fn quotes(_: struct {}) []const u8 {
+            // All double-quotes: worst case for escaping expansion. Each is
+            // already escaped once by the initial JSON encoding (`"` → `\"`)
+            // and would be escaped *again* if a raw prefix were stuffed
+            // unescaped into a wrapper string — exactly the failure mode
+            // `max_tool_result_bytes` has to survive.
+            return "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"";
+        }
+    };
+    const QR = Registry(QuoteActions, &.{
+        .{ .fn_name = "quotes", .description = "Quotes.", .risk = .safe },
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const out = QR.invoke(arena.allocator(), "quotes", "{}", .{ .max_tool_result_bytes = 40 }, null);
+    try std.testing.expect(out == .ok);
+    try std.testing.expect(out.ok.len <= 40);
+
+    // A cap this tight against content that escapes to ~2x may legitimately
+    // land on a short partial or, for a smaller cap, on one of the floor
+    // tiers — that tradeoff is the point of this test, so the shape is not
+    // pinned here (the non-empty property is pinned by the two tests either
+    // side of this one). What must hold regardless: it fits, and it parses.
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), out.ok, .{});
+    defer parsed.deinit();
+}
+
+test "dispatch: a realistic oversized object result keeps most of its budget as content" {
+    const RowActions = struct {
+        const Row = struct { id: u32, name: []const u8, note: []const u8 };
+        pub fn rows(_: struct {}) []const Row {
+            // The shape a real tool returns: an array of records. Its JSON
+            // encoding is ~1.2KB and is dense with quoted keys and quoted
+            // string values, so nearly every byte of any prefix re-escapes
+            // to two — the case a single un-escaped byte budget silently
+            // turned into an empty partial.
+            const table = [_]Row{.{
+                .id = 1,
+                .name = "widget-alpha",
+                .note = "a reasonably wordy note field, as tool results tend to have",
+            }} ** 12;
+            return &table;
+        }
+    };
+    const RR = Registry(RowActions, &.{
+        .{ .fn_name = "rows", .description = "Rows.", .risk = .safe },
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const out = RR.invoke(arena.allocator(), "rows", "{}", .{ .max_tool_result_bytes = 512 }, null);
+    try std.testing.expect(out == .ok);
+    try std.testing.expect(out.ok.len <= 512);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), out.ok, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+
+    // A truncated reply that spends its whole budget on the wrapper is
+    // useless to the model. At a 512-byte cap the content must dominate:
+    // most of the budget is real prefix, and it starts where the original
+    // encoding starts.
+    const partial = parsed.value.object.get("partial").?.string;
+    try std.testing.expect(partial.len >= 400);
+    try std.testing.expect(std.mem.startsWith(u8, partial, "[{\"id\":1,\"name\":\"widget-alpha\""));
+}
+
+test "dispatch: an approved confirmation leaves no live token behind" {
+    policy.resetTokens();
+    seedPolicyKey();
+    const DangerActions = struct {
+        pub var ran: u32 = 0;
+        pub fn wipe(_: struct {}) void {
+            ran += 1;
+        }
+    };
+    const DR = Registry(DangerActions, &.{
+        .{ .fn_name = "wipe", .description = "Delete everything.", .risk = .dangerous },
+    });
+    const p: policy.Policy = .{ .allow_risk = .dangerous };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const first = DR.invoke(arena.allocator(), "wipe", "{}", p, null);
+    const token = first.needs_confirmation;
+    const approved = DR.invoke(arena.allocator(), "wipe", "{}", p, token);
+    try std.testing.expect(approved == .ok);
+    try std.testing.expectEqual(@as(u32, 1), DangerActions.ran);
+
+    // The approved claim must not have left a second, still-live token
+    // bound to this call sitting in the table (the leftover-authorization
+    // bug this fixes) — fill every remaining slot with distinct calls and
+    // confirm the table has its full capacity available, not
+    // `token_cap - 1`.
+    var i: usize = 0;
+    while (i < policy.token_cap) : (i += 1) {
+        var buf: [24]u8 = undefined;
+        const args = std.fmt.bufPrint(&buf, "{{\"n\":{d}}}", .{i}) catch unreachable;
+        _ = try policy.issueToken("filler", args);
+    }
+    try std.testing.expectError(policy.IssueError.TableFull, policy.issueToken("filler", "{}"));
+    policy.resetTokens();
+}
+
+test "dispatch: a full confirmation table is refused, not silently evicted" {
+    policy.resetTokens();
+    seedPolicyKey();
+    const DangerActions = struct {
+        pub fn wipe(_: struct {}) void {}
+    };
+    const DR = Registry(DangerActions, &.{
+        .{ .fn_name = "wipe", .description = "Delete everything.", .risk = .dangerous },
+    });
+    const p: policy.Policy = .{ .allow_risk = .dangerous };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var i: usize = 0;
+    while (i < policy.token_cap) : (i += 1) {
+        var buf: [24]u8 = undefined;
+        const args = std.fmt.bufPrint(&buf, "{{\"n\":{d}}}", .{i}) catch unreachable;
+        _ = try policy.issueToken("other", args);
+    }
+    const out = DR.invoke(arena.allocator(), "wipe", "{}", p, null);
+    try std.testing.expect(out == .err);
+    try std.testing.expectEqualStrings("too many pending confirmations", out.err);
+    policy.resetTokens();
+}
+
+test "dispatch: a rejected confirmation token is audited distinctly from a first-time ask" {
+    policy.resetTokens();
+    seedPolicyKey();
+    audit.reset();
+    const DangerActions = struct {
+        pub fn wipe(_: struct {}) void {}
+        pub fn nuke(_: struct {}) void {}
+    };
+    const DR = Registry(DangerActions, &.{
+        .{ .fn_name = "wipe", .description = "Delete everything.", .risk = .dangerous },
+        .{ .fn_name = "nuke", .description = "Delete everything else.", .risk = .dangerous },
+    });
+    const p: policy.Policy = .{ .allow_risk = .dangerous };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A routine first-time ask.
+    const first = DR.invoke(arena.allocator(), "wipe", "{}", p, null);
+    try std.testing.expect(first == .needs_confirmation);
+    const token = first.needs_confirmation;
+
+    // The same token, redeemed against a different tool — this is the
+    // attack the (tool, args) binding exists to stop, and it must not read
+    // the same in the audit trail as the routine ask above.
+    const wrong = DR.invoke(arena.allocator(), "nuke", "{}", p, token);
+    try std.testing.expect(wrong == .needs_confirmation);
+
+    var buf: [4]audit.Record = undefined;
+    const got = audit.recent(&buf);
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    try std.testing.expectEqual(audit.Outcome.needs_confirmation, got[0].outcome);
+    try std.testing.expectEqual(audit.Outcome.claim_rejected, got[1].outcome);
+
+    policy.resetTokens();
+    audit.reset();
+}
+
+// ---- RouteRegistry tests -----------------------------------------------
+//
+// Desktop IPC routes have a different declaration shape than HTTP/model
+// actions (`Args`/`Reply`/`handle(ctx, alloc, args)` — see
+// `src/desktop/ipc_router.zig`), so `RouteRegistry` is a distinct comptime
+// type from `Registry`. What these tests pin is that it is gated by the
+// *same* `policy`/`audit` machinery, not a second copy of it.
+
+const RouteCtx = struct { pings: u32 = 0 };
+
+const TestRoutes = struct {
+    pub const ping = struct {
+        pub const Args = struct {};
+        pub const Reply = struct { ok: bool };
+        pub fn handle(ctx: *RouteCtx, _: std.mem.Allocator, _: Args) !Reply {
+            ctx.pings += 1;
+            return .{ .ok = true };
+        }
+    };
+};
+
+const route_test_decls: []const tool.ToolDecl = &.{
+    .{ .fn_name = "ping", .description = "Ping the desktop host.", .risk = .safe },
+};
+
+const RR2 = RouteRegistry(TestRoutes, RouteCtx, route_test_decls);
+
+test "route dispatch: a declared route executes and is audited" {
+    audit.reset();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: RouteCtx = .{};
+
+    const out = RR2.invoke(&ctx, arena.allocator(), "ping", "{}", .{}, null);
+    try std.testing.expectEqualStrings("{\"ok\":true}", out.ok);
+    try std.testing.expectEqual(@as(u32, 1), ctx.pings);
+    try std.testing.expectEqual(@as(usize, 1), audit.total());
+
+    var buf: [1]audit.Record = undefined;
+    const got = audit.recent(&buf);
+    try std.testing.expectEqualStrings("ping", got[0].name());
+    try std.testing.expectEqual(audit.Outcome.allowed, got[0].outcome);
+}
+
+test "route dispatch: an undeclared route is refused without executing" {
+    audit.reset();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: RouteCtx = .{};
+
+    // `nuke` exists nowhere on TestRoutes at all — same "unknown tool"
+    // refusal path as an undeclared HTTP action.
+    const out = RR2.invoke(&ctx, arena.allocator(), "nuke", "{}", .{}, null);
+    try std.testing.expect(out == .err);
+    try std.testing.expectEqualStrings("unknown tool", out.err);
+    try std.testing.expectEqual(@as(u32, 0), ctx.pings);
+}
+
+test "route dispatch: a dangerous route shares the exact confirmation-token gate as an HTTP action" {
+    // Proves the sharing, not just the shape: a token minted for an HTTP
+    // action's dangerous call must not authorise a desktop route (and vice
+    // versa isn't reachable — a route's own token is what's tested here),
+    // and RouteRegistry.invoke drives the identical policy.issueToken /
+    // policy.claimToken / audit.record calls Registry.invoke does.
+    policy.resetTokens();
+    seedPolicyKey();
+    audit.reset();
+
+    const DangerRoutes = struct {
+        pub const wipe = struct {
+            pub var ran: u32 = 0;
+            pub const Args = struct {};
+            pub const Reply = struct {};
+            pub fn handle(_: *RouteCtx, _: std.mem.Allocator, _: Args) !Reply {
+                ran += 1;
+                return .{};
+            }
+        };
+    };
+    const DRR = RouteRegistry(DangerRoutes, RouteCtx, &.{
+        .{ .fn_name = "wipe", .description = "Delete everything.", .risk = .dangerous },
+    });
+    const p: policy.Policy = .{ .allow_risk = .dangerous };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: RouteCtx = .{};
+
+    const first = DRR.invoke(&ctx, arena.allocator(), "wipe", "{}", p, null);
+    try std.testing.expect(first == .needs_confirmation);
+    try std.testing.expectEqual(@as(u32, 0), DangerRoutes.wipe.ran);
+
+    const token = first.needs_confirmation;
+    const approved = DRR.invoke(&ctx, arena.allocator(), "wipe", "{}", p, token);
+    try std.testing.expect(approved == .ok);
+    try std.testing.expectEqual(@as(u32, 1), DangerRoutes.wipe.ran);
+
+    // Replaying the same token must not run it again — the same single-use
+    // guarantee `policy.claimToken` gives every dangerous HTTP action.
+    const third = DRR.invoke(&ctx, arena.allocator(), "wipe", "{}", p, token);
+    try std.testing.expect(third == .needs_confirmation);
+    try std.testing.expectEqual(@as(u32, 1), DangerRoutes.wipe.ran);
+
+    policy.resetTokens();
+    audit.reset();
+}

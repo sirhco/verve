@@ -14,11 +14,17 @@ pub fn build(b: *std.Build) void {
     // at compile time. Served at verve://app/<path> by the asset router.
     const public_assets_mod = buildPublicAssets(b, "frontend");
 
-    // The desktop platform layer is vendored at scaffold time.
+    // The desktop platform layer is vendored at scaffold time. `verve` is
+    // wired in by name (not reachable by relative import — it's outside
+    // this module's root subtree) for `ai_cli.zig`'s `verve.ai.Provider`/
+    // `Message` vocabulary.
     const desktop_mod = b.createModule(.{
         .root_source_file = b.path("src/desktop/window.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "verve", .module = verve_mod },
+        },
     });
 
     const exe_mod = b.createModule(.{
@@ -100,8 +106,7 @@ pub fn build(b: *std.Build) void {
             b.getInstallStep().dependOn(&install_loader.step);
         },
         .linux => {
-            const use_gtk4 = b.option(bool, "gtk4",
-                "Use GTK4 + WebKitGTK 6.0 instead of GTK3 + WebKitGTK 4.1") orelse false;
+            const use_gtk4 = b.option(bool, "gtk4", "Use GTK4 + WebKitGTK 6.0 instead of GTK3 + WebKitGTK 4.1") orelse false;
             if (use_gtk4) {
                 desktop_mod.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
                 desktop_mod.linkSystemLibrary("webkitgtk-6.0", .{ .use_pkg_config = .force });

@@ -10,6 +10,7 @@ pub const islands = @import("islands.zig");
 pub const routes_mod = @import("routes.zig");
 pub const Route = routes_mod.Route;
 pub const routes = routes_mod.routes;
+pub const ai = @import("ai.zig");
 
 const log = std.log.scoped(.verve);
 
@@ -136,6 +137,57 @@ pub fn vizAdvanceTick(buf: []u8) ?[]const u8 {
 threadlocal var tl_nodes: [8]VizNode = undefined;
 threadlocal var tl_edges: [8]VizEdge = undefined;
 
+// ---- AI chat demo (Task 8) -------------------------------------------
+
+/// System prompt for the `/ai-chat` demo's agent turns.
+const ai_system =
+    \\You help the user manage a todo list and a counter in this demo app.
+    \\Use the provided tools rather than guessing at state. Keep replies short.
+;
+
+/// Sourced from `anthropic.Client`'s own default field, not restated as a
+/// second literal — Task 6's fix round made `Client.model` the one place
+/// this app's default model name lives (`provider.Request.model` is `null`
+/// by default precisely so callers don't have to repeat it). Used for both
+/// the live and the mock provider, so a script that doesn't care what model
+/// string it's handed (`MockProvider.complete` ignores `req.model`) still
+/// reads as "whatever this app's default model is," not a hardcoded guess.
+const default_ai_model: []const u8 = (verve.ai.anthropic.Client{}).model;
+
+/// Scripted turns for the CI integration test and any offline run of the
+/// demo: one tool call, then a summary. Selected by `ai.mockEnabled()`
+/// (`VERVE_AI_MOCK` in the captured environment) instead of a live
+/// Anthropic call — no API key, no network, deterministic reply.
+const mock_turns = [_]verve.ai.message.Response{
+    .{
+        .stop_reason = .tool_use,
+        .blocks = &.{.{ .tool_use = .{ .id = "toolu_mock1", .name = "getCount", .input_json = "{}" } }},
+    },
+    .{
+        .stop_reason = .end_turn,
+        .blocks = &.{.{ .text = "The counter is available via getCount." }},
+    },
+};
+
+/// Threadlocal scratch for `aiChat`'s reply text. The api_handler
+/// serializes the return value on this same request thread immediately
+/// after `Actions.aiChat` returns (see `tl_nodes`/`tl_edges` above for the
+/// identical pattern) — no allocator, no cross-thread race, and nothing to
+/// free. A `page_allocator.dupe` here would leak: nothing on this path ever
+/// frees a server-action return value.
+const AI_REPLY_MAX = 4096;
+threadlocal var tl_ai_reply: [AI_REPLY_MAX]u8 = undefined;
+
+/// Largest prefix of `text` no longer than `max` that doesn't split a
+/// multi-byte UTF-8 codepoint. Mirrors `core/ai/registry.zig`'s internal
+/// `utf8SafeCut` (not exported, and small enough not to be worth exporting
+/// just for this one call site).
+fn utf8SafeCut(text: []const u8, max: usize) usize {
+    var cut = @min(text.len, max);
+    while (cut > 0 and !std.unicode.utf8ValidateSlice(text[0..cut])) cut -= 1;
+    return cut;
+}
+
 pub const Actions = struct {
     /// Current graph snapshot for the live-data demo, seq-stamped. Pure read:
     /// the model only changes when the publisher loop ticks it (which it does
@@ -212,6 +264,63 @@ pub const Actions = struct {
         todo_lens[todo_count] = 0;
         log.info("removeTodo: idx={d}", .{args.index});
     }
+
+    /// Run one agent turn over this app's tool allowlist (`ai.tools`).
+    ///
+    /// Synchronous on the request thread — non-streaming, bounded by
+    /// `Policy.max_steps`. Streaming turns need the push hub and belong to a
+    /// later cluster.
+    ///
+    /// Security: no API key and no confirmation token ever appear in the
+    /// return value. `verve.ai.run` never lets a confirmation token reach
+    /// the provider (see `core/ai/agent.zig`'s module doc comment), and
+    /// this demo's allowlist declares nothing `.dangerous`, so no token is
+    /// ever minted on this path in the first place. `anthropic.Client`
+    /// never logs or echoes the API key (see `resolveApiKey`); on failure
+    /// this function only ever returns/propagates an error *name*.
+    pub fn aiChat(args: struct { prompt: []const u8 }) ![]const u8 {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const Reg = verve.ai.Registry(Actions, ai.tools);
+        const p: verve.ai.Policy = .{ .max_steps = 6 };
+
+        var convo: std.ArrayList(verve.ai.Message) = .empty;
+        try convo.append(a, .{
+            .role = .user,
+            .blocks = &.{.{ .text = args.prompt }},
+        });
+
+        // VERVE_AI_MOCK selects the scripted MockProvider instead of a live
+        // Anthropic call — the whole point is letting the integration suite
+        // exercise this route with no API key and no network. See
+        // ai.mockEnabled and src/server/main.zig's initEnviron call.
+        const outcome = if (ai.mockEnabled()) blk: {
+            var mock: verve.ai.MockProvider = .{ .turns = &mock_turns };
+            break :blk try verve.ai.run(a, mock.provider(), Reg, p, &convo, ai_system, default_ai_model);
+        } else blk: {
+            var client: verve.ai.anthropic.Client = .{};
+            break :blk try verve.ai.run(a, client.provider(), Reg, p, &convo, ai_system, default_ai_model);
+        };
+
+        if (outcome.stopped == .refusal) return "The model declined this request.";
+
+        const text = outcome.text;
+        if (text.len <= tl_ai_reply.len) {
+            @memcpy(tl_ai_reply[0..text.len], text);
+            return tl_ai_reply[0..text.len];
+        }
+
+        // Reply exceeds the fixed scratch buffer: truncate explicitly with
+        // a visible marker rather than silently (see tl_ai_reply's doc
+        // comment for why this isn't a page_allocator.dupe instead).
+        const marker = " [truncated]";
+        const room = utf8SafeCut(text, tl_ai_reply.len - marker.len);
+        @memcpy(tl_ai_reply[0..room], text[0..room]);
+        @memcpy(tl_ai_reply[room .. room + marker.len], marker);
+        return tl_ai_reply[0 .. room + marker.len];
+    }
 };
 
 test "vizGraph snapshots are stable and edge endpoints resolve" {
@@ -268,10 +377,11 @@ test "vizAdvanceTick emits seq-ordered deltas that transform the snapshot" {
     try std.testing.expectEqual(before_n, wrapped.nodes.len);
 }
 
-// Pull viz_data and viz_live tests into the app test suite.
+// Pull viz_data, viz_live, and ai tests into the app test suite.
 test {
     _ = @import("viz_data.zig");
     _ = @import("viz_live.zig");
+    _ = @import("ai.zig");
 }
 
 // ---------------------------------------------------------------------------

@@ -1124,6 +1124,13 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        // `ai_cli.zig` builds a `provider.Provider` against `core/ai`'s
+        // `message.zig`/`provider.zig` types — a module rooted at
+        // `src/desktop/` cannot reach `src/core/` via a relative `../`
+        // import (Zig 0.16 confines an import to the module's own root
+        // subtree), so it goes through the `verve` module by name instead,
+        // same as `i18n_it_mod` below does for its own separate artifact.
+        desktop_test_mod.addImport("verve", verve_mod);
         // power.zig + single_instance.zig use extern "c" symbols (flock,
         // getenv, CoreFoundation / IOKit). Link libc on both macOS and
         // Linux so the test binary resolves them; Windows path uses

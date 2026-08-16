@@ -239,8 +239,15 @@ pub const Context = struct {
     /// freed at end of render. Wasm-client builds return
     /// `error.UnsupportedOnClient` — use a Server Function (Phase 3+)
     /// for client-side outbound work.
+    ///
+    /// Threads `self.io` (the server-supplied `Io`, when present) through
+    /// automatically unless `opts` already specifies one — route code gets
+    /// the request's own `Io` for free rather than falling back to
+    /// `fetch.zig`'s process-lifetime default.
     pub fn fetch(self: *const Context, url: []const u8, opts: fetch_mod.FetchOptions) !fetch_mod.FetchResponse {
-        return fetch_mod.fetch(self.allocator, url, opts);
+        var merged = opts;
+        if (merged.io == null) merged.io = self.io;
+        return fetch_mod.fetch(self.allocator, url, merged);
     }
 
     /// Direct-call a Server Function from a render. The function must
