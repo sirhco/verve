@@ -20,6 +20,7 @@ pub const policy = @import("policy.zig");
 pub const Message = @import("message.zig").Message;
 pub const Provider = @import("provider.zig").Provider;
 pub const MockProvider = @import("mock_provider.zig").MockProvider;
+pub const anthropic = @import("anthropic.zig");
 pub const run = @import("agent.zig").run;
 
 test {
@@ -31,5 +32,6 @@ test {
     _ = @import("message.zig");
     _ = @import("provider.zig");
     _ = @import("mock_provider.zig");
+    _ = @import("anthropic.zig");
     _ = @import("agent.zig");
 }

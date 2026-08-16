@@ -107,6 +107,13 @@ pub fn main(init: std.process.Init) !void {
     // entropy source. Unseeded, `verve.ai`'s dangerous-tool path fails
     // closed (IssueError.Unseeded) rather than minting a predictable token.
     verve.ai.policy.initRandom(io);
+
+    // Hand the real process environment to the Anthropic provider so its
+    // `ANTHROPIC_API_KEY` fallback can find it. Zig 0.16 has no ambient
+    // getenv — `init.environ_map` is the one live capture of it, made once
+    // here at the true process entry point (mirrors `std.testing.environ`,
+    // which the Zig test runner populates the same way).
+    verve.ai.anthropic.initEnviron(init.environ_map);
     printStartupBanner(cli);
 
     // Live-graph publisher (opt-in: only when the app declares
