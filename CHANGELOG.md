@@ -4,6 +4,33 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.51.1] - 2026-08-16
+
+### Fixed
+
+- **`desktop.process.runCapture` reported every failure as `SpawnFailed`.** The
+  `std.process.run` call mapped its whole error set through a single
+  `catch return error.SpawnFailed`, so a child that spawned and ran perfectly but
+  wrote more than the 1 MiB per-stream cap came back as a spawn failure — pointing
+  a reader at `PATH` and permissions for what is actually a size problem. The two
+  have opposite fixes, so they are now distinct: `Error.OutputTooLarge` for
+  `error.StreamTooLong`, `SpawnFailed` only for a real spawn failure. `Error` gains
+  the `OutputTooLarge` variant (relevant to exhaustive switches), and the 1 MiB cap
+  is now the named `process.output_limit_bytes` rather than a repeated literal.
+- **`desktop.ai_cli.Client.complete` inherited the same mislabel**, so an oversized
+  Claude Code response surfaced as `CliSpawnFailed`. It now returns
+  `error.CliOutputTooLarge`; `CliSpawnFailed` still means what it says.
+- **`runCapture`'s doc comment was wrong.** It claimed each stream "caps at
+  `max_output_bytes` (default 1 MiB) before being truncated". There is no
+  `max_output_bytes` option, and output is never truncated — exceeding the cap is an
+  error, and the caller gets no partial output, because a JSON payload cut in half
+  is worse than no payload.
+
+Found by driving `Client.complete` against a fake `claude` on `PATH` that violates
+the CLI contract six different ways — the technique also confirmed the five paths
+that were already correct (`CliReportedError`, `CliFailed`, `InvalidCliOutput` for
+both malformed JSON and a missing `result` key, and the happy path).
+
 ## [0.51.0] - 2026-08-16
 
 ### Added

@@ -76,7 +76,14 @@ pub const Client = struct {
         var argv_buf: [4][]const u8 = undefined;
         const argv = buildArgv(&argv_buf, self.binary, prompt);
 
-        const result = process.runCapture(arena, self.io, argv) catch return error.CliSpawnFailed;
+        const result = process.runCapture(arena, self.io, argv) catch |err| switch (err) {
+            // The CLI ran and answered; the answer was simply bigger than
+            // `process.output_limit_bytes`. Kept distinct from
+            // `CliSpawnFailed` because the two have opposite fixes: one means
+            // "`claude` isn't on PATH", the other means "ask for less output".
+            error.OutputTooLarge => return error.CliOutputTooLarge,
+            else => return error.CliSpawnFailed,
+        };
         if (result.code != 0) {
             // stderr can echo the prompt (and whatever the model produced)
             // back verbatim — log only the exit code, same stance
