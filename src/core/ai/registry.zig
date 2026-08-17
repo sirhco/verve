@@ -60,13 +60,13 @@ fn gate(
     confirm_token: ?u64,
 ) Gated {
     const decl = findDecl(decls, name) orelse {
-        audit.record(name, .safe, .denied, args_json.len);
+        audit.recordArgs(name, .safe, .denied, args_json);
         return .{ .outcome = .{ .err = "unknown tool" } };
     };
 
     switch (policy.check(p, decl, args_json)) {
         .deny => |reason| {
-            audit.record(name, decl.risk, .denied, args_json.len);
+            audit.recordArgs(name, decl.risk, .denied, args_json);
             return .{ .outcome = .{ .err = reason } };
         },
         .needs_confirmation => {
@@ -89,13 +89,13 @@ fn gate(
                     // evict some other pending approval to make
                     // room, and refuse rather than mint a token from
                     // an unseeded (predictable) generator.
-                    audit.record(name, decl.risk, .denied, args_json.len);
+                    audit.recordArgs(name, decl.risk, .denied, args_json);
                     return .{ .outcome = .{ .err = switch (err) {
                         error.Unseeded => "confirmation token store is not initialized",
                         error.TableFull => "too many pending confirmations",
                     } } };
                 };
-                audit.record(name, decl.risk, outcome, args_json.len);
+                audit.recordArgs(name, decl.risk, outcome, args_json);
                 return .{ .outcome = .{ .needs_confirmation = fresh } };
             }
             // Approved: fall through to execute. Nothing is minted
@@ -118,17 +118,17 @@ fn finish(
     name: []const u8,
     decl: tool.ToolDecl,
     p: policy.Policy,
-    args_bytes: usize,
+    args_json: []const u8,
     result: action_invoke.Error!action_invoke.InvokeResult,
 ) ToolOutcome {
     const res = result catch |err| {
-        audit.record(name, decl.risk, .failed, args_bytes);
+        audit.recordArgs(name, decl.risk, .failed, args_json);
         return .{ .err = switch (err) {
             action_invoke.Error.BadArgs => "invalid arguments for tool",
             action_invoke.Error.ActionFailed => "tool execution failed",
         } };
     };
-    audit.record(name, decl.risk, .allowed, args_bytes);
+    audit.recordArgs(name, decl.risk, .allowed, args_json);
     const json = switch (res) {
         .ok => "null",
         .value_json => |v| v,
@@ -190,7 +190,7 @@ pub fn Registry(comptime Actions: type, comptime decls: []const tool.ToolDecl) t
             inline for (decls) |d| {
                 if (std.mem.eql(u8, d.fn_name, name)) {
                     const func = @field(Actions, d.fn_name);
-                    return finish(arena, name, decl, p, args_json.len, invokeAction(func, arena, args_json));
+                    return finish(arena, name, decl, p, args_json, invokeAction(func, arena, args_json));
                 }
             }
             unreachable;
@@ -265,7 +265,7 @@ pub fn RouteRegistry(comptime Routes: type, comptime Ctx: type, comptime decls: 
                         name,
                         decl,
                         p,
-                        args_json.len,
+                        args_json,
                         action_invoke.invokeRouteJson(Route, ctx, arena, args_json, true),
                     );
                 }

@@ -19,6 +19,22 @@ pub const Record = struct {
     risk: tool.Risk = .safe,
     outcome: Outcome = .allowed,
     args_bytes: usize = 0,
+    /// Monotonic call counter, assigned before the ring wraps. Lets a reader
+    /// see that entries were evicted — a gap in `seq` across `recent` — where
+    /// the ring alone always looks like a full, complete window.
+    seq: u64 = 0,
+    /// Hash of the exact argument payload. Records *which* arguments ran
+    /// without storing unbounded, attacker-controlled bytes, so the ring stays
+    /// fixed-size and allocator-free. Two calls to the same tool with the same
+    /// `args_bytes` are otherwise indistinguishable in this record, and
+    /// "which arguments were executed" is the question a reader most needs
+    /// answered.
+    ///
+    /// A correlation aid, deliberately NOT a security commitment: unkeyed and
+    /// therefore forgeable by anyone who can compute it. `policy.bindingOf` is
+    /// the keyed hash, because that one gates execution; this one only labels
+    /// a log line.
+    args_hash: u64 = 0,
 
     pub fn name(self: *const Record) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -34,7 +50,21 @@ fn lock() void {
     while (!mu.tryLock()) std.atomic.spinLoopHint();
 }
 
+/// Record a call, deriving both `args_bytes` and `args_hash` from the payload.
+/// Preferred over `record` wherever the argument JSON is in hand — which is
+/// every dispatch path through `registry.gate` / `registry.finish`.
+pub fn recordArgs(name: []const u8, risk: tool.Risk, outcome: Outcome, args_json: []const u8) void {
+    recordFull(name, risk, outcome, args_json.len, std.hash.Wyhash.hash(0, args_json));
+}
+
+/// Record a call whose argument payload isn't available — only its length.
+/// Leaves `args_hash` zero. Retained for callers outside the dispatch paths;
+/// prefer `recordArgs`.
 pub fn record(name: []const u8, risk: tool.Risk, outcome: Outcome, args_bytes: usize) void {
+    recordFull(name, risk, outcome, args_bytes, 0);
+}
+
+fn recordFull(name: []const u8, risk: tool.Risk, outcome: Outcome, args_bytes: usize, args_hash: u64) void {
     lock();
     defer mu.unlock();
     const slot = &ring[count % cap];
@@ -51,11 +81,15 @@ pub fn record(name: []const u8, risk: tool.Risk, outcome: Outcome, args_bytes: u
     slot.risk = risk;
     slot.outcome = outcome;
     slot.args_bytes = args_bytes;
+    slot.args_hash = args_hash;
+    // Assigned before the bump, so the first call is seq 0 and `seq` indexes
+    // calls rather than counting them.
+    slot.seq = count;
     count += 1;
     // Log the sanitized, length-capped copy — never the raw `name` — so a
     // single refusal can't write unbounded or forged content to the host log.
-    std.log.scoped(.verve_ai).info("tool {s} risk={s} outcome={s} args={d}B", .{
-        slot.name(), @tagName(risk), @tagName(outcome), args_bytes,
+    std.log.scoped(.verve_ai).info("tool {s} risk={s} outcome={s} args={d}B hash={x} seq={d}", .{
+        slot.name(), @tagName(risk), @tagName(outcome), args_bytes, args_hash, slot.seq,
     });
 }
 
@@ -103,6 +137,44 @@ test "audit: ring wraps without growing" {
     try std.testing.expectEqual(cap + 5, total());
     var buf: [cap]Record = undefined;
     try std.testing.expectEqual(cap, recent(&buf).len);
+}
+
+test "audit: seq is monotonic and exposes ring eviction" {
+    // Without a sequence number a reader cannot tell a full window from a
+    // window that quietly dropped entries — the ring only ever shows `cap`
+    // records either way.
+    reset();
+    var i: usize = 0;
+    while (i < cap + 3) : (i += 1) recordArgs("t", .safe, .allowed, "{}");
+
+    var buf: [cap]Record = undefined;
+    const got = recent(&buf);
+    // cap+3 calls, cap retained: the oldest surviving entry is the 4th call.
+    try std.testing.expectEqual(@as(u64, 3), got[0].seq);
+    try std.testing.expectEqual(@as(u64, cap + 2), got[got.len - 1].seq);
+}
+
+test "audit: args_hash distinguishes payloads that args_bytes cannot" {
+    // "Which arguments ran" is the question args_bytes can't answer: these
+    // two calls are the same length and the same tool, and differ only in
+    // the value that actually mattered.
+    reset();
+    recordArgs("removeTodo", .mutating, .allowed, "{\"index\":0}");
+    recordArgs("removeTodo", .mutating, .allowed, "{\"index\":1}");
+
+    var buf: [2]Record = undefined;
+    const got = recent(&buf);
+    try std.testing.expectEqual(got[0].args_bytes, got[1].args_bytes);
+    try std.testing.expect(got[0].args_hash != got[1].args_hash);
+}
+
+test "audit: identical payloads hash identically" {
+    reset();
+    recordArgs("t", .safe, .allowed, "{\"a\":1}");
+    recordArgs("t", .safe, .allowed, "{\"a\":1}");
+    var buf: [2]Record = undefined;
+    const got = recent(&buf);
+    try std.testing.expectEqual(got[0].args_hash, got[1].args_hash);
 }
 
 test "audit: non-printable bytes in the tool name are sanitized, not just capped" {
