@@ -648,23 +648,40 @@ const Routes = struct {
             /// it. Parsed strictly — an argument name the caller invented is
             /// rejected, not ignored.
             args_json: []const u8 = "{}",
+            /// A token this route previously handed back on a
+            /// `needs_confirmation` reply, echoed after a human approved the
+            /// call. Zero means "no approval held". Single-use, and bound to
+            /// this exact `(name, args_json)` pair — an approval for one call
+            /// cannot be spent on another (see `policy.claimToken`).
+            confirm_token: u64 = 0,
         };
         pub const Reply = struct {
             /// "ok" | "denied" | "needs_confirmation"
             outcome: []const u8,
             value_json: []const u8 = "",
             err: []const u8 = "",
+            /// Set only on the `needs_confirmation` arm; echo it back in
+            /// `Args.confirm_token` to execute.
+            ///
+            /// Handing this to the page is safe *here and only here*: the
+            /// caller of this route is the app's own human-driven UI, exactly
+            /// like a CSRF token issued to a form. It would NOT be safe on any
+            /// path where a model is the caller — which is why `ai_tool_call`
+            /// must never itself appear in `ai_tool_decls`, and why the agent
+            /// loop (`verve.ai.run`) deliberately has no way to surface a
+            /// token at all. If a future change routes model output into this
+            /// route, delete this field first.
+            confirm_token: u64 = 0,
         };
         pub fn handle(c: *RouterCtx, alloc: std.mem.Allocator, args: Args) !Reply {
-            return switch (AiTools.invoke(c, alloc, args.name, args.args_json, .{}, null)) {
+            const token: ?u64 = if (args.confirm_token == 0) null else args.confirm_token;
+            return switch (AiTools.invoke(c, alloc, args.name, args.args_json, .{}, token)) {
                 .ok => |v| .{ .outcome = "ok", .value_json = v },
                 .err => |e| .{ .outcome = "denied", .err = e },
-                // Unreachable while `ai_tool_decls` declares nothing
-                // `.dangerous` — see the note there. Flip a decl's `risk` and
-                // rebuild to exercise it.
-                .needs_confirmation => .{
+                .needs_confirmation => |t| .{
                     .outcome = "needs_confirmation",
                     .err = "a human must approve this call",
+                    .confirm_token = t,
                 },
             };
         }
