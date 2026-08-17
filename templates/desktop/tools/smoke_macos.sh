@@ -33,7 +33,18 @@ GOLDEN_DIR="${SMOKE_GOLDEN_DIR:-./tests/golden}"
 SHOT="$OUT_DIR/shot.png"
 CKSUM="$OUT_DIR/checksum.txt"
 GOLDEN_CKSUM="$GOLDEN_DIR/checksum.txt"
-APP_TIMEOUT_SECS="${SMOKE_APP_TIMEOUT:-6}"
+# Backstop against a genuinely hung app — NOT an assertion about how fast the
+# app should be. The real assertion is the checksum comparison at the bottom;
+# this only exists so a hang doesn't hang CI forever, so it should be generous.
+#
+# It was 6s, which made this job flaky on macOS CI: the honest
+# launch → webview → wasm hydrate → click → smoke_done → snapshot → exit path
+# costs ~5.5-7s on a cold runner, so a passing run cleared 6s by ~0.3s and any
+# hiccup servicing the asset scheme (a 2.4s gap between index.html and
+# style.css was observed on one failure) tipped it over. Matches
+# `smoke_linux.sh`'s `SMOKE_READY_TIMEOUT` default, which is 30 for the same
+# reason — see its "a fixed sleep races on cold runners" note.
+APP_TIMEOUT_SECS="${SMOKE_APP_TIMEOUT:-30}"
 
 if [[ -z "$APP" || ! -x "$APP" ]]; then
   echo "smoke: usage: $0 <app-binary> [output-dir]" >&2

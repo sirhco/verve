@@ -790,7 +790,7 @@ Overrides:
 | Env / arg | Default | Purpose |
 |-----------|---------|---------|
 | `SMOKE_GOLDEN_DIR` | `./tests/golden` | Alternate golden directory |
-| `SMOKE_APP_TIMEOUT` | `6` | Seconds to wait for app self-exit |
+| `SMOKE_APP_TIMEOUT` | `30` | Hang backstop, in seconds. Not a speed assertion — the real check is the checksum diff. A cold macOS CI runner legitimately needs ~5.5–7s |
 | 2nd arg to script | `./.smoke` | Output directory |
 
 ## Runtime flags
