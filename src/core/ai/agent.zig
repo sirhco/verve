@@ -7,7 +7,8 @@
 //! (see `policy.claimToken`) — this loop must never let that value reach the
 //! provider. It doesn't: the `tool_result` built for that case below is a
 //! fixed, token-free string. The token itself has no path out of this
-//! function at all: `Outcome` (below) carries only `{ text, steps, stopped }`,
+//! function at all: `Outcome` (below) carries only
+//! `{ text, steps, stopped, halted }` — none of which is or encodes a token —
 //! so a caller of `run` cannot learn that a confirmation is pending, which
 //! `(tool, args)` it is for, or what token would redeem it. A host that wants
 //! the approval flow must bypass this loop and call `Reg.invoke` directly —
@@ -20,10 +21,29 @@ const message = @import("message.zig");
 const provider = @import("provider.zig");
 const policy = @import("policy.zig");
 
+/// Why the loop stopped — which `stopped` alone cannot express, because a
+/// provider `stop_reason` of `.tool_use` is reported both when the step budget
+/// runs out and when a malformed turn is guarded.
+pub const Halted = enum {
+    /// The provider ended the turn on its own terms; `stopped` is its reason.
+    provider,
+    /// `policy.Policy.max_steps` was exhausted with the model still asking for
+    /// more tools. Raising the budget and retrying may finish the task.
+    max_steps,
+    /// A turn claimed `stop_reason == .tool_use` but carried no `tool_use`
+    /// blocks, so the loop stopped rather than round-trip an empty
+    /// `content` array the Messages API rejects. Retrying with a bigger budget
+    /// would not help; the turn itself was malformed.
+    empty_tool_use_turn,
+};
+
 pub const Outcome = struct {
     text: []const u8,
     steps: u8,
+    /// The provider's own `stop_reason`, verbatim.
     stopped: message.StopReason,
+    /// Why *this loop* returned. See `Halted`.
+    halted: Halted = .provider,
 };
 
 /// Run the tool-use loop to completion.
@@ -69,7 +89,7 @@ pub fn run(
         }
 
         if (res.stop_reason != .tool_use) {
-            return .{ .text = last_text, .steps = step, .stopped = res.stop_reason };
+            return .{ .text = last_text, .steps = step, .stopped = res.stop_reason, .halted = .provider };
         }
 
         // One user message carrying every result for this assistant turn —
@@ -102,12 +122,12 @@ pub fn run(
         // round trip (an empty `content` array is invalid). Stop here with a
         // clear outcome instead.
         if (results.items.len == 0) {
-            return .{ .text = last_text, .steps = step, .stopped = res.stop_reason };
+            return .{ .text = last_text, .steps = step, .stopped = res.stop_reason, .halted = .empty_tool_use_turn };
         }
 
         try convo.append(arena, .{ .role = .user, .blocks = try results.toOwnedSlice(arena) });
     }
-    return .{ .text = last_text, .steps = step, .stopped = .tool_use };
+    return .{ .text = last_text, .steps = step, .stopped = .tool_use, .halted = .max_steps };
 }
 
 // ---- tests ------------------------------------------------------------
@@ -272,6 +292,36 @@ test "agent: max_steps is enforced" {
     try std.testing.expectEqual(@as(u32, 3), always.calls);
     try std.testing.expectEqual(message.StopReason.tool_use, outcome.stopped);
     try std.testing.expectEqual(@as(u8, 3), outcome.steps);
+    try std.testing.expectEqual(Halted.max_steps, outcome.halted);
+}
+
+test "agent: budget exhaustion and a guarded empty turn are distinguishable" {
+    // Both report `stopped == .tool_use`, because that is genuinely what the
+    // provider said. `halted` is the only thing that separates "the model was
+    // still working when the budget ran out" from "the turn was malformed and
+    // the loop refused to round-trip empty content" — a caller deciding
+    // whether to raise max_steps and retry needs to tell them apart.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var always: AlwaysToolUseProvider = .{};
+    var convo1: std.ArrayList(message.Message) = .empty;
+    try convo1.append(a, userTurn("loop forever"));
+    const exhausted = try run(a, always.asProvider(), R, .{ .max_steps = 2 }, &convo1, "sys", "model-x");
+
+    var mock: @import("mock_provider.zig").MockProvider = .{ .turns = &.{
+        .{ .stop_reason = .tool_use, .blocks = &.{.{ .text = "thinking..." }} },
+    } };
+    var convo2: std.ArrayList(message.Message) = .empty;
+    try convo2.append(a, userTurn("do something"));
+    const malformed = try run(a, mock.provider(), R, .{}, &convo2, "sys", "model-x");
+
+    try std.testing.expectEqual(exhausted.stopped, malformed.stopped);
+    try std.testing.expectEqual(message.StopReason.tool_use, exhausted.stopped);
+    try std.testing.expect(exhausted.halted != malformed.halted);
+    try std.testing.expectEqual(Halted.max_steps, exhausted.halted);
+    try std.testing.expectEqual(Halted.empty_tool_use_turn, malformed.halted);
 }
 
 test "agent: refusal stops the loop and surfaces it" {

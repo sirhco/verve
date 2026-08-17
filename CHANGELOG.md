@@ -4,6 +4,52 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Desktop AI demo — closes the `verve.ai` spec's S5 deviation.** `ai_tool_call`
+  runs an allowlisted IPC route as a model tool through `verve.ai.RouteRegistry`
+  (its first non-test caller), and `ai_delegate` / `ai_delegate_poll` hand a whole
+  task to the Claude Code CLI via `desktop.ai_cli` (the first invocation of
+  `Client.complete` outside its unit tests). Both are demo cards in the scaffolded
+  desktop app.
+- **A human confirmation round-trip for `.dangerous` tools.** `cookie_clear` is
+  declared `.dangerous`; the gate refuses it with a single-use token bound to the
+  exact `(name, args)` pair, a human clicks Confirm to redeem it, and replaying the
+  same token is rejected — `needs_confirmation`, then `allowed`, then
+  `claim_rejected` in the audit trail.
+- **Audit forensics.** `audit.Record` gains `seq: u64` (so ring eviction is visible
+  as a gap rather than looking like a complete window) and `args_hash: u64` (so
+  *which* arguments ran is recorded, which `args_bytes` alone cannot distinguish).
+  New `audit.recordArgs` derives both from the payload; the log line gains `hash=`
+  and `seq=`. The hash is unkeyed and documented as a correlation aid, not a
+  security commitment — `policy.bindingOf` remains the keyed hash that gates
+  execution.
+- **Integer tool arguments now carry `minimum` / `maximum`** derived from the
+  declared Zig bit width, so a model learns a `u8` field's range instead of
+  discovering it from a rejected call. Comptime-evaluated; no runtime cost.
+
+### Changed
+
+- **BREAKING: `verve.ai_action_invoke` is now `verve.action_invoke`.** The module's
+  main consumer (`api_handler`) is not AI-specific, so the old name misdescribed it.
+- **BREAKING: `agent.Outcome` gains `halted: Halted`.** `stopped` reported
+  `.tool_use` both when `max_steps` was exhausted and when a malformed empty
+  `tool_use` turn was guarded, leaving a caller unable to tell "budget ran out,
+  retrying bigger may work" from "the turn was malformed, retrying will not".
+  `stopped` keeps its meaning (the provider's wire `stop_reason`); `halted` says why
+  the loop itself returned.
+
+### Fixed
+
+- **A `u64` confirmation token could not survive the desktop JSON bridge.** JSON
+  numbers are IEEE doubles in the webview and `Number.MAX_SAFE_INTEGER` is ~9.0e15,
+  so a token near 1.5e19 came back with its low bits rounded off; `claimToken` then
+  rejected it and audited `claim_rejected`, which reads exactly like a replay attempt
+  rather than a mangled number. The desktop route now carries the token as a decimal
+  string.
+
 ## [0.52.0] - 2026-08-17
 
 ### Changed

@@ -253,7 +253,7 @@ pub const serializeEncodeToBytes = @import("core/serialize.zig").encodeToBytes;
 pub const setDiTablesAllocator = @import("core/context_di.zig").setOwnerTablesAllocator;
 
 // Shared action invoker — used by the HTTP api_handler and the AI tool registry.
-pub const ai_action_invoke = @import("core/action_invoke.zig");
+pub const action_invoke = @import("core/action_invoke.zig");
 
 test {
     _ = node_mod;

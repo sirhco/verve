@@ -10,7 +10,7 @@ const Writer = std.Io.Writer;
 const app = @import("app");
 const verve = @import("verve");
 const http = std.http;
-const action_invoke = @import("verve").ai_action_invoke;
+const action_invoke = @import("verve").action_invoke;
 
 pub const RequestMeta = verve.RequestMeta;
 
