@@ -4,6 +4,31 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The HTTP request target was aliased, not copied — despite being named
+  `target_copy`.** `request.head.target` is a slice into `handleConnection`'s
+  `read_buf`; the body reader refills that buffer and the next keep-alive
+  iteration overwrites it, so the slice was only valid until the first read
+  after the head. Two consumers outlived it: `logRequest` runs after
+  `handleRequest` returns, and — the part that mattered —
+  `api_handler.dispatch` receives `path` *after* the request body has been
+  read, where it selects which `Actions` function runs. The target is now
+  copied into a per-iteration stack buffer up front, and routing and logging
+  both read the copy.
+
+  Surfaced as a corrupted access-log line (`GET <2 garbage bytes> 6351.1ms`)
+  during live-API testing — the first requests slow enough to make the buffer
+  reuse visible. Metrics were never affected: `metrics.routeLabel` returns
+  only comptime literals, never a slice of the input.
+
+- **A request target longer than 8 KiB now returns 414** instead of being
+  routed. Truncating would still route, and a clipped `/public/<long>` is a
+  different, shorter path the prefix handler would serve — so the client could
+  get a response for a URL it never sent.
+
 ## [0.53.0] - 2026-08-17
 
 ### Added

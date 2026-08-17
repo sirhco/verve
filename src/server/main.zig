@@ -25,6 +25,12 @@ pub const std_options: std.Options = .{ .log_level = .info };
 
 const READ_BUF_SIZE = 64 * 1024;
 const WRITE_BUF_SIZE = 64 * 1024;
+
+/// Cap on a request target (path + query) that this server will route.
+/// Bounds the per-connection stack copy taken in `handleConnection`; anything
+/// longer gets a 414 rather than being truncated into a different route.
+/// Comfortably above the ~2 KB practical URL limit browsers enforce.
+const MAX_TARGET_LEN = 8 * 1024;
 const DEFAULT_BODY_LIMIT: usize = 1 * 1024 * 1024;
 const PUBLIC_PREFIX = "/public/";
 const STATIC_MAX_SIZE: usize = 4 * 1024 * 1024;
@@ -289,7 +295,27 @@ fn handleConnection(
         };
         const start = std.Io.Clock.now(.awake, io);
         const method_name = @tagName(request.head.method);
-        const target_copy = request.head.target;
+
+        // `request.head.target` is a slice INTO `read_buf` — it is not owned by
+        // the request. The body reader refills that buffer, and the next
+        // keep-alive iteration overwrites it outright, so the slice is only
+        // valid until the first read after the head. Two consumers here outlive
+        // that: `api_handler.dispatch` receives `path` *after* the request body
+        // has been read (it selects which `Actions` function runs), and
+        // `logRequest` runs after `handleRequest` has returned. Copying once,
+        // up front, is what makes both safe — a previous version aliased the
+        // buffer under the name `target_copy` without copying anything, which
+        // printed corrupted access-log lines on slow requests.
+        var target_buf: [MAX_TARGET_LEN]u8 = undefined;
+        if (request.head.target.len > target_buf.len) {
+            // Refuse rather than truncate: a truncated target would still be
+            // routed, and could match a shorter route than the client asked for.
+            request.respond("request target too long", .{ .status = .uri_too_long }) catch {};
+            return;
+        }
+        @memcpy(target_buf[0..request.head.target.len], request.head.target);
+        const target_copy = target_buf[0..request.head.target.len];
+
         const path = pathOf(target_copy);
         const route_label = metrics.routeLabel(path);
         // Capture request headers ONCE before any response or body read.

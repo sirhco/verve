@@ -267,6 +267,22 @@ test "server boots, serves pages, returns expected status codes" {
         defer resp.deinit(gpa);
         try std.testing.expectEqual(@as(u16, 404), resp.status);
     }
+    {
+        // An over-long target is refused with 414 rather than truncated.
+        // Truncating would still route: `/public/<8KB of x>` clipped to the
+        // buffer is a *different, shorter* path that the `/public/` prefix
+        // handler would happily serve, so the client could get a response for
+        // a URL it never asked for. The cap exists because the server copies
+        // the target out of the connection read buffer (see MAX_TARGET_LEN in
+        // src/server/main.zig).
+        var long_target: [9 * 1024]u8 = undefined;
+        @memset(&long_target, 'x');
+        @memcpy(long_target[0..8], "/public/");
+
+        var resp = try request(io, gpa, TEST_PORT, "GET", &long_target);
+        defer resp.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 414), resp.status);
+    }
 }
 
 test "form-encoded /api/addTodo + /api/removeTodo updates /todos" {
