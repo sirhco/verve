@@ -59,7 +59,13 @@ fn typeSchema(comptime T: type, comptime desc: ?[]const u8, comptime path: []con
         const tail = if (desc) |d| ",\"description\":\"" ++ escape(d) ++ "\"" else "";
         return switch (@typeInfo(T)) {
             .bool => "{\"type\":\"boolean\"" ++ tail ++ "}",
-            .int => "{\"type\":\"integer\"" ++ tail ++ "}",
+            // Bounds from the declared width, so a model learns that a `u8`
+            // field cannot be 300 rather than discovering it from a rejected
+            // call. Comptime-evaluated, so this costs nothing at runtime.
+            // `tail` (the optional description) stays last, matching every
+            // other arm.
+            .int => "{\"type\":\"integer\",\"minimum\":" ++ std.fmt.comptimePrint("{d}", .{std.math.minInt(T)}) ++
+                ",\"maximum\":" ++ std.fmt.comptimePrint("{d}", .{std.math.maxInt(T)}) ++ tail ++ "}",
             .float => "{\"type\":\"number\"" ++ tail ++ "}",
             // An optional is the same shape as its child; omittability is
             // expressed by leaving the field out of `required`, not here.
@@ -112,7 +118,41 @@ test "schema: flat struct with string and int" {
     const Args = struct { text: []const u8, count: i32 };
     const got = comptime jsonSchema(Args, &.{});
     try std.testing.expectEqualStrings(
-        \\{"type":"object","properties":{"text":{"type":"string"},"count":{"type":"integer"}},"required":["text","count"],"additionalProperties":false}
+        \\{"type":"object","properties":{"text":{"type":"string"},"count":{"type":"integer","minimum":-2147483648,"maximum":2147483647}},"required":["text","count"],"additionalProperties":false}
+    , got);
+}
+
+test "schema: integer bounds come from the Zig bit width" {
+    // Without bounds a model only learns "integer" and discovers the real
+    // range by having its call rejected. The declared width already carries
+    // that information, so emit it.
+    const Args = struct { small: u8, signed: i8 };
+    const got = comptime jsonSchema(Args, &.{});
+    try std.testing.expectEqualStrings(
+        \\{"type":"object","properties":{"small":{"type":"integer","minimum":0,"maximum":255},"signed":{"type":"integer","minimum":-128,"maximum":127}},"required":["small","signed"],"additionalProperties":false}
+    , got);
+}
+
+test "schema: usize emits its full 64-bit range" {
+    // `src/app/ai.zig`'s `removeTodo` takes `index: usize`, so this is the
+    // shape a real app ships. The bound is honest but enormous, and some
+    // models handle a 20-digit literal poorly — pinned here so that narrowing
+    // `usize` (to `u32`, or by clamping the emitted maximum) is a deliberate
+    // decision with a failing test attached, not a silent drift.
+    const Args = struct { index: usize };
+    const got = comptime jsonSchema(Args, &.{});
+    try std.testing.expectEqualStrings(
+        \\{"type":"object","properties":{"index":{"type":"integer","minimum":0,"maximum":18446744073709551615}},"required":["index"],"additionalProperties":false}
+    , got);
+}
+
+test "schema: an integer field's description still comes last" {
+    // `tail` carries the optional description and must stay after the bounds,
+    // matching every other type arm. Nothing else pins this ordering.
+    const Args = struct { n: u8 };
+    const got = comptime jsonSchema(Args, &.{.{ .field = "n", .description = "how many" }});
+    try std.testing.expectEqualStrings(
+        \\{"type":"object","properties":{"n":{"type":"integer","minimum":0,"maximum":255,"description":"how many"}},"required":["n"],"additionalProperties":false}
     , got);
 }
 
@@ -127,7 +167,7 @@ test "schema: default and optional fields are not required" {
     const Args = struct { a: []const u8, b: u8 = 3, c: ?[]const u8 = null };
     const got = comptime jsonSchema(Args, &.{});
     try std.testing.expectEqualStrings(
-        \\{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer"},"c":{"type":"string"}},"required":["a"],"additionalProperties":false}
+        \\{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer","minimum":0,"maximum":255},"c":{"type":"string"}},"required":["a"],"additionalProperties":false}
     , got);
 }
 
