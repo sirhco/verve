@@ -230,10 +230,12 @@ fn aiDelegateWorker(io: std.Io, prompt: []const u8) void {
 /// dispatch path. The list is validated at comptime, so a typo'd `fn_name` or
 /// a stale `arg_docs.field` is a build failure.
 ///
-/// Nothing here is `.dangerous` on purpose: `.dangerous` tools require a
-/// human confirmation round-trip, and this template ships no approval UI to
-/// perform one. Shipping a dangerous tool without the UI to confirm it would
-/// be worse than shipping neither.
+/// One entry here is `.dangerous` (`cookie_clear`). That tier never executes
+/// on the strength of the model's word alone: the gate mints a single-use
+/// token bound to the exact `(name, args)` pair and refuses until a human
+/// echoes it back — the Confirm button on the demo card. Do not declare a
+/// tool `.dangerous` without a UI that can actually perform that approval;
+/// it would be permanently unrunnable rather than merely guarded.
 const ai_tool_decls: []const verve.ai.ToolDecl = &.{
     .{
         .fn_name = "system_info",
@@ -249,6 +251,18 @@ const ai_tool_decls: []const verve.ai.ToolDecl = &.{
             .{ .field = "body", .description = "Notification body text." },
         },
     },
+    .{
+        .fn_name = "cookie_clear",
+        .description = "Delete every cookie in this app's web view.",
+        // The one `.dangerous` tool here. It cannot run without a single-use
+        // token bound to this exact (name, args) pair, minted by the gate and
+        // redeemed only after a human clicks Confirm.
+        //
+        // Chosen because it is genuinely irreversible yet cannot harm the
+        // machine. Do not add a destructive route to a template other people
+        // scaffold from purely to demonstrate a risk tier.
+        .risk = .dangerous,
+    },
 };
 
 /// The desktop-IPC sibling of `verve.ai.Registry`. Both call the same `gate`
@@ -256,6 +270,20 @@ const ai_tool_decls: []const verve.ai.ToolDecl = &.{
 /// IPC gets exactly the guarantees one arriving over HTTP gets, from one
 /// implementation rather than two that can drift.
 const AiTools = verve.ai.RouteRegistry(Routes, RouterCtx, ai_tool_decls);
+
+/// Policy for IPC-triggered tool calls.
+///
+/// The default `Policy` caps `allow_risk` at `.mutating`, which refuses a
+/// `.dangerous` tool outright — `policy.check` tests the ceiling *before* the
+/// confirmation threshold, so with the default a dangerous call is `denied`
+/// and the approval path is unreachable. That is a good default (an app opts
+/// in to dangerous tools deliberately), but this demo exists to show the
+/// approval round-trip, so it raises the ceiling.
+///
+/// Raising `allow_risk` does not weaken the gate. `confirm_at` stays
+/// `.dangerous`, so such a call still cannot execute without a single-use
+/// token bound to its exact arguments and redeemed by a human.
+const ai_policy: verve.ai.Policy = .{ .allow_risk = .dangerous };
 
 /// Comptime route table. Each public decl is a route; the router
 /// matches incoming `type` against the decl name.
@@ -650,10 +678,12 @@ const Routes = struct {
             args_json: []const u8 = "{}",
             /// A token this route previously handed back on a
             /// `needs_confirmation` reply, echoed after a human approved the
-            /// call. Zero means "no approval held". Single-use, and bound to
+            /// call. Empty means "no approval held". Single-use, and bound to
             /// this exact `(name, args_json)` pair — an approval for one call
             /// cannot be spent on another (see `policy.claimToken`).
-            confirm_token: u64 = 0,
+            ///
+            /// A decimal **string**, not a number. See `Reply.confirm_token`.
+            confirm_token: []const u8 = "",
         };
         pub const Reply = struct {
             /// "ok" | "denied" | "needs_confirmation"
@@ -663,6 +693,18 @@ const Routes = struct {
             /// Set only on the `needs_confirmation` arm; echo it back in
             /// `Args.confirm_token` to execute.
             ///
+            /// A decimal **string**, not a number, and that is load-bearing.
+            /// The token spans the full `u64` range, JSON numbers are IEEE
+            /// doubles in every webview, and `Number.MAX_SAFE_INTEGER` is
+            /// about 9.0e15 — so a token near 1.5e19 silently loses its low
+            /// bits crossing the bridge and comes back rounded (observed:
+            /// a mint ending `...107000`). `claimToken` then rejects it and
+            /// audits `claim_rejected`, which reads like a broken gate rather
+            /// than a mangled number. Other `u64` fields on these routes
+            /// (byte counts, uptime) are safe only because their magnitudes
+            /// never approach 2^53; anything using the full range must cross
+            /// as a string.
+            ///
             /// Handing this to the page is safe *here and only here*: the
             /// caller of this route is the app's own human-driven UI, exactly
             /// like a CSRF token issued to a form. It would NOT be safe on any
@@ -671,17 +713,24 @@ const Routes = struct {
             /// loop (`verve.ai.run`) deliberately has no way to surface a
             /// token at all. If a future change routes model output into this
             /// route, delete this field first.
-            confirm_token: u64 = 0,
+            confirm_token: []const u8 = "",
         };
         pub fn handle(c: *RouterCtx, alloc: std.mem.Allocator, args: Args) !Reply {
-            const token: ?u64 = if (args.confirm_token == 0) null else args.confirm_token;
-            return switch (AiTools.invoke(c, alloc, args.name, args.args_json, .{}, token)) {
+            // A token that isn't a valid u64 is treated as no token at all,
+            // not as an error: the gate then mints a fresh one and asks for
+            // approval again, which is the safe direction to fail.
+            const token: ?u64 = if (args.confirm_token.len == 0)
+                null
+            else
+                std.fmt.parseInt(u64, args.confirm_token, 10) catch null;
+
+            return switch (AiTools.invoke(c, alloc, args.name, args.args_json, ai_policy, token)) {
                 .ok => |v| .{ .outcome = "ok", .value_json = v },
                 .err => |e| .{ .outcome = "denied", .err = e },
                 .needs_confirmation => |t| .{
                     .outcome = "needs_confirmation",
                     .err = "a human must approve this call",
-                    .confirm_token = t,
+                    .confirm_token = try std.fmt.allocPrint(alloc, "{d}", .{t}),
                 },
             };
         }

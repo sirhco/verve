@@ -152,13 +152,15 @@ pub fn home(ctx: *const verve.Context) !*verve.Node {
             ctx.section().class("card").children(.{
                 ctx.h2("AI tool gate over IPC"),
                 ctx.p().text("Runs an IPC route as an AI tool through verve.ai.RouteRegistry — the same gate a model-issued HTTP tool call passes: allowlist, argument size, risk tier, human confirmation, and an audit line for every outcome including the refusals."),
-                ctx.p().text("system_info and notify are on this app's allowlist in handlers.zig. smoke_done is a real route that is not, so it is refused. Watch stderr for the audit lines."),
+                ctx.p().text("system_info and notify are on this app's allowlist in handlers.zig. smoke_done is a real route that is not, so it is refused. cookie_clear is declared dangerous: it will not run until a human approves it. Watch stderr for the audit lines."),
                 ctx.div().class("row").children(.{
                     ctx.button("system_info (allowed)").id("ai-tool-allowed"),
                     ctx.button("notify (allowed)").id("ai-tool-notify"),
                     ctx.button("smoke_done (not allowlisted)").id("ai-tool-denied"),
+                    ctx.button("cookie_clear (dangerous)").id("ai-tool-danger"),
                 }),
                 ctx.div().id("ai-tool-result").class("result-panel").text(""),
+                ctx.div().id("ai-tool-confirm").class("row").text(""),
             }),
             ctx.section().class("card").children(.{
                 ctx.h2("Log"),
@@ -381,4 +383,42 @@ const inline_js =
     \\document.getElementById('ai-tool-allowed').addEventListener('click', () => aiTool('system_info', '{}'));
     \\document.getElementById('ai-tool-notify').addEventListener('click', () => aiTool('notify', '{"title":"Verve","body":"Fired through the AI tool gate."}'));
     \\document.getElementById('ai-tool-denied').addEventListener('click', () => aiTool('smoke_done', '{"checksum":0}'));
+    \\
+    \\// The .dangerous tier: ask, get refused with a token, let a human
+    \\// approve, then redeem. The token is single-use and bound to this exact
+    \\// (name, args) pair — it never leaves this page and is never shown to a
+    \\// model.
+    \\document.getElementById('ai-tool-danger').addEventListener('click', async () => {
+    \\  const out = document.getElementById('ai-tool-result');
+    \\  const bar = document.getElementById('ai-tool-confirm');
+    \\  bar.textContent = '';
+    \\  out.textContent = 'requesting cookie_clear…';
+    \\  out.className = 'result-panel loading';
+    \\  try {
+    \\    const r = await window.verve.request({
+    \\      type: 'ai_tool_call', name: 'cookie_clear', args_json: '{}',
+    \\    });
+    \\    if (r.outcome !== 'needs_confirmation') {
+    \\      out.className = 'result-panel error';
+    \\      out.textContent = 'expected needs_confirmation, got ' + r.outcome;
+    \\      return;
+    \\    }
+    \\    out.className = 'result-panel';
+    \\    out.textContent = 'Gate refused: a human must approve this call.';
+    \\    const btn = document.createElement('button');
+    \\    btn.textContent = 'Confirm cookie_clear';
+    \\    btn.addEventListener('click', async () => {
+    \\      const c = await window.verve.request({
+    \\        type: 'ai_tool_call', name: 'cookie_clear', args_json: '{}',
+    \\        confirm_token: r.confirm_token,
+    \\      });
+    \\      out.className = 'result-panel ' + (c.outcome === 'ok' ? 'ok' : 'error');
+    \\      out.textContent = 'after approval: ' + c.outcome + ' ' + (c.value_json || c.err);
+    \\    });
+    \\    bar.appendChild(btn);
+    \\  } catch (err) {
+    \\    out.textContent = '✗ ' + err.message;
+    \\    out.className = 'result-panel error';
+    \\  }
+    \\});
 ;

@@ -227,9 +227,40 @@ no dispatch path. The demo card proves it: `smoke_done` is a real route,
 and asking for it by name returns `unknown tool` and audits as denied.
 **The JS shim is not a trust boundary — this list is.**
 
-Nothing is declared `.dangerous`, because that tier demands a human
-confirmation round-trip and this template ships no approval UI. Flip a
-`risk` and rebuild to exercise the `needs_confirmation` arm.
+#### The `.dangerous` tier
+
+`cookie_clear` is declared `.dangerous`, and the card's fourth button walks
+the full approval round-trip:
+
+1. Ask for it. The gate refuses (`needs_confirmation`) and mints a
+   single-use token bound to that exact `(name, args)` pair.
+2. A human clicks **Confirm**, echoing the token back.
+3. The gate redeems it and the route runs.
+4. Replaying the same token fails — it was consumed. Audited as
+   `claim_rejected`.
+
+stderr tells the same story:
+
+```
+tool cookie_clear risk=dangerous outcome=needs_confirmation args=2B
+tool cookie_clear risk=dangerous outcome=allowed            args=2B
+tool cookie_clear risk=dangerous outcome=claim_rejected     args=2B
+```
+
+Two things to copy if you add a `.dangerous` tool of your own:
+
+- **Raise `allow_risk`.** `policy.check` tests the risk ceiling *before* the
+  confirmation threshold, so under the default `Policy` (`allow_risk =
+  .mutating`) a dangerous call is simply `denied` and the approval path is
+  unreachable. This app passes `ai_policy`, which is
+  `.{ .allow_risk = .dangerous }`. That does not weaken the gate — `confirm_at`
+  is still `.dangerous`, so approval is still required.
+- **Carry the token as a string.** It spans the full `u64` range and JSON
+  numbers are IEEE doubles in the webview, so above 2^53 it silently comes
+  back rounded and the gate rejects it. `Args`/`Reply` use `[]const u8`.
+
+Do not declare a tool `.dangerous` without a UI that can perform the
+approval — it would be permanently unrunnable rather than merely guarded.
 
 ### Delegation — `ai_delegate` / `ai_delegate_poll`
 
