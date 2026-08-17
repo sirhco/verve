@@ -4,7 +4,13 @@ All notable changes to Verve are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
-## [0.51.1] - 2026-08-16
+## [0.52.0] - 2026-08-17
+
+### Changed
+
+- **`desktop.process.Error` gains an `OutputTooLarge` variant.** Breaking for any
+  exhaustive `switch` over that error set, which is why this is a minor bump rather
+  than a patch. See the fix below for why the variant exists.
 
 ### Fixed
 
